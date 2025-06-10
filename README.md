@@ -5,16 +5,33 @@ kvcached is a KV cache management system for serving multiple Large Language Mod
 ## Prerequisites
 
 * Python (tested with 3.11)
-* PyTorch (tested with 2.6.0)
+* Virtual environment tools (scripts are provided for uv==0.7.12)
 
-**Important Note:** It is highly recommended to create a separate virtual environment, using tools like `conda`, `venv`, or `uv`, before installing and using `kvcached`.
+**Important Note:** The scripts will create separate virtual environments using `uv` for vLLM and sglang.
+
+## All-in-One Installation (vLLM+SGLang+kvcached, Recommended)
+
+kvcached now supports both vLLM and SGLang. Currently, it requires modifications to the LLM engine's code. To facilitate this process, we provide patches for vLLM version 0.8.4 and SGLang version 0.4.6.post2, along with detailed setup instructions, in the `engine_integration/` directory.
+
+You can install everything (vLLM+SGLang+kvcached) by running the following commands:
+
+```bash
+cd engine_integration/scripts
+./setup.sh
+```
+
+This script will download the specified versions of vLLM and SGLang, create separate venv environments, compile the code, apply the necessary patches, and install kvcached.
 
 ## Installation from Source
 
-To install kvcached from source, run the following command:
+If you want to install kvcached on your own, you can install it from source, run the following command:
+
 ```bash
 pip install -e .
 ```
+
+This will compile and install kvcached. If you have the right versions of vLLM and SGLang, you can apply the patches in `engine_integration/scripts`, and it should work.
+
 
 ## Manual Compilation
 
@@ -30,18 +47,7 @@ To resolve this issue, one can rebuild the `vmm_ops` library locally by running:
 python setup.py build_ext --inplace
 ```
 
-## Integration with LLM Engines
-
-Currently, kvcached requires modifications to the LLM engine's code. To facilitate this process, we provide patches for vLLM version 0.8.4 and SGLang version 0.4.6.post2, along with detailed setup instructions, in the `engine_integration/` directory.
-
-To install vLLM and SGLang and apply the kvcached patches, follow these steps:
-
-```bash
-cd engine_integration/
-./scripts/setup.sh
-```
-
-This script will download the specified versions of vLLM and SGLang, compile the code, and apply the necessary patches. After the script completes, you should see `vllm-v0.8.4/` and `sglang-v0.4.6.post2/` directories created.
+## Testing
 
 To verify the successful installation and benchmark the performance of vLLM/SGLang with kvcached, run:
 

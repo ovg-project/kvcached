@@ -10,7 +10,7 @@ MODEL=meta-llama/Llama-3.1-8B
 VLLM_PORT=12346
 SGL_PORT=30000
 
-NUM_PROMPTS=1000
+NUM_PROMPTS=100
 REQUEST_RATE=10
 
 op=$1
@@ -26,6 +26,8 @@ check_and_download_sharegpt() {
 
 if [ "$op" == "vllm" ]; then
     check_and_download_sharegpt
+    source "$ENGINE_DIR/vllm-v0.8.4/.venv/bin/activate"
+    uv pip install pandas datasets
     pushd $ENGINE_DIR/vllm-v0.8.4/benchmarks
     python benchmark_serving.py --backend=vllm \
       --model $MODEL \
@@ -34,9 +36,11 @@ if [ "$op" == "vllm" ]; then
       --request-rate $REQUEST_RATE \
       --num-prompts $NUM_PROMPTS \
       --port $VLLM_PORT
+    deactivate
     popd
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     check_and_download_sharegpt
+    source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
     pushd $SCRIPT_DIR
     python -m sglang.bench_serving --backend sglang-oai \
       --model $MODEL \
@@ -45,6 +49,7 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
       --request-rate $REQUEST_RATE \
       --num-prompts $NUM_PROMPTS \
       --port $SGL_PORT
+    deactivate
     popd
 else
     echo "Invalid option: $op"
