@@ -1,8 +1,9 @@
-import numpy as np
 import logging
 
-from kvcached.controller.utils import (get_kv_cache_limit, DEFAULT_IPC_NAME,
-                                       RwLockedShm)
+import numpy as np
+
+from kvcached.controller.utils import (DEFAULT_IPC_NAME, RwLockedShm,
+                                       get_kv_cache_limit)
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +18,7 @@ class MemoryInfoClient:
                          np.int64().itemsize * 2, RwLockedShm.WLOCK) as mm:
             mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
             if mem_info[1] + size > mem_info[0]:
-                logger.warning(
-                    f"Not enough memory available for {size} bytes")
+                logger.warning(f"Not enough memory available for {size} bytes")
                 return False
             mem_info[1] += size
             return True

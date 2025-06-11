@@ -19,7 +19,7 @@ def get_csrc_files(path) -> List[str]:
 
 
 def get_extensions():
-    from torch.utils.cpp_extension import (CUDAExtension, BuildExtension,
+    from torch.utils.cpp_extension import (BuildExtension, CUDAExtension,
                                            include_paths, library_paths)
 
     csrc_files = get_csrc_files(CSRC_PATH)

@@ -1,8 +1,9 @@
 import fcntl
-import mmap
-import numpy as np
 import logging
+import mmap
 import os
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +54,7 @@ def get_kv_cache_limit(ipc_name: str) -> np.ndarray:
     """
     try:
         with RwLockedShm(get_ipc_name(ipc_name),
-                         np.int64().itemsize * 2,
-                         RwLockedShm.RLOCK) as mm:
+                         np.int64().itemsize * 2, RwLockedShm.RLOCK) as mm:
             mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm).copy()
             return mem_info
     except FileNotFoundError:

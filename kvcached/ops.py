@@ -4,10 +4,10 @@ from typing import List, Tuple
 import torch
 
 from kvcached.slab_allocator import PAGE_SIZE
-
 from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
+
 
 def init_kvcached() -> None:
     device = f"cuda:{torch.cuda.current_device()}"

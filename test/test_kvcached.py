@@ -1,7 +1,6 @@
 import torch
 
 from kvcached.ops import init_kvcached, vllm_alloc_kv_cache
-
 from kvcached.vmm_ops import map_to_kv_tensors, shutdown_kvcached
 
 num_blocks = 2864
@@ -27,7 +26,8 @@ print("Creating KV tensors")
 #     layer_mem_size, dtype, device, num_layers
 # )
 kv_shape = (2, num_blocks, block_mem_size)
-kv_tensors = vllm_alloc_kv_cache(kv_shape, block_size, dtype, device, num_layers)
+kv_tensors = vllm_alloc_kv_cache(kv_shape, block_size, dtype, device,
+                                 num_layers)
 
 ktensors = []
 vtensors = []
@@ -50,12 +50,12 @@ print("Mapped to KV tensors")
 ele_idxs = [o // 2 for o in offsets]
 print("Accessing KV tensors")
 for i in range(num_layers):
-    ktensors[i][ele_idxs] = torch.tensor(
-        list(range(i, i + 5)), device=device, dtype=dtype
-    )
-    vtensors[i][ele_idxs] = torch.tensor(
-        list(range(i + 5, i + 10)), device=device, dtype=dtype
-    )
+    ktensors[i][ele_idxs] = torch.tensor(list(range(i, i + 5)),
+                                         device=device,
+                                         dtype=dtype)
+    vtensors[i][ele_idxs] = torch.tensor(list(range(i + 5, i + 10)),
+                                         device=device,
+                                         dtype=dtype)
 
 for i in range(num_layers):
     print(ktensors[i][ele_idxs], vtensors[i][ele_idxs])

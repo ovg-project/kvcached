@@ -6,10 +6,9 @@ except ImportError:
     import os
     import sys
 
-    SCRIPT_PATH=os.path.dirname(os.path.realpath(__file__))
+    SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
     sys.path.append(os.path.join(SCRIPT_PATH, ".."))
     from simulator.simulator import Simulator
-
 
 
 def main(args):

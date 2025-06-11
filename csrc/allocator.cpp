@@ -117,7 +117,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
-  const std::vector<offset_t> &offsets) {
+    const std::vector<offset_t> &offsets) {
   for (int64_t i = 0; i < num_layers_; i++) {
     auto kv_name = std::string(kv_prefix) + std::to_string(i);
     auto ftensor = ftensors_[kv_name].get();
