@@ -1,24 +1,24 @@
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef212..9e99ddb2 100644
+index f7eef212..90f10996 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,25 @@ class TokenToKVPoolAllocator:
          self.clear()
- 
+
          self._kvcache = kvcache
 +        self.use_kvcached = (hasattr(kvcache, "use_kvcached") and
 +                             kvcache.use_kvcached)
 +        if self.use_kvcached:
 +            self.kv_allocator = kvcache.kv_allocator
- 
+
      def available_size(self):
 +        if self.use_kvcached:
 +            return self.kv_allocator.available_size()
          return len(self.free_slots)
- 
+
      def get_kvcache(self):
          return self._kvcache
- 
+
      def alloc(self, need_size: int):
 +        if self.use_kvcached:
 +            indices = self.kv_allocator.alloc(need_size)
@@ -27,21 +27,19 @@ index f7eef212..9e99ddb2 100644
 +
          if need_size > len(self.free_slots):
              return None
- 
-@@ -170,6 +181,10 @@ class TokenToKVPoolAllocator:
-         return select_index
- 
-     def free(self, free_index: torch.Tensor):
-+        if self.use_kvcached:
-+            self.kv_allocator.free(free_index.cpu().numpy())
-+            return
-+
-         if free_index.numel() == 0:
+
+@@ -174,6 +185,8 @@ class TokenToKVPoolAllocator:
              return
- 
-@@ -194,6 +209,10 @@ class TokenToKVPoolAllocator:
+
+         if self.is_not_in_free_group:
++            if self.use_kvcached:
++                return self.kv_allocator.free(free_index.cpu().numpy())
+             self.free_slots = torch.cat((self.free_slots, free_index))
+         else:
+             self.free_group.append(free_index)
+@@ -194,6 +207,10 @@ class TokenToKVPoolAllocator:
          self.free_slots = free_slots
- 
+
      def clear(self):
 +        if hasattr(self, "use_kvcached") and self.use_kvcached:
 +            self.kv_allocator.clear()
@@ -50,17 +48,14 @@ index f7eef212..9e99ddb2 100644
          # The padded slot 0 is used for writing dummy outputs from padded tokens.
          self.free_slots = torch.arange(
              1, self.size + 1, dtype=torch.int64, device=self.device
-@@ -233,6 +252,32 @@ class MHATokenToKVPool(KVCache):
+@@ -233,6 +250,27 @@ class MHATokenToKVPool(KVCache):
          self.head_num = head_num
          self.head_dim = head_dim
          self.layer_num = layer_num
 +
 +        self.use_kvcached = True
 +        if self.use_kvcached:
-+            # try:
-+            if True:
-+                # import sys
-+                # sys.path.append("/data/yifanqiao/code/kvcached")
++            try:
 +                from kvcached import ops as kvcached_ops
 +                from kvcached.slab_allocator import KVCacheManager
 +
@@ -75,18 +70,16 @@ index f7eef212..9e99ddb2 100644
 +                    self.cell_size,
 +                    num_layers=end_layer - start_layer + 1,
 +                )
-+            # except ImportError as e:
-+            #     raise ImportError(
-+            #         "kvcached is required for elastic memory. Please install it first."
-+            #     ) from e
++            except ImportError as e:
++                raise ImportError("kvcached is not found. Please install it for elastic memory.") from e
 +
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -247,7 +292,29 @@ class MHATokenToKVPool(KVCache):
+@@ -247,7 +285,29 @@ class MHATokenToKVPool(KVCache):
              f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
          )
- 
+
 +    def __del__(self):
 +        if self.use_kvcached and self.kv_allocator is not None:
 +            self.kvcached_ops.shutdown_kvcached()
@@ -113,3 +106,4 @@ index f7eef212..9e99ddb2 100644
          with self.memory_saver_adapter.region():
              # [size, head_num, head_dim] for each layer
              # The padded slot 0 is used for writing dummy outputs from padded tokens.
+
