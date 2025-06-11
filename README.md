@@ -32,7 +32,6 @@ pip install -e .
 
 This will compile and install kvcached. If you have the right versions of vLLM and SGLang, you can apply the patches in `engine_integration/scripts`, and it should work.
 
-
 ## Manual Compilation
 
 kvcached includes a CPP-based library called `vmm_ops` for managing low-level CUDA virtual memory operations. This library is typically built and installed automatically during the kvcached installation process. However, in some cases, the installation may not complete successfully, resulting in an import error when attempting to use kvcached. For example, you might encounter an error similar to this:
@@ -59,3 +58,20 @@ cd engine_integration/benchmark
 ```
 
 Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
+
+## Contributing
+
+We are grateful for and open to contributions and collaborations of any kind.
+
+We use pre-commit to ensure a consistent coding style. You can set it up by
+
+```
+pip install pre-commit
+pre-commit install
+```
+
+Before pushing your code, please run the following check and make sure your code passes all checks.
+
+```
+pre-commit run --all-files
+```
