@@ -5,6 +5,7 @@ kvcached is a KV cache management system for serving multiple Large Language Mod
 ## Prerequisites
 
 * Python (tested with 3.11)
+* PyTorch (tested with 2.6.0)
 * Virtual environment tools (scripts are provided for uv==0.7.12)
 
 **Important Note:** The scripts will create separate virtual environments using `uv` for vLLM and sglang.
@@ -74,4 +75,13 @@ Before pushing your code, please run the following check and make sure your code
 
 ```
 pre-commit run --all-files
+```
+
+## Contacts
+
+Feel free to contact us for contributions and collaborations.
+
+```
+Jiarong Xing (jxing@rice.edu)
+Yifan Qiao (yifanqiao@berkeley.edu)
 ```
