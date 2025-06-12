@@ -5,6 +5,7 @@ kvcached is a KV cache management system for serving multiple Large Language Mod
 ## Prerequisites
 
 * Python (tested with 3.11)
+* PyTorch (tested with 2.6.0 and 2.7.0)
 * Virtual environment tools (scripts are provided for uv==0.7.12)
 
 **Important Note:** The scripts will create separate virtual environments using `uv` for vLLM and sglang.
@@ -27,25 +28,13 @@ This script will download the specified versions of vLLM and SGLang, create sepa
 If you want to install kvcached on your own, you can install it from source, run the following command:
 
 ```bash
-pip install -e .
+pip install -e . --no-build-isolation
 ```
 
 This will compile and install kvcached. If you have the right versions of vLLM and SGLang, you can apply the patches in `engine_integration/scripts`, and it should work.
 
+NOTE: `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment.
 
-## Manual Compilation
-
-kvcached includes a CPP-based library called `vmm_ops` for managing low-level CUDA virtual memory operations. This library is typically built and installed automatically during the kvcached installation process. However, in some cases, the installation may not complete successfully, resulting in an import error when attempting to use kvcached. For example, you might encounter an error similar to this:
-
-```txt
-ImportError: /data/yifanqiao/code/kvcached/kvcached/vmm_ops.cpython-311-x86_64-linux-gnu.so: undefined symbol: _ZNK2at10TensorBase4nameB5cxx11Ev
-```
-
-To resolve this issue, one can rebuild the `vmm_ops` library locally by running:
-
-```python
-python setup.py build_ext --inplace
-```
 
 ## Testing
 

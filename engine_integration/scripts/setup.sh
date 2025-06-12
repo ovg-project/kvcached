@@ -21,19 +21,17 @@ setup_vllm() {
 
     uv venv --python=python3.11
     source .venv/bin/activate
-
     uv pip install --upgrade pip
-    pushd "$KVCACHED_DIR"
-    uv pip install -e .
-    popd
 
     VLLM_USE_PRECOMPILED=1 uv pip install --editable .
     git apply "$SCRIPT_DIR/kvcached-vllm-v0.8.4.patch"
 
     pushd "$KVCACHED_DIR"
-    python setup.py build_ext --inplace # build again to avoid .so missing issue
+    uv pip install -e . --no-build-isolation
+    popd
 
     deactivate
+    popd
 }
 
 setup_sgl() {
@@ -44,20 +42,18 @@ setup_sgl() {
 
     uv venv --python=python3.11
     source .venv/bin/activate
-
     uv pip install --upgrade pip
-    pushd "$KVCACHED_DIR"
-    uv pip install -e .
-    popd
 
     uv pip install -e "python[all]"
     git apply "$SCRIPT_DIR/kvcached-sglang-v0.4.6.post2.patch"
 
     pushd "$KVCACHED_DIR"
-    python setup.py build_ext --inplace # build again to avoid .so missing issue
+    uv pip install -e . --no-build-isolation
+    popd
+
 
     deactivate
-    pushd "$SCRIPT_DIR"
+    popd
 }
 
 # Check for uv before proceeding
