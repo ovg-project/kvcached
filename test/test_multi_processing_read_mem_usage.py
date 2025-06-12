@@ -1,16 +1,12 @@
-
-from kvcached import ops as kvcached_ops
-from kvcached.slab_allocator import KVCacheManager
-import torch
-import gc
-
-from kvcached.ops import init_kvcached, shutdown_kvcached, sgl_alloc_kv_cache
-from kvcached.slab_allocator import KVCacheManager
-import sys
 import argparse
 import time
-import numpy as np
 
+import numpy as np
+import torch
+
+from kvcached import ops as kvcached_ops
+from kvcached.ops import init_kvcached, shutdown_kvcached
+from kvcached.slab_allocator import KVCacheManager
 
 total_tokens = 10000
 head_num = 32
@@ -19,6 +15,7 @@ dtype = torch.float16
 device = "cuda:0"
 layer_num = 32
 
+
 def run_kv_cached(i):
 
     torch.set_default_device("cuda:0")
@@ -26,24 +23,24 @@ def run_kv_cached(i):
     init_kvcached()
     print(f"Initialized kvcached in process {i}")
     k_buffer, v_buffer = kvcached_ops.sgl_alloc_kv_cache(
-    total_tokens,
-    head_num,
-    head_dim,
-    dtype,
-    device,
-    layer_num,)
+        total_tokens,
+        head_num,
+        head_dim,
+        dtype,
+        device,
+        layer_num,
+    )
 
     cell_size = head_num * head_dim * dtype.itemsize
 
-    kv_allocator = KVCacheManager(
-                    total_tokens,
-                    1,
-                    cell_size,
-                    num_layers=layer_num,
-                    ipc_name="ipc_gpu_id_x_model_id_y")
-    
+    kv_allocator = KVCacheManager(total_tokens,
+                                  1,
+                                  cell_size,
+                                  num_layers=layer_num,
+                                  ipc_name="ipc_gpu_id_x_model_id_y")
+
     allocated_indices = []
-    
+
     for i in range(10):
         allocated_indices.extend(kv_allocator.alloc(500))
         time.sleep(1)
@@ -53,9 +50,12 @@ def run_kv_cached(i):
     kv_allocator.trim()
     time.sleep(5)
 
-    print(f"average setting memory usage time {np.average(kv_allocator.page_allocator.write_shm_times) * 1e6}us")
+    print(
+        f"average setting memory usage time {np.average(kv_allocator.page_allocator.write_shm_times) * 1e6}us"
+    )
     shutdown_kvcached()
     return
+
 
 def read_kv_cached_memory_usage():
     from kvcached.slab_allocator import MemoryUsageReader
@@ -85,7 +85,7 @@ if __name__ == "__main__":
     print(f"spawn {num_processes} processes")
     for i in range(num_processes):
         pipe = context.Pipe()
-        p = context.Process(target=run_kv_cached, args=(i,))
+        p = context.Process(target=run_kv_cached, args=(i, ))
         p.start()
         processes.append(p)
 
@@ -93,5 +93,4 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
-    
     print("shutdown kvcached")

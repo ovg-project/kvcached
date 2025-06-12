@@ -1,9 +1,9 @@
+import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
 from collections import defaultdict, deque
+from typing import Dict, List, Optional
 
 import torch
-import warnings
 
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
@@ -71,8 +71,7 @@ class Page:
 
     def get_used_blocks(self) -> List[int]:
         all_blk_ids = [
-            block_id
-            for block_id in range(
+            block_id for block_id in range(
                 self.page_id * self.num_kv_blocks,
                 (self.page_id + 1) * self.num_kv_blocks,
             )
@@ -86,7 +85,8 @@ class Page:
 
     def _sanity_check(self, block_id: int) -> None:
         if not self._has_block(block_id):
-            raise ValueError(f"Page {self.page_id} does not have block {block_id}")
+            raise ValueError(
+                f"Page {self.page_id} does not have block {block_id}")
         if block_id in self.free_list:
             raise ValueError(f"Block {block_id} is already free")
 
@@ -133,7 +133,8 @@ class PageAllocator(PageAllocatorBase):
         self.max_reserved_pages = 5
         self.reserved_page_list: List[int] = []  # For fast path allocation
 
-        self.reclaimed_page_list: List[int] = []  # To record reclaimed page ids
+        self.reclaimed_page_list: List[int] = [
+        ]  # To record reclaimed page ids
 
     def alloc_page(self) -> Page:
         if self.num_free_pages <= 0:
@@ -201,9 +202,8 @@ class PageAllocator(PageAllocatorBase):
 
             # Allocate new pages if needed.
             if num_to_expand > 0:
-                new_page_ids = range(
-                    self.num_total_pages, self.num_total_pages + num_to_expand
-                )
+                new_page_ids = range(self.num_total_pages,
+                                     self.num_total_pages + num_to_expand)
                 self.free_page_list.extend(new_page_ids)
                 self.num_free_pages += num_to_expand
             self.num_total_pages = new_num_pages
@@ -221,8 +221,7 @@ class PageAllocator(PageAllocatorBase):
     def trim(self) -> None:
         if self.reserved_page_list:
             unmap_from_kv_tensors(
-                [pid * self.page_size for pid in self.reserved_page_list]
-            )
+                [pid * self.page_size for pid in self.reserved_page_list])
             self.free_page_list.extend(self.reserved_page_list)
             self.reserved_page_list = []
 
@@ -239,13 +238,16 @@ class PageAllocator(PageAllocatorBase):
         return block_id * block_mem_size // self.page_size
 
     def get_num_free_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_free_pages() * self._num_blocks_per_page(block_mem_size)
+        return self.get_num_free_pages() * self._num_blocks_per_page(
+            block_mem_size)
 
     def get_num_inuse_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_inuse_pages() * self._num_blocks_per_page(block_mem_size)
+        return self.get_num_inuse_pages() * self._num_blocks_per_page(
+            block_mem_size)
 
     def get_num_total_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_total_pages() * self._num_blocks_per_page(block_mem_size)
+        return self.get_num_total_pages() * self._num_blocks_per_page(
+            block_mem_size)
 
     def _num_blocks_per_page(self, block_mem_size: int):
         assert self.page_size % block_mem_size == 0
@@ -253,6 +255,7 @@ class PageAllocator(PageAllocatorBase):
 
 
 class KVCacheManager:
+
     def __init__(
         self,
         num_blocks: int,
@@ -344,7 +347,9 @@ class KVCacheManager:
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
             if page_id not in self.full_pages and page_id not in self.avail_pages:
-                warnings.warn(f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed.")
+                warnings.warn(
+                    f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed."
+                )
                 continue
             if page_id in self.full_pages:
                 page = self.full_pages.pop(page_id)
@@ -360,12 +365,10 @@ class KVCacheManager:
                 self.avail_pages[page_id] = page
 
         self.page_allocator.free_pages(pages_to_free)
-        if (
-            self.in_shrink
-            and self.page_allocator.get_num_inuse_blocks(self.block_mem_size)
-            <= self.target_num_blocks
-        ):
-            self.page_allocator.resize(self.target_num_blocks * self.block_mem_size)
+        if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
+                self.block_mem_size) <= self.target_num_blocks):
+            self.page_allocator.resize(self.target_num_blocks *
+                                       self.block_mem_size)
             self.in_shrink = False
             self.target_num_blocks = None
 
@@ -391,11 +394,10 @@ class KVCacheManager:
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_blocks = None
-            return True # Successfully resized.
+            return True  # Successfully resized.
         # Failed to resize due to too many in-use blocks.
-        assert (
-            len(self.reserved_blocks) == 0
-        ), "Reserved blocks must be freed before resizing."
+        assert (len(self.reserved_blocks) == 0
+                ), "Reserved blocks must be freed before resizing."
         # NOTE: we can support resizing with reserved blocks, but we want to enforce
         # this check for now to ensure correctness.
         self.in_shrink = True
@@ -412,8 +414,7 @@ class KVCacheManager:
             free_size = 0
         else:
             virtual_free_size = self.page_allocator.get_num_free_blocks(
-                self.block_mem_size
-            )
+                self.block_mem_size)
             physical_free_size = self._physical_free_size()
             free_size = min(virtual_free_size, physical_free_size)
         # print(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
@@ -426,9 +427,8 @@ class KVCacheManager:
 
         avail_phy_pages = avail_phy_mem_size // PAGE_SIZE
         # Each layer needs to reserve K and V tensors.
-        avail_phy_blocks = (avail_phy_pages // self.num_layers // 2) * (
-            PAGE_SIZE // self.block_mem_size
-        )
+        avail_phy_blocks = (avail_phy_pages // self.num_layers //
+                            2) * (PAGE_SIZE // self.block_mem_size)
         return avail_phy_blocks
 
     def clear(self):

@@ -5,7 +5,7 @@ def test_charge():
     client = kvcached_client.MemoryInfoClient()
     avail_mem = client.get_available_memory_in_bytes()
     print(f"avail_mem: {avail_mem}")
-    print(f"charge 100")
+    print("charge 100")
     assert client.charge(100)
     assert client.get_available_memory_in_bytes() == avail_mem - 100
     print(f"avail_mem after charge: {client.get_available_memory_in_bytes()}")
@@ -15,13 +15,14 @@ def test_uncharge():
     client = kvcached_client.MemoryInfoClient()
     avail_mem = client.get_available_memory_in_bytes()
     print(f"avail_mem: {avail_mem}")
-    print(f"charge 100")
+    print("charge 100")
     assert client.charge(100)
     print(f"avail_mem after charge: {client.get_available_memory_in_bytes()}")
-    print(f"uncharge 100")
+    print("uncharge 100")
     assert client.uncharge(100)
     assert client.get_available_memory_in_bytes() == avail_mem
-    print(f"avail_mem after uncharge: {client.get_available_memory_in_bytes()}")
+    print(
+        f"avail_mem after uncharge: {client.get_available_memory_in_bytes()}")
 
 
 def main():

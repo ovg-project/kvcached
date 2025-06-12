@@ -1,10 +1,10 @@
-import mmap
-import posix_ipc
-import numpy as np
 import logging
 
-from kvcached.controller.utils import (get_ipc_name, DEFAULT_IPC_NAME,
-                                       RwLockedShm, get_kv_cache_limit)
+import numpy as np
+import posix_ipc
+
+from kvcached.controller.utils import (DEFAULT_IPC_NAME, RwLockedShm,
+                                       get_ipc_name, get_kv_cache_limit)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +22,7 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
 
     # Now we can safely memory map and write the values
     with RwLockedShm(get_ipc_name(ipc_name),
-                     np.int64().itemsize * 2,
-                     RwLockedShm.WLOCK) as mm:
+                     np.int64().itemsize * 2, RwLockedShm.WLOCK) as mm:
         mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
         mem_info[0] = kv_cache_limit
         mem_info[1] = 0
@@ -36,8 +35,7 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     """
     try:
         with RwLockedShm(get_ipc_name(ipc_name),
-                         np.int64().itemsize * 2,
-                         RwLockedShm.WLOCK) as mm:
+                         np.int64().itemsize * 2, RwLockedShm.WLOCK) as mm:
             mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
             delta = kv_cache_limit - mem_info[0]
             if delta < 0:
@@ -57,7 +55,7 @@ def main(args):
     elif args.action == "get":
         mem_info = get_kv_cache_limit(args.ipc_name)
         if mem_info is None:
-            print(f"No kv cache limit set")
+            print("No kv cache limit set")
         else:
             print(f"{{kv_cache_limit: {mem_info[0]}, in_use: {mem_info[1]}}}")
     elif args.action == "update":

@@ -1,6 +1,6 @@
 #include <pybind11/pybind11.h>
-#include <torch/extension.h>
 #include <string>
+#include <torch/extension.h>
 #include <vector>
 
 #include "allocator.hpp"
@@ -9,8 +9,7 @@
 
 namespace kvcached {
 
-std::vector<torch::Tensor> create_kv_tensors(size_t size,
-                                             size_t dtype_size,
+std::vector<torch::Tensor> create_kv_tensors(size_t size, size_t dtype_size,
                                              const std::string &dev_str,
                                              int64_t num_layers) {
   auto allocator = FTensorAllocator::global_allocator();
@@ -33,7 +32,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
 
   m.def("init_kvcached", &kvcached::FTensorAllocator::init,
-        "Initailize kvcached");
+        "Initialize kvcached");
   m.def("shutdown_kvcached", &kvcached::FTensorAllocator::shutdown,
         "Shutdown kvcached");
   // m.def("create_ktensors", &kvcached::create_ktensors, "create_ktensors");

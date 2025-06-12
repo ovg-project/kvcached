@@ -1,7 +1,7 @@
 import time
+from multiprocessing import shared_memory
 
 import numpy as np
-from multiprocessing import shared_memory
 
 
 class MemoryUsageReader:
@@ -17,11 +17,12 @@ class MemoryUsageReader:
                 if time.perf_counter() - start_time > create_timeout:
                     raise e
                 time.sleep(0.5)
-        self._memory_in_use = np.ndarray((2,), dtype=np.int64, buffer=self.shm.buf)
+        self._memory_in_use = np.ndarray((2, ),
+                                         dtype=np.int64,
+                                         buffer=self.shm.buf)
 
     def get_memory_usage_in_mb(self):
         return self._memory_in_use[0] / 1024 / 1024
-
 
     def get_memory_usage_in_gb(self):
         return self._memory_in_use[0] / 1024 / 1024 / 1024

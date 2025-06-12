@@ -48,3 +48,29 @@ cd engine_integration/benchmark
 ```
 
 Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
+
+## Contributing
+
+We are grateful for and open to contributions and collaborations of any kind.
+
+We use pre-commit to ensure a consistent coding style. You can set it up by
+
+```
+pip install pre-commit
+pre-commit install
+```
+
+Before pushing your code, please run the following check and make sure your code passes all checks.
+
+```
+pre-commit run --all-files
+```
+
+## Contacts
+
+Feel free to contact us for contributions and collaborations.
+
+```
+Jiarong Xing (jxing@rice.edu)
+Yifan Qiao (yifanqiao@berkeley.edu)
+```
