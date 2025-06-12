@@ -35,7 +35,6 @@ This will compile and install kvcached. If you have the right versions of vLLM a
 
 NOTE: `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment.
 
-
 ## Testing
 
 To verify the successful installation and benchmark the performance of vLLM/SGLang with kvcached, run:

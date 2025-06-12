@@ -3,8 +3,9 @@ from pathlib import Path
 from typing import List
 
 from setuptools import setup
+
 try:
-    from torch.utils.cpp_extension import (CUDAExtension, BuildExtension,
+    from torch.utils.cpp_extension import (BuildExtension, CUDAExtension,
                                            include_paths, library_paths)
 except ImportError:
     raise ImportError("Torch not found, please install torch>=2.6.0 first.")
