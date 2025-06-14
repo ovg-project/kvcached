@@ -28,12 +28,21 @@ This script will download the specified versions of vLLM and SGLang, create sepa
 If you want to install kvcached on your own, you can install it from source, run the following command:
 
 ```bash
+pip install -r requirements.txt # install build dependencies
 pip install -e . --no-build-isolation
 ```
 
 This will compile and install kvcached. If you have the right versions of vLLM and SGLang, you can apply the patches in `engine_integration/scripts`, and it should work.
 
 NOTE: `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment.
+
+### Manual Compilation
+
+kvcached includes a CPP-based library called `vmm_ops` for managing low-level CUDA virtual memory operations. This library is typically built and installed automatically during the kvcached installation process. However, one can rebuild the `vmm_ops` library locally by running:
+
+```python
+python setup.py build_ext --inplace
+```
 
 ## Testing
 
