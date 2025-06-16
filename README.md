@@ -57,6 +57,10 @@ cd engine_integration/benchmark
 
 Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
 
+## Known issues
+
+If you observe the SGLang server crashing after the benchmark client finishes, please refer to [this issue](https://github.com/ovg-project/kvcached/issues/5) for a detailed explanation of the root cause and solutions.
+
 ## Contributing
 
 We are grateful for and open to contributions and collaborations of any kind.
