@@ -11,6 +11,7 @@ from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
 GPU_UTILIZATION = 0.95
+PAGE_PREALLOC_ENABLED = False
 
 
 class Page:
@@ -120,7 +121,8 @@ class PageAllocator(PageAllocatorBase):
     def __init__(self, total_mem_size: int, page_size: int):
         print(f"Init PageAllocator: "
               f"total_mem_size={total_mem_size//(1024*1024)}MB, "
-              f"page_size={page_size//(1024*1024)}MB, ")
+              f"page_size={page_size//(1024*1024)}MB, "
+              f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
@@ -145,7 +147,9 @@ class PageAllocator(PageAllocatorBase):
         self.prealloc_needed = False
         self.prealloc_thd = None
 
-        self._start_prealloc_thread()  # Start preallocation thread
+        if PAGE_PREALLOC_ENABLED:
+            # Start preallocation thread
+            self._start_prealloc_thread()
 
     def _prealloc_worker(self):
         """Worker thread that preallocates pages and maps them to physical memory."""
@@ -244,8 +248,9 @@ class PageAllocator(PageAllocatorBase):
         page = Page(page_id, self.page_size)
         map_to_kv_tensors([page_id * self.page_size])
 
-        # Trigger preallocation to refill the pool
-        self._trigger_preallocation()
+        if PAGE_PREALLOC_ENABLED:
+            # Trigger preallocation to refill the pool
+            self._trigger_preallocation()
 
         return page
 
@@ -366,7 +371,8 @@ class PageAllocator(PageAllocatorBase):
 
     def __del__(self):
         # Stop preallocation thread
-        self._stop_prealloc_thread()
+        if PAGE_PREALLOC_ENABLED:
+            self._stop_prealloc_thread()
 
 
 class KVCacheManager:
