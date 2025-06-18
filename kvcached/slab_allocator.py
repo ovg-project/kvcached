@@ -485,7 +485,9 @@ class KVCacheManager:
             else:
                 self.avail_pages[page_id] = page
 
-        self.page_allocator.free_pages(pages_to_free)
+        if len(pages_to_free) > 0:
+            self.page_allocator.free_pages(pages_to_free)
+
         if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
                 self.block_mem_size) <= self.target_num_blocks):
             self.page_allocator.resize(self.target_num_blocks *
