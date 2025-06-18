@@ -261,21 +261,21 @@ def main() -> None:
         })
 
     # Print summary table
-    print(f"\n{'='*100}")
+    print(f"\n{'='*120}")
     print("SUMMARY TABLE")
-    print(f"{'='*100}")
+    print(f"{'='*120}")
     print(
-        f"{'Batch Size':<12} {'Alloc OFF (s)':<14} {'Alloc ON (s)':<14} {'Free OFF (s)':<14} {'Free ON (s)':<14} {'Alloc Speedup (%)':<15} {'Free Speedup (%)':<15}"
+        f"{'Batch Size':<12} {'Total Alloc OFF (s)':<18} {'Total Alloc ON (s)':<18} {'Total Free OFF (s)':<18} {'Total Free ON (s)':<18} {'Alloc Save (%)':<15} {'Free Save (%)':<15}"
     )
-    print(f"{'-'*100}")
+    print(f"{'-'*120}")
 
     for result in results:
         print(
-            f"{result['batch_size']:<12} {result['alloc_time_off']:<14.4f} {result['alloc_time_on']:<14.4f} "
-            f"{result['free_time_off']:<14.4f} {result['free_time_on']:<14.4f} {result['alloc_speedup']:<15.2f} {result['free_speedup']:<15.2f}"
+            f"{result['batch_size']:<12} {result['alloc_time_off']:<18.4f} {result['alloc_time_on']:<18.4f} "
+            f"{result['free_time_off']:<18.4f} {result['free_time_on']:<18.4f} {result['alloc_speedup']:<15.2f} {result['free_speedup']:<15.2f}"
         )
 
-    print(f"{'='*100}")
+    print(f"{'='*120}")
 
 
 if __name__ == "__main__":
