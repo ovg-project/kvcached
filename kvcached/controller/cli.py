@@ -39,9 +39,9 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
             mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
             delta = kv_cache_limit - mem_info[0]
             if delta < 0:
-                if mem_info[1] + delta < 0:
+                if mem_info[0] - mem_info[1] + delta < 0:
                     logger.warning(
-                        f"kv_cache_limit is less than in_use for {ipc_name}")
+                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}")
             mem_info[0] = kv_cache_limit
             return mem_info
     except FileNotFoundError:
