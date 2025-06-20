@@ -41,7 +41,8 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
             if delta < 0:
                 if mem_info[0] - mem_info[1] + delta < 0:
                     logger.warning(
-                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}")
+                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
+                    )
             mem_info[0] = kv_cache_limit
             return mem_info
     except FileNotFoundError:
