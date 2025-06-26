@@ -46,7 +46,7 @@ python setup.py build_ext --inplace
 
 ## Testing
 
-To verify the successful installation and benchmark the performance of vLLM/SGLang with kvcached, run:
+kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of vLLM/SGLang with kvcached, run:
 
 ```bash
 cd engine_integration/benchmark
@@ -55,7 +55,7 @@ cd engine_integration/benchmark
 ./start_client.sh [vllm|sgl]
 ```
 
-Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
+The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
 
 ## Known issues
 
