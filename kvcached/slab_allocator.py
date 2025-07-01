@@ -11,7 +11,7 @@ from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
 GPU_UTILIZATION = 0.95
-PAGE_PREALLOC_ENABLED = False
+PAGE_PREALLOC_ENABLED = True
 
 
 class Page:
