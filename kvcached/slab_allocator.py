@@ -350,6 +350,10 @@ class PageAllocator(PageAllocatorBase):
     def get_num_total_pages(self) -> int:
         return self.num_total_pages
 
+    def get_num_reserved_pages(self) -> int:
+        with self.prealloc_lock:
+            return len(self.reserved_page_list)
+
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
 
@@ -542,6 +546,23 @@ class KVCacheManager:
             free_size = min(virtual_free_size, physical_free_size)
         # print(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
         return avail_size + free_size
+
+    def get_mapped_memory_size(self, unit='bytes') -> float:
+        """Get memory usage in specified unit (bytes, kb, mb, gb)."""
+        memory_bytes = (self.page_allocator.get_num_inuse_pages() +
+                        self.page_allocator.get_num_reserved_pages()
+                        ) * self.num_layers * PAGE_SIZE * 2  # K and V tensors
+
+        if unit == 'bytes':
+            return memory_bytes
+        elif unit == 'kb':
+            return memory_bytes / 1024
+        elif unit == 'mb':
+            return memory_bytes / (1024**2)
+        elif unit == 'gb':
+            return memory_bytes / (1024**3)
+        else:
+            raise ValueError(f"Unknown unit: {unit}")
 
     def _physical_free_size(self) -> int:
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
