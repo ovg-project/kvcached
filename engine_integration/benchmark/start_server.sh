@@ -9,6 +9,8 @@ MODEL=meta-llama/Llama-3.1-8B
 VLLM_PORT=12346
 SGL_PORT=30000
 
+TP_SIZE=4
+
 op=$1
 
 if [ "$op" == "vllm" ]; then
@@ -17,7 +19,7 @@ if [ "$op" == "vllm" ]; then
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     export ENABLE_KVCACHED=true
-    vllm serve "$MODEL" --disable-log-requests --no-enable-prefix-caching --port="$VLLM_PORT"
+    vllm serve "$MODEL" --disable-log-requests --no-enable-prefix-caching --port="$VLLM_PORT" --tensor-parallel-size="$TP_SIZE"
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
     export PYTHONPATH="$KVCACHED_DIR:$PYTHONPATH"
