@@ -74,7 +74,7 @@ def start_worker_listerner_thread(rank: int):
             conn, _ = server_sock.accept()
             try:
                 msg = recv_msg(conn)
-                print(f"Worker {rank} received message: {msg}")
+                # print(f"Worker {rank} received message: {msg}")
                 if msg["cmd"] == "map_to_kv_tensors":
                     map_to_kv_tensors(msg["offsets"])
                     send_msg(conn, {"status": "success"})

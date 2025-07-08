@@ -24,7 +24,7 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
     export PYTHONPATH="$KVCACHED_DIR:$PYTHONPATH"
     export ENABLE_KVCACHED=true
-    python -m sglang.launch_server --model "$MODEL" --disable-radix-cache --disable-overlap-schedule --trust-remote-code --port "$SGL_PORT"
+    python -m sglang.launch_server --model "$MODEL" --disable-radix-cache --disable-overlap-schedule --trust-remote-code --port "$SGL_PORT" --tensor-parallel-size="$TP_SIZE"
 else
     echo "Invalid option: $op"
     exit 1
