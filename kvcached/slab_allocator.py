@@ -186,16 +186,16 @@ class PageAllocator(PageAllocatorBase):
                         [pid * self.page_size for pid in pages_to_reserve])
                     with self.prealloc_lock:
                         self.reserved_page_list.extend(pages_to_reserve)
-                    print(
-                        f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
-                    )
+                    # print(
+                    #     f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
+                    # )
                 except Exception as e:
                     # If mapping fails, return pages to free list
                     with self.prealloc_lock:
                         self.free_page_list.extendleft(pages_to_reserve)
-                    print(
-                        f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
-                    )
+                    # print(
+                    #     f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
+                    # )
 
     def _start_prealloc_thread(self):
         """Start the preallocation thread"""
@@ -216,7 +216,7 @@ class PageAllocator(PageAllocatorBase):
                 self.prealloc_cond.notify_all()
             self.prealloc_thd.join()
             self.prealloc_thd = None
-            print("Stopped page preallocation thread")
+            # print("Stopped page preallocation thread")
 
     def _trigger_preallocation(self):
         """Trigger the preallocation thread to fill up reserved blocks"""
