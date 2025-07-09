@@ -189,7 +189,7 @@ class PageAllocator(PageAllocatorBase):
                     # print(
                     #     f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
                     # )
-                except Exception as e:
+                except Exception:
                     # If mapping fails, return pages to free list
                     with self.prealloc_lock:
                         self.free_page_list.extendleft(pages_to_reserve)
