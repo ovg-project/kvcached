@@ -1,3 +1,4 @@
+import logging
 import threading
 import warnings
 from abc import ABC, abstractmethod
@@ -7,6 +8,8 @@ from typing import Dict, List, Optional
 import torch
 
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
+
+logger = logging.getLogger(__name__)
 
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
@@ -119,10 +122,10 @@ class PageAllocatorBase(ABC):
 class PageAllocator(PageAllocatorBase):
 
     def __init__(self, total_mem_size: int, page_size: int):
-        print(f"Init PageAllocator: "
-              f"total_mem_size={total_mem_size//(1024*1024)}MB, "
-              f"page_size={page_size//(1024*1024)}MB, "
-              f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
+        logger.info(f"Init KVCached PageAllocator: "
+                    f"total_mem_size={total_mem_size//(1024*1024)}MB, "
+                    f"page_size={page_size//(1024*1024)}MB, "
+                    f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
@@ -186,16 +189,16 @@ class PageAllocator(PageAllocatorBase):
                         [pid * self.page_size for pid in pages_to_reserve])
                     with self.prealloc_lock:
                         self.reserved_page_list.extend(pages_to_reserve)
-                    # print(
-                    #     f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
-                    # )
-                except Exception:
+                    logger.debug(
+                        f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
+                    )
+                except Exception as e:
                     # If mapping fails, return pages to free list
                     with self.prealloc_lock:
                         self.free_page_list.extendleft(pages_to_reserve)
-                    # print(
-                    #     f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
-                    # )
+                    logger.error(
+                        f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
+                    )
 
     def _start_prealloc_thread(self):
         """Start the preallocation thread"""
@@ -216,7 +219,7 @@ class PageAllocator(PageAllocatorBase):
                 self.prealloc_cond.notify_all()
             self.prealloc_thd.join()
             self.prealloc_thd = None
-            # print("Stopped page preallocation thread")
+            logger.debug("Stopped page preallocation thread")
 
     def _trigger_preallocation(self):
         """Trigger the preallocation thread to fill up reserved blocks"""
