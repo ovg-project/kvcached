@@ -77,6 +77,7 @@ if [ -z "$op" ]; then
     exit 1
 fi
 
+# Check for uv before proceeding
 check_uv
 
 case "$op" in
