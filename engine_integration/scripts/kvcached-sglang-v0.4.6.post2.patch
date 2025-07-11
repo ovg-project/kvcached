@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef212..3b24790f 100644
+index f7eef2120..06431d8c7 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -59,8 +59,8 @@ index f7eef212..3b24790f 100644
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
 +        if self.enable_kvcached:
 +            try:
-+                from kvcached import ops as kvcached_ops
-+                from kvcached.slab_allocator import KVCacheManager
++                import kvcached.integration.sglang.ops as kvcached_ops
++                from kvcached.kv_cache_manager import KVCacheManager
 +
 +                self.kvcached_ops = kvcached_ops
 +                self.kvcached_ops.init_kvcached()
@@ -81,7 +81,7 @@ index f7eef212..3b24790f 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -247,7 +290,29 @@ class MHATokenToKVPool(KVCache):
+@@ -247,7 +290,26 @@ class MHATokenToKVPool(KVCache):
              f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
          )
  
@@ -94,18 +94,15 @@ index f7eef212..3b24790f 100644
 +
      def _create_buffers(self):
 +        if self.enable_kvcached:
-+            assert self.page_size == 1, "kvcached only supports page_size = 1 for SGL"
-+            k_buffer, v_buffer = self.kvcached_ops.sgl_alloc_kv_cache(
++            self.k_buffer, self.v_buffer = self.kvcached_ops.alloc_kv_cache(
 +                self.size,
 +                self.head_num,
 +                self.head_dim,
 +                self.dtype,
-+                # f"{self.device}:{self.gpu_id}",
-+                "cuda",
++                self.device,
 +                self.layer_num,
++                self.page_size,
 +            )
-+            self.k_buffer = k_buffer
-+            self.v_buffer = v_buffer
 +            return
 +
          with self.memory_saver_adapter.region():

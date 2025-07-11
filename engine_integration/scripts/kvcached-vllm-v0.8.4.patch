@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 74f3f7852..3f402d16b 100644
+index 74f3f7852..c6a9d6ac0 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -279,3 +279,91 @@ class BlockPool:
@@ -20,7 +20,7 @@ index 74f3f7852..3f402d16b 100644
 +        assert not enable_caching, "Caching is not supported in ElasticBlockPool"
 +        self.num_gpu_blocks = num_gpu_blocks
 +
-+        from kvcached.slab_allocator import KVCacheManager  # type: ignore
++        from kvcached.kv_cache_manager import KVCacheManager  # type: ignore
 +        self.kv_cache_manager = KVCacheManager(num_gpu_blocks, block_size,
 +                                               cell_size, num_layers)
 +
@@ -95,36 +95,33 @@ index 74f3f7852..3f402d16b 100644
 +        """
 +        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 33761cf7f..bc6f0fd84 100644
+index 33761cf7f..13ba583c2 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -55,7 +55,24 @@ class KVCacheManager:
+@@ -55,7 +55,21 @@ class KVCacheManager:
          self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
                                             self.block_size)
  
 -        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
-+        import os
-+        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
-+                                         "false").lower() == "true"
-+        if self.enable_kvcached:
-+            from vllm.v1.core.block_pool import (
-+                ElasticBlockPool)  # type: ignore
++        self.use_kvcached = True
++        if self.use_kvcached:
++            from vllm.v1.core.block_pool import ElasticBlockPool  # type: ignore
 +            if self.enable_caching:
 +                raise ValueError("Caching is not supported for kvcached")
 +            # cell_size is the size of the k/v cache tensor for a single token.
 +            cell_size = kv_cache_spec.page_size_bytes // self.block_size // 2
-+            self.block_pool = ElasticBlockPool(self.num_gpu_blocks,
-+                                               self.block_size,
-+                                               cell_size=cell_size,
-+                                               num_layers=len(
-+                                                   kv_cache_config.tensors),
-+                                               enable_caching=enable_caching)
++            self.block_pool = ElasticBlockPool(
++                self.num_gpu_blocks,
++                self.block_size,
++                cell_size=cell_size,
++                num_layers=len(kv_cache_config.tensors),
++                enable_caching=enable_caching)
 +        else:
 +            self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
  
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
-@@ -176,7 +193,7 @@ class KVCacheManager:
+@@ -176,7 +190,7 @@ class KVCacheManager:
              new_computed_blocks: A list of new computed blocks just hitting the
                  prefix caching.
              num_lookahead_tokens: The number of speculative tokens to allocate.
@@ -134,29 +131,27 @@ index 33761cf7f..bc6f0fd84 100644
  
          Blocks layout:
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 70e8bd75e..794465606 100644
+index 70e8bd75e..447266c25 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -272,6 +272,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -272,6 +272,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
          self.seq_lens_np = self.seq_lens_cpu.numpy()
  
-+        import os
-+        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
-+                                         "false").lower() == "true"
-+        if self.enable_kvcached:
-+            import kvcached.ops as kvcached_ops
++        self.use_kvcached = True
++        if self.use_kvcached:
++            import kvcached.integration.vllm.ops as kvcached_ops
 +            kvcached_ops.init_kvcached()
 +            self.kvcached_ops = kvcached_ops
 +
      def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
          """Update the cached states and the persistent batch with the scheduler
          output.
-@@ -1640,6 +1648,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1640,6 +1646,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          kv_caches: dict[str, torch.Tensor] = {}
  
-+        if self.enable_kvcached:
++        if self.use_kvcached:
 +            for kv_cache_group in kv_cache_config.kv_cache_groups:
 +                kv_cache_spec = kv_cache_group.kv_cache_spec
 +                for layer_name in kv_cache_group.layer_names:
@@ -180,7 +175,7 @@ index 70e8bd75e..794465606 100644
 +                num_blocks, kv_cache_spec.block_size,
 +                kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
 +
-+            kv_cache_buffers = self.kvcached_ops.vllm_alloc_kv_cache(
++            kv_cache_buffers = self.kvcached_ops.alloc_kv_cache(
 +                kv_cache_shape, kv_cache_spec.block_size, dtype,
 +                self.device.type, num_layers)
 +            layer_id = 0
