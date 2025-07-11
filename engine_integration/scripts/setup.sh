@@ -1,5 +1,5 @@
 #!/bin/bash
-set -x
+set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -44,7 +44,7 @@ setup_vllm() {
     popd
 }
 
-setup_sgl() {
+setup_sglang() {
     pushd "$ENGINE_DIR"
 
     git clone -b v0.4.6.post2 https://github.com/sgl-project/sglang.git sglang-v0.4.6.post2
@@ -70,8 +70,29 @@ setup_sgl() {
     popd
 }
 
-# Check for uv before proceeding
+op=${1:-}
+
+if [ -z "$op" ]; then
+    echo "Usage: $0 <vllm|sglang|all>"
+    exit 1
+fi
+
 check_uv
 
-setup_vllm
-setup_sgl
+case "$op" in
+    "vllm")
+        setup_vllm
+        ;;
+    "sglang")
+        setup_sglang
+        ;;
+    "all")
+        setup_vllm
+        setup_sglang
+        ;;
+    *)
+        echo "Error: Unknown option '$op'"
+        echo "Usage: $0 <vllm|sglang|all>"
+        exit 1
+        ;;
+esac
