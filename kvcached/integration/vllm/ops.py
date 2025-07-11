@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.utils import PAGE_SIZE
 from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
@@ -50,3 +51,8 @@ def alloc_kv_cache(
         t.view(kvcache_shape).view(dtype=dtype) for t in raw_kv_tensors
     ]
     return kv_tensors
+
+
+def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
+                         num_layers: int) -> KVCacheManager:
+    return KVCacheManager(num_blocks, block_size, cell_size, num_layers)
