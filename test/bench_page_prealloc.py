@@ -27,11 +27,12 @@ from typing import Tuple
 
 import torch
 
-from kvcached.ops import init_kvcached, sgl_alloc_kv_cache, shutdown_kvcached
-from kvcached.slab_allocator import KVCacheManager
+from kvcached.integration.sglang.ops import (alloc_kv_cache, init_kvcached,
+                                             shutdown_kvcached)
+from kvcached.kv_cache_manager import KVCacheManager
 
 # Relative import of the package works when executed from repo root or installed.
-MODULE_PATH = "kvcached.slab_allocator"
+MODULE_PATH = "kvcached.kv_cache_manager"
 
 
 def _llm_sim_kvcache_benchmark(kv_cache_manager, iterations: int,
@@ -80,18 +81,18 @@ def _run_single_benchmark_kvcache(prealloc_enabled: bool, total_tokens: int,
     """Run one benchmark variant using KVCacheManager and return the alloc and free times (seconds)."""
 
     # Reload the module to reset global state between variants.
-    slab_allocator = importlib.import_module(MODULE_PATH)
-    importlib.reload(slab_allocator)
+    kv_cache_manager = importlib.import_module(MODULE_PATH)
+    importlib.reload(kv_cache_manager)
 
     # Set preallocation flag before any PageAllocator/KVCacheManager is created
-    setattr(slab_allocator, "PAGE_PREALLOC_ENABLED", prealloc_enabled)
+    setattr(kv_cache_manager, "PAGE_PREALLOC_ENABLED", prealloc_enabled)
 
     init_kvcached()
 
     # Allocate dummy KV buffers (simulate real usage)
     dtype_obj = getattr(torch, dtype)
-    k_buffer, v_buffer = sgl_alloc_kv_cache(total_tokens, head_num, head_dim,
-                                            dtype_obj, device, num_layers)
+    k_buffer, v_buffer = alloc_kv_cache(total_tokens, head_num, head_dim,
+                                        dtype_obj, device, num_layers)
 
     print(f"cell_size =  {head_num * head_dim * dtype_obj.itemsize} bytes")
 

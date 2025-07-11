@@ -2,9 +2,9 @@ import gc
 
 import torch
 
-from kvcached import ops as kvcached_ops
-from kvcached.ops import init_kvcached, shutdown_kvcached
-from kvcached.slab_allocator import KVCacheManager
+from kvcached.integration.sglang.ops import (alloc_kv_cache, init_kvcached,
+                                             shutdown_kvcached)
+from kvcached.kv_cache_manager import KVCacheManager
 
 total_tokens = 100000
 head_num = 32
@@ -17,7 +17,7 @@ print("Initializing kvcached")
 init_kvcached()
 print("Initialized kvcached")
 
-k_buffer, v_buffer = kvcached_ops.sgl_alloc_kv_cache(
+k_buffer, v_buffer = alloc_kv_cache(
     total_tokens,
     head_num,
     head_dim,
