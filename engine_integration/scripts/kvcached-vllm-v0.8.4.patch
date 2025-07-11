@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 74f3f7852..c6a9d6ac0 100644
+index 74f3f7852..06a4e9794 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -279,3 +279,91 @@ class BlockPool:
@@ -20,9 +20,9 @@ index 74f3f7852..c6a9d6ac0 100644
 +        assert not enable_caching, "Caching is not supported in ElasticBlockPool"
 +        self.num_gpu_blocks = num_gpu_blocks
 +
-+        from kvcached.kv_cache_manager import KVCacheManager  # type: ignore
-+        self.kv_cache_manager = KVCacheManager(num_gpu_blocks, block_size,
-+                                               cell_size, num_layers)
++        import kvcached.integration.vllm.interfaces as kvcached_interfaces  # type: ignore
++        self.kv_cache_manager = kvcached_interfaces.get_kv_cache_manager(
++            num_gpu_blocks, block_size, cell_size, num_layers)
 +
 +    def get_cached_block(self,
 +                         block_hash: BlockHashType) -> Optional[KVCacheBlock]:
@@ -95,7 +95,7 @@ index 74f3f7852..c6a9d6ac0 100644
 +        """
 +        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 33761cf7f..13ba583c2 100644
+index 33761cf7f..a4cf4138a 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -55,7 +55,21 @@ class KVCacheManager:
@@ -121,17 +121,8 @@ index 33761cf7f..13ba583c2 100644
  
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
-@@ -176,7 +190,7 @@ class KVCacheManager:
-             new_computed_blocks: A list of new computed blocks just hitting the
-                 prefix caching.
-             num_lookahead_tokens: The number of speculative tokens to allocate.
--                This is used by spec decode proposers with kv-cache such 
-+                This is used by spec decode proposers with kv-cache such
-                 as eagle.
- 
-         Blocks layout:
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 70e8bd75e..447266c25 100644
+index 70e8bd75e..e335e70c4 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -272,6 +272,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -140,9 +131,9 @@ index 70e8bd75e..447266c25 100644
  
 +        self.use_kvcached = True
 +        if self.use_kvcached:
-+            import kvcached.integration.vllm.ops as kvcached_ops
-+            kvcached_ops.init_kvcached()
-+            self.kvcached_ops = kvcached_ops
++            import kvcached.integration.vllm.interfaces as kvcached_interfaces
++            kvcached_interfaces.init_kvcached()
++            self.kvcached_interfaces = kvcached_interfaces
 +
      def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
          """Update the cached states and the persistent batch with the scheduler
@@ -175,7 +166,7 @@ index 70e8bd75e..447266c25 100644
 +                num_blocks, kv_cache_spec.block_size,
 +                kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
 +
-+            kv_cache_buffers = self.kvcached_ops.alloc_kv_cache(
++            kv_cache_buffers = self.kvcached_interfaces.alloc_kv_cache(
 +                kv_cache_shape, kv_cache_spec.block_size, dtype,
 +                self.device.type, num_layers)
 +            layer_id = 0

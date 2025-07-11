@@ -1,6 +1,6 @@
 import torch
 
-from kvcached.integration.vllm.ops import alloc_kv_cache, init_kvcached
+from kvcached.integration.vllm.interfaces import alloc_kv_cache, init_kvcached
 from kvcached.vmm_ops import map_to_kv_tensors, shutdown_kvcached
 
 num_blocks = 2864

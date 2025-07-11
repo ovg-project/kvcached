@@ -9,17 +9,33 @@ from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
 
+_kvcached_initialized: bool = False
+_kvcached_device = None
+
 
 def init_kvcached(tp_rank: int = 0,
                   tp_size: int = 1,
                   device: Optional[str] = None) -> None:
+    global _kvcached_initialized, _kvcached_device
+    if _kvcached_initialized:
+        return
+
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
+
     _init_kvcached_impl(device)
+    _kvcached_initialized = True
+    _kvcached_device = device
 
 
 def shutdown_kvcached() -> None:
+    global _kvcached_initialized, _kvcached_device
+    if not _kvcached_initialized:
+        return
+
     _shutdown_kvcached_impl()
+    _kvcached_initialized = False
+    _kvcached_device = None
 
 
 def alloc_kv_cache(
@@ -29,6 +45,10 @@ def alloc_kv_cache(
     device: str,
     num_layers: int,
 ) -> List[torch.Tensor]:
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first.")
+
     assert (len(kvcache_shape) > 2 and kvcache_shape[0]
             == 2), "Only supports stacked kv cache at 1st dim."
     assert torch.cuda.is_available(), "CUDA is not available."
@@ -55,4 +75,8 @@ def alloc_kv_cache(
 
 def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
                          num_layers: int) -> KVCacheManager:
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first.")
+
     return KVCacheManager(num_blocks, block_size, cell_size, num_layers)

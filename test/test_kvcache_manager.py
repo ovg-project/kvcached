@@ -2,8 +2,9 @@ import gc
 
 import torch
 
-from kvcached.integration.sglang.ops import (alloc_kv_cache, init_kvcached,
-                                             shutdown_kvcached)
+from kvcached.integration.sglang.interfaces import (alloc_kv_cache,
+                                                    init_kvcached,
+                                                    shutdown_kvcached)
 from kvcached.kv_cache_manager import KVCacheManager
 
 total_tokens = 100000
