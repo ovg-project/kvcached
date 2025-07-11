@@ -27,6 +27,9 @@ def alloc_kv_cache(
     page_size: int = 1,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     assert torch.cuda.is_available(), "CUDA is not available."
+    if page_size != 1:
+        print(
+            "Warning: kvcached is only tested with page_size = 1 for SGLang.")
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
