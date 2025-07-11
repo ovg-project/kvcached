@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -8,8 +8,9 @@ from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
 
 
-def init_kvcached() -> None:
-    device = f"cuda:{torch.cuda.current_device()}"
+def init_kvcached(tp_size: int = 1, device: Optional[str] = None) -> None:
+    if device is None:
+        device = f"cuda:{torch.cuda.current_device()}"
     _init_kvcached_impl(device)
 
 
