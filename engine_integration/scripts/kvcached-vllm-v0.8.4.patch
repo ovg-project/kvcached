@@ -95,42 +95,56 @@ index 74f3f7852..06a4e9794 100644
 +        """
 +        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 33761cf7f..a4cf4138a 100644
+index 33761cf7f..bc6f0fd84 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -55,7 +55,21 @@ class KVCacheManager:
+@@ -55,7 +55,24 @@ class KVCacheManager:
          self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
                                             self.block_size)
  
 -        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
-+        self.use_kvcached = True
-+        if self.use_kvcached:
-+            from vllm.v1.core.block_pool import ElasticBlockPool  # type: ignore
++        import os
++        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                         "false").lower() == "true"
++        if self.enable_kvcached:
++            from vllm.v1.core.block_pool import (
++                ElasticBlockPool)  # type: ignore
 +            if self.enable_caching:
 +                raise ValueError("Caching is not supported for kvcached")
 +            # cell_size is the size of the k/v cache tensor for a single token.
 +            cell_size = kv_cache_spec.page_size_bytes // self.block_size // 2
-+            self.block_pool = ElasticBlockPool(
-+                self.num_gpu_blocks,
-+                self.block_size,
-+                cell_size=cell_size,
-+                num_layers=len(kv_cache_config.tensors),
-+                enable_caching=enable_caching)
++            self.block_pool = ElasticBlockPool(self.num_gpu_blocks,
++                                               self.block_size,
++                                               cell_size=cell_size,
++                                               num_layers=len(
++                                                   kv_cache_config.tensors),
++                                               enable_caching=enable_caching)
 +        else:
 +            self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
  
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
+@@ -176,7 +193,7 @@ class KVCacheManager:
+             new_computed_blocks: A list of new computed blocks just hitting the
+                 prefix caching.
+             num_lookahead_tokens: The number of speculative tokens to allocate.
+-                This is used by spec decode proposers with kv-cache such 
++                This is used by spec decode proposers with kv-cache such
+                 as eagle.
+ 
+         Blocks layout:
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 70e8bd75e..e335e70c4 100644
+index 70e8bd75e..6f1e9f4da 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -272,6 +272,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -272,6 +272,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
          self.seq_lens_np = self.seq_lens_cpu.numpy()
  
-+        self.use_kvcached = True
-+        if self.use_kvcached:
++        import os
++        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                         "false").lower() == "true"
++        if self.enable_kvcached:
 +            import kvcached.integration.vllm.interfaces as kvcached_interfaces
 +            kvcached_interfaces.init_kvcached()
 +            self.kvcached_interfaces = kvcached_interfaces
@@ -138,11 +152,11 @@ index 70e8bd75e..e335e70c4 100644
      def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
          """Update the cached states and the persistent batch with the scheduler
          output.
-@@ -1640,6 +1646,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1640,6 +1648,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          kv_caches: dict[str, torch.Tensor] = {}
  
-+        if self.use_kvcached:
++        if self.enable_kvcached:
 +            for kv_cache_group in kv_cache_config.kv_cache_groups:
 +                kv_cache_spec = kv_cache_group.kv_cache_spec
 +                for layer_name in kv_cache_group.layer_names:
