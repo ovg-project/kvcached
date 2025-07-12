@@ -1,4 +1,3 @@
-import logging
 import threading
 import warnings
 from abc import ABC, abstractmethod
@@ -7,9 +6,10 @@ from typing import Dict, List, Optional
 
 import torch
 
+from kvcached.logging_config import get_kvcached_logger
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
-logger = logging.getLogger(__name__)
+logger = get_kvcached_logger()
 
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
