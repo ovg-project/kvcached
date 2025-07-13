@@ -8,7 +8,7 @@ try:
     from torch.utils.cpp_extension import (BuildExtension, CUDAExtension,
                                            include_paths, library_paths)
 except ImportError:
-    raise ImportError("Torch not found, please install torch>=2.6.0 first.")
+    raise ImportError("Torch not found, please install torch>=2.0.0 first.")
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH

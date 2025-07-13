@@ -39,7 +39,7 @@ static inline std::unique_ptr<Page> make_unique_page(const torch::Device &dev,
 FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
                  torch::Device dev, std::shared_ptr<Page> zero_page)
     : name_(name), vaddr_(nullptr), size_(size), dtype_(dtype), dev_(dev),
-      zero_page_(zero_page) {
+      zero_page_(zero_page), managed_vaddr_(true) {
   vaddr_ = alloc_virtual_mem(dev_, size_);
   init_with_zero_();
 
@@ -50,10 +50,21 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
       torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
 }
 
+FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
+                 torch::Device dev, std::shared_ptr<Page> zero_page, generic_ptr_t vaddr)
+    : name_(name), vaddr_(vaddr), size_(size), dtype_(dtype), dev_(dev),
+      zero_page_(zero_page), managed_vaddr_(false) {
+  auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
+  auto options =
+      torch::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
+  tensor_ =
+      torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+}
+
 FTensor::~FTensor() {
   mapping_.clear(); // Free all physical pages directly.
   zero_page_.reset();
-  if (vaddr_) {
+  if (vaddr_ && managed_vaddr_) {
     CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
     CHECK_DRV(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
   }
@@ -120,7 +131,7 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
 }
 
 bool FTensor::init_with_zero_() {
-  assert(vaddr_ % kPageSize == 0); // Ensure alignment.
+  assert(reinterpret_cast<uintptr_t>(vaddr_) % kPageSize == 0); // Ensure alignment.
   assert(size_ % kPageSize == 0);  // Ensure alignment.
 
   bool succ = true;

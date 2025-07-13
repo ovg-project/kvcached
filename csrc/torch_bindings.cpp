@@ -26,6 +26,12 @@ bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets) {
   auto allocator = FTensorAllocator::global_allocator();
   return allocator->unmap_from_kv_tensors(offsets);
 }
+
+void free_kv_tensors() {
+  auto allocator = FTensorAllocator::global_allocator();
+  allocator->free_kv_tensors();
+}
+
 } // namespace kvcached
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -38,6 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // m.def("create_ktensors", &kvcached::create_ktensors, "create_ktensors");
   // m.def("create_vtensors", &kvcached::create_vtensors, "create_vtensors");
   m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors");
+  m.def("free_kv_tensors", &kvcached::free_kv_tensors, "free_kv_tensors");
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors");
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors");

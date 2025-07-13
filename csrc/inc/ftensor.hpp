@@ -15,6 +15,8 @@ class FTensor {
 public:
   FTensor(const std::string &name, size_t size, torch::Dtype dtype,
           torch::Device dev, std::shared_ptr<Page> zero_page);
+  FTensor(const std::string &name, size_t size, torch::Dtype dtype,
+          torch::Device dev, std::shared_ptr<Page> zero_page, generic_ptr_t vaddr);
   ~FTensor();
   bool map(offset_t offset);
   bool unmap(offset_t offset);
@@ -32,6 +34,7 @@ private:
   torch::Dtype dtype_;
   torch::Device dev_;
   std::shared_ptr<Page> zero_page_;
+  bool managed_vaddr_;
 
   torch::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
