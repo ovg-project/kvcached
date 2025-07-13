@@ -1,8 +1,8 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 74f3f7852..83911ad01 100644
+index 74f3f7852..2ac1bcb01 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -279,3 +279,95 @@ class BlockPool:
+@@ -279,3 +279,96 @@ class BlockPool:
              The KV cache usage (between 0.0 and 1.0).
          """
          return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
@@ -23,7 +23,8 @@ index 74f3f7852..83911ad01 100644
 +        self.num_gpu_blocks = num_gpu_blocks
 +
 +        from kvcached.integration.vllm.interfaces import (  # noqa: E501
-+            get_kv_cache_manager)
++            get_kv_cache_manager, init_kvcached)
++        init_kvcached()
 +        self.kv_cache_manager = get_kv_cache_manager(num_gpu_blocks,
 +                                                     block_size, cell_size,
 +                                                     num_layers)
