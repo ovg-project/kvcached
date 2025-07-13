@@ -37,8 +37,6 @@ class Page:
 
     def destroy(self) -> None:
         assert self.initialized() and len(self.free_list) == self.num_kv_blocks
-        self.block_size = None
-        self.phy_token_kv_size = None
         self.num_kv_blocks = None
         self.free_list = None
 
