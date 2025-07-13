@@ -1,6 +1,7 @@
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+from functools import wraps
 from typing import Dict, List, Optional
 
 import torch
@@ -400,6 +401,16 @@ class PageAllocator(PageAllocatorBase):
             self._stop_prealloc_thread()
 
 
+def synchronized(method):
+
+    @wraps(method)
+    def synchronized_method(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return synchronized_method
+
+
 class KVCacheManager:
 
     def __init__(
@@ -431,10 +442,16 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._lock = threading.RLock()
 
+    @synchronized
     def alloc(self, need_size: int) -> List[int]:
         if self.available_size() < need_size:
-            return None
+            print(
+                f"Warning: available_size() < need_size, "
+                f"available_size={self.available_size()}, need_size={need_size}"
+            )
+            return []
 
         ret_index = []
         page: Page = None
@@ -481,6 +498,7 @@ class KVCacheManager:
         assert remaining_need == 0, "Insufficient memory for allocation."
         return ret_index
 
+    @synchronized
     def free(self, indices: List[int]):
         # assert (
         #     len(self.reserved_blocks) == 0
@@ -527,6 +545,7 @@ class KVCacheManager:
             self.in_shrink = False
             self.target_num_blocks = None
 
+    @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
         if self.available_size() < need_size:
             return False
@@ -539,10 +558,15 @@ class KVCacheManager:
         return True
 
     def free_reserved(self):
+        # We intentionally *do not* wrap this method in an additional
+        # ``with self.lock`` because ``self.free`` already acquires the same
+        # re-entrant lock.  Attempting to acquire it again would be safe with
+        # an ``RLock`` but is unnecessary; leaving it out reduces contention.
         if self.reserved_blocks:
             self.free(self.reserved_blocks)
             self.reserved_blocks = []
 
+    @synchronized
     def resize(self, new_num_blocks: int):
         new_mem_size = new_num_blocks * self.block_mem_size
         if self.page_allocator.resize(new_mem_size):
@@ -560,9 +584,11 @@ class KVCacheManager:
         self.free_reserved()
         return False
 
+    @synchronized
     def trim(self):
         self.page_allocator.trim()
 
+    @synchronized
     def available_size(self) -> int:
         avail_size = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
@@ -575,6 +601,7 @@ class KVCacheManager:
         # logger.info(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
         return avail_size + free_size
 
+    @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = (self.page_allocator.get_num_inuse_pages() +
