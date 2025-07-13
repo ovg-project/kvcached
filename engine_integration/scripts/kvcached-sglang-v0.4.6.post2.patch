@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef212..3b24790f 100644
+index f7eef2120..7e7caca02 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -10,11 +10,11 @@ index f7eef212..3b24790f 100644
 +            hasattr(kvcache, "enable_kvcached") and kvcache.enable_kvcached
 +        )
 +        if self.enable_kvcached:
-+            self.kv_allocator = kvcache.kv_allocator
++            self.kvcached_allocator = kvcache.kvcached_allocator
  
      def available_size(self):
 +        if self.enable_kvcached:
-+            return self.kv_allocator.available_size()
++            return self.kvcached_allocator.available_size()
          return len(self.free_slots)
  
      def get_kvcache(self):
@@ -22,7 +22,7 @@ index f7eef212..3b24790f 100644
  
      def alloc(self, need_size: int):
 +        if self.enable_kvcached:
-+            indices = self.kv_allocator.alloc(need_size)
++            indices = self.kvcached_allocator.alloc(need_size)
 +            indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
 +            return indices
 +
@@ -34,7 +34,7 @@ index f7eef212..3b24790f 100644
  
          if self.is_not_in_free_group:
 +            if self.enable_kvcached:
-+                return self.kv_allocator.free(free_index.cpu().numpy())
++                return self.kvcached_allocator.free(free_index.cpu().numpy())
              self.free_slots = torch.cat((self.free_slots, free_index))
          else:
              self.free_group.append(free_index)
@@ -43,31 +43,30 @@ index f7eef212..3b24790f 100644
  
      def clear(self):
 +        if hasattr(self, "enable_kvcached") and self.enable_kvcached:
-+            self.kv_allocator.clear()
++            self.kvcached_allocator.clear()
 +            return
 +
          # The padded slot 0 is used for writing dummy outputs from padded tokens.
          self.free_slots = torch.arange(
              1, self.size + 1, dtype=torch.int64, device=self.device
-@@ -233,6 +251,31 @@ class MHATokenToKVPool(KVCache):
+@@ -233,6 +251,30 @@ class MHATokenToKVPool(KVCache):
          self.head_num = head_num
          self.head_dim = head_dim
          self.layer_num = layer_num
 +
-+        import os
++        import os  # noqa: E501
 +
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
 +        if self.enable_kvcached:
 +            try:
-+                from kvcached import ops as kvcached_ops
-+                from kvcached.slab_allocator import KVCacheManager
++                import kvcached.integration.sglang.interfaces as kvcached_interfaces  # noqa: E501
 +
-+                self.kvcached_ops = kvcached_ops
-+                self.kvcached_ops.init_kvcached()
++                self.kvcached_interfaces = kvcached_interfaces
++                self.kvcached_interfaces.init_kvcached()
 +
 +                # Initialize KV allocator based on per-token KV size (cell_size)
 +                self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
-+                self.kv_allocator = KVCacheManager(
++                self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
 +                    self.size,
 +                    self.page_size,
 +                    self.cell_size,
@@ -81,31 +80,28 @@ index f7eef212..3b24790f 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -247,7 +290,29 @@ class MHATokenToKVPool(KVCache):
+@@ -247,7 +289,26 @@ class MHATokenToKVPool(KVCache):
              f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
          )
  
 +    def __del__(self):
-+        if self.enable_kvcached and self.kv_allocator is not None:
-+            self.kvcached_ops.shutdown_kvcached()
-+            del self.kv_allocator
++        if self.enable_kvcached and self.kvcached_allocator is not None:
++            self.kvcached_interfaces.shutdown_kvcached()
++            del self.kvcached_allocator
 +            self.k_buffer = None
 +            self.v_buffer = None
 +
      def _create_buffers(self):
 +        if self.enable_kvcached:
-+            assert self.page_size == 1, "kvcached only supports page_size = 1 for SGL"
-+            k_buffer, v_buffer = self.kvcached_ops.sgl_alloc_kv_cache(
++            self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
 +                self.size,
 +                self.head_num,
 +                self.head_dim,
 +                self.dtype,
-+                # f"{self.device}:{self.gpu_id}",
-+                "cuda",
++                self.device,
 +                self.layer_num,
++                self.page_size,
 +            )
-+            self.k_buffer = k_buffer
-+            self.v_buffer = v_buffer
 +            return
 +
          with self.memory_saver_adapter.region():

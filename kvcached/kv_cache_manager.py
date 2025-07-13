@@ -1,5 +1,4 @@
 import threading
-import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
@@ -9,10 +8,12 @@ import torch
 
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
+from kvcached.utils import PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
+logger = get_kvcached_logger()
+
 SANITY_CHECK = False
-PAGE_SIZE = 2 * 1024 * 1024  # 2MB
 GPU_UTILIZATION = 0.95
 PAGE_PREALLOC_ENABLED = True
 
@@ -125,10 +126,10 @@ class PageAllocator(PageAllocatorBase):
                  total_mem_size: int,
                  page_size: int,
                  tp_size: int = None):
-        print(f"Init PageAllocator: "
-              f"total_mem_size={total_mem_size//(1024*1024)}MB, "
-              f"page_size={page_size//(1024*1024)}MB, "
-              f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
+        logger.info(f"Init KVCached PageAllocator: "
+                    f"total_mem_size={total_mem_size//(1024*1024)}MB, "
+                    f"page_size={page_size//(1024*1024)}MB, "
+                    f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
@@ -210,14 +211,14 @@ class PageAllocator(PageAllocatorBase):
                         [pid * self.page_size for pid in pages_to_reserve])
                     with self.prealloc_lock:
                         self.reserved_page_list.extend(pages_to_reserve)
-                    print(
+                    logger.debug(
                         f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
                     )
                 except Exception as e:
                     # If mapping fails, return pages to free list
                     with self.prealloc_lock:
                         self.free_page_list.extendleft(pages_to_reserve)
-                    print(
+                    logger.error(
                         f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
                     )
 
@@ -240,7 +241,7 @@ class PageAllocator(PageAllocatorBase):
                 self.prealloc_cond.notify_all()
             self.prealloc_thd.join()
             self.prealloc_thd = None
-            print("Stopped page preallocation thread")
+            logger.debug("Stopped page preallocation thread")
 
     def _trigger_preallocation(self):
         """Trigger the preallocation thread to fill up reserved blocks"""
@@ -376,6 +377,10 @@ class PageAllocator(PageAllocatorBase):
     def get_num_total_pages(self) -> int:
         return self.num_total_pages
 
+    def get_num_reserved_pages(self) -> int:
+        with self.prealloc_lock:
+            return len(self.reserved_page_list)
+
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
 
@@ -415,7 +420,6 @@ class KVCacheManager:
         self.num_layers = num_layers
 
         mem_size = self.num_blocks * self.block_mem_size
-
         num_children_processes = len(
             psutil.Process().children(recursive=False))
         self.tp_size = max(num_children_processes,
@@ -503,7 +507,7 @@ class KVCacheManager:
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
             if page_id not in self.full_pages and page_id not in self.avail_pages:
-                warnings.warn(
+                logger.warning(
                     f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed."
                 )
                 continue
@@ -575,8 +579,25 @@ class KVCacheManager:
                 self.block_mem_size)
             physical_free_size = self._physical_free_size()
             free_size = min(virtual_free_size, physical_free_size)
-        # print(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
+        # logger.info(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
         return avail_size + free_size
+
+    def get_mapped_memory_size(self, unit='bytes') -> float:
+        """Get memory usage in specified unit (bytes, kb, mb, gb)."""
+        memory_bytes = (self.page_allocator.get_num_inuse_pages() +
+                        self.page_allocator.get_num_reserved_pages()
+                        ) * self.num_layers * PAGE_SIZE * 2  # K and V tensors
+
+        if unit == 'bytes':
+            return memory_bytes
+        elif unit == 'kb':
+            return memory_bytes / 1024
+        elif unit == 'mb':
+            return memory_bytes / (1024**2)
+        elif unit == 'gb':
+            return memory_bytes / (1024**3)
+        else:
+            raise ValueError(f"Unknown unit: {unit}")
 
     def _physical_free_size(self) -> int:
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()

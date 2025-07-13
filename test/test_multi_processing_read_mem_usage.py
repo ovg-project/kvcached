@@ -4,9 +4,10 @@ import time
 import numpy as np
 import torch
 
-from kvcached import ops as kvcached_ops
-from kvcached.ops import init_kvcached, shutdown_kvcached
-from kvcached.slab_allocator import KVCacheManager
+from kvcached.integration.sglang.interfaces import (alloc_kv_cache,
+                                                    init_kvcached,
+                                                    shutdown_kvcached)
+from kvcached.kv_cache_manager import KVCacheManager
 
 total_tokens = 10000
 head_num = 32
@@ -22,7 +23,7 @@ def run_kv_cached(i):
     print(f"Initializing kvcached in process {i}")
     init_kvcached()
     print(f"Initialized kvcached in process {i}")
-    k_buffer, v_buffer = kvcached_ops.sgl_alloc_kv_cache(
+    k_buffer, v_buffer = alloc_kv_cache(
         total_tokens,
         head_num,
         head_dim,
@@ -58,7 +59,7 @@ def run_kv_cached(i):
 
 
 def read_kv_cached_memory_usage():
-    from kvcached.slab_allocator import MemoryUsageReader
+    from kvcached.kv_cache_manager import MemoryUsageReader
 
     reader = MemoryUsageReader("ipc_gpu_id_x_model_id_y")
 
