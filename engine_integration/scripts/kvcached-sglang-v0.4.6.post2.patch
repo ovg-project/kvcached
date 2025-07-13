@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef2120..7b1ce598a 100644
+index f7eef2120..d8d3b81a2 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -49,12 +49,13 @@ index f7eef2120..7b1ce598a 100644
          # The padded slot 0 is used for writing dummy outputs from padded tokens.
          self.free_slots = torch.arange(
              1, self.size + 1, dtype=torch.int64, device=self.device
-@@ -233,6 +251,29 @@ class MHATokenToKVPool(KVCache):
+@@ -233,6 +251,30 @@ class MHATokenToKVPool(KVCache):
          self.head_num = head_num
          self.head_dim = head_dim
          self.layer_num = layer_num
 +
 +        import os
++
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
 +        if self.enable_kvcached:
 +            try:
@@ -79,7 +80,7 @@ index f7eef2120..7b1ce598a 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -247,7 +288,26 @@ class MHATokenToKVPool(KVCache):
+@@ -247,7 +289,26 @@ class MHATokenToKVPool(KVCache):
              f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
          )
  
