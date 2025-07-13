@@ -6,13 +6,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-from kvcached.logging_config import get_kvcached_logger
+from kvcached.utils import PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
 
 SANITY_CHECK = False
-PAGE_SIZE = 2 * 1024 * 1024  # 2MB
 GPU_UTILIZATION = 0.95
 PAGE_PREALLOC_ENABLED = True
 
@@ -547,7 +546,7 @@ class KVCacheManager:
                 self.block_mem_size)
             physical_free_size = self._physical_free_size()
             free_size = min(virtual_free_size, physical_free_size)
-        # print(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
+        # logger.info(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
         return avail_size + free_size
 
     def get_mapped_memory_size(self, unit='bytes') -> float:
