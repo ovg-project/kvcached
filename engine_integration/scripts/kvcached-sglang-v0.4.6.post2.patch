@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef2120..d8d3b81a2 100644
+index f7eef2120..7e7caca02 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -54,12 +54,12 @@ index f7eef2120..d8d3b81a2 100644
          self.head_dim = head_dim
          self.layer_num = layer_num
 +
-+        import os
++        import os  # noqa: E501
 +
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
 +        if self.enable_kvcached:
 +            try:
-+                import kvcached.integration.sglang.interfaces as kvcached_interfaces
++                import kvcached.integration.sglang.interfaces as kvcached_interfaces  # noqa: E501
 +
 +                self.kvcached_interfaces = kvcached_interfaces
 +                self.kvcached_interfaces.init_kvcached()

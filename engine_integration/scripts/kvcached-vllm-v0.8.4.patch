@@ -1,14 +1,14 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 74f3f7852..705cc1c04 100644
+index 74f3f7852..83911ad01 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
-@@ -279,3 +279,92 @@ class BlockPool:
+@@ -279,3 +279,95 @@ class BlockPool:
              The KV cache usage (between 0.0 and 1.0).
          """
          return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 +
 +
-+class ElasticBlockPool:
++class ElasticBlockPool(BlockPool):
 +    """ElasticBlockPool that manages KVCacheBlocks.
 +    It provides same interface as BlockPool, but it leverages kvcached for
 +    elastic KV cachememory management.
@@ -19,11 +19,14 @@ index 74f3f7852..705cc1c04 100644
 +        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
 +        assert not enable_caching, (
 +            "Caching is not supported in ElasticBlockPool")
++
 +        self.num_gpu_blocks = num_gpu_blocks
 +
-+        import kvcached.integration.vllm.interfaces as kvcached_interfaces  # type: ignore
-+        self.kv_cache_manager = kvcached_interfaces.get_kv_cache_manager(
-+            num_gpu_blocks, block_size, cell_size, num_layers)
++        from kvcached.integration.vllm.interfaces import (  # noqa: E501
++            get_kv_cache_manager)
++        self.kv_cache_manager = get_kv_cache_manager(num_gpu_blocks,
++                                                     block_size, cell_size,
++                                                     num_layers)
 +
 +    def get_cached_block(self,
 +                         block_hash: BlockHashType) -> Optional[KVCacheBlock]:
@@ -96,41 +99,37 @@ index 74f3f7852..705cc1c04 100644
 +        """
 +        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 33761cf7f..047ebff99 100644
+index 33761cf7f..076ccc99b 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -55,11 +55,28 @@ class KVCacheManager:
+@@ -55,7 +55,25 @@ class KVCacheManager:
          self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
                                             self.block_size)
  
 -        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
-+        import os
++        import os  # noqa: E501
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
 +                                         "false").lower() == "true"
++
++        self.block_pool: BlockPool
 +        if self.enable_kvcached:
-+            from vllm.v1.core.block_pool import ElasticBlockPool
++            from vllm.v1.core.block_pool import ElasticBlockPool  # noqa: E501
 +            if self.enable_caching:
 +                raise ValueError("Caching is not supported for kvcached")
 +            # cell_size is the size of the k/v cache tensor for a single token.
 +            cell_size = kv_cache_spec.page_size_bytes // self.block_size // 2
-+            self.block_pool = ElasticBlockPool(
-+                self.num_gpu_blocks,  # type: ignore
-+                self.block_size,
-+                cell_size=cell_size,
-+                num_layers=len(kv_cache_config.tensors),
-+                enable_caching=enable_caching)
++            self.block_pool = ElasticBlockPool(self.num_gpu_blocks,
++                                               self.block_size,
++                                               cell_size=cell_size,
++                                               num_layers=len(
++                                                   kv_cache_config.tensors),
++                                               enable_caching=enable_caching)
 +        else:
-+            self.block_pool = BlockPool(self.num_gpu_blocks,
-+                                        enable_caching)  # type: ignore
++            self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
  
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
--            block_pool=self.block_pool,
-+            block_pool=self.block_pool,  # type: ignore
-         )
- 
-         # Mapping from request ID to blocks to track the blocks allocated
-@@ -176,7 +193,7 @@ class KVCacheManager:
+@@ -176,7 +194,7 @@ class KVCacheManager:
              new_computed_blocks: A list of new computed blocks just hitting the
                  prefix caching.
              num_lookahead_tokens: The number of speculative tokens to allocate.
