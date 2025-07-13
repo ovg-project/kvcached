@@ -1,5 +1,4 @@
 import threading
-import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
@@ -474,7 +473,7 @@ class KVCacheManager:
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
             if page_id not in self.full_pages and page_id not in self.avail_pages:
-                warnings.warn(
+                logger.warning(
                     f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed."
                 )
                 continue

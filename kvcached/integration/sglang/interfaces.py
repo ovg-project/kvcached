@@ -3,10 +3,12 @@ from typing import List, Optional, Tuple
 import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
-from kvcached.utils import PAGE_SIZE
+from kvcached.utils import PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
+
+logger = get_kvcached_logger()
 
 _kvcached_initialized: bool = False
 _kvcached_device = None
@@ -52,8 +54,7 @@ def alloc_kv_cache(
 
     assert torch.cuda.is_available(), "CUDA is not available."
     if page_size != 1:
-        print(
-            "Warning: kvcached is only tested with page_size = 1 for SGLang.")
+        logger.warning("kvcached is only tested with page_size=1 for SGLang.")
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
