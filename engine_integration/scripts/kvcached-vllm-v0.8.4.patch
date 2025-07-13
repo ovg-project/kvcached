@@ -99,15 +99,16 @@ index 74f3f7852..83911ad01 100644
 +        """
 +        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 33761cf7f..076ccc99b 100644
+index 33761cf7f..d10145bc8 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -55,7 +55,25 @@ class KVCacheManager:
+@@ -55,7 +55,26 @@ class KVCacheManager:
          self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
                                             self.block_size)
  
 -        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
 +        import os  # noqa: E501
++
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
 +                                         "false").lower() == "true"
 +
@@ -129,15 +130,6 @@ index 33761cf7f..076ccc99b 100644
  
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
-@@ -176,7 +194,7 @@ class KVCacheManager:
-             new_computed_blocks: A list of new computed blocks just hitting the
-                 prefix caching.
-             num_lookahead_tokens: The number of speculative tokens to allocate.
--                This is used by spec decode proposers with kv-cache such 
-+                This is used by spec decode proposers with kv-cache such
-                 as eagle.
- 
-         Blocks layout:
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index 70e8bd75e..331801969 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
