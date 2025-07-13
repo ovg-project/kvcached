@@ -131,25 +131,34 @@ index 33761cf7f..d10145bc8 100644
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 70e8bd75e..331801969 100644
+index 70e8bd75e..eb9425673 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -272,6 +272,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -272,6 +272,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
          self.seq_lens_np = self.seq_lens_cpu.numpy()
  
 +        import os
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
 +                                         "false").lower() == "true"
++
 +        if self.enable_kvcached:
 +            import kvcached.integration.vllm.interfaces as kvcached_interfaces
-+            kvcached_interfaces.init_kvcached()
 +            self.kvcached_interfaces = kvcached_interfaces
++            # Get tensor parallel rank and size from vLLM's parallel state
++            from vllm.distributed.parallel_state import (
++                get_tensor_model_parallel_rank,
++                get_tensor_model_parallel_world_size)
++            tp_rank = get_tensor_model_parallel_rank()
++            tp_size = get_tensor_model_parallel_world_size()
++            kvcached_interfaces.init_kvcached(tp_rank=tp_rank,
++                                              tp_size=tp_size,
++                                              device=str(self.device))
 +
      def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
          """Update the cached states and the persistent batch with the scheduler
          output.
-@@ -1640,6 +1648,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1640,6 +1657,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          kv_caches: dict[str, torch.Tensor] = {}
  

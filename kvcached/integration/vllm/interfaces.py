@@ -30,7 +30,7 @@ def init_kvcached(tp_rank: int = 0,
 
     if tp_size > 1:
         # start the listener thread for tensor parallel kv cache management
-        start_worker_listerner_thread(torch.cuda.current_device())
+        start_worker_listerner_thread(tp_rank)
 
 
 def shutdown_kvcached() -> None:
@@ -80,8 +80,8 @@ def alloc_kv_cache(
 
 def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
                          num_layers: int) -> KVCacheManager:
-    if not _kvcached_initialized:
-        raise RuntimeError(
-            "kvcached is not initialized. Please call init_kvcached() first.")
+    # if not _kvcached_initialized:
+    #     raise RuntimeError(
+    #         "kvcached is not initialized. Please call init_kvcached() first.")
 
     return KVCacheManager(num_blocks, block_size, cell_size, num_layers)
