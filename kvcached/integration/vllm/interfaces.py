@@ -12,12 +12,17 @@ from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
 
 _kvcached_initialized: bool = False
 _kvcached_device = None
+_tp_size: int = 1
 
 
-def init_kvcached(tp_rank: int = 0,
-                  tp_size: int = 1,
-                  device: Optional[str] = None) -> None:
-    global _kvcached_initialized, _kvcached_device
+def init_kvcached(
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    is_worker: bool = False,
+    device: Optional[str] = None,
+) -> None:
+    global _kvcached_initialized, _kvcached_device, _tp_size
+
     if _kvcached_initialized:
         return
 
@@ -27,8 +32,9 @@ def init_kvcached(tp_rank: int = 0,
     _init_kvcached_impl(device)
     _kvcached_initialized = True
     _kvcached_device = device
+    _tp_size = tp_size
 
-    if tp_size > 1:
+    if tp_size > 1 and is_worker:
         # start the listener thread for tensor parallel kv cache management
         start_worker_listerner_thread(tp_rank)
 
@@ -80,8 +86,9 @@ def alloc_kv_cache(
 
 def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
                          num_layers: int) -> KVCacheManager:
-    # if not _kvcached_initialized:
-    #     raise RuntimeError(
-    #         "kvcached is not initialized. Please call init_kvcached() first.")
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(num_blocks, block_size, cell_size, num_layers)
+    return KVCacheManager(num_blocks, block_size, cell_size, num_layers,
+                          _tp_size)

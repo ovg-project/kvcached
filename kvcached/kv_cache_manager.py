@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
-import psutil
 import torch
 
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
@@ -414,19 +413,18 @@ class KVCacheManager:
         block_size: int,
         cell_size: int,
         num_layers: int,
+        tp_size: int = 1,
     ):
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
 
         mem_size = self.num_blocks * self.block_mem_size
-        num_children_processes = len(
-            psutil.Process().children(recursive=False))
-        self.tp_size = max(num_children_processes,
-                           1)  # fall back to 1 if no children processes
-        tp_size = self.tp_size
-        if tp_size > 1:
-            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE, tp_size)
+        self.tp_size = tp_size
+
+        if self.tp_size > 1:
+            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE,
+                                                self.tp_size)
         else:
             self.page_allocator = PageAllocator(mem_size, PAGE_SIZE)
 
