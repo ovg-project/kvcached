@@ -228,11 +228,31 @@ index 38de00625..2f043db61 100644
          one of them is full attention. Then, split the kv cache groups into full
          attention groups and other groups.
          """
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index e2fdf6f8a..778b56598 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -86,6 +86,15 @@ class EngineCore:
+         self.collective_rpc("initialize_cache",
+                             args=(num_gpu_blocks, num_cpu_blocks))
+ 
++        enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
++        if enable_kvcached:
++            from kvcached.integration.vllm.interfaces import init_kvcached
++            init_kvcached(
++                tp_rank=0,
++                tp_size=vllm_config.parallel_config.tensor_parallel_size,
++                is_worker=False,
++            )
++
+         self.structured_output_manager = StructuredOutputManager(vllm_config)
+ 
+         # Setup scheduler.
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 5a26e88db..b7edc99e6 100644
+index 5a26e88db..a0bc62cae 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -311,6 +311,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -311,6 +311,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
          self.seq_lens_np = self.seq_lens_cpu.numpy()
  
@@ -251,12 +271,13 @@ index 5a26e88db..b7edc99e6 100644
 +            tp_size = get_tensor_model_parallel_world_size()
 +            kvcached_interfaces.init_kvcached(tp_rank=tp_rank,
 +                                              tp_size=tp_size,
++                                              is_worker=True,
 +                                              device=str(self.device))
 +
          # Layer pairings for cross-layer KV sharing.
          # If an Attention layer `layer_name` is in the keys of this dict, it
          # means this layer will perform attention using the keys and values
-@@ -1943,7 +1960,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1943,7 +1961,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
          This is to help balance expert-selection
           - during profile_run
@@ -265,7 +286,7 @@ index 5a26e88db..b7edc99e6 100644
          """
          dp_size = self.vllm_config.parallel_config.data_parallel_size
          randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
-@@ -2564,20 +2581,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2564,20 +2582,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              Dict[str, torch.Tensor]: A map between layer names to their
              corresponding memory buffer for KV cache.
          """
@@ -307,7 +328,7 @@ index 5a26e88db..b7edc99e6 100644
  
          bind_kv_cache(kv_caches,
                        self.compilation_config.static_forward_context,
-@@ -2737,3 +2761,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2737,3 +2762,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  "the mamba page size")
  
          return attn_page_size
