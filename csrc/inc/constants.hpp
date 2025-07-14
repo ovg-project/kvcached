@@ -11,6 +11,7 @@ using page_id_t = int64_t;
 using offset_t = page_id_t;
 
 static constexpr size_t kPageSize = 2 * 1024 * 1024;
+static constexpr size_t kStartAddr = 0x1f0'000'000'000;
 
 static constexpr page_id_t INV_PAGE_ID = -1;
 static constexpr page_id_t ZERO_PAGE_ID = INV_PAGE_ID - 1;
