@@ -51,7 +51,8 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
 }
 
 FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
-                 torch::Device dev, std::shared_ptr<Page> zero_page, generic_ptr_t vaddr)
+                 torch::Device dev, std::shared_ptr<Page> zero_page,
+                 generic_ptr_t vaddr)
     : name_(name), vaddr_(vaddr), size_(size), dtype_(dtype), dev_(dev),
       zero_page_(zero_page), managed_vaddr_(false) {
   auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
@@ -131,8 +132,9 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
 }
 
 bool FTensor::init_with_zero_() {
-  assert(reinterpret_cast<uintptr_t>(vaddr_) % kPageSize == 0); // Ensure alignment.
-  assert(size_ % kPageSize == 0);  // Ensure alignment.
+  assert(reinterpret_cast<uintptr_t>(vaddr_) % kPageSize ==
+         0);                      // Ensure alignment.
+  assert(size_ % kPageSize == 0); // Ensure alignment.
 
   bool succ = true;
   for (size_t offset = 0; offset < size_; offset += kPageSize) {

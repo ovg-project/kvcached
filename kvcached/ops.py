@@ -1,23 +1,21 @@
 import math
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
 from kvcached.slab_allocator import PAGE_SIZE
 
 try:
-    from kvcached.vmm_ops import create_kv_tensors
+    from kvcached.vmm_ops import create_kv_tensors, free_kv_tensors
     from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
     from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
-    from kvcached.vmm_ops import free_kv_tensors
 except ImportError:
     # If direct import fails, try importing from vmm_ops module
     # This handles the case where kvcached is used as a standalone module
     try:
-        from vmm_ops import create_kv_tensors
+        from vmm_ops import create_kv_tensors, free_kv_tensors
         from vmm_ops import init_kvcached as _init_kvcached_impl
         from vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
-        from vmm_ops import free_kv_tensors
     except ImportError:
         # Final fallback: try to add local csrc path
         import os
@@ -27,25 +25,21 @@ except ImportError:
         KVCACHED_PATH = os.path.realpath(f"{SCRIPT_PATH}/../csrc")
         if os.path.exists(KVCACHED_PATH):
             sys.path.append(KVCACHED_PATH)
-        
+
         # Try to import from kvcached.vmm_ops or vmm_ops
         try:
-            from kvcached.vmm_ops import create_kv_tensors
-            from kvcached.vmm_ops import (
-                init_kvcached as _init_kvcached_impl
-            )
-            from kvcached.vmm_ops import (
+            from kvcached.vmm_ops import create_kv_tensors, free_kv_tensors
+            from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
+            from kvcached.vmm_ops import \
                 shutdown_kvcached as _shutdown_kvcached_impl
-            )
-            from kvcached.vmm_ops import free_kv_tensors
         except ImportError:
-            from vmm_ops import create_kv_tensors
+            from vmm_ops import create_kv_tensors, free_kv_tensors
             from vmm_ops import init_kvcached as _init_kvcached_impl
             from vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
-            from vmm_ops import free_kv_tensors
 
 
-def init_kvcached(gpu_id: Optional[int] = None, virtual_mem_size_gb: int = 20, 
+def init_kvcached(gpu_id: Optional[int] = None,
+                  virtual_mem_size_gb: int = 20,
                   reserve_virtual_mem: bool = False) -> None:
     virtual_mem_size = virtual_mem_size_gb * 1024 * 1024 * 1024  # GB
     if gpu_id is None:
@@ -66,9 +60,8 @@ def vllm_alloc_kv_cache(
     device: str,
     num_layers: int,
 ) -> List[torch.Tensor]:
-    assert (
-        len(kvcache_shape) > 2 and kvcache_shape[0] == 2
-    ), "Only supports stacked kv cache at 1st dim."
+    assert (len(kvcache_shape) > 2 and kvcache_shape[0]
+            == 2), "Only supports stacked kv cache at 1st dim."
     kvcache_shape = list(kvcache_shape)
     num_blocks = kvcache_shape[1]
     cell_size = math.prod(kvcache_shape[2:]) * dtype.itemsize * block_size
@@ -76,9 +69,8 @@ def vllm_alloc_kv_cache(
     kvcache_shape[1] = aligned_num_blocks
 
     tensor_mem_size = math.prod(kvcache_shape) * dtype.itemsize
-    raw_kv_tensors = create_kv_tensors(
-        tensor_mem_size, dtype.itemsize, device, num_layers
-    )
+    raw_kv_tensors = create_kv_tensors(tensor_mem_size, dtype.itemsize, device,
+                                       num_layers)
 
     kv_tensors = [
         t.view(kvcache_shape).view(dtype=dtype) for t in raw_kv_tensors
@@ -102,9 +94,8 @@ def sgl_alloc_kv_cache(
     # gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
     # virtual_mem_size = _align_to(gpu_mem_size // num_layers, 2 * PAGE_SIZE)
 
-    raw_kv_tensors = create_kv_tensors(
-        virtual_mem_size, dtype.itemsize, device, num_layers
-    )
+    raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
+                                       device, num_layers)
 
     kv_shape = (-1, head_num, head_dim)
     k_tensors, v_tensors = [], []

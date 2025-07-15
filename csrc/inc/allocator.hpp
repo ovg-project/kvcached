@@ -17,14 +17,14 @@ namespace kvcached {
 
 class FTensorAllocator {
 public:
-  FTensorAllocator(size_t total_mem_size, const torch::Device &device, bool single_vaddr = false);
+  FTensorAllocator(size_t total_mem_size, const torch::Device &device,
+                   bool single_vaddr = false);
   ~FTensorAllocator();
 
   // Raw FTensor interfaces.
   torch::Tensor create_ftensor(size_t size, torch::Dtype dtype,
                                const std::string &dev_str,
-                               std::string name = "",
-                               void* vaddr = nullptr);
+                               std::string name = "", void *vaddr = nullptr);
   void free_ftensor(torch::Tensor &ftensor);
   void destroy();
 
@@ -37,7 +37,8 @@ public:
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
-  static void init(size_t total_mem_size, const std::string &dev_str, bool single_vaddr);
+  static void init(size_t total_mem_size, const std::string &dev_str,
+                   bool single_vaddr);
   static void shutdown();
   static FTensorAllocator *global_allocator();
 
@@ -48,12 +49,10 @@ private:
                                                      torch::Dtype dtype,
                                                      const std::string &dev_str,
                                                      int64_t num_layers);
-  std::vector<torch::Tensor> create_kv_tensors_impl_(std::string_view prefix,
-                                                     size_t size,
-                                                     torch::Dtype dtype,
-                                                     const std::string &dev_str,
-                                                     int64_t num_layers,
-                                                     generic_ptr_t vaddr);
+  std::vector<torch::Tensor>
+  create_kv_tensors_impl_(std::string_view prefix, size_t size,
+                          torch::Dtype dtype, const std::string &dev_str,
+                          int64_t num_layers, generic_ptr_t vaddr);
 
   void init_cuda_();
 
