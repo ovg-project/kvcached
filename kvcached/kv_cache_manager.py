@@ -120,7 +120,17 @@ class PageAllocatorBase(ABC):
 
 class PageAllocator(PageAllocatorBase):
 
-    def __init__(self, total_mem_size: int, page_size: int, tp_size: int = 1):
+    def __init__(self,
+                 total_mem_size: int,
+                 page_size: int,
+                 tp_size: int = 1,
+                 async_sched: bool = False):
+        """
+        Args:
+            total_mem_size: Total memory size in bytes.
+            page_size: Page size in bytes.
+            async_sched: Whether asynchronous scheduling is enabled.
+        """
         logger.info(f"Init KVCached PageAllocator: "
                     f"total_mem_size={total_mem_size//(1024*1024)}MB, "
                     f"page_size={page_size//(1024*1024)}MB, "
@@ -130,6 +140,8 @@ class PageAllocator(PageAllocatorBase):
 
         self.total_mem_size = total_mem_size
         self.page_size = page_size
+        self.tp_size = tp_size
+        self.async_sched = async_sched
         self.num_free_pages = total_mem_size // page_size
         self.num_total_pages = total_mem_size // page_size
 
@@ -151,8 +163,6 @@ class PageAllocator(PageAllocatorBase):
         if PAGE_PREALLOC_ENABLED:
             # Start preallocation thread
             self._start_prealloc_thread()
-
-        self.tp_size = tp_size
 
     def _prealloc_worker(self):
         """Worker thread that preallocates pages and maps them to physical memory."""
@@ -393,7 +403,8 @@ class PageAllocator(PageAllocatorBase):
             # unmap the pages across all tensor parallel workers.
             broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
         else:
-            torch.cuda.synchronize()
+            if self.async_sched:
+                torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
 
 
@@ -416,19 +427,24 @@ class KVCacheManager:
         cell_size: int,
         num_layers: int,
         tp_size: int = 1,
+        async_sched: bool = False,
     ):
+        """
+        Args:
+            num_blocks: Number of blocks.
+            block_size: Size of each block in bytes.
+            cell_size: Size of each cell in bytes.
+            num_layers: Number of layers.
+            async_sched: Whether asynchronous scheduling is enabled.
+        """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
 
-        mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-
-        if self.tp_size > 1:
-            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE,
-                                                self.tp_size)
-        else:
-            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE)
+        mem_size = self.num_blocks * self.block_mem_size
+        self.page_allocator = PageAllocator(mem_size, PAGE_SIZE, tp_size,
+                                            async_sched)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
