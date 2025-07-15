@@ -121,10 +121,7 @@ class PageAllocatorBase(ABC):
 
 class PageAllocator(PageAllocatorBase):
 
-    def __init__(self,
-                 total_mem_size: int,
-                 page_size: int,
-                 tp_size: int = None):
+    def __init__(self, total_mem_size: int, page_size: int, tp_size: int = 1):
         logger.info(f"Init KVCached PageAllocator: "
                     f"total_mem_size={total_mem_size//(1024*1024)}MB, "
                     f"page_size={page_size//(1024*1024)}MB, "
@@ -161,7 +158,7 @@ class PageAllocator(PageAllocatorBase):
 
     def call_map_to_kv_tensors(self, offsets: list[int]) -> None:
         """Call the mapping function to map pages to physical memory, considering tensor parallelism."""
-        if self.tp_size is not None and self.tp_size > 1:
+        if self.tp_size > 1:
             # map the pages across all tensor parallel workers.
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
@@ -169,7 +166,7 @@ class PageAllocator(PageAllocatorBase):
 
     def call_unmap_from_kv_tensors(self, offsets: list[int]) -> None:
         """Call the unmapping function to unmap pages from physical memory, considering tensor parallelism."""
-        if self.tp_size is not None and self.tp_size > 1:
+        if self.tp_size > 1:
             # unmap the pages across all tensor parallel workers.
             broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
         else:
