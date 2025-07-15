@@ -139,8 +139,7 @@ class PageAllocator(PageAllocatorBase):
         self.max_reserved_pages = 10
         self.reserved_page_list: List[int] = []  # For fast path allocation
 
-        self.reclaimed_page_list: List[int] = [
-        ]  # To record reclaimed page ids
+        self.reclaimed_page_list: List[int] = []  # For reclaimed page ids
 
         # Preallocation thread management
         self.prealloc_lock = threading.RLock()
@@ -154,22 +153,6 @@ class PageAllocator(PageAllocatorBase):
             self._start_prealloc_thread()
 
         self.tp_size = tp_size
-
-    def call_map_to_kv_tensors(self, offsets: list[int]) -> None:
-        """Call the mapping function to map pages to physical memory, considering tensor parallelism."""
-        if self.tp_size > 1:
-            # map the pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
-        else:
-            map_to_kv_tensors(offsets)
-
-    def call_unmap_from_kv_tensors(self, offsets: list[int]) -> None:
-        """Call the unmapping function to unmap pages from physical memory, considering tensor parallelism."""
-        if self.tp_size > 1:
-            # unmap the pages across all tensor parallel workers.
-            broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
-        else:
-            unmap_from_kv_tensors(offsets)
 
     def _prealloc_worker(self):
         """Worker thread that preallocates pages and maps them to physical memory."""
@@ -202,8 +185,7 @@ class PageAllocator(PageAllocatorBase):
             # Todo: Map pages to physical memory (outside lock)
             if pages_to_reserve:
                 try:
-                    self.call_map_to_kv_tensors(
-                        [pid * self.page_size for pid in pages_to_reserve])
+                    self._map_pages(pages_to_reserve)
                     with self.prealloc_lock:
                         self.reserved_page_list.extend(pages_to_reserve)
                     logger.debug(
@@ -248,7 +230,6 @@ class PageAllocator(PageAllocatorBase):
         if self.num_free_pages <= 0:
             raise ValueError("No free pages left")
         self.num_free_pages -= 1
-        # self.free_page_list = sorted(self.free_page_list)
 
         # Fast path: allocate pages with reserved physical memory mapping.
         with self.prealloc_lock:
@@ -266,7 +247,7 @@ class PageAllocator(PageAllocatorBase):
         with self.prealloc_lock:
             page_id = self.free_page_list.popleft()
         page = Page(page_id, self.page_size)
-        self.call_map_to_kv_tensors([page_id * self.page_size])
+        self._map_pages([page_id])
 
         if PAGE_PREALLOC_ENABLED:
             # Trigger preallocation to refill the pool
@@ -290,7 +271,7 @@ class PageAllocator(PageAllocatorBase):
                 return
 
         # Slow path: free page and its physical memory mapping.
-        self.call_unmap_from_kv_tensors([page_id * self.page_size])
+        self._unmap_pages([page_id])
         with self.prealloc_lock:
             self.free_page_list.append(page_id)
 
@@ -305,8 +286,7 @@ class PageAllocator(PageAllocatorBase):
                 page_ids = page_ids[num_to_reserve:]
 
         # Slow path: free page_ids and their physical memory mapping.
-        self.call_unmap_from_kv_tensors(
-            [pid * self.page_size for pid in page_ids])
+        self._unmap_pages(page_ids)
         with self.prealloc_lock:
             self.free_page_list.extend(page_ids)
 
@@ -357,8 +337,7 @@ class PageAllocator(PageAllocatorBase):
         if not pages_to_unmap:
             return
 
-        self.call_unmap_from_kv_tensors(
-            [pid * self.page_size for pid in pages_to_unmap])
+        self._unmap_pages(pages_to_unmap)
 
         with self.prealloc_lock:
             self.free_page_list.extend(pages_to_unmap)
@@ -399,6 +378,23 @@ class PageAllocator(PageAllocatorBase):
         # Stop preallocation thread
         if PAGE_PREALLOC_ENABLED:
             self._stop_prealloc_thread()
+
+    def _map_pages(self, page_ids: list[int]) -> None:
+        offsets = [pid * self.page_size for pid in page_ids]
+        if self.tp_size > 1:
+            # map the pages across all tensor parallel workers.
+            broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
+        else:
+            map_to_kv_tensors(offsets)
+
+    def _unmap_pages(self, page_ids: list[int]) -> None:
+        offsets = [pid * self.page_size for pid in page_ids]
+        if self.tp_size > 1:
+            # unmap the pages across all tensor parallel workers.
+            broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
+        else:
+            torch.cuda.synchronize()
+            unmap_from_kv_tensors(offsets)
 
 
 def synchronized(method):
