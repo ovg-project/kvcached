@@ -1,3 +1,17 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8891115c1..34099c61e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1235,7 +1235,8 @@ class Scheduler(
+             if not self.enable_hierarchical_cache
+             else self.max_total_num_tokens - protected_size
+         )
+-        if memory_leak:
++        enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
++        if memory_leak and not enable_kvcached:
+             msg = (
+                 "token_to_kv_pool_allocator memory leak detected! "
+                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
 index f7eef2120..7e7caca02 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
