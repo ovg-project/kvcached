@@ -22,17 +22,18 @@ except ImportError:
         KVCACHED_PATH = os.path.realpath(f"{SCRIPT_PATH}/../csrc")
         if os.path.exists(KVCACHED_PATH):
             sys.path.append(KVCACHED_PATH)
-        
+
         # Try to import from kvcached.vmm_ops or vmm_ops
         try:
-            from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
+            from kvcached.vmm_ops import (map_to_kv_tensors,
+                                          unmap_from_kv_tensors)
         except ImportError:
             from vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
-from multiprocessing import shared_memory
-import numpy as np
 import time
+from multiprocessing import shared_memory
 
+import numpy as np
 
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
@@ -41,39 +42,39 @@ PAGE_PREALLOC_ENABLED = True
 
 
 class Timer:
+
     def __init__(self, timings: List[float]):
         self.timings = timings
-    
+
     def __enter__(self):
         self.start = time.time()
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.timings.append(time.time() - self.start)
 
 
 class MemoryUsageReader():
+
     def __init__(self, ipc_name: str, create_timeout=60):
         self.ipc_name = ipc_name
         self.create_timeout = create_timeout
         self.shared_memory = None
         self.memory_usage_array = None
-        
+
         # Try to access the shared memory segment
         try:
-            self.shared_memory = shared_memory.SharedMemory(
-                name=ipc_name, create=False
-            )
-            self.memory_usage_array = np.ndarray(
-                (1,), dtype=np.int64, buffer=self.shared_memory.buf
-            )
+            self.shared_memory = shared_memory.SharedMemory(name=ipc_name,
+                                                            create=False)
+            self.memory_usage_array = np.ndarray((1, ),
+                                                 dtype=np.int64,
+                                                 buffer=self.shared_memory.buf)
         except FileNotFoundError:
             # If shared memory doesn't exist, create it
             self.shared_memory = shared_memory.SharedMemory(
-                name=ipc_name, create=True, size=np.int64().itemsize
-            )
-            self.memory_usage_array = np.ndarray(
-                (1,), dtype=np.int64, buffer=self.shared_memory.buf
-            )
+                name=ipc_name, create=True, size=np.int64().itemsize)
+            self.memory_usage_array = np.ndarray((1, ),
+                                                 dtype=np.int64,
+                                                 buffer=self.shared_memory.buf)
             self.memory_usage_array[0] = 0
 
     def get_memory_usage_in_mb(self):
@@ -109,8 +110,8 @@ class Page:
         self.free_list = [stt_idx + i for i in range(self.num_kv_blocks)]
 
     def destroy(self) -> None:
-        assert (self.initialized() and 
-                len(self.free_list) == self.num_kv_blocks)
+        assert (self.initialized()
+                and len(self.free_list) == self.num_kv_blocks)
         self.block_size = None
         self.phy_token_kv_size = None
         self.num_kv_blocks = None
@@ -161,8 +162,7 @@ class Page:
 
     def _sanity_check(self, block_id: int) -> None:
         assert self._has_block(block_id), (
-            f"Block {block_id} is not in page {self.page_id}"
-        )
+            f"Block {block_id} is not in page {self.page_id}")
 
 
 class PageAllocatorBase(ABC):
@@ -190,7 +190,9 @@ class PageAllocatorBase(ABC):
 
 class PageAllocator(PageAllocatorBase):
 
-    def __init__(self, total_mem_size: int, page_size: int,
+    def __init__(self,
+                 total_mem_size: int,
+                 page_size: int,
                  num_layers: int = 1,
                  shm: shared_memory.SharedMemory = None,
                  device: str = "cpu"):
@@ -211,8 +213,9 @@ class PageAllocator(PageAllocatorBase):
 
         if shm is not None:
             self.shm = shm
-            self.memory_in_use = np.ndarray(
-                (1,), dtype=np.int64, buffer=self.shm.buf)
+            self.memory_in_use = np.ndarray((1, ),
+                                            dtype=np.int64,
+                                            buffer=self.shm.buf)
             self.memory_in_use[0] = 0
         else:
             self.shm = None
@@ -248,8 +251,7 @@ class PageAllocator(PageAllocatorBase):
         while self.prealloc_running:
             with self.prealloc_lock:
                 # Wait until preallocation is needed or thread is stopped
-                while (not self.prealloc_needed and
-                       self.prealloc_running):
+                while (not self.prealloc_needed and self.prealloc_running):
                     self.prealloc_cond.wait()
 
                 if not self.prealloc_running:
@@ -257,8 +259,7 @@ class PageAllocator(PageAllocatorBase):
 
                 self.prealloc_needed = False
                 current_reserved = len(self.reserved_page_list)
-                to_reserve = max(
-                    0, self.min_reserved_pages - current_reserved)
+                to_reserve = max(0, self.min_reserved_pages - current_reserved)
                 # Only try to reserve up to the available free pages
                 to_reserve = min(to_reserve, len(self.free_page_list))
                 if to_reserve <= 0:
@@ -269,8 +270,7 @@ class PageAllocator(PageAllocatorBase):
                 # Get pages from free list
                 for _ in range(to_reserve):
                     if self.free_page_list:
-                        pages_to_reserve.append(
-                            self.free_page_list.popleft())
+                        pages_to_reserve.append(self.free_page_list.popleft())
                     else:
                         break
 
@@ -278,9 +278,8 @@ class PageAllocator(PageAllocatorBase):
                 if pages_to_reserve:
                     try:
                         # Fix: use same offset calculation as original
-                        map_to_kv_tensors([
-                            pid * self.page_size
-                            for pid in pages_to_reserve])
+                        map_to_kv_tensors(
+                            [pid * self.page_size for pid in pages_to_reserve])
                         if self.shm is not None:
                             with Timer(self.write_shm_times):
                                 self.memory_in_use[0] += (
@@ -298,8 +297,8 @@ class PageAllocator(PageAllocatorBase):
         """Start the preallocation thread"""
         if self.prealloc_thd is None:
             self.prealloc_running = True
-            self.prealloc_thd = threading.Thread(
-                target=self._prealloc_worker, daemon=True)
+            self.prealloc_thd = threading.Thread(target=self._prealloc_worker,
+                                                 daemon=True)
             self.prealloc_thd.start()
             print("Started page preallocation thread")
 
@@ -330,8 +329,7 @@ class PageAllocator(PageAllocatorBase):
                 page_id = self.reserved_page_list.pop()
 
                 # Trigger preallocation to refill reserved pool
-                if (len(self.reserved_page_list) <
-                        self.min_reserved_pages):
+                if (len(self.reserved_page_list) < self.min_reserved_pages):
                     self.prealloc_needed = True
                     self.prealloc_cond.notify()
 
@@ -360,7 +358,7 @@ class PageAllocator(PageAllocatorBase):
 
     def free_page(self, page: Page) -> None:
         page_id = page.page_id
-        
+
         # Check if we can add to reserved pool
         added_to_reserved = False
         with self.prealloc_lock:
@@ -378,7 +376,7 @@ class PageAllocator(PageAllocatorBase):
         unmap_from_kv_tensors([page_id * self.page_size])
         with self.prealloc_lock:
             self.free_page_list.append(page_id)
-        
+
         if self.shm is not None:
             with Timer(self.write_shm_times):
                 self.memory_in_use[0] -= self.page_size_all_layers
@@ -410,14 +408,14 @@ class PageAllocator(PageAllocatorBase):
         # Unmap remaining pages and add to free list
         if remaining_pages:
             # Fix: use same offset calculation as original
-            unmap_from_kv_tensors([
-                pid * self.page_size for pid in remaining_pages])
+            unmap_from_kv_tensors(
+                [pid * self.page_size for pid in remaining_pages])
             with self.prealloc_lock:
                 self.free_page_list.extend(remaining_pages)
             if self.shm is not None:
                 with Timer(self.write_shm_times):
-                    self.memory_in_use[0] -= (
-                        len(remaining_pages) * self.page_size_all_layers)
+                    self.memory_in_use[0] -= (len(remaining_pages) *
+                                              self.page_size_all_layers)
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
@@ -430,8 +428,8 @@ class PageAllocator(PageAllocatorBase):
             return True
         elif new_num_pages < self.num_total_pages:
             num_pages_to_remove = self.num_total_pages - new_num_pages
-            available_pages = (
-                len(self.free_page_list) + len(self.reserved_page_list))
+            available_pages = (len(self.free_page_list) +
+                               len(self.reserved_page_list))
             if available_pages < num_pages_to_remove:
                 return False
             for _ in range(num_pages_to_remove):
@@ -457,14 +455,13 @@ class PageAllocator(PageAllocatorBase):
             self.reserved_page_list = []
 
         # Fix: use same offset calculation as original
-        slab_offsets = [
-            page_id * self.page_size for page_id in pages_to_unmap]
+        slab_offsets = [page_id * self.page_size for page_id in pages_to_unmap]
         if slab_offsets:
             unmap_from_kv_tensors(slab_offsets)
             if self.shm is not None:
                 with Timer(self.write_shm_times):
-                    mem_decrease = (
-                        len(slab_offsets) * self.page_size_all_layers)
+                    mem_decrease = (len(slab_offsets) *
+                                    self.page_size_all_layers)
                     self.memory_in_use[0] -= mem_decrease
 
         with self.prealloc_lock:
@@ -474,7 +471,7 @@ class PageAllocator(PageAllocatorBase):
         return len(self.free_page_list)
 
     def get_num_inuse_pages(self) -> int:
-        return (self.num_total_pages - self.get_num_free_pages() - 
+        return (self.num_total_pages - self.get_num_free_pages() -
                 len(self.reserved_page_list))
 
     def get_num_total_pages(self) -> int:
@@ -487,15 +484,15 @@ class PageAllocator(PageAllocatorBase):
         return block_id * block_mem_size // self.page_size
 
     def get_num_free_blocks(self, block_mem_size: int) -> int:
-        return (self.get_num_free_pages() * 
+        return (self.get_num_free_pages() *
                 self._num_blocks_per_page(block_mem_size))
 
     def get_num_inuse_blocks(self, block_mem_size: int) -> int:
-        return (self.get_num_inuse_pages() * 
+        return (self.get_num_inuse_pages() *
                 self._num_blocks_per_page(block_mem_size))
 
     def get_num_total_blocks(self, block_mem_size: int) -> int:
-        return (self.get_num_total_pages() * 
+        return (self.get_num_total_pages() *
                 self._num_blocks_per_page(block_mem_size))
 
     def _num_blocks_per_page(self, block_mem_size: int):
@@ -518,9 +515,10 @@ class KVCacheManager:
         self.num_layers = num_layers
 
         mem_size = self.num_blocks * self.block_mem_size
-        self.page_allocator = PageAllocator(
-            mem_size, PAGE_SIZE, num_layers=num_layers, shm=shm
-        )
+        self.page_allocator = PageAllocator(mem_size,
+                                            PAGE_SIZE,
+                                            num_layers=num_layers,
+                                            shm=shm)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
@@ -587,12 +585,11 @@ class KVCacheManager:
 
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
-            if (page_id not in self.full_pages and 
-                page_id not in self.avail_pages):
+            if (page_id not in self.full_pages
+                    and page_id not in self.avail_pages):
                 warnings.warn(
                     f"Page {page_id} is not in avail_pages or full_pages, "
-                    f"it is possible that the page is already freed."
-                )
+                    f"it is possible that the page is already freed.")
                 continue
             if page_id in self.full_pages:
                 page = self.full_pages.pop(page_id)
@@ -610,9 +607,8 @@ class KVCacheManager:
         if len(pages_to_free) > 0:
             self.page_allocator.free_pages(pages_to_free)
 
-        if (self.in_shrink and 
-            self.page_allocator.get_num_inuse_blocks(self.block_mem_size) <= 
-            self.target_num_blocks):
+        if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
+                self.block_mem_size) <= self.target_num_blocks):
             self.page_allocator.resize(self.target_num_blocks *
                                        self.block_mem_size)
             self.in_shrink = False
@@ -663,8 +659,8 @@ class KVCacheManager:
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = ((self.page_allocator.get_num_inuse_pages() +
-                        self.page_allocator.get_num_reserved_pages()) * 
-                       self.num_layers * PAGE_SIZE * 2)
+                         self.page_allocator.get_num_reserved_pages()) *
+                        self.num_layers * PAGE_SIZE * 2)
 
         if unit == 'bytes':
             return memory_bytes
@@ -684,8 +680,8 @@ class KVCacheManager:
 
         avail_phy_pages = avail_phy_mem_size // PAGE_SIZE
         # Each layer needs to reserve K and V tensors.
-        avail_phy_blocks = ((avail_phy_pages // self.num_layers // 2) * 
-                           (PAGE_SIZE // self.block_mem_size))
+        avail_phy_blocks = ((avail_phy_pages // self.num_layers // 2) *
+                            (PAGE_SIZE // self.block_mem_size))
         return avail_phy_blocks
 
     def clear(self):

@@ -1,5 +1,5 @@
-#include <memory>
 #include <fcntl.h>
+#include <memory>
 #include <sys/mman.h>
 #include <torch/extension.h>
 
@@ -24,10 +24,10 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
-static inline void* alloc_virtual_mem(const torch::Device &dev, size_t size) {
+static inline void *alloc_virtual_mem(const torch::Device &dev, size_t size) {
   ASSERT(size % kPageSize == 0, "alloc size not aligned."); // Ensure alignment.
 
-  void* vaddr;
+  void *vaddr;
   if (dev.is_cuda()) {
     CHECK_DRV(cuMemAddressReserve(reinterpret_cast<CUdeviceptr *>(&vaddr), size,
                                   kPageSize, 0ULL, 0ULL));
@@ -39,18 +39,20 @@ static inline void* alloc_virtual_mem(const torch::Device &dev, size_t size) {
   return vaddr;
 }
 
-static inline bool map_page(Page *page, offset_t offset, bool set_access, void* vaddr_base) {
+static inline bool map_page(Page *page, offset_t offset, bool set_access,
+                            void *vaddr_base) {
   assert(offset % kPageSize == 0); // Ensure alignment.
   assert(page);
-  auto vaddr =
-      reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(vaddr_base) + offset);
+  auto vaddr = reinterpret_cast<void *>(
+      reinterpret_cast<uintptr_t>(vaddr_base) + offset);
   return page->map(vaddr, set_access);
 }
 
-static inline bool init_with_zero(void* vaddr, size_t size, 
+static inline bool init_with_zero(void *vaddr, size_t size,
                                   std::shared_ptr<Page> zero_page) {
-  assert(reinterpret_cast<uintptr_t>(vaddr) % kPageSize == 0); // Ensure alignment.
-  assert(size % kPageSize == 0);  // Ensure alignment.
+  assert(reinterpret_cast<uintptr_t>(vaddr) % kPageSize ==
+         0);                     // Ensure alignment.
+  assert(size % kPageSize == 0); // Ensure alignment.
 
   bool succ = true;
   for (size_t offset = 0; offset < size; offset += kPageSize) {
@@ -62,14 +64,17 @@ static inline bool init_with_zero(void* vaddr, size_t size,
   return succ;
 }
 
-FTensorAllocator::FTensorAllocator(size_t total_mem_size, const torch::Device &device, bool single_vaddr)
-    : total_mem_size_(total_mem_size), dev_(device), num_layers_(0), single_vaddr_(single_vaddr), vaddr_(nullptr) {
+FTensorAllocator::FTensorAllocator(size_t total_mem_size,
+                                   const torch::Device &device,
+                                   bool single_vaddr)
+    : total_mem_size_(total_mem_size), dev_(device), num_layers_(0),
+      single_vaddr_(single_vaddr), vaddr_(nullptr) {
 
   if (dev_.is_cuda()) {
     init_cuda_();
   }
   zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-  
+
   if (single_vaddr_) {
     vaddr_ = alloc_virtual_mem(dev_, total_mem_size_);
     init_with_zero(vaddr_, total_mem_size_, zero_page_);
@@ -82,20 +87,24 @@ void FTensorAllocator::destroy() {
   ftensors_.clear();
   zero_page_.reset();
   if (vaddr_ && single_vaddr_) {
-    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), total_mem_size_));
-    CHECK_DRV(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), total_mem_size_));
+    CHECK_DRV(
+        cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), total_mem_size_));
+    CHECK_DRV(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_),
+                               total_mem_size_));
   }
 }
 
 /* FIXME (YIFAN): this is not thread safe. */
-void FTensorAllocator::init(size_t total_mem_size, const std::string &dev_str, bool single_vaddr) {
+void FTensorAllocator::init(size_t total_mem_size, const std::string &dev_str,
+                            bool single_vaddr) {
   if (g_allocator_) {
     LOGE("FTensorAllocator has been initialized. Re-initializing...")
     g_allocator_.reset();
   }
 
   auto device = torch::Device(dev_str);
-  g_allocator_ = std::make_unique<FTensorAllocator>(total_mem_size, device, single_vaddr);
+  g_allocator_ =
+      std::make_unique<FTensorAllocator>(total_mem_size, device, single_vaddr);
 }
 
 FTensorAllocator *FTensorAllocator::global_allocator() {
@@ -111,8 +120,7 @@ void FTensorAllocator::shutdown() {
 
 torch::Tensor FTensorAllocator::create_ftensor(size_t size, torch::Dtype dtype,
                                                const std::string &dev_str,
-                                               std::string name,
-                                               void* vaddr) {
+                                               std::string name, void *vaddr) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
@@ -148,15 +156,14 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
   if (single_vaddr_) {
-    return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers, vaddr_);
+    return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers,
+                                   vaddr_);
   } else {
     return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers);
   }
 }
 
-void FTensorAllocator::free_kv_tensors() {
-  ftensors_.clear();
-}
+void FTensorAllocator::free_kv_tensors() { ftensors_.clear(); }
 
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   for (int64_t i = 0; i < num_layers_; i++) {
@@ -224,10 +231,12 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_impl_(
   size_t vaddr_offset = 0;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
-    auto offset_vaddr = reinterpret_cast<generic_ptr_t>(reinterpret_cast<uintptr_t>(vaddr) + vaddr_offset);
+    auto offset_vaddr = reinterpret_cast<generic_ptr_t>(
+        reinterpret_cast<uintptr_t>(vaddr) + vaddr_offset);
     auto tensor = create_ftensor(size, dtype, dev_str, name, offset_vaddr);
     ftensors.push_back(tensor);
-    vaddr_offset += (size + kPageSize - 1) / kPageSize * kPageSize; // Round up to the nearest page.
+    vaddr_offset += (size + kPageSize - 1) / kPageSize *
+                    kPageSize; // Round up to the nearest page.
   }
   return ftensors;
 }
