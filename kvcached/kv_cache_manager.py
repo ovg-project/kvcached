@@ -408,6 +408,25 @@ class PageAllocator(PageAllocatorBase):
             unmap_from_kv_tensors(offsets)
 
 
+class NoOpLock:
+    """A no-op lock that implements the same interface as threading.RLock"""
+
+    def acquire(self, blocking=True, timeout=-1):
+        return True
+
+    def release(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def locked(self):
+        return False
+
+
 def synchronized(method):
 
     @wraps(method)
@@ -454,7 +473,8 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
-        self._lock = threading.RLock()
+        # NOTE: we use a no-op lock for sync scheduling to avoid overhead
+        self._lock = threading.RLock() if async_sched else NoOpLock()
 
     @synchronized
     def alloc(self, need_size: int) -> List[int]:
