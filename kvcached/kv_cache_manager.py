@@ -3,18 +3,21 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, SHM_SIZE, RwLockedShm,
+                            get_ipc_name, get_kvcached_logger,
+                            init_kv_cache_limit)
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
 
 SANITY_CHECK = False
 GPU_UTILIZATION = 0.95
-PAGE_PREALLOC_ENABLED = True
+PAGE_PREALLOC_ENABLED = False
 
 
 class Page:
@@ -136,8 +139,8 @@ class PageAllocator(PageAllocatorBase):
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
-        self.min_reserved_pages = 5
-        self.max_reserved_pages = 10
+        self.min_reserved_pages = 0
+        self.max_reserved_pages = 0
         self.reserved_page_list: List[int] = []  # For fast path allocation
 
         self.reclaimed_page_list: List[int] = [
@@ -416,14 +419,9 @@ class KVCacheManager:
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
 
-        mem_size = self.num_blocks * self.block_mem_size
+        self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-
-        if self.tp_size > 1:
-            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE,
-                                                self.tp_size)
-        else:
-            self.page_allocator = PageAllocator(mem_size, PAGE_SIZE)
+        self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE, self.tp_size)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
@@ -434,7 +432,17 @@ class KVCacheManager:
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
 
+        self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
+        init_kv_cache_limit(self.ipc_name, self.mem_size)
+
     def alloc(self, need_size: int) -> List[int]:
+        # Inter-process synchronization: take an exclusive lock on the
+        # backing file of the shared-memory segment before reading or writing.
+        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.RLOCK) as mm:
+            new_mem_size, _ = np.ndarray((2, ), dtype=np.int64, buffer=mm)
+            if new_mem_size != self.mem_size:
+                self.resize(new_mem_size)
+
         if self.available_size() < need_size:
             return None
 
@@ -481,6 +489,13 @@ class KVCacheManager:
                 page.free_list = []
                 self.full_pages[page.page_id] = page
         assert remaining_need == 0, "Insufficient memory for allocation."
+
+        used_size = (self.page_allocator.get_num_inuse_pages() *
+                     self.num_layers * PAGE_SIZE * 2)
+        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.WLOCK) as mm:
+            shm_arr = np.ndarray((2, ), dtype=np.int64, buffer=mm)
+            shm_arr[:] = [self.mem_size, used_size]
+
         return ret_index
 
     def free(self, indices: List[int]):
@@ -529,6 +544,12 @@ class KVCacheManager:
             self.in_shrink = False
             self.target_num_blocks = None
 
+        used_size = (self.page_allocator.get_num_inuse_pages() *
+                     self.num_layers * PAGE_SIZE * 2)
+        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.WLOCK) as mm:
+            shm_arr = np.ndarray((2, ), dtype=np.int64, buffer=mm)
+            shm_arr[:] = [self.mem_size, used_size]
+
     def try_to_reserve(self, need_size: int) -> bool:
         if self.available_size() < need_size:
             return False
@@ -545,8 +566,7 @@ class KVCacheManager:
             self.free(self.reserved_blocks)
             self.reserved_blocks = []
 
-    def resize(self, new_num_blocks: int):
-        new_mem_size = new_num_blocks * self.block_mem_size
+    def resize(self, new_mem_size: int):
         if self.page_allocator.resize(new_mem_size):
             if self.in_shrink:
                 self.in_shrink = False
@@ -558,7 +578,7 @@ class KVCacheManager:
         # NOTE: we can support resizing with reserved blocks, but we want to enforce
         # this check for now to ensure correctness.
         self.in_shrink = True
-        self.target_num_blocks = new_num_blocks
+        self.target_num_blocks = new_mem_size // self.block_mem_size
         self.free_reserved()
         return False
 
