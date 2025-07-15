@@ -1,6 +1,8 @@
 # kvcached
 
-kvcached is a KV cache management system for serving multiple Large Language Models (LLMs) on a single GPU. It manages and coordinates the use of KV cache resources among co-located LLM instances, enabling them to share GPU memory. kvcached is compatible with popular LLM serving engines, including vLLM and SGLang.
+kvcached is a new KV cache management system that supports on-demand KV cache allocation. It implements the concept of GPU virtual memory, allowing applications to reserve virtual address space without immediately committing physical memory. Physical memory is then automatically allocated and mapped as needed at runtime. This capability allows multiple LLMs to run concurrently on a single GPU and flexibly share its memory, significantly improving GPU utilization and reducing memory fragmentation.
+
+kvcached is compatible with popular LLM serving engines, including SGLang and vLLM.
 
 ## Prerequisites
 
@@ -8,20 +10,20 @@ kvcached is a KV cache management system for serving multiple Large Language Mod
 * PyTorch (tested with 2.6.0 and 2.7.0)
 * Virtual environment tools (scripts are provided for uv==0.7.12)
 
-**Important Note:** The scripts will create separate virtual environments using `uv` for vLLM and sglang.
+**Important Note:** The scripts will create separate virtual environments using `uv` for SGLang and vLLM.
 
-## All-in-One Installation (vLLM+SGLang+kvcached, Recommended)
+## All-in-One Installation (SGLang+vLLM+kvcached, Recommended)
 
-kvcached now supports both vLLM and SGLang. Currently, it requires modifications to the LLM engine's code. To facilitate this process, we provide patches for vLLM version 0.8.4 and SGLang version 0.4.6.post2, along with detailed setup instructions, in the `engine_integration/` directory.
+kvcached now supports both SGLang and vLLM. Currently, it requires modifications to the LLM engine's code. To facilitate this process, we provide patches for SGLang (0.4.6.post2) and vLLM (0.8.4, 0.9.2), along with detailed setup instructions, in the `engine_integration/` directory.
 
-You can install everything (vLLM+SGLang+kvcached) by running the following commands:
+You can install everything (SGLang+vLLM+kvcached) by running the following commands:
 
 ```bash
 cd engine_integration/scripts
-./setup.sh
+./setup.sh all
 ```
 
-This script will download the specified versions of vLLM and SGLang, create separate venv environments, compile the code, apply the necessary patches, and install kvcached.
+This script will download the specified versions of SGLang and vLLM, create separate venv environments, compile the code, apply the necessary patches, and install kvcached.
 
 ## Installation from Source
 
@@ -32,7 +34,7 @@ pip install -r requirements.txt # install build dependencies
 pip install -e . --no-build-isolation
 ```
 
-This will compile and install kvcached. If you have the right versions of vLLM and SGLang, you can apply the patches in `engine_integration/scripts`, and it should work.
+This will compile and install kvcached. If you have the right versions of SGLang and vLLM, you can apply the patches in `engine_integration/scripts`, and it should work.
 
 NOTE: `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment.
 
@@ -46,16 +48,16 @@ python setup.py build_ext --inplace
 
 ## Testing
 
-kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of vLLM/SGLang with kvcached, run:
+kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of SGLang/vLLM with kvcached, run:
 
 ```bash
 cd engine_integration/benchmark
-./start_server.sh [vllm|sgl]
+./start_server.sh [sgl|vllm]
 # Wait until LLM server is ready
-./start_client.sh [vllm|sgl]
+./start_client.sh [sgl|vllm]
 ```
 
-The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run vLLM/SGLang with kvcached.
+The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run SGLang/vLLM with kvcached.
 
 ## Known issues
 
@@ -85,4 +87,5 @@ Feel free to contact us for contributions and collaborations.
 ```
 Jiarong Xing (jxing@rice.edu)
 Yifan Qiao (yifanqiao@berkeley.edu)
+Shan Yu (shanyu1@g.ucla.edu)
 ```
