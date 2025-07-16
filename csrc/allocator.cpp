@@ -37,6 +37,7 @@ FTensorAllocator::FTensorAllocator(const torch::Device &device)
 FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
+  std::lock_guard<std::mutex> lock(mtx_);
   ftensors_.clear();
   zero_page_.reset();
 }
@@ -158,6 +159,7 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
 }
 
 void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
+  std::lock_guard<std::mutex> lock(mtx_);
   auto name = ftensor.name();
   if (ftensors_.find(name) == ftensors_.end()) {
     return;

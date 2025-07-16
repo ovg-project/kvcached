@@ -597,11 +597,8 @@ class KVCacheManager:
         self.reserved_blocks.extend(reserved)
         return True
 
+    @synchronized
     def free_reserved(self):
-        # We intentionally *do not* wrap this method in an additional
-        # ``with self.lock`` because ``self.free`` already acquires the same
-        # re-entrant lock.  Attempting to acquire it again would be safe with
-        # an ``RLock`` but is unnecessary; leaving it out reduces contention.
         if self.reserved_blocks:
             self.free(self.reserved_blocks)
             self.reserved_blocks = []
