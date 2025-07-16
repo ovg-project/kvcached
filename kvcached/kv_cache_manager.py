@@ -1,15 +1,19 @@
+import atexit
+import os
+import signal
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
+import posix_ipc
 import torch
 
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
 from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, MemInfoStruct,
-                            RwLockedShm, get_ipc_name, get_kvcached_logger,
-                            init_kv_cache_limit)
+                            RwLockedShm, get_ipc_name, get_ipc_path,
+                            get_kvcached_logger, init_kv_cache_limit)
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
@@ -433,6 +437,7 @@ class KVCacheManager:
 
         self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
         init_kv_cache_limit(self.ipc_name, self.mem_size)
+        self._register_cleanup()
 
     def alloc(self, need_size: int) -> List[int]:
         # Inter-process synchronization: take an exclusive lock on the
@@ -632,3 +637,43 @@ class KVCacheManager:
 
     def clear(self):
         raise NotImplementedError
+
+    def _cleanup_shm(self, *args):
+        """Remove the POSIX shared-memory segment and its backing file."""
+        try:
+            # Unlink the POSIX shared memory object (no-op if already removed)
+            posix_ipc.unlink_shared_memory(self.ipc_name)
+        except Exception:
+            pass
+
+        # Also attempt to remove the backing file in /dev/shm (created by RwLockedShm)
+        try:
+            os.unlink(get_ipc_path(self.ipc_name))
+        except FileNotFoundError:
+            pass
+
+        # If invoked as a signal handler, re-raise the default behaviour so the
+        # process exits with the expected status code.
+        if args and isinstance(args[0], int):
+            signum = args[0]
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    def _register_cleanup(self):
+        """Register atexit and signal handlers for shared-memory cleanup."""
+        # Run on normal interpreter shutdown
+        atexit.register(self._cleanup_shm)
+
+        # Handle common termination signals (e.g., Ctrl-C or docker stop)
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(_sig, self._cleanup_shm)
+            except Exception:
+                # Could fail in non-main threads; ignore.
+                pass
+
+    def __del__(self):
+        try:
+            self._cleanup_shm()
+        except Exception:
+            pass
