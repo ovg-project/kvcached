@@ -8,9 +8,9 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-from kvcached.controller.cli import get_kv_cache_limit, update_kv_cache_limit
-from kvcached.controller.kvtop import _detect_kvcache_ipc_names
-from kvcached.controller.kvtop import kvtop as kvtop_ui
+from kvtop import _detect_kvcache_ipc_names
+from kvtop import kvtop as kvtop_ui
+from utils import get_kv_cache_limit, update_kv_cache_limit
 
 try:
     import readline  # type: ignore
@@ -56,7 +56,7 @@ def _clr(text: str, color: str | None = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'top', 'help', 'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'help', 'exit', 'quit'
 ]
 
 # Nicely formatted help text for the interactive shell.
@@ -66,7 +66,7 @@ Available commands:
   limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
   watch [-n sec] [ipc ...]     Continuously display usage table
-  top [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
+  kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
   exit | quit                  Exit the shell
@@ -203,7 +203,7 @@ def cmd_limit(ipc: str, size_str: str):
 
 
 def cmd_limit_percent(ipc: str, percent: float):
-    from kvcached.controller.cli import get_total_gpu_memory
+    from kvcached.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
@@ -271,8 +271,8 @@ def interactive_shell():
             elif cmd == 'watch':
                 interval = float(tokens[1]) if len(tokens) > 1 else 1.0
                 cmd_watch(interval)
-            elif cmd == 'top':
-                # Syntax: top [refresh] [ipc...]
+            elif cmd == 'kvtop':
+                # Syntax: kvtop [refresh] [ipc...]
                 # If first arg numeric → refresh, else ipc name.
                 refresh = 1.0
                 ipcs = []
@@ -325,14 +325,14 @@ def _main():
     p_watch.add_argument('-n', '--interval', type=float, default=1.0)
     p_watch.add_argument('ipc', nargs='*')
 
-    # top
-    p_top = sub.add_parser('top', help='Launch curses kvtop UI')
-    p_top.add_argument('-r',
-                       '--refresh',
-                       type=float,
-                       default=1.0,
-                       help='Refresh interval')
-    p_top.add_argument('ipc', nargs='*', help='IPC names (optional)')
+    # kvtop
+    p_kvtop = sub.add_parser('kvtop', help='Launch curses kvtop UI')
+    p_kvtop.add_argument('-r',
+                         '--refresh',
+                         type=float,
+                         default=1.0,
+                         help='Refresh interval')
+    p_kvtop.add_argument('ipc', nargs='*', help='IPC names (optional)')
 
     # shell
     sub.add_parser('shell', help='Start interactive shell')
@@ -347,7 +347,7 @@ def _main():
         cmd_limit_percent(args.ipc, args.percent)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
-    elif args.command == 'top':
+    elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
     elif args.command == 'shell' or args.command is None:
         interactive_shell()
