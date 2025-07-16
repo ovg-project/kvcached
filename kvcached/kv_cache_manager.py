@@ -20,7 +20,7 @@ logger = get_kvcached_logger()
 
 SANITY_CHECK = False
 GPU_UTILIZATION = 0.95
-PAGE_PREALLOC_ENABLED = False
+PAGE_PREALLOC_ENABLED = True
 
 
 class Page:
@@ -142,8 +142,8 @@ class PageAllocator(PageAllocatorBase):
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
-        self.min_reserved_pages = 0
-        self.max_reserved_pages = 0
+        self.min_reserved_pages = 5
+        self.max_reserved_pages = 10
         self.reserved_page_list: List[int] = []  # For fast path allocation
 
         self.reclaimed_page_list: List[int] = [
