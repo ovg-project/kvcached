@@ -92,11 +92,18 @@ def alloc_kv_cache(
     return k_tensors, v_tensors
 
 
-def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
-                         num_layers: int) -> KVCacheManager:
+def get_kv_cache_manager(num_blocks: int,
+                         block_size: int,
+                         cell_size: int,
+                         num_layers: int,
+                         reserve_null_block: bool = True) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(num_blocks, block_size, cell_size, num_layers,
-                          _async_sched)
+    return KVCacheManager(num_blocks,
+                          block_size,
+                          cell_size,
+                          num_layers,
+                          async_sched=_async_sched,
+                          reserve_null_block=reserve_null_block)

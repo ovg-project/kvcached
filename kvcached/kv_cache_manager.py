@@ -124,17 +124,20 @@ class PageAllocator(PageAllocatorBase):
                  total_mem_size: int,
                  page_size: int,
                  tp_size: int = 1,
-                 async_sched: bool = False):
+                 async_sched: bool = False,
+                 enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
         """
         Args:
             total_mem_size: Total memory size in bytes.
             page_size: Page size in bytes.
             async_sched: Whether asynchronous scheduling is enabled.
+            enable_page_prealloc: Whether to enable page preallocation.
         """
         logger.info(f"Init KVCached PageAllocator: "
                     f"total_mem_size={total_mem_size//(1024*1024)}MB, "
                     f"page_size={page_size//(1024*1024)}MB, "
-                    f"enable_prealloc={PAGE_PREALLOC_ENABLED}")
+                    f"async_sched={async_sched}, "
+                    f"enable_prealloc={enable_page_prealloc}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
@@ -149,20 +152,26 @@ class PageAllocator(PageAllocatorBase):
 
         self.min_reserved_pages = 5
         self.max_reserved_pages = 10
-        self.reserved_page_list: List[int] = []  # For fast path allocation
+        self.reserved_page_list: deque[int] = deque()  # Fast path allocation
 
-        self.reclaimed_page_list: List[int] = []  # For reclaimed page ids
+        self.reclaimed_page_list: deque[int] = deque()  # Reclaimed page ids
 
         # Preallocation thread management
+        self.enable_page_prealloc = enable_page_prealloc
         self.prealloc_lock = threading.RLock()
         self.prealloc_cond = threading.Condition(self.prealloc_lock)
         self.prealloc_running = False
         self.prealloc_needed = False
         self.prealloc_thd = None
 
-        if PAGE_PREALLOC_ENABLED:
-            # Start preallocation thread
+    def start_prealloc_thread(self):
+        # NOTE: called by KVCacheManager after reserving the null block
+        if self.enable_page_prealloc:
             self._start_prealloc_thread()
+
+    def __del__(self):
+        if self.enable_page_prealloc:  # Stop preallocation thread
+            self._stop_prealloc_thread()
 
     def _prealloc_worker(self):
         """Worker thread that preallocates pages and maps them to physical memory."""
@@ -192,7 +201,6 @@ class PageAllocator(PageAllocatorBase):
                     else:
                         break
 
-            # Todo: Map pages to physical memory (outside lock)
             if pages_to_reserve:
                 try:
                     self._map_pages(pages_to_reserve)
@@ -244,7 +252,7 @@ class PageAllocator(PageAllocatorBase):
         # Fast path: allocate pages with reserved physical memory mapping.
         with self.prealloc_lock:
             if self.reserved_page_list:
-                page_id = self.reserved_page_list.pop()
+                page_id = self.reserved_page_list.popleft()
 
                 # Trigger preallocation to refill reserved pool if getting low
                 if len(self.reserved_page_list) < self.min_reserved_pages:
@@ -259,7 +267,7 @@ class PageAllocator(PageAllocatorBase):
         page = Page(page_id, self.page_size)
         self._map_pages([page_id])
 
-        if PAGE_PREALLOC_ENABLED:
+        if self.enable_page_prealloc:
             # Trigger preallocation to refill the pool
             self._trigger_preallocation()
 
@@ -269,7 +277,8 @@ class PageAllocator(PageAllocatorBase):
         page_id = page.page_id
         if SANITY_CHECK:
             with self.prealloc_lock:
-                if page_id in self.free_page_list or page_id in self.reserved_page_list:
+                if (page_id in self.free_page_list
+                        or page_id in self.reserved_page_list):
                     raise ValueError(f"Page {page_id} is already free")
 
         self.num_free_pages += 1
@@ -380,27 +389,21 @@ class PageAllocator(PageAllocatorBase):
         return self.get_num_total_pages() * self._num_blocks_per_page(
             block_mem_size)
 
+    # Private methods
     def _num_blocks_per_page(self, block_mem_size: int):
         assert self.page_size % block_mem_size == 0
         return self.page_size // block_mem_size
 
-    def __del__(self):
-        # Stop preallocation thread
-        if PAGE_PREALLOC_ENABLED:
-            self._stop_prealloc_thread()
-
     def _map_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:
-            # map the pages across all tensor parallel workers.
+        if self.tp_size > 1:  # map pages across all tensor parallel workers.
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
             map_to_kv_tensors(offsets)
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:
-            # unmap the pages across all tensor parallel workers.
+        if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
             broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
         else:
             if self.async_sched:
@@ -447,6 +450,7 @@ class KVCacheManager:
         num_layers: int,
         tp_size: int = 1,
         async_sched: bool = False,
+        reserve_null_block: bool = False,
     ):
         """
         Args:
@@ -476,13 +480,17 @@ class KVCacheManager:
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
+        # Reserve the first block as null block for padding tokens
+        if reserve_null_block:
+            self.null_block = self.alloc(1)
+            assert self.null_block == [0], "Failed to reserve null block"
+        self.page_allocator.start_prealloc_thread()
+
     @synchronized
     def alloc(self, need_size: int) -> List[int]:
         if self.available_size() < need_size:
-            print(
-                f"Warning: available_size() < need_size, "
-                f"available_size={self.available_size()}, need_size={need_size}"
-            )
+            logger.warning(f"available_size()={self.available_size()} < "
+                           f"need_size={need_size}")
             return []
 
         ret_index = []
