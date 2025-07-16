@@ -422,6 +422,7 @@ class KVCacheManager:
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
 
+        # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
         self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE, self.tp_size)
@@ -436,16 +437,14 @@ class KVCacheManager:
         self.target_num_blocks: Optional[int] = None
 
         self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
-        init_kv_cache_limit(self.ipc_name, self.mem_size)
+        init_kv_cache_limit(self.ipc_name, self.mem_size * num_layers * 2)
         self._register_cleanup()
 
     def alloc(self, need_size: int) -> List[int]:
-        # Inter-process synchronization: take an exclusive lock on the
-        # backing file of the shared-memory segment before reading or writing.
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.RLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            new_mem_size = mem_info.total_size
+            new_mem_size = mem_info.total_size // self.num_layers // 2
             if new_mem_size != self.mem_size:
                 self.resize(new_mem_size)
 
@@ -577,6 +576,12 @@ class KVCacheManager:
             self.reserved_blocks = []
 
     def resize(self, new_mem_size: int):
+        """
+        Reset the limit of the K or V tensor in one layer.
+        new_mem_size: the memory size of the K or V tensor in one layer
+        """
+        assert new_mem_size > 0, "new_mem_size must be positive"
+
         if self.page_allocator.resize(new_mem_size):
             if self.in_shrink:
                 self.in_shrink = False
@@ -665,11 +670,11 @@ class KVCacheManager:
         atexit.register(self._cleanup_shm)
 
         # Handle common termination signals (e.g., Ctrl-C or docker stop)
-        for _sig in (signal.SIGINT, signal.SIGTERM):
+        for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP,
+                     signal.SIGQUIT):
             try:
                 signal.signal(_sig, self._cleanup_shm)
             except Exception:
-                # Could fail in non-main threads; ignore.
                 pass
 
     def __del__(self):
