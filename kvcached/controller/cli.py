@@ -1,12 +1,23 @@
 import logging
 
-import numpy as np
 import posix_ipc
 
-from kvcached.controller.utils import (DEFAULT_IPC_NAME, RwLockedShm,
-                                       get_ipc_name, get_kv_cache_limit)
+from kvcached.utils import (DEFAULT_IPC_NAME, MemInfoStruct, RwLockedShm,
+                            get_ipc_name)
 
 logger = logging.getLogger(__name__)
+
+
+def get_kv_cache_limit(ipc_name: str) -> MemInfoStruct:
+    """
+    Get the kv cache limit for the current process.
+    """
+    try:
+        with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
+                         RwLockedShm.RLOCK) as mm:
+            return MemInfoStruct.from_buffer(mm)
+    except FileNotFoundError:
+        return None
 
 
 def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
@@ -16,16 +27,17 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     """
     shm = posix_ipc.SharedMemory(get_ipc_name(ipc_name),
                                  posix_ipc.O_CREAT,
-                                 size=np.int64().itemsize * 2,
+                                 size=MemInfoStruct.SHM_SIZE,
                                  mode=0o666)
     shm.close_fd()
 
     # Now we can safely memory map and write the values
-    with RwLockedShm(get_ipc_name(ipc_name),
-                     np.int64().itemsize * 2, RwLockedShm.WLOCK) as mm:
-        mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
-        mem_info[0] = kv_cache_limit
-        mem_info[1] = 0
+    with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
+                     RwLockedShm.WLOCK) as mm:
+        mem_info = MemInfoStruct.from_buffer(mm)
+        mem_info.total_size = kv_cache_limit
+        mem_info.used_size = 0
+        mem_info.write_to_buffer(mm)
         return mem_info
 
 
@@ -34,19 +46,32 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     Update the kv cache limit for the current process.
     """
     try:
-        with RwLockedShm(get_ipc_name(ipc_name),
-                         np.int64().itemsize * 2, RwLockedShm.WLOCK) as mm:
-            mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
-            delta = kv_cache_limit - mem_info[0]
+        with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
+                         RwLockedShm.WLOCK) as mm:
+            mem_info = MemInfoStruct.from_buffer(mm)
+            delta = kv_cache_limit - mem_info.total_size
             if delta < 0:
-                if mem_info[0] - mem_info[1] + delta < 0:
+                if mem_info.total_size - mem_info.used_size + delta < 0:
                     logger.warning(
                         f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
                     )
-            mem_info[0] = kv_cache_limit
+            mem_info.total_size = kv_cache_limit
+            mem_info.write_to_buffer(mm)
             return mem_info
     except FileNotFoundError:
         return None
+
+
+def get_total_gpu_memory() -> int:
+    """Return total memory of CUDA device 0 or 0 if CUDA unavailable."""
+    try:
+        import torch  # imported lazily to avoid heavy import cost when not needed
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory
+    except Exception:  # pragma: no cover – best-effort helper
+        pass
+    return 0
 
 
 def main(args):
@@ -58,7 +83,9 @@ def main(args):
         if mem_info is None:
             print("No kv cache limit set")
         else:
-            print(f"{{kv_cache_limit: {mem_info[0]}, in_use: {mem_info[1]}}}")
+            print(
+                f"{{kv_cache_limit: {mem_info.total_size}, in_use: {mem_info.used_size}}}"
+            )
     elif args.action == "update":
         update_kv_cache_limit(args.ipc_name, args.size)
         print(f"Updated kv cache limit to {args.size}")

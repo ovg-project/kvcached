@@ -2,11 +2,17 @@ import fcntl
 import logging
 import mmap
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import posix_ipc
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
+
+# Allow overriding the shared-memory segment name via env var so multiple
+# kvcached deployments on one machine can coexist without collision.
+DEFAULT_IPC_NAME = os.getenv("KVCACHED_IPC_NAME", "kvcached_mem_info")
+SHM_DIR = "/dev/shm"
 
 
 def align_to(x: int, a: int) -> int:
@@ -44,13 +50,6 @@ def get_kvcached_logger(name: str = "kvcached") -> logging.Logger:
     return logger
 
 
-# Allow overriding the shared-memory segment name via env var so multiple
-# kvcached deployments on one machine can coexist without collision.
-DEFAULT_IPC_NAME = os.getenv("KVCACHED_IPC_NAME", "kvcached_mem_info")
-SHM_DIR = "/dev/shm"
-SHM_SIZE = np.int64().itemsize * 2
-
-
 def get_ipc_path(ipc_name: str) -> str:
     """Convert IPC name to full path in /dev/shm."""
     if ipc_name.startswith('/'):
@@ -63,18 +62,28 @@ def get_ipc_name(ipc_path: str) -> str:
     return os.path.basename(ipc_path)
 
 
+@dataclass
 class MemInfoStruct:
+    total_size: int
+    used_size: int
 
-    def __init__(self, total_size: int, used_size: int):
-        self.total_size = total_size
-        self.used_size = used_size
+    DTYPE = np.int64
+    N_FIELDS = 2
+    SHM_SIZE = np.dtype(DTYPE).itemsize * N_FIELDS
 
-    def to_np_array(self) -> np.ndarray:
-        return np.array([self.total_size, self.used_size], dtype=np.int64)
+    @classmethod
+    def _view(cls, buf: mmap.mmap) -> np.ndarray:
+        """Return a live NumPy view onto the shared buffer."""
+        return np.ndarray((cls.N_FIELDS, ), dtype=cls.DTYPE, buffer=buf)
 
-    @staticmethod
-    def from_np_array(data: np.ndarray) -> "MemInfoStruct":
-        return MemInfoStruct(data[0], data[1])
+    @classmethod
+    def from_buffer(cls, buf: mmap.mmap) -> "MemInfoStruct":
+        arr = cls._view(buf)
+        return cls(int(arr[0]), int(arr[1]))
+
+    def write_to_buffer(self, buf: mmap.mmap) -> None:
+        arr = self._view(buf)
+        arr[:] = (self.total_size, self.used_size)
 
 
 class RwLockedShm:
@@ -122,19 +131,6 @@ class RwLockedShm:
         self.file.close()
 
 
-def get_kv_cache_limit(ipc_name: str) -> np.ndarray:
-    """
-    Get the kv cache limit for the current process.
-    """
-    try:
-        with RwLockedShm(get_ipc_name(ipc_name), SHM_SIZE,
-                         RwLockedShm.RLOCK) as mm:
-            mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm).copy()
-            return mem_info
-    except FileNotFoundError:
-        return None
-
-
 def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     """
     Set the kv cache limit for the current process.
@@ -142,13 +138,15 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     """
     shm = posix_ipc.SharedMemory(get_ipc_name(ipc_name),
                                  posix_ipc.O_CREAT,
-                                 size=SHM_SIZE,
+                                 size=MemInfoStruct.SHM_SIZE,
                                  mode=0o666)
     shm.close_fd()
 
     # Now we can safely memory map and write the values
-    with RwLockedShm(get_ipc_name(ipc_name), SHM_SIZE,
+    with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
                      RwLockedShm.WLOCK) as mm:
-        mem_info = np.ndarray((2, ), dtype=np.int64, buffer=mm)
-        mem_info[:] = [kv_cache_limit, 0]
+        mem_info = MemInfoStruct.from_buffer(mm)
+        mem_info.total_size = kv_cache_limit
+        mem_info.used_size = 0
+        mem_info.write_to_buffer(mm)
         return mem_info

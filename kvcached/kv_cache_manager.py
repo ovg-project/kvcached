@@ -3,13 +3,12 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, SHM_SIZE, RwLockedShm,
-                            get_ipc_name, get_kvcached_logger,
+from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, MemInfoStruct,
+                            RwLockedShm, get_ipc_name, get_kvcached_logger,
                             init_kv_cache_limit)
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
@@ -438,8 +437,10 @@ class KVCacheManager:
     def alloc(self, need_size: int) -> List[int]:
         # Inter-process synchronization: take an exclusive lock on the
         # backing file of the shared-memory segment before reading or writing.
-        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.RLOCK) as mm:
-            new_mem_size, _ = np.ndarray((2, ), dtype=np.int64, buffer=mm)
+        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
+                         RwLockedShm.RLOCK) as mm:
+            mem_info = MemInfoStruct.from_buffer(mm)
+            new_mem_size = mem_info.total_size
             if new_mem_size != self.mem_size:
                 self.resize(new_mem_size)
 
@@ -492,9 +493,11 @@ class KVCacheManager:
 
         used_size = (self.page_allocator.get_num_inuse_pages() *
                      self.num_layers * PAGE_SIZE * 2)
-        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.WLOCK) as mm:
-            shm_arr = np.ndarray((2, ), dtype=np.int64, buffer=mm)
-            shm_arr[:] = [self.mem_size, used_size]
+        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
+                         RwLockedShm.WLOCK) as mm:
+            mem_info = MemInfoStruct.from_buffer(mm)
+            mem_info.used_size = used_size
+            mem_info.write_to_buffer(mm)
 
         return ret_index
 
@@ -546,9 +549,11 @@ class KVCacheManager:
 
         used_size = (self.page_allocator.get_num_inuse_pages() *
                      self.num_layers * PAGE_SIZE * 2)
-        with RwLockedShm(self.ipc_name, SHM_SIZE, RwLockedShm.WLOCK) as mm:
-            shm_arr = np.ndarray((2, ), dtype=np.int64, buffer=mm)
-            shm_arr[:] = [self.mem_size, used_size]
+        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
+                         RwLockedShm.WLOCK) as mm:
+            mem_info = MemInfoStruct.from_buffer(mm)
+            mem_info.used_size = used_size
+            mem_info.write_to_buffer(mm)
 
     def try_to_reserve(self, need_size: int) -> bool:
         if self.available_size() < need_size:
