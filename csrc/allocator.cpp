@@ -77,8 +77,17 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
   return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers);
 }
 
-bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+bool FTensorAllocator::kv_tensors_created() {
   std::lock_guard<std::mutex> lock(mtx_);
+  return num_layers_ > 0;
+}
+
+bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (num_layers_ == 0) {
+    LOGE("try to map to KV tensors when KV tensors are not created");
+    return false;
+  }
 
   for (int64_t i = 0; i < num_layers_; i++) {
     auto kv_name = std::string(kv_prefix) + std::to_string(i);
@@ -102,7 +111,11 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 
 bool FTensorAllocator::unmap_from_kv_tensors(
     const std::vector<offset_t> &offsets) {
-  std::lock_guard<std::mutex> lock(mtx_);
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (num_layers_ == 0) {
+    LOGE("try to unmap from KV tensors when KV tensors are not created");
+    return false;
+  }
 
   for (int64_t i = 0; i < num_layers_; i++) {
     auto kv_name = std::string(kv_prefix) + std::to_string(i);

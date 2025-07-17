@@ -1,4 +1,5 @@
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from functools import wraps
@@ -6,10 +7,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
+from kvcached.tp_ipc_util import (broadcast_kv_tensors_created_to_workers,
+                                  broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
 from kvcached.utils import PAGE_SIZE, get_kvcached_logger
-from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
+from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
+                              unmap_from_kv_tensors)
 
 logger = get_kvcached_logger()
 
@@ -304,6 +307,9 @@ class PageAllocator(PageAllocatorBase):
                 self.reserved_page_list.extend(page_ids[:num_to_reserve])
                 page_ids = page_ids[num_to_reserve:]
 
+        if len(page_ids) == 0:
+            return
+
         # Slow path: free page_ids and their physical memory mapping.
         self._unmap_pages(page_ids)
         with self.prealloc_lock:
@@ -463,6 +469,7 @@ class KVCacheManager:
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
+        self.reserve_null_block = reserve_null_block
 
         self.tp_size = tp_size
         mem_size = self.num_blocks * self.block_mem_size
@@ -480,14 +487,49 @@ class KVCacheManager:
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
+        self.null_block: Optional[list[int]] = None
+
+        # Event used to signal that _post_init() has finished.
+        self._post_init_done = threading.Event()
+        # Launch _post_init in the background; it will block until KV tensors
+        # exist, then complete the remaining setup (reserve null block, start
+        # pre-alloc thread) and finally set the event.
+        threading.Thread(target=self._post_init, daemon=True).start()
+
+    def _post_init(self):
+        if self.null_block is not None:
+            return
+
+        def _check_kv_tensors_created():
+            if self.tp_size > 1:
+                return broadcast_kv_tensors_created_to_workers(self.tp_size)
+            else:
+                return kv_tensors_created()
+
+        # Busy-wait until the KV tensors become available.
+        while not _check_kv_tensors_created():
+            time.sleep(0.001)
+
         # Reserve the first block as null block for padding tokens
-        if reserve_null_block:
-            self.null_block = self.alloc(1)
+        if self.reserve_null_block:
+            # Skip the wait to avoid dead-lock with the event.
+            self.null_block = self.alloc(1, _skip_wait=True)
             assert self.null_block == [0], "Failed to reserve null block"
         self.page_allocator.start_prealloc_thread()
 
+        self._post_init_done.set()
+
+    def _wait_post_init(self):
+        if not self._post_init_done.is_set():
+            self._post_init_done.wait()
+
     @synchronized
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, need_size: int, _skip_wait: bool = False) -> List[int]:
+        if not _skip_wait:
+            # Normal callers must wait until background initialisation is
+            # finished and then perform the usual capacity check.
+            self._wait_post_init()
+
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
                            f"need_size={need_size}")
@@ -540,24 +582,28 @@ class KVCacheManager:
 
     @synchronized
     def free(self, indices: List[int]):
+        self._wait_post_init()
         # assert (
         #     len(self.reserved_blocks) == 0
         # ), "Reserved blocks must be used or freed before freeing other blocks."
         # # NOTE: we can support freeing reserved blocks, but we want to enforce
         # # this check for now to ensure correctness.
+        unique_indices = set(indices)
         if self.reserved_blocks:
-            for idx in indices:
-                if idx in self.reserved_blocks:
-                    self.reserved_blocks.remove(idx)
+            self.reserved_blocks = [
+                idx for idx in self.reserved_blocks
+                if idx not in unique_indices
+            ]
 
         idx_dict = defaultdict(list)
-        for idx in indices:
+        for idx in unique_indices:
             page_id = self.page_allocator.get_page_id(idx, self.block_mem_size)
             idx_dict[page_id].append(idx)
 
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
-            if page_id not in self.full_pages and page_id not in self.avail_pages:
+            if (SANITY_CHECK and page_id not in self.full_pages
+                    and page_id not in self.avail_pages):
                 logger.warning(
                     f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed."
                 )
@@ -587,6 +633,7 @@ class KVCacheManager:
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
+        self._wait_post_init()
         if self.available_size() < need_size:
             return False
         # assert (
@@ -605,6 +652,7 @@ class KVCacheManager:
 
     @synchronized
     def resize(self, new_num_blocks: int):
+        self._wait_post_init()
         new_mem_size = new_num_blocks * self.block_mem_size
         if self.page_allocator.resize(new_mem_size):
             if self.in_shrink:
@@ -623,6 +671,7 @@ class KVCacheManager:
 
     @synchronized
     def trim(self):
+        self._wait_post_init()
         self.page_allocator.trim()
 
     @synchronized
