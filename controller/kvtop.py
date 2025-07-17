@@ -33,8 +33,8 @@ def _detect_kvcache_ipc_names() -> List[str]:
             try:
                 with RwLockedShm(fname, MemInfoStruct.SHM_SIZE,
                                  RwLockedShm.RLOCK) as mm:
-                    mem_info = MemInfoStruct.from_buffer(mm)
-                    if mem_info.total_size <= 0:
+                    total_size = MemInfoStruct.from_buffer(mm).total_size
+                    if total_size <= 0:
                         continue
                 candidates.append(fname)
             except Exception:

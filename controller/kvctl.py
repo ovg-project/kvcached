@@ -136,14 +136,31 @@ SIZE_SUFFIXES = {
 
 
 def _parse_size(size_str: str) -> int:
-    """Convert human-friendly size strings like '512M', '1g', '100_000' to bytes."""
+    """
+    Convert human-friendly size strings such as ``512M``, ``1g`` or
+    ``100_000`` into a byte count.
+
+    Because some suffixes overlap (e.g. ``b`` vs ``mb``), we sort the suffix
+    table by *descending length* so that the longest suffix wins.  Invalid
+    strings raise ``ValueError`` instead of crashing later.
+    """
     s = size_str.strip().lower().replace(',', '').replace('_', '')
-    for suf, mul in SIZE_SUFFIXES.items():
+
+    # Try to match the longest suffix first ("mb" before "b", etc.)
+    for suf, mul in sorted(SIZE_SUFFIXES.items(), key=lambda kv: -len(kv[0])):
         if s.endswith(suf):
-            num = float(s[:-len(suf)])
+            num_part = s[:-len(suf)] or "0"
+            try:
+                num = float(num_part)
+            except ValueError as exc:
+                raise ValueError(f"Invalid size string '{size_str}'") from exc
             return int(num * mul)
-    # No suffix – assume raw bytes
-    return int(float(s))
+
+    # No recognised suffix – assume the string is raw bytes
+    try:
+        return int(float(s))
+    except ValueError as exc:
+        raise ValueError(f"Invalid size string '{size_str}'") from exc
 
 
 def _format_size(num_bytes: int) -> str:
@@ -200,12 +217,32 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
 
 
 def cmd_limit(ipc: str, size_str: str):
+    """Set an absolute limit for an existing IPC segment.
+
+    We first validate that the supplied ``ipc`` name corresponds to a running
+    segment; otherwise we refuse the operation to avoid accidentally creating
+    a new (wrong-case) shared-memory file.
+    """
+    if get_kv_cache_limit(ipc) is None:
+        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
+              file=sys.stderr)
+        avail = _detect_kvcache_ipc_names()
+        if avail:
+            print("Active IPC names:", ", ".join(avail), file=sys.stderr)
+        return
+
     size_bytes = _parse_size(size_str)
     update_kv_cache_limit(ipc, size_bytes)
 
 
 def cmd_limit_percent(ipc: str, percent: float):
-    from kvcached.utils import get_total_gpu_memory
+    """Set limit as percentage of total GPU RAM for an existing IPC."""
+    if get_kv_cache_limit(ipc) is None:
+        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
+              file=sys.stderr)
+        return
+
+    from utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
@@ -271,19 +308,43 @@ def interactive_shell():
             elif cmd == 'limit-percent' and len(tokens) == 3:
                 cmd_limit_percent(tokens[1], float(tokens[2]))
             elif cmd == 'watch':
-                interval = float(tokens[1]) if len(tokens) > 1 else 1.0
-                cmd_watch(interval)
+                # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
+                interval: float = 1.0
+                ipcs: List[str] = []
+                i = 1
+                while i < len(tokens):
+                    tok = tokens[i]
+                    if tok in ('-n', '--interval'):
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError(
+                                "Expected number after '-n/--interval'")
+                        interval = float(tokens[i])
+                    else:
+                        # If token is a bare number and interval wasn't set via flag,
+                        # treat it as the legacy positional interval argument.
+                        if not ipcs and tok.replace('.', '', 1).isdigit():
+                            interval = float(tok)
+                        else:
+                            ipcs.append(tok)
+                    i += 1
+                cmd_watch(interval, ipcs if ipcs else None)
             elif cmd == 'kvtop':
-                # Syntax: kvtop [refresh] [ipc...]
-                # If first arg numeric → refresh, else ipc name.
-                refresh = 1.0
-                ipcs = []
-                if len(tokens) >= 2:
-                    try:
-                        refresh = float(tokens[1])
-                        ipcs = tokens[2:]
-                    except ValueError:
-                        ipcs = tokens[1:]
+                # Syntax: kvtop [-r/--refresh SEC] [ipc ...]
+                refresh: float = 1.0
+                ipcs: List[str] = []
+                i = 1
+                while i < len(tokens):
+                    tok = tokens[i]
+                    if tok in ('-r', '--refresh'):
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError(
+                                "Expected float after '-r/--refresh'")
+                        refresh = float(tokens[i])
+                    else:
+                        ipcs.append(tok)
+                    i += 1
                 cmd_top(ipcs if ipcs else None, refresh)
             else:
                 # Fallback to system shell
