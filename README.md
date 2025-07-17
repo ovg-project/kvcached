@@ -4,6 +4,16 @@ kvcached is a new KV cache management system that supports on-demand KV cache al
 
 kvcached is compatible with popular LLM serving engines, including SGLang and vLLM.
 
+## Installation
+
+It is recommended to install PyTorch first by following the official instructions.
+
+Then, install `kvcached` from PyPI. Note that `--no-build-isolation` is required.
+
+```bash
+pip install kvcached --no-build-isolation
+```
+
 ## Prerequisites
 
 * Python (tested with 3.11)

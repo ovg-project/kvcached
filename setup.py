@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import List
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 try:
     from torch.utils.cpp_extension import (BuildExtension, CUDAExtension,
@@ -40,8 +40,9 @@ def get_extensions():
 ext_modules, cmdclass = get_extensions()
 
 setup(
-    name="kvcached",
-    version="0.1.0",
+    packages=find_packages(),
+    long_description=open("README.md", "r", encoding="utf-8").read(),
+    long_description_content_type="text/markdown",
     ext_modules=ext_modules,
     cmdclass=cmdclass,
 )
