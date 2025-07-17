@@ -425,7 +425,8 @@ class KVCacheManager:
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-        self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE, self.tp_size)
+        self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE,
+                                            self.tp_size)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
