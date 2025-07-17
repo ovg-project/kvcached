@@ -8,11 +8,13 @@ kvcached is compatible with popular LLM serving engines, including SGLang and vL
 
 It is recommended to install PyTorch first by following the official instructions.
 
-Then, install `kvcached` from PyPI. Note that `--no-build-isolation` is required.
+Then, install kvcached:
 
 ```bash
 pip install kvcached --no-build-isolation
 ```
+
+Note that `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment. If PyTorch is re-installed or upgraded, one will need to re-install kvcached as well.
 
 ## Prerequisites
 

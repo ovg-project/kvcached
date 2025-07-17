@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 DEV_MODE=false  # Set to true to use the local kvcached directory
+KVCACHED_VERSION=0.0.1.dev3
 
 check_uv() {
     if ! command -v uv &> /dev/null; then
@@ -42,7 +43,9 @@ setup_vllm() {
         uv pip install -e . --no-build-isolation
         popd
     else
-        uv pip install -i https://test.pypi.org/simple/ kvcached==0.0.1.dev2 --no-build-isolation --no-cache-dir
+        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
+        --no-build-isolation --no-cache-dir \
+        --extra-index-url https://pypi.org/simple
     fi
 
     deactivate
@@ -71,7 +74,9 @@ setup_sglang() {
         uv pip install -e . --no-build-isolation
         popd
     else
-        uv pip install -i https://test.pypi.org/simple/ kvcached==0.0.1.dev2 --no-build-isolation --no-cache-dir
+        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
+        --no-build-isolation --no-cache-dir \
+        --extra-index-url https://pypi.org/simple
     fi
 
 
