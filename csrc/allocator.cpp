@@ -153,6 +153,7 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_impl_(
   return ftensors;
 }
 
+/** this function is not thread-safe */
 torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
                                                 const std::string &dev_str,
                                                 std::string name) {
@@ -171,8 +172,8 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
   return ftensors_[name]->get_tensor();
 }
 
+/** this function is not thread-safe */
 void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
-  std::lock_guard<std::mutex> lock(mtx_);
   auto name = ftensor.name();
   if (ftensors_.find(name) == ftensors_.end()) {
     return;
