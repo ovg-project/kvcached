@@ -21,6 +21,66 @@ GPU_UTILIZATION = 0.95
 PAGE_PREALLOC_ENABLED = True
 
 
+class NoOpLock:
+    """A no-op lock that implements the same interface as threading.RLock"""
+
+    def acquire(self, blocking=True, timeout=-1):
+        return True
+
+    def release(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def locked(self):
+        return False
+
+
+class NoOpCondition:
+    """A no-op condition that implements the same interface as threading.Condition"""
+
+    def __init__(self, lock: threading.RLock):
+        self.lock = lock
+
+    def wait(self, timeout=None):
+        return True
+
+    def wait_for(self, predicate, timeout=None):
+        return predicate()
+
+    def notify(self, n=1):
+        pass
+
+    def notify_all(self):
+        pass
+
+    def acquire(self, *args):
+        return self.lock.acquire(*args)
+
+    def release(self):
+        return self.lock.release()
+
+    def __enter__(self):
+        return self.lock.__enter__()
+
+    def __exit__(self, *args):
+        return self.lock.__exit__(*args)
+
+
+def synchronized(method):
+
+    @wraps(method)
+    def synchronized_method(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return synchronized_method
+
+
 class Page:
 
     def __init__(self, page_id: int, page_size: int):
@@ -139,6 +199,7 @@ class PageAllocator(PageAllocatorBase):
         logger.info(f"Init KVCached PageAllocator: "
                     f"total_mem_size={total_mem_size//(1024*1024)}MB, "
                     f"page_size={page_size//(1024*1024)}MB, "
+                    f"tp_size={tp_size}, "
                     f"async_sched={async_sched}, "
                     f"enable_prealloc={enable_page_prealloc}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
@@ -153,99 +214,34 @@ class PageAllocator(PageAllocatorBase):
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
-        self.min_reserved_pages = 5
-        self.max_reserved_pages = 10
+        self.min_reserved_pages: int = 5
+        self.max_reserved_pages: int = 10
         self.reserved_page_list: deque[int] = deque()  # Fast path allocation
 
         self.reclaimed_page_list: deque[int] = deque()  # Reclaimed page ids
 
         # Preallocation thread management
-        self.enable_page_prealloc = enable_page_prealloc
-        self.prealloc_lock = threading.RLock()
-        self.prealloc_cond = threading.Condition(self.prealloc_lock)
-        self.prealloc_running = False
-        self.prealloc_needed = False
-        self.prealloc_thd = None
-
-    def start_prealloc_thread(self):
-        # NOTE: called by KVCacheManager after reserving the null block
+        self.enable_page_prealloc: bool = enable_page_prealloc
         if self.enable_page_prealloc:
-            self._start_prealloc_thread()
+            self.prealloc_lock = threading.RLock()
+            self.prealloc_cond = threading.Condition(self.prealloc_lock)
+        else:  # No preallocation lock and condition are needed.
+            self.prealloc_lock = NoOpLock()
+            self.prealloc_cond = NoOpCondition(self.prealloc_lock)
+        self.prealloc_running: bool = False
+        self.prealloc_needed: bool = False
+        self.prealloc_thd: Optional[threading.Thread] = None
 
     def __del__(self):
         if self.enable_page_prealloc:  # Stop preallocation thread
             self._stop_prealloc_thread()
 
-    def _prealloc_worker(self):
-        """Worker thread that preallocates pages and maps them to physical memory."""
-        while self.prealloc_running:
-            with self.prealloc_lock:
-                # Wait until preallocation is needed or thread is stopped
-                while not self.prealloc_needed and self.prealloc_running:
-                    self.prealloc_cond.wait()
-
-                if not self.prealloc_running:
-                    break
-
-                self.prealloc_needed = False
-                current_reserved = len(self.reserved_page_list)
-                to_reserve = max(0, self.min_reserved_pages - current_reserved)
-                # Only try to reserve up to the available free pages
-                to_reserve = min(to_reserve, len(self.free_page_list))
-                if to_reserve <= 0:
-                    continue
-
-                pages_to_reserve = []
-
-                # Get pages from free list
-                for _ in range(to_reserve):
-                    if self.free_page_list:
-                        pages_to_reserve.append(self.free_page_list.popleft())
-                    else:
-                        break
-
-            if pages_to_reserve:
-                try:
-                    self._map_pages(pages_to_reserve)
-                    with self.prealloc_lock:
-                        self.reserved_page_list.extend(pages_to_reserve)
-                    logger.debug(
-                        f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
-                    )
-                except Exception as e:
-                    # If mapping fails, return pages to free list
-                    with self.prealloc_lock:
-                        self.free_page_list.extendleft(pages_to_reserve)
-                    logger.error(
-                        f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
-                    )
-
-    def _start_prealloc_thread(self):
-        """Start the preallocation thread"""
-        if self.prealloc_thd is None:
-            self.prealloc_running = True
-            self.prealloc_thd = threading.Thread(target=self._prealloc_worker,
-                                                 daemon=True)
-            self.prealloc_thd.start()
-
-            # Initial preallocation trigger
-            self._trigger_preallocation()
-
-    def _stop_prealloc_thread(self):
-        """Stop the preallocation thread"""
-        if self.prealloc_thd is not None:
-            with self.prealloc_lock:
-                self.prealloc_running = False
-                self.prealloc_cond.notify_all()
-            self.prealloc_thd.join()
-            self.prealloc_thd = None
-            logger.debug("Stopped page preallocation thread")
-
-    def _trigger_preallocation(self):
-        """Trigger the preallocation thread to fill up reserved blocks"""
-        with self.prealloc_lock:
-            self.prealloc_needed = True
-            self.prealloc_cond.notify()
+    def start_prealloc_thread(self):
+        # NOTE: called by KVCacheManager after reserving the null block
+        if self.enable_page_prealloc:
+            self.prealloc_lock = threading.RLock()
+            self.prealloc_cond = threading.Condition(self.prealloc_lock)
+            self._start_prealloc_thread()
 
     def alloc_page(self) -> Page:
         if self.num_free_pages <= 0:
@@ -400,6 +396,75 @@ class PageAllocator(PageAllocatorBase):
         assert self.page_size % block_mem_size == 0
         return self.page_size // block_mem_size
 
+    def _prealloc_worker(self):
+        """Worker thread that preallocates and maps physical pages."""
+        while self.prealloc_running:
+            with self.prealloc_lock:
+                # Wait until preallocation is needed or thread is stopped
+                while not self.prealloc_needed and self.prealloc_running:
+                    self.prealloc_cond.wait()
+
+                if not self.prealloc_running:
+                    break
+
+                self.prealloc_needed = False
+                current_reserved = len(self.reserved_page_list)
+                to_reserve = max(0, self.min_reserved_pages - current_reserved)
+                # Only try to reserve up to the available free pages
+                to_reserve = min(to_reserve, len(self.free_page_list))
+                if to_reserve <= 0:
+                    continue
+
+                pages_to_reserve = []
+
+                # Get pages from free list
+                for _ in range(to_reserve):
+                    if self.free_page_list:
+                        pages_to_reserve.append(self.free_page_list.popleft())
+                    else:
+                        break
+
+            if pages_to_reserve:
+                try:
+                    self._map_pages(pages_to_reserve)
+                    with self.prealloc_lock:
+                        self.reserved_page_list.extend(pages_to_reserve)
+                    logger.debug(
+                        f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
+                    )
+                except Exception as e:
+                    # If mapping fails, return pages to free list
+                    with self.prealloc_lock:
+                        self.free_page_list.extendleft(pages_to_reserve)
+                    logger.error(
+                        f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
+                    )
+
+    def _start_prealloc_thread(self):
+        if self.prealloc_thd is None:
+            self.prealloc_running = True
+            self.prealloc_thd = threading.Thread(target=self._prealloc_worker,
+                                                 daemon=True)
+            self.prealloc_thd.start()
+
+            # Initial preallocation trigger
+            self._trigger_preallocation()
+
+    def _stop_prealloc_thread(self):
+        if self.prealloc_thd is not None:
+            with self.prealloc_lock:
+                self.prealloc_running = False
+                self.prealloc_cond.notify_all()
+            self.prealloc_thd.join()
+            self.prealloc_thd = None
+            logger.debug("Stopped page preallocation thread")
+
+    def _trigger_preallocation(self):
+        """Trigger the preallocation thread to fill up reserved blocks"""
+        with self.prealloc_lock:
+            self.prealloc_needed = True
+            self.prealloc_cond.notify()
+
     def _map_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # map pages across all tensor parallel workers.
@@ -415,35 +480,6 @@ class PageAllocator(PageAllocatorBase):
             if self.async_sched:
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
-
-
-class NoOpLock:
-    """A no-op lock that implements the same interface as threading.RLock"""
-
-    def acquire(self, blocking=True, timeout=-1):
-        return True
-
-    def release(self):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
-
-    def locked(self):
-        return False
-
-
-def synchronized(method):
-
-    @wraps(method)
-    def synchronized_method(self, *args, **kwargs):
-        with self._lock:
-            return method(self, *args, **kwargs)
-
-    return synchronized_method
 
 
 class KVCacheManager:
@@ -508,7 +544,7 @@ class KVCacheManager:
 
         # Busy-wait until the KV tensors become available.
         while not _check_kv_tensors_created():
-            time.sleep(0.001)
+            time.sleep(0.001)  # 1ms
 
         # Reserve the first block as null block for padding tokens
         if self.reserve_null_block:
