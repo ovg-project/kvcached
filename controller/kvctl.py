@@ -17,6 +17,8 @@ try:
     READLINE_AVAILABLE = True
 except ImportError:  # pragma: no cover – win / minimal envs
     READLINE_AVAILABLE = False
+    print("readline not available. Auto-completion will not work.",
+          file=sys.stderr)
 
 # ANSI colour handling -------------------------------------------------------
 
