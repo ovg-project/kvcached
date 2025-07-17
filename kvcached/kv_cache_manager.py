@@ -9,11 +9,11 @@ from typing import Dict, List, Optional
 import posix_ipc
 import torch
 
+from controller.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
+                              get_ipc_path, init_kv_cache_limit)
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, MemInfoStruct,
-                            RwLockedShm, get_ipc_name, get_ipc_path,
-                            get_kvcached_logger, init_kv_cache_limit)
+from kvcached.utils import DEFAULT_IPC_NAME, PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
