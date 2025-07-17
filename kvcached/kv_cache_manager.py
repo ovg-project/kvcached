@@ -560,7 +560,9 @@ class KVCacheManager:
             self._post_init_done.wait()
 
     @synchronized
-    def alloc(self, need_size: int, _skip_wait: bool = False) -> List[int]:
+    def alloc(self,
+              need_size: int,
+              _skip_wait: bool = False) -> Optional[List[int]]:
         if not _skip_wait:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
@@ -569,7 +571,7 @@ class KVCacheManager:
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
                            f"need_size={need_size}")
-            return []
+            return None
 
         ret_index = []
         page: Page = None
