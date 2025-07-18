@@ -618,12 +618,6 @@ class KVCacheManager:
         remaining_need = need_size
 
         if self.reserved_blocks:
-            # assert (
-            #     len(self.reserved_blocks) == need_size
-            # ), "Currently, we must have all blocks reserved before allocation to avoid OOM."
-            # # NOTE: we can support len(self.reserved_blocks) != need_size cases,
-            # # but we want to check reservation size == allocation size for now
-            # # to ensure correctness.
             if len(self.reserved_blocks) >= remaining_need:
                 ret_index = self.reserved_blocks[:remaining_need]
                 self.reserved_blocks = self.reserved_blocks[remaining_need:]
@@ -666,11 +660,7 @@ class KVCacheManager:
     @synchronized
     def free(self, indices: List[int]):
         self._wait_post_init()
-        # assert (
-        #     len(self.reserved_blocks) == 0
-        # ), "Reserved blocks must be used or freed before freeing other blocks."
-        # # NOTE: we can support freeing reserved blocks, but we want to enforce
-        # # this check for now to ensure correctness.
+
         unique_indices = set(indices)
         if self.reserved_blocks:
             self.reserved_blocks = [
@@ -688,8 +678,8 @@ class KVCacheManager:
             if (SANITY_CHECK and page_id not in self.full_pages
                     and page_id not in self.avail_pages):
                 logger.warning(
-                    f"Page {page_id} is not in avail_pages or full_pages, it is possible that the page is already freed."
-                )
+                    f"Page {page_id} is not in avail_pages or full_pages, "
+                    "it is possible that the page is already freed.")
                 continue
             if page_id in self.full_pages:
                 page = self.full_pages.pop(page_id)
@@ -726,11 +716,10 @@ class KVCacheManager:
         self._wait_post_init()
         if self.available_size() < need_size:
             return False
-        # assert (
-        #     len(self.reserved_blocks) == 0
-        # ), "Reserved blocks must be used or freed before reserving more."
         reserved = self.alloc(need_size)
-        assert reserved is not None, "Failed to reserve blocks."
+        if reserved is None:
+            logger.warning("Failed to reserve blocks.")
+            return False
         self.reserved_blocks.extend(reserved)
         return True
 
