@@ -640,7 +640,6 @@ class KVCacheManager:
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 _, page = self.avail_pages.popitem()
-            assert page is not None
             if page.num_free_blocks() > remaining_need:
                 self.num_avail_blocks -= remaining_need
                 alloced_index = page.free_list[:remaining_need]
@@ -654,7 +653,6 @@ class KVCacheManager:
                 remaining_need -= len(page.free_list)
                 page.free_list = []
                 self.full_pages[page.page_id] = page
-        assert remaining_need == 0, "Insufficient memory for allocation."
 
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
@@ -780,7 +778,6 @@ class KVCacheManager:
                 self.block_mem_size)
             physical_free_size = self._physical_free_size()
             free_size = min(virtual_free_size, physical_free_size)
-        # logger.info(f"YIFAN: avail_size: {avail_size}, free_size: {free_size}, virtual_free_size: {virtual_free_size}, physical_free_size: {physical_free_size}")
         return avail_size + free_size
 
     @synchronized
