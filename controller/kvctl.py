@@ -105,14 +105,28 @@ def _setup_readline():
 
         if len(tokens) == 0:  # completing first word
             options = [cmd for cmd in COMMANDS if cmd.startswith(text)]
-        elif len(tokens) == 1:  # still completing command name
-            options = [cmd for cmd in COMMANDS if cmd.startswith(text)]
+        elif len(tokens) == 1:
+            # We have typed exactly one complete token (the command) and are
+            # now completing the *first* argument.  For the set of commands
+            # that accept an IPC name as the next token, offer those names;
+            # otherwise continue completing the command itself.
+
+            cmd = tokens[0]
+
+            if cmd in ('limit', 'limit-percent', 'list', 'watch'):
+                ipc_names = _detect_kvcache_ipc_names()
+                # Case-insensitive matching so "VLLM" also matches "vllm".
+                options = [
+                    n for n in ipc_names if n.lower().startswith(text.lower())
+                ]
+            else:
+                options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
             if cmd in ('limit', 'limit-percent', 'list', 'watch'):
                 options = [
                     n for n in _detect_kvcache_ipc_names()
-                    if n.startswith(text)
+                    if n.lower().startswith(text.lower())
                 ]
             else:
                 options = []
@@ -121,7 +135,27 @@ def _setup_readline():
         return None
 
     readline.set_completer(_complete)
-    readline.parse_and_bind('tab: complete')
+    # Use appropriate key binding depending on whether Python's readline
+    # is linked against GNU readline or the libedit compatibility layer
+    # (common on macOS and some minimal Linux builds).  The latter uses a
+    # different command syntax.
+    if getattr(readline, "__doc__", "").startswith("Importing this module enables command line editing using libedit") or \
+            (readline.__doc__ and "libedit" in readline.__doc__):
+        # libedit style
+        readline.parse_and_bind('bind ^I rl_complete')
+    else:
+        # GNU readline style
+        readline.parse_and_bind('tab: complete')
+
+    # Ensure hyphens are treated as part of a word so commands like
+    # "limit-percent" can be completed after typing "limit-per".
+    try:
+        delims = readline.get_completer_delims()
+        if '-' in delims:
+            readline.set_completer_delims(delims.replace('-', ''))
+    except AttributeError:
+        # Some readline/libedit shims may not expose these functions
+        pass
 
 
 SIZE_SUFFIXES = {
