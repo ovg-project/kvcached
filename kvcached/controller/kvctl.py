@@ -8,9 +8,9 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-from kvtop import _detect_kvcache_ipc_names
-from kvtop import kvtop as kvtop_ui
-from utils import get_kv_cache_limit, update_kv_cache_limit
+from kvcached.controller.kvtop import _detect_kvcache_ipc_names
+from kvcached.controller.kvtop import kvtop as kvtop_ui
+from kvcached.controller.utils import get_kv_cache_limit, update_kv_cache_limit
 
 try:
     import readline  # type: ignore
@@ -58,7 +58,8 @@ def _clr(text: str, color: str | None = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'help', 'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
+    'exit', 'quit'
 ]
 
 # Nicely formatted help text for the interactive shell.
@@ -71,6 +72,7 @@ Available commands:
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
+  delete <ipc>                 Delete IPC segment and its limit entry
   exit | quit                  Exit the shell
 """
 
@@ -113,7 +115,7 @@ def _setup_readline():
 
             cmd = tokens[0]
 
-            if cmd in ('limit', 'limit-percent', 'list', 'watch'):
+            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
                 ipc_names = _detect_kvcache_ipc_names()
                 # Case-insensitive matching so "VLLM" also matches "vllm".
                 options = [
@@ -123,7 +125,7 @@ def _setup_readline():
                 options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
-            if cmd in ('limit', 'limit-percent', 'list', 'watch'):
+            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
                 options = [
                     n for n in _detect_kvcache_ipc_names()
                     if n.lower().startswith(text.lower())
@@ -276,7 +278,7 @@ def cmd_limit_percent(ipc: str, percent: float):
               file=sys.stderr)
         return
 
-    from utils import get_total_gpu_memory
+    from kvcached.controller.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
@@ -300,6 +302,21 @@ def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
 def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
     """Launch the kvtop curses UI (blocks until user quits)."""
     kvtop_ui(ipcs, refresh)
+
+
+# ---------------------------------------------------------------------------
+# Delete IPC command
+# ---------------------------------------------------------------------------
+
+
+def cmd_delete(ipc: str):
+    from kvcached.controller.utils import delete_kv_cache_segment
+
+    if delete_kv_cache_segment(ipc):
+        print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
+    else:
+        print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True),
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +397,8 @@ def interactive_shell():
                         ipcs.append(tok)
                     i += 1
                 cmd_top(ipcs if ipcs else None, refresh)
+            elif cmd == 'delete' and len(tokens) == 2:
+                cmd_delete(tokens[1])
             else:
                 # Fallback to system shell
                 os.system(line)
@@ -431,6 +450,10 @@ def _main():
                          help='Refresh interval')
     p_kvtop.add_argument('ipc', nargs='*', help='IPC names (optional)')
 
+    # delete
+    p_del = sub.add_parser('delete', help='Delete IPC segment')
+    p_del.add_argument('ipc')
+
     # shell
     sub.add_parser('shell', help='Start interactive shell')
 
@@ -446,6 +469,8 @@ def _main():
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
+    elif args.command == 'delete':
+        cmd_delete(args.ipc)
     elif args.command == 'shell' or args.command is None:
         interactive_shell()
     else:

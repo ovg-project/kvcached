@@ -11,8 +11,9 @@ from typing import Dict, List, Optional
 import posix_ipc
 import torch
 
-from controller.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
-                              get_ipc_path, init_kv_cache_limit)
+from kvcached.controller.utils import (MemInfoStruct, RwLockedShm,
+                                       get_ipc_name, get_ipc_path,
+                                       init_kv_cache_limit)
 from kvcached.tp_ipc_util import (broadcast_kv_tensors_created_to_workers,
                                   broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
@@ -330,9 +331,9 @@ class PageAllocator(PageAllocatorBase):
             # Reuse previously reclaimed pages first.
             num_to_reuse = min(len(self.reclaimed_page_list), num_to_expand)
             with self.prealloc_lock:
-                self.free_page_list.extend(
-                    self.reclaimed_page_list[:num_to_reuse])
-            self.reclaimed_page_list = self.reclaimed_page_list[num_to_reuse:]
+                for _ in range(num_to_reuse):
+                    self.free_page_list.append(
+                        self.reclaimed_page_list.popleft())
             num_to_expand -= num_to_reuse
             self.num_free_pages += num_to_reuse
 
@@ -358,7 +359,7 @@ class PageAllocator(PageAllocatorBase):
 
     def trim(self) -> None:
         with self.prealloc_lock:
-            pages_to_unmap = self.reserved_page_list[:]  # copy
+            pages_to_unmap = list(self.reserved_page_list)
             self.reserved_page_list.clear()
 
         if not pages_to_unmap:
@@ -635,7 +636,8 @@ class KVCacheManager:
                 self.full_pages[page.page_id] = page
         assert remaining_need == 0, "Insufficient memory for allocation."
 
-        used_size = (self.page_allocator.get_num_inuse_pages() *
+        used_size = ((self.page_allocator.get_num_inuse_pages() +
+                      self.page_allocator.get_num_reserved_pages()) *
                      self.num_layers * PAGE_SIZE * 2)
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:

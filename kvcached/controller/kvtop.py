@@ -4,7 +4,8 @@ import os
 import time
 from typing import List, Optional, Union
 
-from utils import SHM_DIR, MemInfoStruct, RwLockedShm, get_ipc_name
+from kvcached.controller.utils import (SHM_DIR, MemInfoStruct, RwLockedShm,
+                                       get_ipc_name)
 
 
 def _format_size(num_bytes: int) -> str:

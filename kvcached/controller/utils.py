@@ -150,6 +150,38 @@ def update_kv_cache_limit(ipc_name: str,
         return None
 
 
+# ---------------------------------------------------------------------------
+# IPC cleanup helpers
+# ---------------------------------------------------------------------------
+
+
+def delete_kv_cache_segment(ipc_name: str) -> bool:
+    """Remove the shared-memory segment and backing file for *ipc_name*.
+
+    Returns True if the segment existed and was removed, False if it was not
+    found. Any other exception is propagated so callers can handle unexpected
+    errors.
+    """
+    shm_name = get_ipc_name(ipc_name)
+
+    removed = False
+    try:
+        posix_ipc.unlink_shared_memory(shm_name)
+        removed = True
+    except posix_ipc.ExistentialError:
+        # Segment did not exist.
+        pass
+
+    # Best-effort removal of the backing file created by RwLockedShm.
+    try:
+        os.unlink(get_ipc_path(shm_name))
+        removed = True or removed
+    except FileNotFoundError:
+        pass
+
+    return removed
+
+
 def get_total_gpu_memory() -> int:
     """Return total memory of CUDA device 0 or 0 if CUDA unavailable."""
     try:
