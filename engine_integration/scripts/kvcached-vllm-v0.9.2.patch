@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index d21f94727..173f67963 100644
+index d21f94727..f53b52a9e 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -347,3 +347,112 @@ class BlockPool:
@@ -74,7 +74,7 @@ index d21f94727..173f67963 100644
 +                f"Cannot get {num_blocks} free blocks from the pool")
 +
 +        block_ids = self.kv_cache_manager.alloc(num_blocks)
-+        assert len(block_ids) == num_blocks
++        assert block_ids is not None and len(block_ids) == num_blocks
 +
 +        return [KVCacheBlock(bid) for bid in block_ids]
 +

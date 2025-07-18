@@ -3,7 +3,8 @@ import pickle
 import socket
 import threading
 
-from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
+from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
+                              unmap_from_kv_tensors)
 
 SOCKET_DIR = "/tmp/kvcached-ipc"
 
@@ -81,6 +82,9 @@ def start_worker_listerner_thread(rank: int):
                 elif msg["cmd"] == "unmap_from_kv_tensors":
                     unmap_from_kv_tensors(msg["offsets"])
                     send_msg(conn, {"status": "success"})
+                elif msg["cmd"] == "kv_tensors_created":
+                    created: bool = kv_tensors_created()
+                    send_msg(conn, {"status": "success", "created": created})
                 else:
                     send_msg(conn, {
                         "status": "error",
@@ -127,3 +131,24 @@ def broadcast_unmap_from_kv_tensors_to_workers(tp_size: int,
                 raise RuntimeError(f"Worker {rank} failed to unmap {response}")
         finally:
             sock.close()
+
+
+def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
+    created = True
+    for rank in range(tp_size):
+        socket_path = get_worker_socket_path(rank)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        try:
+            send_msg(sock, {"cmd": "kv_tensors_created"})
+            response = recv_msg(sock)
+            if response.get("status") != "success":
+                raise RuntimeError(
+                    f"Worker {rank} failed to check KV tensors created: {response}"
+                )
+            if not response.get("created"):
+                created = False
+        finally:
+            sock.close()
+
+    return created

@@ -1,5 +1,7 @@
 #include <memory>
+#include <mutex>
 #include <torch/extension.h>
+#include <unordered_map>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -10,6 +12,7 @@
 
 namespace kvcached {
 std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
+std::mutex FTensorAllocator::g_allocator_mutex_;
 
 static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
                                                      page_id_t page_id) {
@@ -34,12 +37,13 @@ FTensorAllocator::FTensorAllocator(const torch::Device &device)
 FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
+  std::lock_guard<std::mutex> lock(mtx_);
   ftensors_.clear();
   zero_page_.reset();
 }
 
-/* FIXME (YIFAN): this is not thread safe. */
 void FTensorAllocator::init(const std::string &dev_str) {
+  std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (g_allocator_) {
     LOGE("FTensorAllocator has been initialized. Re-initializing...")
     g_allocator_.reset();
@@ -50,52 +54,41 @@ void FTensorAllocator::init(const std::string &dev_str) {
 }
 
 FTensorAllocator *FTensorAllocator::global_allocator() {
+  std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   assert(g_allocator_);
   return g_allocator_.get();
 }
 
 void FTensorAllocator::shutdown() {
+  std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (g_allocator_) {
     g_allocator_.reset();
   }
-}
-
-torch::Tensor FTensorAllocator::create_ftensor(size_t size, torch::Dtype dtype,
-                                               const std::string &dev_str,
-                                               std::string name) {
-  if (name.empty())
-    name = get_anon_tensor_name_();
-
-  if (ftensors_.find(name) != ftensors_.end()) {
-    auto tensor = ftensors_[name].get()->get_tensor();
-    assert(tensor.numel() * tensor.element_size() == size);
-    assert(tensor.device() == torch::Device(dev_str));
-    return tensor;
-  }
-  // Create a new FTensor.
-  ftensors_[name] =
-      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
-  return ftensors_[name]->get_tensor();
-}
-
-void FTensorAllocator::free_ftensor(torch::Tensor &ftensor) {
-  auto name = ftensor.name();
-  if (ftensors_.find(name) == ftensors_.end()) {
-    return;
-  }
-  ftensors_.erase(name);
 }
 
 std::vector<torch::Tensor>
 FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
                                     const std::string &dev_str,
                                     int64_t num_layers) {
+  std::lock_guard<std::mutex> lock(mtx_);
+
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
   return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers);
 }
 
+bool FTensorAllocator::kv_tensors_created() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  return num_layers_ > 0;
+}
+
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (num_layers_ == 0) {
+    LOGE("try to map to KV tensors when KV tensors are not created");
+    return false;
+  }
+
   for (int64_t i = 0; i < num_layers_; i++) {
     auto kv_name = std::string(kv_prefix) + std::to_string(i);
     auto ftensor = ftensors_[kv_name].get();
@@ -118,6 +111,12 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 
 bool FTensorAllocator::unmap_from_kv_tensors(
     const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (num_layers_ == 0) {
+    LOGE("try to unmap from KV tensors when KV tensors are not created");
+    return false;
+  }
+
   for (int64_t i = 0; i < num_layers_; i++) {
     auto kv_name = std::string(kv_prefix) + std::to_string(i);
     auto ftensor = ftensors_[kv_name].get();
@@ -148,10 +147,38 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_impl_(
   std::vector<torch::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
-    auto tensor = create_ftensor(size, dtype, dev_str, name);
+    auto tensor = create_ftensor_(size, dtype, dev_str, name);
     ftensors.push_back(tensor);
   }
   return ftensors;
+}
+
+/** this function is not thread-safe */
+torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
+                                                const std::string &dev_str,
+                                                std::string name) {
+  if (name.empty())
+    name = get_anon_tensor_name_();
+
+  if (ftensors_.find(name) != ftensors_.end()) {
+    auto tensor = ftensors_[name].get()->get_tensor();
+    assert(tensor.numel() * tensor.element_size() == size);
+    assert(tensor.device() == torch::Device(dev_str));
+    return tensor;
+  }
+  // Create a new FTensor.
+  ftensors_[name] =
+      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
+  return ftensors_[name]->get_tensor();
+}
+
+/** this function is not thread-safe */
+void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
+  auto name = ftensor.name();
+  if (ftensors_.find(name) == ftensors_.end()) {
+    return;
+  }
+  ftensors_.erase(name);
 }
 
 void FTensorAllocator::init_cuda_() {

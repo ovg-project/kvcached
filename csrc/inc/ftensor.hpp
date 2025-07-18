@@ -10,7 +10,7 @@
 
 namespace kvcached {
 
-/* NOTE: currently FTensor is not thread-safe. */
+/* NOTE: FTensorAllocator is thread-safe but FTensor is not. */
 class FTensor {
 public:
   FTensor(const std::string &name, size_t size, torch::Dtype dtype,

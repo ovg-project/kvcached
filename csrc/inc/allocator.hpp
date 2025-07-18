@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -20,17 +21,11 @@ public:
   FTensorAllocator(const torch::Device &device);
   ~FTensorAllocator();
 
-  // Raw FTensor interfaces.
-  torch::Tensor create_ftensor(size_t size, torch::Dtype dtype,
-                               const std::string &dev_str,
-                               std::string name = "");
-  void free_ftensor(torch::Tensor &ftensor);
-  void destroy();
-
   // KV cache interfaces.
   std::vector<torch::Tensor> create_kv_tensors(size_t size, torch::Dtype dtype,
                                                const std::string &dev_str,
                                                int64_t num_layers);
+  bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
@@ -38,18 +33,26 @@ public:
   static void init(const std::string &dev_str);
   static void shutdown();
   static FTensorAllocator *global_allocator();
+  void destroy();
 
 private:
+  // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
   std::vector<torch::Tensor> create_kv_tensors_impl_(std::string_view prefix,
                                                      size_t size,
                                                      torch::Dtype dtype,
                                                      const std::string &dev_str,
                                                      int64_t num_layers);
+  torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
+                                const std::string &dev_str,
+                                std::string name = "");
+  void free_ftensor_(torch::Tensor &ftensor);
 
+  // CUDA util functions.
   void init_cuda_();
 
   static std::unique_ptr<FTensorAllocator> g_allocator_;
+  static std::mutex g_allocator_mutex_;
 
   torch::Device dev_;
 

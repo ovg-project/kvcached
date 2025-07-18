@@ -8,17 +8,20 @@
 
 namespace kvcached {
 
+static std::atomic<size_t> g_vaddr_allocated_offset = 0;
+
 static inline generic_ptr_t alloc_virtual_mem(const torch::Device &dev,
                                               size_t size) {
   ASSERT(size % kPageSize == 0, "alloc size not aligned."); // Ensure alignment.
 
   generic_ptr_t vaddr;
+  size_t offset = g_vaddr_allocated_offset.fetch_add(size);
   if (dev.is_cuda()) {
     CHECK_DRV(cuMemAddressReserve(reinterpret_cast<CUdeviceptr *>(&vaddr), size,
-                                  kPageSize, 0ULL, 0ULL));
+                                  kPageSize, kStartAddr + offset, 0ULL));
   } else {
-    vaddr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    vaddr = mmap(reinterpret_cast<void *>(kStartAddr + offset), size,
+                 PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT(vaddr != MAP_FAILED, "mmap failed.");
   }
   // LOGE("Allocated virtual memory at %p", vaddr);
