@@ -123,41 +123,46 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
                     mem_info = MemInfoStruct.from_buffer(mm)
                     total = int(mem_info.total_size)
                     used = int(mem_info.used_size)
+                    prealloc = int(mem_info.prealloc_size)
             except FileNotFoundError:
-                total = used = 0
+                total = used = prealloc = 0
 
-            free = max(total - used, 0)
-            percent = (used / total * 100) if total else 0
+            free = max(total - used - prealloc, 0)
+            percent_total = ((used + prealloc) / total * 100) if total else 0
 
-            # Determine colour based on utilisation
-            if percent < 50:
+            # Determine colour based on combined utilisation (used + prealloc)
+            if percent_total < 50:
                 bar_color = curses.color_pair(1) if use_colors else 0
-            elif percent < 80:
+            elif percent_total < 80:
                 bar_color = curses.color_pair(2) if use_colors else 0
             else:
                 bar_color = curses.color_pair(3) if use_colors else 0
 
-            used_width = int(bar_width * percent / 100)
+            used_width = int(bar_width * used / total) if total else 0
+            prealloc_only_width = int(bar_width * prealloc / total) if total else 0
+            bar_prealloc = "=" * prealloc_only_width
             bar_used = "#" * used_width
-            bar_free = "-" * (bar_width - used_width)
+            bar_free = "-" * (bar_width - prealloc_only_width - used_width)
 
             # Section header per IPC
             stdscr.addstr(current_row, 0, f"IPC: {name}", header_attr)
             current_row += 1
 
             stdscr.addstr(current_row, 0, "[", header_attr)
-            stdscr.addstr(bar_used[:max(0, width - 2)], bar_color)
-            stdscr.addstr(bar_free[:max(0, width - 2 - len(bar_used))])
+            stdscr.addstr(bar_prealloc[:max(0, width - 2)],
+                          curses.color_pair(2) if use_colors else 0)
+            stdscr.addstr(bar_used[:max(0, width - 2 - len(bar_prealloc))], bar_color)
+            stdscr.addstr(bar_free[:max(0, width - 2 - len(bar_prealloc) - len(bar_used))])
             if width - 1 > 0:
                 stdscr.addstr(current_row,
-                              min(width - 1, len("[" + bar_used + bar_free)),
+                              min(width - 1, len("[" + bar_prealloc + bar_used + bar_free)),
                               "]", header_attr)
 
             current_row += 1
             stdscr.addstr(
                 current_row,
                 0,
-                f"Used: {_format_size(used)} / {_format_size(total)} ({percent:.1f}%) | Free: {_format_size(free)}"[:
+                f"Prealloc: {_format_size(prealloc)} | Used: {_format_size(used)} / {_format_size(total)} ({percent_total:.1f}%) | Free: {_format_size(free)}"[:
                                                                                                                     width
                                                                                                                     -
                                                                                                                     1],

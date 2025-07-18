@@ -640,6 +640,7 @@ class KVCacheManager:
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
             mem_info.used_size = self._get_used_size()
+            mem_info.prealloc_size = self._get_prealloc_size()
             mem_info.write_to_buffer(mm)
 
         return ret_index
@@ -699,6 +700,7 @@ class KVCacheManager:
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
             mem_info.used_size = self._get_used_size()
+            mem_info.prealloc_size = self._get_prealloc_size()
             mem_info.write_to_buffer(mm)
 
     @synchronized
@@ -763,8 +765,13 @@ class KVCacheManager:
 
     @synchronized
     def _get_used_size(self) -> int:
-        return ((self.page_allocator.get_num_inuse_pages() +
-                 self.page_allocator.get_num_reserved_pages()) *
+        # Memory actively used by allocations (excludes preallocated pages)
+        return (self.page_allocator.get_num_inuse_pages() *
+                self.num_layers * PAGE_SIZE * 2)
+
+    def _get_prealloc_size(self) -> int:
+        # Memory held by preallocated pages that are not yet actively used
+        return (self.page_allocator.get_num_reserved_pages() *
                 self.num_layers * PAGE_SIZE * 2)
 
     @synchronized

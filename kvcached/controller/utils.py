@@ -26,9 +26,10 @@ def get_ipc_name(ipc_path: str) -> str:
 class MemInfoStruct:
     total_size: int
     used_size: int
+    prealloc_size: int
 
     DTYPE = np.int64
-    N_FIELDS = 2
+    N_FIELDS = 3
     SHM_SIZE = np.dtype(DTYPE).itemsize * N_FIELDS
 
     @classmethod
@@ -39,11 +40,11 @@ class MemInfoStruct:
     @classmethod
     def from_buffer(cls, buf: mmap.mmap) -> "MemInfoStruct":
         arr = cls._view(buf)
-        return cls(int(arr[0]), int(arr[1]))
+        return cls(int(arr[0]), int(arr[1]), int(arr[2]))  # total, used, prealloc
 
     def write_to_buffer(self, buf: mmap.mmap) -> None:
         arr = self._view(buf)
-        arr[:] = (self.total_size, self.used_size)
+        arr[:] = (self.total_size, self.used_size, self.prealloc_size)
 
 
 class RwLockedShm:
@@ -105,9 +106,7 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     # Now we can safely memory map and write the values
     with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
                      RwLockedShm.WLOCK) as mm:
-        mem_info = MemInfoStruct.from_buffer(mm)
-        mem_info.total_size = kv_cache_limit
-        mem_info.used_size = 0
+        mem_info = MemInfoStruct(kv_cache_limit, 0, 0)
         mem_info.write_to_buffer(mm)
         return mem_info
 
