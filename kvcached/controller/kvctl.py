@@ -44,7 +44,7 @@ def _supports_color() -> bool:
 COLOR_ENABLED = _supports_color()
 
 
-def _clr(text: str, color: str | None = None, *, bold: bool = False) -> str:
+def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
     if not COLOR_ENABLED:
         return text
     seq = ''

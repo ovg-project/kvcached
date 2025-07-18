@@ -135,7 +135,7 @@ def update_kv_cache_limit(ipc_name: str,
             mem_info = MemInfoStruct.from_buffer(mm)
             delta = kv_cache_limit - mem_info.total_size
             if delta < 0:
-                if mem_info.total_size - mem_info.used_size + delta < 0:
+                if mem_info.used_size > kv_cache_limit:
                     print(
                         f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
                     )

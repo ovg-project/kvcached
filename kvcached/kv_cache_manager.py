@@ -636,13 +636,10 @@ class KVCacheManager:
                 self.full_pages[page.page_id] = page
         assert remaining_need == 0, "Insufficient memory for allocation."
 
-        used_size = ((self.page_allocator.get_num_inuse_pages() +
-                      self.page_allocator.get_num_reserved_pages()) *
-                     self.num_layers * PAGE_SIZE * 2)
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = used_size
+            mem_info.used_size = self._get_used_size()
             mem_info.write_to_buffer(mm)
 
         return ret_index
@@ -698,12 +695,10 @@ class KVCacheManager:
             self.in_shrink = False
             self.target_num_blocks = None
 
-        used_size = (self.page_allocator.get_num_inuse_pages() *
-                     self.num_layers * PAGE_SIZE * 2)
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = used_size
+            mem_info.used_size = self._get_used_size()
             mem_info.write_to_buffer(mm)
 
     @synchronized
@@ -767,11 +762,15 @@ class KVCacheManager:
         return avail_size + free_size
 
     @synchronized
+    def _get_used_size(self) -> int:
+        return ((self.page_allocator.get_num_inuse_pages() +
+                 self.page_allocator.get_num_reserved_pages()) *
+                self.num_layers * PAGE_SIZE * 2)
+
+    @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = (self.page_allocator.get_num_inuse_pages() +
-                        self.page_allocator.get_num_reserved_pages()
-                        ) * self.num_layers * PAGE_SIZE * 2  # K and V tensors
+        memory_bytes = self._get_used_size()
 
         if unit == 'bytes':
             return memory_bytes
