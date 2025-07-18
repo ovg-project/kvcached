@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from functools import wraps
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import posix_ipc
 import torch
@@ -97,16 +97,22 @@ class Page:
         self.free_list = None
 
     def init(self, block_mem_size: int) -> None:
-        assert not self.initialized()
+        if self.initialized():
+            logger.warning(f"Page {self.page_id} is already initialized")
+            return
 
-        assert self.page_size % block_mem_size == 0
-        self.num_kv_blocks = self.page_size // block_mem_size
+        start_block, end_block = self.get_block_range(self.page_id,
+                                                      self.page_size,
+                                                      block_mem_size)
 
-        stt_idx = self.page_id * self.num_kv_blocks
-        self.free_list = [stt_idx + i for i in range(self.num_kv_blocks)]
+        self.num_kv_blocks = end_block - start_block
+        self.free_list = list(range(start_block, end_block))
 
     def destroy(self) -> None:
-        assert self.initialized() and len(self.free_list) == self.num_kv_blocks
+        if not self.initialized() or len(self.free_list) != self.num_kv_blocks:
+            logger.warning(f"Page {self.page_id} is not initialized or "
+                           "is corrupted")
+
         self.num_kv_blocks = None
         self.free_list = None
 
@@ -142,19 +148,8 @@ class Page:
     def get_free_blocks(self) -> List[int]:
         return self.free_list
 
-    def get_used_blocks(self) -> List[int]:
-        all_blk_ids = [
-            block_id for block_id in range(
-                self.page_id * self.num_kv_blocks,
-                (self.page_id + 1) * self.num_kv_blocks,
-            )
-        ]
-        return list(set(all_blk_ids) - set(self.free_list))
-
     def _has_block(self, block_id: int) -> bool:
-        stt_idx = self.page_id * self.num_kv_blocks
-        end_idx = stt_idx + self.num_kv_blocks
-        return block_id >= stt_idx and block_id < end_idx
+        return block_id >= self.start_block and block_id < self.end_block
 
     def _sanity_check(self, block_id: int) -> None:
         if not self._has_block(block_id):
@@ -162,6 +157,33 @@ class Page:
                 f"Page {self.page_id} does not have block {block_id}")
         if block_id in self.free_list:
             raise ValueError(f"Block {block_id} is already free")
+
+    @staticmethod
+    def get_block_range(page_id: int, page_size: int,
+                        block_mem_size: int) -> Tuple[int, int]:
+        """
+        Get the block range of a page.
+        The page contains [start_block, end_block), which handles the case where
+        page_size is not divisible by block_mem_size.
+        For example, if page_size = 16 and block_mem_size = 6, the page 0
+        contains [0, 2) blocks, and the page 1 contains [3, 5) blocks.
+        Pages:  |      0-16       |        16-32        |
+                | 0-6 | 6-12 | 12-18 | 18-24 | 24-30 | 30-32 |
+        Blocks: |  0  |  1   |2<skip>|   3   |   4   |5<skip>|
+        """
+        start_block = (page_id * page_size + block_mem_size -
+                       1) // block_mem_size
+        end_block = ((page_id + 1) * page_size) // block_mem_size
+        return start_block, end_block
+
+    @staticmethod
+    def get_num_blocks(page_size: int, block_mem_size: int) -> int:
+        """
+        Calculate the number of blocks that can fit in a page.
+        This calculation is accurate even when page_size is not divisible by
+        block_mem_size.
+        """
+        return page_size // block_mem_size
 
 
 class PageAllocatorBase(ABC):
@@ -386,22 +408,18 @@ class PageAllocator(PageAllocatorBase):
         return block_id * block_mem_size // self.page_size
 
     def get_num_free_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_free_pages() * self._num_blocks_per_page(
-            block_mem_size)
+        return self.get_num_free_pages() * Page.get_num_blocks(
+            self.page_size, block_mem_size)
 
     def get_num_inuse_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_inuse_pages() * self._num_blocks_per_page(
-            block_mem_size)
+        return self.get_num_inuse_pages() * Page.get_num_blocks(
+            self.page_size, block_mem_size)
 
     def get_num_total_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_total_pages() * self._num_blocks_per_page(
-            block_mem_size)
+        return self.get_num_total_pages() * Page.get_num_blocks(
+            self.page_size, block_mem_size)
 
     # Private methods
-    def _num_blocks_per_page(self, block_mem_size: int):
-        assert self.page_size % block_mem_size == 0
-        return self.page_size // block_mem_size
-
     def _prealloc_worker(self):
         """Worker thread that preallocates and maps physical pages."""
         while self.prealloc_running:
@@ -560,7 +578,7 @@ class KVCacheManager:
         # Reserve the first block as null block for padding tokens
         if self.reserve_null_block:
             # Skip the wait to avoid dead-lock with the event.
-            self.null_block = self.alloc(1, _skip_wait=True)
+            self.null_block = self._alloc(1, _skip_wait=True)
             assert self.null_block == [0], "Failed to reserve null block"
         self.page_allocator.start_prealloc_thread()
 
@@ -570,10 +588,13 @@ class KVCacheManager:
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
 
+    def alloc(self, need_size: int) -> Optional[List[int]]:
+        return self._alloc(need_size)
+
     @synchronized
-    def alloc(self,
-              need_size: int,
-              _skip_wait: bool = False) -> Optional[List[int]]:
+    def _alloc(self,
+               need_size: int,
+               _skip_wait: bool = False) -> Optional[List[int]]:
         if not _skip_wait:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
@@ -796,8 +817,10 @@ class KVCacheManager:
 
         avail_phy_pages = avail_phy_mem_size // PAGE_SIZE
         # Each layer needs to reserve K and V tensors.
+        # Use the page allocator's method to get accurate block count per page
+        blocks_per_page = Page.get_num_blocks(PAGE_SIZE, self.block_mem_size)
         avail_phy_blocks = (avail_phy_pages // self.num_layers //
-                            2) * (PAGE_SIZE // self.block_mem_size)
+                            2) * blocks_per_page
         return avail_phy_blocks
 
     def clear(self):
