@@ -766,8 +766,8 @@ class KVCacheManager:
     @synchronized
     def _get_used_size(self) -> int:
         # Memory actively used by allocations (excludes preallocated pages)
-        return (self.page_allocator.get_num_inuse_pages() *
-                self.num_layers * PAGE_SIZE * 2)
+        return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
+                PAGE_SIZE * 2)
 
     def _get_prealloc_size(self) -> int:
         # Memory held by preallocated pages that are not yet actively used

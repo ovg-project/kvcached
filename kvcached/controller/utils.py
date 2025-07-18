@@ -40,7 +40,8 @@ class MemInfoStruct:
     @classmethod
     def from_buffer(cls, buf: mmap.mmap) -> "MemInfoStruct":
         arr = cls._view(buf)
-        return cls(int(arr[0]), int(arr[1]), int(arr[2]))  # total, used, prealloc
+        return cls(int(arr[0]), int(arr[1]),
+                   int(arr[2]))  # total, used, prealloc
 
     def write_to_buffer(self, buf: mmap.mmap) -> None:
         arr = self._view(buf)

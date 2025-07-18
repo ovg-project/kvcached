@@ -139,7 +139,8 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
                 bar_color = curses.color_pair(3) if use_colors else 0
 
             used_width = int(bar_width * used / total) if total else 0
-            prealloc_only_width = int(bar_width * prealloc / total) if total else 0
+            prealloc_only_width = int(bar_width * prealloc /
+                                      total) if total else 0
             bar_prealloc = "=" * prealloc_only_width
             bar_used = "#" * used_width
             bar_free = "-" * (bar_width - prealloc_only_width - used_width)
@@ -151,21 +152,26 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
             stdscr.addstr(current_row, 0, "[", header_attr)
             stdscr.addstr(bar_prealloc[:max(0, width - 2)],
                           curses.color_pair(2) if use_colors else 0)
-            stdscr.addstr(bar_used[:max(0, width - 2 - len(bar_prealloc))], bar_color)
-            stdscr.addstr(bar_free[:max(0, width - 2 - len(bar_prealloc) - len(bar_used))])
+            stdscr.addstr(bar_used[:max(0, width - 2 - len(bar_prealloc))],
+                          bar_color)
+            stdscr.addstr(
+                bar_free[:max(0, width - 2 - len(bar_prealloc) -
+                              len(bar_used))])
             if width - 1 > 0:
-                stdscr.addstr(current_row,
-                              min(width - 1, len("[" + bar_prealloc + bar_used + bar_free)),
-                              "]", header_attr)
+                stdscr.addstr(
+                    current_row,
+                    min(width - 1,
+                        len("[" + bar_prealloc + bar_used + bar_free)), "]",
+                    header_attr)
 
             current_row += 1
             stdscr.addstr(
                 current_row,
                 0,
                 f"Prealloc: {_format_size(prealloc)} | Used: {_format_size(used)} / {_format_size(total)} ({percent_total:.1f}%) | Free: {_format_size(free)}"[:
-                                                                                                                    width
-                                                                                                                    -
-                                                                                                                    1],
+                                                                                                                                                               width
+                                                                                                                                                               -
+                                                                                                                                                               1],
             )
             current_row += 2  # Blank line after each IPC section
 
