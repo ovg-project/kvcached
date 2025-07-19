@@ -216,7 +216,7 @@ class KVCacheManager:
     def free(self, indices: List[int]):
         self._wait_post_init()
 
-        if not indices:
+        if len(indices) == 0:
             return  # Nothing to free
 
         unique_indices = set(indices)
