@@ -1,3 +1,11 @@
+"""
+kvcached Memory Manager
+
+This module implements a hierarchical memory management system for KV cache:
+- Pages: Large memory chunks (e.g., 2MB) that are mapped/unmapped to physical memory
+- Blocks: Smaller units within pages that are allocated to store KV cache data
+"""
+
 import atexit
 import os
 import signal
@@ -22,9 +30,15 @@ from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
 
 logger = get_kvcached_logger()
 
+# Configuration constants
+GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
+PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
+                                  "true").lower() == "true"
+MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
+MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 SANITY_CHECK = False
-GPU_UTILIZATION = 0.95
-PAGE_PREALLOC_ENABLED = True
+PREALLOC_THREAD_TIMEOUT: float = 1.0  # seconds
+KV_TENSOR_WAIT_TIMEOUT: float = 5.0  # seconds
 
 
 class NoOpLock:
@@ -233,8 +247,8 @@ class PageAllocator(PageAllocatorBase):
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
-        self.min_reserved_pages: int = 5
-        self.max_reserved_pages: int = 10
+        self.min_reserved_pages: int = MIN_RESERVED_PAGES
+        self.max_reserved_pages: int = MAX_RESERVED_PAGES
         self.reserved_page_list: deque[int] = deque()  # Fast path allocation
 
         self.reclaimed_page_list: deque[int] = deque()  # Reclaimed page ids
@@ -252,8 +266,12 @@ class PageAllocator(PageAllocatorBase):
         self.prealloc_thd: Optional[threading.Thread] = None
 
     def __del__(self):
-        if self.enable_page_prealloc:  # Stop preallocation thread
-            self._stop_prealloc_thread()
+        try:
+            if self.enable_page_prealloc and self.prealloc_thd is not None:
+                self._stop_prealloc_thread(timeout=PREALLOC_THREAD_TIMEOUT)
+        except Exception:
+            # Silently ignore exceptions during cleanup
+            pass
 
     def start_prealloc_thread(self):
         # NOTE: called by KVCacheManager after reserving the null block
@@ -263,12 +281,12 @@ class PageAllocator(PageAllocatorBase):
             self._start_prealloc_thread()
 
     def alloc_page(self) -> Page:
-        if self.num_free_pages <= 0:
-            raise ValueError("No free pages left")
-        self.num_free_pages -= 1
-
-        # Fast path: allocate pages with reserved physical memory mapping.
         with self.prealloc_lock:
+            if self.num_free_pages <= 0:
+                raise ValueError("No free pages left")
+            self.num_free_pages -= 1
+
+            # Fast path: allocate pages with reserved physical memory mapping.
             if self.reserved_page_list:
                 page_id = self.reserved_page_list.popleft()
 
@@ -279,17 +297,23 @@ class PageAllocator(PageAllocatorBase):
 
                 return Page(page_id, self.page_size)
 
-        # Slow path: allocate pages with new physical memory mapping.
-        with self.prealloc_lock:
+            # Slow path: allocate pages with new physical memory mapping.
             page_id = self.free_page_list.popleft()
-        page = Page(page_id, self.page_size)
-        self._map_pages([page_id])
+
+        try:
+            self._map_pages([page_id])
+        except Exception as e:
+            # If mapping fails, return page to free list and restore count
+            with self.prealloc_lock:
+                self.free_page_list.appendleft(page_id)
+                self.num_free_pages += 1
+            raise RuntimeError(f"Failed to map page {page_id}: {e}") from e
 
         if self.enable_page_prealloc:
             # Trigger preallocation to refill the pool
             self._trigger_preallocation()
 
-        return page
+        return Page(page_id, self.page_size)
 
     def free_page(self, page_id: int) -> None:
         if SANITY_CHECK:
@@ -332,53 +356,70 @@ class PageAllocator(PageAllocatorBase):
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
 
-        if new_num_pages < self.get_num_inuse_pages():
-            return False
-        if new_num_pages == self.num_total_pages:
-            return True
-        elif new_num_pages > self.num_total_pages:
-            num_to_expand = new_num_pages - self.num_total_pages
+        with self.prealloc_lock:
+            if new_num_pages < self.get_num_inuse_pages():
+                return False
+            if new_num_pages == self.num_total_pages:
+                return True
+            elif new_num_pages > self.num_total_pages:
+                num_to_expand = new_num_pages - self.num_total_pages
 
-            # Reuse previously reclaimed pages first.
-            num_to_reuse = min(len(self.reclaimed_page_list), num_to_expand)
-            with self.prealloc_lock:
-                for _ in range(num_to_reuse):
-                    self.free_page_list.append(
-                        self.reclaimed_page_list.popleft())
-            num_to_expand -= num_to_reuse
-            self.num_free_pages += num_to_reuse
+                # Reuse previously reclaimed pages first.
+                num_to_reuse = min(len(self.reclaimed_page_list),
+                                   num_to_expand)
+                if num_to_reuse > 0:
+                    for _ in range(num_to_reuse):
+                        self.free_page_list.append(
+                            self.reclaimed_page_list.popleft())
+                    num_to_expand -= num_to_reuse
+                    self.num_free_pages += num_to_reuse
 
-            # Allocate new pages if needed.
-            if num_to_expand > 0:
-                new_page_ids = range(self.num_total_pages,
-                                     self.num_total_pages + num_to_expand)
-                with self.prealloc_lock:
+                # Allocate new pages if needed.
+                if num_to_expand > 0:
+                    new_page_ids = list(
+                        range(self.num_total_pages,
+                              self.num_total_pages + num_to_expand))
                     self.free_page_list.extend(new_page_ids)
-                self.num_free_pages += num_to_expand
-            self.num_total_pages = new_num_pages
-        else:  # new_num_pages < self.num_total_pages and new_num_pages >= num_inuse_pages
-            num_to_reclaim = self.num_total_pages - new_num_pages
-            with self.prealloc_lock:
+                    self.num_free_pages += num_to_expand
+                self.num_total_pages = new_num_pages
+            else:  # new_num_pages < self.num_total_pages and new_num_pages >= num_inuse_pages
+                num_to_reclaim = self.num_total_pages - new_num_pages
+
                 if len(self.free_page_list) < num_to_reclaim:
-                    self.trim()
-                assert len(self.free_page_list) >= num_to_reclaim
+                    # Need to trim reserved pages first
+                    reserved_count = len(self.reserved_page_list)
+                    if reserved_count > 0:
+                        # Move reserved pages back to free list
+                        pages_to_unmap = list(self.reserved_page_list)
+                        self.reserved_page_list.clear()
+                        # Unmap outside the lock to avoid holding it during I/O
+                        self.prealloc_lock.release()
+                        self._unmap_pages(pages_to_unmap)
+                        self.prealloc_lock.acquire()
+                        self.free_page_list.extend(pages_to_unmap)
+
+                if len(self.free_page_list) < num_to_reclaim:
+                    # Still not enough free pages
+                    return False
+
                 for _ in range(num_to_reclaim):
                     self.reclaimed_page_list.append(self.free_page_list.pop())
-            self.num_free_pages -= num_to_reclaim
-            self.num_total_pages = new_num_pages
+                self.num_free_pages -= num_to_reclaim
+                self.num_total_pages = new_num_pages
         return True
 
     def trim(self) -> None:
         with self.prealloc_lock:
-            pages_to_unmap = list(self.reserved_page_list)
+            pages_to_unmap = list(self.reserved_page_list)  # copy
             self.reserved_page_list.clear()
 
-        if not pages_to_unmap:
-            return
+            if not pages_to_unmap:
+                return
 
-        self._unmap_pages(pages_to_unmap)
+            self.prealloc_lock.release()
+            self._unmap_pages(pages_to_unmap)
+            self.prealloc_lock.acquire()
 
-        with self.prealloc_lock:
             self.free_page_list.extend(pages_to_unmap)
 
     def get_num_free_pages(self) -> int:
@@ -464,12 +505,15 @@ class PageAllocator(PageAllocatorBase):
             # Initial preallocation trigger
             self._trigger_preallocation()
 
-    def _stop_prealloc_thread(self):
+    def _stop_prealloc_thread(self, timeout: Optional[float] = None):
         if self.prealloc_thd is not None:
             with self.prealloc_lock:
                 self.prealloc_running = False
                 self.prealloc_cond.notify_all()
-            self.prealloc_thd.join()
+            self.prealloc_thd.join(timeout)
+            if self.prealloc_thd.is_alive():
+                logger.warning(
+                    "Preallocation thread did not stop within timeout")
             self.prealloc_thd = None
             logger.debug("Stopped page preallocation thread")
 
@@ -561,18 +605,34 @@ class KVCacheManager:
             else:
                 return kv_tensors_created()
 
-        # Busy-wait until the KV tensors become available.
-        while not _check_kv_tensors_created():
-            time.sleep(0.001)  # 1ms
+        try:
+            total_wait = 0.0
+            while not _check_kv_tensors_created():
+                if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
+                    raise TimeoutError("KV tensors not created after "
+                                       f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
 
-        # Reserve the first block as null block for padding tokens
-        if self.reserve_null_block:
-            # Skip the wait to avoid dead-lock with the event.
-            self.null_block = self._alloc(1, _skip_wait=True)
-            assert self.null_block == [0], "Failed to reserve null block"
-        self.page_allocator.start_prealloc_thread()
+                time.sleep(0.001)  # 1ms
+                total_wait += 0.001
 
-        self._post_init_done.set()
+            # Reserve the first block as null block for padding tokens
+            if self.reserve_null_block:
+                # Skip the wait to avoid dead-lock with the event.
+                self.null_block = self._alloc(1, _skip_wait=True)
+                if self.null_block != [0]:
+                    logger.error(
+                        f"Failed to reserve null block, got {self.null_block}")
+                    raise RuntimeError(
+                        "Failed to reserve null block at index 0")
+
+            self.page_allocator.start_prealloc_thread()
+        except Exception as e:
+            logger.error(
+                f"Error during KVCacheManager post-initialization: {e}")
+            # Set the event even on error to unblock waiting threads
+            raise
+        finally:
+            self._post_init_done.set()
 
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
@@ -651,6 +711,9 @@ class KVCacheManager:
     def free(self, indices: List[int]):
         self._wait_post_init()
 
+        if not indices:
+            return  # Nothing to free
+
         unique_indices = set(indices)
         if self.reserved_blocks:
             self.reserved_blocks = [
@@ -665,26 +728,35 @@ class KVCacheManager:
 
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
-            if (SANITY_CHECK and page_id not in self.full_pages
-                    and page_id not in self.avail_pages):
-                logger.warning(
-                    f"Page {page_id} is not in avail_pages or full_pages, "
-                    "it is possible that the page is already freed.")
-                continue
+            # Find the page - it must be in either full_pages or avail_pages
+            page = None
             if page_id in self.full_pages:
                 page = self.full_pages.pop(page_id)
-            else:
+            elif page_id in self.avail_pages:
                 page = self.avail_pages.pop(page_id)
+            else:
+                if SANITY_CHECK:
+                    # This is a serious error - the page should exist
+                    raise ValueError(
+                        f"Page {page_id} not found in avail_pages or full_pages. "
+                        f"This indicates a serious state inconsistency.")
+                else:
+                    logger.error(
+                        f"Page {page_id} not found in avail_pages or full_pages. "
+                        f"Skipping to avoid crash, but this indicates a serious bug."
+                    )
+                    continue
 
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
+
             if page.empty():
                 pages_to_free.append(page.page_id)
                 self.num_avail_blocks -= page.num_free_blocks()
             else:
                 self.avail_pages[page_id] = page
 
-        if len(pages_to_free) > 0:
+        if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
 
         if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
@@ -800,7 +872,7 @@ class KVCacheManager:
         return avail_phy_blocks
 
     def clear(self):
-        raise NotImplementedError
+        raise NotImplementedError("kvcached does not support clear() for now")
 
     def _cleanup_shm(self, *args):
         """Remove the POSIX shared-memory segment and its backing file."""
