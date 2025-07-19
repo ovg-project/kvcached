@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 DEV_MODE=false  # Set to true to use the local kvcached directory
-KVCACHED_VERSION=0.0.1.dev3
+KVCACHED_VERSION=0.0.1.dev4
 
 check_uv() {
     if ! command -v uv &> /dev/null; then
