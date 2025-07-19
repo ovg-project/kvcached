@@ -59,9 +59,35 @@ cd engine_integration/benchmark
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run SGLang/vLLM with kvcached.
 
-## Known issues
+## Memory monitoring and control via kvcached CLI
 
-If you observe the SGLang server crashing after the benchmark client finishes, please refer to [this issue](https://github.com/ovg-project/kvcached/issues/5) for a detailed explanation of the root cause and solutions.
+kvcached includes a built-in CLI tool that allows you to monitor GPU memory usage and manage memory limits across different applications.
+
+To launch the CLI, navigate to the project root directory and run:
+
+```
+python kvcached/controller/kvctl.py
+```
+
+Once inside the CLI, type `help` to view all supported commands:
+
+```
+kvcached> help
+Available commands:
+  list [ipc ...]               List IPC segments and usage
+  limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
+  limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
+  watch [-n sec] [ipc ...]     Continuously display usage table
+  kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
+  !<shell cmd>                 Run command in system shell
+  help                         Show this help message
+  delete <ipc>                 Delete IPC segment and its limit entry
+  exit | quit                  Exit the shell
+
+kvcached>
+```
+
+Use the `kvtop` command for real-time visualization of memory usage:
 
 ## Contributing
 
