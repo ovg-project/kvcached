@@ -149,15 +149,17 @@ class PageAllocator(PageAllocatorBase):
         Args:
             total_mem_size: Total memory size in bytes.
             page_size: Page size in bytes.
+            tp_size: Tensor parallel size.
             async_sched: Whether asynchronous scheduling is enabled.
             enable_page_prealloc: Whether to enable page preallocation.
         """
-        logger.info(f"Init KVCached PageAllocator: "
-                    f"total_mem_size={total_mem_size//(1024*1024)}MB, "
-                    f"page_size={page_size//(1024*1024)}MB, "
-                    f"tp_size={tp_size}, "
-                    f"async_sched={async_sched}, "
-                    f"enable_prealloc={enable_page_prealloc}")
+        logger.info(
+            f"Init kvcached KV cache allocator: "
+            f"total_mem_size_per_layer={total_mem_size//(1024*1024)}MB, "
+            f"page_size={page_size//(1024*1024)}MB, "
+            f"tp_size={tp_size}, "
+            f"async_sched={async_sched}, "
+            f"enable_prealloc={enable_page_prealloc}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
