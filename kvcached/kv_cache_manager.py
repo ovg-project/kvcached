@@ -7,6 +7,7 @@ This module implements a hierarchical memory management system for KV cache:
 """
 
 import atexit
+import functools
 import os
 import signal
 import threading
@@ -19,7 +20,7 @@ import torch
 
 from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
                                 get_ipc_path, init_kv_cache_limit)
-from kvcached.locks import NoOpLock, synchronized
+from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
 from kvcached.utils import (DEFAULT_IPC_NAME, GPU_UTILIZATION, PAGE_SIZE,
@@ -29,6 +30,19 @@ from kvcached.vmm_ops import kv_tensors_created
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+
+
+def synchronized(method):
+    """
+    A helper decorator to synchronize access to a method.
+    """
+
+    @functools.wraps(method)
+    def synchronized_method(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return synchronized_method
 
 
 class KVCacheManager:

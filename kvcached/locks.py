@@ -1,4 +1,3 @@
-import functools
 import threading
 
 
@@ -50,13 +49,3 @@ class NoOpCondition:
 
     def __exit__(self, *args):
         return self.lock.__exit__(*args)
-
-
-def synchronized(method):
-
-    @functools.wraps(method)
-    def synchronized_method(self, *args, **kwargs):
-        with self._lock:
-            return method(self, *args, **kwargs)
-
-    return synchronized_method

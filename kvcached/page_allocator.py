@@ -179,11 +179,11 @@ class PageAllocator(PageAllocatorBase):
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
         if self.enable_page_prealloc:
-            self.prealloc_lock = threading.RLock()
-            self.prealloc_cond = threading.Condition(self.prealloc_lock)
+            self._lock = threading.RLock()
+            self._cond = threading.Condition(self._lock)
         else:  # No preallocation lock and condition are needed.
-            self.prealloc_lock = NoOpLock()
-            self.prealloc_cond = NoOpCondition(self.prealloc_lock)
+            self._lock = NoOpLock()
+            self._cond = NoOpCondition(self._lock)
         self.prealloc_running: bool = False
         self.prealloc_needed: bool = False
         self.prealloc_thd: Optional[threading.Thread] = None
@@ -199,12 +199,12 @@ class PageAllocator(PageAllocatorBase):
     def start_prealloc_thread(self):
         # NOTE: called by KVCacheManager after reserving the null block
         if self.enable_page_prealloc:
-            self.prealloc_lock = threading.RLock()
-            self.prealloc_cond = threading.Condition(self.prealloc_lock)
+            self._lock = threading.RLock()
+            self._cond = threading.Condition(self._lock)
             self._start_prealloc_thread()
 
     def alloc_page(self) -> Page:
-        with self.prealloc_lock:
+        with self._lock:
             if self.num_free_pages <= 0:
                 raise ValueError("No free pages left")
             self.num_free_pages -= 1
@@ -216,7 +216,7 @@ class PageAllocator(PageAllocatorBase):
                 # Trigger preallocation to refill reserved pool if getting low
                 if len(self.reserved_page_list) < self.min_reserved_pages:
                     self.prealloc_needed = True
-                    self.prealloc_cond.notify()
+                    self._cond.notify()
 
                 return Page(page_id, self.page_size)
 
@@ -227,7 +227,7 @@ class PageAllocator(PageAllocatorBase):
             self._map_pages([page_id])
         except Exception as e:
             # If mapping fails, return page to free list and restore count
-            with self.prealloc_lock:
+            with self._lock:
                 self.free_page_list.appendleft(page_id)
                 self.num_free_pages += 1
             raise RuntimeError(f"Failed to map page {page_id}: {e}") from e
@@ -239,15 +239,12 @@ class PageAllocator(PageAllocatorBase):
         return Page(page_id, self.page_size)
 
     def free_page(self, page_id: int) -> None:
-        if SANITY_CHECK:
-            with self.prealloc_lock:
-                if (page_id in self.free_page_list
-                        or page_id in self.reserved_page_list):
-                    raise ValueError(f"Page {page_id} is already free")
+        with self._lock:
+            if SANITY_CHECK and (page_id in self.free_page_list
+                                 or page_id in self.reserved_page_list):
+                raise ValueError(f"Page {page_id} is already free or reserved")
 
-        self.num_free_pages += 1
-
-        with self.prealloc_lock:
+            self.num_free_pages += 1
             if len(self.reserved_page_list) < self.max_reserved_pages:
                 # Fast path: reserve page with its physical memory mapping.
                 self.reserved_page_list.append(page_id)
@@ -255,12 +252,19 @@ class PageAllocator(PageAllocatorBase):
 
         # Slow path: free page and its physical memory mapping.
         self._unmap_pages([page_id])
-        with self.prealloc_lock:
+        with self._lock:
             self.free_page_list.append(page_id)
 
     def free_pages(self, page_ids: List[int]) -> None:
-        self.num_free_pages += len(page_ids)
-        with self.prealloc_lock:
+        with self._lock:
+            if SANITY_CHECK:
+                for page_id in page_ids:
+                    if (page_id in self.free_page_list
+                            or page_id in self.reserved_page_list):
+                        raise ValueError(
+                            f"Page {page_id} is already free or reserved")
+
+            self.num_free_pages += len(page_ids)
             num_to_reserve = self.max_reserved_pages - len(
                 self.reserved_page_list)
             if num_to_reserve > 0:
@@ -273,13 +277,12 @@ class PageAllocator(PageAllocatorBase):
 
         # Slow path: free page_ids and their physical memory mapping.
         self._unmap_pages(page_ids)
-        with self.prealloc_lock:
+        with self._lock:
             self.free_page_list.extend(page_ids)
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
-
-        with self.prealloc_lock:
+        with self._lock:
             if new_num_pages < self.get_num_inuse_pages():
                 return False
             if new_num_pages == self.num_total_pages:
@@ -316,9 +319,11 @@ class PageAllocator(PageAllocatorBase):
                         pages_to_unmap = list(self.reserved_page_list)
                         self.reserved_page_list.clear()
                         # Unmap outside the lock to avoid holding it during I/O
-                        self.prealloc_lock.release()
-                        self._unmap_pages(pages_to_unmap)
-                        self.prealloc_lock.acquire()
+                        try:
+                            self._lock.release()
+                            self._unmap_pages(pages_to_unmap)
+                        finally:
+                            self._lock.acquire()
                         self.free_page_list.extend(pages_to_unmap)
 
                 if len(self.free_page_list) < num_to_reclaim:
@@ -332,16 +337,18 @@ class PageAllocator(PageAllocatorBase):
         return True
 
     def trim(self) -> None:
-        with self.prealloc_lock:
+        with self._lock:
             pages_to_unmap = list(self.reserved_page_list)  # copy
             self.reserved_page_list.clear()
 
             if not pages_to_unmap:
                 return
 
-            self.prealloc_lock.release()
-            self._unmap_pages(pages_to_unmap)
-            self.prealloc_lock.acquire()
+            try:
+                self._lock.release()
+                self._unmap_pages(pages_to_unmap)
+            finally:
+                self._lock.acquire()
 
             self.free_page_list.extend(pages_to_unmap)
 
@@ -355,7 +362,7 @@ class PageAllocator(PageAllocatorBase):
         return self.num_total_pages
 
     def get_num_reserved_pages(self) -> int:
-        with self.prealloc_lock:
+        with self._lock:
             return len(self.reserved_page_list)
 
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
@@ -377,10 +384,10 @@ class PageAllocator(PageAllocatorBase):
     def _prealloc_worker(self):
         """Worker thread that preallocates and maps physical pages."""
         while self.prealloc_running:
-            with self.prealloc_lock:
+            with self._lock:
                 # Wait until preallocation is needed or thread is stopped
                 while not self.prealloc_needed and self.prealloc_running:
-                    self.prealloc_cond.wait()
+                    self._cond.wait()
 
                 if not self.prealloc_running:
                     break
@@ -405,14 +412,14 @@ class PageAllocator(PageAllocatorBase):
             if pages_to_reserve:
                 try:
                     self._map_pages(pages_to_reserve)
-                    with self.prealloc_lock:
+                    with self._lock:
                         self.reserved_page_list.extend(pages_to_reserve)
                     logger.debug(
                         f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
                     )
                 except Exception as e:
                     # If mapping fails, return pages to free list
-                    with self.prealloc_lock:
+                    with self._lock:
                         self.free_page_list.extendleft(pages_to_reserve)
                     logger.error(
                         f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
@@ -430,9 +437,9 @@ class PageAllocator(PageAllocatorBase):
 
     def _stop_prealloc_thread(self, timeout: Optional[float] = None):
         if self.prealloc_thd is not None:
-            with self.prealloc_lock:
+            with self._lock:
                 self.prealloc_running = False
-                self.prealloc_cond.notify_all()
+                self._cond.notify_all()
             self.prealloc_thd.join(timeout)
             if self.prealloc_thd.is_alive():
                 logger.warning(
@@ -442,9 +449,9 @@ class PageAllocator(PageAllocatorBase):
 
     def _trigger_preallocation(self):
         """Trigger the preallocation thread to fill up reserved blocks"""
-        with self.prealloc_lock:
+        with self._lock:
             self.prealloc_needed = True
-            self.prealloc_cond.notify()
+            self._cond.notify()
 
     def _map_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
