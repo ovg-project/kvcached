@@ -93,31 +93,18 @@ class Page:
         self.page_id = page_id
         self.page_size = page_size
 
+        self.start_block = None
+        self.end_block = None
         self.num_kv_blocks = None
         self.free_list = None
 
     def init(self, block_mem_size: int) -> None:
-        if self.initialized():
-            logger.warning(f"Page {self.page_id} is already initialized")
-            return
 
-        start_block, end_block = self.get_block_range(self.page_id,
-                                                      self.page_size,
-                                                      block_mem_size)
+        self.start_block, self.end_block = self.get_block_range(
+            self.page_id, self.page_size, block_mem_size)
 
-        self.num_kv_blocks = end_block - start_block
-        self.free_list = list(range(start_block, end_block))
-
-    def destroy(self) -> None:
-        if not self.initialized() or len(self.free_list) != self.num_kv_blocks:
-            logger.warning(f"Page {self.page_id} is not initialized or "
-                           "is corrupted")
-
-        self.num_kv_blocks = None
-        self.free_list = None
-
-    def initialized(self) -> bool:
-        return self.num_kv_blocks is not None and self.free_list is not None
+        self.num_kv_blocks = self.end_block - self.start_block
+        self.free_list = list(range(self.start_block, self.end_block))
 
     def alloc(self) -> int:
         if self.full():
@@ -193,11 +180,15 @@ class PageAllocatorBase(ABC):
         pass
 
     @abstractmethod
-    def alloc_page(self) -> int:
+    def alloc_page(self) -> Page:
         pass
 
     @abstractmethod
-    def free_page(self, page: int) -> None:
+    def free_page(self, page_id: int) -> None:
+        pass
+
+    @abstractmethod
+    def free_pages(self, page_ids: List[int]) -> None:
         pass
 
     @abstractmethod
@@ -300,8 +291,7 @@ class PageAllocator(PageAllocatorBase):
 
         return page
 
-    def free_page(self, page: Page) -> None:
-        page_id = page.page_id
+    def free_page(self, page_id: int) -> None:
         if SANITY_CHECK:
             with self.prealloc_lock:
                 if (page_id in self.free_page_list
