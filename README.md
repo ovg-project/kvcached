@@ -66,7 +66,7 @@ kvcached includes a built-in CLI tool that allows you to monitor GPU memory usag
 To launch the CLI, navigate to the project root directory and run:
 
 ```
-python kvcached/controller/kvctl.py
+python kvcached/cli/kvctl.py
 ```
 
 Once inside the CLI, type `help` to view all supported commands:

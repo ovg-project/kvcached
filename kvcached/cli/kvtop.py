@@ -4,7 +4,7 @@ import os
 import time
 from typing import List, Optional, Union
 
-from kvcached.controller.utils import (SHM_DIR, MemInfoStruct, RwLockedShm,
+from kvcached.cli.utils import (SHM_DIR, MemInfoStruct, RwLockedShm,
                                        get_ipc_name)
 
 

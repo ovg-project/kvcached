@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import posix_ipc
 import torch
 
-from kvcached.controller.utils import (MemInfoStruct, RwLockedShm,
+from kvcached.cli.utils import (MemInfoStruct, RwLockedShm,
                                        get_ipc_name, get_ipc_path,
                                        init_kv_cache_limit)
 from kvcached.tp_ipc_util import (broadcast_kv_tensors_created_to_workers,

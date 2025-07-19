@@ -8,9 +8,9 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-from kvcached.controller.kvtop import _detect_kvcache_ipc_names
-from kvcached.controller.kvtop import kvtop as kvtop_ui
-from kvcached.controller.utils import get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.kvtop import _detect_kvcache_ipc_names
+from kvcached.cli.kvtop import kvtop as kvtop_ui
+from kvcached.cli.utils import get_kv_cache_limit, update_kv_cache_limit
 
 try:
     import readline  # type: ignore
@@ -278,7 +278,7 @@ def cmd_limit_percent(ipc: str, percent: float):
               file=sys.stderr)
         return
 
-    from kvcached.controller.utils import get_total_gpu_memory
+    from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
@@ -310,7 +310,7 @@ def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
 
 
 def cmd_delete(ipc: str):
-    from kvcached.controller.utils import delete_kv_cache_segment
+    from kvcached.cli.utils import delete_kv_cache_segment
 
     if delete_kv_cache_segment(ipc):
         print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
