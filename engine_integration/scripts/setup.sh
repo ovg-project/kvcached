@@ -22,8 +22,8 @@ install_requirements() {
 setup_vllm() {
     pushd "$ENGINE_DIR"
 
-    git clone -b v0.9.2 https://github.com/vllm-project/vllm.git vllm-v0.9.2
-    cd vllm-v0.9.2
+    git clone -b v0.8.4 https://github.com/vllm-project/vllm.git vllm-v0.8.4
+    cd vllm-v0.8.4
 
     uv venv --python=python3.11
     source .venv/bin/activate
@@ -33,7 +33,7 @@ setup_vllm() {
     install_requirements
 
     VLLM_USE_PRECOMPILED=1 uv pip install --editable .
-    git apply "$SCRIPT_DIR/kvcached-vllm-v0.9.2.patch"
+    git apply "$SCRIPT_DIR/kvcached-vllm-v0.8.4.patch"
 
     # Install kvcached after installing VLLM to find the correct torch version
     pushd "$KVCACHED_DIR"

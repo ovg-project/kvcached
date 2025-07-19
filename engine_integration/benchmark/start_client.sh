@@ -26,9 +26,9 @@ check_and_download_sharegpt() {
 
 if [ "$op" == "vllm" ]; then
     check_and_download_sharegpt
-    source "$ENGINE_DIR/vllm-v0.9.2/.venv/bin/activate"
+    source "$ENGINE_DIR/vllm-v0.8.4/.venv/bin/activate"
     uv pip install pandas datasets
-    pushd $ENGINE_DIR/vllm-v0.9.2/benchmarks
+    pushd $ENGINE_DIR/vllm-v0.8.4/benchmarks
     python benchmark_serving.py --backend=vllm \
       --model $MODEL \
       --dataset-name sharegpt \
