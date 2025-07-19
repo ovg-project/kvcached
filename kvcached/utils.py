@@ -3,6 +3,13 @@ import os
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
 
+# Configuration constants for KVCacheManager
+GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
+PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
+                                  "true").lower() == "true"
+MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
+MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
+
 # Allow overriding the shared-memory segment name via env var so multiple
 # kvcached deployments on one machine can coexist without collision.
 DEFAULT_IPC_NAME = os.getenv("KVCACHED_IPC_NAME", "kvcached_mem_info")

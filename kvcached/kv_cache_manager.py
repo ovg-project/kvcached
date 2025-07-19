@@ -24,21 +24,18 @@ from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
 from kvcached.tp_ipc_util import (broadcast_kv_tensors_created_to_workers,
                                   broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import DEFAULT_IPC_NAME, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import (DEFAULT_IPC_NAME, GPU_UTILIZATION,
+                            MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
+                            PAGE_PREALLOC_ENABLED, PAGE_SIZE,
+                            get_kvcached_logger)
 from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
                               unmap_from_kv_tensors)
 
 logger = get_kvcached_logger()
 
-# Configuration constants
-GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
-PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
-                                  "true").lower() == "true"
-MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
-MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 SANITY_CHECK = False
-PREALLOC_THREAD_TIMEOUT: float = 1.0  # seconds
-KV_TENSOR_WAIT_TIMEOUT: float = 5.0  # seconds
+PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
+KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 
 
 class NoOpLock:
