@@ -53,3 +53,41 @@ repos:
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt, --index-strategy, unsafe-best-match, --torch-backend, cu128]
       files: ^requirements/test\.(in|txt)$
+# Add mypy hooks for both local runs and CI (manual stage)
+- repo: local
+  hooks:
+  - id: mypy-local
+    name: Run mypy for local Python installation
+    entry: tools/mypy.sh 0 "local"
+    language: python
+    types: [python]
+    additional_dependencies: &mypy_deps [mypy==1.11.1, types-cachetools, types-setuptools, types-PyYAML, types-requests, pydantic]
+    stages: [pre-commit] # Don't run in CI
+  - id: mypy-3.9
+    name: Run mypy for Python 3.9
+    entry: tools/mypy.sh 1 "3.9"
+    language: python
+    types: [python]
+    additional_dependencies: *mypy_deps
+    stages: [manual] # Only run in CI
+  - id: mypy-3.10
+    name: Run mypy for Python 3.10
+    entry: tools/mypy.sh 1 "3.10"
+    language: python
+    types: [python]
+    additional_dependencies: *mypy_deps
+    stages: [manual] # Only run in CI
+  - id: mypy-3.11
+    name: Run mypy for Python 3.11
+    entry: tools/mypy.sh 1 "3.11"
+    language: python
+    types: [python]
+    additional_dependencies: *mypy_deps
+    stages: [manual] # Only run in CI
+  - id: mypy-3.12
+    name: Run mypy for Python 3.12
+    entry: tools/mypy.sh 1 "3.12"
+    language: python
+    types: [python]
+    additional_dependencies: *mypy_deps
+    stages: [manual] # Only run in CI
