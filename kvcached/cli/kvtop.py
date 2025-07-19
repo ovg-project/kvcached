@@ -249,7 +249,10 @@ def kvtop(ipc_names: Union[str, List[str], None] = None,
 # ---------------------------------------------------------------------------
 # CLI entry-point
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
+
+
+def main() -> None:
+    """Main entry point for kvtop CLI."""
     parser = argparse.ArgumentParser(
         description="Interactive TUI for monitoring KVCached memory usage.")
     parser.add_argument(
@@ -266,3 +269,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     kvtop(args.ipc_names if args.ipc_names else None, args.refresh)
+
+
+if __name__ == "__main__":
+    main()

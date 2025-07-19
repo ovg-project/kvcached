@@ -1,3 +1,12 @@
+# Version information
+from importlib.metadata import version
+
+try:
+    __version__ = version("kvcached")
+except Exception:
+    # Fallback for development installations
+    __version__ = "unknown"
+
 # Ensure PyTorch is imported first before importing kvcached.vmm_ops
 try:
     import torch  # noqa: F401

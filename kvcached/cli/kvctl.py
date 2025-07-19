@@ -417,7 +417,7 @@ def interactive_shell():
 # ---------------------------------------------------------------------------
 
 
-def _main():
+def main():
     parser = argparse.ArgumentParser(description="KVCached control utility")
     sub = parser.add_subparsers(dest='command')
 
@@ -478,4 +478,4 @@ def _main():
 
 
 if __name__ == '__main__':
-    _main()
+    main()
