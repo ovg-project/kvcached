@@ -42,6 +42,13 @@ class Page:
         block_id = self.free_list.pop()
         return block_id
 
+    def alloc_all_remaining(self) -> List[int]:
+        if self.full():
+            raise ValueError(f"Page {self.page_id} is already full")
+        block_ids = self.free_list
+        self.free_list = []
+        return block_ids
+
     def free(self, block_id: int) -> None:
         if SANITY_CHECK:
             self._sanity_check(block_id)

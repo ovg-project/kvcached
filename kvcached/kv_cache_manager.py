@@ -184,9 +184,9 @@ class KVCacheManager:
                 self.avail_pages[page.page_id] = page
             else:
                 self.num_avail_blocks -= page.num_free_blocks()
-                ret_index.extend(page.free_list)
-                remaining_need -= len(page.free_list)
-                page.free_list = []
+                additional_blocks = page.alloc_all_remaining()
+                ret_index.extend(additional_blocks)
+                remaining_need -= len(additional_blocks)
                 self.full_pages[page.page_id] = page
 
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
