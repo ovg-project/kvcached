@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
-DEV_MODE=false  # Set to true to use the local kvcached directory
+DEV_MODE=true  # Set to false to use the released kvcached package
 KVCACHED_VERSION=0.0.1.dev5
 
 check_uv() {

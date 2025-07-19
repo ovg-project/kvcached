@@ -24,7 +24,7 @@ Note that `--no-build-isolation` is required for kvcached to find the right PyTo
 
 **Important Note:** The scripts will create separate virtual environments using `uv` for SGLang and vLLM.
 
-## All-in-One Installation (SGLang+vLLM+kvcached, Recommended)
+## All-in-One Installation (SGLang+vLLM+kvcached, Recommended for Development)
 
 kvcached now supports both SGLang and vLLM. Currently, it requires modifications to the LLM engine's code. To facilitate this process, we provide patches for SGLang (0.4.6.post2) and vLLM (0.8.4, 0.9.2), along with detailed setup instructions, in the `engine_integration/` directory.
 
@@ -73,11 +73,15 @@ The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to 
 
 ## Memory monitoring and control via kvcached CLI
 
-kvcached includes a built-in CLI tool that allows you to monitor GPU memory usage and manage memory limits across different applications.
+kvcached includes a built-in CLI tool that allows you to monitor GPU memory usage and manage memory limits across different applications. A command `kvctl` is installed along with kvcached package:
+
+```bash
+kvctl
+```
 
 To launch the CLI, navigate to the project root directory and run:
 
-```
+```bash
 python kvcached/cli/kvctl.py
 ```
 
