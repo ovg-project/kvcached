@@ -42,4 +42,4 @@ jobs:
 
       # Run only the mypy hook that matches this Python version (manual stage)
       - name: Run MyPy pre-commit hook
-        run: pre-commit run --all-files --hook-stage manual --hook-id mypy-${{ matrix.python-version }}
+        run: pre-commit run --all-files --hook-stage manual mypy-${{ matrix.python-version }}
