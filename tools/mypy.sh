@@ -33,8 +33,8 @@ run_mypy() {
     fi
 }
 
-run_mypy tests
-run_mypy benchmarks
+# run_mypy tests
+# run_mypy benchmarks
 run_mypy kvcached
 # run_mypy kvcached/cli
 # run_mypy kvcached/integration

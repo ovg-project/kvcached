@@ -1,4 +1,5 @@
 import threading
+from typing import Union
 
 
 class NoOpLock:
@@ -23,7 +24,7 @@ class NoOpLock:
 class NoOpCondition:
     """A no-op condition that implements the same interface as threading.Condition"""
 
-    def __init__(self, lock: threading.RLock):
+    def __init__(self, lock: Union[threading.RLock, NoOpLock]):
         self.lock = lock
 
     def wait(self, timeout=None):
