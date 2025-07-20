@@ -28,7 +28,7 @@ cd engine_integration/scripts
 git apply [patch_name][engine_code_path]
 ```
 
-## All-in-One Installation (SGLang+vLLM+kvcached, Recommended for Development)
+## All-in-One Installation (Recommended for Development)
 
 You can install everything (SGLang+vLLM+kvcached) by running the following commands:
 
