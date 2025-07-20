@@ -4,29 +4,31 @@ kvcached is a new KV cache management system that supports on-demand KV cache al
 
 kvcached is compatible with popular LLM serving engines, including SGLang and vLLM.
 
-## Installation
+## kvcached Installation
 
-It is recommended to install PyTorch first by following the official instructions.
+### Prerequisites
 
-Then, install kvcached:
+* Python (tested with 3.11)
+* PyTorch (tested with 2.6.0 and 2.7.0)
+
+kvcached can be installed as simple as
 
 ```bash
 pip install kvcached --no-build-isolation
 ```
 
-Note that `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment. If PyTorch is re-installed or upgraded, one will need to re-install kvcached as well.
+Note that `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment. If PyTorch is re-installed or upgraded, kvcached also needs re-installation.
 
-## Prerequisites
+kvcached now supports both **SGLang** and **vLLM**. While we are in the process of upstreaming the integration interfaces, we provide temporary support via code patches.
 
-* Python (tested with 3.11)
-* PyTorch (tested with 2.6.0 and 2.7.0)
-* Virtual environment tools (scripts are provided for uv==0.7.12)
+To apply a patch:
 
-**Important Note:** The scripts will create separate virtual environments using `uv` for SGLang and vLLM.
+```bash
+cd engine_integration/scripts
+git apply [patch_name][engine_code_path]
+```
 
 ## All-in-One Installation (SGLang+vLLM+kvcached, Recommended for Development)
-
-kvcached now supports both SGLang and vLLM. Currently, it requires modifications to the LLM engine's code. To facilitate this process, we provide patches for SGLang (0.4.6.post2) and vLLM (0.8.4, 0.9.2), along with detailed setup instructions, in the `engine_integration/` directory.
 
 You can install everything (SGLang+vLLM+kvcached) by running the following commands:
 
@@ -35,28 +37,7 @@ cd engine_integration/scripts
 ./setup.sh all
 ```
 
-This script will download the specified versions of SGLang and vLLM, create separate venv environments, compile the code, apply the necessary patches, and install kvcached.
-
-## Installation from Source
-
-If you want to install kvcached on your own, you can install it from source, run the following command:
-
-```bash
-pip install -r requirements.txt # install build dependencies
-pip install -e . --no-build-isolation
-```
-
-This will compile and install kvcached. If you have the right versions of SGLang and vLLM, you can apply the patches in `engine_integration/scripts`, and it should work.
-
-NOTE: `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment.
-
-### Manual Compilation
-
-kvcached includes a CPP-based library called `vmm_ops` for managing low-level CUDA virtual memory operations. This library is typically built and installed automatically during the kvcached installation process. However, one can rebuild the `vmm_ops` library locally by running:
-
-```python
-python setup.py build_ext --inplace
-```
+This script will download the specified versions of SGLang and vLLM, create separate venv environments (using `uv`), compile the code, apply the necessary patches, and install kvcached.
 
 ## Testing
 
@@ -77,12 +58,6 @@ kvcached includes a built-in CLI tool that allows you to monitor GPU memory usag
 
 ```bash
 kvctl
-```
-
-To launch the CLI, navigate to the project root directory and run:
-
-```bash
-python kvcached/cli/kvctl.py
 ```
 
 Once inside the CLI, type `help` to view all supported commands:
