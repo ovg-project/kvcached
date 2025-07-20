@@ -5,17 +5,7 @@ import time
 from typing import List, Optional, Union
 
 from kvcached.cli.utils import (SHM_DIR, MemInfoStruct, RwLockedShm,
-                                get_ipc_name)
-
-
-def _format_size(num_bytes: int) -> str:
-    """Pretty-print a size in bytes using the largest suitable unit."""
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num_bytes < 1024 or unit == "TB":
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    # Should not reach here
-    return f"{num_bytes} B"
+                                _format_size, get_ipc_name)
 
 
 def _detect_kvcache_ipc_names() -> List[str]:
