@@ -61,6 +61,7 @@ repos:
     entry: tools/mypy.sh 0 "local"
     language: python
     types: [python]
+    pass_filenames: false
     additional_dependencies: &mypy_deps [mypy==1.11.1, types-cachetools, types-setuptools, types-PyYAML, types-requests, pydantic]
     stages: [pre-commit] # Don't run in CI
   - id: mypy-3.9
