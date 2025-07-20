@@ -4,13 +4,68 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvcached"
-version = "0.1.0"
+version = "0.0.1.dev6"
+authors = [
+    {name = "The kvcached team"}
+]
 readme = "README.md"
+description = "A KV cache management system that supports on-demand KV cache allocation for LLMs with GPU virtual memory"
+requires-python = ">=3.9,<3.13"
+license = "Apache-2.0"
+keywords = [
+    "llm",
+    "kv-cache",
+    "gpu-memory",
+    "gpu-sharing",
+    "machine-learning",
+    "pytorch",
+    "vllm",
+    "sglang",
+    "cuda",
+    "memory-management"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "numpy>=1.26.0",
     "posix_ipc>=1.0",
 ]
-requires-python = ">=3.9,<3.12"
+
+[project.scripts]
+kvctl = "kvcached.cli.kvctl:main"
+kvtop = "kvcached.cli.kvtop:main"
+
+[project.urls]
+Homepage = "https://github.com/ovg-project/kvcached"
+Repository = "https://github.com/ovg-project/kvcached"
+Issues = "https://github.com/ovg-project/kvcached/issues"
+Documentation = "https://github.com/ovg-project/kvcached#readme"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "setuptools>=64",
+    "wheel",
+]
 
 [tool.setuptools]
-packages = ["kvcached"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kvcached*"]
+exclude = ["*__pycache__*"]
+
+[tool.setuptools.package-data]
+kvcached = ["*.so", "*.pyi", "py.typed"]

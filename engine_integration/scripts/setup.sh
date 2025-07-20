@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
+DEV_MODE=true  # Set to false to use the released kvcached package
+KVCACHED_VERSION=0.0.1.dev5
 
 check_uv() {
     if ! command -v uv &> /dev/null; then
@@ -22,8 +24,8 @@ install_requirements() {
 setup_vllm() {
     pushd "$ENGINE_DIR"
 
-    git clone -b v0.8.4 https://github.com/vllm-project/vllm.git vllm-v0.8.4
-    cd vllm-v0.8.4
+    git clone -b v0.9.2 https://github.com/vllm-project/vllm.git vllm-v0.9.2
+    cd vllm-v0.9.2
 
     uv venv --python=python3.11
     source .venv/bin/activate
@@ -33,12 +35,18 @@ setup_vllm() {
     install_requirements
 
     VLLM_USE_PRECOMPILED=1 uv pip install --editable .
-    git apply "$SCRIPT_DIR/kvcached-vllm-v0.8.4.patch"
+    git apply "$SCRIPT_DIR/kvcached-vllm-v0.9.2.patch"
 
     # Install kvcached after installing VLLM to find the correct torch version
-    pushd "$KVCACHED_DIR"
-    uv pip install -e . --no-build-isolation
-    popd
+    if [ "$DEV_MODE" = true ]; then
+        pushd "$KVCACHED_DIR"
+        uv pip install -e . --no-build-isolation
+        popd
+    else
+        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
+        --no-build-isolation --no-cache-dir \
+        --extra-index-url https://pypi.org/simple
+    fi
 
     deactivate
     popd
@@ -61,9 +69,15 @@ setup_sglang() {
     git apply "$SCRIPT_DIR/kvcached-sglang-v0.4.6.post2.patch"
 
     # Install kvcached after install sglang to find the correct torch version
-    pushd "$KVCACHED_DIR"
-    uv pip install -e . --no-build-isolation
-    popd
+    if [ "$DEV_MODE" = true ]; then
+        pushd "$KVCACHED_DIR"
+        uv pip install -e . --no-build-isolation
+        popd
+    else
+        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
+        --no-build-isolation --no-cache-dir \
+        --extra-index-url https://pypi.org/simple
+    fi
 
 
     deactivate
