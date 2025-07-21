@@ -6,15 +6,20 @@ ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
 
-MODEL=meta-llama/Llama-3.1-8B
-VLLM_PORT=12346
-SGL_PORT=30000
+DEFAULT_MODEL=meta-llama/Llama-3.1-8B
+DEFAULT_VLLM_PORT=12346
+DEFAULT_SGL_PORT=30000
 
 NUM_PROMPTS=1000
 REQUEST_RATE=10
 
 op=$1
+port_arg=$2
+model_arg=$3
 
+MODEL=${model_arg:-$DEFAULT_MODEL}
+VLLM_PORT=${port_arg:-$DEFAULT_VLLM_PORT}
+SGL_PORT=${port_arg:-$DEFAULT_SGL_PORT}
 
 check_and_download_sharegpt() {
     pushd $SCRIPT_DIR
