@@ -1,11 +1,11 @@
 import threading
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import List, Optional, Tuple, Union, cast
+from typing import List, Optional, Tuple, cast
 
 import torch
 
-from kvcached.locks import NoOpCondition, NoOpLock
+from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
 from kvcached.utils import (MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
@@ -203,8 +203,8 @@ class PageAllocator(PageAllocatorBase):
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
 
-        self._lock: Union[threading.RLock, NoOpLock]
-        self._cond: Union[threading.Condition, NoOpCondition]
+        self._lock: LockLike
+        self._cond: ConditionLike
 
         if self.enable_page_prealloc:
             self._lock = threading.RLock()
