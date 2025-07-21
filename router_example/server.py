@@ -5,7 +5,7 @@ import logging
 import json
 from typing import Dict, Any
 from aiohttp import web, ClientSession
-from .router import LLMRouter
+from router import LLMRouter
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ class RouterServer:
         self.app.router.add_get('/health', self.handle_health)
         self.app.router.add_get('/models', self.handle_list_models)
         self.app.router.add_get('/health/{model_name}', self.handle_model_health)
+        self.app.router.add_get('/get_server_info', self.handle_get_server_info)
     
     async def handle_completion(self, request: web.Request) -> web.Response:
         """Handle completion requests"""
@@ -195,12 +196,21 @@ class RouterServer:
                 content_type='application/json'
             )
     
+    async def handle_get_server_info(self, request: web.Request) -> web.Response:
+        """Handle get server info requests"""
+        # return dummy data
+        return web.Response(
+            text=json.dumps({"status": "dummy"}),
+            status=200,
+            content_type='application/json'
+        )
+    
     async def start(self):
         """Start the router server"""
         logger.info(f"Starting router server on port {self.port}")
 
         # Start LLM servers based on the configuration
-        await self.router.start_llm_servers()
+        # await self.router.start_llm_servers()
         
         runner = web.AppRunner(self.app)
         await runner.setup()
