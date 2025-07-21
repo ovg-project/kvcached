@@ -5,11 +5,11 @@
 CI=${1:-0}
 PYTHON_VERSION=${2:-local}
 
-if [ "$CI" -eq 1 ]; then
+if [[ "$CI" -eq 1 ]]; then
     set -e
 fi
 
-if [ $PYTHON_VERSION == "local" ]; then
+if [[ "$PYTHON_VERSION" == "local" ]]; then
     PYTHON_VERSION=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 fi
 
@@ -18,13 +18,13 @@ EXCLUDE_PATTERN='engine_integration/.*'
 run_mypy() {
     local target=$1; shift || true
     # Default to the current directory (full repo) if no target is specified.
-    if [ -z "$target" ]; then
+    if [[ -z "$target" ]]; then
         target="."
     fi
 
     echo "Running mypy on $target"
 
-    if [ "$CI" -eq 1 ]; then
+    if [[ "$CI" -eq 1 ]]; then
         # In CI, run mypy with full strictness.
         mypy --python-version "${PYTHON_VERSION}" --namespace-packages --exclude "${EXCLUDE_PATTERN}" "$@" "$target"
     else
