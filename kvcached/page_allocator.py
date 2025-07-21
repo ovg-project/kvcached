@@ -27,7 +27,7 @@ class Page:
         self.start_block: Optional[int] = None
         self.end_block: Optional[int] = None
         self.num_kv_blocks: Optional[int] = None
-        self.free_list: Optional[List[int]] = None
+        self.free_list: List[int] = []
 
     def _require_init(self) -> None:
         """Raise AssertionError if the page has not been initialised.
@@ -35,7 +35,6 @@ class Page:
         assert self.start_block is not None, "Page not initialised"
         assert self.end_block is not None, "Page not initialised"
         assert self.num_kv_blocks is not None, "Page not initialised"
-        assert self.free_list is not None, "Page not initialised"
 
     def init(self, block_mem_size: int) -> None:
         self.start_block, self.end_block = self.get_block_range(
@@ -44,52 +43,42 @@ class Page:
         self.num_kv_blocks = self.end_block - self.start_block
         self.free_list = list(range(self.start_block, self.end_block))
 
-    def alloc(self) -> int:
+    def alloc(self, num_blocks: int = 1) -> List[int]:
         self._require_init()
         if self.full():
             raise ValueError(f"Page {self.page_id} is already full")
-        # mypy: free_list is non-None after _require_init
-        block_id = cast(List[int],
-                        self.free_list).pop()  # type: ignore[arg-type]
-        return block_id
-
-    def alloc_all_remaining(self) -> List[int]:
-        self._require_init()
-        if self.full():
-            raise ValueError(f"Page {self.page_id} is already full")
-        block_ids = cast(List[int], self.free_list)
-        self.free_list = []
+        block_ids = self.free_list[:num_blocks]
+        self.free_list = self.free_list[num_blocks:]
         return block_ids
 
     def free(self, block_id: int) -> None:
         self._require_init()
         if SANITY_CHECK:
             self._sanity_check(block_id)
-        cast(List[int], self.free_list).append(block_id)
+        self.free_list.append(block_id)
 
     def free_batch(self, block_ids: List[int]) -> None:
         self._require_init()
         if SANITY_CHECK:
             for block_id in block_ids:
                 self._sanity_check(block_id)
-        cast(List[int], self.free_list).extend(block_ids)
+        self.free_list.extend(block_ids)
 
     def empty(self) -> bool:
         self._require_init()
-        return len(cast(List[int],
-                        self.free_list)) == cast(int, self.num_kv_blocks)
+        return len(self.free_list) == self.num_kv_blocks
 
     def full(self) -> bool:
         self._require_init()
-        return not cast(List[int], self.free_list)
+        return not self.free_list
 
     def num_free_blocks(self) -> int:
         self._require_init()
-        return len(cast(List[int], self.free_list))
+        return len(self.free_list)
 
     def get_free_blocks(self) -> List[int]:
         self._require_init()
-        return cast(List[int], self.free_list)
+        return self.free_list
 
     def _has_block(self, block_id: int) -> bool:
         self._require_init()
@@ -101,7 +90,7 @@ class Page:
         if not self._has_block(block_id):
             raise ValueError(
                 f"Page {self.page_id} does not have block {block_id}")
-        if block_id in cast(List[int], self.free_list):
+        if block_id in self.free_list:
             raise ValueError(f"Block {block_id} is already free")
 
     @staticmethod
