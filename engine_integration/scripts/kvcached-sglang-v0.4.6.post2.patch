@@ -13,27 +13,27 @@ index 8891115c1..34099c61e 100644
                  "token_to_kv_pool_allocator memory leak detected! "
                  f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef2120..241ff2476 100644
+index f7eef2120..1632dd706 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
          self.clear()
-
+ 
          self._kvcache = kvcache
 +        self.enable_kvcached = (
 +            hasattr(kvcache, "enable_kvcached") and kvcache.enable_kvcached
 +        )
 +        if self.enable_kvcached:
 +            self.kvcached_allocator = kvcache.kvcached_allocator
-
+ 
      def available_size(self):
 +        if self.enable_kvcached:
 +            return self.kvcached_allocator.available_size()
          return len(self.free_slots)
-
+ 
      def get_kvcache(self):
          return self._kvcache
-
+ 
      def alloc(self, need_size: int):
 +        if self.enable_kvcached:
 +            indices = self.kvcached_allocator.alloc(need_size)
@@ -42,10 +42,10 @@ index f7eef2120..241ff2476 100644
 +
          if need_size > len(self.free_slots):
              return None
-
+ 
 @@ -174,6 +186,8 @@ class TokenToKVPoolAllocator:
              return
-
+ 
          if self.is_not_in_free_group:
 +            if self.enable_kvcached:
 +                return self.kvcached_allocator.free(free_index.cpu().numpy().tolist())
@@ -54,7 +54,7 @@ index f7eef2120..241ff2476 100644
              self.free_group.append(free_index)
 @@ -194,6 +208,10 @@ class TokenToKVPoolAllocator:
          self.free_slots = free_slots
-
+ 
      def clear(self):
 +        if hasattr(self, "enable_kvcached") and self.enable_kvcached:
 +            self.kvcached_allocator.clear()
@@ -95,19 +95,18 @@ index f7eef2120..241ff2476 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -248,6 +291,18 @@ class MHATokenToKVPool(KVCache):
+@@ -248,6 +291,17 @@ class MHATokenToKVPool(KVCache):
          )
-
+ 
      def _create_buffers(self):
 +        if self.enable_kvcached:
 +            self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
-+                self.size,
-+                self.head_num,
-+                self.head_dim,
-+                self.dtype,
-+                self.device,
-+                self.layer_num,
-+                self.page_size,
++                kvcache_shape=(self.head_num, self.head_dim),
++                num_tokens=self.size,
++                dtype=self.dtype,
++                device=self.device,
++                num_layers=self.layer_num,
++                page_size=self.page_size,
 +            )
 +            return
 +
