@@ -2,6 +2,7 @@ import os
 import pickle
 import socket
 import threading
+from typing import Any, Dict, cast
 
 from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
                               unmap_from_kv_tensors)
@@ -17,7 +18,12 @@ def get_worker_socket_path(rank: int) -> str:
     return os.path.join(SOCKET_DIR, f"worker_{rank}.sock")
 
 
-def send_msg(sock: socket.socket, msg: object) -> None:
+# NOTE: All messages exchanged through the IPC layer are dictionaries with
+# string keys and arbitrary JSON-serialisable (picklable) values.
+Message = Dict[str, Any]
+
+
+def send_msg(sock: socket.socket, msg: Message) -> None:
     """
     Send a message through the socket.
     The message is serialized using pickle.
@@ -26,7 +32,8 @@ def send_msg(sock: socket.socket, msg: object) -> None:
     sock.sendall(len(data).to_bytes(4, 'big') + data)
 
 
-def recv_msg(sock: socket.socket) -> object:
+# The receive side mirrors *send_msg* and therefore also returns a *Message*.
+def recv_msg(sock: socket.socket) -> Message:
     """
     Receive a message from the socket.
     The message is deserialized using pickle.
@@ -48,7 +55,7 @@ def recv_msg(sock: socket.socket) -> object:
         data += chunk
     if len(data) != length:
         raise ValueError("Received data length does not match expected length")
-    return pickle.loads(data)
+    return cast(Message, pickle.loads(data))
 
 
 def start_worker_listerner_thread(rank: int):
@@ -74,7 +81,7 @@ def start_worker_listerner_thread(rank: int):
         while True:
             conn, _ = server_sock.accept()
             try:
-                msg = recv_msg(conn)
+                msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
                 if msg["cmd"] == "map_to_kv_tensors":
                     map_to_kv_tensors(msg["offsets"])
@@ -108,7 +115,7 @@ def broadcast_map_to_kv_tensors_to_workers(tp_size: int,
         sock.connect(socket_path)
         try:
             send_msg(sock, {"cmd": "map_to_kv_tensors", "offsets": offsets})
-            response = recv_msg(sock)
+            response: Message = recv_msg(sock)
             if response.get("status") != "success":
                 raise RuntimeError(f"Worker {rank} failed to map: {response}")
         finally:
@@ -126,7 +133,7 @@ def broadcast_unmap_from_kv_tensors_to_workers(tp_size: int,
                 "cmd": "unmap_from_kv_tensors",
                 "offsets": offsets
             })
-            response = recv_msg(sock)
+            response: Message = recv_msg(sock)
             if response.get("status") != "success":
                 raise RuntimeError(f"Worker {rank} failed to unmap {response}")
         finally:
@@ -141,7 +148,7 @@ def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
         sock.connect(socket_path)
         try:
             send_msg(sock, {"cmd": "kv_tensors_created"})
-            response = recv_msg(sock)
+            response: Message = recv_msg(sock)
             if response.get("status") != "success":
                 raise RuntimeError(
                     f"Worker {rank} failed to check KV tensors created: {response}"

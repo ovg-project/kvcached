@@ -69,3 +69,9 @@ exclude = ["*__pycache__*"]
 
 [tool.setuptools.package-data]
 kvcached = ["*.so", "*.pyi", "py.typed"]
+
+[tool.mypy]
+plugins = ['pydantic.mypy']
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
