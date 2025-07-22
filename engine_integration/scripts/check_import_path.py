@@ -23,3 +23,6 @@ print("\npage_allocator will be imported from:", spec.origin)
 
 # Force (re-)import and print its __file__
 print("page_allocator actually imported from:", pa.__file__)
+
+vmm_spec = iu.find_spec("kvcached.vmm_ops")
+print("vmm_ops found at:", vmm_spec)
