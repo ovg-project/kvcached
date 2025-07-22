@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,9 +50,8 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
+    kvcache_shape: Tuple[int, ...],  # (head_num, head_dim)
     num_tokens: int,
-    head_num: int,
-    head_dim: int,
     dtype: torch.dtype,
     device: str,
     num_layers: int,
@@ -68,7 +68,8 @@ def alloc_kv_cache(
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
-    block_mem_size = head_num * head_dim * dtype.itemsize * block_size
+    kvcache_shape_list: List[int] = list(kvcache_shape)
+    block_mem_size = math.prod(kvcache_shape_list) * dtype.itemsize
     blocks_per_page = PAGE_SIZE // block_mem_size
 
     gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
@@ -82,7 +83,7 @@ def alloc_kv_cache(
         "Not enough memory to allocate KV cache."
     num_tokens = block_size * blocks_per_page * num_pages
 
-    kv_shape = (num_tokens, head_num, head_dim)
+    kv_shape = (num_tokens, *kvcache_shape)
     k_tensors, v_tensors = [], []
     for t in raw_kv_tensors:
         t = t.view(2, *kv_shape).view(dtype=dtype)
