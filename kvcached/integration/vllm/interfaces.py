@@ -51,15 +51,23 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-    kvcache_shape: Tuple[int, ...],
-    block_size: int,
-    dtype: torch.dtype,
-    device: str,
-    num_layers: int,
+        kvcache_shape: Tuple[int, ...],
+        block_size: int,
+        dtype: torch.dtype,
+        device: str,
+        num_layers: int,
+        attention_type: str = "MHA",  # TODO: support MLA
+        kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> List[torch.Tensor]:
     if not _kvcached_initialized:
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
+
+    if attention_type != "MHA":
+        raise ValueError(f"Attention type {attention_type} is not supported.")
+
+    if kv_layout != "NHD":
+        raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     assert (len(kvcache_shape) > 2 and kvcache_shape[0]
             == 2), "Only supports stacked kv cache at 1st dim."

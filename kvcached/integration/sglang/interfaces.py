@@ -50,16 +50,23 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-    kvcache_shape: Tuple[int, ...],  # (head_num, head_dim)
-    num_tokens: int,
+    kvcache_shape: Tuple[int, ...],
     dtype: torch.dtype,
     device: str,
     num_layers: int,
     page_size: int = 1,
+    attention_type: str = "MHA",  # TODO: support MLA
+    kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not _kvcached_initialized:
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
+
+    if attention_type != "MHA":
+        raise ValueError(f"Attention type {attention_type} is not supported.")
+
+    if kv_layout != "NHD":
+        raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     assert torch.cuda.is_available(), "CUDA is not available."
     if page_size != 1:
@@ -68,8 +75,8 @@ def alloc_kv_cache(
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
-    kvcache_shape_list: List[int] = list(kvcache_shape)
-    block_mem_size = math.prod(kvcache_shape_list) * dtype.itemsize
+    num_tokens = kvcache_shape[0]
+    block_mem_size = math.prod(kvcache_shape[1:]) * dtype.itemsize
     blocks_per_page = PAGE_SIZE // block_mem_size
 
     gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
@@ -82,13 +89,14 @@ def alloc_kv_cache(
     assert block_size * blocks_per_page * num_pages >= num_tokens, \
         "Not enough memory to allocate KV cache."
     num_tokens = block_size * blocks_per_page * num_pages
+    actual_kvcache_shape: List[int] = list(kvcache_shape)
+    actual_kvcache_shape[0] = num_tokens
 
-    kv_shape = (num_tokens, *kvcache_shape)
     k_tensors, v_tensors = [], []
     for t in raw_kv_tensors:
-        t = t.view(2, *kv_shape).view(dtype=dtype)
-        k_tensors.append(t.narrow(0, 0, 1).view(kv_shape))
-        v_tensors.append(t.narrow(0, 1, 1).view(kv_shape))
+        t = t.view(2, *actual_kvcache_shape).view(dtype=dtype)
+        k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
+        v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
 
     return k_tensors, v_tensors
 
