@@ -51,7 +51,8 @@ install_kvcached_editable() {
     # 3. Save the compiled .so file(s) to a temporary location.
     local tmp_so_dir
     tmp_so_dir=$(mktemp -d)
-    find "$installed_pkg_dir" -name '*.so' -exec mv {} "$tmp_so_dir/" \;
+    # The wheel *should* always contain vmm_ops.so, but be tolerant just in case.
+    find "$installed_pkg_dir" -name 'vmm_ops*.so' -exec mv {} "$tmp_so_dir/" \; || true
 
     # 4. Uninstall the wheel's Python files to prevent shadowing.
     uv pip uninstall kvcached
@@ -74,7 +75,16 @@ import sys
 __path__.insert(0, os.path.abspath(os.path.join("$KVCACHED_DIR", "kvcached")))
 EOF
 
-    # 7. Remove any stray compiled extensions from the source tree itself.
+    # 7. Ensure the site-packages copy of kvcached takes precedence over the
+    #    repository path ("" / CWD).  We do this via a .pth file executed by
+    #    the site module at startup; it reorders sys.path so that the
+    #    directory that *contains* this .pth is placed at index 0.
+    local pth_file="$site_packages/00_kvcached_prepend.pth"
+    echo "Creating $pth_file to prepend site-packages on sys.path"
+    printf '%s\n' 'import sys,sysconfig; p=sysconfig.get_paths().get("purelib"); sys.path.insert(0,p) if p and p in sys.path else None' > "$pth_file"
+
+    # 8. Remove any stray compiled extensions from the source tree itself to
+    #    avoid confusion when switching between virtual-envs.
     find "$KVCACHED_DIR/kvcached" -maxdepth 1 -name 'vmm_ops*.so' -exec rm -f {} + || true
 }
 
