@@ -13,7 +13,7 @@ index 8891115c1..34099c61e 100644
                  "token_to_kv_pool_allocator memory leak detected! "
                  f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef2120..1632dd706 100644
+index f7eef2120..7bfb3fe55 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -36,7 +36,7 @@ index f7eef2120..1632dd706 100644
  
      def alloc(self, need_size: int):
 +        if self.enable_kvcached:
-+            indices = self.kvcached_allocator.alloc(need_size)
++            indices: List[int] = self.kvcached_allocator.alloc(need_size)
 +            indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
 +            return indices
 +
@@ -82,7 +82,7 @@ index f7eef2120..1632dd706 100644
 +                # Initialize KV allocator based on per-token KV size (cell_size)
 +                self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
 +                self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
-+                    self.size,
++                    self.size + self.page_size,
 +                    self.page_size,
 +                    self.cell_size,
 +                    num_layers=end_layer - start_layer + 1,
@@ -95,18 +95,19 @@ index f7eef2120..1632dd706 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -248,6 +291,17 @@ class MHATokenToKVPool(KVCache):
+@@ -248,6 +291,18 @@ class MHATokenToKVPool(KVCache):
          )
  
      def _create_buffers(self):
 +        if self.enable_kvcached:
 +            self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
-+                kvcache_shape=(self.head_num, self.head_dim),
-+                num_tokens=self.size,
++                kvcache_shape=(self.size + self.page_size, self.head_num, self.head_dim),
 +                dtype=self.dtype,
 +                device=self.device,
 +                num_layers=self.layer_num,
 +                page_size=self.page_size,
++                attention_type="MHA",
++                kv_layout="NHD",
 +            )
 +            return
 +
