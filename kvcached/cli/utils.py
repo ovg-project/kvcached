@@ -195,8 +195,13 @@ def get_total_gpu_memory() -> int:
 
 
 def _format_size(num_bytes: int) -> str:
-    """Return human-readable size using B, KB, MB, GB, or TB automatically."""
+    """Return human-readable size (B, KB, MB, GB, TB).
+    """
+
+    size: float = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num_bytes < 1024 or unit == "TB":
-            return f"{num_bytes:.2f} {unit}"
-        num_bytes /= 1024
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+    raise RuntimeError("_format_size fell through all units")

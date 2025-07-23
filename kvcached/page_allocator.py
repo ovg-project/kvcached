@@ -1,11 +1,11 @@
 import threading
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 import torch
 
-from kvcached.locks import NoOpCondition, NoOpLock
+from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
 from kvcached.utils import (MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
@@ -24,10 +24,17 @@ class Page:
         self.page_id = page_id
         self.page_size = page_size
 
-        self.start_block = None
-        self.end_block = None
-        self.num_kv_blocks = None
-        self.free_list = None
+        self.start_block: Optional[int] = None
+        self.end_block: Optional[int] = None
+        self.num_kv_blocks: Optional[int] = None
+        self.free_list: List[int] = []
+
+    def _require_init(self) -> None:
+        """Raise AssertionError if the page has not been initialised.
+        """
+        assert self.start_block is not None, "Page not initialised"
+        assert self.end_block is not None, "Page not initialised"
+        assert self.num_kv_blocks is not None, "Page not initialised"
 
     def init(self, block_mem_size: int) -> None:
         self.start_block, self.end_block = self.get_block_range(
@@ -36,46 +43,50 @@ class Page:
         self.num_kv_blocks = self.end_block - self.start_block
         self.free_list = list(range(self.start_block, self.end_block))
 
-    def alloc(self) -> int:
+    def alloc(self, num_blocks: int = 1) -> List[int]:
+        self._require_init()
         if self.full():
             raise ValueError(f"Page {self.page_id} is already full")
-        block_id = self.free_list.pop()
-        return block_id
-
-    def alloc_all_remaining(self) -> List[int]:
-        if self.full():
-            raise ValueError(f"Page {self.page_id} is already full")
-        block_ids = self.free_list
-        self.free_list = []
+        block_ids = self.free_list[:num_blocks]
+        self.free_list = self.free_list[num_blocks:]
         return block_ids
 
     def free(self, block_id: int) -> None:
+        self._require_init()
         if SANITY_CHECK:
             self._sanity_check(block_id)
         self.free_list.append(block_id)
 
     def free_batch(self, block_ids: List[int]) -> None:
+        self._require_init()
         if SANITY_CHECK:
             for block_id in block_ids:
                 self._sanity_check(block_id)
         self.free_list.extend(block_ids)
 
     def empty(self) -> bool:
+        self._require_init()
         return len(self.free_list) == self.num_kv_blocks
 
     def full(self) -> bool:
+        self._require_init()
         return not self.free_list
 
     def num_free_blocks(self) -> int:
+        self._require_init()
         return len(self.free_list)
 
     def get_free_blocks(self) -> List[int]:
+        self._require_init()
         return self.free_list
 
     def _has_block(self, block_id: int) -> bool:
-        return block_id >= self.start_block and block_id < self.end_block
+        self._require_init()
+        return block_id >= cast(int, self.start_block) and block_id < cast(
+            int, self.end_block)
 
     def _sanity_check(self, block_id: int) -> None:
+        self._require_init()
         if not self._has_block(block_id):
             raise ValueError(
                 f"Page {self.page_id} does not have block {block_id}")
@@ -180,6 +191,10 @@ class PageAllocator(PageAllocatorBase):
 
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
+
+        self._lock: LockLike
+        self._cond: ConditionLike
+
         if self.enable_page_prealloc:
             self._lock = threading.RLock()
             self._cond = threading.Condition(self._lock)

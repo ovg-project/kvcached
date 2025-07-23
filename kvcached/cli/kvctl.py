@@ -6,11 +6,12 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional, TypedDict
 
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names
 from kvcached.cli.kvtop import kvtop as kvtop_ui
-from kvcached.cli.utils import get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import (_format_size, get_kv_cache_limit,
+                                update_kv_cache_limit)
 
 try:
     import readline  # type: ignore
@@ -199,23 +200,20 @@ def _parse_size(size_str: str) -> int:
         raise ValueError(f"Invalid size string '{size_str}'") from exc
 
 
-def _format_size(num_bytes: int) -> str:
-    # Reuse simple formatter (non-curses version of kvtop helper)
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if num_bytes < 1024 or unit == 'TB':
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes} B"
-
-
 # ---------------------------------------------------------------------------
 # Core command implementations
 # ---------------------------------------------------------------------------
 
 
+class _IpcStats(TypedDict):
+    ipc: str
+    limit_bytes: int
+    used_bytes: int
+
+
 def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
     names = ipcs or _detect_kvcache_ipc_names()
-    res: List[Dict[str, int]] = []
+    res: List[_IpcStats] = []
     for name in names:
         info = get_kv_cache_limit(name)
         if info is None:
@@ -361,7 +359,7 @@ def interactive_shell():
             elif cmd == 'watch':
                 # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
                 interval: float = 1.0
-                ipcs: List[str] = []
+                ipcs_watch: List[str] = []
                 i = 1
                 while i < len(tokens):
                     tok = tokens[i]
@@ -374,16 +372,17 @@ def interactive_shell():
                     else:
                         # If token is a bare number and interval wasn't set via flag,
                         # treat it as the legacy positional interval argument.
-                        if not ipcs and tok.replace('.', '', 1).isdigit():
+                        if not ipcs_watch and tok.replace('.', '',
+                                                          1).isdigit():
                             interval = float(tok)
                         else:
-                            ipcs.append(tok)
+                            ipcs_watch.append(tok)
                     i += 1
-                cmd_watch(interval, ipcs if ipcs else None)
+                cmd_watch(interval, ipcs_watch if ipcs_watch else None)
             elif cmd == 'kvtop':
                 # Syntax: kvtop [-r/--refresh SEC] [ipc ...]
                 refresh: float = 1.0
-                ipcs: List[str] = []
+                ipcs_top: List[str] = []
                 i = 1
                 while i < len(tokens):
                     tok = tokens[i]
@@ -394,9 +393,9 @@ def interactive_shell():
                                 "Expected float after '-r/--refresh'")
                         refresh = float(tokens[i])
                     else:
-                        ipcs.append(tok)
+                        ipcs_top.append(tok)
                     i += 1
-                cmd_top(ipcs if ipcs else None, refresh)
+                cmd_top(ipcs_top if ipcs_top else None, refresh)
             elif cmd == 'delete' and len(tokens) == 2:
                 cmd_delete(tokens[1])
             else:

@@ -168,7 +168,7 @@ class KVCacheManager:
             return None
 
         ret_index = []
-        page: Page = None
+        page: Optional[Page] = None
 
         remaining_need = need_size
 
@@ -189,19 +189,17 @@ class KVCacheManager:
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 _, page = self.avail_pages.popitem()
-            if page.num_free_blocks() > remaining_need:
-                self.num_avail_blocks -= remaining_need
-                alloced_index = page.free_list[:remaining_need]
-                page.free_list = page.free_list[remaining_need:]
-                ret_index.extend(alloced_index)
-                remaining_need = 0
-                self.avail_pages[page.page_id] = page
-            else:
-                self.num_avail_blocks -= page.num_free_blocks()
-                additional_blocks = page.alloc_all_remaining()
-                ret_index.extend(additional_blocks)
-                remaining_need -= len(additional_blocks)
+            num_to_alloc_from_page = min(page.num_free_blocks(),
+                                         remaining_need)
+            alloced_index = page.alloc(num_to_alloc_from_page)
+            ret_index.extend(alloced_index)
+            if page.full():
                 self.full_pages[page.page_id] = page
+            else:
+                self.avail_pages[page.page_id] = page
+
+            self.num_avail_blocks -= num_to_alloc_from_page
+            remaining_need -= num_to_alloc_from_page
 
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
@@ -264,12 +262,14 @@ class KVCacheManager:
         if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
 
-        if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
-                self.block_mem_size) <= self.target_num_blocks):
-            self.page_allocator.resize(self.target_num_blocks *
-                                       self.block_mem_size)
-            self.in_shrink = False
-            self.target_num_blocks = None
+        if self.in_shrink:
+            assert self.target_num_blocks is not None
+            if (self.page_allocator.get_num_inuse_blocks(self.block_mem_size)
+                    <= self.target_num_blocks):
+                self.page_allocator.resize(self.target_num_blocks *
+                                           self.block_mem_size)
+                self.in_shrink = False
+                self.target_num_blocks = None
 
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:

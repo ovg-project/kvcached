@@ -13,6 +13,7 @@ from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
 _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
+_tp_size: int = 1
 
 
 def init_kvcached(tp_rank: int = 0,
@@ -64,22 +65,24 @@ def alloc_kv_cache(
             == 2), "Only supports stacked kv cache at 1st dim."
     assert torch.cuda.is_available(), "CUDA is not available."
 
-    kvcache_shape = list(kvcache_shape)
-    block_mem_size = math.prod(kvcache_shape[2:]) * dtype.itemsize
+    kvcache_shape_list: List[int] = list(kvcache_shape)
+
+    block_mem_size = math.prod(kvcache_shape_list[2:]) * dtype.itemsize
     blocks_per_page = PAGE_SIZE // block_mem_size
 
     gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
 
     num_pages = gpu_mem_size // num_layers // 2 // PAGE_SIZE
     num_blocks = num_pages * blocks_per_page
-    kvcache_shape[1] = num_blocks
-    virtual_mem_size = math.prod(kvcache_shape) * dtype.itemsize
+    kvcache_shape_list[1] = num_blocks
+    virtual_mem_size = math.prod(kvcache_shape_list) * dtype.itemsize
 
     raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
                                        device, num_layers)
 
     kv_tensors = [
-        t.view(kvcache_shape).view(dtype=dtype) for t in raw_kv_tensors
+        t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
+        for t in raw_kv_tensors
     ]
     return kv_tensors
 
