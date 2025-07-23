@@ -10,16 +10,16 @@ from router import LLMRouter
 logger = logging.getLogger(__name__)
 
 
-class RouterServer:
+class MultiLLMFrontend:
 
     def __init__(self, config_path: str, port: int = 8080):
         self.router = LLMRouter(config_path)
         self.port = port
         self.app = web.Application()
-        self.setup_routes()
+        self.configure_endpoints()
 
-    def setup_routes(self):
-        """Setup HTTP routes"""
+    def configure_endpoints(self):
+        """Configure HTTP endpoints"""
         self.app.router.add_post('/v1/completions', self.handle_completion)
         self.app.router.add_post('/v1/chat/completions',
                                  self.handle_chat_completion)
@@ -244,7 +244,7 @@ async def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Create and start the server
-    server = RouterServer(args.config, args.port)
+    server = MultiLLMFrontend(args.config, args.port)
     await server.start()
 
 

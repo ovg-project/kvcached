@@ -1,0 +1,18 @@
+{
+  "models": {
+    "meta-llama/Llama-3.2-1B": {
+      "endpoint": {
+        "host": "localhost",
+        "port": 30101
+      },
+      "start_command": "../kvcached/engine_integration/benchmark/start_server.sh sglang 30101 meta-llama/Llama-3.2-1B"
+    },
+    "Qwen/Qwen3-0.6B": {
+      "endpoint": {
+        "host": "localhost",
+        "port": 30102
+      },
+      "start_command": "../kvcached/engine_integration/benchmark/start_server.sh sglang 30102 Qwen/Qwen3-0.6B"
+    }
+  }
+}
