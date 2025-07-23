@@ -1,0 +1,35 @@
+instances:
+  - name: instance1
+    model: meta-llama/Llama-3.2-1B
+    engine: vllm
+    using_venv: true
+    venv_path:  /home/jrxing/kvcached/engine_integration/vllm-v0.9.2/.venv
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=VLLM"
+    engine_env:
+      - "VLLM_USE_V1=1"
+      - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+    engine_args:
+      - "--disable-log-requests"
+      - "--no-enable-prefix-caching"
+      - "--enforce-eager"
+      - "--port=12346"
+      - "--gpu-memory-utilization 0.5"
+  - name: instance2
+    model: meta-llama/Llama-3.2-1B
+    engine: sglang
+    using_venv: true
+    venv_path: /home/jrxing/kvcached/engine_integration/sglang-v0.4.6.post2/.venv
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=SGLANG"
+    engine_env:
+      - "TORCHINDUCTOR_DISABLE=1"
+      - "TORCHDYNAMO_DISABLE=1"
+    engine_args:
+      - "--disable-radix-cache"
+      - "--trust-remote-code"
+      - "--attention-backend torch_native"
+      - "--mem-fraction-static 0.5"
+      - "--port=30000"
