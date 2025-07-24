@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from typing import Optional
 
 from aiohttp import web
 from router import LLMRouter
@@ -12,8 +13,17 @@ logger = logging.getLogger(__name__)
 
 class MultiLLMFrontend:
 
-    def __init__(self, config_path: str, port: int = 8080):
-        self.router = LLMRouter(config_path)
+    def __init__(self,
+                 port: int = 8080,
+                 model_config_path: Optional[str] = None,
+                 model_config_json: Optional[dict] = None):
+        if not model_config_path and model_config_json is None:
+            raise ValueError(
+                "Either model_config_path or model_config_json must be provided"
+            )
+
+        self.router = LLMRouter(config_path=model_config_path,
+                                models_config=model_config_json)
         self.port = port
         self.app = web.Application()
         self.configure_endpoints()
@@ -227,9 +237,12 @@ async def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='LLM Router Server')
-    parser.add_argument('--config',
-                        required=True,
-                        help='Path to router configuration file')
+    parser.add_argument('--model-config-path',
+                        required=False,
+                        help='Path to router configuration file (JSON)')
+    parser.add_argument('--model-config-json',
+                        required=False,
+                        help='Inline JSON string mapping models to endpoints')
     parser.add_argument('--port',
                         type=int,
                         default=8080,
@@ -238,13 +251,29 @@ async def main():
 
     args = parser.parse_args()
 
+    models_config = None
+    if args.model_config_json:
+        try:
+            models_config = json.loads(args.model_config_json)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Invalid --models-json: {e}")
+
+    if not args.model_config_path and models_config is None:
+        parser.error(
+            "Either --model-config-path or --model-config-json must be provided"
+        )
+
     # Setup logging
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Create and start the server
-    server = MultiLLMFrontend(args.config, args.port)
+    server = MultiLLMFrontend(
+        port=args.port,
+        model_config_path=args.model_config_path,
+        model_config_json=models_config,
+    )
     await server.start()
 
 

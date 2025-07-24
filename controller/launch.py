@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import shlex
 import subprocess
@@ -221,11 +222,129 @@ def _launch_in_tmux(session: str, window_name: str, cmd: List[str],
     ],
                    check=True)
 
+    # Remove the default window 0 if it still exists, leaving only our named window.
+    try:
+        subprocess.run(["tmux", "kill-window", "-t", f"{session}:0"],
+                       check=True)
+    except subprocess.CalledProcessError:
+        pass
+
+
+def _extract_models_mapping(
+        raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build the model→endpoint mapping consumed by the router frontend."""
+    models_mapping: Dict[str, Dict[str, Any]] = {}
+
+    for inst in raw_cfg.get("instances", []):
+        model_name = inst["model"]
+
+        # Defaults
+        host = "localhost"
+        port = None
+
+        raw_args = inst.get("engine_args", inst.get("args", []))
+        if isinstance(raw_args, str):
+            arg_list = shlex.split(raw_args)
+        else:
+            arg_list: List[str] = []
+            for item in raw_args:
+                arg_list.extend(shlex.split(str(item)))
+
+        for idx, token in enumerate(arg_list):
+            if token.startswith("--host="):
+                host = token.split("=", 1)[1]
+            elif token == "--host" and idx + 1 < len(arg_list):
+                host = arg_list[idx + 1]
+            elif token.startswith("--port="):
+                try:
+                    port = int(token.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif token == "--port" and idx + 1 < len(arg_list):
+                try:
+                    port = int(arg_list[idx + 1])
+                except ValueError:
+                    pass
+
+        if port is None:
+            logger.warning(
+                "Could not determine port for model %s – skipping in router mapping",
+                model_name)
+            continue
+
+        models_mapping[model_name] = {"endpoint": {"host": host, "port": port}}
+
+    return models_mapping
+
+
+def _launch_instances(instances_cfg: List[Dict[str, Any]],
+                      global_env: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Launch each configured model instance in its own dedicated tmux session."""
+    launched: List[Dict[str, Any]] = []
+
+    for inst in instances_cfg:
+        session_name = f"kvcached-{inst['name']}"
+
+        # Ensure tmux session exists (detached)
+        if not _ensure_tmux_session(session_name):
+            logger.info("Skipping launch for %s", inst["name"])
+            continue
+
+        cmd = _build_command(inst)
+        env_mod = {**global_env, **_collect_env_mods(inst)}
+        try:
+            _launch_in_tmux(session_name, inst["name"], cmd, env_mod, inst)
+            logger.info("Launched %s in tmux session '%s'", inst["name"],
+                        session_name)
+            launched.append(inst)
+        except subprocess.CalledProcessError as e:
+            logger.error("Failed to launch %s: %s", inst["name"], e)
+
+    return launched
+
+
+def _maybe_launch_router(router_cfg: Dict[str, Any],
+                         models_mapping: Dict[str, Dict[str, Any]]) -> None:
+    """Conditionally launch the router/frontend if enabled in the config."""
+    if not router_cfg.get("enable_router", False):
+        logger.info("Router launch disabled via configuration.")
+        return
+
+    frontend_session = "kvcached-frontend"
+    if not _ensure_tmux_session(frontend_session):
+        return
+
+    frontend_port = router_cfg.get("router_port", 8080)
+    models_json = json.dumps({"models": models_mapping})
+
+    frontend_cmd = [
+        "python",
+        "-u",
+        str(Path(__file__).parent / "frontend.py"),
+        "--model-config-json",
+        models_json,
+        "--port",
+        str(frontend_port),
+    ]
+
+    try:
+        _launch_in_tmux(frontend_session, "frontend", frontend_cmd, {}, {})
+        logger.info("Launched frontend in tmux session '%s' (port %s)",
+                    frontend_session, frontend_port)
+        logger.info("  tmux attach -t %s  # to attach to frontend",
+                    frontend_session)
+    except subprocess.CalledProcessError as e:
+        logger.error("Failed to launch frontend: %s", e)
+
 
 def main() -> None:
+    """Entry point for the KVCached controller CLI."""
     parser = argparse.ArgumentParser(
         description="KVCached controller launcher")
-    parser.add_argument("--config", type=Path, help="Path to YAML config file")
+    parser.add_argument("--config",
+                        type=Path,
+                        required=True,
+                        help="Path to YAML config file")
     args = parser.parse_args()
 
     cfg_path = args.config.expanduser().resolve()
@@ -236,31 +355,24 @@ def main() -> None:
     with cfg_path.open("r") as f:
         raw_cfg = yaml.safe_load(f)
 
+    # Extract global env and router configuration
+    global_env_cfg: Dict[str, Any] = raw_cfg.get("kvcached", {}) or {}
+    global_kvcached_env = {
+        str(k).upper(): str(v)
+        for k, v in global_env_cfg.items()
+    }
+    router_cfg: Dict[str, Any] = raw_cfg.get("router", {}) or {}
+
+    # Build derived configurations
+    models_mapping = _extract_models_mapping(raw_cfg)
+
     try:
         instances_cfg = _parse_cfg(raw_cfg, cfg_path.parent)
     except Exception as e:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    launched_instances = []
-    # Launch each instance in its own tmux session
-    for inst in instances_cfg:
-        session_name = f"kvcached-{inst['name']}"
-
-        # Ensure tmux session exists (detached)
-        if not _ensure_tmux_session(session_name):
-            logger.info("Skipping launch for %s", inst["name"])
-            continue
-
-        cmd = _build_command(inst)
-        env_mod = _collect_env_mods(inst)
-        try:
-            _launch_in_tmux(session_name, inst["name"], cmd, env_mod, inst)
-            logger.info("Launched %s in tmux session '%s'", inst["name"],
-                        session_name)
-            launched_instances.append(inst)
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed to launch %s: %s", inst["name"], e)
+    launched_instances = _launch_instances(instances_cfg, global_kvcached_env)
 
     if launched_instances:
         logger.info(
@@ -271,6 +383,8 @@ def main() -> None:
                         inst["name"])
     else:
         logger.info("No instances were launched.")
+
+    _maybe_launch_router(router_cfg, models_mapping)
 
 
 if __name__ == "__main__":

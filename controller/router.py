@@ -33,11 +33,28 @@ class ModelConfig:
 
 class LLMRouter:
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self,
+                 config_path: Optional[str] = None,
+                 models_config: Optional[Dict[str, Any]] = None):
+        """Create a router.
+
+        Parameters
+        ----------
+        config_path : Optional[str]
+            Path to a JSON configuration file in the original format.
+        models_config : Optional[Dict[str, Any]]
+            In-memory dict mapping model names to endpoint definitions. If
+            provided, this takes precedence over *config_path* so no extra
+            file is required when the controller already knows endpoint
+            details at runtime.
+        """
+
         self.models: Dict[str, ModelConfig] = {}
         self.session: Optional[aiohttp.ClientSession] = None
 
-        if config_path:
+        if models_config is not None:
+            self.load_config_from_dict(models_config)
+        elif config_path is not None:
             self.load_config(config_path)
 
     def load_config(self, config_path: str):
@@ -70,6 +87,51 @@ class LLMRouter:
             raise
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")
+            raise
+
+    def load_config_from_dict(self, config_data: Dict[str, Any]):
+        """Load router configuration from an in-memory dictionary.
+
+        This supports two shapes:
+
+        1. The original JSON shape::
+
+               {"models": {
+                   "m1": {"endpoint": {"host": "h", "port": 123}},
+                   ...
+               }}
+
+        2. A flattened variant::
+
+               {"m1": {"host": "h", "port": 123}, ...}
+        """
+
+        try:
+            self.models = {}
+
+            # Accept either top-level "models" or direct mapping
+            models_section = config_data.get("models", config_data)
+
+            for model_name, model_cfg in models_section.items():
+                # Support flattened or nested "endpoint" key
+                if "endpoint" in model_cfg:
+                    ep_cfg = model_cfg["endpoint"]
+                else:
+                    ep_cfg = model_cfg
+
+                endpoint = Endpoint(
+                    host=ep_cfg["host"],
+                    port=int(ep_cfg["port"]),
+                    health_check_path=ep_cfg.get("health_check_path",
+                                                 "/health"),
+                )
+
+                self.models[model_name] = ModelConfig(model_name, endpoint)
+
+            logger.info("Loaded configuration for %s models from dict",
+                        len(self.models))
+        except Exception as e:
+            logger.error("Error loading configuration from dict: %s", e)
             raise
 
     def add_model(self, model_config: ModelConfig):

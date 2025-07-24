@@ -1,3 +1,14 @@
+kvcached:
+  kvcached_gpu_utilization: 0.95
+  kvcached_page_prealloc_enabled: true
+  kvcached_min_reserved_pages: 5
+  kvcached_max_reserved_pages: 10
+  kvcached_sanity_check: false
+  kvcached_log_level: INFO
+router:
+  enable_router: true
+  router_port: 8080
+  router_host: localhost
 instances:
   - name: instance1
     model: meta-llama/Llama-3.2-1B
@@ -14,10 +25,11 @@ instances:
       - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--enforce-eager"
+      - "--host=localhost"
       - "--port=12346"
       - "--gpu-memory-utilization 0.5"
   - name: instance2
-    model: meta-llama/Llama-3.2-1B
+    model: Qwen/Qwen3-0.6B
     engine: sglang
     using_venv: true
     venv_path: /home/jrxing/kvcached/engine_integration/sglang-v0.4.6.post2/.venv
@@ -32,4 +44,5 @@ instances:
       - "--trust-remote-code"
       - "--attention-backend torch_native"
       - "--mem-fraction-static 0.5"
+      - "--host=localhost"
       - "--port=30000"
