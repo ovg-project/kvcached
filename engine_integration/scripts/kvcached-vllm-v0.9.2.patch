@@ -182,7 +182,7 @@ index e2fdf6f8a..d3bb46d5d 100644
  
          # Setup scheduler.
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 5a26e88db..5458f784d 100644
+index 5a26e88db..f440124d5 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -51,7 +51,8 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
@@ -264,7 +264,7 @@ index 5a26e88db..5458f784d 100644
  
          bind_kv_cache(kv_caches,
                        self.compilation_config.static_forward_context,
-@@ -2737,3 +2765,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2737,3 +2765,76 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  "the mamba page size")
  
          return attn_page_size
@@ -328,6 +328,8 @@ index 5a26e88db..5458f784d 100644
 +            dtype,
 +            self.device.type,
 +            num_layers,
++            attention_type="MHA",
++            kv_layout="NHD",
 +        )
 +
 +        # Create layer_name -> tensor mapping from raw buffers.
