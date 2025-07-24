@@ -1,14 +1,13 @@
-#!/usr/bin/env python3
-
 import asyncio
 import json
-import logging
 from typing import Optional
 
 from aiohttp import web
 from router import LLMRouter
 
-logger = logging.getLogger(__name__)
+from kvcached.utils import get_kvcached_logger
+
+logger = get_kvcached_logger()
 
 
 class MultiLLMFrontend:
@@ -247,7 +246,6 @@ async def main():
                         type=int,
                         default=8080,
                         help='Port to run the server on')
-    parser.add_argument('--log-level', default='INFO', help='Log level')
 
     args = parser.parse_args()
 
@@ -262,11 +260,6 @@ async def main():
         parser.error(
             "Either --model-config-path or --model-config-json must be provided"
         )
-
-    # Setup logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Create and start the server
     server = MultiLLMFrontend(

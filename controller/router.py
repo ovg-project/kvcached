@@ -1,12 +1,13 @@
 import asyncio
 import json
-import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 
-logger = logging.getLogger(__name__)
+from kvcached.utils import get_kvcached_logger
+
+logger = get_kvcached_logger()
 
 
 @dataclass

@@ -1,6 +1,5 @@
 import argparse
 import json
-import logging
 import shlex
 import subprocess
 import sys
@@ -12,7 +11,6 @@ import yaml
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
-logger.setLevel(logging.INFO)
 
 
 def _parse_cfg(cfg: Dict[str, Any], config_dir: Path) -> List[Dict[str, Any]]:
@@ -213,7 +211,7 @@ def _launch_in_tmux(session: str, window_name: str, cmd: List[str],
 
     full_cmd = f"{activate_cmd}{env_exports}{cmd_str}"
 
-    logger.info("Command for %s: %s", window_name, full_cmd)
+    logger.debug("Command for %s: %s", window_name, full_cmd)
 
     # Ensure only one window per session: first create the real window, then remove the default index 0 if it still exists
     subprocess.run([
@@ -294,8 +292,9 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
         env_mod = {**global_env, **_collect_env_mods(inst)}
         try:
             _launch_in_tmux(session_name, inst["name"], cmd, env_mod, inst)
-            logger.info("Launched %s in tmux session '%s'", inst["name"],
-                        session_name)
+            logger.info(
+                "Launched %s in tmux session '%s'. tmux attach -t %s to attach",
+                inst["name"], session_name, session_name)
             launched.append(inst)
         except subprocess.CalledProcessError as e:
             logger.error("Failed to launch %s: %s", inst["name"], e)
@@ -329,10 +328,9 @@ def _maybe_launch_router(router_cfg: Dict[str, Any],
 
     try:
         _launch_in_tmux(frontend_session, "frontend", frontend_cmd, {}, {})
-        logger.info("Launched frontend in tmux session '%s' (port %s)",
-                    frontend_session, frontend_port)
-        logger.info("  tmux attach -t %s  # to attach to frontend",
-                    frontend_session)
+        logger.info(
+            "Launched frontend in tmux session '%s' (port %s). tmux attach -t %s  to attach",
+            frontend_session, frontend_port, frontend_session)
     except subprocess.CalledProcessError as e:
         logger.error("Failed to launch frontend: %s", e)
 
@@ -372,18 +370,7 @@ def main() -> None:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    launched_instances = _launch_instances(instances_cfg, global_kvcached_env)
-
-    if launched_instances:
-        logger.info(
-            "All instances launched. Attach to individual sessions with:")
-        for inst in launched_instances:
-            session_name = f"kvcached-{inst['name']}"
-            logger.info("  tmux attach -t %s  # for %s", session_name,
-                        inst["name"])
-    else:
-        logger.info("No instances were launched.")
-
+    _launch_instances(instances_cfg, global_kvcached_env)
     _maybe_launch_router(router_cfg, models_mapping)
 
 
