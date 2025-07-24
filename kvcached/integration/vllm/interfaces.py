@@ -69,8 +69,9 @@ def alloc_kv_cache(
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
-    assert (len(kvcache_shape) > 2 and kvcache_shape[0]
-            == 2), "Only supports stacked kv cache at 1st dim."
+    if len(kvcache_shape) != 4 or kvcache_shape[0] != 2:
+        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
     assert torch.cuda.is_available(), "CUDA is not available."
 
     kvcache_shape_list: List[int] = list(kvcache_shape)
