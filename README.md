@@ -11,6 +11,8 @@ kvcached is compatible with popular LLM serving engines, including SGLang and vL
 * Python (tested with 3.11)
 * PyTorch (tested with 2.6.0 and 2.7.0)
 
+> ⚠️ Version `0.0.1` is broken. Please use `0.0.1.post1` or later.
+
 kvcached can be installed as simple as
 
 ```bash
