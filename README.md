@@ -17,8 +17,6 @@ kvcached can be installed as simple as
 pip install kvcached --no-build-isolation
 ```
 
-> ⚠️ Version `0.0.1` is broken. Please use `0.0.1.post1` or later.
-
 Note that `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment. If PyTorch is re-installed or upgraded, kvcached also needs re-installation.
 
 kvcached now supports both **SGLang** and **vLLM**. While we are in the process of upstreaming the integration interfaces, we provide temporary support via code patches.
@@ -26,8 +24,21 @@ kvcached now supports both **SGLang** and **vLLM**. While we are in the process 
 To apply a patch:
 
 ```bash
-cd <path to the installed engine (e.g,. SGLang or vLLM) source code directory>
-git apply <kvcached directory>/engine_integration/scripts/[patch_for_engine]
+cd $PATH_TO_ENGINE_SRC # Where the source code of installed SGLang or vLLM is
+git apply $PATH_TO_KVCACHED/engine_integration/scripts/$PATCH_FILE
+
+# Examples:
+# For SGLang v0.4.6.post2
+cd /path/to/your/sglang-v0.4.6.post2
+git apply /path/to/kvcached/engine_integration/scripts/kvcached-sglang-v0.4.6.post2.patch
+
+# For vLLM v0.9.2
+cd /path/to/your/vllm-v0.9.2
+git apply /path/to/kvcached/engine_integration/scripts/kvcached-vllm-v0.9.2.patch
+
+# For vLLM v0.8.4
+cd /path/to/your/vllm-v0.8.4
+git apply /path/to/kvcached/engine_integration/scripts/kvcached-vllm-v0.8.4.patch
 ```
 
 ## All-in-One Installation (Recommended for Development)
