@@ -35,10 +35,6 @@ git apply /path/to/kvcached/engine_integration/scripts/kvcached-sglang-v0.4.6.po
 # For vLLM v0.9.2
 cd /path/to/your/vllm-v0.9.2
 git apply /path/to/kvcached/engine_integration/scripts/kvcached-vllm-v0.9.2.patch
-
-# For vLLM v0.8.4
-cd /path/to/your/vllm-v0.8.4
-git apply /path/to/kvcached/engine_integration/scripts/kvcached-vllm-v0.8.4.patch
 ```
 
 ## All-in-One Installation (Recommended for Development)
