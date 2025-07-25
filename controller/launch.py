@@ -1,5 +1,4 @@
 import argparse
-import json
 import shlex
 import subprocess
 import sys
@@ -7,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
+from utils import collect_env_mods, ensure_tmux_session, launch_in_tmux
 
 from kvcached.utils import get_kvcached_logger
 
@@ -129,105 +129,6 @@ def _build_command(inst: Dict[str, Any]) -> List[str]:
     return cmd
 
 
-def _ensure_tmux_session(session: str) -> bool:
-    """Ensure a detached tmux session named ``session`` exists.
-
-    Returns:
-        bool: True if session is ready for launching, False if user chose to skip
-    """
-    try:
-        subprocess.run(
-            ["tmux", "has-session", "-t", session],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # Session exists - prompt user
-        response = input(
-            f"Tmux session '{session}' already exists. Kill it and restart? (y/N): "
-        )
-        if response.lower() == 'y':
-            logger.info("Killing existing tmux session: %s", session)
-            subprocess.run(["tmux", "kill-session", "-t", session], check=True)
-        else:
-            logger.info("Skipping launch for session: %s", session)
-            return False
-    except subprocess.CalledProcessError:
-        # Session does not exist - continue to create it
-        pass
-
-    # Create new session detached
-    subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            "-x",
-            "120",
-            "-y",
-            "30"  # Set window size
-        ],
-        check=True)
-    # Configure scrollback and other settings
-    subprocess.run(
-        ["tmux", "set-option", "-t", session, "history-limit", "999999"],
-        check=True)
-    subprocess.run(["tmux", "set-option", "-t", session, "mouse", "on"],
-                   check=True)
-
-    return True
-
-
-def _collect_env_mods(inst: Dict[str, Any]) -> Dict[str, str]:
-    env: Dict[str, str] = {}
-
-    for kv in inst.get("engine_env", []) + inst.get("kvcached_env", []):
-        if "=" not in kv:
-            raise ValueError(f"Invalid env entry (expected KEY=VALUE): {kv}")
-        key, value = kv.split("=", 1)
-        env[key] = value
-
-    return env
-
-
-def _launch_in_tmux(session: str, window_name: str, cmd: List[str],
-                    env_mod: Dict[str, str], inst: Dict[str, Any]) -> None:
-    """Launch ``cmd`` inside its own tmux window with overridden env vars."""
-    # Prepare environment exports
-    env_exports = "".join(f"export {k}={shlex.quote(str(v))}; "
-                          for k, v in env_mod.items())
-
-    cmd_str = shlex.join(cmd)
-
-    # If virtualenv activation is requested, prepend source command
-    if inst.get("using_venv") and inst.get("venv_path"):
-        venv_activate = Path(
-            inst["venv_path"]).expanduser().resolve() / "bin" / "activate"
-        activate_cmd = f"source {shlex.quote(str(venv_activate))}; "
-    else:
-        activate_cmd = ""
-
-    full_cmd = f"{activate_cmd}{env_exports}{cmd_str}"
-
-    logger.debug("Command for %s: %s", window_name, full_cmd)
-
-    # Ensure only one window per session: first create the real window, then remove the default index 0 if it still exists
-    subprocess.run([
-        "tmux", "new-window", "-t", session, "-n", window_name, "bash", "-c",
-        f"echo 'Starting {window_name}...'; {full_cmd}; echo 'Press Enter to close...'; read"
-    ],
-                   check=True)
-
-    # Remove the default window 0 if it still exists, leaving only our named window.
-    try:
-        subprocess.run(["tmux", "kill-window", "-t", f"{session}:0"],
-                       check=True)
-    except subprocess.CalledProcessError:
-        pass
-
-
 def _extract_models_mapping(
         raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Build the model→endpoint mapping consumed by the router frontend."""
@@ -284,14 +185,14 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
         session_name = f"kvcached-{inst['name']}"
 
         # Ensure tmux session exists (detached)
-        if not _ensure_tmux_session(session_name):
+        if not ensure_tmux_session(session_name):
             logger.info("Skipping launch for %s", inst["name"])
             continue
 
         cmd = _build_command(inst)
-        env_mod = {**global_env, **_collect_env_mods(inst)}
+        env_mod = {**global_env, **collect_env_mods(inst)}
         try:
-            _launch_in_tmux(session_name, inst["name"], cmd, env_mod, inst)
+            launch_in_tmux(session_name, inst["name"], cmd, env_mod, inst)
             logger.info(
                 "Launched %s in tmux session '%s'. tmux attach -t %s to attach",
                 inst["name"], session_name, session_name)
@@ -303,31 +204,30 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
 
 
 def _maybe_launch_router(router_cfg: Dict[str, Any],
-                         models_mapping: Dict[str, Dict[str, Any]]) -> None:
+                         config_path: Path) -> None:
     """Conditionally launch the router/frontend if enabled in the config."""
     if not router_cfg.get("enable_router", False):
         logger.info("Router launch disabled via configuration.")
         return
 
     frontend_session = "kvcached-frontend"
-    if not _ensure_tmux_session(frontend_session):
+    if not ensure_tmux_session(frontend_session):
         return
 
     frontend_port = router_cfg.get("router_port", 8080)
-    models_json = json.dumps({"models": models_mapping})
 
     frontend_cmd = [
         "python",
         "-u",
         str(Path(__file__).parent / "frontend.py"),
-        "--model-config-json",
-        models_json,
+        "--config",
+        str(config_path),
         "--port",
         str(frontend_port),
     ]
 
     try:
-        _launch_in_tmux(frontend_session, "frontend", frontend_cmd, {}, {})
+        launch_in_tmux(frontend_session, "frontend", frontend_cmd, {}, {})
         logger.info(
             "Launched frontend in tmux session '%s' (port %s). tmux attach -t %s  to attach",
             frontend_session, frontend_port, frontend_session)
@@ -361,9 +261,6 @@ def main() -> None:
     }
     router_cfg: Dict[str, Any] = raw_cfg.get("router", {}) or {}
 
-    # Build derived configurations
-    models_mapping = _extract_models_mapping(raw_cfg)
-
     try:
         instances_cfg = _parse_cfg(raw_cfg, cfg_path.parent)
     except Exception as e:
@@ -371,7 +268,7 @@ def main() -> None:
         sys.exit(1)
 
     _launch_instances(instances_cfg, global_kvcached_env)
-    _maybe_launch_router(router_cfg, models_mapping)
+    _maybe_launch_router(router_cfg, cfg_path)
 
 
 if __name__ == "__main__":

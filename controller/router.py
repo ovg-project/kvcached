@@ -1,5 +1,4 @@
 import asyncio
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -34,15 +33,11 @@ class ModelConfig:
 
 class LLMRouter:
 
-    def __init__(self,
-                 config_path: Optional[str] = None,
-                 models_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, models_config: Dict[str, Any]):
         """Create a router.
 
         Parameters
         ----------
-        config_path : Optional[str]
-            Path to a JSON configuration file in the original format.
         models_config : Optional[Dict[str, Any]]
             In-memory dict mapping model names to endpoint definitions. If
             provided, this takes precedence over *config_path* so no extra
@@ -53,42 +48,7 @@ class LLMRouter:
         self.models: Dict[str, ModelConfig] = {}
         self.session: Optional[aiohttp.ClientSession] = None
 
-        if models_config is not None:
-            self.load_config_from_dict(models_config)
-        elif config_path is not None:
-            self.load_config(config_path)
-
-    def load_config(self, config_path: str):
-        """Load router configuration from JSON file"""
-        try:
-            with open(config_path, 'r') as f:
-                config_data = json.load(f)
-
-            self.models = {}
-            for model_name, model_config in config_data.get("models",
-                                                            {}).items():
-                endpoint = Endpoint(
-                    host=model_config["endpoint"]["host"],
-                    port=model_config["endpoint"]["port"],
-                    health_check_path=model_config["endpoint"].get(
-                        "health_check_path", "/health"))
-
-                self.models[model_name] = ModelConfig(
-                    model_name=model_name,
-                    endpoint=endpoint,
-                )
-
-            logger.info(f"Loaded configuration for {len(self.models)} models")
-
-        except FileNotFoundError:
-            logger.error(f"Configuration file not found: {config_path}")
-            raise
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in configuration file: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error loading configuration: {e}")
-            raise
+        self.load_config_from_dict(models_config)
 
     def load_config_from_dict(self, config_data: Dict[str, Any]):
         """Load router configuration from an in-memory dictionary.

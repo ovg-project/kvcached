@@ -1,7 +1,11 @@
 import asyncio
 import json
-from typing import Optional
+import resource
+import shlex
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import yaml
 from aiohttp import web
 from router import LLMRouter
 
@@ -9,20 +13,24 @@ from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
 
+# Ensure this process has a sufficiently high file-descriptor limit.
+_TARGET_NOFILE = 1048576
+
+try:
+    soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_nofile < _TARGET_NOFILE:
+        new_soft = min(_TARGET_NOFILE, hard_nofile)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_nofile))
+        logger.info("Raised RLIMIT_NOFILE from %s to %s", soft_nofile,
+                    new_soft)
+except Exception as _e:
+    logger.warning("Could not raise RLIMIT_NOFILE: %s", _e)
+
 
 class MultiLLMFrontend:
 
-    def __init__(self,
-                 port: int = 8080,
-                 model_config_path: Optional[str] = None,
-                 model_config_json: Optional[dict] = None):
-        if not model_config_path and model_config_json is None:
-            raise ValueError(
-                "Either model_config_path or model_config_json must be provided"
-            )
-
-        self.router = LLMRouter(config_path=model_config_path,
-                                models_config=model_config_json)
+    def __init__(self, port: int, model_config_json: Dict[str, Any]):
+        self.router = LLMRouter(models_config=model_config_json)
         self.port = port
         self.app = web.Application()
         self.configure_endpoints()
@@ -82,6 +90,11 @@ class MultiLLMFrontend:
                 try:
                     async for chunk in result.content.iter_chunked(1024):
                         await response.write(chunk)
+
+                    # Explicitly close the stream to make sure the
+                    # connection/FIFO is released promptly.
+                    await response.write_eof()
+
                     return response
                 finally:
                     await result.release()
@@ -92,7 +105,7 @@ class MultiLLMFrontend:
                                     content_type='application/json')
 
         except Exception as e:
-            logger.error(f"Error handling completion request: {e}")
+            logger.error(f"Error handling completion request: {str(e)}")
             return web.Response(text=json.dumps({"error": str(e)}),
                                 status=500,
                                 content_type='application/json')
@@ -141,6 +154,10 @@ class MultiLLMFrontend:
                 try:
                     async for chunk in result.content.iter_chunked(1024):
                         await response.write(chunk)
+
+                    # Ensure the downstream connection is properly closed.
+                    await response.write_eof()
+
                     return response
                 finally:
                     await result.release()
@@ -232,16 +249,70 @@ class MultiLLMFrontend:
             await runner.cleanup()
 
 
+def _extract_models_mapping(
+        raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build the model→endpoint mapping consumed by the router frontend.
+
+    This mirrors the logic in controller.launch so that the frontend can run
+    standalone given only the master YAML config file.
+    """
+
+    models_mapping: Dict[str, Dict[str, Any]] = {}
+
+    for inst in raw_cfg.get("instances", []):
+        model_name = inst["model"]
+
+        # Defaults
+        host: str = "localhost"
+        port: Optional[int] = None
+
+        raw_args = inst.get("engine_args", inst.get("args", []))
+
+        # Normalize args to a flat list of strings
+        if isinstance(raw_args, str):
+            arg_list: List[str] = shlex.split(raw_args)
+        else:
+            arg_list: List[str] = []
+            for item in raw_args:
+                arg_list.extend(shlex.split(str(item)))
+
+        # Detect --host / --port options
+        for idx, token in enumerate(arg_list):
+            if token.startswith("--host="):
+                host = token.split("=", 1)[1]
+            elif token == "--host" and idx + 1 < len(arg_list):
+                host = arg_list[idx + 1]
+            elif token.startswith("--port="):
+                try:
+                    port = int(token.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif token == "--port" and idx + 1 < len(arg_list):
+                try:
+                    port = int(arg_list[idx + 1])
+                except ValueError:
+                    pass
+
+        if port is None:
+            logger.warning(
+                "Could not determine port for model %s – skipping in router mapping",
+                model_name,
+            )
+            continue
+
+        models_mapping[model_name] = {"endpoint": {"host": host, "port": port}}
+
+    return models_mapping
+
+
 async def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='LLM Router Server')
-    parser.add_argument('--model-config-path',
-                        required=False,
-                        help='Path to router configuration file (JSON)')
-    parser.add_argument('--model-config-json',
-                        required=False,
-                        help='Inline JSON string mapping models to endpoints')
+    parser.add_argument(
+        '--config',
+        required=True,
+        help='Path to YAML configuration file (e.g. example-config.yaml)')
     parser.add_argument('--port',
                         type=int,
                         default=8080,
@@ -249,22 +320,18 @@ async def main():
 
     args = parser.parse_args()
 
-    models_config = None
-    if args.model_config_json:
-        try:
-            models_config = json.loads(args.model_config_json)
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"Invalid --models-json: {e}")
+    cfg_path = Path(args.config).expanduser().resolve()
+    if not cfg_path.is_file():
+        raise SystemExit(f"YAML config file not found: {cfg_path}")
 
-    if not args.model_config_path and models_config is None:
-        parser.error(
-            "Either --model-config-path or --model-config-json must be provided"
-        )
+    with cfg_path.open("r") as f:
+        raw_cfg = yaml.safe_load(f)
 
-    # Create and start the server
+    models_mapping = _extract_models_mapping(raw_cfg)
+    models_config = {"models": models_mapping}
+
     server = MultiLLMFrontend(
         port=args.port,
-        model_config_path=args.model_config_path,
         model_config_json=models_config,
     )
     await server.start()
