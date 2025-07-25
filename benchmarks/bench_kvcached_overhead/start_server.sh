@@ -20,20 +20,17 @@ if [ "$op" == "vllm" ]; then
     vllm serve "$MODEL" \
     --disable-log-requests \
     --no-enable-prefix-caching \
-    --enforce-eager \
-    --gpu-memory-utilization 0.5 \
     --port="$VLLM_PORT"
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
     export ENABLE_KVCACHED=true
-    export TORCHINDUCTOR_DISABLE=1
-    export TORCHDYNAMO_DISABLE=1
     export KVCACHED_IPC_NAME=SGLANG
+    export KVCACHED_PAGE_PREALLOC_ENABLED=true
+    export KVCACHED_MIN_RESERVED_PAGES=5
+    export KVCACHED_MAX_RESERVED_PAGES=100
     python -m sglang.launch_server --model "$MODEL" \
     --disable-radix-cache \
     --trust-remote-code \
-    --attention-backend torch_native \
-    --mem-fraction-static 0.5 \
     --port "$SGL_PORT"
 else
     echo "Invalid option: $op"
