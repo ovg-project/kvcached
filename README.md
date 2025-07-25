@@ -26,15 +26,6 @@ To apply a patch:
 ```bash
 cd $PATH_TO_ENGINE_SRC # Where the source code of installed SGLang or vLLM is
 git apply $PATH_TO_KVCACHED/engine_integration/scripts/$PATCH_FILE
-
-# Examples:
-# For SGLang v0.4.6.post2
-cd /path/to/your/sglang-v0.4.6.post2
-git apply /path/to/kvcached/engine_integration/scripts/kvcached-sglang-v0.4.6.post2.patch
-
-# For vLLM v0.9.2
-cd /path/to/your/vllm-v0.9.2
-git apply /path/to/kvcached/engine_integration/scripts/kvcached-vllm-v0.9.2.patch
 ```
 
 ## All-in-One Installation (Recommended for Development)
