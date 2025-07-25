@@ -46,7 +46,14 @@ class LLMRouter:
         """
 
         self.models: Dict[str, ModelConfig] = {}
-        self.session: Optional[aiohttp.ClientSession] = None
+
+        # Use a connector with *no* limit to avoid the default 100 concurrent
+        # connections cap in aiohttp.
+        self._connector = aiohttp.TCPConnector(limit=0)
+        self.session: aiohttp.ClientSession = aiohttp.ClientSession(
+            connector=self._connector,
+            timeout=aiohttp.ClientTimeout(total=3000),  # sensible default
+        )
 
         self.load_config_from_dict(models_config)
 
@@ -121,8 +128,8 @@ class LLMRouter:
         if not endpoint:
             return None
 
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+        if self.session is None or self.session.closed:
+            raise Exception("Session not initialised")
 
         try:
             url = f"{endpoint.base_url}{endpoint_path}"
@@ -189,8 +196,8 @@ class LLMRouter:
         model_config = self.models[model_name]
         health_status = {}
 
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+        if self.session is None or self.session.closed:
+            raise Exception("Session not initialised")
 
         endpoint = model_config.endpoint
         try:
@@ -208,9 +215,10 @@ class LLMRouter:
 
     async def close(self):
         """Close the HTTP session"""
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
-            self.session = None
+        if not self._connector.closed:
+            await self._connector.close()
 
     def list_models(self) -> List[str]:
         """List all configured models"""
