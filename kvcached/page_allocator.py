@@ -1,5 +1,4 @@
 import threading
-from abc import ABC, abstractmethod
 from collections import deque
 from typing import List, Optional, Tuple, cast
 
@@ -121,34 +120,7 @@ class Page:
         return page_size // block_mem_size
 
 
-class PageAllocatorBase(ABC):
-
-    @abstractmethod
-    def __init__(self, total_mem_size: int, page_size: int):
-        pass
-
-    @abstractmethod
-    def alloc_page(self) -> Page:
-        pass
-
-    @abstractmethod
-    def free_page(self, page_id: int) -> None:
-        pass
-
-    @abstractmethod
-    def free_pages(self, page_ids: List[int]) -> None:
-        pass
-
-    @abstractmethod
-    def get_num_free_pages(self) -> int:
-        pass
-
-    @abstractmethod
-    def get_num_total_pages(self) -> int:
-        pass
-
-
-class PageAllocator(PageAllocatorBase):
+class PageAllocator:
 
     def __init__(self,
                  total_mem_size: int,
