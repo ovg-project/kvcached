@@ -63,6 +63,7 @@ class KVCacheManager:
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
             async_sched: Whether asynchronous scheduling is enabled.
+            reserve_null_block: Whether to reserve the first block as null block for padding tokens. This is required by SGLang which assumes the first block is always reserved as padded tokens.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -212,8 +213,8 @@ class KVCacheManager:
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_size()
-            mem_info.prealloc_size = self._get_prealloc_size()
+            mem_info.used_size = self._get_used_phy_mem_size()
+            mem_info.prealloc_size = self._get_prealloc_phy_mem_size()
             mem_info.write_to_buffer(mm)
 
         return ret_index
@@ -272,8 +273,7 @@ class KVCacheManager:
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
-            if (self.page_allocator.get_num_inuse_blocks(self.block_mem_size)
-                    <= self.target_num_blocks):
+            if self._get_num_alloced_blocks() <= self.target_num_blocks:
                 self.page_allocator.resize(self.target_num_blocks *
                                            self.block_mem_size)
                 self.in_shrink = False
@@ -282,8 +282,8 @@ class KVCacheManager:
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.WLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_size()
-            mem_info.prealloc_size = self._get_prealloc_size()
+            mem_info.used_size = self._get_used_phy_mem_size()
+            mem_info.prealloc_size = self._get_prealloc_phy_mem_size()
             mem_info.write_to_buffer(mm)
 
     @synchronized
@@ -338,16 +338,18 @@ class KVCacheManager:
         if self.in_shrink:
             free_size = 0
         else:
-            virtual_free_size = self.page_allocator.get_num_free_blocks(
-                self.block_mem_size)
-            physical_free_size = self._physical_free_size()
-            free_size = min(virtual_free_size, physical_free_size)
+            virtual_free_pages = self.page_allocator.get_num_free_pages()
+            physical_free_pages = self.page_allocator.get_avail_physical_pages(
+            ) + self.page_allocator.get_num_reserved_pages()
+            free_pages = min(virtual_free_pages, physical_free_pages)
+            free_size = free_pages * Page.get_num_blocks(
+                self.page_size, self.block_mem_size)
         return avail_size + free_size
 
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = self._get_used_size()
+        memory_bytes = self._get_used_phy_mem_size()
 
         if unit == 'bytes':
             return memory_bytes
@@ -365,25 +367,29 @@ class KVCacheManager:
 
     # Private methods
     @synchronized
-    def _get_used_size(self) -> int:
+    def _get_num_alloced_blocks(self) -> int:
+        # Blocks from fully allocated pages
+        blocks_from_full_pages = len(self.full_pages) * Page.get_num_blocks(
+            self.page_size, self.block_mem_size)
+        # Blocks from partially allocated pages
+        blocks_from_avail_pages = len(self.avail_pages) * Page.get_num_blocks(
+            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        # Blocks from reserved blocks
+        blocks_from_reserved_blocks = len(self.reserved_blocks)
+        return (blocks_from_full_pages + blocks_from_avail_pages +
+                blocks_from_reserved_blocks)
+
+    @synchronized
+    def _get_used_phy_mem_size(self) -> int:
         # Memory actively used by allocations (excludes preallocated pages)
         return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
                 self.page_size * 2)
 
     @synchronized
-    def _get_prealloc_size(self) -> int:
+    def _get_prealloc_phy_mem_size(self) -> int:
         # Memory held by preallocated pages that are not yet actively used
         return (self.page_allocator.get_num_reserved_pages() *
                 self.num_layers * self.page_size * 2)
-
-    @synchronized
-    def _physical_free_size(self) -> int:
-        avail_phy_pages = self.page_allocator.get_avail_physical_pages()
-        # Use the page allocator's method to get accurate block count per page
-        blocks_per_page = Page.get_num_blocks(self.page_size,
-                                              self.block_mem_size)
-        avail_phy_blocks = avail_phy_pages * blocks_per_page
-        return avail_phy_blocks
 
     def _cleanup_shm(self, *args):
         """Remove the POSIX shared-memory segment and its backing file."""

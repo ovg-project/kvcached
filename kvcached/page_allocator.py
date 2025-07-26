@@ -374,18 +374,6 @@ class PageAllocator:
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
 
-    def get_num_free_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_free_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
-
-    def get_num_inuse_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_inuse_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
-
-    def get_num_total_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_total_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
-
     # Private methods
     def _prealloc_worker(self):
         """Worker thread that preallocates and maps physical pages."""
