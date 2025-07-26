@@ -7,9 +7,9 @@ import torch
 from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import (MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
-                            PAGE_PREALLOC_ENABLED, SANITY_CHECK,
-                            get_kvcached_logger)
+from kvcached.utils import (GPU_UTILIZATION, MAX_RESERVED_PAGES,
+                            MIN_RESERVED_PAGES, PAGE_PREALLOC_ENABLED,
+                            SANITY_CHECK, get_kvcached_logger)
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
@@ -123,14 +123,16 @@ class Page:
 class PageAllocator:
 
     def __init__(self,
-                 total_mem_size: int,
+                 num_layers: int,
+                 mem_size_per_layer: int,
                  page_size: int,
                  tp_size: int = 1,
                  async_sched: bool = False,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
         """
         Args:
-            total_mem_size: Total memory size in bytes.
+            num_layers: Number of layers (for physical memory calculation).
+            mem_size_per_layer: Memory size per layer in bytes.
             page_size: Page size in bytes.
             tp_size: Tensor parallel size.
             async_sched: Whether asynchronous scheduling is enabled.
@@ -138,7 +140,9 @@ class PageAllocator:
         """
         logger.info(
             f"Init kvcached KV cache allocator: "
-            f"total_mem_size_per_layer={total_mem_size//(1024*1024)}MB, "
+            f"num_layers={num_layers}, "
+            f"mem_size_per_layer={mem_size_per_layer//(1024*1024)}MB, "
+            f"total_mem_size={num_layers * mem_size_per_layer//(1024*1024)}MB, "
             f"page_size={page_size//(1024*1024)}MB, "
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
@@ -146,12 +150,14 @@ class PageAllocator:
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
-        self.total_mem_size = total_mem_size
+        self.num_layers = num_layers
+        self.mem_size_per_layer = mem_size_per_layer
         self.page_size = page_size
         self.tp_size = tp_size
         self.async_sched = async_sched
-        self.num_free_pages = total_mem_size // page_size
-        self.num_total_pages = total_mem_size // page_size
+        self.gpu_utilization = GPU_UTILIZATION
+        self.num_free_pages = mem_size_per_layer // page_size
+        self.num_total_pages = mem_size_per_layer // page_size
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
@@ -354,6 +360,17 @@ class PageAllocator:
         with self._lock:
             return len(self.reserved_page_list)
 
+    def get_avail_physical_pages(self) -> int:
+        avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
+        headroom = total_phy_mem_size * (1 - self.gpu_utilization)
+        avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
+
+        # Calculate available pages considering layers and K/V split
+        avail_phy_pages = avail_phy_mem_size // self.page_size
+        # Each layer needs to reserve K and V tensors so we divide by 2.
+        avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
+        return avail_pages_per_layer
+
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
 
@@ -385,7 +402,8 @@ class PageAllocator:
                 current_reserved = len(self.reserved_page_list)
                 to_reserve = max(0, self.min_reserved_pages - current_reserved)
                 # Only try to reserve up to the available free pages
-                to_reserve = min(to_reserve, len(self.free_page_list))
+                to_reserve = min(to_reserve, len(self.free_page_list),
+                                 self.get_avail_physical_pages())
                 if to_reserve <= 0:
                     continue
 
