@@ -16,15 +16,14 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 import posix_ipc
-import torch
 
 from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
                                 get_ipc_path, init_kv_cache_limit)
 from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
-from kvcached.utils import (DEFAULT_IPC_NAME, GPU_UTILIZATION, PAGE_SIZE,
-                            SANITY_CHECK, get_kvcached_logger)
+from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK,
+                            get_kvcached_logger)
 from kvcached.vmm_ops import kv_tensors_created
 
 logger = get_kvcached_logger()
@@ -70,11 +69,14 @@ class KVCacheManager:
         self.num_layers = num_layers
         self.reserve_null_block = reserve_null_block
 
+        # The physical page size used by kvcached page allocator.
+        self.page_size = PAGE_SIZE
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-        self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE,
-                                            self.tp_size, async_sched)
+        self.page_allocator = PageAllocator(self.num_layers, self.mem_size,
+                                            self.page_size, self.tp_size,
+                                            async_sched)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
@@ -142,6 +144,12 @@ class KVCacheManager:
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+
+    def __del__(self):
+        try:
+            self._cleanup_shm()
+        except Exception:
+            pass
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
@@ -337,17 +345,6 @@ class KVCacheManager:
         return avail_size + free_size
 
     @synchronized
-    def _get_used_size(self) -> int:
-        # Memory actively used by allocations (excludes preallocated pages)
-        return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
-                PAGE_SIZE * 2)
-
-    def _get_prealloc_size(self) -> int:
-        # Memory held by preallocated pages that are not yet actively used
-        return (self.page_allocator.get_num_reserved_pages() *
-                self.num_layers * PAGE_SIZE * 2)
-
-    @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = self._get_used_size()
@@ -363,21 +360,29 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
-    def _physical_free_size(self) -> int:
-        avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
-        headroom = total_phy_mem_size * (1 - GPU_UTILIZATION)
-        avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
-
-        avail_phy_pages = avail_phy_mem_size // PAGE_SIZE
-        # Each layer needs to reserve K and V tensors.
-        # Use the page allocator's method to get accurate block count per page
-        blocks_per_page = Page.get_num_blocks(PAGE_SIZE, self.block_mem_size)
-        avail_phy_blocks = (avail_phy_pages // self.num_layers //
-                            2) * blocks_per_page
-        return avail_phy_blocks
-
     def clear(self):
         raise NotImplementedError("kvcached does not support clear() for now")
+
+    # Private methods
+    @synchronized
+    def _get_used_size(self) -> int:
+        # Memory actively used by allocations (excludes preallocated pages)
+        return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
+                PAGE_SIZE * 2)
+
+    @synchronized
+    def _get_prealloc_size(self) -> int:
+        # Memory held by preallocated pages that are not yet actively used
+        return (self.page_allocator.get_num_reserved_pages() *
+                self.num_layers * PAGE_SIZE * 2)
+
+    @synchronized
+    def _physical_free_size(self) -> int:
+        avail_phy_pages = self.page_allocator.get_avail_physical_pages()
+        # Use the page allocator's method to get accurate block count per page
+        blocks_per_page = Page.get_num_blocks(PAGE_SIZE, self.block_mem_size)
+        avail_phy_blocks = avail_phy_pages * blocks_per_page
+        return avail_phy_blocks
 
     def _cleanup_shm(self, *args):
         """Remove the POSIX shared-memory segment and its backing file."""
@@ -412,9 +417,3 @@ class KVCacheManager:
                 signal.signal(_sig, self._cleanup_shm)
             except Exception:
                 pass
-
-    def __del__(self):
-        try:
-            self._cleanup_shm()
-        except Exception:
-            pass
