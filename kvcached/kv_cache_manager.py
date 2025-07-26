@@ -226,15 +226,14 @@ class KVCacheManager:
         if len(indices) == 0:
             return  # Nothing to free
 
-        unique_indices = set(indices)
-        if self.reserved_blocks:
-            self.reserved_blocks = [
-                idx for idx in self.reserved_blocks
-                if idx not in unique_indices
-            ]
+        if SANITY_CHECK:
+            for idx in indices:
+                if idx in self.reserved_blocks:
+                    raise ValueError(f"Freed index {idx} is in "
+                                     " reserved_blocks, which is not allowed.")
 
         idx_dict = defaultdict(list)
-        for idx in unique_indices:
+        for idx in indices:
             page_id = self.page_allocator.get_page_id(idx, self.block_mem_size)
             idx_dict[page_id].append(idx)
 
