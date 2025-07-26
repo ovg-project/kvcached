@@ -1,6 +1,5 @@
 import asyncio
 import json
-import resource
 import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -8,23 +7,11 @@ from typing import Any, Dict, List, Optional
 import yaml
 from aiohttp import web
 from router import LLMRouter
+from utils import set_ulimit
 
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
-
-# Ensure this process has a sufficiently high file-descriptor limit.
-_TARGET_NOFILE = 1048576
-
-try:
-    soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft_nofile < _TARGET_NOFILE:
-        new_soft = min(_TARGET_NOFILE, hard_nofile)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_nofile))
-        logger.info("Raised RLIMIT_NOFILE from %s to %s", soft_nofile,
-                    new_soft)
-except Exception as _e:
-    logger.warning("Could not raise RLIMIT_NOFILE: %s", _e)
 
 
 class MultiLLMFrontend:
@@ -34,6 +21,7 @@ class MultiLLMFrontend:
         self.port = port
         self.app = web.Application()
         self.configure_endpoints()
+        set_ulimit()
 
     def configure_endpoints(self):
         """Configure HTTP endpoints"""

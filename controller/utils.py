@@ -1,3 +1,4 @@
+import resource
 import shlex
 import subprocess
 from pathlib import Path
@@ -6,6 +7,19 @@ from typing import Any, Dict, List
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
+
+
+# Ensure this process has a sufficiently high file-descriptor limit.
+def set_ulimit(target_soft_limit=1048576):
+    try:
+        soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_nofile < target_soft_limit:
+            new_soft = min(target_soft_limit, hard_nofile)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_nofile))
+            logger.info("Raised RLIMIT_NOFILE from %s to %s", soft_nofile,
+                        new_soft)
+    except Exception as _e:
+        logger.warning("Could not raise RLIMIT_NOFILE: %s", _e)
 
 
 def ensure_tmux_session(session: str) -> bool:

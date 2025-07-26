@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 import yaml
-from utils import collect_env_mods, ensure_tmux_session, launch_in_tmux
+from utils import (collect_env_mods, ensure_tmux_session, launch_in_tmux,
+                   set_ulimit)
 
 
 def load_config(config_path: str = "example-config.yaml"):
@@ -99,6 +100,8 @@ def main():
 
     print(f"Loading configuration from {args.config}...")
     models_config, router_port = load_config(args.config)
+
+    set_ulimit()
 
     _launch_benchmark_clients_tmux(models_config, router_port)
 
