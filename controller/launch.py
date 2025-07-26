@@ -241,7 +241,7 @@ def main() -> None:
         description="KVCached controller launcher")
     parser.add_argument("--config",
                         type=Path,
-                        required=True,
+                        default="example-config.yaml",
                         help="Path to YAML config file")
     args = parser.parse_args()
 
