@@ -24,8 +24,8 @@ kvcached now supports both **SGLang** and **vLLM**. While we are in the process 
 To apply a patch:
 
 ```bash
-cd engine_integration/scripts
-git apply [patch_name][engine_code_path]
+cd $PATH_TO_ENGINE_SRC # Where the source code of installed SGLang or vLLM is
+git apply $PATH_TO_KVCACHED/engine_integration/scripts/$PATCH_FILE
 ```
 
 ## All-in-One Installation (Recommended for Development)

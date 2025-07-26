@@ -131,14 +131,15 @@ index 33761cf7f..d10145bc8 100644
          self.specialized_manager = get_specialized_manager(
              kv_cache_spec=kv_cache_spec,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index f642e5100..39b256398 100644
+index f642e5100..923e2ee04 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -73,6 +73,16 @@ class EngineCore:
          vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
          vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
  
-+        enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
++        enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                    "false").lower() == "true"
 +        if enable_kvcached:
 +            from kvcached.integration.vllm.interfaces import init_kvcached
 +            init_kvcached(
@@ -147,12 +148,11 @@ index f642e5100..39b256398 100644
 +                is_worker=False,
 +            )
 +
-+
          self.structured_output_manager = StructuredOutputManager(vllm_config)
  
          # Setup scheduler.
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 70e8bd75e..736c5a995 100644
+index 70e8bd75e..022c9d150 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -272,6 +272,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -180,7 +180,7 @@ index 70e8bd75e..736c5a995 100644
      def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
          """Update the cached states and the persistent batch with the scheduler
          output.
-@@ -1640,6 +1658,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1640,6 +1658,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          kv_caches: dict[str, torch.Tensor] = {}
  
@@ -214,8 +214,14 @@ index 70e8bd75e..736c5a995 100644
 +                kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
 +
 +            kv_cache_buffers = self.kvcached_interfaces.alloc_kv_cache(
-+                kv_cache_shape, kv_cache_spec.block_size, dtype,
-+                self.device.type, num_layers)
++                kv_cache_shape,
++                kv_cache_spec.block_size,
++                dtype,
++                self.device.type,
++                num_layers,
++                attention_type="MHA",
++                kv_layout="NHD",
++            )
 +            layer_id = 0
 +            for kv_cache_group in kv_cache_config.kv_cache_groups:
 +                for layer_name in kv_cache_group.layer_names:

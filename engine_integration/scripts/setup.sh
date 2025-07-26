@@ -5,7 +5,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 DEV_MODE=true  # Set to false to use the released kvcached package
-KVCACHED_VERSION=0.0.1.dev5
 
 check_uv() {
     if ! command -v uv &> /dev/null; then
@@ -100,6 +99,8 @@ setup_vllm() {
 
     # Install requirements for kvcached first to avoid overwriting vLLM's requirements
     install_requirements
+    # vLLM-v0.9.2 requires transformers>=4.51.1 but not too new.
+    uv pip install transformers==4.51.1
 
     VLLM_USE_PRECOMPILED=1 uv pip install --editable .
     git apply "$SCRIPT_DIR/kvcached-vllm-v0.9.2.patch"
@@ -108,9 +109,7 @@ setup_vllm() {
     if [ "$DEV_MODE" = true ]; then
         install_kvcached_editable
     else
-        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
-        --no-build-isolation --no-cache-dir \
-        --extra-index-url https://pypi.org/simple
+        uv pip install kvcached --no-build-isolation --no-cache-dir
     fi
 
     deactivate
@@ -137,9 +136,7 @@ setup_sglang() {
     if [ "$DEV_MODE" = true ]; then
         install_kvcached_editable
     else
-        uv pip install -i https://test.pypi.org/simple/ kvcached==$KVCACHED_VERSION \
-        --no-build-isolation --no-cache-dir \
-        --extra-index-url https://pypi.org/simple
+        uv pip install kvcached --no-build-isolation --no-cache-dir
     fi
 
 
