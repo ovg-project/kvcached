@@ -368,19 +368,20 @@ class KVCacheManager:
     def _get_used_size(self) -> int:
         # Memory actively used by allocations (excludes preallocated pages)
         return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
-                PAGE_SIZE * 2)
+                self.page_size * 2)
 
     @synchronized
     def _get_prealloc_size(self) -> int:
         # Memory held by preallocated pages that are not yet actively used
         return (self.page_allocator.get_num_reserved_pages() *
-                self.num_layers * PAGE_SIZE * 2)
+                self.num_layers * self.page_size * 2)
 
     @synchronized
     def _physical_free_size(self) -> int:
         avail_phy_pages = self.page_allocator.get_avail_physical_pages()
         # Use the page allocator's method to get accurate block count per page
-        blocks_per_page = Page.get_num_blocks(PAGE_SIZE, self.block_mem_size)
+        blocks_per_page = Page.get_num_blocks(self.page_size,
+                                              self.block_mem_size)
         avail_phy_blocks = avail_phy_pages * blocks_per_page
         return avail_phy_blocks
 
