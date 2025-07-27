@@ -13,7 +13,6 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from kvcached.locks import NoOpLock
-from kvcached.mem_info_tracker import MemInfoTracker
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
 from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
@@ -93,8 +92,6 @@ class KVCacheManager:
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
 
-        self.mem_info_tracker = MemInfoTracker(self.mem_size * num_layers * 2)
-
     def _post_init(self):
         if self.null_block is not None:
             return
@@ -150,7 +147,7 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        new_mem_size = self.mem_info_tracker.check_and_get_resize_target(
+        new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
             self.mem_size, self.num_layers)
         if new_mem_size is not None:
             self.resize(new_mem_size)
@@ -189,9 +186,6 @@ class KVCacheManager:
 
             self.num_avail_blocks -= num_from_page
             remaining_need -= num_from_page
-
-        self.mem_info_tracker.update_memory_usage(
-            self._get_used_phy_mem_size(), self._get_prealloc_phy_mem_size())
 
         return ret_index
 
@@ -254,9 +248,6 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
-
-        self.mem_info_tracker.update_memory_usage(
-            self._get_used_phy_mem_size(), self._get_prealloc_phy_mem_size())
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -321,7 +312,8 @@ class KVCacheManager:
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = self._get_used_phy_mem_size()
+        memory_bytes = (self.page_allocator.get_num_inuse_pages() *
+                        self.num_layers * self.page_size * 2)
 
         if unit == 'bytes':
             return memory_bytes
@@ -350,15 +342,3 @@ class KVCacheManager:
         blocks_from_reserved_blocks = len(self.reserved_blocks)
         return (blocks_from_full_pages + blocks_from_avail_pages +
                 blocks_from_reserved_blocks)
-
-    @synchronized
-    def _get_used_phy_mem_size(self) -> int:
-        # Memory actively used by allocations (excludes preallocated pages)
-        return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
-                self.page_size * 2)
-
-    @synchronized
-    def _get_prealloc_phy_mem_size(self) -> int:
-        # Memory held by preallocated pages that are not yet actively used
-        return (self.page_allocator.get_num_reserved_pages() *
-                self.num_layers * self.page_size * 2)
