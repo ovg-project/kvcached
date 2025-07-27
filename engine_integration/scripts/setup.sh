@@ -119,8 +119,8 @@ setup_vllm() {
 setup_sglang() {
     pushd "$ENGINE_DIR"
 
-    git clone -b v0.4.6.post2 https://github.com/sgl-project/sglang.git sglang-v0.4.6.post2
-    cd sglang-v0.4.6.post2
+    git clone -b v0.4.9 https://github.com/sgl-project/sglang.git sglang-v0.4.9
+    cd sglang-v0.4.9
 
     uv venv --python=python3.11
     source .venv/bin/activate
@@ -130,7 +130,7 @@ setup_sglang() {
     install_requirements
 
     uv pip install -e "python[all]"
-    git apply "$SCRIPT_DIR/kvcached-sglang-v0.4.6.post2.patch"
+    git apply "$SCRIPT_DIR/kvcached-sglang-v0.4.9.patch"
 
     # Install kvcached after install sglang to find the correct torch version
     if [ "$DEV_MODE" = true ]; then
