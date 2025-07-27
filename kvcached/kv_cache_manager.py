@@ -335,7 +335,10 @@ class KVCacheManager:
         # Blocks from fully allocated pages
         blocks_from_full_pages = len(self.full_pages) * Page.get_num_blocks(
             self.page_size, self.block_mem_size)
-        # Blocks from partially allocated pages
+        # Blocks from partially allocated pages. num_avail_blocks is the number
+        # of free blocks in the partially allocated pages so the number of
+        # allocated blocks is the total number of blocks in the partially
+        # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = len(self.avail_pages) * Page.get_num_blocks(
             self.page_size, self.block_mem_size) - self.num_avail_blocks
         # Blocks from reserved blocks
