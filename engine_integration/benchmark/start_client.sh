@@ -45,7 +45,7 @@ if [ "$op" == "vllm" ]; then
     popd
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     check_and_download_sharegpt
-    source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
+    source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
     pushd $SCRIPT_DIR
     python -m sglang.bench_serving --backend sglang-oai \
       --model $MODEL \

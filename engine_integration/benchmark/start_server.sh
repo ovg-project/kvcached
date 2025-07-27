@@ -29,7 +29,7 @@ if [ "$op" == "vllm" ]; then
     --gpu-memory-utilization 0.5 \
     --port="$VLLM_PORT"
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
-    source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
+    source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
     python -m sglang.launch_server --model "$MODEL" \
