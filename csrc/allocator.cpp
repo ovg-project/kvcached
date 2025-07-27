@@ -28,13 +28,14 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
-FTensorAllocator::FTensorAllocator(const torch::Device &device)
-    : dev_(device), num_layers_(0) {
+FTensorAllocator::FTensorAllocator(const torch::Device &device,
+                                   bool contiguous_layout)
+    : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
+      kv_tensor_size_per_layer_(0) {
 
   if (dev_.is_cuda()) {
     init_cuda_();
   }
-  zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
 }
 
 FTensorAllocator::~FTensorAllocator() { destroy(); }
@@ -42,10 +43,12 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
   ftensors_.clear();
+  contiguous_kv_tensor_.reset();
   zero_page_.reset();
 }
 
-void FTensorAllocator::init(const std::string &dev_str, size_t page_size) {
+void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
+                            bool contiguous_layout) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (g_allocator_) {
     LOGE("FTensorAllocator has been initialized. Re-initializing...")
@@ -65,7 +68,7 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size) {
   }
 
   auto device = torch::Device(dev_str);
-  g_allocator_ = std::make_unique<FTensorAllocator>(device);
+  g_allocator_ = std::make_unique<FTensorAllocator>(device, contiguous_layout);
 }
 
 FTensorAllocator *FTensorAllocator::global_allocator() {
@@ -89,7 +92,19 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
-  return create_kv_tensors_impl_(kv_prefix, size, dtype, dev_str, num_layers);
+  kv_tensor_size_per_layer_ = size;
+
+  if (contiguous_layout_) {
+    // For contiguous layout, we use compound page which groups all layers
+    // together for a single page.
+    kPageSize *= num_layers;
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    return create_kv_tensors_contiguous_(size, dtype, dev_str, num_layers);
+  } else {
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    return create_kv_tensors_per_layer_(kv_prefix, size, dtype, dev_str,
+                                        num_layers);
+  }
 }
 
 bool FTensorAllocator::kv_tensors_created() {
@@ -104,21 +119,38 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     return false;
   }
 
-  for (int64_t i = 0; i < num_layers_; i++) {
-    auto kv_name = std::string(kv_prefix) + std::to_string(i);
-    auto ftensor = ftensors_[kv_name].get();
-    /**
-     * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-     * dim. This is used for calculating the offset of the V tensor.
-     * FIXME: (YIFAN) we may support other KV cache layouts later.
-     */
+  if (contiguous_layout_) {
+    // In contiguous layout, use the single contiguous tensor for mapping
+    // Each offset maps a block that contains all layers
+    auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
     auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+
     for (auto offset : offsets) {
+      // Map K and V regions for this block (covers all layers)
       auto koffset = offset;
       auto voffset = offset + v_base_offset;
       ftensor->map(koffset);
       ftensor->map(voffset);
+    }
+  } else {
+    // Original per-layer mapping
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      /**
+       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
+       * dim. This is used for calculating the offset of the V tensor.
+       * FIXME: (YIFAN) we may support other KV cache layouts later.
+       */
+      auto tensor = ftensor->get_tensor();
+      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      for (auto offset : offsets) {
+        auto koffset = offset;
+        auto voffset = offset + v_base_offset;
+        ftensor->map(koffset);
+        ftensor->map(voffset);
+      }
     }
   }
   return true;
@@ -132,19 +164,33 @@ bool FTensorAllocator::unmap_from_kv_tensors(
     return false;
   }
 
-  for (int64_t i = 0; i < num_layers_; i++) {
-    auto kv_name = std::string(kv_prefix) + std::to_string(i);
-    auto ftensor = ftensors_[kv_name].get();
-    /**
-     * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-     * dim. This is used for calculating the offset of the V tensor.
-     * FIXME: (YIFAN) we may support other KV cache layouts later.
-     */
+  if (contiguous_layout_) {
+    // In contiguous layout, unmap using the single contiguous tensor
+    auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
     auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+
     for (auto offset : offsets) {
+      // Unmap K and V regions for this block (covers all layers)
       ftensor->unmap(offset);
       ftensor->unmap(offset + v_base_offset);
+    }
+  } else {
+    // Original per-layer unmapping
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      /**
+       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
+       * dim. This is used for calculating the offset of the V tensor.
+       * FIXME: (YIFAN) we may support other KV cache layouts later.
+       */
+      auto tensor = ftensor->get_tensor();
+      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      for (auto offset : offsets) {
+        ftensor->unmap(offset);
+        ftensor->unmap(offset + v_base_offset);
+      }
     }
   }
   return true;
@@ -156,7 +202,7 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
   return std::string(prefix) + std::to_string(counter++);
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_impl_(
+std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
     std::string_view prefix, size_t size, torch::Dtype dtype,
     const std::string &dev_str, int64_t num_layers) {
   std::vector<torch::Tensor> ftensors;
@@ -166,6 +212,67 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_impl_(
     ftensors.push_back(tensor);
   }
   return ftensors;
+}
+
+std::vector<torch::Tensor>
+FTensorAllocator::create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
+                                                const std::string &dev_str,
+                                                int64_t num_layers) {
+  // In contiguous layout, Python passes per-layer size, and we multiply by
+  // num_layers to get total size
+  size_t total_kv_size = size * num_layers;
+
+  // For alignment, we want to align to page boundaries that are kPageSize *
+  // num_layers This ensures proper alignment for Python's page management.
+  // Note that here kPageSize is already multiplied by num_layers.
+  size_t aligned_size =
+      ((total_kv_size + kPageSize - 1) / kPageSize) * kPageSize;
+
+  // Create the single contiguous KV tensor (contains K and V for all layers)
+  auto contiguous_name = std::string(kv_prefix) + "contiguous";
+  contiguous_kv_tensor_ = std::make_unique<FTensor>(
+      contiguous_name, aligned_size, dtype, dev_, zero_page_);
+
+  // Get the contiguous tensor
+  auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
+
+  // Calculate elements per layer from the actual allocated tensor size
+  auto total_elements = contiguous_tensor.numel();
+  auto elements_per_layer = total_elements / num_layers;
+
+  // Create tensor views for each layer that share the same underlying storage
+  // Layout:
+  // |page0_layer0|page0_layer1|...|page0_layer31|page1_layer0|...|page1_layer31|...
+  // Need strided views where each layer tensor contains:
+  // |page0_layeri|page1_layeri|page2_layeri|...
+  std::vector<torch::Tensor> result;
+
+  auto elements_per_compound_page = elements_per_layer * num_layers;
+  auto num_compound_pages = total_elements / elements_per_compound_page;
+
+  for (int64_t i = 0; i < num_layers; i++) {
+    // Create strided view for layer i
+    // For interleaved layout:
+    // |page0_layer0|page0_layer1|...|page0_layer31|page1_layer0|...
+    // Layer i tensor should contain elements at positions:
+    // [i*elements_per_layer, i*elements_per_layer + elements_per_layer),
+    // [elements_per_compound_page + i*elements_per_layer,
+    // elements_per_compound_page + i*elements_per_layer + elements_per_layer),
+    // etc.
+
+    auto layer_view = contiguous_tensor.as_strided(
+        /* size: [num_compound_pages, elements_per_layer] = */
+        {num_compound_pages, elements_per_layer},
+        /* stride: [elements_per_compound_page, 1] = skip to next page, then
+           contiguous = */
+        {elements_per_compound_page, 1},
+        /* offset: start at layer i in first page = */
+        i * elements_per_layer);
+
+    result.push_back(layer_view);
+  }
+
+  return result;
 }
 
 /** this function is not thread-safe */
@@ -223,8 +330,9 @@ void FTensorAllocator::init_cuda_() {
   size_t chunk_sz = 0;
   CHECK_DRV(cuMemGetAllocationGranularity(&chunk_sz, &prop,
                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-  ASSERT(chunk_sz == kPageSize, "Invalid page size, %lu should be %lu %lu %d\n",
-         kPageSize, chunk_sz, chunk_sz - kPageSize, chunk_sz == kPageSize);
+  ASSERT(kPageSize % chunk_sz == 0,
+         "Invalid page size: %lu must be a multiple of CUDA granularity %lu\n",
+         kPageSize, chunk_sz);
 }
 
 } // namespace kvcached

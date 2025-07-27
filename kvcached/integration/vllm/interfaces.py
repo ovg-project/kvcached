@@ -14,25 +14,28 @@ _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
 _tp_size: int = 1
+_contiguous_layout: bool = True
 
 
 def init_kvcached(tp_rank: int = 0,
                   tp_size: int = 1,
                   is_worker: bool = False,
                   device: Optional[str] = None,
-                  async_sched: bool = False) -> None:
-    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
+                  async_sched: bool = False,
+                  contiguous_layout: bool = True) -> None:
+    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched, _contiguous_layout
     if _kvcached_initialized:
         return
 
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
 
-    _init_kvcached_impl(device, PAGE_SIZE)
+    _init_kvcached_impl(device, PAGE_SIZE, contiguous_layout)
     _kvcached_initialized = True
     _kvcached_device = device
     _tp_size = tp_size
     _async_sched = async_sched
+    _contiguous_layout = contiguous_layout
 
     if tp_size > 1 and is_worker:
         # start the listener thread for tensor parallel kv cache management
@@ -40,7 +43,7 @@ def init_kvcached(tp_rank: int = 0,
 
 
 def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_device, _async_sched, _contiguous_layout
     if not _kvcached_initialized:
         return
 
@@ -48,6 +51,7 @@ def shutdown_kvcached() -> None:
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _contiguous_layout = False
 
 
 def alloc_kv_cache(
@@ -102,5 +106,12 @@ def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(num_blocks, block_size, cell_size, num_layers,
-                          _tp_size, _async_sched)
+    return KVCacheManager(
+        num_blocks,
+        block_size,
+        cell_size,
+        num_layers,
+        _tp_size,
+        contiguous_layout=_contiguous_layout,
+        async_sched=_async_sched,
+    )

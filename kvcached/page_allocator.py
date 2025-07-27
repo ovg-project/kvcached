@@ -129,6 +129,7 @@ class PageAllocator:
                  page_size: int,
                  tp_size: int = 1,
                  async_sched: bool = False,
+                 contiguous_layout: bool = False,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
         """
         Args:
@@ -137,6 +138,7 @@ class PageAllocator:
             page_size: Page size in bytes.
             tp_size: Tensor parallel size.
             async_sched: Whether asynchronous scheduling is enabled.
+            contiguous_layout: Whether to use contiguous layout.
             enable_page_prealloc: Whether to enable page preallocation.
         """
         logger.info(
@@ -147,6 +149,7 @@ class PageAllocator:
             f"page_size={page_size//(1024*1024)}MB, "
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
+            f"contiguous_layout={contiguous_layout}, "
             f"enable_prealloc={enable_page_prealloc}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
@@ -156,6 +159,7 @@ class PageAllocator:
         self.page_size = page_size
         self.tp_size = tp_size
         self.async_sched = async_sched
+        self.contiguous_layout = contiguous_layout
         self.gpu_utilization = GPU_UTILIZATION
         self.num_free_pages = mem_size_per_layer // page_size
         self.num_total_pages = mem_size_per_layer // page_size
@@ -454,7 +458,12 @@ class PageAllocator:
             self._cond.notify()
 
     def _map_pages(self, page_ids: list[int]) -> None:
-        offsets = [pid * self.page_size for pid in page_ids]
+        if self.contiguous_layout:
+            offsets = [
+                pid * self.page_size * self.num_layers for pid in page_ids
+            ]
+        else:
+            offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # map pages across all tensor parallel workers.
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
@@ -463,7 +472,12 @@ class PageAllocator:
         self._update_memory_usage()
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
-        offsets = [pid * self.page_size for pid in page_ids]
+        if self.contiguous_layout:
+            offsets = [
+                pid * self.page_size * self.num_layers for pid in page_ids
+            ]
+        else:
+            offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
             broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
         else:
