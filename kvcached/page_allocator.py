@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, cast
 import torch
 
 from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
+from kvcached.mem_info_tracker import MemInfoTracker
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
 from kvcached.utils import (GPU_UTILIZATION, MAX_RESERVED_PAGES,
@@ -132,7 +133,7 @@ class PageAllocator:
         """
         Args:
             num_layers: Number of layers (for physical memory calculation).
-            mem_size_per_layer: Memory size per layer in bytes.
+            mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
             page_size: Page size in bytes.
             tp_size: Tensor parallel size.
             async_sched: Whether asynchronous scheduling is enabled.
@@ -166,6 +167,10 @@ class PageAllocator:
         self.reserved_page_list: deque[int] = deque()  # Fast path allocation
 
         self.reclaimed_page_list: deque[int] = deque()  # Reclaimed page ids
+
+        # Initialize memory info tracker
+        self.mem_info_tracker = MemInfoTracker(self.mem_size_per_layer *
+                                               num_layers * 2)
 
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
@@ -454,6 +459,8 @@ class PageAllocator:
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
             map_to_kv_tensors(offsets)
+        # Update memory usage after mapping pages
+        self._update_memory_usage()
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
@@ -463,3 +470,17 @@ class PageAllocator:
             if self.async_sched:
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
+        # Update memory usage after unmapping pages
+        self._update_memory_usage()
+
+    def _update_memory_usage(self):
+        """Update memory usage information in shared memory."""
+        # Memory actively used by allocations (excludes preallocated pages).
+        used_phy_mem_size = (self.get_num_inuse_pages() * self.num_layers *
+                             self.page_size * 2)
+        # Memory held by preallocated pages that are not yet actively used.
+        prealloc_phy_mem_size = (self.get_num_reserved_pages() *
+                                 self.num_layers * self.page_size * 2)
+
+        self.mem_info_tracker.update_memory_usage(
+            used_size=used_phy_mem_size, prealloc_size=prealloc_phy_mem_size)
