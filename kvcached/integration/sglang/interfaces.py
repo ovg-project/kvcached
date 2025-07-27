@@ -28,7 +28,7 @@ def init_kvcached(tp_rank: int = 0,
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
 
-    _init_kvcached_impl(device)
+    _init_kvcached_impl(device, PAGE_SIZE)
     _kvcached_initialized = True
     _kvcached_device = device
     _async_sched = async_sched

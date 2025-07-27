@@ -30,7 +30,7 @@ public:
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
-  static void init(const std::string &dev_str);
+  static void init(const std::string &dev_str, size_t page_size = 0);
   static void shutdown();
   static FTensorAllocator *global_allocator();
   void destroy();
