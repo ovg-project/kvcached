@@ -16,8 +16,7 @@ class MemInfoTracker:
     def __init__(self, total_mem_size: int):
         """
         Args:
-            ipc_name: IPC name for shared memory
-            total_mem_size: Total memory size to initialize with
+            total_mem_size: Total memory size to initialize shared memory with
         """
         self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
         init_kv_cache_limit(self.ipc_name, total_mem_size)
