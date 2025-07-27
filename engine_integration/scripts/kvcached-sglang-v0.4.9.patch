@@ -14,7 +14,7 @@ index 635536a97..8ae8c03a9 100644
                  "token_to_kv_pool_allocator memory leak detected! "
                  f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
-index 6d06fa103..75ca5af0a 100644
+index 6d06fa103..536d3f3de 100644
 --- a/python/sglang/srt/mem_cache/allocator.py
 +++ b/python/sglang/srt/mem_cache/allocator.py
 @@ -153,6 +153,43 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -43,19 +43,19 @@ index 6d06fa103..75ca5af0a 100644
 +        return self.kvcached_allocator.available_size()
 +
 +    def alloc(self, need_size: int):
-+        indices: List[int] = self.kvcached_allocator.alloc(need_size)
++        indices: list[int] = self.kvcached_allocator.alloc(need_size)
 +        indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
 +        return indices
 +
 +    def free(self, free_index: torch.Tensor):
 +        if self.is_not_in_free_group:
-+            return self.kvcached_allocator.free(free_index.cpu().numpy())
++            indices: list[int] = free_index.cpu().numpy().tolist()
++            return self.kvcached_allocator.free(indices)
 +        else:
 +            self.free_group.append(free_index)
 +
 +    def clear(self):
-+        if hasattr(self, "kvcached_allocator"):
-+            self.kvcached_allocator.clear()
++        self.kvcached_allocator.clear()
 +
 +
  class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
