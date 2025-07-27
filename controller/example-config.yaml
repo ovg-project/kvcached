@@ -24,7 +24,6 @@ instances: # instances configuration
     engine_args:
       - "--disable-log-requests"
       - "--no-enable-prefix-caching"
-      - "--enforce-eager"
       - "--host=localhost"
       - "--port=12346"
       - "--gpu-memory-utilization 0.5"
@@ -36,13 +35,9 @@ instances: # instances configuration
     kvcached_env:
       - "ENABLE_KVCACHED=true"
       - "KVCACHED_IPC_NAME=SGLANG"
-    engine_env:
-      - "TORCHINDUCTOR_DISABLE=1"
-      - "TORCHDYNAMO_DISABLE=1"
     engine_args:
       - "--disable-radix-cache"
       - "--trust-remote-code"
-      - "--attention-backend torch_native"
       - "--mem-fraction-static 0.5"
       - "--host=localhost"
       - "--port=30000"
