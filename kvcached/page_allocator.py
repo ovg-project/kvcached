@@ -218,6 +218,8 @@ class PageAllocator:
                     self.prealloc_needed = True
                     self._cond.notify()
 
+                # Update memory usage after fast path allocation
+                self._update_memory_usage()
                 return Page(page_id, self.page_size)
 
             # Slow path: allocate pages with new physical memory mapping.
@@ -236,6 +238,8 @@ class PageAllocator:
             # Trigger preallocation to refill the pool
             self._trigger_preallocation()
 
+        # Update memory usage after mapping pages
+        self._update_memory_usage()
         return Page(page_id, self.page_size)
 
     def free_page(self, page_id: int) -> None:
@@ -248,12 +252,16 @@ class PageAllocator:
             if len(self.reserved_page_list) < self.max_reserved_pages:
                 # Fast path: reserve page with its physical memory mapping.
                 self.reserved_page_list.append(page_id)
+                # Update memory usage after fast path free/reserve
+                self._update_memory_usage()
                 return
 
         # Slow path: free page and its physical memory mapping.
         self._unmap_pages([page_id])
         with self._lock:
             self.free_page_list.append(page_id)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def free_pages(self, page_ids: List[int]) -> None:
         with self._lock:
@@ -273,12 +281,16 @@ class PageAllocator:
                 page_ids = page_ids[num_to_reserve:]
 
         if len(page_ids) == 0:
+            # Update memory usage after fast path free/reserve
+            self._update_memory_usage()
             return
 
         # Slow path: free page_ids and their physical memory mapping.
         self._unmap_pages(page_ids)
         with self._lock:
             self.free_page_list.extend(page_ids)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
@@ -325,6 +337,8 @@ class PageAllocator:
                         finally:
                             self._lock.acquire()
                         self.free_page_list.extend(pages_to_unmap)
+                        # Update memory usage after unmapping pages
+                        self._update_memory_usage()
 
                 if len(self.free_page_list) < num_to_reclaim:
                     # Still not enough free pages
@@ -342,6 +356,8 @@ class PageAllocator:
             self.reserved_page_list.clear()
 
             if not pages_to_unmap:
+                # Update memory usage after trimming
+                self._update_memory_usage()
                 return
 
             try:
@@ -351,6 +367,8 @@ class PageAllocator:
                 self._lock.acquire()
 
             self.free_page_list.extend(pages_to_unmap)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def get_num_free_pages(self) -> int:
         return self.num_free_pages
@@ -414,7 +432,9 @@ class PageAllocator:
                     self._map_pages(pages_to_reserve)
                     with self._lock:
                         self.reserved_page_list.extend(pages_to_reserve)
-                    logger.debug(
+                        # Update memory usage after mapping pages
+                        self._update_memory_usage()
+                    logger.info(
                         f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
                     )
                 except Exception as e:
@@ -459,8 +479,6 @@ class PageAllocator:
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
             map_to_kv_tensors(offsets)
-        # Update memory usage after mapping pages
-        self._update_memory_usage()
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
@@ -470,8 +488,6 @@ class PageAllocator:
             if self.async_sched:
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
-        # Update memory usage after unmapping pages
-        self._update_memory_usage()
 
     def _update_memory_usage(self):
         """Update memory usage information in shared memory."""
