@@ -39,6 +39,27 @@ cd engine_integration/scripts
 
 This script will download the specified versions of SGLang and vLLM, create separate venv environments (using `uv`), compile the code, apply the necessary patches, and install kvcached.
 
+## All-in-One with Docker 
+
+You can use the docker image (updated: 07/27/2025) directly:
+
+```bash
+docker build -t kvcached-image .
+```
+
+```bash
+docker run -itd --shm-size 32g --gpus all \
+    -v ~/.cache:/root/.cache \
+    -v /dev/shm:/shm \
+    --env "HF_TOKEN=..." \
+    --ipc=host \
+    --network=host \
+    --privileged \
+    --name kvcached \
+    kvcached-image \
+    bash
+```
+
 ## Testing
 
 kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of SGLang/vLLM with kvcached, run:
