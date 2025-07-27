@@ -1,7 +1,40 @@
 import logging
 import os
 
-PAGE_SIZE = 2 * 1024 * 1024  # 2MB
+
+def _get_page_size() -> int:
+    """Get PAGE_SIZE from environment variable with validation.
+
+    Returns:
+        PAGE_SIZE in bytes, must be a multiple of 2MB (2097152 bytes)
+
+    Raises:
+        ValueError: If PAGE_SIZE is not a multiple of 2MB
+    """
+    default_page_size = 2 * 1024 * 1024  # 2MB
+    page_size_mb_str = os.getenv("KVCACHED_PAGE_SIZE_MB")
+
+    if page_size_mb_str is None:
+        return default_page_size
+
+    try:
+        page_size = int(page_size_mb_str) * 1024 * 1024
+    except ValueError:
+        raise ValueError(
+            f"Invalid KVCACHED_PAGE_SIZE_MB: {page_size_mb_str}. Must be an integer."
+        )
+
+    # Validate that PAGE_SIZE is a multiple of 2MB
+    base_size = 2 * 1024 * 1024  # 2MB
+    if page_size <= 0 or page_size % base_size != 0:
+        raise ValueError(
+            f"PAGE_SIZE must be a positive multiple of 2MB (2097152 bytes), "
+            f"got: {page_size}")
+
+    return page_size
+
+
+PAGE_SIZE = _get_page_size()
 
 # Configuration constants for KVCacheManager
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
