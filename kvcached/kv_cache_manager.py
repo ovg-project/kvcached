@@ -6,24 +6,17 @@ This module implements a hierarchical memory management system for KV cache:
 - Blocks: Smaller units within pages that are allocated to store KV cache data
 """
 
-import atexit
 import functools
-import os
-import signal
 import threading
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-import posix_ipc
-
-from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
-                                get_ipc_path, init_kv_cache_limit)
 from kvcached.locks import NoOpLock
+from kvcached.mem_info_tracker import MemInfoTracker
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
-from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK,
-                            get_kvcached_logger)
+from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
 from kvcached.vmm_ops import kv_tensors_created
 
 logger = get_kvcached_logger()
@@ -100,9 +93,7 @@ class KVCacheManager:
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
 
-        self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
-        init_kv_cache_limit(self.ipc_name, self.mem_size * num_layers * 2)
-        self._register_cleanup()
+        self.mem_info_tracker = MemInfoTracker(self.mem_size * num_layers * 2)
 
     def _post_init(self):
         if self.null_block is not None:
@@ -147,12 +138,6 @@ class KVCacheManager:
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
 
-    def __del__(self):
-        try:
-            self._cleanup_shm()
-        except Exception:
-            pass
-
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
 
@@ -165,12 +150,10 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.RLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            new_mem_size = mem_info.total_size // self.num_layers // 2
-            if new_mem_size != self.mem_size:
-                self.resize(new_mem_size)
+        new_mem_size = self.mem_info_tracker.check_and_get_resize_target(
+            self.mem_size, self.num_layers)
+        if new_mem_size is not None:
+            self.resize(new_mem_size)
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -207,12 +190,8 @@ class KVCacheManager:
             self.num_avail_blocks -= num_from_page
             remaining_need -= num_from_page
 
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_phy_mem_size()
-            mem_info.prealloc_size = self._get_prealloc_phy_mem_size()
-            mem_info.write_to_buffer(mm)
+        self.mem_info_tracker.update_memory_usage(
+            self._get_used_phy_mem_size(), self._get_prealloc_phy_mem_size())
 
         return ret_index
 
@@ -276,12 +255,8 @@ class KVCacheManager:
                 self.in_shrink = False
                 self.target_num_blocks = None
 
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_phy_mem_size()
-            mem_info.prealloc_size = self._get_prealloc_phy_mem_size()
-            mem_info.write_to_buffer(mm)
+        self.mem_info_tracker.update_memory_usage(
+            self._get_used_phy_mem_size(), self._get_prealloc_phy_mem_size())
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -387,37 +362,3 @@ class KVCacheManager:
         # Memory held by preallocated pages that are not yet actively used
         return (self.page_allocator.get_num_reserved_pages() *
                 self.num_layers * self.page_size * 2)
-
-    def _cleanup_shm(self, *args):
-        """Remove the POSIX shared-memory segment and its backing file."""
-        try:
-            # Unlink the POSIX shared memory object (no-op if already removed)
-            posix_ipc.unlink_shared_memory(self.ipc_name)
-        except Exception:
-            pass
-
-        # Also attempt to remove the backing file in /dev/shm (created by RwLockedShm)
-        try:
-            os.unlink(get_ipc_path(self.ipc_name))
-        except FileNotFoundError:
-            pass
-
-        # If invoked as a signal handler, re-raise the default behaviour so the
-        # process exits with the expected status code.
-        if args and isinstance(args[0], int):
-            signum = args[0]
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
-
-    def _register_cleanup(self):
-        """Register atexit and signal handlers for shared-memory cleanup."""
-        # Run on normal interpreter shutdown
-        atexit.register(self._cleanup_shm)
-
-        # Handle common termination signals (e.g., Ctrl-C or docker stop)
-        for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP,
-                     signal.SIGQUIT):
-            try:
-                signal.signal(_sig, self._cleanup_shm)
-            except Exception:
-                pass
