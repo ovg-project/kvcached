@@ -41,26 +41,18 @@ This script will download the specified versions of SGLang and vLLM, create sepa
 
 ## Run kvcached with Docker
 
-You can test kvcached with Docker. We provide Dockerfile for both SGLang and vLLM.
+You can test kvcached with Docker. We provide docker images for both SGLang and vLLM.
 
-Take SGLang as an example. To build the image (will take a few minutes):
+You can pull them with
 
 ```bash
-docker build -f docker/Dockerfile.sglang -t kvcached-sglang:0.4.9 .
+docker pull ghcr.io/ovg-project/kvcached_v0.0.2-sglang_v0.4.9:latest
 ```
 
-Run it:
+or
 
 ```bash
-docker run -itd --shm-size 32g --gpus all \
-    -v ~/.cache:/root/.cache \
-    -v /dev/shm:/shm \
-    --ipc=host \
-    --network=host \
-    --privileged \
-    --name kvcached-sglang \
-    kvcached-sglang:0.4.9 \
-    bash
+docker pull ghcr.io/ovg-project/kvcached_v0.0.2-vllm_v0.9.2:latest
 ```
 
 ## Testing
