@@ -1,16 +1,16 @@
 import threading
-from abc import ABC, abstractmethod
 from collections import deque
 from typing import List, Optional, Tuple, cast
 
 import torch
 
 from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
+from kvcached.mem_info_tracker import MemInfoTracker
 from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
                                   broadcast_unmap_from_kv_tensors_to_workers)
-from kvcached.utils import (MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
-                            PAGE_PREALLOC_ENABLED, SANITY_CHECK,
-                            get_kvcached_logger)
+from kvcached.utils import (GPU_UTILIZATION, MAX_RESERVED_PAGES,
+                            MIN_RESERVED_PAGES, PAGE_PREALLOC_ENABLED,
+                            SANITY_CHECK, get_kvcached_logger)
 from kvcached.vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
 logger = get_kvcached_logger()
@@ -121,44 +121,19 @@ class Page:
         return page_size // block_mem_size
 
 
-class PageAllocatorBase(ABC):
-
-    @abstractmethod
-    def __init__(self, total_mem_size: int, page_size: int):
-        pass
-
-    @abstractmethod
-    def alloc_page(self) -> Page:
-        pass
-
-    @abstractmethod
-    def free_page(self, page_id: int) -> None:
-        pass
-
-    @abstractmethod
-    def free_pages(self, page_ids: List[int]) -> None:
-        pass
-
-    @abstractmethod
-    def get_num_free_pages(self) -> int:
-        pass
-
-    @abstractmethod
-    def get_num_total_pages(self) -> int:
-        pass
-
-
-class PageAllocator(PageAllocatorBase):
+class PageAllocator:
 
     def __init__(self,
-                 total_mem_size: int,
+                 num_layers: int,
+                 mem_size_per_layer: int,
                  page_size: int,
                  tp_size: int = 1,
                  async_sched: bool = False,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
         """
         Args:
-            total_mem_size: Total memory size in bytes.
+            num_layers: Number of layers (for physical memory calculation).
+            mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
             page_size: Page size in bytes.
             tp_size: Tensor parallel size.
             async_sched: Whether asynchronous scheduling is enabled.
@@ -166,7 +141,9 @@ class PageAllocator(PageAllocatorBase):
         """
         logger.info(
             f"Init kvcached KV cache allocator: "
-            f"total_mem_size_per_layer={total_mem_size//(1024*1024)}MB, "
+            f"num_layers={num_layers}, "
+            f"mem_size_per_layer={mem_size_per_layer//(1024*1024)}MB, "
+            f"total_mem_size={num_layers * mem_size_per_layer//(1024*1024)}MB, "
             f"page_size={page_size//(1024*1024)}MB, "
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
@@ -174,12 +151,14 @@ class PageAllocator(PageAllocatorBase):
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
-        self.total_mem_size = total_mem_size
+        self.num_layers = num_layers
+        self.mem_size_per_layer = mem_size_per_layer
         self.page_size = page_size
         self.tp_size = tp_size
         self.async_sched = async_sched
-        self.num_free_pages = total_mem_size // page_size
-        self.num_total_pages = total_mem_size // page_size
+        self.gpu_utilization = GPU_UTILIZATION
+        self.num_free_pages = mem_size_per_layer // page_size
+        self.num_total_pages = mem_size_per_layer // page_size
 
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
 
@@ -188,6 +167,10 @@ class PageAllocator(PageAllocatorBase):
         self.reserved_page_list: deque[int] = deque()  # Fast path allocation
 
         self.reclaimed_page_list: deque[int] = deque()  # Reclaimed page ids
+
+        # Initialize memory info tracker
+        self.mem_info_tracker = MemInfoTracker(self.mem_size_per_layer *
+                                               num_layers * 2)
 
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
@@ -235,6 +218,8 @@ class PageAllocator(PageAllocatorBase):
                     self.prealloc_needed = True
                     self._cond.notify()
 
+                # Update memory usage after fast path allocation
+                self._update_memory_usage()
                 return Page(page_id, self.page_size)
 
             # Slow path: allocate pages with new physical memory mapping.
@@ -253,6 +238,8 @@ class PageAllocator(PageAllocatorBase):
             # Trigger preallocation to refill the pool
             self._trigger_preallocation()
 
+        # Update memory usage after mapping pages
+        self._update_memory_usage()
         return Page(page_id, self.page_size)
 
     def free_page(self, page_id: int) -> None:
@@ -265,12 +252,16 @@ class PageAllocator(PageAllocatorBase):
             if len(self.reserved_page_list) < self.max_reserved_pages:
                 # Fast path: reserve page with its physical memory mapping.
                 self.reserved_page_list.append(page_id)
+                # Update memory usage after fast path free/reserve
+                self._update_memory_usage()
                 return
 
         # Slow path: free page and its physical memory mapping.
         self._unmap_pages([page_id])
         with self._lock:
             self.free_page_list.append(page_id)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def free_pages(self, page_ids: List[int]) -> None:
         with self._lock:
@@ -290,12 +281,16 @@ class PageAllocator(PageAllocatorBase):
                 page_ids = page_ids[num_to_reserve:]
 
         if len(page_ids) == 0:
+            # Update memory usage after fast path free/reserve
+            self._update_memory_usage()
             return
 
         # Slow path: free page_ids and their physical memory mapping.
         self._unmap_pages(page_ids)
         with self._lock:
             self.free_page_list.extend(page_ids)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
@@ -342,6 +337,8 @@ class PageAllocator(PageAllocatorBase):
                         finally:
                             self._lock.acquire()
                         self.free_page_list.extend(pages_to_unmap)
+                        # Update memory usage after unmapping pages
+                        self._update_memory_usage()
 
                 if len(self.free_page_list) < num_to_reclaim:
                     # Still not enough free pages
@@ -359,6 +356,8 @@ class PageAllocator(PageAllocatorBase):
             self.reserved_page_list.clear()
 
             if not pages_to_unmap:
+                # Update memory usage after trimming
+                self._update_memory_usage()
                 return
 
             try:
@@ -368,6 +367,8 @@ class PageAllocator(PageAllocatorBase):
                 self._lock.acquire()
 
             self.free_page_list.extend(pages_to_unmap)
+            # Update memory usage after unmapping pages
+            self._update_memory_usage()
 
     def get_num_free_pages(self) -> int:
         return self.num_free_pages
@@ -382,20 +383,19 @@ class PageAllocator(PageAllocatorBase):
         with self._lock:
             return len(self.reserved_page_list)
 
+    def get_avail_physical_pages(self) -> int:
+        avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
+        headroom = total_phy_mem_size * (1 - self.gpu_utilization)
+        avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
+
+        # Calculate available pages considering layers and K/V split
+        avail_phy_pages = avail_phy_mem_size // self.page_size
+        # Each layer needs to reserve K and V tensors so we divide by 2.
+        avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
+        return avail_pages_per_layer
+
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
-
-    def get_num_free_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_free_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
-
-    def get_num_inuse_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_inuse_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
-
-    def get_num_total_blocks(self, block_mem_size: int) -> int:
-        return self.get_num_total_pages() * Page.get_num_blocks(
-            self.page_size, block_mem_size)
 
     # Private methods
     def _prealloc_worker(self):
@@ -413,7 +413,8 @@ class PageAllocator(PageAllocatorBase):
                 current_reserved = len(self.reserved_page_list)
                 to_reserve = max(0, self.min_reserved_pages - current_reserved)
                 # Only try to reserve up to the available free pages
-                to_reserve = min(to_reserve, len(self.free_page_list))
+                to_reserve = min(to_reserve, len(self.free_page_list),
+                                 self.get_avail_physical_pages())
                 if to_reserve <= 0:
                     continue
 
@@ -431,7 +432,9 @@ class PageAllocator(PageAllocatorBase):
                     self._map_pages(pages_to_reserve)
                     with self._lock:
                         self.reserved_page_list.extend(pages_to_reserve)
-                    logger.debug(
+                        # Update memory usage after mapping pages
+                        self._update_memory_usage()
+                    logger.info(
                         f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
                     )
                 except Exception as e:
@@ -485,3 +488,15 @@ class PageAllocator(PageAllocatorBase):
             if self.async_sched:
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
+
+    def _update_memory_usage(self):
+        """Update memory usage information in shared memory."""
+        # Memory actively used by allocations (excludes preallocated pages).
+        used_phy_mem_size = (self.get_num_inuse_pages() * self.num_layers *
+                             self.page_size * 2)
+        # Memory held by preallocated pages that are not yet actively used.
+        prealloc_phy_mem_size = (self.get_num_reserved_pages() *
+                                 self.num_layers * self.page_size * 2)
+
+        self.mem_info_tracker.update_memory_usage(
+            used_size=used_phy_mem_size, prealloc_size=prealloc_phy_mem_size)
