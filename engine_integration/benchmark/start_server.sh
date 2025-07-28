@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
-DEFAULT_MODEL=meta-llama/Llama-3.2-1B
+DEFAULT_MODEL=meta-llama/Llama-3.1-8B
 DEFAULT_VLLM_PORT=12346
 DEFAULT_SGL_PORT=30000
 
@@ -30,7 +30,6 @@ if [ "$op" == "vllm" ]; then
     vllm serve "$MODEL" \
     --disable-log-requests \
     --no-enable-prefix-caching \
-    --enforce-eager \
     --gpu-memory-utilization 0.5 \
     --port="$VLLM_PORT"
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
@@ -39,13 +38,10 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     fi
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
-    export TORCHINDUCTOR_DISABLE=1
-    export TORCHDYNAMO_DISABLE=1
     python -m sglang.launch_server --model "$MODEL" \
     --disable-radix-cache \
     --trust-remote-code \
     --mem-fraction-static 0.5 \
-    --attention-backend torch_native \
     --port "$SGL_PORT"
 else
     echo "Invalid option: $op"
