@@ -14,7 +14,7 @@ index 635536a97..8ae8c03a9 100644
                  "token_to_kv_pool_allocator memory leak detected! "
                  f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
-index 6d06fa103..536d3f3de 100644
+index 6d06fa103..e4820b981 100644
 --- a/python/sglang/srt/mem_cache/allocator.py
 +++ b/python/sglang/srt/mem_cache/allocator.py
 @@ -153,6 +153,43 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -55,8 +55,8 @@ index 6d06fa103..536d3f3de 100644
 +            self.free_group.append(free_index)
 +
 +    def clear(self):
-+        self.kvcached_allocator.clear()
-+
++        if hasattr(self, "kvcached_allocator"):
++            self.kvcached_allocator.clear()
 +
  class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
      """Allocator for SWA hybrid KV cache."""
