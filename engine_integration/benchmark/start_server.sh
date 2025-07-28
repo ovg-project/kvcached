@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
-DEFAULT_MODEL=meta-llama/Llama-3.1-8B
+DEFAULT_MODEL=meta-llama/Llama-3.2-1B
 DEFAULT_VLLM_PORT=12346
 DEFAULT_SGL_PORT=30000
 
