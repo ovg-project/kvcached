@@ -32,41 +32,90 @@ python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --
 | Flag                |  Default  | Description                                                        |
 |---------------------|-----------|--------------------------------------------------------------------|
 | --tp-size           | —         | Number of tensor-parallel workers to employ.                   |
-| --pages-per-iter    | 1         | How many *pages* to map per iteration.                |
+| --pages-per-iter    | 1         | How many pages to map per iteration.                |
 | --iters             | 20        | Number of benchmark iterations.                                    |
-| --map-impl          | seq       | Mapping broadcast implementation to benchmark. {seq,thread,async}            |
+| --map-impl          | seq       | Mapping broadcast implementation to benchmark. **{seq,thread,async}**            |
 | -v, --verbose       | off       | Show per-iteration timings.             |
 | --num-layers        | 32        | Dummy layer count for alloc_kv_cache(). Only affect the number of virtual pages    |
 | --async-sched       | off       | Whether asynchronous scheduling is enabled, input arg of init_kvcached
 | --block-size        | 16        | Number of tokens in a cache block. Actually not used by vLLM interfaces.    |
 
 ### Example
-#### Command
+Test different implementations on 4 A40 GPUs with PCIe interconnect.
+#### Sequential
 
 ```bash
-# test with 8 A40 GPUs with PCIe interconnect
-python kvcached_tp_ipc_benchmark.py --tp-size 8 --pages-per-iter 1 --iters 20 --map-impl seq
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl seq
 ```
 
-#### Output
-
 ```
-
 === IPC Benchmark Summary ===
 Broadcast impl       : seq (sequential_sync.py)
-TP size                 : 8
+TP size                 : 4
 Iterations              : 20
 Pages Per Iteration     : 1
 
 +---------------+-----------+------------+
 | Metric        |  Map (ms) | Unmap (ms) |
 |---------------|-----------|------------|
-| mean          |     90.25 |     112.66 |
-| p95           |    109.56 |     116.83 |
-| max           |    140.68 |     144.85 |
-| min           |     82.63 |     109.08 |
+| mean          |     44.29 |      55.61 |
+| p95           |     47.19 |      57.46 |
+| max           |     96.31 |      68.16 |
+| min           |     40.80 |      54.36 |
 |---------------|-----------|------------|
-| per-page mean |     90.25 |     112.66 |
+| per-page mean |     44.29 |      55.61 |
++---------------+-----------+------------+
+
+```
+
+#### Thread pool
+
+```bash
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl thread
+```
+
+```
+=== IPC Benchmark Summary ===
+Broadcast impl       : thread (threadpool.py)
+TP size                 : 4
+Iterations              : 20
+Pages Per Iteration     : 1
+
++---------------+-----------+------------+
+| Metric        |  Map (ms) | Unmap (ms) |
+|---------------|-----------|------------|
+| mean          |     34.21 |      57.86 |
+| p95           |     37.71 |      68.26 |
+| max           |     40.96 |      68.92 |
+| min           |     31.41 |      55.03 |
+|---------------|-----------|------------|
+| per-page mean |     34.21 |      57.86 |
++---------------+-----------+------------+
+
+```
+
+#### Asyncio
+
+```bash
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl async
+```
+
+```
+=== IPC Benchmark Summary ===
+Broadcast impl       : async (__main__.py)
+TP size                 : 4
+Iterations              : 20
+Pages Per Iteration     : 1
+
++---------------+-----------+------------+
+| Metric        |  Map (ms) | Unmap (ms) |
+|---------------|-----------|------------|
+| mean          |     30.40 |      56.36 |
+| p95           |     31.58 |      66.15 |
+| max           |     39.71 |      73.03 |
+| min           |     29.02 |      54.29 |
+|---------------|-----------|------------|
+| per-page mean |     30.40 |      56.36 |
 +---------------+-----------+------------+
 
 ```

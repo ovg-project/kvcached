@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import inspect
 import multiprocessing as mp
+import os
 import sys
 import time
 from importlib.util import module_from_spec, spec_from_file_location
@@ -64,6 +65,24 @@ def get_broadcast_impl(name: str):
         return wrapper
 
     return fn
+
+
+def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:
+    """Block until all worker sockets are available."""
+    deadline = time.time() + timeout_sec
+    from kvcached.tp_ipc_util import get_worker_socket_path
+
+    while True:
+        ready = True
+        for rank in range(tp_size):
+            if not os.path.exists(get_worker_socket_path(rank)):
+                ready = False
+                break
+        if ready:
+            return
+        if time.time() > deadline:
+            raise TimeoutError("Not all worker sockets became available in time.")
+        time.sleep(0.1)
 
 
 # ---------------- Worker code ---------------- #
@@ -148,6 +167,7 @@ def run_benchmark(
     # Wait until every worker reports its KV tensors exist
     if verbose:
         print("Waiting for workers to become ready...", flush=True)
+    wait_for_all_worker_sockets(tp_size)
     while True:
         try:
             if broadcast_kv_tensors_created_to_workers(tp_size):
@@ -156,7 +176,7 @@ def run_benchmark(
             pass  # listener not up yet
         time.sleep(0.1)
     if verbose:
-        print("All workers ready – starting benchmark.\n", flush=True)
+        print("All workers ready - starting benchmark.\n", flush=True)
 
     # -------- Benchmark loop --------
     map_times: List[float] = []
@@ -296,5 +316,5 @@ if __name__ == "__main__":
             impl_key=impl_key,
         )
     except KeyboardInterrupt:
-        print("\nInterrupted – shutting down.", flush=True)
+        print("\nInterrupted - shutting down.", flush=True)
         sys.exit(0)
