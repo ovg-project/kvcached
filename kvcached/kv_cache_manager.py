@@ -6,25 +6,16 @@ This module implements a hierarchical memory management system for KV cache:
 - Blocks: Smaller units within pages that are allocated to store KV cache data
 """
 
-import atexit
 import functools
-import os
-import signal
 import threading
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-import posix_ipc
-import torch
-
-from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
-                                get_ipc_path, init_kv_cache_limit)
 from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
-from kvcached.utils import (DEFAULT_IPC_NAME, GPU_UTILIZATION, PAGE_SIZE,
-                            SANITY_CHECK, get_kvcached_logger)
+from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
 from kvcached.vmm_ops import kv_tensors_created
 
 logger = get_kvcached_logger()
@@ -64,30 +55,35 @@ class KVCacheManager:
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
             async_sched: Whether asynchronous scheduling is enabled.
+            reserve_null_block: Whether to reserve the first block as null block
+                for padding tokens. This is required by SGLang which assumes the
+                first block is always reserved as padded tokens.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.reserve_null_block = reserve_null_block
 
+        # The physical page size used by kvcached page allocator.
+        self.page_size = PAGE_SIZE
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-        self.page_allocator = PageAllocator(self.mem_size, PAGE_SIZE,
-                                            self.tp_size, async_sched)
+        self.page_allocator = PageAllocator(self.num_layers, self.mem_size,
+                                            self.page_size, self.tp_size,
+                                            async_sched)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}
         self.full_pages: Dict[int, Page] = {}
 
         self.reserved_blocks: List[int] = []
+        self.null_block: Optional[list[int]] = None
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
-
-        self.null_block: Optional[list[int]] = None
 
         # Event used to signal that _post_init() has finished.
         self._post_init_done = threading.Event()
@@ -95,10 +91,6 @@ class KVCacheManager:
         # exist, then complete the remaining setup (reserve null block, start
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
-
-        self.ipc_name = get_ipc_name(DEFAULT_IPC_NAME)
-        init_kv_cache_limit(self.ipc_name, self.mem_size * num_layers * 2)
-        self._register_cleanup()
 
     def _post_init(self):
         if self.null_block is not None:
@@ -155,12 +147,10 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.RLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            new_mem_size = mem_info.total_size // self.num_layers // 2
-            if new_mem_size != self.mem_size:
-                self.resize(new_mem_size)
+        new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
+            self.mem_size, self.num_layers)
+        if new_mem_size is not None:
+            self.resize(new_mem_size)
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -172,41 +162,30 @@ class KVCacheManager:
 
         remaining_need = need_size
 
-        if self.reserved_blocks:
-            if len(self.reserved_blocks) >= remaining_need:
-                ret_index = self.reserved_blocks[:remaining_need]
-                self.reserved_blocks = self.reserved_blocks[remaining_need:]
-                remaining_need = 0
-            else:
-                ret_index = self.reserved_blocks
-                remaining_need -= len(self.reserved_blocks)
-                self.reserved_blocks = []
+        if self.reserved_blocks:  # Try to allocate from reserved blocks first
+            num_from_reserved = min(len(self.reserved_blocks), remaining_need)
+            # ret_index is empty before so we directly assign it
+            ret_index = self.reserved_blocks[:num_from_reserved]
+            self.reserved_blocks = self.reserved_blocks[num_from_reserved:]
+            remaining_need -= num_from_reserved
 
-        while remaining_need > 0:
+        while remaining_need > 0:  # Allocate the remaining blocks from pages
             if not self.avail_pages:
                 page = self.page_allocator.alloc_page()
                 page.init(self.block_mem_size)
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 _, page = self.avail_pages.popitem()
-            num_to_alloc_from_page = min(page.num_free_blocks(),
-                                         remaining_need)
-            alloced_index = page.alloc(num_to_alloc_from_page)
+            num_from_page = min(page.num_free_blocks(), remaining_need)
+            alloced_index = page.alloc(num_from_page)
             ret_index.extend(alloced_index)
             if page.full():
                 self.full_pages[page.page_id] = page
             else:
                 self.avail_pages[page.page_id] = page
 
-            self.num_avail_blocks -= num_to_alloc_from_page
-            remaining_need -= num_to_alloc_from_page
-
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_size()
-            mem_info.prealloc_size = self._get_prealloc_size()
-            mem_info.write_to_buffer(mm)
+            self.num_avail_blocks -= num_from_page
+            remaining_need -= num_from_page
 
         return ret_index
 
@@ -217,15 +196,15 @@ class KVCacheManager:
         if len(indices) == 0:
             return  # Nothing to free
 
-        unique_indices = set(indices)
-        if self.reserved_blocks:
-            self.reserved_blocks = [
-                idx for idx in self.reserved_blocks
-                if idx not in unique_indices
-            ]
+        if SANITY_CHECK:
+            for idx in indices:
+                if idx in self.reserved_blocks:
+                    raise ValueError(f"Freed index {idx} is in "
+                                     " reserved_blocks, which is not allowed.")
 
+        # Group indices by page_id
         idx_dict = defaultdict(list)
-        for idx in unique_indices:
+        for idx in indices:
             page_id = self.page_allocator.get_page_id(idx, self.block_mem_size)
             idx_dict[page_id].append(idx)
 
@@ -264,19 +243,11 @@ class KVCacheManager:
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
-            if (self.page_allocator.get_num_inuse_blocks(self.block_mem_size)
-                    <= self.target_num_blocks):
+            if self._get_num_alloced_blocks() <= self.target_num_blocks:
                 self.page_allocator.resize(self.target_num_blocks *
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
-
-        with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            mem_info.used_size = self._get_used_size()
-            mem_info.prealloc_size = self._get_prealloc_size()
-            mem_info.write_to_buffer(mm)
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -312,8 +283,8 @@ class KVCacheManager:
         # Failed to resize due to too many in-use blocks.
         assert (len(self.reserved_blocks) == 0
                 ), "Reserved blocks must be freed before resizing."
-        # NOTE: we can support resizing with reserved blocks, but we want to enforce
-        # this check for now to ensure correctness.
+        # NOTE: we can support resizing with reserved blocks, but we want to
+        # enforce this check for now to ensure correctness.
         self.in_shrink = True
         self.target_num_blocks = new_mem_size // self.block_mem_size
         self.free_reserved()
@@ -330,27 +301,19 @@ class KVCacheManager:
         if self.in_shrink:
             free_size = 0
         else:
-            virtual_free_size = self.page_allocator.get_num_free_blocks(
-                self.block_mem_size)
-            physical_free_size = self._physical_free_size()
-            free_size = min(virtual_free_size, physical_free_size)
+            virtual_free_pages = self.page_allocator.get_num_free_pages()
+            physical_free_pages = self.page_allocator.get_avail_physical_pages(
+            ) + self.page_allocator.get_num_reserved_pages()
+            free_pages = min(virtual_free_pages, physical_free_pages)
+            free_size = free_pages * Page.get_num_blocks(
+                self.page_size, self.block_mem_size)
         return avail_size + free_size
-
-    @synchronized
-    def _get_used_size(self) -> int:
-        # Memory actively used by allocations (excludes preallocated pages)
-        return (self.page_allocator.get_num_inuse_pages() * self.num_layers *
-                PAGE_SIZE * 2)
-
-    def _get_prealloc_size(self) -> int:
-        # Memory held by preallocated pages that are not yet actively used
-        return (self.page_allocator.get_num_reserved_pages() *
-                self.num_layers * PAGE_SIZE * 2)
 
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = self._get_used_size()
+        memory_bytes = (self.page_allocator.get_num_inuse_pages() *
+                        self.num_layers * self.page_size * 2)
 
         if unit == 'bytes':
             return memory_bytes
@@ -363,58 +326,22 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
-    def _physical_free_size(self) -> int:
-        avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
-        headroom = total_phy_mem_size * (1 - GPU_UTILIZATION)
-        avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
-
-        avail_phy_pages = avail_phy_mem_size // PAGE_SIZE
-        # Each layer needs to reserve K and V tensors.
-        # Use the page allocator's method to get accurate block count per page
-        blocks_per_page = Page.get_num_blocks(PAGE_SIZE, self.block_mem_size)
-        avail_phy_blocks = (avail_phy_pages // self.num_layers //
-                            2) * blocks_per_page
-        return avail_phy_blocks
-
     def clear(self):
         raise NotImplementedError("kvcached does not support clear() for now")
 
-    def _cleanup_shm(self, *args):
-        """Remove the POSIX shared-memory segment and its backing file."""
-        try:
-            # Unlink the POSIX shared memory object (no-op if already removed)
-            posix_ipc.unlink_shared_memory(self.ipc_name)
-        except Exception:
-            pass
-
-        # Also attempt to remove the backing file in /dev/shm (created by RwLockedShm)
-        try:
-            os.unlink(get_ipc_path(self.ipc_name))
-        except FileNotFoundError:
-            pass
-
-        # If invoked as a signal handler, re-raise the default behaviour so the
-        # process exits with the expected status code.
-        if args and isinstance(args[0], int):
-            signum = args[0]
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
-
-    def _register_cleanup(self):
-        """Register atexit and signal handlers for shared-memory cleanup."""
-        # Run on normal interpreter shutdown
-        atexit.register(self._cleanup_shm)
-
-        # Handle common termination signals (e.g., Ctrl-C or docker stop)
-        for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP,
-                     signal.SIGQUIT):
-            try:
-                signal.signal(_sig, self._cleanup_shm)
-            except Exception:
-                pass
-
-    def __del__(self):
-        try:
-            self._cleanup_shm()
-        except Exception:
-            pass
+    # Private methods
+    @synchronized
+    def _get_num_alloced_blocks(self) -> int:
+        # Blocks from fully allocated pages
+        blocks_from_full_pages = len(self.full_pages) * Page.get_num_blocks(
+            self.page_size, self.block_mem_size)
+        # Blocks from partially allocated pages. num_avail_blocks is the number
+        # of free blocks in the partially allocated pages so the number of
+        # allocated blocks is the total number of blocks in the partially
+        # allocated pages minus the number of free blocks.
+        blocks_from_avail_pages = len(self.avail_pages) * Page.get_num_blocks(
+            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        # Blocks from reserved blocks
+        blocks_from_reserved_blocks = len(self.reserved_blocks)
+        return (blocks_from_full_pages + blocks_from_avail_pages +
+                blocks_from_reserved_blocks)

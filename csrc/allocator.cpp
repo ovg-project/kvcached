@@ -11,6 +11,9 @@
 #include "torch_utils.hpp"
 
 namespace kvcached {
+// Global configurable page size
+size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
+
 std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
 
@@ -42,11 +45,23 @@ void FTensorAllocator::destroy() {
   zero_page_.reset();
 }
 
-void FTensorAllocator::init(const std::string &dev_str) {
+void FTensorAllocator::init(const std::string &dev_str, size_t page_size) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (g_allocator_) {
     LOGE("FTensorAllocator has been initialized. Re-initializing...")
     g_allocator_.reset();
+  }
+
+  // Set global page size if provided (0 means use default)
+  if (page_size > 0) {
+    // Validate that page_size is a multiple of 2MB
+    size_t base_size = 2 * 1024 * 1024; // 2MB
+    if (page_size % base_size != 0) {
+      LOGE("Invalid page size: %zu, must be a multiple of 2MB (2097152 bytes)",
+           page_size);
+      abort();
+    }
+    kPageSize = page_size;
   }
 
   auto device = torch::Device(dev_str);

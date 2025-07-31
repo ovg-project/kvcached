@@ -9,9 +9,9 @@
 
 namespace kvcached {
 
-void init_kvcached(const std::string &dev_str) {
+void init_kvcached(const std::string &dev_str, size_t page_size = 0) {
   py::gil_scoped_release release;
-  FTensorAllocator::init(dev_str);
+  FTensorAllocator::init(dev_str, page_size);
 }
 
 void shutdown_kvcached() {
@@ -50,7 +50,8 @@ bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
 
-  m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached");
+  m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
+        py::arg("dev_str"), py::arg("page_size") = 0);
   m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
   m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors");
   m.def("kv_tensors_created", &kvcached::kv_tensors_created,

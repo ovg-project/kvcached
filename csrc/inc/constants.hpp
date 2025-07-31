@@ -10,7 +10,8 @@ using generic_ptr_t = void *;
 using page_id_t = int64_t;
 using offset_t = page_id_t;
 
-static constexpr size_t kPageSize = 2 * 1024 * 1024;
+// Page size is now configurable via kvcached initialization
+extern size_t kPageSize;
 static constexpr size_t kStartAddr = 0x1f0'000'000'000;
 
 static constexpr page_id_t INV_PAGE_ID = -1;
