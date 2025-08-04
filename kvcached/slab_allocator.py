@@ -1,8 +1,9 @@
+import os
 import threading
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -15,7 +16,6 @@ except ImportError:
         from vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
     except ImportError:
         # Final fallback: try to add local csrc path
-        import os
         import sys
 
         SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -30,10 +30,52 @@ except ImportError:
         except ImportError:
             from vmm_ops import map_to_kv_tensors, unmap_from_kv_tensors
 
+# >>> ADD NVTX utilities
+import contextlib
 import time
 from multiprocessing import shared_memory
 
 import numpy as np
+
+try:
+    from torch.cuda import nvtx as _nvtx
+    print("✅ [NVTX-INIT] torch.cuda.nvtx imported successfully")
+except Exception as e:
+    print(f"❌ [NVTX-INIT] Failed to import torch.cuda.nvtx: {e}")
+    _nvtx = None
+
+# >>> ADD CUDA synchronization control
+ENABLE_CUDA_SYNC = os.getenv("KVCACHED_ENABLE_CUDA_SYNC",
+                             "false").lower() in ("true", "1", "yes")
+if ENABLE_CUDA_SYNC:
+    print("✅ [CUDA-SYNC] CUDA synchronization enabled for NVTX profiling")
+else:
+    print("ℹ️  [CUDA-SYNC] CUDA synchronization disabled")
+
+
+def cuda_sync_if_enabled():
+    """Conditionally perform CUDA sync based on environment variable"""
+    if ENABLE_CUDA_SYNC and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+@contextlib.contextmanager
+def nvtx_range(name: str):
+    if _nvtx is None:
+        error_msg = (f"❌ [NVTX-ERROR] NVTX not available but trying to use "
+                     f"range '{name}'")
+        print(error_msg)
+        raise RuntimeError(error_msg + " - Please ensure torch.cuda.nvtx is "
+                           "properly installed")
+
+    cuda_sync_if_enabled()  # Sync before starting NVTX range
+    _nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        _nvtx.range_pop()
+        cuda_sync_if_enabled()  # Sync after ending NVTX range
+
 
 SANITY_CHECK = False
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB
@@ -222,8 +264,8 @@ class PageAllocator(PageAllocatorBase):
             self.memory_in_use = None
 
         # Preallocation settings
-        self.min_reserved_pages = 5
-        self.max_reserved_pages = 10
+        self.min_reserved_pages = 100
+        self.max_reserved_pages = 200
         self.reserved_page_list: List[int] = []
         self.reclaimed_page_list: List[int] = []
 
@@ -345,7 +387,8 @@ class PageAllocator(PageAllocatorBase):
         # Map the page to physical memory (slow path)
         page = Page(page_id, self.page_size)
         # Fix: use same offset calculation as original
-        map_to_kv_tensors([page_id * self.page_size])
+        with nvtx_range("map_to_kv_tensors"):
+            map_to_kv_tensors([page_id * self.page_size])
 
         if self.shm is not None:
             with Timer(self.write_shm_times):
@@ -373,7 +416,8 @@ class PageAllocator(PageAllocatorBase):
         # Slow path: unmap and add to free list
         page.destroy()
         # Fix: use same offset calculation as original
-        unmap_from_kv_tensors([page_id * self.page_size])
+        with nvtx_range("unmap_from_kv_tensors"):
+            unmap_from_kv_tensors([page_id * self.page_size])
         with self.prealloc_lock:
             self.free_page_list.append(page_id)
 
@@ -509,6 +553,8 @@ class KVCacheManager:
         cell_size: int,
         num_layers: int,
         shm: shared_memory.SharedMemory = None,
+        return_device: Optional[str] = None,
+        **kwargs,
     ):
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -529,96 +575,156 @@ class KVCacheManager:
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
 
-    def alloc(self, need_size: int) -> List[int]:
-        if self.available_size() < need_size:
-            return None
+        # ---- New optional fast-path settings ----
+        # Set device for returning Tensor directly from allocator, defaults
+        # to reading from environment variable; if empty, keeps old
+        # behavior (return list)
+        self.return_device: Optional[str] = (
+            return_device if return_device is not None else os.getenv(
+                "KVCACHED_RETURN_DEVICE", None))
+        # Whether to pin_memory CPU tensor and then async copy
+        self.pin_cpu: bool = True
 
-        ret_index = []
-        page: Page = None
+        # 提前预留所有可用页面以优化性能
+        available = self.available_size()
+        if available > 0:
+            reserved_success = self.try_to_reserve(available)
+            print(f"Pre-reserved {len(self.reserved_blocks)} blocks out of "
+                  f"{available} available blocks. Success: {reserved_success}")
 
-        remaining_need = need_size
+    def alloc(self, need_size: int) -> Union[List[int], torch.Tensor]:
+        with nvtx_range(f"kv_alloc_total({need_size})"):
+            if need_size == 0:
+                if self.return_device:
+                    dev = self.return_device
+                    device_str = dev if dev.startswith("cuda") else "cpu"
+                    return torch.empty(0, dtype=torch.int32, device=device_str)
+                return []
 
-        if self.reserved_blocks:
-            if len(self.reserved_blocks) >= remaining_need:
-                ret_index = self.reserved_blocks[:remaining_need]
-                self.reserved_blocks = self.reserved_blocks[remaining_need:]
-                remaining_need = 0
-            else:
-                ret_index = self.reserved_blocks
-                remaining_need -= len(self.reserved_blocks)
-                self.reserved_blocks = []
+            if self.available_size() < need_size:
+                return None
 
-        while remaining_need > 0:
-            if not self.avail_pages:
-                page = self.page_allocator.alloc_page()
-                page.init(self.block_mem_size)
-                self.num_avail_blocks += page.num_free_blocks()
-            else:
-                _, page = self.avail_pages.popitem()
-            assert page is not None
-            if page.num_free_blocks() > remaining_need:
-                self.num_avail_blocks -= remaining_need
-                alloced_index = page.free_list[:remaining_need]
-                page.free_list = page.free_list[remaining_need:]
-                ret_index.extend(alloced_index)
-                remaining_need = 0
-                self.avail_pages[page.page_id] = page
-            else:
-                self.num_avail_blocks -= page.num_free_blocks()
-                ret_index.extend(page.free_list)
-                remaining_need -= len(page.free_list)
-                page.free_list = []
-                self.full_pages[page.page_id] = page
-        assert remaining_need == 0, "Insufficient memory for allocation."
-        return ret_index
+            ret_index: List[int] = []
+            remaining_need = need_size
 
-    def free(self, indices: List[int]):
-        if self.reserved_blocks:
+            # fast path: reserved_blocks
+            with nvtx_range("alloc_reserved_fastpath"):
+                if self.reserved_blocks:
+                    if len(self.reserved_blocks) >= remaining_need:
+                        ret_index = self.reserved_blocks[:remaining_need]
+                        self.reserved_blocks = self.reserved_blocks[
+                            remaining_need:]
+                        remaining_need = 0
+                    else:
+                        ret_index = self.reserved_blocks
+                        remaining_need -= len(self.reserved_blocks)
+                        self.reserved_blocks = []
+
+            with nvtx_range("alloc_page_loop"):
+                while remaining_need > 0:
+                    if not self.avail_pages:
+                        with nvtx_range("alloc_page+map"):
+                            page = self.page_allocator.alloc_page()
+                            page.init(self.block_mem_size)
+                            self.num_avail_blocks += page.num_free_blocks()
+                    else:
+                        _, page = self.avail_pages.popitem()
+
+                    assert page is not None
+                    free_n = page.num_free_blocks()
+                    if free_n > remaining_need:
+                        self.num_avail_blocks -= remaining_need
+                        alloced_index = page.free_list[:remaining_need]
+                        page.free_list = page.free_list[remaining_need:]
+                        ret_index.extend(alloced_index)
+                        remaining_need = 0
+                        self.avail_pages[page.page_id] = page
+                    else:
+                        self.num_avail_blocks -= free_n
+                        ret_index.extend(page.free_list)
+                        remaining_need -= free_n
+                        page.free_list = []
+                        self.full_pages[page.page_id] = page
+
+            # If tensor is not needed, return list directly
+            if self.return_device is None:
+                return ret_index
+
+            # list -> pinned CPU tensor -> async to GPU
+            with nvtx_range("list->tensor/H2D"):
+                idx_cpu = torch.as_tensor(ret_index, dtype=torch.int32)
+                if self.return_device.startswith("cuda"):
+                    if self.pin_cpu and not idx_cpu.is_pinned():
+                        idx_cpu = idx_cpu.pin_memory()
+                    idx_gpu = idx_cpu.to(self.return_device, non_blocking=True)
+                    result = idx_gpu
+                else:
+                    result = idx_cpu
+
+            return result
+
+    def free(self, indices: Union[List[int], torch.Tensor, np.ndarray]):
+        indices_len = len(indices) if hasattr(indices, '__len__') else 1
+        with nvtx_range(f"kv_free({indices_len})"):
+            # --- Added: support for tensor / numpy array / iterable ---
+            if isinstance(indices, torch.Tensor):
+                if indices.is_cuda:
+                    indices = indices.cpu()
+                indices = indices.tolist()
+            elif not isinstance(indices, list):
+                # e.g., numpy array or other iterable
+                indices = list(indices)
+
+            if self.reserved_blocks:
+                for idx in indices:
+                    if idx in self.reserved_blocks:
+                        self.reserved_blocks.remove(idx)
+
+            idx_dict = defaultdict(list)
             for idx in indices:
-                if idx in self.reserved_blocks:
-                    self.reserved_blocks.remove(idx)
+                page_id = self.page_allocator.get_page_id(
+                    idx, self.block_mem_size)
+                idx_dict[page_id].append(idx)
 
-        idx_dict = defaultdict(list)
-        for idx in indices:
-            page_id = self.page_allocator.get_page_id(idx, self.block_mem_size)
-            idx_dict[page_id].append(idx)
+            pages_to_free: List[int] = []
+            for page_id, idxs in idx_dict.items():
+                if (page_id not in self.full_pages
+                        and page_id not in self.avail_pages):
+                    warnings.warn(
+                        f"Page {page_id} is not in avail_pages or full_pages, "
+                        f"it is possible that the page is already freed.")
+                    continue
+                if page_id in self.full_pages:
+                    page = self.full_pages.pop(page_id)
+                else:
+                    page = self.avail_pages.pop(page_id)
 
-        pages_to_free: List[int] = []
-        for page_id, idxs in idx_dict.items():
-            if (page_id not in self.full_pages
-                    and page_id not in self.avail_pages):
-                warnings.warn(
-                    f"Page {page_id} is not in avail_pages or full_pages, "
-                    f"it is possible that the page is already freed.")
-                continue
-            if page_id in self.full_pages:
-                page = self.full_pages.pop(page_id)
-            else:
-                page = self.avail_pages.pop(page_id)
+                self.num_avail_blocks += len(idxs)
+                page.free_batch(idxs)
+                if page.empty():
+                    pages_to_free.append(page.page_id)
+                    self.num_avail_blocks -= page.num_free_blocks()
+                else:
+                    self.avail_pages[page_id] = page
 
-            self.num_avail_blocks += len(idxs)
-            page.free_batch(idxs)
-            if page.empty():
-                pages_to_free.append(page.page_id)
-                self.num_avail_blocks -= page.num_free_blocks()
-            else:
-                self.avail_pages[page_id] = page
+            if len(pages_to_free) > 0:
+                self.page_allocator.free_pages(pages_to_free)
 
-        if len(pages_to_free) > 0:
-            self.page_allocator.free_pages(pages_to_free)
-
-        if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
-                self.block_mem_size) <= self.target_num_blocks):
-            self.page_allocator.resize(self.target_num_blocks *
-                                       self.block_mem_size)
-            self.in_shrink = False
+            if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
+                    self.block_mem_size) <= self.target_num_blocks):
+                self.page_allocator.resize(self.target_num_blocks *
+                                           self.block_mem_size)
+                self.in_shrink = False
             self.target_num_blocks = None
 
     def try_to_reserve(self, need_size: int) -> bool:
         if self.available_size() < need_size:
             return False
         reserved = self.alloc(need_size)
-        assert reserved is not None, "Failed to reserve blocks."
+        if reserved is None:
+            return False
+        if isinstance(reserved, torch.Tensor):
+            reserved = reserved.cpu().tolist()
         self.reserved_blocks.extend(reserved)
         return True
 
@@ -652,7 +758,8 @@ class KVCacheManager:
         else:
             virtual_free_size = self.page_allocator.get_num_free_blocks(
                 self.block_mem_size)
-            physical_free_size = self._physical_free_size()
+            # physical_free_size = self._physical_free_size()
+            physical_free_size = float('inf')
             free_size = min(virtual_free_size, physical_free_size)
         return avail_size + free_size
 
