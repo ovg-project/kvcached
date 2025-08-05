@@ -460,7 +460,7 @@ class PageAllocator:
     def _map_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
             offsets = [
-                pid * self.page_size * self.num_layers for pid in page_ids
+                pid * self.page_size * self.num_layers * 2 for pid in page_ids
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
@@ -474,7 +474,7 @@ class PageAllocator:
     def _unmap_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
             offsets = [
-                pid * self.page_size * self.num_layers for pid in page_ids
+                pid * self.page_size * self.num_layers * 2 for pid in page_ids
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]

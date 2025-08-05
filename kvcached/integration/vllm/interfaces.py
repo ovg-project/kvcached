@@ -55,7 +55,7 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-        kvcache_shape: Tuple[int, ...],
+        kvcache_shape: Tuple[int, ...],  # (2, num_blocks, head_num, head_dim)
         block_size: int,
         dtype: torch.dtype,
         device: str,
@@ -93,10 +93,20 @@ def alloc_kv_cache(
     raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
                                        device, num_layers)
 
-    kv_tensors = [
-        t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
-        for t in raw_kv_tensors
-    ]
+    if not _contiguous_layout:
+        kv_tensors = [
+            t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
+            for t in raw_kv_tensors
+        ]
+    else:
+        contiguous_tensor = raw_kv_tensors[0].view(
+            num_blocks, num_layers, 2,
+            *kvcache_shape_list[2:]).view(dtype=dtype)
+        kv_tensors = [
+            contiguous_tensor[:, i, :, :, :].permute(
+                1, 0, *range(2, len(kvcache_shape_list)))
+            for i in range(num_layers)
+        ]
     return kv_tensors
 
 

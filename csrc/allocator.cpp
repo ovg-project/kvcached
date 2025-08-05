@@ -97,7 +97,7 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page.
-    kPageSize *= num_layers;
+    kPageSize *= num_layers * 2;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_contiguous_(size, dtype, dev_str, num_layers);
   } else {
@@ -124,14 +124,10 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     // Each offset maps a block that contains all layers
     auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
-    auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
 
     for (auto offset : offsets) {
       // Map K and V regions for this block (covers all layers)
-      auto koffset = offset;
-      auto voffset = offset + v_base_offset;
-      ftensor->map(koffset);
-      ftensor->map(voffset);
+      ftensor->map(offset);
     }
   } else {
     // Original per-layer mapping
@@ -168,12 +164,10 @@ bool FTensorAllocator::unmap_from_kv_tensors(
     // In contiguous layout, unmap using the single contiguous tensor
     auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
-    auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
 
     for (auto offset : offsets) {
       // Unmap K and V regions for this block (covers all layers)
       ftensor->unmap(offset);
-      ftensor->unmap(offset + v_base_offset);
     }
   } else {
     // Original per-layer unmapping
@@ -235,44 +229,7 @@ FTensorAllocator::create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
 
   // Get the contiguous tensor
   auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
-
-  // Calculate elements per layer from the actual allocated tensor size
-  auto total_elements = contiguous_tensor.numel();
-  auto elements_per_layer = total_elements / num_layers;
-
-  // Create tensor views for each layer that share the same underlying storage
-  // Layout:
-  // |page0_layer0|page0_layer1|...|page0_layer31|page1_layer0|...|page1_layer31|...
-  // Need strided views where each layer tensor contains:
-  // |page0_layeri|page1_layeri|page2_layeri|...
-  std::vector<torch::Tensor> result;
-
-  auto elements_per_compound_page = elements_per_layer * num_layers;
-  auto num_compound_pages = total_elements / elements_per_compound_page;
-
-  for (int64_t i = 0; i < num_layers; i++) {
-    // Create strided view for layer i
-    // For interleaved layout:
-    // |page0_layer0|page0_layer1|...|page0_layer31|page1_layer0|...
-    // Layer i tensor should contain elements at positions:
-    // [i*elements_per_layer, i*elements_per_layer + elements_per_layer),
-    // [elements_per_compound_page + i*elements_per_layer,
-    // elements_per_compound_page + i*elements_per_layer + elements_per_layer),
-    // etc.
-
-    auto layer_view = contiguous_tensor.as_strided(
-        /* size: [num_compound_pages, elements_per_layer] = */
-        {num_compound_pages, elements_per_layer},
-        /* stride: [elements_per_compound_page, 1] = skip to next page, then
-           contiguous = */
-        {elements_per_compound_page, 1},
-        /* offset: start at layer i in first page = */
-        i * elements_per_layer);
-
-    result.push_back(layer_view);
-  }
-
-  return result;
+  return {contiguous_tensor};
 }
 
 /** this function is not thread-safe */
