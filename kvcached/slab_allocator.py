@@ -74,19 +74,18 @@ def cuda_sync_if_enabled():
 @contextlib.contextmanager
 def nvtx_range(name: str):
     if _nvtx is None:
-        error_msg = (f"❌ [NVTX-ERROR] NVTX not available but trying to use "
-                     f"range '{name}'")
-        print(error_msg)
-        raise RuntimeError(error_msg + " - Please ensure torch.cuda.nvtx is "
-                           "properly installed")
+        yield
+        return
 
-    cuda_sync_if_enabled()  # Sync before starting NVTX range
+    if ENABLE_CUDA_SYNC and torch.cuda.is_available():
+        torch.cuda.synchronize()
     _nvtx.range_push(name)
     try:
         yield
     finally:
         _nvtx.range_pop()
-        cuda_sync_if_enabled()  # Sync after ending NVTX range
+        if ENABLE_CUDA_SYNC and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
 
 SANITY_CHECK = False
@@ -104,7 +103,11 @@ class Timer:
         self.start = time.time()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.timings.append(time.time() - self.start)
+        duration = time.time() - self.start
+        self.timings.append(duration)
+        # Prevent unlimited growth by keeping only recent entries
+        if len(self.timings) > 1024:
+            self.timings.pop(0)
 
 
 class MemoryUsageReader():
@@ -265,6 +268,11 @@ class PageAllocator(PageAllocatorBase):
         self.free_page_list: deque[int] = deque(range(self.num_free_pages))
         self.write_shm_times = []
 
+        # Performance metrics
+        self.slow_path_count = 0  # Count of alloc_page() slow path hits
+        self.fast_path_count = 0  # Count of alloc_page() fast path hits
+        self.reserved_at_alloc = []  # Track reserved count at alloc entry
+
         if shm is not None:
             self.shm = shm
             self.memory_in_use = np.ndarray((1, ),
@@ -292,6 +300,29 @@ class PageAllocator(PageAllocatorBase):
         # NEW: Track how many upper-level allocs are in the "protected zone"
         self.alloc_active = 0
 
+        # --- Refill thresholds & budgets (new) ---
+        # Keep your existing semantics:
+        #   min_reserved_pages -> soft low-water (L_soft)
+        #   max_reserved_pages -> high-water (H)
+        # Add a critical low-water (L_crit) as a hard floor.
+        self.crit_reserved_pages = int(
+            os.getenv("KVCACHED_L_CRIT",
+                      str(max(1, min(self.min_reserved_pages // 4, 64)))))
+        # Refill batching & budget
+        self.refill_sleep_sec = float(
+            os.getenv("KVCACHED_REFILL_SLEEP_SEC", "0.05"))  # 50ms
+        self.refill_budget_ms = float(
+            os.getenv("KVCACHED_REFILL_BUDGET_MS", "1.0"))  # per wake
+        self.refill_bmin = int(os.getenv("KVCACHED_REFILL_BMIN", "32"))
+        self.refill_bmax = int(os.getenv("KVCACHED_REFILL_BMAX", "128"))
+
+        # Ensure threshold relationships: L_crit ≤ L_soft ≤ H
+        self.min_reserved_pages = max(1, self.min_reserved_pages)
+        self.max_reserved_pages = max(self.max_reserved_pages,
+                                      self.min_reserved_pages)
+        self.crit_reserved_pages = min(self.crit_reserved_pages,
+                                       self.min_reserved_pages)
+
         # Start preallocation thread
         self._start_prealloc_thread()
 
@@ -305,104 +336,91 @@ class PageAllocator(PageAllocatorBase):
             self.shm.unlink()
 
     def _prealloc_worker(self):
-        """Preallocates pages and maps them to physical memory."""
+        """Refill reserved pages with hysteresis + time budget."""
         if _is_kvcached_profile_enabled():
-            current_time = time.time()
-            msg = (f"🧵[PREALLOC-WORKER] [{current_time:.3f}] "
-                   f"Thread started, prealloc_running={self.prealloc_running}")
-            logger.info(msg)
+            logger.info("🧵[PREALLOC-WORKER] started")
 
         while self.prealloc_running:
+            # Check whether refill is needed
             with self.prealloc_lock:
-                # Wait until preallocation is needed and no alloc is active
-                while self.prealloc_running and (not self.prealloc_needed
-                                                 or self.alloc_active > 0):
-                    # alloc is ongoing, or no need to refill → wait
-                    if _is_kvcached_profile_enabled(
-                    ) and self.alloc_active > 0:
-                        current_time = time.time()
-                        logger.info(f"🧵[WORKER] [{current_time:.3f}] "
-                                    f"pause: alloc_active={self.alloc_active}")
-                    self.prealloc_cond.wait()
+                reserved = len(self.reserved_page_list)
+                free_pages = len(self.free_page_list)
+                need_refill = (self.prealloc_needed
+                               or (reserved < self.min_reserved_pages))
 
-                if not self.prealloc_running:
-                    break
-
-                if _is_kvcached_profile_enabled() and self.alloc_active == 0:
-                    current_time = time.time()
-                    logger.info(f"🧵[WORKER] [{current_time:.3f}] "
-                                f"resume: alloc_active={self.alloc_active}")
-
-                if _is_kvcached_profile_enabled():
-                    current_time = time.time()
-                    free_pages = len(self.free_page_list)
-                    reserved_pages = len(self.reserved_page_list)
-                    msg = (f"🧵[PREALLOC-WORKER] [{current_time:.3f}] "
-                           f"Starting preallocation cycle, "
-                           f"prealloc_needed={self.prealloc_needed}, "
-                           f"free_pages={free_pages}, "
-                           f"reserved_pages={reserved_pages}")
-                    logger.info(msg)
-
-                self.prealloc_needed = False
-                current_reserved = len(self.reserved_page_list)
-                to_reserve = max(0, self.min_reserved_pages - current_reserved)
-                # Only try to reserve up to the available free pages
-                to_reserve = min(to_reserve, len(self.free_page_list))
-                if to_reserve <= 0:
+                # Condition: pause when alloc is busy and stock >= L_soft; otherwise allow refill
+                should_pause = ((not need_refill)
+                                or (self.alloc_active > 0
+                                    and reserved >= self.min_reserved_pages))
+                if should_pause:
+                    # Sleep as fallback to avoid missing wakeups
+                    self.prealloc_cond.wait(timeout=self.refill_sleep_sec)
+                    self.prealloc_needed = False
                     continue
 
-                pages_to_reserve = []
+                # Consume external trigger
+                self.prealloc_needed = False
 
-                # Get pages from free list
-                for _ in range(to_reserve):
-                    if self.free_page_list:
-                        pages_to_reserve.append(self.free_page_list.popleft())
-                    else:
+            # Start a time-budget-limited refill round
+            t_start = time.time()
+            while (time.time() - t_start) * 1000.0 < self.refill_budget_ms:
+                with self.prealloc_lock:
+                    if not self.prealloc_running:
                         break
 
-            # Map pages to physical memory (outside lock)
-            if pages_to_reserve:
+                    reserved = len(self.reserved_page_list)
+                    free_pages = len(self.free_page_list)
+                    if free_pages == 0:
+                        break
+
+                    # Target level: if alloc is busy and >= L_crit, only top up to L_soft; otherwise fill to H
+                    if self.alloc_active > 0 and reserved >= self.crit_reserved_pages:
+                        target = self.min_reserved_pages  # top-up only
+                    else:
+                        target = self.max_reserved_pages  # fill to H when idle or too low
+
+                    deficit = max(0, target - reserved)
+                    if deficit == 0:
+                        break
+
+                    take_cap = min(deficit, free_pages)
+                    # Dynamic batching, clamped within [bmin, bmax]
+                    take = max(self.refill_bmin, min(self.refill_bmax,
+                                                     take_cap))
+
+                    pages = []
+                    for _ in range(take):
+                        if self.free_page_list:
+                            pages.append(self.free_page_list.popleft())
+                        else:
+                            break
+
+                if not pages:
+                    break
+
+                # Map outside lock
                 try:
-                    # Fix: use same offset calculation as original
-                    map_to_kv_tensors(
-                        [pid * self.page_size for pid in pages_to_reserve])
+                    map_to_kv_tensors([pid * self.page_size for pid in pages])
+                except Exception as e:
+                    # Return pages on failure
+                    with self.prealloc_lock:
+                        for pid in reversed(pages):
+                            self.free_page_list.appendleft(pid)
+                    if _is_kvcached_profile_enabled():
+                        logger.warning(
+                            f"❌[PREALLOC-MAP-FAIL] pages={len(pages)} err={e}")
+                    break
+
+                # Write back reserved list and memory stats
+                with self.prealloc_lock:
                     if self.shm is not None:
                         with Timer(self.write_shm_times):
-                            self.memory_in_use[0] += (
-                                len(pages_to_reserve) *
-                                self.page_size_all_layers)
+                            self.memory_in_use[0] += len(
+                                pages) * self.page_size_all_layers
+                    self.reserved_page_list.extend(pages)
+                    self.prealloc_cond.notify_all()
 
-                    with self.prealloc_lock:
-                        self.reserved_page_list.extend(pages_to_reserve)
-                        self.prealloc_cond.notify_all()
-
-                    if _is_kvcached_profile_enabled():
-                        current_time = time.time()
-                        free_pages_after = len(self.free_page_list)
-                        reserved_pages_after = len(self.reserved_page_list)
-                        reclaimed_pages = len(self.reclaimed_page_list)
-                        memory_usage = (self.memory_in_use[0] if
-                                        self.memory_in_use is not None else 0)
-                        msg = (f"🔧[PREALLOC-MAPPED] [{current_time:.3f}] "
-                               f"mapped_pages={len(pages_to_reserve)}, "
-                               f"free_pages={free_pages_after}, "
-                               f"reserved_pages={reserved_pages_after}, "
-                               f"reclaimed_pages={reclaimed_pages}, "
-                               f"memory_in_use={memory_usage}")
-                        logger.info(msg)
-
-                except Exception as e:
-                    # If mapping fails, return pages to free list
-                    with self.prealloc_lock:
-                        self.free_page_list.extendleft(pages_to_reserve)
-                    if _is_kvcached_profile_enabled():
-                        current_time = time.time()
-                        logger.info(
-                            f"❌[PREALLOC-MAP-FAIL] [{current_time:.3f}] "
-                            f"failed_pages={len(pages_to_reserve)}, error={e}")
-                    print(f"Failed to preallocate "
-                          f"{len(pages_to_reserve)} pages: {e}")
+            # End of refill round, next round triggered by cond or timeout
 
     def _start_prealloc_thread(self):
         """Start the preallocation thread"""
@@ -484,9 +502,10 @@ class PageAllocator(PageAllocatorBase):
         with nvtx_range("map_to_kv_tensors"):
             map_to_kv_tensors([page_id * self.page_size])
 
-        if self.shm is not None:
-            with Timer(self.write_shm_times):
-                self.memory_in_use[0] += self.page_size_all_layers
+        with self.prealloc_lock:
+            if self.shm is not None:
+                with Timer(self.write_shm_times):
+                    self.memory_in_use[0] += self.page_size_all_layers
 
         # Trigger preallocation to refill the pool
         self._trigger_preallocation()
@@ -547,10 +566,9 @@ class PageAllocator(PageAllocatorBase):
             unmap_from_kv_tensors([page_id * self.page_size])
         with self.prealloc_lock:
             self.free_page_list.append(page_id)
-
-        if self.shm is not None:
-            with Timer(self.write_shm_times):
-                self.memory_in_use[0] -= self.page_size_all_layers
+            if self.shm is not None:
+                with Timer(self.write_shm_times):
+                    self.memory_in_use[0] -= self.page_size_all_layers
 
         if _is_kvcached_profile_enabled():
             free_pages_final = len(self.free_page_list)
@@ -597,10 +615,10 @@ class PageAllocator(PageAllocatorBase):
                 [pid * self.page_size for pid in remaining_pages])
             with self.prealloc_lock:
                 self.free_page_list.extend(remaining_pages)
-            if self.shm is not None:
-                with Timer(self.write_shm_times):
-                    self.memory_in_use[0] -= (len(remaining_pages) *
-                                              self.page_size_all_layers)
+                if self.shm is not None:
+                    with Timer(self.write_shm_times):
+                        self.memory_in_use[0] -= (len(remaining_pages) *
+                                                  self.page_size_all_layers)
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
@@ -622,7 +640,7 @@ class PageAllocator(PageAllocatorBase):
                     self.free_page_list.pop()
                 elif self.reserved_page_list:
                     page_id = self.reserved_page_list.pop()
-                    slab_offsets = [page_id * self.page_size_all_layers]
+                    slab_offsets = [page_id * self.page_size]
                     unmap_from_kv_tensors(slab_offsets)
                     if self.shm is not None:
                         with Timer(self.write_shm_times):
@@ -653,17 +671,20 @@ class PageAllocator(PageAllocatorBase):
             self.free_page_list.extend(pages_to_unmap)
 
     def get_num_free_pages(self) -> int:
-        return len(self.free_page_list)
+        with self.prealloc_lock:
+            return len(self.free_page_list)
 
     def get_num_inuse_pages(self) -> int:
-        return (self.num_total_pages - self.get_num_free_pages() -
-                len(self.reserved_page_list))
+        with self.prealloc_lock:
+            return (self.num_total_pages - len(self.free_page_list) -
+                    len(self.reserved_page_list))
 
     def get_num_total_pages(self) -> int:
         return self.num_total_pages
 
     def get_num_reserved_pages(self) -> int:
-        return len(self.reserved_page_list)
+        with self.prealloc_lock:
+            return len(self.reserved_page_list)
 
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
@@ -766,25 +787,22 @@ class KVCacheManager:
 
             # fast path: reserved_blocks
             with nvtx_range("alloc_reserved_fastpath"):
-                if self.reserved_blocks:
-                    if len(self.reserved_blocks) >= remaining_need:
-                        ret_index = self.reserved_blocks[:remaining_need]
-                        self.reserved_blocks = self.reserved_blocks[
-                            remaining_need:]
-                        remaining_need = 0
-                    else:
-                        ret_index = self.reserved_blocks
-                        remaining_need -= len(self.reserved_blocks)
-                        self.reserved_blocks = []
+                # Protect reserved_blocks with the same lock to avoid races
+                with self.page_allocator.prealloc_lock:
+                    if self.reserved_blocks:
+                        n = min(len(self.reserved_blocks), remaining_need)
+                        ret_index = self.reserved_blocks[:n]
+                        del self.reserved_blocks[:n]
+                        remaining_need -= n
 
             with nvtx_range("alloc_page_loop"):
                 # ENTER critical section for the whole multi-page allocation
+                alloc_start_time = time.time()
                 with self.page_allocator.prealloc_lock:
                     self.page_allocator.alloc_active += 1
                     if _is_kvcached_profile_enabled():
-                        current_time = time.time()
                         logger.info(
-                            f"📦[ALLOC] [{current_time:.3f}] "
+                            f"📦[ALLOC] [{alloc_start_time:.3f}] "
                             f"critical enter, pages_needed={remaining_need}, "
                             f"alloc_active={self.page_allocator.alloc_active}")
                     # Optional: wake up worker to see alloc_active>0 and go wait
@@ -819,10 +837,11 @@ class KVCacheManager:
                     with self.page_allocator.prealloc_lock:
                         self.page_allocator.alloc_active -= 1
                         if _is_kvcached_profile_enabled():
-                            current_time = time.time()
+                            alloc_duration = time.time() - alloc_start_time
                             logger.info(
-                                f"📦[ALLOC] [{current_time:.3f}] "
+                                f"📦[ALLOC] [{time.time():.3f}] "
                                 f"critical exit, allocated={len(ret_index)}, "
+                                f"duration={alloc_duration*1000:.2f}ms, "
                                 f"alloc_active={self.page_allocator.alloc_active}"
                             )
                         self.page_allocator.prealloc_cond.notify_all()
@@ -991,7 +1010,8 @@ class KVCacheManager:
 
         if isinstance(reserved, torch.Tensor):
             reserved = reserved.cpu().tolist()
-        self.reserved_blocks.extend(reserved)
+        with self.page_allocator.prealloc_lock:
+            self.reserved_blocks.extend(reserved)
 
         if _is_kvcached_profile_enabled():
             reserved_blocks_after = len(self.reserved_blocks)
@@ -1077,7 +1097,7 @@ class KVCacheManager:
 
         total_available = avail_size + free_size
 
-        # More frequent logging of key metric changes (log every 50 calls)
+        # More frequent logging of key metric changes (log every 1000 calls)
         if _is_kvcached_profile_enabled():
             memory_usage = 0
             if hasattr(self.page_allocator, 'memory_in_use'
@@ -1089,7 +1109,7 @@ class KVCacheManager:
                 self._available_size_call_count = 0
             self._available_size_call_count += 1
 
-            # Log detailed status every 50 calls, including intermediate calculations
+            # Log detailed status every 1000 calls, including intermediate calculations
             if self._available_size_call_count % 1000 == 0:
                 free_pages = len(self.page_allocator.free_page_list)
                 reserved_pages = len(self.page_allocator.reserved_page_list)
