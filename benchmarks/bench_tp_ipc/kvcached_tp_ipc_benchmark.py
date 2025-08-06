@@ -57,7 +57,7 @@ def get_broadcast_impl(name: str):
     if inspect.iscoroutinefunction(fn):
 
         def wrapper(*args, **kwargs):
-            """Sync wrapper so caller doesn’t need to know this is async."""
+            """Sync wrapper so caller doesn't need to know this is async."""
             return asyncio.run(fn(*args, **kwargs))
 
         wrapper.__name__ = fn.__name__
