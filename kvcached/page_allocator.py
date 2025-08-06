@@ -482,8 +482,6 @@ class PageAllocator:
             broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
         else:
             map_to_kv_tensors(offsets)
-        # Update memory usage after mapping pages
-        self._update_memory_usage()
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         offsets = [pid * self.page_size for pid in page_ids]
@@ -493,8 +491,6 @@ class PageAllocator:
             if self.async_sched:
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
-        # Update memory usage after unmapping pages
-        self._update_memory_usage()
 
     def _update_memory_usage(self):
         """Update memory usage information in shared memory."""
