@@ -1,5 +1,4 @@
-ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ENABLE_KVCACHED=true
@@ -7,7 +6,7 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="/root/.local/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y \
-        software-properties-common git vim curl wget build-essential ninja-build \
+        software-properties-common git curl wget build-essential ninja-build \
         python3.11 python3.11-dev python3.11-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*       \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
@@ -15,24 +14,16 @@ RUN apt-get update && apt-get install -y \
     && python -m pip install --upgrade pip setuptools wheel
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="$HOME/.cargo/bin:$PATH"
 
 WORKDIR /workspace
 RUN git clone https://github.com/ovg-project/kvcached.git
 WORKDIR /workspace/kvcached
-RUN uv pip install --system -r requirements.txt
+RUN pip install . --no-build-isolation
 
-WORKDIR /workspace
-RUN git clone -b v0.9.2 https://github.com/vllm-project/vllm.git vllm-v0.9.2
-WORKDIR /workspace/vllm-v0.9.2
-RUN uv pip install --system transformers==4.51.1
-RUN VLLM_USE_PRECOMPILED=1 uv pip install --system --editable .
-RUN git apply /workspace/kvcached/engine_integration/scripts/kvcached-vllm-v0.9.2.patch
+WORKDIR /workspace/kvcached/engine_integration/scripts
+RUN chmod +x setup.sh && ./setup.sh vllm
 
+EXPOSE 8080 30000 30001
 
 WORKDIR /workspace/kvcached
-RUN uv pip install --system -e . --no-build-isolation
-
-EXPOSE 8080 12346 30000 30001
-
 CMD ["bash"]
