@@ -1,0 +1,38 @@
+ARG CUDA_VERSION=12.6.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ENABLE_KVCACHED=true
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y \
+        software-properties-common git vim curl wget build-essential ninja-build \
+        libnuma1 python3.11 python3.11-dev python3.11-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/*       \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && python -m pip install --upgrade pip setuptools wheel
+
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="$HOME/.cargo/bin:$PATH"
+
+WORKDIR /workspace
+RUN git clone https://github.com/ovg-project/kvcached.git
+WORKDIR /workspace/kvcached
+RUN uv pip install --system -r requirements.txt
+
+WORKDIR /workspace
+RUN git clone -b v0.4.9 https://github.com/sgl-project/sglang.git sglang-v0.4.9
+WORKDIR /workspace/sglang-v0.4.9
+RUN uv pip install --system -e "python[all]"
+RUN git apply /workspace/kvcached/engine_integration/scripts/kvcached-sglang-v0.4.9.patch
+
+
+WORKDIR /workspace/kvcached
+RUN uv pip install --system -e . --no-build-isolation
+
+EXPOSE 8080 12346 30000 30001
+
+CMD ["bash"]
