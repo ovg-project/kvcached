@@ -7,7 +7,7 @@ from kvcached.integration.sglang.interfaces import (alloc_kv_cache,
                                                     shutdown_kvcached)
 from kvcached.kv_cache_manager import KVCacheManager
 
-total_tokens = 100000
+total_tokens = 2864
 head_num = 32
 head_dim = 128
 dtype = torch.float16
@@ -19,12 +19,10 @@ init_kvcached()
 print("Initialized kvcached")
 
 k_buffer, v_buffer = alloc_kv_cache(
-    total_tokens,
-    head_num,
-    head_dim,
-    dtype,
-    device,
-    layer_num,
+    kvcache_shape=(total_tokens, head_num, head_dim),
+    dtype=dtype,
+    device=device,
+    num_layers=layer_num,
 )
 
 print("Initializing KV cache manager")
@@ -33,6 +31,8 @@ kv_cache_manager = KVCacheManager(
     block_size=1,
     cell_size=head_num * head_dim * dtype.itemsize,
     num_layers=layer_num,
+    contiguous_layout=True,
+    reserve_null_block=True,
 )
 print("Initialized KV cache manager")
 
@@ -79,11 +79,13 @@ print("-" * 100)
 print(
     f"Freeing {50000} tokens. GPU memory before free: {torch.cuda.mem_get_info(device)[0] / 1024 / 1024} MB. Available size: {kv_cache_manager.available_size()}"
 )
-kv_cache_manager.free(indices[:50000])
-cur_gpu_memory = torch.cuda.mem_get_info(device)[0]
-print(
-    f"GPU memory after free {50000} tokens: {torch.cuda.mem_get_info(device)[0] / 1024 / 1024} MB. Available size: {kv_cache_manager.available_size()}"
-)
+
+if indices is not None:
+    kv_cache_manager.free(indices[:50000])
+    cur_gpu_memory = torch.cuda.mem_get_info(device)[0]
+    print(
+        f"GPU memory after free {50000} tokens: {torch.cuda.mem_get_info(device)[0] / 1024 / 1024} MB. Available size: {kv_cache_manager.available_size()}"
+    )
 
 print("-" * 100)
 print(f"Allocating {20000} tokens")
