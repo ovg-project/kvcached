@@ -1,10 +1,10 @@
-# Tensor-Parallel IPC Benchmark for *kvcached*
+# Tensor-Parallel IPC Page Map/Unmap Benchmark
 
 This benchmark measures **overhead** of the *kvcached vmm ops* when using inter-process-communication (IPC) to map / unmap KV cache pages across **tensor-parallel (TP) workers** in vLLM.
 
 The script launches a minimal TP layout:
 * A main process that will broadcast vmm ops to all workers, emulating the **scheduler process**
-* *tp_size* processes spawned by the main process, who listen on and execute vmm ops, emulating the **GPU worker processes**
+* *tp_size* processes spawned by the main process, which listen on and execute vmm ops, emulating the **GPU worker processes**
 
 For each iteration the scheduler
 
@@ -42,7 +42,7 @@ python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --
 
 ### Example
 Test different implementations on 4 A40 GPUs with PCIe interconnect.
-#### Sequential
+#### Sequential socket
 
 ```bash
 python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl seq
