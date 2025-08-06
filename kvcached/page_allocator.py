@@ -156,6 +156,8 @@ class PageAllocator:
         self.page_size = page_size
         self.tp_size = tp_size
         self.async_sched = async_sched
+        # TODO: make this compatible with engine's memory limit after getting
+        # better configuration management.
         self.gpu_utilization = GPU_UTILIZATION
         self.num_free_pages = mem_size_per_layer // page_size
         self.num_total_pages = mem_size_per_layer // page_size
@@ -320,6 +322,7 @@ class PageAllocator:
                     self.free_page_list.extend(new_page_ids)
                     self.num_free_pages += num_to_expand
                 self.num_total_pages = new_num_pages
+                self._update_memory_usage()
             else:  # new_num_pages < self.num_total_pages and new_num_pages >= num_inuse_pages
                 num_to_reclaim = self.num_total_pages - new_num_pages
 
@@ -434,16 +437,16 @@ class PageAllocator:
                         self.reserved_page_list.extend(pages_to_reserve)
                         # Update memory usage after mapping pages
                         self._update_memory_usage()
-                    logger.info(
-                        f"Preallocated {len(pages_to_reserve)} pages, reserved={len(self.reserved_page_list)}"
-                    )
+                    logger.debug(
+                        f"Preallocated {len(pages_to_reserve)} pages, "
+                        f"reserved={len(self.reserved_page_list)}")
                 except Exception as e:
                     # If mapping fails, return pages to free list
                     with self._lock:
                         self.free_page_list.extendleft(pages_to_reserve)
                     logger.error(
-                        f"Failed to preallocate {len(pages_to_reserve)} pages: {e}"
-                    )
+                        f"Failed to preallocate {len(pages_to_reserve)} pages: "
+                        f"{e}")
 
     def _start_prealloc_thread(self):
         if self.prealloc_thd is None:
