@@ -8,8 +8,6 @@ from kvcached.utils import _get_page_size
 from kvcached.vmm_ops import (map_to_kv_tensors, shutdown_kvcached,
                               unmap_from_kv_tensors)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
 num_blocks = 2864
 head_num = 8
 head_dim = 4096
