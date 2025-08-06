@@ -17,7 +17,7 @@ head_dim = 4096
 block_size = 1
 block_mem_size = head_num * head_dim * block_size
 
-num_layers = 28
+num_layers = 32
 device = "cuda:0"
 dtype = torch.float16
 contiguous_layout = True
@@ -34,31 +34,16 @@ init_kvcached(contiguous_layout=contiguous_layout)
 print("Initialized kvcached")
 
 print("Creating KV tensors")
-# ktensors = kvcached_ops.create_ktensors(
-#     layer_mem_size, dtype, device, num_layers
-# )
-# vtensors = kvcached_ops.create_vtensors(
-#     layer_mem_size, dtype, device, num_layers
-# )
 kv_shape = (num_blocks, head_num, head_dim)
 
 page_size = _get_page_size()
 k_tensors, v_tensors = alloc_kv_cache(kv_shape, dtype, device, num_layers)
 
-# ktensors = []
-# vtensors = []
-# num_elements = layer_mem_size // 2
-# for i in range(num_layers):
-#     print(kv_tensors[i].shape)
-#     ktensors.append(kv_tensors[i].narrow(0, 0, 1).view(-1))
-#     vtensors.append(kv_tensors[i].narrow(0, 1, 1).view(-1))
 print("Created KV tensors")
 
-# for i in range(num_layers):
-#     print(k_tensors[i].shape, v_tensors[i].shape)
-
 print("Mapping to KV tensors")
-slab_size = _get_page_size()  # 2MB
+slab_size = _get_page_size()
+slab_size = slab_size * 2 * num_layers if contiguous_layout else slab_size
 num_pages = 10  # 10 pages
 # offsets = [slab_size * i for i in range(num_pages)]
 offsets = [slab_size * i for i in [1, 3, 5, 7, 9]]
