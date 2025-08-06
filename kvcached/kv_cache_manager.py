@@ -305,17 +305,17 @@ class KVCacheManager:
 
     @synchronized
     def available_size(self) -> int:
-        avail_size = self.num_avail_blocks + len(self.reserved_blocks)
+        avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
-            free_size = 0
+            blocks_from_free_pages = 0
         else:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
             physical_free_pages = self.page_allocator.get_avail_physical_pages(
             ) + self.page_allocator.get_num_reserved_pages()
             free_pages = min(virtual_free_pages, physical_free_pages)
-            free_size = free_pages * Page.get_num_blocks(
+            blocks_from_free_pages = free_pages * Page.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_size + free_size
+        return avail_blocks + blocks_from_free_pages
 
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:

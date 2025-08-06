@@ -28,7 +28,7 @@ def _get_page_size() -> int:
     base_size = 2 * 1024 * 1024  # 2MB
     if page_size <= 0 or page_size % base_size != 0:
         raise ValueError(
-            f"PAGE_SIZE must be a positive multiple of 2MB ({base_size} bytes), "
+            f"PAGE_SIZE must be a positive multiple of 2MB (2097152 bytes), "
             f"got: {page_size}")
 
     return page_size
