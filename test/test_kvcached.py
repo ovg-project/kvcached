@@ -1,10 +1,19 @@
+import os
+
 import torch
 
-from kvcached.integration.sglang.interfaces import (alloc_kv_cache,
-                                                    init_kvcached)
-from kvcached.utils import _get_page_size
-from kvcached.vmm_ops import (map_to_kv_tensors, shutdown_kvcached,
-                              unmap_from_kv_tensors)
+contiguous_layout = True
+
+os.environ[
+    "KVCACHED_CONTIGUOUS_LAYOUT"] = "true" if contiguous_layout else "false"
+
+# Import after setting environment variables to ensure proper configuration
+from kvcached.integration.sglang.interfaces import alloc_kv_cache  # noqa: E402
+from kvcached.integration.sglang.interfaces import init_kvcached  # noqa: E402
+from kvcached.utils import _get_page_size  # noqa: E402
+from kvcached.vmm_ops import map_to_kv_tensors  # noqa: E402
+from kvcached.vmm_ops import shutdown_kvcached  # noqa: E402
+from kvcached.vmm_ops import unmap_from_kv_tensors  # noqa: E402
 
 num_blocks = 2864
 head_num = 8
@@ -13,10 +22,9 @@ head_dim = 4096
 block_size = 1
 block_mem_size = head_num * head_dim * block_size
 
-num_layers = 32
+num_layers = 28
 device = "cuda:0"
 dtype = torch.float16
-contiguous_layout = True
 
 layer_mem_size = num_blocks * block_mem_size * dtype.itemsize
 total_mem_size = num_layers * 2 * layer_mem_size
@@ -26,7 +34,7 @@ print(f"total_mem_size: {total_mem_size / 1024 / 1024 / 1024} GB")
 
 print("Initializing kvcached")
 torch.cuda.set_device(0)
-init_kvcached(contiguous_layout=contiguous_layout)
+init_kvcached()
 print("Initialized kvcached")
 
 print("Creating KV tensors")
@@ -40,6 +48,7 @@ print("Created KV tensors")
 print("Mapping to KV tensors")
 slab_size = _get_page_size()
 slab_size = slab_size * 2 * num_layers if contiguous_layout else slab_size
+print(f"slab_size: {slab_size / 1024 / 1024} MB")
 num_pages = 10  # 10 pages
 # offsets = [slab_size * i for i in range(num_pages)]
 offsets = [slab_size * i for i in [1, 3, 5, 7, 9]]
