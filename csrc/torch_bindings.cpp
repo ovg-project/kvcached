@@ -54,7 +54,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
         py::arg("dev_str"), py::arg("page_size") = 0,
-        py::arg("contiguous_layout") = false);
+        py::arg("contiguous_layout") = true);
   m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
   m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors");
   m.def("kv_tensors_created", &kvcached::kv_tensors_created,
