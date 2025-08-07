@@ -54,6 +54,7 @@ class KVCacheManager:
             block_size: Size of each block in bytes.
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
+            tp_size: Number of tensor parallel processes.
             async_sched: Whether asynchronous scheduling is enabled.
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
@@ -69,9 +70,13 @@ class KVCacheManager:
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.tp_size = tp_size
-        self.page_allocator = PageAllocator(self.num_layers, self.mem_size,
-                                            self.page_size, self.tp_size,
-                                            async_sched)
+        self.page_allocator = PageAllocator(
+            self.num_layers,
+            self.mem_size,
+            self.page_size,
+            self.tp_size,
+            async_sched=async_sched,
+        )
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, Page] = {}

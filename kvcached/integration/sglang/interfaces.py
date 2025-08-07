@@ -5,7 +5,7 @@ import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listerner_thread
-from kvcached.utils import PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
@@ -15,12 +15,15 @@ logger = get_kvcached_logger()
 _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
+_contiguous_layout = CONTIGUOUS_LAYOUT
 
 
-def init_kvcached(tp_rank: int = 0,
-                  tp_size: int = 1,
-                  device: Optional[str] = None,
-                  async_sched: bool = False) -> None:
+def init_kvcached(
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    device: Optional[str] = None,
+    async_sched: bool = False,
+) -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if _kvcached_initialized:
         return
@@ -28,7 +31,7 @@ def init_kvcached(tp_rank: int = 0,
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
 
-    _init_kvcached_impl(device, PAGE_SIZE)
+    _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
     _kvcached_device = device
     _async_sched = async_sched
@@ -83,6 +86,10 @@ def alloc_kv_cache(
     blocks_per_page = PAGE_SIZE // block_mem_size
 
     gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
+
+    # Calculate virtual memory size based on layout
+    # For contiguous layout, C++ will handle num_layers multiplication
+    # So we still calculate per-layer size and let C++ multiply
     num_pages = gpu_mem_size // num_layers // 2 // PAGE_SIZE
     virtual_mem_size = num_pages * PAGE_SIZE * 2
 
@@ -96,10 +103,19 @@ def alloc_kv_cache(
     actual_kvcache_shape[0] = num_tokens
 
     k_tensors, v_tensors = [], []
-    for t in raw_kv_tensors:
-        t = t.view(2, *actual_kvcache_shape).view(dtype=dtype)
-        k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
-        v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
+
+    if not _contiguous_layout:
+        for t in raw_kv_tensors:
+            t = t.view(2, *actual_kvcache_shape).view(dtype=dtype)
+            k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
+            v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
+    else:
+        contiguous_tensor = raw_kv_tensors[0].view(
+            num_tokens, num_layers, 2,
+            *actual_kvcache_shape[1:]).view(dtype=dtype)
+        for i in range(num_layers):
+            k_tensors.append(contiguous_tensor[:, i, 0, :, :])
+            v_tensors.append(contiguous_tensor[:, i, 1, :, :])
 
     return k_tensors, v_tensors
 
@@ -113,9 +129,11 @@ def get_kv_cache_manager(num_blocks: int,
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(num_blocks,
-                          block_size,
-                          cell_size,
-                          num_layers,
-                          async_sched=_async_sched,
-                          reserve_null_block=reserve_null_block)
+    return KVCacheManager(
+        num_blocks,
+        block_size,
+        cell_size,
+        num_layers,
+        async_sched=_async_sched,
+        reserve_null_block=reserve_null_block,
+    )

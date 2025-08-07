@@ -5,7 +5,7 @@ import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listerner_thread
-from kvcached.utils import PAGE_SIZE
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
 from kvcached.vmm_ops import create_kv_tensors
 from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
 from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
@@ -14,13 +14,16 @@ _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
 _tp_size: int = 1
+_contiguous_layout: bool = CONTIGUOUS_LAYOUT
 
 
-def init_kvcached(tp_rank: int = 0,
-                  tp_size: int = 1,
-                  is_worker: bool = False,
-                  device: Optional[str] = None,
-                  async_sched: bool = False) -> None:
+def init_kvcached(
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    is_worker: bool = False,
+    device: Optional[str] = None,
+    async_sched: bool = False,
+) -> None:
     global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
     if _kvcached_initialized:
         return
@@ -28,7 +31,7 @@ def init_kvcached(tp_rank: int = 0,
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
 
-    _init_kvcached_impl(device, PAGE_SIZE)
+    _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
     _kvcached_device = device
     _tp_size = tp_size
@@ -51,7 +54,7 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-        kvcache_shape: Tuple[int, ...],
+        kvcache_shape: Tuple[int, ...],  # (2, num_blocks, head_num, head_dim)
         block_size: int,
         dtype: torch.dtype,
         device: str,
@@ -89,10 +92,20 @@ def alloc_kv_cache(
     raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
                                        device, num_layers)
 
-    kv_tensors = [
-        t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
-        for t in raw_kv_tensors
-    ]
+    if not _contiguous_layout:
+        kv_tensors = [
+            t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
+            for t in raw_kv_tensors
+        ]
+    else:
+        contiguous_tensor = raw_kv_tensors[0].view(
+            num_blocks, num_layers, 2,
+            *kvcache_shape_list[2:]).view(dtype=dtype)
+        kv_tensors = [
+            contiguous_tensor[:, i, :, :, :].permute(
+                1, 0, *range(2, len(kvcache_shape_list)))
+            for i in range(num_layers)
+        ]
     return kv_tensors
 
 
@@ -102,5 +115,11 @@ def get_kv_cache_manager(num_blocks: int, block_size: int, cell_size: int,
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(num_blocks, block_size, cell_size, num_layers,
-                          _tp_size, _async_sched)
+    return KVCacheManager(
+        num_blocks,
+        block_size,
+        cell_size,
+        num_layers,
+        _tp_size,
+        async_sched=_async_sched,
+    )
