@@ -45,7 +45,6 @@ class KVCacheManager:
         cell_size: int,
         num_layers: int,
         tp_size: int = 1,
-        contiguous_layout: bool = False,
         async_sched: bool = False,
         reserve_null_block: bool = False,
     ):
@@ -56,7 +55,6 @@ class KVCacheManager:
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
             tp_size: Number of tensor parallel processes.
-            contiguous_layout: Whether to use contiguous layout.
             async_sched: Whether asynchronous scheduling is enabled.
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
@@ -77,7 +75,6 @@ class KVCacheManager:
             self.mem_size,
             self.page_size,
             self.tp_size,
-            contiguous_layout=contiguous_layout,
             async_sched=async_sched,
         )
 

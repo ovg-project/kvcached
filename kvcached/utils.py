@@ -43,6 +43,8 @@ PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
 MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
 MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
+CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
+                              "true").lower() == "true"
 
 # Allow overriding the shared-memory segment name via env var so multiple
 # kvcached deployments on one machine can coexist without collision.
