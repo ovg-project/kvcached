@@ -300,6 +300,15 @@ class PageAllocator(PageAllocatorBase):
         # NEW: Track how many upper-level allocs are in the "protected zone"
         self.alloc_active = 0
 
+        # Free behavior control: keep pages mapped instead of unmapping
+        # self.keep_all_mapped = bool(os.getenv("KVCACHED_KEEP_ALL_MAPPED", "true").lower()
+        #                            in ("true", "1", "yes"))
+        self.keep_all_mapped = True
+        if self.keep_all_mapped:
+            print(
+                "🔧 KVCACHED_KEEP_ALL_MAPPED=true: Pages will stay mapped when freed"
+            )
+
         # --- Refill thresholds & budgets (new) ---
         # Keep your existing semantics:
         #   min_reserved_pages -> soft low-water (L_soft)
@@ -620,13 +629,30 @@ class PageAllocator(PageAllocatorBase):
             memory_usage_before = (self.memory_in_use[0]
                                    if self.memory_in_use is not None else 0)
 
-        # Check if we can add to reserved pool
+        # Check if we should keep mapped or can add to reserved pool
         added_to_reserved = False
+
         with self.prealloc_lock:
-            if len(self.reserved_page_list) < self.max_reserved_pages:
-                # Fast path: add to reserved pool (keep mapped)
-                self.reserved_page_list.append(page_id)
-                added_to_reserved = True
+            if self.keep_all_mapped:
+                # Always try to add to reserved pool when keep_all_mapped is enabled
+                if len(self.reserved_page_list) < self.max_reserved_pages:
+                    self.reserved_page_list.append(page_id)
+                    added_to_reserved = True
+                else:
+                    # If reserved is full, expand it to accommodate more pages
+                    self.reserved_page_list.append(page_id)
+                    added_to_reserved = True
+                    if _is_kvcached_profile_enabled():
+                        logger.info(
+                            f"📄[FREE-PAGE-EXPAND] page_id={page_id} "
+                            f"reserved_pages={len(self.reserved_page_list)} "
+                            f"(beyond max_reserved_pages={self.max_reserved_pages})"
+                        )
+            else:
+                # Original logic: only add if within max_reserved_pages limit
+                if len(self.reserved_page_list) < self.max_reserved_pages:
+                    self.reserved_page_list.append(page_id)
+                    added_to_reserved = True
 
         if added_to_reserved:
             if _is_kvcached_profile_enabled():
@@ -634,7 +660,8 @@ class PageAllocator(PageAllocatorBase):
                 reserved_pages_after = len(self.reserved_page_list)
                 memory_usage_after = (self.memory_in_use[0]
                                       if self.memory_in_use is not None else 0)
-                msg = (f"📄[FREE-PAGE-FAST] [{current_time:.3f}] "
+                path_type = "KEEP-MAPPED" if self.keep_all_mapped else "FAST"
+                msg = (f"📄[FREE-PAGE-{path_type}] [{current_time:.3f}] "
                        f"page_id={page_id}, "
                        f"free_pages: {free_pages_before}->{free_pages_after}, "
                        f"reserved_pages: {reserved_pages_before}->"
@@ -644,7 +671,7 @@ class PageAllocator(PageAllocatorBase):
                 logger.info(msg)
             return
 
-        # Slow path: unmap and add to free list
+        # Slow path: unmap and add to free list (only when keep_all_mapped=false)
         page.destroy()
         # Fix: use same offset calculation as original
         with nvtx_range("unmap_from_kv_tensors"):
@@ -678,22 +705,33 @@ class PageAllocator(PageAllocatorBase):
         remaining_pages = []
 
         with self.prealloc_lock:
-            # Calculate how many we can add to reserved pool
-            space_in_reserved = max(
-                0, self.max_reserved_pages - len(self.reserved_page_list))
-
-            if space_in_reserved > 0:
-                # Add up to space_in_reserved pages to reserved pool
-                reserved_pages = page_ids[:space_in_reserved]
+            if self.keep_all_mapped:
+                # Keep all pages mapped when enabled
+                reserved_pages = page_ids
                 self.reserved_page_list.extend(reserved_pages)
-
-                # The rest go to remaining_pages
-                remaining_pages = page_ids[space_in_reserved:]
+                if _is_kvcached_profile_enabled():
+                    logger.info(
+                        f"📄[FREE-PAGES-KEEP-MAPPED] "
+                        f"added={len(reserved_pages)} pages, "
+                        f"total_reserved={len(self.reserved_page_list)} "
+                        f"(beyond max={self.max_reserved_pages} if needed)")
             else:
-                # No space in reserved pool, all pages go to remaining
-                remaining_pages = page_ids
+                # Original logic: respect max_reserved_pages limit
+                space_in_reserved = max(
+                    0, self.max_reserved_pages - len(self.reserved_page_list))
 
-        # Unmap remaining pages and add to free list
+                if space_in_reserved > 0:
+                    # Add up to space_in_reserved pages to reserved pool
+                    reserved_pages = page_ids[:space_in_reserved]
+                    self.reserved_page_list.extend(reserved_pages)
+
+                    # The rest go to remaining_pages
+                    remaining_pages = page_ids[space_in_reserved:]
+                else:
+                    # No space in reserved pool, all pages go to remaining
+                    remaining_pages = page_ids
+
+        # Unmap remaining pages and add to free list (only when keep_all_mapped=false)
         if remaining_pages:
             # Fix: use same offset calculation as original
             unmap_from_kv_tensors(
@@ -1018,8 +1056,10 @@ class KVCacheManager:
                 memory_usage_before = self.page_allocator.memory_in_use[0]
 
         with nvtx_range(f"kv_free({indices_len})"):
-            # --- Added: support for tensor / numpy array / iterable ---
+            free_start_time = time.time()
 
+            # Phase 1: Convert indices to list format
+            convert_start = time.time()
             if isinstance(indices, torch.Tensor):
                 if indices.is_cuda:
                     indices = indices.cpu()
@@ -1027,15 +1067,24 @@ class KVCacheManager:
             elif not isinstance(indices, list):
                 # e.g., numpy array or other iterable
                 indices = list(indices)
+            convert_time = (time.time() - convert_start) * 1000
 
+            # Phase 2: Group indices by page_id
+            grouping_start = time.time()
             idx_dict = defaultdict(list)
             for idx in indices:
                 page_id = self.page_allocator.get_page_id(
                     idx, self.block_mem_size)
                 idx_dict[page_id].append(idx)
+            grouping_time = (time.time() - grouping_start) * 1000
 
+            # Phase 3: Process pages and identify pages to free
+            page_process_start = time.time()
             pages_to_free: List[int] = []
+            pages_processed = 0
+            pages_emptied = 0
             for page_id, idxs in idx_dict.items():
+                pages_processed += 1
                 if (page_id not in self.full_pages
                         and page_id not in self.avail_pages):
                     warnings.warn(
@@ -1051,19 +1100,45 @@ class KVCacheManager:
                 page.free_batch(idxs)
                 if page.empty():
                     pages_to_free.append(page.page_id)
+                    pages_emptied += 1
                     self.num_avail_blocks -= page.num_free_blocks()
                 else:
                     self.avail_pages[page_id] = page
+            page_process_time = (time.time() - page_process_start) * 1000
 
+            # Phase 4: Free pages (potentially slow)
+            page_free_start = time.time()
             if len(pages_to_free) > 0:
                 self.page_allocator.free_pages(pages_to_free)
+            page_free_time = (time.time() - page_free_start) * 1000
 
+            # Phase 5: Handle shrinking
+            shrink_start = time.time()
+            shrink_handled = False
             if (self.in_shrink and self.page_allocator.get_num_inuse_blocks(
                     self.block_mem_size) <= self.target_num_blocks):
                 self.page_allocator.resize(self.target_num_blocks *
                                            self.block_mem_size)
                 self.in_shrink = False
+                shrink_handled = True
             self.target_num_blocks = None
+            shrink_time = (time.time() - shrink_start) * 1000
+
+            total_free_time = (time.time() - free_start_time) * 1000
+
+            # Detailed timing log
+            if _is_kvcached_profile_enabled():
+                logger.info(
+                    f"🗑️[FREE-TIMING] [{current_time:.3f}] "
+                    f"freed_blocks={indices_len} pages_to_free={len(pages_to_free)} "
+                    f"pages_processed={pages_processed} pages_emptied={pages_emptied} "
+                    f"shrink_handled={shrink_handled} "
+                    f"times: convert={convert_time:.2f}ms "
+                    f"group={grouping_time:.2f}ms "
+                    f"process={page_process_time:.2f}ms "
+                    f"page_free={page_free_time:.2f}ms "
+                    f"shrink={shrink_time:.2f}ms "
+                    f"total={total_free_time:.2f}ms")
 
         if _is_kvcached_profile_enabled():
             num_avail_blocks_after = self.num_avail_blocks
