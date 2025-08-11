@@ -18,13 +18,13 @@ def load_config(config_path: str = "example-config.yaml"):
                 "Error: YAML configuration must contain an 'instances' list.")
             sys.exit(1)
 
-        # Build a mapping of model_name -> instance_details
+        # Build a mapping of instance_name -> instance_details
         models = {}
         for instance in config["instances"]:
-            model_name = instance.get("model") or instance.get("name")
-            if model_name is None:
+            inst_name = instance.get("name")
+            if inst_name is None:
                 continue
-            models[model_name] = instance
+            models[inst_name] = instance
 
         router_cfg = config.get("router", {})
         router_port = router_cfg.get("router_port")
@@ -53,8 +53,8 @@ def _launch_benchmark_clients_tmux(models_config, router_port: int):
     script_dir = (Path(__file__).parent /
                   "../engine_integration/benchmark").resolve()
 
-    for model_name, inst in models_config.items():
-        inst_name = inst.get("name") or model_name.replace("/", "-")
+    for inst_name, inst in models_config.items():
+        model_name = inst.get("model")
         session_name = f"benchmark-{inst_name}"
 
         if not ensure_tmux_session(session_name):

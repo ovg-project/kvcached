@@ -1,0 +1,37 @@
+kvcached: # 调试kvcached配置
+  kvcached_gpu_utilization: 0.5  # 大幅减少GPU利用率
+  kvcached_page_prealloc_enabled: false  # 禁用预分配
+  kvcached_min_reserved_pages: 1
+  kvcached_max_reserved_pages: 2
+  kvcached_sanity_check: true   # 启用完整性检查
+  kvcached_log_level: DEBUG     # 详细日志
+
+router:
+  enable_router: false
+  router_port: 8080
+
+instances:
+  - name: sglang-debug
+    model: meta-llama/Llama-3.2-1B
+    engine: sglang
+    using_venv: false
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=SGLANG_DEBUG"
+      - "CUDA_VISIBLE_DEVICES=0"
+    engine_env:
+      - "TOKENIZERS_PARALLELISM=false"
+      - "HF_HOME=/shared-models"
+      - "TRITON_CACHE_DIR=/tmp/triton_cache"  # 指定Triton缓存目录
+    engine_args:
+      - "--disable-radix-cache"
+      - "--trust-remote-code" 
+      - "--mem-fraction-static=0.3"  # 极保守的内存使用
+      - "--host=0.0.0.0"
+      - "--port=30333"
+      - "--skip-server-warmup"
+      - "--disable-cuda-graph"
+      - "--attention-backend=triton"  # 明确指定triton后端
+      - "--log-level=debug"
+      - "--max-running-requests=1"    # 限制并发请求
+      - "--max-total-tokens=1000"     # 限制总token数 

@@ -1,0 +1,110 @@
+{
+  "experiments": [
+    {
+      "name": "kvcached_enabled_rate_20",
+      "description": "KVCached启用，请求速率20 req/s",
+      "config_file": "dual-sglang-config.yaml",
+      "request_rate": 20,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": true,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_enabled_rate_25",
+      "description": "KVCached启用，请求速率25 req/s",
+      "config_file": "dual-sglang-config.yaml",
+      "request_rate": 25,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": true,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_enabled_rate_30",
+      "description": "KVCached启用，请求速率30 req/s",
+      "config_file": "dual-sglang-config.yaml",
+      "request_rate": 30,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": true,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_enabled_rate_35",
+      "description": "KVCached启用，请求速率35 req/s",
+      "config_file": "dual-sglang-config.yaml",
+      "request_rate": 35,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": true,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_enabled_rate_40",
+      "description": "KVCached启用，请求速率40 req/s",
+      "config_file": "dual-sglang-config.yaml",
+      "request_rate": 40,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": true,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_disabled_rate_20",
+      "description": "KVCached禁用，请求速率20 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 20,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_disabled_rate_25",
+      "description": "KVCached禁用，请求速率25 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 25,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_disabled_rate_30",
+      "description": "KVCached禁用，请求速率30 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 30,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_disabled_rate_35",
+      "description": "KVCached禁用，请求速率35 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 35,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "kvcached_disabled_rate_40",
+      "description": "KVCached禁用，请求速率40 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 40,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    }
+  ],
+  "global_settings": {
+    "base_log_dir": "/workspace/kvcached/yangmin_logs",
+    "timeout_minutes": 15,
+    "cleanup_between_experiments": true,
+    "save_detailed_logs": true
+  }
+} 

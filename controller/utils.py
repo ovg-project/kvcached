@@ -77,6 +77,53 @@ def ensure_tmux_session(session: str) -> bool:
     return True
 
 
+def ensure_tmux_session_auto_kill(session: str) -> bool:
+    """Ensure a detached tmux session exists, automatically kill existing one.
+    
+    This is similar to ensure_tmux_session but automatically kills existing
+    sessions without prompting, useful for automated scripts.
+    """
+    
+    try:
+        subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Session exists – automatically kill it
+        logger.info("Killing existing tmux session: %s", session)
+        subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    except subprocess.CalledProcessError:
+        # Session does not exist – we'll create it below
+        pass
+
+    # Create new detached session with a decent window size
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            "120",
+            "-y",
+            "30",
+        ],
+        check=True,
+    )
+
+    # Configure helpful defaults with increased history for better log capture
+    subprocess.run(
+        ["tmux", "set-option", "-t", session, "history-limit", "50000"],
+        check=True)
+    subprocess.run(["tmux", "set-option", "-t", session, "mouse", "on"],
+                   check=True)
+
+    return True
+
+
 def collect_env_mods(inst: Dict[str, Any]) -> Dict[str, str]:
     """Collect environment overrides from an *instance* configuration dict."""
 

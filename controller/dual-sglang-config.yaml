@@ -1,0 +1,53 @@
+kvcached: # kvcached环境变量（所有实例共享）
+  kvcached_gpu_utilization: 0.95
+  kvcached_page_prealloc_enabled: true
+  kvcached_min_reserved_pages: 5
+  kvcached_max_reserved_pages: 10
+  kvcached_sanity_check: false
+  kvcached_log_level: INFO
+
+router: # 路由器配置
+  enable_router: true
+  router_port: 8080
+  router_host: localhost
+
+instances: # 实例配置（适用于Docker和本地环境）
+  - name: sglang-instance1
+    model: meta-llama/Llama-3.2-1B  # 可以根据你的模型修改
+    engine: sglang
+    using_venv: true   # 使用新安装的虚拟环境
+    venv_path: /workspace/kvcached/engine_integration/sglang-v0.4.9/.venv
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=SGLANG1"  # 每个实例使用不同的IPC名称
+      - "CUDA_VISIBLE_DEVICES=0"     # 指定GPU
+    engine_env:
+      - "TOKENIZERS_PARALLELISM=false"
+      - "HF_HOME=/shared-models"      # 模型缓存目录（Docker中调整为挂载路径）
+    engine_args:
+      - "--disable-radix-cache"
+      - "--trust-remote-code"
+      - "--mem-fraction-static=0.3"  # 使用30%的GPU内存
+      - "--host=0.0.0.0"             # 使用0.0.0.0适配Docker和本地（本地也可用）
+      - "--port=30333"               # 第一个实例端口
+      - "--disable-cuda-graph"       # 禁用CUDA图以减少内存使用
+
+  - name: sglang-instance2
+    model: meta-llama/Llama-3.2-1B  # 可以使用相同或不同的模型
+    engine: sglang
+    using_venv: true   # 使用新安装的虚拟环境
+    venv_path: /workspace/kvcached/engine_integration/sglang-v0.4.9/.venv
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=SGLANG2"  # 不同的IPC名称
+      - "CUDA_VISIBLE_DEVICES=0"     # 同一GPU
+    engine_env:
+      - "TOKENIZERS_PARALLELISM=false"
+      - "HF_HOME=/shared-models"
+    engine_args:
+      - "--disable-radix-cache"
+      - "--trust-remote-code"
+      - "--mem-fraction-static=0.3"  # 使用30%的GPU内存
+      - "--host=0.0.0.0"             # 使用0.0.0.0
+      - "--port=30334"               # 第二个实例端口
+      - "--disable-cuda-graph"       # 禁用CUDA图以减少内存使用 

@@ -94,7 +94,11 @@ class LLMRouter:
                                                  "/health"),
                 )
 
-                self.models[model_name] = ModelConfig(model_name, endpoint)
+                # Create model config with actual model name if available
+                actual_model = model_cfg.get("actual_model_name", model_name)
+                model_config = ModelConfig(model_name, endpoint)
+                model_config.actual_model_name = actual_model
+                self.models[model_name] = model_config
 
             logger.info("Loaded configuration for %s models from dict",
                         len(self.models))
@@ -108,14 +112,30 @@ class LLMRouter:
         logger.info(f"Added model configuration for {model_config.model_name}")
 
     def get_endpoint_for_model(self, model_name: str) -> Optional[Endpoint]:
-        """Get the endpoint for a given model"""
-        if model_name not in self.models:
+        """Get the endpoint for a given model with load balancing support"""
+        # First try direct instance name lookup
+        if model_name in self.models:
+            return self.models[model_name].endpoint
+        
+        # If not found, look for instances serving this model
+        matching_instances = []
+        for instance_name, model_config in self.models.items():
+            if hasattr(model_config, 'actual_model_name'):
+                if model_config.actual_model_name == model_name:
+                    matching_instances.append(model_config)
+            # Also check if the instance name contains the model info
+            elif model_name in instance_name or instance_name.endswith(model_name.split('/')[-1]):
+                matching_instances.append(model_config)
+        
+        if not matching_instances:
             logger.warning(f"Model {model_name} not found in configuration")
             return None
 
-        model_config = self.models[model_name]
-
-        return model_config.endpoint
+        # Simple round-robin or random selection
+        import random
+        selected = random.choice(matching_instances)
+        logger.debug(f"Selected instance {selected.model_name} for model {model_name}")
+        return selected.endpoint
 
     async def route_request(
         self,

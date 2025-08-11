@@ -1,0 +1,54 @@
+{
+  "experiments": [
+    {
+      "name": "static_kvcached_rate_5",
+      "description": "Static模式 - KVCached禁用，请求速率5 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 5,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 2
+    },
+    {
+      "name": "static_kvcached_rate_10",
+      "description": "Static模式 - KVCached禁用，请求速率10 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 10,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "static_kvcached_rate_15",
+      "description": "Static模式 - KVCached禁用，请求速率15 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 15,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "static_kvcached_rate_20",
+      "description": "Static模式 - KVCached禁用，请求速率20 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 20,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    },
+    {
+      "name": "static_kvcached_rate_25",
+      "description": "Static模式 - KVCached禁用，请求速率25 req/s",
+      "config_file": "dual-sglang-no-kvcached-config.yaml",
+      "request_rate": 25,
+      "num_prompts": 500,
+      "max_concurrency": null,
+      "kvcached_enabled": false,
+      "expected_duration_minutes": 1
+    }
+  ]
+} 

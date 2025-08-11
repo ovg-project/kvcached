@@ -136,6 +136,7 @@ def _extract_models_mapping(
 
     for inst in raw_cfg.get("instances", []):
         model_name = inst["model"]
+        inst_name = inst.get("name", model_name)
 
         # Defaults
         host = "localhost"
@@ -167,11 +168,15 @@ def _extract_models_mapping(
 
         if port is None:
             logger.warning(
-                "Could not determine port for model %s – skipping in router mapping",
-                model_name)
+                "Could not determine port for instance %s – skipping in router mapping",
+                inst_name)
             continue
 
-        models_mapping[model_name] = {"endpoint": {"host": host, "port": port}}
+        # Use instance name as key to support multiple instances of same model
+        models_mapping[inst_name] = {
+            "endpoint": {"host": host, "port": port},
+            "actual_model_name": model_name  # Keep track of actual model name
+        }
 
     return models_mapping
 
