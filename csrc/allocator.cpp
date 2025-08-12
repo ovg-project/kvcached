@@ -32,7 +32,6 @@ FTensorAllocator::FTensorAllocator(const torch::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
       kv_tensor_size_per_layer_(0) {
-
   if (dev_.is_cuda()) {
     init_cuda_();
   }
