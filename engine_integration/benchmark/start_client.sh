@@ -59,12 +59,6 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
         source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
     fi
 
-    if [ "$IN_DOCKER" = false ]; then
-        pushd $SCRIPT_DIR
-    else
-        pushd /workspace/sglang-v0.4.9
-    fi
-
     python -m sglang.bench_serving --backend sglang-oai \
         --model $MODEL \
         --dataset-name sharegpt \
@@ -75,7 +69,6 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     if [ "$IN_DOCKER" = false ]; then
         deactivate
     fi
-    popd
 else
     echo "Invalid option: $op"
     exit 1
