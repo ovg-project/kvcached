@@ -49,7 +49,7 @@ You can pull them with
 docker pull ghcr.io/ovg-project/[kvcached-sglang|kvcached-vllm]:latest
 ```
 
-More instructions can be found here.
+More instructions can be found [here](./docker/README.md).
 
 ## Testing
 
