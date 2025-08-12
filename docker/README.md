@@ -29,8 +29,7 @@ We use vLLM as an example.
 docker run -itd \
   --shm-size 32g \
   --gpus all \
-  -v ~/.cache:/root/.cache \
-  --env "HUGGING_FACE_HUB_TOKEN=<secret>" \
+  --env "HF_TOKEN=<secret>" \
   -v /dev/shm:/shm \
   --ipc=host \
   --network=host \
