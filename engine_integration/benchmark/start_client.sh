@@ -21,6 +21,8 @@ MODEL=${model_arg:-$DEFAULT_MODEL}
 VLLM_PORT=${port_arg:-$DEFAULT_VLLM_PORT}
 SGL_PORT=${port_arg:-$DEFAULT_SGL_PORT}
 
+PYTHON=${PYTHON:-python3}
+
 source "$SCRIPT_DIR/env_detect.sh"
 
 check_and_download_sharegpt() {
@@ -36,13 +38,13 @@ if [ "$op" == "vllm" ]; then
     if [ "$IN_DOCKER" = false ]; then
         source "$ENGINE_DIR/vllm-v0.9.2/.venv/bin/activate"
     fi
-    python -m pip install -q pandas datasets
+    $PYTHON -m pip install -q pandas datasets
     if [ "$IN_DOCKER" = false ]; then
         pushd $ENGINE_DIR/vllm-v0.9.2/benchmarks
     else
-        pushd /workspace/vllm-v0.9.2/benchmarks
+        pushd /vllm-workspace/vllm-v0.9.2/benchmarks
     fi
-    python benchmark_serving.py --backend=vllm \
+    $PYTHON benchmark_serving.py --backend=vllm \
       --model $MODEL \
       --dataset-name sharegpt \
       --dataset-path $SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json \
@@ -59,7 +61,7 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
         source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
     fi
 
-    python -m sglang.bench_serving --backend sglang-oai \
+    $PYTHON -m sglang.bench_serving --backend sglang-oai \
         --model $MODEL \
         --dataset-name sharegpt \
         --dataset-path $SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json \

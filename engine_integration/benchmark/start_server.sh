@@ -17,6 +17,8 @@ MODEL=${model_arg:-$DEFAULT_MODEL}
 VLLM_PORT=${port_arg:-$DEFAULT_VLLM_PORT}
 SGL_PORT=${port_arg:-$DEFAULT_SGL_PORT}
 
+PYTHON=${PYTHON:-python3}
+
 source "$SCRIPT_DIR/env_detect.sh"
 
 # Detect if the first visible GPU is an NVIDIA L4. 
@@ -60,7 +62,7 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
         export TORCHDYNAMO_DISABLE=1
         SGL_L4_ARGS="--attention-backend torch_native"
     fi
-    python -m sglang.launch_server --model "$MODEL" \
+    $PYTHON -m sglang.launch_server --model "$MODEL" \
     --disable-radix-cache \
     --trust-remote-code \
     --mem-fraction-static 0.5 \
