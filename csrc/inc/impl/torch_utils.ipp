@@ -22,7 +22,8 @@ static inline torch::Dtype torch_dtype_cast(const py::object &dtype) {
   if (dtype.is(py::module_::import("torch").attr("bool")))
     return torch::kBool;
 
-  throw std::runtime_error("Unsupported dtype: " + py::str(dtype).cast<std::string>());
+  throw std::runtime_error("Unsupported dtype: " +
+                           py::str(dtype).cast<std::string>());
 }
 
 static inline torch::Dtype torch_dtype_from_size(size_t dtype_size) {
@@ -36,7 +37,8 @@ static inline torch::Dtype torch_dtype_from_size(size_t dtype_size) {
   case 8:
     return torch::kInt64;
   default:
-    throw std::runtime_error("Unsupported dtype size: " + std::to_string(dtype_size));
+    throw std::runtime_error("Unsupported dtype size: " +
+                             std::to_string(dtype_size));
   }
 }
 
