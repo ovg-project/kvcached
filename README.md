@@ -46,14 +46,10 @@ You can test kvcached with Docker. We provide docker images for both SGLang and 
 You can pull them with
 
 ```bash
-docker pull ghcr.io/ovg-project/kvcached_v0.0.2-sglang_v0.4.9:latest
+docker pull ghcr.io/ovg-project/[kvcached-sglang|kvcached-vllm]:latest
 ```
 
-or
-
-```bash
-docker pull ghcr.io/ovg-project/kvcached_v0.0.2-vllm_v0.9.2:latest
-```
+More instructions can be found here.
 
 ## Testing
 
