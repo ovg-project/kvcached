@@ -13,7 +13,8 @@ import numpy as np
 import torch
 
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
-from kvcached.utils import PAGE_SIZE
+
+PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
 
 
 def get_broadcast_impl(name: str):

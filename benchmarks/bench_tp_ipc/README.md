@@ -20,7 +20,7 @@ Different **broadcast strategies** are pluggable (`sequential loop`, `thread poo
 
 ```bash
 # From repository root
-cd kvcached/benchmarks/bench_tp_ipc
+cd benchmarks/bench_tp_ipc
 
 # Run on 4 GPUs, map 1 kv cache page per iteration, run 20 iterations
 # using the Python async-await broadcast implementation
