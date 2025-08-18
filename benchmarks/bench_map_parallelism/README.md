@@ -1,4 +1,4 @@
-# kvcached Map Parallelism Benchmark
+# CUDA VMM Map Parallelism Benchmark
 
 This benchmark measures how **CUDA VMM mapping** scales with process-level parallelism using *kvcached*'s memory ops—**without** the TP IPC layer. This benchmark is motivated by an observation that the async TP IPC implementation doesn't not achieve near ×TP speedup in VMM operations. It compares:
 
