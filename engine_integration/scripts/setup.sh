@@ -82,6 +82,21 @@ EOF
     echo "Creating $pth_file to prepend site-packages on sys.path"
     printf '%s\n' 'import sys,sysconfig; p=sysconfig.get_paths().get("purelib"); sys.path.insert(0,p) if p and p in sys.path else None' > "$pth_file"
 
+    # Manually add CLI entrypoints for kvtop and kvctl
+    bin_dir="$(python -c 'import sysconfig; print(sysconfig.get_paths()["scripts"])')"
+
+    cat > "$bin_dir/kvtop" <<EOF
+#!/usr/bin/env bash
+exec python -m kvcached.cli.kvtop "\$@"
+EOF
+
+    cat > "$bin_dir/kvctl" <<EOF
+#!/usr/bin/env bash
+exec python -m kvcached.cli.kvctl "\$@"
+EOF
+
+    chmod +x "$bin_dir/kvtop" "$bin_dir/kvctl"
+
     # 8. Remove any stray compiled extensions from the source tree itself to
     #    avoid confusion when switching between virtual-envs.
     find "$KVCACHED_DIR/kvcached" -maxdepth 1 -name 'vmm_ops*.so' -exec rm -f {} + || true
