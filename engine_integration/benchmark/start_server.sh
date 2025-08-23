@@ -8,14 +8,17 @@ KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 DEFAULT_MODEL=meta-llama/Llama-3.2-1B
 DEFAULT_VLLM_PORT=12346
 DEFAULT_SGL_PORT=30000
+DEFAULT_MODE="dev"
 
 op=$1
-port_arg=$2
-model_arg=$3
+port=$2
+model=$3
+mode=$4
 
-MODEL=${model_arg:-$DEFAULT_MODEL}
-VLLM_PORT=${port_arg:-$DEFAULT_VLLM_PORT}
-SGL_PORT=${port_arg:-$DEFAULT_SGL_PORT}
+MODEL=${model:-$DEFAULT_MODEL}
+VLLM_PORT=${port:-$DEFAULT_VLLM_PORT}
+SGL_PORT=${port:-$DEFAULT_SGL_PORT}
+MODE=${mode:-$DEFAULT_MODE}
 
 PYTHON=${PYTHON:-python3}
 
@@ -31,7 +34,7 @@ else
 fi
 
 if [ "$op" == "vllm" ]; then
-    if [ "$IN_DOCKER" = false ]; then
+    if [ "$MODE" = "dev" ]; then
         source "$ENGINE_DIR/vllm-v0.9.2/.venv/bin/activate"
     fi
     export VLLM_USE_V1=1
@@ -50,7 +53,7 @@ if [ "$op" == "vllm" ]; then
     --port="$VLLM_PORT" \
     $VLLM_L4_ARGS
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
-    if [ "$IN_DOCKER" = false ]; then
+    if [ "$MODE" = "dev" ]; then
         source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
     fi
     export ENABLE_KVCACHED=true
