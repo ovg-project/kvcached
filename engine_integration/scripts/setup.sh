@@ -102,6 +102,7 @@ setup_vllm() {
     # vLLM-v0.9.2 requires transformers>=4.51.1 but not too new.
     uv pip install transformers==4.51.1
 
+    # use specific version of precompiled wheel
     pip download "vllm==0.9.2" --no-deps -d /tmp
     export VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/vllm-0.9.2-cp38-abi3-manylinux1_x86_64.whl
     uv pip install --editable .
