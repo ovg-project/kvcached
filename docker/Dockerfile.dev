@@ -1,0 +1,42 @@
+ARG CUDA_VERSION=12.6.0
+ARG UBUNTU_VERSION=22.04
+FROM nvcr.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+# Basic environment
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    TZ=Etc/UTC \
+    # CUDA toolchain paths
+    PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# Core build + useful tools. No torch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git curl wget ca-certificates \
+    cmake ninja-build pkg-config \
+    python3 python3-pip python3-venv \
+    openssh-client \
+    vim less unzip zip \
+    libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Quality-of-life: make Python point to python3
+RUN echo 'alias python=python3' >> ~/.bashrc \
+ && echo 'alias pip=pip3' >> ~/.bashrc
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
+
+# Working directory
+WORKDIR /workspace
+
+RUN git clone https://github.com/ovg-project/kvcached.git
+WORKDIR /workspace/kvcached/engine_integration/scripts
+RUN chmod +x setup.sh && ./setup.sh all
+
+
+EXPOSE 8080 12346 30000 30001
+
+WORKDIR /workspace/kvcached
+CMD ["bash"]
