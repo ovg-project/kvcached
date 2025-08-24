@@ -63,6 +63,7 @@ cd engine_integration/benchmark
 ```
 
 For vLLM and SGLang image, need to specify development mode as prod before running the benchmark.
+
 ```bash
 sed -i 's/^DEFAULT_MODE="dev"$/DEFAULT_MODE="prod"/' \
     engine_integration/benchmark/start_server.sh
