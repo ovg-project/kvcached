@@ -41,6 +41,7 @@ def test_charge_behavior():
 
     # Check updated usage
     updated = get_kv_cache_limit(IPC_NAME)
+    assert updated is not None
     assert updated.used_size == initial_used_size + 100
     assert updated.prealloc_size == initial_prealloc_size
     assert updated.total_size == TOTAL_MEM
@@ -68,6 +69,7 @@ def test_uncharge_behavior():
 
     # Check it's back to 0
     updated = get_kv_cache_limit(IPC_NAME)
+    assert updated is not None
     assert updated.used_size == initial_used_size
     assert updated.prealloc_size == initial_prealloc_size
     assert updated.total_size == TOTAL_MEM
@@ -89,6 +91,7 @@ def test_reserve_behavior():
 
     # Check updated usage
     updated = get_kv_cache_limit(IPC_NAME)
+    assert updated is not None
     assert updated.used_size == initial_used_size
     assert updated.prealloc_size == initial_prealloc_size + 300
     assert updated.total_size == TOTAL_MEM
@@ -116,6 +119,7 @@ def test_unreserve_behavior():
 
     # Check it's back to 0
     updated = get_kv_cache_limit(IPC_NAME)
+    assert updated is not None
     assert updated.used_size == initial_used_size
     assert updated.prealloc_size == initial_prealloc_size
     assert updated.total_size == TOTAL_MEM
@@ -151,6 +155,7 @@ def test_multi_process_concurrent_charge_variable():
         p.join()
 
     updated = get_kv_cache_limit(IPC_NAME)
+    assert updated is not None
     expected_total = NUM_PROCESSES * CHARGE_PER_PROCESS
     assert updated.used_size == expected_total, \
         f"Expected used_size={expected_total}, got {updated.used_size}"
@@ -161,6 +166,7 @@ def test_tracker_update_memory_usage():
     tracker.update_memory_usage(used_size=600, prealloc_size=600)
 
     mem_info = get_kv_cache_limit(IPC_NAME)
+    assert mem_info is not None
     assert mem_info.used_size == 600
     assert mem_info.prealloc_size == 600
     assert mem_info.total_size == TOTAL_MEM
