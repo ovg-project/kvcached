@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 import aiohttp
 
 from kvcached.utils import get_kvcached_logger
+from traffic_monitor import traffic_monitor
 
 logger = get_kvcached_logger()
 
@@ -124,11 +125,20 @@ class LLMRouter:
         endpoint_path: str = "/v1/completions"
     ) -> Optional[Union[Dict[str, Any], aiohttp.ClientResponse]]:
         """Route a request to the appropriate endpoint"""
+        # Record request start for traffic monitoring
+        request_stats = traffic_monitor.record_request_start(model_name, endpoint_path)
+        
         endpoint = self.get_endpoint_for_model(model_name)
         if not endpoint:
+            traffic_monitor.record_request_end(
+                request_stats, success=False, error_message=f"Model {model_name} not found"
+            )
             return None
 
         if self.session is None or self.session.closed:
+            traffic_monitor.record_request_end(
+                request_stats, success=False, error_message="Session not initialized"
+            )
             raise Exception("Session not initialised")
 
         try:
@@ -149,10 +159,16 @@ class LLMRouter:
                     logger.info(
                         f"Successfully routed streaming request for model {model_name} to {endpoint.base_url}"
                     )
+                    traffic_monitor.record_request_end(request_stats, success=True)
                     return response
                 else:
+                    error_text = await response.text()
                     logger.error(
-                        f"Streaming request failed with status {response.status}: {await response.text()}"
+                        f"Streaming request failed with status {response.status}: {error_text}"
+                    )
+                    traffic_monitor.record_request_end(
+                        request_stats, success=False, 
+                        error_message=f"HTTP {response.status}: {error_text}"
                     )
                     await response.release()
                     return None
@@ -166,10 +182,16 @@ class LLMRouter:
                         logger.info(
                             f"Successfully routed request for model {model_name} to {endpoint.base_url}"
                         )
+                        traffic_monitor.record_request_end(request_stats, success=True)
                         return result
                     else:
+                        error_text = await response.text()
                         logger.error(
-                            f"Request failed with status {response.status}: {await response.text()}"
+                            f"Request failed with status {response.status}: {error_text}"
+                        )
+                        traffic_monitor.record_request_end(
+                            request_stats, success=False, 
+                            error_message=f"HTTP {response.status}: {error_text}"
                         )
                         return None
 
@@ -177,9 +199,15 @@ class LLMRouter:
             logger.error(
                 f"Request timeout for model {model_name} at {endpoint.base_url}"
             )
+            traffic_monitor.record_request_end(
+                request_stats, success=False, error_message="Request timeout"
+            )
             return None
         except Exception as e:
             logger.error(f"Error routing request for model {model_name}: {e}")
+            traffic_monitor.record_request_end(
+                request_stats, success=False, error_message=str(e)
+            )
             return None
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:
