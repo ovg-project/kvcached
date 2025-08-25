@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import time
+from multiprocessing.synchronize import Barrier
 
 import pytest
 
@@ -120,8 +121,7 @@ def test_unreserve_behavior():
     assert updated.total_size == TOTAL_MEM
 
 
-def worker_charge_with_barrier(ipc_name, amount,
-                               barrier: multiprocessing.Barrier):
+def worker_charge_with_barrier(ipc_name, amount, barrier: Barrier):
 
     barrier.wait()  # Synchronize entry
 
