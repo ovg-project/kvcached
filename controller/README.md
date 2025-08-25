@@ -84,3 +84,26 @@ python benchmark.py --config example-config.yaml
 ```
 
 A separate *tmux* session (`benchmark-<name>`) is created for every model so you can watch latency/throughput side by side.
+
+
+## Traffic Statistics 
+(traffic_monitor.py)
+- Request tracking: Records all requests per model with timestamps
+- Request rate calculation: Calculates requests/second over configurable time windows
+- Response time monitoring: Tracks average response times
+- Success/failure rates: Monitors request success rates
+- Idle time detection: Identifies models with no recent activity
+
+
+## New API Endpoints
+(frontend.py)
+- GET /traffic/stats - All models' traffic statistics
+- GET /traffic/stats/{model_name} - Specific model statistics
+- GET /traffic/idle?threshold=300 - Models idle longer than threshold
+- GET /traffic/active?threshold=300 - Currently active models
+
+
+## TODO
+- ✅ Implement request rate tracking per model
+- Add idle time monitoring for sleep mode detection
+- Test the traffic monitoring functionality
