@@ -22,7 +22,7 @@ except Exception:
         return decorator
 
 
-logger = get_kvcached_logger(__name__)
+logger = get_kvcached_logger()
 
 
 def _env_enabled() -> bool:
@@ -36,12 +36,13 @@ def _enable_kvcached() -> bool:
 @when_imported("vllm")
 def _patch_vllm(_vllm: types.ModuleType) -> None:
     if not _env_enabled():
-        logger.debug("kvcached.autopatch: disabled by KVCACHED_AUTOPATCH")
+        logger.debug("Disabled by KVCACHED_AUTOPATCH")
         return
 
     # Track patch success status
     patch_status = {
         "elastic_block_pool": False,
+        "engine_core": False,
         "kv_cache_coordinator": False,
         "gpu_model_runner": False,
     }
@@ -50,50 +51,35 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
     logger.info("Patching vllm with kvcached support")
     try:
         block_pool_mod = importlib.import_module("vllm.v1.core.block_pool")
+        engine_mod = importlib.import_module("vllm.v1.engine.core")
         kvcoord_mod = importlib.import_module(
             "vllm.v1.core.kv_cache_coordinator")
         gpumr_mod = importlib.import_module("vllm.v1.worker.gpu_model_runner")
     except Exception:
-        # Older/newer vLLM layouts: best-effort import fallbacks
-        logger.debug("v1 imports failed, trying fallback layout")
-        try:
-            block_pool_mod = importlib.import_module("vllm.core.block_pool")
-        except Exception:
-            logger.warning("failed to import block_pool module")
-            return
-        try:
-            kvcoord_mod = importlib.import_module(
-                "vllm.core.kv_cache_coordinator")
-        except Exception:
-            kvcoord_mod = None
-        try:
-            gpumr_mod = importlib.import_module("vllm.worker.gpu_model_runner")
-        except Exception:
-            gpumr_mod = None
+        logger.error(
+            "Failed to import vllm modules, check if vllm==0.9.2 is installed."
+        )
+        return
 
     # Apply patches and track success
     patch_status["elastic_block_pool"] = _inject_elastic_block_pool(
         block_pool_mod)
-
-    if kvcoord_mod is not None:
-        patch_status["kv_cache_coordinator"] = _patch_kv_cache_coordinator(
-            kvcoord_mod, block_pool_mod)
-
-    if gpumr_mod is not None:
-        patch_status["gpu_model_runner"] = _patch_gpu_model_runner(gpumr_mod)
+    patch_status["kv_cache_coordinator"] = _patch_kv_cache_coordinator(
+        kvcoord_mod, block_pool_mod)
+    patch_status["engine_core"] = _patch_engine_core(engine_mod)
+    patch_status["gpu_model_runner"] = _patch_gpu_model_runner(gpumr_mod)
 
     # Log overall status
     successful_patches = [name for name, succ in patch_status.items() if succ]
     failed_patches = [name for name, succ in patch_status.items() if not succ]
 
     if successful_patches:
-        logger.info("successfully patched %s", ", ".join(successful_patches))
+        logger.info("Successfully patched %s", ", ".join(successful_patches))
     if failed_patches:
-        logger.warning("failed to patch %s", ", ".join(failed_patches))
+        logger.warning("Failed to patch %s", ", ".join(failed_patches))
 
 
 def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
-    # Skip if already injected
     if hasattr(block_pool_mod, "ElasticBlockPool"):
         return True
 
@@ -170,6 +156,36 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
     return True
 
 
+def _patch_engine_core(engine_mod: types.ModuleType) -> bool:
+    EngineCore = getattr(engine_mod, "EngineCore", None)
+    if EngineCore is None:
+        return False
+
+    original_init = EngineCore.__init__
+
+    def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
+        import os
+        res = original_init(self, vllm_config, *args, **kwargs)
+        enable_kvcached = os.getenv("ENABLE_KVCACHED",
+                                    "false").lower() == "true"
+        if enable_kvcached:
+            try:
+                from kvcached.integration.vllm.interfaces import init_kvcached
+                init_kvcached(
+                    tp_rank=0,
+                    tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                    is_worker=False,
+                )
+            except Exception:
+                pass
+        return res
+
+    if getattr(EngineCore.__init__, "__kvcached_patched__", False) is not True:
+        _patched_engine_init.__kvcached_patched__ = True  # type: ignore[attr-defined]
+        EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+    return True
+
+
 def _patch_kv_cache_coordinator(kvcoord_mod: types.ModuleType,
                                 block_pool_mod: types.ModuleType) -> bool:
     KVCacheCoordinator = getattr(kvcoord_mod, "KVCacheCoordinator", None)
@@ -220,7 +236,7 @@ def _patch_kv_cache_coordinator(kvcoord_mod: types.ModuleType,
                 enable_caching=getattr(self, "enable_caching", False),
             )
         except Exception:
-            logger.warning("failed to patch kv_cache_coordinator")
+            logger.warning("Failed to patch kv_cache_coordinator")
             return
 
     if getattr(KVCacheCoordinator.__init__, "__kvcached_patched__",
