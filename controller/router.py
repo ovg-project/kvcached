@@ -3,10 +3,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
+from sleep_manager import sleep_manager
+from traffic_monitor import traffic_monitor
 
 from kvcached.utils import get_kvcached_logger
-from traffic_monitor import traffic_monitor
-from sleep_manager import sleep_manager
 
 logger = get_kvcached_logger()
 
@@ -127,29 +127,36 @@ class LLMRouter:
     ) -> Optional[Union[Dict[str, Any], aiohttp.ClientResponse]]:
         """Route a request to the appropriate endpoint"""
         # Record request start for traffic monitoring
-        request_stats = traffic_monitor.record_request_start(model_name, endpoint_path)
-        
+        request_stats = traffic_monitor.record_request_start(
+            model_name, endpoint_path)
+
         endpoint = self.get_endpoint_for_model(model_name)
         if not endpoint:
             traffic_monitor.record_request_end(
-                request_stats, success=False, error_message=f"Model {model_name} not found"
-            )
+                request_stats,
+                success=False,
+                error_message=f"Model {model_name} not found")
             return None
-        
+
         # Check if model is sleeping and try to wake it up
         if sleep_manager.is_model_sleeping(model_name):
-            logger.info(f"Model {model_name} is sleeping, attempting to wake up for request")
+            logger.info(
+                f"Model {model_name} is sleeping, attempting to wake up for request"
+            )
             wake_success = await sleep_manager.handle_request_wake(model_name)
             if not wake_success:
                 traffic_monitor.record_request_end(
-                    request_stats, success=False, error_message=f"Failed to wake sleeping model {model_name}"
+                    request_stats,
+                    success=False,
+                    error_message=f"Failed to wake sleeping model {model_name}"
                 )
                 return None
 
         if self.session is None or self.session.closed:
             traffic_monitor.record_request_end(
-                request_stats, success=False, error_message="Session not initialized"
-            )
+                request_stats,
+                success=False,
+                error_message="Session not initialized")
             raise Exception("Session not initialised")
 
         try:
@@ -170,7 +177,8 @@ class LLMRouter:
                     logger.info(
                         f"Successfully routed streaming request for model {model_name} to {endpoint.base_url}"
                     )
-                    traffic_monitor.record_request_end(request_stats, success=True)
+                    traffic_monitor.record_request_end(request_stats,
+                                                       success=True)
                     return response
                 else:
                     error_text = await response.text()
@@ -178,9 +186,9 @@ class LLMRouter:
                         f"Streaming request failed with status {response.status}: {error_text}"
                     )
                     traffic_monitor.record_request_end(
-                        request_stats, success=False, 
-                        error_message=f"HTTP {response.status}: {error_text}"
-                    )
+                        request_stats,
+                        success=False,
+                        error_message=f"HTTP {response.status}: {error_text}")
                     await response.release()
                     return None
             else:
@@ -193,7 +201,8 @@ class LLMRouter:
                         logger.info(
                             f"Successfully routed request for model {model_name} to {endpoint.base_url}"
                         )
-                        traffic_monitor.record_request_end(request_stats, success=True)
+                        traffic_monitor.record_request_end(request_stats,
+                                                           success=True)
                         return result
                     else:
                         error_text = await response.text()
@@ -201,24 +210,25 @@ class LLMRouter:
                             f"Request failed with status {response.status}: {error_text}"
                         )
                         traffic_monitor.record_request_end(
-                            request_stats, success=False, 
-                            error_message=f"HTTP {response.status}: {error_text}"
-                        )
+                            request_stats,
+                            success=False,
+                            error_message=
+                            f"HTTP {response.status}: {error_text}")
                         return None
 
         except asyncio.TimeoutError:
             logger.error(
                 f"Request timeout for model {model_name} at {endpoint.base_url}"
             )
-            traffic_monitor.record_request_end(
-                request_stats, success=False, error_message="Request timeout"
-            )
+            traffic_monitor.record_request_end(request_stats,
+                                               success=False,
+                                               error_message="Request timeout")
             return None
         except Exception as e:
             logger.error(f"Error routing request for model {model_name}: {e}")
-            traffic_monitor.record_request_end(
-                request_stats, success=False, error_message=str(e)
-            )
+            traffic_monitor.record_request_end(request_stats,
+                                               success=False,
+                                               error_message=str(e))
             return None
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:
