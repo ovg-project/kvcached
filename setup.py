@@ -57,4 +57,5 @@ setup(
     long_description_content_type="text/markdown",
     ext_modules=ext_modules,
     cmdclass=cmdclass,
+    data_files=[("", ["kvcached_vllm_autopatch.pth"])],
 )

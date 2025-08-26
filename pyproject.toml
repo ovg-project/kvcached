@@ -40,6 +40,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.26.0",
     "posix_ipc>=1.0",
+    "wrapt>=1.15",
 ]
 
 [project.scripts]
@@ -61,6 +62,7 @@ dev = [
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["sitecustomize"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -69,6 +71,9 @@ exclude = ["*__pycache__*"]
 
 [tool.setuptools.package-data]
 kvcached = ["*.so", "*.pyi", "py.typed"]
+
+[tool.setuptools.data-files]
+"" = ["kvcached_vllm_autopatch.pth", "sitecustomize.py"]
 
 [tool.mypy]
 plugins = ['pydantic.mypy']
