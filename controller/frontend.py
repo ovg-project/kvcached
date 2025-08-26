@@ -9,6 +9,7 @@ from aiohttp import web
 from router import LLMRouter
 from utils import set_ulimit
 from traffic_monitor import traffic_monitor
+from sleep_manager import sleep_manager
 
 from kvcached.utils import get_kvcached_logger
 
@@ -38,10 +39,16 @@ class MultiLLMFrontend:
         
         # Traffic monitoring endpoints
         self.app.router.add_get('/traffic/stats', self.handle_traffic_stats)
-        self.app.router.add_get('/traffic/stats/{model_name}',
+        self.app.router.add_get('/traffic/stats/model/{model_name}',
                                 self.handle_model_traffic_stats)
         self.app.router.add_get('/traffic/idle', self.handle_idle_models)
         self.app.router.add_get('/traffic/active', self.handle_active_models)
+        
+        # Sleep management endpoints
+        self.app.router.add_get('/sleep/status', self.handle_sleep_status)
+        self.app.router.add_post('/sleep/model/{model_name}', self.handle_sleep_model)
+        self.app.router.add_post('/wake/model/{model_name}', self.handle_wake_model)
+        self.app.router.add_get('/sleep/candidates', self.handle_sleep_candidates)
 
     async def handle_completion(self, request: web.Request) -> web.Response:
         """Handle completion requests"""
@@ -245,7 +252,8 @@ class MultiLLMFrontend:
     async def handle_model_traffic_stats(self, request: web.Request) -> web.Response:
         """Handle traffic statistics requests for a specific model"""
         try:
-            model_name = request.match_info['model_name']
+            import urllib.parse
+            model_name = urllib.parse.unquote(request.match_info['model_name'])
             window_seconds = int(request.query.get('window', 60))
             
             model_stats = traffic_monitor.get_model_stats(model_name)
@@ -348,13 +356,123 @@ class MultiLLMFrontend:
             return web.Response(text=json.dumps({"error": str(e)}),
                                 status=500,
                                 content_type='application/json')
+    
+    async def handle_sleep_status(self, request: web.Request) -> web.Response:
+        """Handle sleep status requests"""
+        try:
+            sleeping_models = sleep_manager.get_sleeping_models()
+            candidates = sleep_manager.get_sleep_candidates()
+            
+            return web.Response(text=json.dumps({
+                "sleeping_models": sleeping_models,
+                "sleep_candidates": candidates,
+                "auto_sleep_enabled": sleep_manager.config.auto_sleep_enabled,
+                "idle_threshold_seconds": sleep_manager.config.idle_threshold_seconds,
+                "wake_on_request": sleep_manager.config.wake_on_request
+            }),
+                                status=200,
+                                content_type='application/json')
+        except Exception as e:
+            logger.error(f"Error getting sleep status: {e}")
+            return web.Response(text=json.dumps({"error": str(e)}),
+                                status=500,
+                                content_type='application/json')
+    
+    async def handle_sleep_model(self, request: web.Request) -> web.Response:
+        """Handle requests to put a model to sleep"""
+        try:
+            import urllib.parse
+            model_name = urllib.parse.unquote(request.match_info['model_name'])
+            
+            # Check if model exists
+            if model_name not in self.router.models:
+                return web.Response(text=json.dumps({
+                    "error": f"Model {model_name} not found"
+                }),
+                                    status=404,
+                                    content_type='application/json')
+            
+            success = await sleep_manager.put_model_to_sleep(model_name, manual=True)
+            
+            return web.Response(text=json.dumps({
+                "model_name": model_name,
+                "success": success,
+                "message": f"Model {model_name} sleep request {'successful' if success else 'failed'}"
+            }),
+                                status=200 if success else 400,
+                                content_type='application/json')
+        except Exception as e:
+            logger.error(f"Error putting model to sleep: {e}")
+            return web.Response(text=json.dumps({"error": str(e)}),
+                                status=500,
+                                content_type='application/json')
+    
+    async def handle_wake_model(self, request: web.Request) -> web.Response:
+        """Handle requests to wake up a sleeping model"""
+        try:
+            import urllib.parse
+            model_name = urllib.parse.unquote(request.match_info['model_name'])
+            # Check if model exists
+            if model_name not in self.router.models:
+                return web.Response(text=json.dumps({
+                    "error": f"Model {model_name} not found"
+                }),
+                                    status=404,
+                                    content_type='application/json')
+            
+            success = await sleep_manager.wake_model(model_name)
+            
+            return web.Response(text=json.dumps({
+                "model_name": model_name,
+                "success": success,
+                "message": f"Model {model_name} wake request {'successful' if success else 'failed'}"
+            }),
+                                status=200 if success else 400,
+                                content_type='application/json')
+        except Exception as e:
+            logger.error(f"Error waking up model: {e}")
+            return web.Response(text=json.dumps({"error": str(e)}),
+                                status=500,
+                                content_type='application/json')
+    
+    async def handle_sleep_candidates(self, request: web.Request) -> web.Response:
+        """Handle requests for models that are candidates for sleep mode"""
+        try:
+            candidates = sleep_manager.get_sleep_candidates()
+            
+            # Get detailed info for each candidate
+            candidate_details = {}
+            for model_name in candidates:
+                model_stats = traffic_monitor.get_model_stats(model_name)
+                if model_stats:
+                    candidate_details[model_name] = {
+                        'idle_time_seconds': model_stats.get_idle_time(),
+                        'total_requests': model_stats.total_requests,
+                        'last_activity_time': model_stats.last_activity_time,
+                        'can_sleep': True
+                    }
+            
+            return web.Response(text=json.dumps({
+                "sleep_candidates": candidates,
+                "candidate_details": candidate_details,
+                "idle_threshold_seconds": sleep_manager.config.idle_threshold_seconds,
+                "auto_sleep_enabled": sleep_manager.config.auto_sleep_enabled
+            }),
+                                status=200,
+                                content_type='application/json')
+        except Exception as e:
+            logger.error(f"Error getting sleep candidates: {e}")
+            return web.Response(text=json.dumps({"error": str(e)}),
+                                status=500,
+                                content_type='application/json')
 
     async def start(self):
         """Start the router server"""
         logger.info(f"Starting router server on port {self.port}")
 
-        # Start traffic monitor
+        # Start traffic monitor and sleep manager
         await traffic_monitor.start()
+        await sleep_manager.start()
 
         # Start LLM servers based on the configuration
         # await self.router.start_llm_servers()
@@ -371,6 +489,7 @@ class MultiLLMFrontend:
         except KeyboardInterrupt:
             logger.info("Shutting down router server...")
         finally:
+            await sleep_manager.stop()
             await traffic_monitor.stop()
             await self.router.close()
             await runner.cleanup()

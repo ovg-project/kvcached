@@ -6,6 +6,7 @@ import aiohttp
 
 from kvcached.utils import get_kvcached_logger
 from traffic_monitor import traffic_monitor
+from sleep_manager import sleep_manager
 
 logger = get_kvcached_logger()
 
@@ -134,6 +135,16 @@ class LLMRouter:
                 request_stats, success=False, error_message=f"Model {model_name} not found"
             )
             return None
+        
+        # Check if model is sleeping and try to wake it up
+        if sleep_manager.is_model_sleeping(model_name):
+            logger.info(f"Model {model_name} is sleeping, attempting to wake up for request")
+            wake_success = await sleep_manager.handle_request_wake(model_name)
+            if not wake_success:
+                traffic_monitor.record_request_end(
+                    request_stats, success=False, error_message=f"Failed to wake sleeping model {model_name}"
+                )
+                return None
 
         if self.session is None or self.session.closed:
             traffic_monitor.record_request_end(
