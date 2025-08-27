@@ -32,14 +32,18 @@ python kvcached_map_parallel_benchmark.py --pages-total 100 --procs 4 --iters 20
 | --pages-total N | —         | Total pages to map per iteration.        |
 | --procs P       | 1         | Number of worker processes.      |
 | --iters K       | 20        | Number of benchmark iterations.      |
+| --not-contiguous       | store_true        | KV tensor layout.      |
 
 ## Example Output
+Tests are conducted on 4 L40S GPUs with PCIe interconnect.
 
 ```bash
 python kvcached_map_parallel_benchmark.py --pages-total 100 --procs 4 --iters 20
 ```
 
 ```bash
+Using layout contiguous=True
+
 ========== Single Process case (1 proc maps N/P pages) ==========
 Processes           : 1
 Iterations          : 20
@@ -49,10 +53,10 @@ Pages per proc / iter: 25
 +-----------------+-------------+
 | Metric          | ms          |
 +-----------------+-------------+
-| mean wall       |     264.308 |
-| p95 wall        |     279.634 |
-| max wall        |     281.756 |
-| min wall        |     255.839 |
+| mean wall       |     14.249 |
+| p95 wall        |     15.447 |
+| max wall        |     18.132 |
+| min wall        |     3.977 |
 +-----------------+-------------+
 
 ========== Serial case (1 proc maps N pages) ==========
@@ -64,10 +68,10 @@ Pages per proc / iter: 100
 +-----------------+-------------+
 | Metric          | ms          |
 +-----------------+-------------+
-| mean wall       |    1058.724 |
-| p95 wall        |    1078.205 |
-| max wall        |    1122.775 |
-| min wall        |    1033.650 |
+| mean wall       |    52.083 |
+| p95 wall        |    56.886 |
+| max wall        |    57.245 |
+| min wall        |    15.631 |
 +-----------------+-------------+
 
 ========== Parallel case (4 procs map N/P each) ==========
@@ -79,13 +83,68 @@ Pages per proc / iter: 25
 +-----------------+-------------+
 | Metric          | ms          |
 +-----------------+-------------+
-| mean wall       |     803.961 |
-| p95 wall        |     831.256 |
-| max wall        |     874.928 |
-| min wall        |     777.173 |
+| mean wall       |     26.650 |
+| p95 wall        |     30.373 |
+| max wall        |     31.055 |
+| min wall        |     17.700 |
 +-----------------+-------------+
 
-Speedup (parallel vs serial): mean x1.32   (ideal being approximately 4.00 if perfect overlap)
+Speedup (parallel vs serial): mean x1.94   (ideal being approximately 4.00 if perfect overlap)
+```
+
+```bash
+python kvcached_map_parallel_benchmark.py --pages-total 100 --procs 4 --iters 20 --not-contiguous
+```
+
+```bash
+Using layout contiguous=False
+
+========== Single Process case (1 proc maps N/P pages) ==========
+Processes           : 1
+Iterations          : 20
+Pages total / iter  : 25
+Pages per proc / iter: 25 
+
++-----------------+-------------+
+| Metric          | ms          |
++-----------------+-------------+
+| mean wall       |     261.651 |
+| p95 wall        |     270.385 |
+| max wall        |     273.408 |
+| min wall        |     255.804 |
++-----------------+-------------+
+
+========== Serial case (1 proc maps N pages) ==========
+Processes           : 1
+Iterations          : 20
+Pages total / iter  : 100
+Pages per proc / iter: 100 
+
++-----------------+-------------+
+| Metric          | ms          |
++-----------------+-------------+
+| mean wall       |    1055.820 |
+| p95 wall        |    1070.830 |
+| max wall        |    1083.050 |
+| min wall        |    1044.460 |
++-----------------+-------------+
+
+========== Parallel case (4 procs map N/P each) ==========
+Processes           : 4
+Iterations          : 20
+Pages total / iter  : 100
+Pages per proc / iter: 25 
+
++-----------------+-------------+
+| Metric          | ms          |
++-----------------+-------------+
+| mean wall       |     950.014 |
+| p95 wall        |    1006.295 |
+| max wall        |    1014.937 |
+| min wall        |     869.605 |
++-----------------+-------------+
+
+Speedup (parallel vs serial): mean x1.11   (ideal being approximately 4.00 if perfect overlap)
 ```
 
 ### Interpretation

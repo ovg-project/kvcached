@@ -33,6 +33,7 @@ def _worker(
     result_q: mp.Queue,
     iter_barrier: mp.Barrier,
     verbose: bool,
+    contiguous_layout: bool,
 ):
     """
     One process (optionally one GPU) that:
@@ -41,6 +42,7 @@ def _worker(
       - waits for start_evt, then iteratively maps (and unmaps) its pages
       - reports per-iteration map time via result_q
     """
+    os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = "true" if contiguous_layout else "false"
     try:
         # Device placement
         dev_id = rank if device_mode == "per-rank" else 0
@@ -100,11 +102,12 @@ def _worker(
                 )
 
             # Assign a disjoint page range to each rank
-            start_page = (
-                base_page + rank * pages_per_proc
-            )  # + it * (pages_per_proc * procs)
+            start_page = base_page + rank * pages_per_proc
             page_ids = [start_page + i for i in range(pages_per_proc)]
-            offsets = [pid * PAGE_SIZE for pid in page_ids]
+            if contiguous_layout:
+                offsets = [pid * PAGE_SIZE * num_layers * 2 for pid in page_ids]
+            else:
+                offsets = [pid * PAGE_SIZE for pid in page_ids]
 
             t0 = time.time()
             map_to_kv_tensors(offsets)
@@ -187,6 +190,7 @@ def _run_parallel_case(
     num_layers: int,
     base_page: int,
     verbose: bool,
+    contiguous_layout: bool,
 ) -> RunStats:
     ctx = mp.get_context("spawn")
     start_evt = ctx.Event()
@@ -218,6 +222,7 @@ def _run_parallel_case(
                 result_q,
                 iter_barrier,
                 verbose,
+                contiguous_layout,
             ),
             daemon=True,
         )
@@ -258,6 +263,7 @@ def _run_serial_case(
     num_layers: int,
     base_page: int,
     verbose: bool,
+    contiguous_layout: bool,
 ) -> RunStats:
     # Serial case = just reuse the same worker function with procs=1
     return _run_parallel_case(
@@ -269,6 +275,7 @@ def _run_serial_case(
         num_layers=num_layers,
         base_page=base_page,
         verbose=verbose,
+        contiguous_layout=contiguous_layout,
     )
 
 
@@ -331,7 +338,20 @@ def main():
         help="Starting page id (kept disjoint across ranks/iters).",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument(
+        "--not-contiguous",
+        action="store_true",
+        help="Simulated kvcache tensor layout, contiguous by default.",
+    )
     args = ap.parse_args()
+
+    os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = (
+        "false" if args.not_contiguous else "true"
+    )
+    contiguous_layout = (
+        os.getenv("KVCACHED_CONTIGUOUS_LAYOUT", "true").lower() == "true"
+    )
+    print(f"Using layout contiguous={contiguous_layout}")
 
     if args.verbose:
         os.environ["KVCACHED_BENCH_VERBOSE"] = "1"
@@ -345,6 +365,7 @@ def main():
         num_layers=args.num_layers,
         base_page=args.base_page,
         verbose=args.verbose,
+        contiguous_layout=contiguous_layout,
     )
     _print_table(
         "Single Process case (1 proc maps N/P pages)",
@@ -363,6 +384,7 @@ def main():
         num_layers=args.num_layers,
         base_page=args.base_page,
         verbose=args.verbose,
+        contiguous_layout=contiguous_layout,
     )
     _print_table(
         "Serial case (1 proc maps N pages)", serial, args.pages_total, 1, args.iters
@@ -378,6 +400,7 @@ def main():
         num_layers=args.num_layers,
         base_page=args.base_page,
         verbose=args.verbose,
+        contiguous_layout=contiguous_layout,
     )
     _print_table(
         f"Parallel case ({args.procs} procs map N/P each)",

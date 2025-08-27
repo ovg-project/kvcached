@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import multiprocessing as mp
 import os
+import socket
 import sys
 import time
 from importlib.util import module_from_spec, spec_from_file_location
@@ -12,7 +13,7 @@ from typing import Callable, List, Tuple
 import numpy as np
 import torch
 
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
+from kvcached.tp_ipc_util import recv_msg, send_msg
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
 
@@ -86,6 +87,29 @@ def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:
         time.sleep(0.1)
 
 
+def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
+    created = True
+    from kvcached.tp_ipc_util import get_worker_socket_path
+
+    for rank in range(tp_size):
+        socket_path = get_worker_socket_path(rank)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        try:
+            send_msg(sock, {"cmd": "kv_tensors_created"})
+            response = recv_msg(sock)
+            if response.get("status") != "success":
+                raise RuntimeError(
+                    f"Worker {rank} failed to check KV tensors created: {response}"
+                )
+            if not response.get("created"):
+                created = False
+        finally:
+            sock.close()
+
+    return created
+
+
 # ---------------- Worker code ---------------- #
 def _worker_entry(
     rank: int,
@@ -94,10 +118,12 @@ def _worker_entry(
     kvcache_shape: Tuple[int, ...],
     block_size: int,
     async_sched: bool,
+    contiguous_layout: bool,
 ) -> None:
     """
     One worker process = one GPU = one TP rank.
     """
+    os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = "true" if contiguous_layout else "false"
     try:
         torch.cuda.set_device(rank)
         from kvcached.integration.vllm.interfaces import init_kvcached
@@ -143,6 +169,7 @@ def run_benchmark(
     verbose: bool,
     broadcast_fn: Callable,
     impl_key: str,
+    contiguous_layout: bool,
 ) -> None:
     mp.set_start_method("spawn", force=True)
 
@@ -159,7 +186,15 @@ def run_benchmark(
     for rank in range(tp_size):
         p = mp.Process(
             target=_worker_entry,
-            args=(rank, tp_size, num_layers, kvcache_shape, block_size, async_sched),
+            args=(
+                rank,
+                tp_size,
+                num_layers,
+                kvcache_shape,
+                block_size,
+                async_sched,
+                contiguous_layout,
+            ),
             daemon=True,
         )
         p.start()
@@ -185,10 +220,11 @@ def run_benchmark(
     from kvcached.tp_ipc_util import broadcast_unmap_from_kv_tensors_to_workers
 
     for it in range(iters):
-        # Synthetic offsets: contiguous pages → byte-offset list
-        # 50 is just arbitrary --- but it cannot exceed the number of virtual pages
-        page_ids = [50 + i for i in range(pages_per_iter)]
-        offsets = [pid * PAGE_SIZE for pid in page_ids]
+        page_ids = [i for i in range(pages_per_iter)]
+        if contiguous_layout:
+            offsets = [pid * PAGE_SIZE * num_layers * 2 for pid in page_ids]
+        else:
+            offsets = [pid * PAGE_SIZE for pid in page_ids]
 
         # ---------- MAP ----------
         t0 = time.time()
@@ -296,6 +332,11 @@ def _parse_args() -> argparse.Namespace:
         default="seq",
         help="Which broadcast implementation to benchmark (default: seq).",
     )
+    parser.add_argument(
+        "--not-contiguous",
+        action="store_true",
+        help="Simulated kvcache tensor layout, contiguous by default.",
+    )
     return parser.parse_args()
 
 
@@ -303,6 +344,13 @@ if __name__ == "__main__":
     args = _parse_args()
     impl_key = args.map_impl
     broadcast_fn = get_broadcast_impl(impl_key)
+    os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = (
+        "false" if args.not_contiguous else "true"
+    )
+    contiguous_layout = (
+        os.getenv("KVCACHED_CONTIGUOUS_LAYOUT", "true").lower() == "true"
+    )
+    print(f"Using layout contiguous={contiguous_layout}")
 
     try:
         run_benchmark(
@@ -315,6 +363,7 @@ if __name__ == "__main__":
             verbose=args.verbose,
             broadcast_fn=broadcast_fn,
             impl_key=impl_key,
+            contiguous_layout=contiguous_layout,
         )
     except KeyboardInterrupt:
         print("\nInterrupted - shutting down.", flush=True)

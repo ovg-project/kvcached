@@ -146,7 +146,7 @@ class PageAllocator:
             f"Init kvcached KV cache allocator: "
             f"num_layers={num_layers}, "
             f"mem_size_per_layer={mem_size_per_layer//(1024*1024)}MB, "
-            f"total_mem_size={num_layers * mem_size_per_layer//(1024*1024)}MB, "
+            f"total_mem_size={2 * num_layers * mem_size_per_layer//(1024*1024)}MB, "
             f"page_size={page_size//(1024*1024)}MB, "
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
