@@ -19,12 +19,13 @@ MODEL=${model:-$DEFAULT_MODEL}
 VLLM_PORT=${port:-$DEFAULT_VLLM_PORT}
 SGL_PORT=${port:-$DEFAULT_SGL_PORT}
 MODE=${mode:-$DEFAULT_MODE}
+TP_SIZE=${tp_arg:-1}
 
 PYTHON=${PYTHON:-python3}
 
 source "$SCRIPT_DIR/env_detect.sh"
 
-# Detect if the first visible GPU is an NVIDIA L4. 
+# Detect if the first visible GPU is an NVIDIA L4.
 GPU_NAME=$(command -v nvidia-smi >/dev/null 2>&1 && \
            nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 || echo "")
 if [[ "$GPU_NAME" == *"L4"* ]]; then
@@ -35,7 +36,7 @@ fi
 
 if [ "$op" == "vllm" ]; then
     if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/vllm-v0.9.2/.venv/bin/activate"
+        source "$ENGINE_DIR/vllm-kvcached-venv/bin/activate"
     fi
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
@@ -51,10 +52,11 @@ if [ "$op" == "vllm" ]; then
     --no-enable-prefix-caching \
     --gpu-memory-utilization 0.5 \
     --port="$VLLM_PORT" \
+    --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
+        source "$ENGINE_DIR/sglang-kvcached-venv/bin/activate"
     fi
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
@@ -70,6 +72,7 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     --trust-remote-code \
     --mem-fraction-static 0.5 \
     --port "$SGL_PORT" \
+    --tp "$TP_SIZE" \
     $SGL_L4_ARGS
 else
     echo "Invalid option: $op"

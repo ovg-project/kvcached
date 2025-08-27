@@ -100,28 +100,24 @@ EOF
     # 8. Remove any stray compiled extensions from the source tree itself to
     #    avoid confusion when switching between virtual-envs.
     find "$KVCACHED_DIR/kvcached" -maxdepth 1 -name 'vmm_ops*.so' -exec rm -f {} + || true
+
+    # 9. Copy the autopatch.pth file to the site-packages directory
+    PYTHON=${PYTHON:-python3}
+    $PYTHON "$KVCACHED_DIR/tools/dev_copy_pth.py"
 }
 
 setup_vllm() {
     pushd "$ENGINE_DIR"
 
-    git clone -b v0.9.2 https://github.com/vllm-project/vllm.git vllm-v0.9.2
-    cd vllm-v0.9.2
-
-    uv venv --python=python3.11
-    source .venv/bin/activate
+    uv venv vllm-kvcached-venv --python=python3.11
+    source vllm-kvcached-venv/bin/activate
     uv pip install --upgrade pip
 
     # Install requirements for kvcached first to avoid overwriting vLLM's requirements
     install_requirements
     # vLLM-v0.9.2 requires transformers>=4.51.1 but not too new.
     uv pip install transformers==4.51.1
-
-    # use specific version of precompiled wheel
-    pip download "vllm==0.9.2" --no-deps -d /tmp
-    export VLLM_PRECOMPILED_WHEEL_LOCATION=/tmp/vllm-0.9.2-cp38-abi3-manylinux1_x86_64.whl
-    uv pip install --editable .
-    git apply "$SCRIPT_DIR/kvcached-vllm-v0.9.2.patch"
+    uv pip install vllm==0.9.2
 
     # Install kvcached after installing VLLM to find the correct torch version
     if [ "$DEV_MODE" = true ]; then
@@ -137,18 +133,15 @@ setup_vllm() {
 setup_sglang() {
     pushd "$ENGINE_DIR"
 
-    git clone -b v0.4.9 https://github.com/sgl-project/sglang.git sglang-v0.4.9
-    cd sglang-v0.4.9
-
-    uv venv --python=python3.11
-    source .venv/bin/activate
+    uv venv sglang-kvcached-venv --python=python3.11
+    source sglang-kvcached-venv/bin/activate
     uv pip install --upgrade pip
 
     # Install requirements for kvcached first to avoid overwriting sglang's requirements
     install_requirements
 
-    uv pip install -e "python[all]"
-    git apply "$SCRIPT_DIR/kvcached-sglang-v0.4.9.patch"
+    uv pip install torch==2.7.0
+    uv pip install "sglang[all]==0.4.9"
 
     # Install kvcached after install sglang to find the correct torch version
     if [ "$DEV_MODE" = true ]; then
