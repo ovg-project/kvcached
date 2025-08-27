@@ -1,7 +1,7 @@
 import inspect
 import os
 import types
-from typing import Any
+from typing import Any, Union
 
 from wrapt.importer import when_imported
 
@@ -119,8 +119,8 @@ def _inject_elastic_mem_pool(mem_pool_mod: types.ModuleType) -> bool:
             layer_num: int,
             device: str,
             enable_memory_saver: bool,
-            start_layer: int | None = None,
-            end_layer: int | None = None,
+            start_layer: Union[int, None] = None,
+            end_layer: Union[int, None] = None,
             enable_overlap_schedule: bool = True,
         ) -> None:
             # Call grandparent (KVCache) initializer – matches the patch's intent
@@ -235,7 +235,7 @@ def _alias_mem_pool_to_elastic(mem_pool_mod: types.ModuleType) -> bool:
 def _patch_scheduler_memory_leak(sched_mod: types.ModuleType) -> bool:
     Scheduler = getattr(sched_mod, "Scheduler")
 
-    target_method_name: str | None = None
+    target_method_name: Union[str, None] = None
     for name, fn in inspect.getmembers(Scheduler,
                                        predicate=inspect.isfunction):
         try:
