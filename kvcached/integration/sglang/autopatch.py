@@ -123,7 +123,8 @@ def _inject_elastic_mem_pool(mem_pool_mod: types.ModuleType) -> bool:
             end_layer: Union[int, None] = None,
             enable_overlap_schedule: bool = True,
         ) -> None:
-            # Call grandparent (KVCache) initializer – matches the patch's intent
+            # Call grandparent (KVCache) initializer because we redefine
+            # all member variables.
             super(MHATokenToKVPool, self).__init__(
                 size=size,
                 page_size=page_size,

@@ -1,7 +1,7 @@
 import importlib
 import os
 import types
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 from kvcached.utils import get_kvcached_logger
 
@@ -85,6 +85,7 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
 
     BlockPool = getattr(block_pool_mod, "BlockPool")
     KVCacheBlock = getattr(block_pool_mod, "KVCacheBlock")
+    BlockHash = getattr(block_pool_mod, "BlockHash")
 
     class ElasticBlockPool(BlockPool):  # type: ignore
         """ElasticBlockPool that manages KVCacheBlocks using kvcached."""
@@ -114,15 +115,29 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
 
             self.null_block = None  # type: ignore
 
-        def get_cached_block(self, block_hash: Any,
-                             kv_cache_group_ids: list[int]):
+        def get_cached_block(
+            self,
+            block_hash: BlockHash,  # type: ignore[valid-type]
+            kv_cache_group_ids: list[int]
+        ) -> Optional[list[KVCacheBlock]]:  # type: ignore[valid-type]
             return None
 
-        def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
+        def cache_full_blocks(
+                self,
+                request: "Request",  # type: ignore[name-defined] # noqa: F821
+                blocks: list[KVCacheBlock],  # type: ignore[valid-type]
+                block_hashes: list[BlockHash],  # type: ignore[valid-type]
+                num_cached_blocks: int,
+                num_full_blocks: int,
+                block_size: int,
+                kv_cache_group_id: int,
+                hash_fn: Callable) -> None:
             raise NotImplementedError(
                 "Caching is not supported in ElasticBlockPool")
 
-        def get_new_blocks(self, num_blocks: int) -> list[Any]:
+        def get_new_blocks(
+                self, num_blocks: int
+        ) -> list[KVCacheBlock]:  # type: ignore[valid-type]
             if num_blocks > self.get_num_free_blocks():
                 raise ValueError(
                     f"Cannot get {num_blocks} free blocks from the pool")
@@ -132,11 +147,20 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
 
             return [KVCacheBlock(bid) for bid in block_ids]
 
-        def touch(self, blocks: tuple[list[Any], ...]) -> None:
+        def touch(
+            self,
+            blocks: tuple[list[KVCacheBlock], ...]  # type: ignore[valid-type]
+        ) -> None:
             raise NotImplementedError("Not supported in ElasticBlockPool")
 
-        def free_blocks(self, ordered_blocks: Iterable[Any]) -> None:
-            block_ids = [block.block_id for block in ordered_blocks]
+        def free_blocks(
+            self,
+            ordered_blocks: Iterable[KVCacheBlock]  # type: ignore[valid-type]
+        ) -> None:  # type: ignore[valid-type]
+            block_ids = [
+                block.block_id  # type: ignore[attr-defined]
+                for block in ordered_blocks
+            ]
             if len(block_ids) > 0:
                 self.kv_cache_manager.free(block_ids)
 
@@ -149,7 +173,9 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
         def get_usage(self) -> float:
             return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 
-        def take_events(self) -> list[Any]:
+        def take_events(
+            self,
+        ) -> list["KVCacheEvent"]:  # type: ignore[name-defined] # noqa: F821
             return []
 
     setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
@@ -165,7 +191,6 @@ def _patch_engine_core(engine_mod: types.ModuleType) -> bool:
 
     def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
         import os
-        res = original_init(self, vllm_config, *args, **kwargs)
         enable_kvcached = os.getenv("ENABLE_KVCACHED",
                                     "false").lower() == "true"
         if enable_kvcached:
@@ -178,7 +203,7 @@ def _patch_engine_core(engine_mod: types.ModuleType) -> bool:
                 )
             except Exception:
                 pass
-        return res
+        return original_init(self, vllm_config, *args, **kwargs)
 
     if getattr(EngineCore.__init__, "__kvcached_patched__", False) is not True:
         _patched_engine_init.__kvcached_patched__ = True  # type: ignore[attr-defined]
