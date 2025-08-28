@@ -21,12 +21,14 @@ instances: # instances configuration
     engine_env:
       - "VLLM_USE_V1=1"
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+      - "VLLM_SERVER_DEV_MODE=1"
     engine_args:
       - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=12346"
       - "--gpu-memory-utilization 0.5"
+      - "--enable-sleep-mode"
   - name: instance2
     model: Qwen/Qwen3-0.6B
     engine: vllm
@@ -38,12 +40,14 @@ instances: # instances configuration
     engine_env:
       - "VLLM_USE_V1=1"
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+      - "VLLM_SERVER_DEV_MODE=1"
     engine_args:
       - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=12347"
       - "--gpu-memory-utilization 0.5"
+      - "--enable-sleep-mode"
   # - name: instance2
   #   model: Qwen/Qwen3-0.6B
   #   engine: sglang

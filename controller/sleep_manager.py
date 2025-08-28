@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
+import aiohttp
 from traffic_monitor import traffic_monitor
 
 from kvcached.utils import get_kvcached_logger
@@ -18,6 +19,9 @@ class SleepConfig:
     auto_sleep_enabled: bool = False  # Whether to automatically put models to sleep
     wake_on_request: bool = True  # Whether to automatically wake models on request
     min_sleep_duration: int = 60  # Minimum time to keep model asleep (seconds)
+    vllm_models_config: Dict[str, Dict[
+        str,
+        str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
 
 
 class SleepManager:
@@ -31,6 +35,9 @@ class SleepManager:
         )  # Models manually put to sleep
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
+        # Initialize default vLLM models config if not provided
+        if self.config.vllm_models_config is None:
+            self.config.vllm_models_config = {}
 
     async def start(self):
         """Start the sleep manager"""
@@ -71,10 +78,22 @@ class SleepManager:
             return False
 
         try:
-            # In a real implementation, you would:
-            # 1. Send a signal to the model process to reduce resources
-            # 2. Move model weights to storage if needed
-            # 3. Pause request processing for this model
+            # Use vLLM Python API to put model to sleep
+            if model_name in self.config.vllm_models_config:
+                model_config = self.config.vllm_models_config[model_name]
+                host = model_config.get("host", "localhost")
+                port = model_config.get("port", "8000")
+
+                success = await self._call_vllm_sleep_api(host, port, level=1)
+                if not success:
+                    logger.error(
+                        f"Failed to call vLLM sleep API for model {model_name}"
+                    )
+                    return False
+            else:
+                logger.warning(
+                    f"No vLLM configuration found for model {model_name}, using fallback behavior"
+                )
 
             self.sleeping_models[model_name] = time.time()
             if manual:
@@ -114,11 +133,21 @@ class SleepManager:
                     f"minimum is {self.config.min_sleep_duration}s")
                 return False
 
-            # Right now, we just wake up the model by sending a signal to the model process
-            # In a real implementation, you would:
-            # 1. Load model weights back to GPU if needed
-            # 2. Resume request processing for this model
-            # 3. Send wake signal to model process
+            # Use vLLM Python API to wake up the model
+            if model_name in self.config.vllm_models_config:
+                model_config = self.config.vllm_models_config[model_name]
+                host = model_config.get("host", "localhost")
+                port = model_config.get("port", "8000")
+
+                success = await self._call_vllm_wake_api(host, port)
+                if not success:
+                    logger.error(
+                        f"Failed to call vLLM wake API for model {model_name}")
+                    return False
+            else:
+                logger.warning(
+                    f"No vLLM configuration found for model {model_name}, using fallback behavior"
+                )
 
             del self.sleeping_models[model_name]
             self.manual_sleep_models.discard(model_name)
@@ -214,6 +243,118 @@ class SleepManager:
                 logger.info(f"Updated sleep config: {key} = {value}")
             else:
                 logger.warning(f"Unknown config key: {key}")
+
+    async def _call_vllm_sleep_api(self,
+                                   host: str,
+                                   port: str,
+                                   level: int = 1) -> bool:
+        """Call vLLM's sleep API endpoint"""
+        url = f"http://{host}:{port}/sleep"
+        payload = {"level": str(level)}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully called vLLM sleep API at {url} with level {level}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"vLLM sleep API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"Error calling vLLM sleep API at {url}: {e}")
+            return False
+
+    async def _call_vllm_wake_api(self, host: str, port: str) -> bool:
+        """Call vLLM's wake_up API endpoint"""
+        url = f"http://{host}:{port}/wake_up"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully called vLLM wake_up API at {url}")
+                        return True
+                    else:
+                        logger.error(
+                            f"vLLM wake_up API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"Error calling vLLM wake_up API at {url}: {e}")
+            return False
+
+    async def check_model_sleep_status(self,
+                                       model_name: str) -> Optional[bool]:
+        """Check if a model is currently sleeping using vLLM's API
+        
+        Returns:
+            True if sleeping, False if awake, None if unable to determine
+        """
+        if model_name not in self.config.vllm_models_config:
+            logger.warning(
+                f"No vLLM configuration found for model {model_name}")
+            return None
+
+        model_config = self.config.vllm_models_config[model_name]
+        host = model_config.get("host", "localhost")
+        port = model_config.get("port", "8000")
+        url = f"http://{host}:{port}/is_sleeping"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        is_sleeping = result.get("is_sleeping", False)
+                        logger.debug(
+                            f"Model {model_name} sleep status: {is_sleeping}")
+                        return is_sleeping
+                    else:
+                        logger.error(
+                            f"vLLM is_sleeping API returned status {response.status}: {await response.text()}"
+                        )
+                        return None
+        except Exception as e:
+            logger.error(
+                f"Error checking model {model_name} sleep status: {e}")
+            return None
+
+    def add_vllm_model(self,
+                       model_name: str,
+                       host: str = "localhost",
+                       port: str = "8000"):
+        """Add a vLLM model configuration for sleep/wake operations"""
+        self.config.vllm_models_config[model_name] = {
+            "host": host,
+            "port": port
+        }
+        logger.info(
+            f"Added vLLM model configuration: {model_name} at {host}:{port}")
+
+    def remove_vllm_model(self, model_name: str):
+        """Remove a vLLM model configuration"""
+        if model_name in self.config.vllm_models_config:
+            del self.config.vllm_models_config[model_name]
+            logger.info(f"Removed vLLM model configuration: {model_name}")
+        else:
+            logger.warning(
+                f"No vLLM configuration found for model {model_name}")
+
+    def get_vllm_models(self) -> Dict[str, Dict[str, str]]:
+        """Get all configured vLLM models"""
+        return self.config.vllm_models_config.copy()
 
 
 # Global sleep manager instance
