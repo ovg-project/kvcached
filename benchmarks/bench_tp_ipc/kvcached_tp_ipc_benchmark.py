@@ -20,7 +20,7 @@ PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
 
 def get_broadcast_impl(name: str):
     """
-    Return the 'broadcast_map_to_kv_tensors_to_workers' callable for the
+    Return the 'broadcast_map_to_kv_tensors' callable for the
     implementation requested by `name`.
 
     Valid names: 'seq', 'thread', 'async'
@@ -54,7 +54,7 @@ def get_broadcast_impl(name: str):
     module = module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    fn = module.broadcast_map_to_kv_tensors_to_workers
+    fn = module.broadcast_map_to_kv_tensors
 
     if inspect.iscoroutinefunction(fn):
 
@@ -87,7 +87,7 @@ def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:
         time.sleep(0.1)
 
 
-def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
+def broadcast_kv_tensors_created(tp_size: int) -> bool:
     created = True
     from kvcached.tp_ipc_util import get_worker_socket_path
 
@@ -206,7 +206,7 @@ def run_benchmark(
     wait_for_all_worker_sockets(tp_size)
     while True:
         try:
-            if broadcast_kv_tensors_created_to_workers(tp_size):
+            if broadcast_kv_tensors_created(tp_size):
                 break
         except ConnectionRefusedError:
             pass  # listener not up yet
@@ -217,7 +217,7 @@ def run_benchmark(
     # -------- Benchmark loop --------
     map_times: List[float] = []
     unmap_times: List[float] = []
-    from kvcached.tp_ipc_util import broadcast_unmap_from_kv_tensors_to_workers
+    from kvcached.tp_ipc_util import broadcast_unmap_from_kv_tensors
 
     for it in range(iters):
         page_ids = [i for i in range(pages_per_iter)]
@@ -232,7 +232,7 @@ def run_benchmark(
         t1 = time.time()
         # ---------- UNMAP ----------
         t2 = time.time()
-        broadcast_unmap_from_kv_tensors_to_workers(tp_size, offsets)
+        broadcast_unmap_from_kv_tensors(tp_size, offsets)
         t3 = time.time()
 
         map_t = t1 - t0

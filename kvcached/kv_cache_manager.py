@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 from kvcached.locks import NoOpLock
 from kvcached.page_allocator import Page, PageAllocator
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created_to_workers
+from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
 from kvcached.vmm_ops import kv_tensors_created
 
@@ -103,7 +103,7 @@ class KVCacheManager:
 
         def _check_kv_tensors_created():
             if self.tp_size > 1:
-                return broadcast_kv_tensors_created_to_workers(self.tp_size)
+                return broadcast_kv_tensors_created(self.tp_size)
             else:
                 return kv_tensors_created()
 

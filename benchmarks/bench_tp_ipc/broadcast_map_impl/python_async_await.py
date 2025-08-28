@@ -31,11 +31,9 @@ async def send_map_cmd_to_worker_async(rank: int, offsets: list[int]):
         await writer.wait_closed()
 
 
-async def broadcast_map_to_kv_tensors_to_workers(
-    tp_size: int, offsets: list[int]
-) -> None:
+async def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
     """
-    Async version of broadcast_map_to_kv_tensors_to_workers.
+    Async version of broadcast_map_to_kv_tensors.
     Sends 'map_to_kv_tensors' to all TP workers concurrently via asyncio.
     """
 

@@ -134,8 +134,8 @@ async def send_and_receive_message_async(rank: int,
         await writer.wait_closed()
 
 
-async def broadcast_map_to_kv_tensors_to_workers_async(
-        tp_size: int, offsets: list[int]) -> None:
+async def _broadcast_map_to_kv_tensors(tp_size: int,
+                                       offsets: list[int]) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
     """
@@ -154,8 +154,8 @@ async def broadcast_map_to_kv_tensors_to_workers_async(
             raise RuntimeError(f"Worker {rank} failed to map: {response}")
 
 
-async def broadcast_unmap_from_kv_tensors_to_workers_async(
-        tp_size: int, offsets: list[int]) -> None:
+async def _broadcast_unmap_from_kv_tensors(tp_size: int,
+                                           offsets: list[int]) -> None:
     """
     Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
     """
@@ -174,7 +174,7 @@ async def broadcast_unmap_from_kv_tensors_to_workers_async(
             raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
 
 
-async def broadcast_kv_tensors_created_to_workers_async(tp_size: int) -> bool:
+async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
     """
     Broadcast the "kv_tensors_created" operation to all workers concurrently.
     Returns True if all workers report that KV tensors are created, False otherwise.
@@ -204,16 +204,13 @@ async def broadcast_kv_tensors_created_to_workers_async(tp_size: int) -> bool:
 
 
 # Wrapper functions to call the async function from sync code
-def broadcast_map_to_kv_tensors_to_workers(tp_size: int,
-                                           offsets: list[int]) -> None:
-    asyncio.run(broadcast_map_to_kv_tensors_to_workers_async(tp_size, offsets))
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
+    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets))
 
 
-def broadcast_unmap_from_kv_tensors_to_workers(tp_size: int,
-                                               offsets: list[int]) -> None:
-    asyncio.run(
-        broadcast_unmap_from_kv_tensors_to_workers_async(tp_size, offsets))
+def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int]) -> None:
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets))
 
 
-def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
-    return asyncio.run(broadcast_kv_tensors_created_to_workers_async(tp_size))
+def broadcast_kv_tensors_created(tp_size: int) -> bool:
+    return asyncio.run(_broadcast_kv_tensors_created(tp_size))

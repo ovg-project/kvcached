@@ -6,8 +6,8 @@ import torch
 
 from kvcached.locks import ConditionLike, LockLike, NoOpCondition, NoOpLock
 from kvcached.mem_info_tracker import MemInfoTracker
-from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors_to_workers,
-                                  broadcast_unmap_from_kv_tensors_to_workers)
+from kvcached.tp_ipc_util import (broadcast_map_to_kv_tensors,
+                                  broadcast_unmap_from_kv_tensors)
 from kvcached.utils import (CONTIGUOUS_LAYOUT, GPU_UTILIZATION,
                             MAX_RESERVED_PAGES, MIN_RESERVED_PAGES,
                             PAGE_PREALLOC_ENABLED, SANITY_CHECK,
@@ -489,7 +489,7 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # map pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors_to_workers(self.tp_size, offsets)
+            broadcast_map_to_kv_tensors(self.tp_size, offsets)
         else:
             map_to_kv_tensors(offsets)
 
@@ -501,7 +501,7 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
-            broadcast_unmap_from_kv_tensors_to_workers(self.tp_size, offsets)
+            broadcast_unmap_from_kv_tensors(self.tp_size, offsets)
         else:
             if self.async_sched:
                 torch.cuda.synchronize()

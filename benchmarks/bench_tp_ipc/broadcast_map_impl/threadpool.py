@@ -20,7 +20,7 @@ def send_map_cmd_to_worker(rank, offsets):
         sock.close()
 
 
-def broadcast_map_to_kv_tensors_to_workers(tp_size: int, offsets: list[int]) -> None:
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
     """Fire-and-forget broadcast: return only when **all** workers succeed."""
 
     def _send(rank: int):

@@ -197,7 +197,7 @@ Pages Per Iteration     : 1
 * Drop a my_impl.py file into broadcast_map_impl/ that defines:
 
 ```python
-def broadcast_map_to_kv_tensors_to_workers(tp_size: int,
+def broadcast_map_to_kv_tensors(tp_size: int,
                                            offsets: list[int]) -> None:
     ...
 # If you use async def, the factory auto-wraps it with asyncio.run().
