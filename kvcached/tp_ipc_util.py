@@ -108,8 +108,7 @@ def start_worker_listener_thread(rank: int):
     t.start()
 
 
-async def send_and_receive_message_async(rank: int,
-                                         message: Message) -> Message:
+async def _send_and_receive_message(rank: int, message: Message) -> Message:
     """
     Send a message to the worker and receive a response asynchronously.
     """
@@ -141,8 +140,7 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
     """
     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
     tasks = [
-        send_and_receive_message_async(rank, map_message)
-        for rank in range(tp_size)
+        _send_and_receive_message(rank, map_message) for rank in range(tp_size)
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -161,7 +159,7 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
     """
     unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets}
     tasks = [
-        send_and_receive_message_async(rank, unmap_message)
+        _send_and_receive_message(rank, unmap_message)
         for rank in range(tp_size)
     ]
 
@@ -181,7 +179,7 @@ async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
     """
     check_message = {"cmd": "kv_tensors_created"}
     tasks = [
-        send_and_receive_message_async(rank, check_message)
+        _send_and_receive_message(rank, check_message)
         for rank in range(tp_size)
     ]
 
