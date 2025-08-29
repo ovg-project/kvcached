@@ -39,13 +39,9 @@ check_and_download_sharegpt() {
 if [ "$op" == "vllm" ]; then
     check_and_download_sharegpt
     if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/vllm-v0.9.2/.venv/bin/activate"
-        pushd $ENGINE_DIR/vllm-v0.9.2/benchmarks
-    else
-        pushd /vllm-workspace/vllm-v0.9.2/benchmarks
+        source "$ENGINE_DIR/vllm-kvcached-venv/bin/activate"
     fi
-    $PYTHON -m pip install -q pandas datasets
-    $PYTHON benchmark_serving.py --backend=vllm \
+    vllm bench serve \
       --model $MODEL \
       --dataset-name sharegpt \
       --dataset-path $SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json \
@@ -55,11 +51,10 @@ if [ "$op" == "vllm" ]; then
     if [ "$MODE" = "dev" ]; then
         deactivate
     fi
-    popd
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     check_and_download_sharegpt
     if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/sglang-v0.4.9/.venv/bin/activate"
+        source "$ENGINE_DIR/sglang-kvcached-venv/bin/activate"
     fi
 
     $PYTHON -m sglang.bench_serving --backend sglang-oai \

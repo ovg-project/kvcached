@@ -40,6 +40,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.26.0",
     "posix_ipc>=1.0",
+    "wrapt>=1.15",
 ]
 
 [project.scripts]
@@ -69,6 +70,9 @@ exclude = ["*__pycache__*"]
 
 [tool.setuptools.package-data]
 kvcached = ["*.so", "*.pyi", "py.typed"]
+
+[tool.setuptools.data-files]
+"" = ["kvcached_autopatch.pth"]
 
 [tool.mypy]
 plugins = ['pydantic.mypy']
