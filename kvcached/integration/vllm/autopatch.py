@@ -56,9 +56,8 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             "vllm.v1.core.kv_cache_coordinator")
         gpumr_mod = importlib.import_module("vllm.v1.worker.gpu_model_runner")
     except Exception:
-        logger.error(
-            "Failed to import vllm modules, check if vllm==0.9.2 is installed."
-        )
+        logger.error("Failed to import vllm modules, check if a supported "
+                     "vllm version is installed.")
         return
 
     # Apply patches and track success
