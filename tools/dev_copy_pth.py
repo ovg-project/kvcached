@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Copy kvcached_vllm_autopatch.pth into the active site-packages.
+Copy kvcached_autopatch.pth into the active site-packages.
 Used in dev mode when kvcached is installed as editable.
 
 Usage:
