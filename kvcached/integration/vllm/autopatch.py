@@ -307,8 +307,9 @@ def _patch_gpu_model_runner(gpumr_mod: types.ModuleType) -> bool:
                               tp_size=tp_size,
                               is_worker=True,
                               device=device_str)
-        except Exception:
+        except Exception as e:
             # Fail open
+            logger.warning("Failed to initialize kvcached, disabling: %s", e)
             self.enable_kvcached = False
 
     if getattr(GPUModelRunner.__init__, "__kvcached_patched__",

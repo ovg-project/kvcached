@@ -255,7 +255,8 @@ def _patch_scheduler_memory_leak(sched_mod: types.ModuleType) -> bool:
     original = getattr(Scheduler, target_method_name)
 
     def _wrapped(self, *args: Any, **kwargs: Any):
-        # TODO: (YIFAN) currently this is a simple but coarse-grained workaround
+        # TODO: (YIFAN) This is a simple but coarse-grained workaround that
+        # disables memory leak detection when ENABLE_KVCACHED is set.
         if _enable_kvcached():
             return
         return original(self, *args, **kwargs)
