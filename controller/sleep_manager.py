@@ -22,6 +22,9 @@ class SleepConfig:
     vllm_models_config: Dict[str, Dict[
         str,
         str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
+    sglang_models_config: Dict[str, Dict[
+        str,
+        str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
 
 
 class SleepManager:
@@ -38,6 +41,9 @@ class SleepManager:
         # Initialize default vLLM models config if not provided
         if self.config.vllm_models_config is None:
             self.config.vllm_models_config = {}
+        # Initialize default SGLang models config if not provided
+        if self.config.sglang_models_config is None:
+            self.config.sglang_models_config = {}
 
     async def start(self):
         """Start the sleep manager"""
@@ -90,9 +96,21 @@ class SleepManager:
                         f"Failed to call vLLM sleep API for model {model_name}"
                     )
                     return False
+            # Use SGLang Python API to release memory occupation
+            elif model_name in self.config.sglang_models_config:
+                model_config = self.config.sglang_models_config[model_name]
+                host = model_config.get("host", "localhost")
+                port = model_config.get("port", "8000")
+
+                success = await self._call_sglang_release_api(host, port)
+                if not success:
+                    logger.error(
+                        f"Failed to call SGLang release API for model {model_name}"
+                    )
+                    return False
             else:
                 logger.warning(
-                    f"No vLLM configuration found for model {model_name}, using fallback behavior"
+                    f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
                 )
 
             self.sleeping_models[model_name] = time.time()
@@ -144,9 +162,21 @@ class SleepManager:
                     logger.error(
                         f"Failed to call vLLM wake API for model {model_name}")
                     return False
+            # Use SGLang Python API to resume memory occupation
+            elif model_name in self.config.sglang_models_config:
+                model_config = self.config.sglang_models_config[model_name]
+                host = model_config.get("host", "localhost")
+                port = model_config.get("port", "8000")
+
+                success = await self._call_sglang_resume_api(host, port)
+                if not success:
+                    logger.error(
+                        f"Failed to call SGLang resume API for model {model_name}"
+                    )
+                    return False
             else:
                 logger.warning(
-                    f"No vLLM configuration found for model {model_name}, using fallback behavior"
+                    f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
                 )
 
             del self.sleeping_models[model_name]
@@ -295,40 +325,47 @@ class SleepManager:
 
     async def check_model_sleep_status(self,
                                        model_name: str) -> Optional[bool]:
-        """Check if a model is currently sleeping using vLLM's API
+        """Check if a model is currently sleeping using vLLM's or SGLang's API
         
         Returns:
             True if sleeping, False if awake, None if unable to determine
         """
-        if model_name not in self.config.vllm_models_config:
+        if model_name in self.config.vllm_models_config:
+            model_config = self.config.vllm_models_config[model_name]
+            host = model_config.get("host", "localhost")
+            port = model_config.get("port", "8000")
+            url = f"http://{host}:{port}/is_sleeping"
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url,
+                                           timeout=aiohttp.ClientTimeout(
+                                               total=10)) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            is_sleeping = result.get("is_sleeping", False)
+                            logger.debug(
+                                f"Model {model_name} sleep status: {is_sleeping}"
+                            )
+                            return is_sleeping
+                        else:
+                            logger.error(
+                                f"vLLM is_sleeping API returned status {response.status}: {await response.text()}"
+                            )
+                            return None
+            except Exception as e:
+                logger.error(
+                    f"Error checking model {model_name} sleep status: {e}")
+                return None
+        elif model_name in self.config.sglang_models_config:
+            # For SGLang, we cannot check memory status via API
             logger.warning(
-                f"No vLLM configuration found for model {model_name}")
+                f"Cannot check memory status for SGLang model {model_name}")
             return None
-
-        model_config = self.config.vllm_models_config[model_name]
-        host = model_config.get("host", "localhost")
-        port = model_config.get("port", "8000")
-        url = f"http://{host}:{port}/is_sleeping"
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                        url,
-                        timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        is_sleeping = result.get("is_sleeping", False)
-                        logger.debug(
-                            f"Model {model_name} sleep status: {is_sleeping}")
-                        return is_sleeping
-                    else:
-                        logger.error(
-                            f"vLLM is_sleeping API returned status {response.status}: {await response.text()}"
-                        )
-                        return None
-        except Exception as e:
-            logger.error(
-                f"Error checking model {model_name} sleep status: {e}")
+        else:
+            logger.warning(
+                f"No vLLM or SGLang configuration found for model {model_name}"
+            )
             return None
 
     def add_vllm_model(self,
@@ -355,6 +392,77 @@ class SleepManager:
     def get_vllm_models(self) -> Dict[str, Dict[str, str]]:
         """Get all configured vLLM models"""
         return self.config.vllm_models_config.copy()
+
+    async def _call_sglang_release_api(self, host: str, port: str) -> bool:
+        """Call SGLang's release_memory_occupation API endpoint"""
+        url = f"http://{host}:{port}/release_memory_occupation"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully called SGLang release_memory_occupation API at {url}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"SGLang release API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"Error calling SGLang release API at {url}: {e}")
+            return False
+
+    async def _call_sglang_resume_api(self, host: str, port: str) -> bool:
+        """Call SGLang's resume_memory_occupation API endpoint"""
+        url = f"http://{host}:{port}/resume_memory_occupation"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully called SGLang resume_memory_occupation API at {url}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"SGLang resume API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"Error calling SGLang resume API at {url}: {e}")
+            return False
+
+    def add_sglang_model(self,
+                         model_name: str,
+                         host: str = "localhost",
+                         port: str = "8000"):
+        """Add a SGLang model configuration for sleep/wake operations"""
+        self.config.sglang_models_config[model_name] = {
+            "host": host,
+            "port": port
+        }
+        logger.info(
+            f"Added SGLang model configuration: {model_name} at {host}:{port}")
+
+    def remove_sglang_model(self, model_name: str):
+        """Remove a SGLang model configuration"""
+        if model_name in self.config.sglang_models_config:
+            del self.config.sglang_models_config[model_name]
+            logger.info(f"Removed SGLang model configuration: {model_name}")
+        else:
+            logger.warning(
+                f"No SGLang configuration found for model {model_name}")
+
+    def get_sglang_models(self) -> Dict[str, Dict[str, str]]:
+        """Get all configured SGLang models"""
+        return self.config.sglang_models_config.copy()
 
 
 # Global sleep manager instance

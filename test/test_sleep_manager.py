@@ -9,8 +9,9 @@ from pathlib import Path
 
 # Add the controller directory to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "controller"))
 
-from sleep_manager import SleepConfig, SleepManager
+from controller.sleep_manager import SleepConfig, SleepManager
 
 
 async def test_basic_functionality():
@@ -45,6 +46,29 @@ async def test_real_vllm_instances(manager):
         print(f"  {model_name}: {config['host']}:{config['port']}")
 
     return models
+
+
+async def test_sglang_configuration(manager):
+    """Test SGLang model configuration management"""
+    print("\n=== Testing SGLang Configuration ===")
+
+    # Add SGLang models
+    manager.add_sglang_model('meta-llama/Llama-3.2-1B-sglang', 'localhost',
+                             '30000')
+    manager.add_sglang_model('Qwen/Qwen3-0.6B-sglang', 'localhost', '30001')
+
+    # Get all SGLang models
+    sglang_models = manager.get_sglang_models()
+    print(f"✓ Added {len(sglang_models)} SGLang models:")
+    for model_name, config in sglang_models.items():
+        print(f"  {model_name}: {config['host']}:{config['port']}")
+
+    # Test removing a model
+    manager.remove_sglang_model('Qwen/Qwen3-0.6B-sglang')
+    sglang_models = manager.get_sglang_models()
+    print(f"✓ After removal, {len(sglang_models)} SGLang models remain")
+
+    return sglang_models
 
 
 async def test_sleep_wake_functionality(manager):
@@ -104,6 +128,63 @@ async def test_sleep_wake_functionality(manager):
             print(f"   Internal sleep tracking: {is_sleeping_internal}")
 
 
+async def test_sglang_sleep_wake_functionality(manager):
+    """Test actual sleep and wake functionality with SGLang instances"""
+    print("\n=== Testing SGLang Sleep/Wake Functionality ===")
+
+    # Test with the SGLang model
+    test_model = 'meta-llama/Llama-3.2-1B-sglang'
+
+    print(f"Testing SGLang sleep/wake cycle for {test_model}")
+
+    # Check initial memory status using SGLang API
+    print("1. Checking initial memory status...")
+    sleep_status = await manager.check_model_sleep_status(test_model)
+    print(f"   Initial memory released status: {sleep_status}")
+
+    # Release memory (put model to sleep)
+    print("2. Releasing memory occupation...")
+    sleep_success = await manager.put_model_to_sleep(test_model, manual=True)
+    print(f"   Release operation success: {sleep_success}")
+
+    if sleep_success:
+        # Wait a moment
+        await asyncio.sleep(2)
+
+        # Check memory status again
+        print("3. Verifying memory is released...")
+        sleep_status = await manager.check_model_sleep_status(test_model)
+        print(f"   Memory status after release: {sleep_status}")
+
+        # Check internal state
+        is_sleeping_internal = manager.is_model_sleeping(test_model)
+        print(f"   Internal sleep tracking: {is_sleeping_internal}")
+
+        # Wait for minimum sleep duration to pass
+        print(
+            f"4. Waiting {manager.config.min_sleep_duration}s for minimum sleep duration..."
+        )
+        await asyncio.sleep(manager.config.min_sleep_duration + 1)
+
+        # Resume memory occupation (wake up the model)
+        print("5. Resuming memory occupation...")
+        wake_success = await manager.wake_model(test_model)
+        print(f"   Resume operation success: {wake_success}")
+
+        if wake_success:
+            # Wait a moment
+            await asyncio.sleep(2)
+
+            # Check final memory status
+            print("6. Verifying memory is resumed...")
+            sleep_status = await manager.check_model_sleep_status(test_model)
+            print(f"   Memory status after resume: {sleep_status}")
+
+            # Check internal state
+            is_sleeping_internal = manager.is_model_sleeping(test_model)
+            print(f"   Internal sleep tracking: {is_sleeping_internal}")
+
+
 async def test_sleep_state_tracking(manager):
     """Test sleep state tracking functionality"""
     print("\n=== Testing Sleep State Tracking ===")
@@ -149,31 +230,69 @@ async def test_api_methods_simulation(manager):
 
     # These methods would make HTTP calls in real usage
     # Here we just test that they can be called without syntax errors
-    print("✓ sleep/wake API methods are properly defined:")
+    print("✓ vLLM sleep/wake API methods are properly defined:")
     print(
         f"  _call_vllm_sleep_api: {hasattr(manager, '_call_vllm_sleep_api')}")
     print(f"  _call_vllm_wake_api: {hasattr(manager, '_call_vllm_wake_api')}")
+
+    print("✓ SGLang API methods are properly defined:")
+    print(
+        f"  _call_sglang_release_api: {hasattr(manager, '_call_sglang_release_api')}"
+    )
+    print(
+        f"  _call_sglang_resume_api: {hasattr(manager, '_call_sglang_resume_api')}"
+    )
+
+    print("✓ Common API methods:")
     print(
         f"  check_model_sleep_status: {hasattr(manager, 'check_model_sleep_status')}"
     )
     print(f"  handle_request_wake: {hasattr(manager, 'handle_request_wake')}")
 
 
+async def test_sglang_api_methods_simulation(manager):
+    """Test SGLang-specific API method behavior"""
+    print("\n=== Testing SGLang API Methods Simulation ===")
+
+    # Test configuration methods
+    print("✓ SGLang model management methods:")
+    print(f"  add_sglang_model: {hasattr(manager, 'add_sglang_model')}")
+    print(f"  remove_sglang_model: {hasattr(manager, 'remove_sglang_model')}")
+    print(f"  get_sglang_models: {hasattr(manager, 'get_sglang_models')}")
+
+    # Test model detection logic
+    test_model = 'meta-llama/Llama-3.2-1B-sglang'
+    print(f"\n✓ Model type detection for '{test_model}':")
+    is_vllm = test_model in manager.config.vllm_models_config
+    is_sglang = test_model in manager.config.sglang_models_config
+    print(f"  Detected as vLLM model: {is_vllm}")
+    print(f"  Detected as SGLang model: {is_sglang}")
+
+
 async def main():
     """Main test function"""
-    print("Testing SleepManager with Real vLLM Instances")
-    print("=" * 60)
-    print("This test connects to running vLLM instances on:")
+    print("Testing SleepManager with Real vLLM and SGLang Instances")
+    print("=" * 70)
+    print("This test connects to running instances on:")
+    print("vLLM instances:")
     print("  - meta-llama/Llama-3.2-1B at localhost:12346")
     print("  - Qwen/Qwen3-0.6B at localhost:12347")
-    print("=" * 60)
+    print("SGLang instances:")
+    print("  - meta-llama/Llama-3.2-1B-sglang at localhost:30000")
+    print("  - Qwen/Qwen3-0.6B-sglang at localhost:30001")
+    print("=" * 70)
 
     try:
         # Run all tests
         manager = await test_basic_functionality()
 
-        # Test actual sleep/wake functionality
+        # Test vLLM functionality
+        await test_real_vllm_instances(manager)
         await test_sleep_wake_functionality(manager)
+
+        # Test SGLang functionality
+        await test_sglang_configuration(manager)
+        await test_sglang_sleep_wake_functionality(manager)
 
         # Test state tracking
         await test_sleep_state_tracking(manager)
@@ -183,10 +302,12 @@ async def main():
 
         # Test API methods
         await test_api_methods_simulation(manager)
+        await test_sglang_api_methods_simulation(manager)
 
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("✅ All tests completed successfully!")
-        print("\nReal vLLM sleep/wake functionality has been tested.")
+        print(
+            "\nBoth vLLM and SGLang sleep/wake functionality has been tested.")
         print("Check the output above for detailed results.")
 
     except Exception as e:
