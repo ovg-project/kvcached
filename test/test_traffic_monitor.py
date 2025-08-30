@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive test script for traffic monitoring and sleep management functionality
+Comprehensive test script for traffic monitoring functionality
 """
 
 import argparse
@@ -97,20 +97,20 @@ class TrafficMonitorTest:
         print("=" * 50)
 
         endpoints = [
-            "/traffic/stats",
-            "/traffic/stats?window=30",
-            "/traffic/idle",
-            "/traffic/idle?threshold=60",
-            "/traffic/active",
-            "/traffic/active?threshold=60&window=30",
+            "/model/traffic/stats",
+            "/model/traffic/stats?window=30",
+            "/model/traffic/idle",
+            "/model/traffic/idle?threshold=60",
+            "/model/traffic/active",
+            "/model/traffic/active?threshold=60&window=30",
         ]
 
         # Test specific model endpoints - encode model names for URL
         import urllib.parse
         for model in self.test_models:
             encoded_model = urllib.parse.quote(model, safe='')
-            endpoints.append(f"/traffic/stats/model/{encoded_model}")
-            endpoints.append(f"/traffic/stats/model/{encoded_model}?window=30")
+            endpoints.append(f"/model/traffic/stats/{encoded_model}")
+            endpoints.append(f"/model/traffic/stats/{encoded_model}?window=30")
 
         results = {}
         for endpoint in endpoints:
@@ -150,87 +150,6 @@ class TrafficMonitorTest:
 
         return results
 
-    async def test_sleep_endpoints(self, session: aiohttp.ClientSession):
-        """Test all sleep management endpoints"""
-        print("\n😴 Testing Sleep Management Endpoints")
-        print("=" * 50)
-
-        results = {}
-
-        # Test sleep status
-        print("\n🔍 Testing sleep status...")
-        result = await self.test_endpoint(session, "/sleep/status")
-        results["sleep_status"] = result
-
-        if result["success"]:
-            print("  ✅ Sleep status retrieved")
-            data = result["data"]
-            print(
-                f"  💤 Sleeping models: {len(data.get('sleeping_models', {}))}")
-            print(
-                f"  🎯 Sleep candidates: {len(data.get('sleep_candidates', []))}"
-            )
-            print(f"  🔄 Auto-sleep: {data.get('auto_sleep_enabled', False)}")
-        else:
-            print(f"  ❌ Failed: {result.get('error', 'Unknown error')}")
-
-        # Test sleep candidates
-        print("\n🎯 Testing sleep candidates...")
-        result = await self.test_endpoint(session, "/sleep/candidates")
-        results["sleep_candidates"] = result
-
-        if result["success"]:
-            candidates = result["data"].get("sleep_candidates", [])
-            print(f"  ✅ Found {len(candidates)} sleep candidates")
-            for candidate in candidates:
-                print(f"    - {candidate}")
-        else:
-            print(f"  ❌ Failed: {result.get('error', 'Unknown error')}")
-
-        # Test manual sleep/wake cycle
-        test_model = self.test_models[-1]
-        print(f"\n💤 Testing manual sleep for model: {test_model}")
-
-        # URL encode the model name
-        import urllib.parse
-        encoded_test_model = urllib.parse.quote(test_model, safe='')
-        print("!!!", encoded_test_model)
-        # Put model to sleep
-        result = await self.test_endpoint(
-            session, f"/sleep/model/{encoded_test_model}", "POST")
-        results["sleep_model"] = result
-
-        if result["success"]:
-            print("  ✅ Model put to sleep successfully")
-        else:
-            print(f"  ❌ Sleep failed: {result.get('error', 'Unknown error')}")
-
-        # Check sleep status again
-        await asyncio.sleep(1)
-        result = await self.test_endpoint(session, "/sleep/status")
-        if result["success"]:
-            sleeping = result["data"].get("sleeping_models", {})
-            if test_model in sleeping or any(test_model in str(k)
-                                             for k in sleeping.keys()):
-                print("  ✅ Model confirmed sleeping")
-            else:
-                print("  ⚠️  Model not found in sleeping list")
-
-        # Wake model up
-        print(
-            f"\n⏰ Testing wake up for model: {test_model} {encoded_test_model}"
-        )
-        result = await self.test_endpoint(session,
-                                          f"/wake/model/{encoded_test_model}",
-                                          "POST")
-        results["wake_model"] = result
-        if result["success"]:
-            print("  ✅ Model woken up successfully")
-        else:
-            print(f"  ❌ Wake failed: {result.get('error', 'Unknown error')}")
-
-        return results
-
     async def test_integration_scenarios(self, session: aiohttp.ClientSession):
         """Test realistic integration scenarios"""
         print("\n🎯 Testing Integration Scenarios")
@@ -251,7 +170,8 @@ class TrafficMonitorTest:
         await asyncio.sleep(2)
 
         # Check updated statistics
-        stats_result = await self.test_endpoint(session, "/traffic/stats")
+        stats_result = await self.test_endpoint(session,
+                                                "/model/traffic/stats")
         if stats_result["success"]:
             stats = stats_result["data"].get("traffic_stats", {})
             print(f"  📊 Current stats show {len(stats)} models with activity")
@@ -267,45 +187,15 @@ class TrafficMonitorTest:
         print("  Waiting 10 seconds to test idle detection...")
         await asyncio.sleep(10)
 
-        idle_result = await self.test_endpoint(session,
-                                               "/traffic/idle?threshold=5")
+        idle_result = await self.test_endpoint(
+            session, "/model/traffic/idle?threshold=5")
         if idle_result["success"]:
             idle_models = idle_result["data"].get("idle_models", [])
             print(f"  😴 Found {len(idle_models)} models idle for >5 seconds")
 
-        # Scenario 3: Test wake-on-request
-        test_model = self.test_models[0]
-        print(f"\n📋 Scenario 3: Wake-on-Request for {test_model}")
-
-        # URL encode the model name
-        import urllib.parse
-        encoded_test_model = urllib.parse.quote(test_model, safe='')
-
-        # Put model to sleep
-        await self.test_endpoint(session, f"/sleep/model/{encoded_test_model}",
-                                 "POST")
-        await asyncio.sleep(2)
-
-        # Send a request to sleeping model
-        print("  Sending request to sleeping model...")
-        test_request = {
-            "model": test_model,
-            "prompt": "Wake up test",
-            "max_tokens": 10
-        }
-        request_result = await self.test_endpoint(session, "/v1/completions",
-                                                  "POST", test_request)
-
-        if request_result["success"]:
-            print("  ✅ Request succeeded - wake-on-request working")
-        else:
-            print(
-                f"  ❌ Request failed: {request_result.get('error', 'Unknown error')}"
-            )
-
     async def run_all_tests(self):
         """Run all test suites"""
-        print("🚀 Starting Traffic Monitor & Sleep Management Tests")
+        print("🚀 Starting Traffic Monitor Tests")
         print("=" * 60)
         print(f"Base URL: {self.base_url}")
         print(f"Test Models: {', '.join(self.test_models)}")
@@ -357,10 +247,6 @@ class TrafficMonitorTest:
                     session)
                 results["traffic_tests"] = traffic_test_results
 
-                # Test sleep management
-                sleep_test_results = await self.test_sleep_endpoints(session)
-                results["sleep_tests"] = sleep_test_results
-
                 # Test integration scenarios
                 await self.test_integration_scenarios(session)
 
@@ -372,18 +258,11 @@ class TrafficMonitorTest:
                 successful_traffic_tests = sum(
                     1 for r in traffic_test_results.values() if r["success"])
 
-                total_sleep_tests = len(sleep_test_results)
-                successful_sleep_tests = sum(
-                    1 for r in sleep_test_results.values() if r["success"])
-
                 print(
                     f"Traffic Tests: {successful_traffic_tests}/{total_traffic_tests} passed"
                 )
-                print(
-                    f"Sleep Tests: {successful_sleep_tests}/{total_sleep_tests} passed"
-                )
 
-                if successful_traffic_tests == total_traffic_tests and successful_sleep_tests == total_sleep_tests:
+                if successful_traffic_tests == total_traffic_tests:
                     print("🎉 All tests passed!")
                 else:
                     print("⚠️  Some tests failed - check output above")
@@ -406,8 +285,8 @@ async def main():
 
     args = parser.parse_args()
 
-    print("Traffic Monitor & Sleep Management Test Suite")
-    print("============================================")
+    print("Traffic Monitor Test Suite")
+    print("==========================")
     print("Make sure the controller server is running!")
     print(f"Expected server URL: {args.url}")
     print()

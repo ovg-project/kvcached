@@ -57,11 +57,43 @@ curl http://localhost:8080/health
 # Per-model health (URL-*encode* slashes)
 curl "http://localhost:8080/health/meta-llama%2FLlama-3.2-1B"
 
-# Check every configured model
-curl http://localhost:8080/health/all
-
 # See which models the router currently knows about
 curl http://localhost:8080/models
+
+# Get server information
+curl http://localhost:8080/get_server_info
+```
+
+### Traffic Monitoring Examples
+
+```bash
+# Get traffic statistics for all models
+curl http://localhost:8080/model/traffic/stats
+
+# Get traffic statistics for specific model with 120-second window
+curl "http://localhost:8080/model/traffic/stats/meta-llama%2FLlama-3.2-1B?window=120"
+
+# Get idle models (idle for more than 5 minutes)
+curl "http://localhost:8080/model/traffic/idle?threshold=300"
+
+# Get active models with 60-second rate calculation window
+curl "http://localhost:8080/model/traffic/active?threshold=300&window=60"
+```
+
+### Sleep Management Examples
+
+```bash
+# Get sleep status of all models
+curl http://localhost:8080/model/sleep/status
+
+# Put a model to sleep
+curl "http://localhost:8080/model/sleep/meta-llama%2FLlama-3.2-1B" -X POST
+
+# Wake up a sleeping model
+curl "http://localhost:8080/model/wake/meta-llama%2FLlama-3.2-1B" -X POST
+
+# Get sleep candidates
+curl http://localhost:8080/model/sleep/candidates
 ```
 
 ---
@@ -163,11 +195,7 @@ tmux attach -t kvcached-frontend
 tmux ls
 ```
 
-## Traffic Statistics
-(traffic_monitor.py)
-
-### Current Implementation Status
-✅ **Fully Implemented**: The traffic monitoring system is fully functional and tracks real request data.
+## Traffic Statistics (traffic_monitor.py)
 
 ### Core Monitoring Features
 * **Request tracking**: Records all requests per model with timestamps
@@ -182,39 +210,7 @@ tmux ls
 * **Configurable windows**: Supports custom time windows for rate calculations
 * **Thread-safe operations**: Uses locks to ensure data consistency
 
-## Sleep Management
-(sleep_manager.py)
-
-### Current Implementation Status
-⚠️ **Note**: The current sleep management is a **signal-based framework** that only tracks sleep states. It does not actually free resources or pause model processes.
-
-### Current Features (Signal Only)
-* **Sleep state tracking**: Records which models are marked as "sleeping"
-* **Manual sleep/wake operations**: Allows setting/clearing sleep flags
-* **Automatic sleep detection**: Identifies models that should be sleeping based on idle time
-* **Wake-on-request detection**: Detects when requests arrive for sleeping models
-* **Configuration management**: Manages sleep-related settings
-
-### Real Implementation Requirements
-For a production-ready sleep management system, the following would need to be implemented:
-
-#### Resource Management
-* **GPU memory deallocation**: Move model weights from GPU to CPU/storage
-* **Process suspension**: Pause model service processes
-* **Memory optimization**: Release computational resources
-* **Weight storage**: Efficient storage and retrieval of model weights
-
-#### Process Control
-* **Model process management**: Start/stop/suspend model service processes
-* **Resource monitoring**: Track GPU memory usage and computational load
-* **Graceful shutdown**: Proper cleanup when putting models to sleep
-* **Fast recovery**: Quick model reloading when waking up
-
-#### Advanced Features
-* **Partial offloading**: Keep frequently used layers in memory
-* **Predictive loading**: Pre-load models based on usage patterns
-* **Resource scheduling**: Intelligent allocation of limited resources
-* **Failure recovery**: Handle wake-up failures gracefully
+## Sleep Management (sleep_manager.py)
 
 ### Sleep Configuration
 * **Idle threshold**: Configurable idle time before sleep (default: 300s)
@@ -223,24 +219,32 @@ For a production-ready sleep management system, the following would need to be i
 * **Wake-on-request**: Toggle automatic wake functionality
 * **Minimum sleep duration**: Minimum time to keep model asleep (default: 60s)
 
-## New API Endpoints
+## API Endpoints
 (frontend.py)
 
+### Core OpenAI-Compatible Endpoints
+* **POST /v1/completions** - Text completion API
+* **POST /v1/chat/completions** - Chat completion API
+* **GET /health** - Router health check
+* **GET /models** - List all configured models
+* **GET /health/{model_name}** - Specific model health check (URL encode model names)
+* **GET /get_server_info** - Server information
+
 ### Traffic Monitoring Endpoints
-* **GET /traffic/stats** - All models' traffic statistics
-* **GET /traffic/stats/model/{model_name}** - Specific model statistics (URL encode model names)
-* **GET /traffic/idle?threshold=300** - Models idle longer than threshold
-* **GET /traffic/active?threshold=300** - Currently active models
+* **GET /model/traffic/stats?window=60** - All models' traffic statistics (window: time window in seconds for rate calculation)
+* **GET /model/traffic/stats/{model_name}?window=60** - Specific model statistics (URL encode model names, window: time window in seconds)
+* **GET /model/traffic/idle?threshold=300** - Models idle longer than threshold (threshold: idle time threshold in seconds)
+* **GET /model/traffic/active?threshold=300&window=60** - Currently active models (threshold: idle time threshold, window: time window for rate calculation)
 
 ### Sleep Management Endpoints
-* **GET /sleep/status** - Current sleep status of all models
-* **POST /sleep/model/{model_name}** - Manually put a model to sleep
-* **POST /wake/model/{model_name}** - Manually wake up a sleeping model
-* **GET /sleep/candidates** - Models that are candidates for sleep mode
+* **GET /model/sleep/status** - Current sleep status of all models
+* **POST /model/sleep/{model_name}** - Manually put a model to sleep
+* **POST /model/wake/{model_name}** - Manually wake up a sleeping model
+* **GET /model/sleep/candidates** - Models that are candidates for sleep mode
 
 ### Response Examples
 
-#### Traffic Statistics Response
+#### Traffic Statistics Response (All Models)
 
 ```json
 {
@@ -255,7 +259,63 @@ For a production-ready sleep management system, the following would need to be i
       "idle_time_seconds": 45.2,
       "is_idle": false
     }
-  }
+  },
+  "window_seconds": 60
+}
+```
+
+#### Single Model Traffic Statistics Response
+
+```json
+{
+  "model_stats": {
+    "model_name": "meta-llama/Llama-3.2-1B",
+    "total_requests": 150,
+    "successful_requests": 148,
+    "failed_requests": 2,
+    "request_rate": 0.25,
+    "avg_response_time": 1.2,
+    "last_activity_time": 1703123456.789,
+    "idle_time_seconds": 45.2,
+    "is_idle": false
+  },
+  "window_seconds": 60
+}
+```
+
+#### Idle Models Response
+
+```json
+{
+  "idle_models": ["meta-llama/Llama-3.2-1B"],
+  "idle_threshold_seconds": 300,
+  "idle_model_details": {
+    "meta-llama/Llama-3.2-1B": {
+      "idle_time_seconds": 456.7,
+      "total_requests": 150,
+      "last_activity_time": 1703123000.0
+    }
+  },
+  "sleep_mode_candidates": 1
+}
+```
+
+#### Active Models Response
+
+```json
+{
+  "active_models": ["Qwen/Qwen3-0.6B"],
+  "idle_threshold_seconds": 300,
+  "window_seconds": 60,
+  "active_model_details": {
+    "Qwen/Qwen3-0.6B": {
+      "request_rate": 2.5,
+      "total_requests": 300,
+      "avg_response_time": 0.8,
+      "last_activity_time": 1703123456.789
+    }
+  },
+  "active_count": 1
 }
 ```
 
@@ -277,7 +337,35 @@ For a production-ready sleep management system, the following would need to be i
 }
 ```
 
-### URL Encoding for Model Names
+#### Sleep/Wake Response
+
+```json
+{
+  "model_name": "meta-llama/Llama-3.2-1B",
+  "success": true,
+  "message": "Model meta-llama/Llama-3.2-1B sleep request successful"
+}
+```
+
+#### Sleep Candidates Response
+
+```json
+{
+  "sleep_candidates": ["meta-llama/Llama-3.2-1B"],
+  "candidate_details": {
+    "meta-llama/Llama-3.2-1B": {
+      "idle_time_seconds": 456.7,
+      "total_requests": 150,
+      "last_activity_time": 1703123000.0,
+      "can_sleep": true
+    }
+  },
+  "idle_threshold_seconds": 300,
+  "auto_sleep_enabled": true
+}
+```
+
+### Note: URL Encoding for Model Names
 When using endpoints with model names containing slashes (e.g., `meta-llama/Llama-3.2-1B`), URL encode the slashes:
 * Original: `meta-llama/Llama-3.2-1B`
 * Encoded: `meta-llama%2FLlama-3.2-1B`
@@ -285,46 +373,15 @@ When using endpoints with model names containing slashes (e.g., `meta-llama/Llam
 Example:
 
 ```bash
-curl "http://localhost:8081/traffic/stats/model/meta-llama%2FLlama-3.2-1B"
-curl "http://localhost:8081/sleep/model/meta-llama%2FLlama-3.2-1B" -X POST
+# Traffic statistics for specific model
+curl "http://localhost:8081/model/traffic/stats/meta-llama%2FLlama-3.2-1B"
+
+# Put model to sleep
+curl "http://localhost:8081/model/sleep/meta-llama%2FLlama-3.2-1B" -X POST
+
+# Wake up model
+curl "http://localhost:8081/model/wake/meta-llama%2FLlama-3.2-1B" -X POST
+
+# Model health check
+curl "http://localhost:8081/health/meta-llama%2FLlama-3.2-1B"
 ```
-
-## Implementation Status Summary
-
-### ✅ Fully Implemented
-* **Traffic Monitoring**: Complete request tracking, statistics, and analysis
-* **Multi-model Routing**: Full OpenAI-compatible API with request routing
-* **Process Management**: tmux-based service management
-* **Configuration System**: YAML-based declarative configuration
-
-### ⚠️ Signal-Based Framework (Not Fully Implemented)
-* **Sleep Management**: Currently only tracks sleep states, does not actually free resources
-* **Resource Optimization**: Framework exists but no actual GPU memory management
-* **Process Control**: Sleep/wake signals are recorded but not acted upon
-
-### 🔄 Future Implementation Requirements
-For production deployment, the following would need to be implemented:
-
-#### Sleep Management Enhancement
-
-```python
-# Example of what real implementation would look like:
-async def put_model_to_sleep(self, model_name: str):
-    # 1. Send signal to model process to reduce resources
-    await self.send_sleep_signal(model_name)
-    
-    # 2. Move model weights to storage
-    await self.offload_model_weights(model_name)
-    
-    # 3. Pause request processing
-    await self.pause_model_service(model_name)
-    
-    # 4. Release GPU memory
-    await self.free_gpu_memory(model_name)
-```
-
-#### Resource Management
-* **GPU Memory Management**: Actual deallocation and reallocation
-* **Process Lifecycle**: Start/stop/suspend model processes
-* **Weight Storage**: Efficient model weight persistence
-* **Performance Optimization**: Minimize wake-up latency

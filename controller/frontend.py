@@ -38,19 +38,22 @@ class MultiLLMFrontend:
                                 self.handle_get_server_info)
 
         # Traffic monitoring endpoints
-        self.app.router.add_get('/traffic/stats', self.handle_traffic_stats)
-        self.app.router.add_get('/traffic/stats/model/{model_name}',
+        self.app.router.add_get('/model/traffic/stats',
+                                self.handle_traffic_stats)
+        self.app.router.add_get('/model/traffic/stats/{model_name}',
                                 self.handle_model_traffic_stats)
-        self.app.router.add_get('/traffic/idle', self.handle_idle_models)
-        self.app.router.add_get('/traffic/active', self.handle_active_models)
+        self.app.router.add_get('/model/traffic/idle', self.handle_idle_models)
+        self.app.router.add_get('/model/traffic/active',
+                                self.handle_active_models)
 
         # Sleep management endpoints
-        self.app.router.add_get('/sleep/status', self.handle_sleep_status)
-        self.app.router.add_post('/sleep/model/{model_name}',
+        self.app.router.add_get('/model/sleep/status',
+                                self.handle_sleep_status)
+        self.app.router.add_post('/model/sleep/{model_name}',
                                  self.handle_sleep_model)
-        self.app.router.add_post('/wake/model/{model_name}',
+        self.app.router.add_post('/model/wake/{model_name}',
                                  self.handle_wake_model)
-        self.app.router.add_get('/sleep/candidates',
+        self.app.router.add_get('/model/sleep/candidates',
                                 self.handle_sleep_candidates)
 
     async def handle_completion(self, request: web.Request) -> web.Response:
