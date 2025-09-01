@@ -130,27 +130,27 @@ python test_traffic_monitor.py
 ## API Endpoints
 
 ### Core OpenAI-Compatible
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | /v1/completions | Text completion API |
-| POST | /v1/chat/completions | Chat completion API |
-| GET | /health | Router health check |
-| GET | /models | List all configured models |
-| GET | /health/{model_name} | Specific model health check (URL encode model names) |
-| GET | /get_server_info | Server information |
+| Endpoint | Description |
+| --- | --- |
+| `/v1/completions` | Text completion API |
+| `/v1/chat/completions` | Chat completion API |
+| `/health` | Router health check |
+| `/models` | List all configured models |
+| `/health/{model_name}` | Specific model health check (URL encode model names) |
+| `/get_server_info` | Server information |
 
 ### Traffic Monitoring
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | /traffic/stats?window=60 | All models' traffic statistics (window: time window in seconds for rate calculation) |
-| GET | /traffic/stats/{model_name}?window=60 | Specific model statistics (URL encode model names, window: time window in seconds) |
-| GET | /models/idle?threshold=300 | Models idle longer than threshold (threshold: idle time threshold in seconds) |
-| GET | /models/active?threshold=300&window=60 | Currently active models (threshold: idle time threshold, window: time window for rate calculation) |
+| Endpoint | Description |
+| --- | --- |
+| `/traffic/stats?window=60` | All models' traffic statistics (window: time window in seconds for rate calculation) |
+| `/traffic/stats/{model_name}?window=60` | Specific model statistics (URL encode model names, window: time window in seconds) |
+| `/models/idle?threshold=300` | Models idle longer than threshold (threshold: idle time threshold in seconds) |
+| `/models/active?threshold=300&window=60` | Currently active models (threshold: idle time threshold, window: time window for rate calculation) |
 
 ### Sleep Management
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | /sleep/status | Current sleep status of all models |
-| POST | /action/sleep/{model_name} | Manually put a model to sleep |
-| POST | /action/wakeup/{model_name} | Manually wake up a sleeping model |
-| GET | /sleep/candidates | Models that are candidates for sleep mode |
+| Endpoint | Description |
+| --- | --- |
+| `/sleep/status` | Current sleep status of all models |
+| `/action/sleep/{model_name}` | Manually put a model to sleep |
+| `/action/wakeup/{model_name}` | Manually wake up a sleeping model |
+| `/sleep/candidates` | Models that are candidates for sleep mode |
