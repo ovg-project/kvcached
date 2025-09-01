@@ -50,9 +50,9 @@ class MultiLLMFrontend:
         self.app.router.add_get('/model/sleep/status',
                                 self.handle_sleep_status)
         self.app.router.add_post('/model/sleep/{model_name}',
-                                 self.handle_sleep_model)
+                                 self.handle_model_sleep)
         self.app.router.add_post('/model/wake/{model_name}',
-                                 self.handle_wake_model)
+                                 self.handle_model_wakeup)
         self.app.router.add_get('/model/sleep/candidates',
                                 self.handle_sleep_candidates)
 
@@ -409,7 +409,7 @@ class MultiLLMFrontend:
                                 status=500,
                                 content_type='application/json')
 
-    async def handle_sleep_model(self, request: web.Request) -> web.Response:
+    async def handle_model_sleep(self, request: web.Request) -> web.Response:
         """Handle requests to put a model to sleep"""
         try:
             import urllib.parse
@@ -441,7 +441,7 @@ class MultiLLMFrontend:
                                 status=500,
                                 content_type='application/json')
 
-    async def handle_wake_model(self, request: web.Request) -> web.Response:
+    async def handle_model_wakeup(self, request: web.Request) -> web.Response:
         """Handle requests to wake up a sleeping model"""
         try:
             import urllib.parse
