@@ -27,7 +27,7 @@ async def test_basic_functionality():
     print("✓ SleepManager created successfully")
     print(f"  Auto sleep enabled: {manager.config.auto_sleep_enabled}")
     print(f"  Idle threshold: {manager.config.idle_threshold_seconds}s")
-    print(f"  Wake on request: {manager.config.wake_on_request}")
+    print(f"  Wake on request: {manager.config.wakeup_on_request}")
     print(f"  Min sleep duration: {manager.config.min_sleep_duration}s")
 
     return manager

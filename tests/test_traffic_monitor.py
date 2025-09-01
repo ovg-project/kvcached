@@ -98,20 +98,20 @@ class TrafficMonitorTest:
         print("=" * 50)
 
         endpoints = [
-            "/model/traffic/stats",
-            "/model/traffic/stats?window=30",
-            "/model/traffic/idle",
-            "/model/traffic/idle?threshold=60",
-            "/model/traffic/active",
-            "/model/traffic/active?threshold=60&window=30",
+            "/traffic/stats",
+            "/traffic/stats?window=30",
+            "/models/idle",
+            "/models/idle?threshold=60",
+            "/models/active",
+            "/models/active?threshold=60&window=30",
         ]
 
         # Test specific model endpoints - encode model names for URL
         import urllib.parse
         for model in self.test_models:
             encoded_model = urllib.parse.quote(model, safe='')
-            endpoints.append(f"/model/traffic/stats/{encoded_model}")
-            endpoints.append(f"/model/traffic/stats/{encoded_model}?window=30")
+            endpoints.append(f"/traffic/stats/{encoded_model}")
+            endpoints.append(f"/traffic/stats/{encoded_model}?window=30")
 
         results = {}
         for endpoint in endpoints:
@@ -171,8 +171,7 @@ class TrafficMonitorTest:
         await asyncio.sleep(2)
 
         # Check updated statistics
-        stats_result = await self.test_endpoint(session,
-                                                "/model/traffic/stats")
+        stats_result = await self.test_endpoint(session, "/traffic/stats")
         if stats_result["success"]:
             stats = stats_result["data"].get("traffic_stats", {})
             print(f"  📊 Current stats show {len(stats)} models with activity")
@@ -188,8 +187,8 @@ class TrafficMonitorTest:
         print("  Waiting 10 seconds to test idle detection...")
         await asyncio.sleep(10)
 
-        idle_result = await self.test_endpoint(
-            session, "/model/traffic/idle?threshold=5")
+        idle_result = await self.test_endpoint(session,
+                                               "/models/idle?threshold=5")
         if idle_result["success"]:
             idle_models = idle_result["data"].get("idle_models", [])
             print(f"  😴 Found {len(idle_models)} models idle for >5 seconds")
