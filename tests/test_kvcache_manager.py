@@ -8,7 +8,10 @@ os.environ[
     "KVCACHED_CONTIGUOUS_LAYOUT"] = "true" if contiguous_layout else "false"
 
 from kvcached.integration.sglang.interfaces import (  # noqa: E402
-    alloc_kv_cache, init_kvcached, shutdown_kvcached)
+    alloc_kv_cache,
+    init_kvcached,
+    shutdown_kvcached,
+)
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
 
 total_tokens = 2864

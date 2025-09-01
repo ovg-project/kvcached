@@ -4,22 +4,15 @@ default_install_hook_types:
 default_stages:
   - pre-commit # Run locally
   - manual # Run in CI
-exclude: 'engine_integration/vllm-v0.8.4|engine_integration/sglang-v0.4.6.post2'
+exclude: '^engine_integration/(vllm|sglang)(-[^/]+)?/.*|sglang-kvcached-venv|vllm-kvcached-venv'
 repos:
-- repo: https://github.com/google/yapf
-  rev: v0.43.0
-  hooks:
-  - id: yapf
-    args: [--in-place, --verbose]
-    # Keep the same list from yapfignore here to avoid yapf failing without any inputs
-    exclude: '(.buildkite|benchmarks|build|examples)/.*'
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.11.7
   hooks:
   - id: ruff
     args: [--output-format, github, --fix]
   - id: ruff-format
-    files: ^(.buildkite|benchmarks|examples)/.*
+    files: ^(.buildkite)/.*
 - repo: https://github.com/codespell-project/codespell
   rev: v2.4.1
   hooks:

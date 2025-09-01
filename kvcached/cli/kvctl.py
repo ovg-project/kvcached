@@ -8,10 +8,8 @@ import sys
 import time
 from typing import List, Optional, TypedDict
 
-from kvcached.cli.kvtop import _detect_kvcache_ipc_names
-from kvcached.cli.kvtop import kvtop as kvtop_ui
-from kvcached.cli.utils import (_format_size, get_kv_cache_limit,
-                                update_kv_cache_limit)
+from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
+from kvcached.cli.utils import _format_size, get_kv_cache_limit, update_kv_cache_limit
 
 try:
     import readline  # type: ignore

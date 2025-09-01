@@ -107,8 +107,7 @@ def _inject_elastic_block_pool(block_pool_mod: types.ModuleType) -> bool:
             self.enable_kv_cache_events = enable_kv_cache_events
             self.kv_event_queue = []  # type: ignore[var-annotated]
 
-            from kvcached.integration.vllm.interfaces import \
-                get_kv_cache_manager
+            from kvcached.integration.vllm.interfaces import get_kv_cache_manager
             self.kv_cache_manager = get_kv_cache_manager(
                 num_gpu_blocks, block_size, cell_size, num_layers)
 
@@ -241,8 +240,7 @@ def _patch_kv_cache_coordinator(kvcoord_mod: types.ModuleType,
             cell_size = kv_cache_spec.page_size_bytes // block_size // 2
 
             try:
-                from vllm.distributed.parallel_state import \
-                    get_tensor_model_parallel_world_size
+                from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
                 tp_size = int(get_tensor_model_parallel_world_size())
             except Exception:
                 tp_size = 1
@@ -289,7 +287,8 @@ def _patch_gpu_model_runner(gpumr_mod: types.ModuleType) -> bool:
         try:
             from vllm.distributed.parallel_state import (
                 get_tensor_model_parallel_rank,
-                get_tensor_model_parallel_world_size)
+                get_tensor_model_parallel_world_size,
+            )
             tp_rank = int(get_tensor_model_parallel_rank())
             tp_size = int(get_tensor_model_parallel_world_size())
         except Exception:
@@ -321,8 +320,7 @@ def _patch_gpu_model_runner(gpumr_mod: types.ModuleType) -> bool:
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
-            from vllm.v1.kv_cache_interface import (FullAttentionSpec,
-                                                    KVCacheTensor)
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 
             if len(kv_cache_config.kv_cache_groups) > 1:
                 raise NotImplementedError(

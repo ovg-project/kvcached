@@ -4,8 +4,7 @@ import os
 import time
 from typing import List, Optional, Union
 
-from kvcached.cli.utils import (SHM_DIR, MemInfoStruct, RwLockedShm,
-                                _format_size, get_ipc_name)
+from kvcached.cli.utils import SHM_DIR, MemInfoStruct, RwLockedShm, _format_size, get_ipc_name
 
 
 def _detect_kvcache_ipc_names() -> List[str]:

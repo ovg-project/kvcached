@@ -4,8 +4,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from utils import (collect_env_mods, ensure_tmux_session, launch_in_tmux,
-                   set_ulimit)
+from utils import collect_env_mods, ensure_tmux_session, launch_in_tmux, set_ulimit
 
 
 def load_config(config_path: str = "example-config.yaml"):
