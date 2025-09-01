@@ -38,23 +38,23 @@ class MultiLLMFrontend:
                                 self.handle_get_server_info)
 
         # Traffic monitoring endpoints
-        self.app.router.add_get('/model/traffic/stats',
-                                self.handle_traffic_stats)
-        self.app.router.add_get('/model/traffic/stats/{model_name}',
+        self.app.router.add_get('/traffic/stats', self.handle_traffic_stats)
+        self.app.router.add_get('/traffic/stats/{model_name}',
                                 self.handle_model_traffic_stats)
-        self.app.router.add_get('/model/traffic/idle', self.handle_idle_models)
-        self.app.router.add_get('/model/traffic/active',
-                                self.handle_active_models)
+
+        # Model idle/active status check endpoints
+        self.app.router.add_get('/models/idle', self.handle_list_idle_models)
+        self.app.router.add_get('/models/active',
+                                self.handle_list_active_models)
 
         # Sleep management endpoints
-        self.app.router.add_get('/model/sleep/status',
-                                self.handle_sleep_status)
-        self.app.router.add_post('/model/sleep/{model_name}',
-                                 self.handle_model_sleep)
-        self.app.router.add_post('/model/wake/{model_name}',
-                                 self.handle_model_wakeup)
-        self.app.router.add_get('/model/sleep/candidates',
+        self.app.router.add_get('/sleep/status', self.handle_sleep_status)
+        self.app.router.add_get('/sleep/candidates',
                                 self.handle_sleep_candidates)
+        self.app.router.add_post('/action/sleep/{model_name}',
+                                 self.handle_model_sleep)
+        self.app.router.add_post('/action/wakeup/{model_name}',
+                                 self.handle_model_wakeup)
 
     async def handle_completion(self, request: web.Request) -> web.Response:
         """Handle completion requests"""
@@ -299,7 +299,8 @@ class MultiLLMFrontend:
                                 status=500,
                                 content_type='application/json')
 
-    async def handle_idle_models(self, request: web.Request) -> web.Response:
+    async def handle_list_idle_models(self,
+                                      request: web.Request) -> web.Response:
         """Handle requests for idle models that could be put to sleep"""
         try:
             # Get optional threshold parameter
@@ -326,7 +327,7 @@ class MultiLLMFrontend:
                 idle_threshold,
                 "idle_model_details":
                 idle_model_stats,
-                "sleep_mode_candidates":
+                "idle_models_count":
                 len(idle_models)
             }),
                                 status=200,
@@ -337,7 +338,8 @@ class MultiLLMFrontend:
                                 status=500,
                                 content_type='application/json')
 
-    async def handle_active_models(self, request: web.Request) -> web.Response:
+    async def handle_list_active_models(self,
+                                        request: web.Request) -> web.Response:
         """Handle requests for active models"""
         try:
             # Get optional threshold parameter
@@ -372,7 +374,7 @@ class MultiLLMFrontend:
                 window_seconds,
                 "active_model_details":
                 active_model_stats,
-                "active_count":
+                "active_models_count":
                 len(active_models)
             }),
                                 status=200,
@@ -398,7 +400,7 @@ class MultiLLMFrontend:
                 sleep_manager.config.auto_sleep_enabled,
                 "idle_threshold_seconds":
                 sleep_manager.config.idle_threshold_seconds,
-                "wake_on_request":
+                "wakeup_on_request":
                 sleep_manager.config.wake_on_request
             }),
                                 status=200,
