@@ -1,3 +1,4 @@
+import asyncio
 import os
 import pickle
 import socket
@@ -58,7 +59,7 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
-def start_worker_listerner_thread(rank: int):
+def start_worker_listener_thread(rank: int):
     """
     Start a thread that listens for messages on the worker socket.
     The callback is called with the received message.
@@ -107,55 +108,107 @@ def start_worker_listerner_thread(rank: int):
     t.start()
 
 
-def broadcast_map_to_kv_tensors_to_workers(tp_size: int,
+async def _send_and_receive_message(rank: int, message: Message) -> Message:
+    """
+    Send a message to the worker and receive a response asynchronously.
+    """
+    socket_path = get_worker_socket_path(rank)
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+
+    try:
+        # Send map command
+        data = pickle.dumps(message)
+        writer.write(len(data).to_bytes(4, 'big') + data)
+        await writer.drain()
+
+        # Read the length of the response from worker
+        length_bytes = await reader.readexactly(4)
+        length = int.from_bytes(length_bytes, 'big')
+
+        # Read the actual response data
+        data = await reader.readexactly(length)
+        return cast(Message, pickle.loads(data))
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _broadcast_map_to_kv_tensors(tp_size: int,
+                                       offsets: list[int]) -> None:
+    """
+    Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
+    """
+    map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
+    tasks = [
+        _send_and_receive_message(rank, map_message) for rank in range(tp_size)
+    ]
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    for rank, response in enumerate(responses):
+        if isinstance(response, Exception):
+            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+        elif not isinstance(response,
+                            dict) or response.get("status") != "success":
+            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+
+
+async def _broadcast_unmap_from_kv_tensors(tp_size: int,
                                            offsets: list[int]) -> None:
-    for rank in range(tp_size):
-        socket_path = get_worker_socket_path(rank)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        try:
-            send_msg(sock, {"cmd": "map_to_kv_tensors", "offsets": offsets})
-            response: Message = recv_msg(sock)
-            if response.get("status") != "success":
-                raise RuntimeError(f"Worker {rank} failed to map: {response}")
-        finally:
-            sock.close()
+    """
+    Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
+    """
+    unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets}
+    tasks = [
+        _send_and_receive_message(rank, unmap_message)
+        for rank in range(tp_size)
+    ]
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    for rank, response in enumerate(responses):
+        if isinstance(response, Exception):
+            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
+        elif not isinstance(response,
+                            dict) or response.get("status") != "success":
+            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
 
 
-def broadcast_unmap_from_kv_tensors_to_workers(tp_size: int,
-                                               offsets: list[int]) -> None:
-    for rank in range(tp_size):
-        socket_path = get_worker_socket_path(rank)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        try:
-            send_msg(sock, {
-                "cmd": "unmap_from_kv_tensors",
-                "offsets": offsets
-            })
-            response: Message = recv_msg(sock)
-            if response.get("status") != "success":
-                raise RuntimeError(f"Worker {rank} failed to unmap {response}")
-        finally:
-            sock.close()
+async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
+    """
+    Broadcast the "kv_tensors_created" operation to all workers concurrently.
+    Returns True if all workers report that KV tensors are created, False otherwise.
+    """
+    check_message = {"cmd": "kv_tensors_created"}
+    tasks = [
+        _send_and_receive_message(rank, check_message)
+        for rank in range(tp_size)
+    ]
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    all_created = True
+    for rank, response in enumerate(responses):
+        if isinstance(response, Exception):
+            raise RuntimeError(
+                f"Worker {rank} failed to check KV tensors created: {response}"
+            )
+        elif not isinstance(response,
+                            dict) or response.get("status") != "success":
+            raise RuntimeError(
+                f"Worker {rank} failed to check KV tensors created: {response}"
+            )
+        elif not response.get("created", False):
+            all_created = False
+
+    return all_created
 
 
-def broadcast_kv_tensors_created_to_workers(tp_size: int) -> bool:
-    created = True
-    for rank in range(tp_size):
-        socket_path = get_worker_socket_path(rank)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        try:
-            send_msg(sock, {"cmd": "kv_tensors_created"})
-            response: Message = recv_msg(sock)
-            if response.get("status") != "success":
-                raise RuntimeError(
-                    f"Worker {rank} failed to check KV tensors created: {response}"
-                )
-            if not response.get("created"):
-                created = False
-        finally:
-            sock.close()
+# Wrapper functions to call the async function from sync code
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
+    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets))
 
-    return created
+
+def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int]) -> None:
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets))
+
+
+def broadcast_kv_tensors_created(tp_size: int) -> bool:
+    return asyncio.run(_broadcast_kv_tensors_created(tp_size))

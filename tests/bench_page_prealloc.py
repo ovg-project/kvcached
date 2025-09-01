@@ -82,22 +82,27 @@ def _run_single_benchmark_kvcache(prealloc_enabled: bool, total_tokens: int,
     """Run one benchmark variant using KVCacheManager and return the alloc and free times (seconds)."""
 
     # Reload the module to reset global state between variants.
-    kv_cache_manager = importlib.import_module(MODULE_PATH)
-    importlib.reload(kv_cache_manager)
+    kv_cache_module = importlib.import_module(MODULE_PATH)
+    importlib.reload(kv_cache_module)
 
     # Set preallocation flag before any PageAllocator/KVCacheManager is created
-    setattr(kv_cache_manager, "PAGE_PREALLOC_ENABLED", prealloc_enabled)
+    setattr(kv_cache_module, "PAGE_PREALLOC_ENABLED", prealloc_enabled)
 
     init_kvcached()
 
     # Allocate dummy KV buffers (simulate real usage)
     dtype_obj = getattr(torch, dtype)
-    k_buffer, v_buffer = alloc_kv_cache(total_tokens, head_num, head_dim,
-                                        dtype_obj, device, num_layers)
+    kvcache_shape = (643009, 8, 64)
+    k_buffer, v_buffer = alloc_kv_cache(
+        kvcache_shape,
+        dtype_obj,
+        device,
+        num_layers,
+    )
 
     print(f"cell_size =  {head_num * head_dim * dtype_obj.itemsize} bytes")
 
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager_instance = KVCacheManager(
         num_blocks=total_tokens,
         block_size=1,
         cell_size=head_num * head_dim * dtype_obj.itemsize,
@@ -105,12 +110,12 @@ def _run_single_benchmark_kvcache(prealloc_enabled: bool, total_tokens: int,
     )
 
     # Warm-up
-    _llm_sim_kvcache_benchmark(kv_cache_manager, iterations // 10, batch_size,
-                               delete_after)
+    _llm_sim_kvcache_benchmark(kv_cache_manager_instance, iterations // 10,
+                               batch_size, delete_after)
 
     # Run the actual benchmark
     total_alloc_time, total_free_time = _llm_sim_kvcache_benchmark(
-        kv_cache_manager, iterations, batch_size, delete_after)
+        kv_cache_manager_instance, iterations, batch_size, delete_after)
 
     shutdown_kvcached()
     return total_alloc_time, total_free_time

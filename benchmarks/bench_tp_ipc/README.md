@@ -39,9 +39,10 @@ python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --
 | --num-layers        | 32        | Dummy layer count for alloc_kv_cache(). Only affect the number of virtual pages    |
 | --async-sched       | off       | Whether asynchronous scheduling is enabled, input arg of init_kvcached
 | --block-size        | 16        | Number of tokens in a cache block. Actually not used by vLLM interfaces.    |
+| --not-contiguous        | store_true        | KV tensor layout.    |
 
 ### Example
-Test different implementations on 4 A40 GPUs with PCIe interconnect.
+Test different implementations on 4 L40S GPUs with PCIe interconnect.
 #### Sequential socket
 
 ```bash
@@ -58,12 +59,36 @@ Pages Per Iteration     : 1
 +---------------+-----------+------------+
 | Metric        |  Map (ms) | Unmap (ms) |
 |---------------|-----------|------------|
-| mean          |     44.29 |      55.61 |
-| p95           |     47.19 |      57.46 |
-| max           |     96.31 |      68.16 |
-| min           |     40.80 |      54.36 |
+| mean          |     3.15 |      2.43 |
+| p95           |     3.55 |      2.85 |
+| max           |     5.95 |      3.38 |
+| min           |     2.71 |      2.09 |
 |---------------|-----------|------------|
-| per-page mean |     44.29 |      55.61 |
+| per-page mean |     3.15 |      2.43 |
++---------------+-----------+------------+
+
+```
+
+```bash
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl seq --not-contiguous
+```
+
+```
+=== IPC Benchmark Summary ===
+Broadcast impl       : seq (sequential_sync.py)
+TP size                 : 4
+Iterations              : 20
+Pages Per Iteration     : 1
+
++---------------+-----------+------------+
+| Metric        |  Map (ms) | Unmap (ms) |
+|---------------|-----------|------------|
+| mean          |     83.93 |      66.93 |
+| p95           |     97.70 |      71.24 |
+| max           |     134.70 |      79.72 |
+| min           |     70.37 |      60.35 |
+|---------------|-----------|------------|
+| per-page mean |     83.93 |      66.93 |
 +---------------+-----------+------------+
 
 ```
@@ -84,12 +109,36 @@ Pages Per Iteration     : 1
 +---------------+-----------+------------+
 | Metric        |  Map (ms) | Unmap (ms) |
 |---------------|-----------|------------|
-| mean          |     34.21 |      57.86 |
-| p95           |     37.71 |      68.26 |
-| max           |     40.96 |      68.92 |
-| min           |     31.41 |      55.03 |
+| mean          |     2.57 |      2.05 |
+| p95           |     3.44 |      2.63 |
+| max           |     3.94 |      3.08 |
+| min           |     2.21 |      1.57 |
 |---------------|-----------|------------|
-| per-page mean |     34.21 |      57.86 |
+| per-page mean |     2.57 |      2.05 |
++---------------+-----------+------------+
+
+```
+
+```bash
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl thread --not-contiguous
+```
+
+```
+=== IPC Benchmark Summary ===
+Broadcast impl       : thread (threadpool.py)
+TP size                 : 4
+Iterations              : 20
+Pages Per Iteration     : 1
+
++---------------+-----------+------------+
+| Metric        |  Map (ms) | Unmap (ms) |
+|---------------|-----------|------------|
+| mean          |     42.74 |      38.71 |
+| p95           |     55.14 |      42.00 |
+| max           |     63.71 |      62.54 |
+| min           |     35.86 |      33.35 |
+|---------------|-----------|------------|
+| per-page mean |     42.74 |      38.71 |
 +---------------+-----------+------------+
 
 ```
@@ -110,12 +159,36 @@ Pages Per Iteration     : 1
 +---------------+-----------+------------+
 | Metric        |  Map (ms) | Unmap (ms) |
 |---------------|-----------|------------|
-| mean          |     30.40 |      56.36 |
-| p95           |     31.58 |      66.15 |
-| max           |     39.71 |      73.03 |
-| min           |     29.02 |      54.29 |
+| mean          |     2.10 |      1.59 |
+| p95           |     2.12 |      2.57 |
+| max           |     2.21 |      3.17 |
+| min           |     2.04 |      1.40 |
 |---------------|-----------|------------|
-| per-page mean |     30.40 |      56.36 |
+| per-page mean |     2.10 |      1.59 |
++---------------+-----------+------------+
+
+```
+
+```bash
+python kvcached_tp_ipc_benchmark.py --tp-size 4 --pages-per-iter 1 --iters 20 --map-impl async --not-contiguous
+```
+
+```
+=== IPC Benchmark Summary ===
+Broadcast impl       : async (__main__.py)
+TP size                 : 4
+Iterations              : 20
+Pages Per Iteration     : 1
+
++---------------+-----------+------------+
+| Metric        |  Map (ms) | Unmap (ms) |
+|---------------|-----------|------------|
+| mean          |     35.96 |      40.63 |
+| p95           |     61.85 |      58.95 |
+| max           |     67.46 |      63.93 |
+| min           |     27.70 |      32.40 |
+|---------------|-----------|------------|
+| per-page mean |     35.96 |      40.63 |
 +---------------+-----------+------------+
 
 ```
@@ -124,7 +197,7 @@ Pages Per Iteration     : 1
 * Drop a my_impl.py file into broadcast_map_impl/ that defines:
 
 ```python
-def broadcast_map_to_kv_tensors_to_workers(tp_size: int,
+def broadcast_map_to_kv_tensors(tp_size: int,
                                            offsets: list[int]) -> None:
     ...
 # If you use async def, the factory auto-wraps it with asyncio.run().
@@ -151,14 +224,12 @@ Workers handle vmm ops in a synchronous manner -- since each worker executes one
 In the benchmark script, the code below
 
 ```python
-# Synthetic offsets: contiguous pages → byte-offset list
-# 50 is just arbitrary --- but it cannot exceed the number of virtual pages
-page_ids = [50 + i for i in range(pages_per_iter)] 
+page_ids = [i for i in range(pages_per_iter)] 
 offsets  = [pid * PAGE_SIZE for pid in page_ids]
 ```
 
 synthesize `page_ids` for the mapping operation.
-`page_ids` can be arbitrary for the benchmarking, except that it needs to respect the virtual memory size.
+`page_ids` can be arbitrary for the benchmarking, as long as it respects the virtual memory size.
 
 In `kvcached`, alloc_kv_cache() will infer the virtual page count according to the GPU memory capacity and num_layers argument. For example, there are 354 pages on my testing machine (A40 GPU), and it is from:
 > 2 (for K/V) x 354 x 2MB x 32 (num_layers) = 45312 MB

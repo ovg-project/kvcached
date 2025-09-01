@@ -6,7 +6,7 @@ Comprehensive test script for traffic monitoring functionality
 import argparse
 import asyncio
 import random
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -18,11 +18,12 @@ class TrafficMonitorTest:
         self.base_url = base_url
         self.test_models = ["meta-llama/Llama-3.2-1B", "Qwen/Qwen3-0.6B"]
 
-    async def test_endpoint(self,
-                            session: aiohttp.ClientSession,
-                            endpoint: str,
-                            method: str = "GET",
-                            json_data: Dict = None) -> Dict[str, Any]:
+    async def test_endpoint(
+            self,
+            session: aiohttp.ClientSession,
+            endpoint: str,
+            method: str = "GET",
+            json_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Test a single endpoint and return result"""
         url = f"{self.base_url}{endpoint}"
 
