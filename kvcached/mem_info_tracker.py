@@ -5,8 +5,13 @@ from typing import Optional
 
 import posix_ipc
 
-from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_name,
-                                get_ipc_path, init_kv_cache_limit)
+from kvcached.cli.utils import (
+    MemInfoStruct,
+    RwLockedShm,
+    get_ipc_name,
+    get_ipc_path,
+    init_kv_cache_limit,
+)
 from kvcached.utils import DEFAULT_IPC_NAME
 
 

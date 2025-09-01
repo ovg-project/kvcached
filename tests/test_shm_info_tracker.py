@@ -5,8 +5,13 @@ from multiprocessing.synchronize import Barrier
 
 import pytest
 
-from kvcached.cli.utils import (MemInfoStruct, RwLockedShm, get_ipc_path,
-                                get_kv_cache_limit, init_kv_cache_limit)
+from kvcached.cli.utils import (
+    MemInfoStruct,
+    RwLockedShm,
+    get_ipc_path,
+    get_kv_cache_limit,
+    init_kv_cache_limit,
+)
 from kvcached.mem_info_tracker import MemInfoTracker
 from kvcached.utils import DEFAULT_IPC_NAME
 

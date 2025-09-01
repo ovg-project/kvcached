@@ -6,8 +6,12 @@ from setuptools import find_packages, setup
 
 try:
     import torch
-    from torch.utils.cpp_extension import (BuildExtension, CUDAExtension,
-                                           include_paths, library_paths)
+    from torch.utils.cpp_extension import (
+        BuildExtension,
+        CUDAExtension,
+        include_paths,
+        library_paths,
+    )
 except ImportError:
     raise ImportError("Torch not found, please install torch>=2.6.0 first.")
 

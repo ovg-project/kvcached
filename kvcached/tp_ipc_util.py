@@ -5,8 +5,7 @@ import socket
 import threading
 from typing import Any, Dict, cast
 
-from kvcached.vmm_ops import (kv_tensors_created, map_to_kv_tensors,
-                              unmap_from_kv_tensors)
+from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
 SOCKET_DIR = "/tmp/kvcached-ipc"
 

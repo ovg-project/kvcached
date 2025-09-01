@@ -6,9 +6,11 @@ import torch
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
-from kvcached.vmm_ops import create_kv_tensors
-from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
-from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
+from kvcached.vmm_ops import (
+    create_kv_tensors,
+    init_kvcached as _init_kvcached_impl,
+    shutdown_kvcached as _shutdown_kvcached_impl,
+)
 
 _kvcached_initialized: bool = False
 _kvcached_device = None

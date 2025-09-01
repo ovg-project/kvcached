@@ -4,9 +4,7 @@ import time
 import numpy as np
 import torch
 
-from kvcached.integration.sglang.interfaces import (alloc_kv_cache,
-                                                    init_kvcached,
-                                                    shutdown_kvcached)
+from kvcached.integration.sglang.interfaces import alloc_kv_cache, init_kvcached, shutdown_kvcached
 from kvcached.kv_cache_manager import KVCacheManager
 
 kvcache_shape = (643009, 8, 64)
