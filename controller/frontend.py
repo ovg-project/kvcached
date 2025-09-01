@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 import yaml
 from aiohttp import web
 from router import LLMRouter
-from sleep_manager import sleep_manager
-from traffic_monitor import traffic_monitor
+from sleep_manager import SleepManager
+from traffic_monitor import TrafficMonitor
 from utils import set_ulimit
 
 from kvcached.utils import get_kvcached_logger
@@ -19,7 +19,11 @@ logger = get_kvcached_logger()
 class MultiLLMFrontend:
 
     def __init__(self, port: int, model_config_json: Dict[str, Any]):
-        self.router = LLMRouter(models_config=model_config_json)
+        self.traffic_monitor = TrafficMonitor()
+        self.sleep_manager = SleepManager(traffic_monitor=self.traffic_monitor)
+        self.router = LLMRouter(models_config=model_config_json,
+                                sleep_manager=self.sleep_manager,
+                                traffic_monitor=self.traffic_monitor)
         self.port = port
         self.app = web.Application()
         self.configure_endpoints()
@@ -241,7 +245,7 @@ class MultiLLMFrontend:
             # Get optional query parameters
             window_seconds = int(request.query.get('window', 60))
 
-            stats = traffic_monitor.get_traffic_summary(window_seconds)
+            stats = self.traffic_monitor.get_traffic_summary(window_seconds)
 
             return web.Response(text=json.dumps({
                 "traffic_stats":
@@ -265,7 +269,7 @@ class MultiLLMFrontend:
             model_name = urllib.parse.unquote(request.match_info['model_name'])
             window_seconds = int(request.query.get('window', 60))
 
-            model_stats = traffic_monitor.get_model_stats(model_name)
+            model_stats = self.traffic_monitor.get_model_stats(model_name)
             if not model_stats:
                 return web.Response(text=json.dumps(
                     {"error":
@@ -307,12 +311,12 @@ class MultiLLMFrontend:
             idle_threshold = int(request.query.get('threshold',
                                                    300))  # Default 5 minutes
 
-            idle_models = traffic_monitor.get_idle_models(idle_threshold)
+            idle_models = self.traffic_monitor.get_idle_models(idle_threshold)
 
             # Get detailed stats for idle models
             idle_model_stats = {}
             for model_name in idle_models:
-                model_stats = traffic_monitor.get_model_stats(model_name)
+                model_stats = self.traffic_monitor.get_model_stats(model_name)
                 if model_stats:
                     idle_model_stats[model_name] = {
                         'idle_time_seconds': model_stats.get_idle_time(),
@@ -347,12 +351,13 @@ class MultiLLMFrontend:
                                                    300))  # Default 5 minutes
             window_seconds = int(request.query.get('window', 60))
 
-            active_models = traffic_monitor.get_active_models(idle_threshold)
+            active_models = self.traffic_monitor.get_active_models(
+                idle_threshold)
 
             # Get detailed stats for active models
             active_model_stats = {}
             for model_name in active_models:
-                model_stats = traffic_monitor.get_model_stats(model_name)
+                model_stats = self.traffic_monitor.get_model_stats(model_name)
                 if model_stats:
                     active_model_stats[model_name] = {
                         'request_rate':
@@ -388,8 +393,8 @@ class MultiLLMFrontend:
     async def handle_sleep_status(self, request: web.Request) -> web.Response:
         """Handle sleep status requests"""
         try:
-            sleeping_models = sleep_manager.get_sleeping_models()
-            candidates = sleep_manager.get_sleep_candidates()
+            sleeping_models = self.sleep_manager.get_sleeping_models()
+            candidates = self.sleep_manager.get_sleep_candidates()
 
             return web.Response(text=json.dumps({
                 "sleeping_models":
@@ -397,16 +402,52 @@ class MultiLLMFrontend:
                 "sleep_candidates":
                 candidates,
                 "auto_sleep_enabled":
-                sleep_manager.config.auto_sleep_enabled,
+                self.sleep_manager.config.auto_sleep_enabled,
                 "idle_threshold_seconds":
-                sleep_manager.config.idle_threshold_seconds,
+                self.sleep_manager.config.idle_threshold_seconds,
                 "wakeup_on_request":
-                sleep_manager.config.wake_on_request
+                self.sleep_manager.config.wake_on_request
             }),
                                 status=200,
                                 content_type='application/json')
         except Exception as e:
             logger.error(f"Error getting sleep status: {e}")
+            return web.Response(text=json.dumps({"error": str(e)}),
+                                status=500,
+                                content_type='application/json')
+
+    async def handle_sleep_candidates(self,
+                                      request: web.Request) -> web.Response:
+        """Handle requests for models that are candidates for sleep mode"""
+        try:
+            candidates = self.sleep_manager.get_sleep_candidates()
+
+            # Get detailed info for each candidate
+            candidate_details = {}
+            for model_name in candidates:
+                model_stats = self.traffic_monitor.get_model_stats(model_name)
+                if model_stats:
+                    candidate_details[model_name] = {
+                        'idle_time_seconds': model_stats.get_idle_time(),
+                        'total_requests': model_stats.total_requests,
+                        'last_activity_time': model_stats.last_activity_time,
+                        'can_sleep': True
+                    }
+
+            return web.Response(text=json.dumps({
+                "sleep_candidates":
+                candidates,
+                "candidate_details":
+                candidate_details,
+                "idle_threshold_seconds":
+                self.sleep_manager.config.idle_threshold_seconds,
+                "auto_sleep_enabled":
+                self.sleep_manager.config.auto_sleep_enabled
+            }),
+                                status=200,
+                                content_type='application/json')
+        except Exception as e:
+            logger.error(f"Error getting sleep candidates: {e}")
             return web.Response(text=json.dumps({"error": str(e)}),
                                 status=500,
                                 content_type='application/json')
@@ -424,8 +465,8 @@ class MultiLLMFrontend:
                                     status=404,
                                     content_type='application/json')
 
-            success = await sleep_manager.put_model_to_sleep(model_name,
-                                                             manual=True)
+            success = await self.sleep_manager.put_model_to_sleep(model_name,
+                                                                  manual=True)
 
             return web.Response(text=json.dumps({
                 "model_name":
@@ -455,7 +496,7 @@ class MultiLLMFrontend:
                                     status=404,
                                     content_type='application/json')
 
-            success = await sleep_manager.wake_model(model_name)
+            success = await self.sleep_manager.wake_model(model_name)
 
             return web.Response(text=json.dumps({
                 "model_name":
@@ -473,49 +514,13 @@ class MultiLLMFrontend:
                                 status=500,
                                 content_type='application/json')
 
-    async def handle_sleep_candidates(self,
-                                      request: web.Request) -> web.Response:
-        """Handle requests for models that are candidates for sleep mode"""
-        try:
-            candidates = sleep_manager.get_sleep_candidates()
-
-            # Get detailed info for each candidate
-            candidate_details = {}
-            for model_name in candidates:
-                model_stats = traffic_monitor.get_model_stats(model_name)
-                if model_stats:
-                    candidate_details[model_name] = {
-                        'idle_time_seconds': model_stats.get_idle_time(),
-                        'total_requests': model_stats.total_requests,
-                        'last_activity_time': model_stats.last_activity_time,
-                        'can_sleep': True
-                    }
-
-            return web.Response(text=json.dumps({
-                "sleep_candidates":
-                candidates,
-                "candidate_details":
-                candidate_details,
-                "idle_threshold_seconds":
-                sleep_manager.config.idle_threshold_seconds,
-                "auto_sleep_enabled":
-                sleep_manager.config.auto_sleep_enabled
-            }),
-                                status=200,
-                                content_type='application/json')
-        except Exception as e:
-            logger.error(f"Error getting sleep candidates: {e}")
-            return web.Response(text=json.dumps({"error": str(e)}),
-                                status=500,
-                                content_type='application/json')
-
     async def start(self):
         """Start the router server"""
         logger.info(f"Starting router server on port {self.port}")
 
         # Start traffic monitor and sleep manager
-        await traffic_monitor.start()
-        await sleep_manager.start()
+        await self.traffic_monitor.start()
+        await self.sleep_manager.start()
 
         # Start LLM servers based on the configuration
         # await self.router.start_llm_servers()
@@ -532,8 +537,8 @@ class MultiLLMFrontend:
         except KeyboardInterrupt:
             logger.info("Shutting down router server...")
         finally:
-            await sleep_manager.stop()
-            await traffic_monitor.stop()
+            await self.traffic_monitor.stop()
+            await self.sleep_manager.stop()
             await self.router.close()
             await runner.cleanup()
 

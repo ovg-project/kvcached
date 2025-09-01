@@ -219,7 +219,3 @@ class TrafficMonitor:
             except Exception as e:
                 logger.error(f"Error in traffic monitor cleanup: {e}")
                 await asyncio.sleep(60)  # Wait a bit before retrying
-
-
-# Global traffic monitor instance
-traffic_monitor = TrafficMonitor()

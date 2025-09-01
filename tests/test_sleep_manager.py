@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "controller"))
 
 from controller.sleep_manager import SleepConfig, SleepManager
+from controller.traffic_monitor import TrafficMonitor
 
 
 async def test_basic_functionality():
@@ -20,7 +21,8 @@ async def test_basic_functionality():
 
     # Create sleep manager with default config
     config = SleepConfig()
-    manager = SleepManager(config)
+    traffic_monitor = TrafficMonitor()
+    manager = SleepManager(config, traffic_monitor=traffic_monitor)
 
     print("✓ SleepManager created successfully")
     print(f"  Auto sleep enabled: {manager.config.auto_sleep_enabled}")

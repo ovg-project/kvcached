@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 import aiohttp
-from traffic_monitor import traffic_monitor
+from traffic_monitor import TrafficMonitor
 
 from kvcached.utils import get_kvcached_logger
 
@@ -30,8 +30,11 @@ class SleepConfig:
 class SleepManager:
     """Manages sleep mode for idle models to save resources"""
 
-    def __init__(self, config: Optional[SleepConfig] = None):
+    def __init__(self,
+                 config: Optional[SleepConfig] = None,
+                 traffic_monitor: Optional[TrafficMonitor] = None):
         self.config = config or SleepConfig()
+        self.traffic_monitor = traffic_monitor  # Injected dependency
         self.sleeping_models: Dict[str, float] = {
         }  # model_name -> sleep_start_time
         self.manual_sleep_models: Set[str] = set(
@@ -209,7 +212,12 @@ class SleepManager:
 
     def get_sleep_candidates(self) -> List[str]:
         """Get models that are candidates for sleep mode based on activity"""
-        idle_models = traffic_monitor.get_idle_models(
+        if self.traffic_monitor is None:
+            logger.warning(
+                "TrafficMonitor not provided; cannot determine sleep candidates"
+            )
+            return []
+        idle_models = self.traffic_monitor.get_idle_models(
             self.config.idle_threshold_seconds)
         # Filter out already sleeping models
         return [
@@ -463,7 +471,3 @@ class SleepManager:
     def get_sglang_models(self) -> Dict[str, Dict[str, str]]:
         """Get all configured SGLang models"""
         return self.config.sglang_models_config.copy()
-
-
-# Global sleep manager instance
-sleep_manager = SleepManager()
