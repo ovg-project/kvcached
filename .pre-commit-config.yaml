@@ -4,7 +4,7 @@ default_install_hook_types:
 default_stages:
   - pre-commit # Run locally
   - manual # Run in CI
-exclude: 'engine_integration/vllm-v0.8.4|engine_integration/sglang-v0.4.6.post2'
+exclude: '^engine_integration/(vllm|sglang)(-[^/]+)?/.*|sglang-kvcached-venv|vllm-kvcached-venv'
 repos:
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.11.7
