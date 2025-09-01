@@ -12,7 +12,6 @@ It exposes unified **OpenAI-compatible** HTTP endpoints that transparently route
 * **Traffic monitoring** – Monitors the request status of each model, e.g., request rate, idle time.
 * **Sleep and wakeup** – Idle models can be deactivated to release model weights, and waked up upon receiving requests.
   
-
 ---
 
 ## Quick Start
@@ -130,22 +129,28 @@ python test_traffic_monitor.py
 
 ## API Endpoints
 
-### Core OpenAI-Compatible Endpoints
-* **POST /v1/completions** - Text completion API
-* **POST /v1/chat/completions** - Chat completion API
-* **GET /health** - Router health check
-* **GET /models** - List all configured models
-* **GET /health/{model_name}** - Specific model health check (URL encode model names)
-* **GET /get_server_info** - Server information
+### Core OpenAI-Compatible
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | /v1/completions | Text completion API |
+| POST | /v1/chat/completions | Chat completion API |
+| GET | /health | Router health check |
+| GET | /models | List all configured models |
+| GET | /health/{model_name} | Specific model health check (URL encode model names) |
+| GET | /get_server_info | Server information |
 
-### Traffic Monitoring Endpoints
-* **GET /traffic/stats?window=60** - All models' traffic statistics (window: time window in seconds for rate calculation)
-* **GET /traffic/stats/{model_name}?window=60** - Specific model statistics (URL encode model names, window: time window in seconds)
-* **GET /models/idle?threshold=300** - Models idle longer than threshold (threshold: idle time threshold in seconds)
-* **GET /models/active?threshold=300&window=60** - Currently active models (threshold: idle time threshold, window: time window for rate calculation)
+### Traffic Monitoring
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | /traffic/stats?window=60 | All models' traffic statistics (window: time window in seconds for rate calculation) |
+| GET | /traffic/stats/{model_name}?window=60 | Specific model statistics (URL encode model names, window: time window in seconds) |
+| GET | /models/idle?threshold=300 | Models idle longer than threshold (threshold: idle time threshold in seconds) |
+| GET | /models/active?threshold=300&window=60 | Currently active models (threshold: idle time threshold, window: time window for rate calculation) |
 
-### Sleep Management Endpoints
-* **GET /sleep/status** - Current sleep status of all models
-* **POST /action/sleep/{model_name}** - Manually put a model to sleep
-* **POST /action/wakeup/{model_name}** - Manually wake up a sleeping model
-* **GET /sleep/candidates** - Models that are candidates for sleep mode
+### Sleep Management
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | /sleep/status | Current sleep status of all models |
+| POST | /action/sleep/{model_name} | Manually put a model to sleep |
+| POST | /action/wakeup/{model_name} | Manually wake up a sleeping model |
+| GET | /sleep/candidates | Models that are candidates for sleep mode |
