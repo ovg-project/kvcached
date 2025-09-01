@@ -496,7 +496,7 @@ class MultiLLMFrontend:
                                     status=404,
                                     content_type='application/json')
 
-            success = await self.sleep_manager.wake_model(model_name)
+            success = await self.sleep_manager.wakeup_model(model_name)
 
             return web.Response(text=json.dumps({
                 "model_name":

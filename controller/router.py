@@ -143,14 +143,14 @@ class LLMRouter:
             logger.info(
                 f"Model {model_name} is sleeping, attempting to wake up for request"
             )
-            wake_success = await self.sleep_manager.handle_request_wake(
+            wakeup_success = await self.sleep_manager.handle_model_wakeup_on_request(
                 model_name)
-            if not wake_success:
+            if not wakeup_success:
                 self.traffic_monitor.record_request_end(
                     request_stats,
                     success=False,
-                    error_message=f"Failed to wake sleeping model {model_name}"
-                )
+                    error_message=
+                    f"Failed to wake up sleeping model {model_name}")
                 return None
 
         if self.session is None or self.session.closed:

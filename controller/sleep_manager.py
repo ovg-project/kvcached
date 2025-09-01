@@ -17,7 +17,7 @@ class SleepConfig:
     idle_threshold_seconds: int = 300  # 5 minutes
     check_interval_seconds: int = 60  # Check every minute
     auto_sleep_enabled: bool = False  # Whether to automatically put models to sleep
-    wake_on_request: bool = True  # Whether to automatically wake models on request
+    wakeup_on_request: bool = True  # Whether to automatically wake models on request
     min_sleep_duration: int = 60  # Minimum time to keep model asleep (seconds)
     vllm_models_config: Dict[str, Dict[
         str,
@@ -127,7 +127,7 @@ class SleepManager:
             logger.error(f"Failed to put model {model_name} to sleep: {e}")
             return False
 
-    async def wake_model(self, model_name: str) -> bool:
+    async def wakeup_model(self, model_name: str) -> bool:
         """
         Wake up a sleeping model
         
@@ -160,7 +160,7 @@ class SleepManager:
                 host = model_config.get("host", "localhost")
                 port = model_config.get("port", "8000")
 
-                success = await self._call_vllm_wake_api(host, port)
+                success = await self._call_vllm_wakeup_api(host, port)
                 if not success:
                     logger.error(
                         f"Failed to call vLLM wake API for model {model_name}")
@@ -252,7 +252,7 @@ class SleepManager:
                 logger.error(f"Error in sleep monitor: {e}")
                 await asyncio.sleep(30)  # Wait before retrying
 
-    async def handle_request_wake(self, model_name: str) -> bool:
+    async def handle_model_wakeup_on_request(self, model_name: str) -> bool:
         """
         Handle wake-up request when a request comes for a sleeping model
         
@@ -262,7 +262,7 @@ class SleepManager:
         Returns:
             True if model was woken up or already awake, False if wake failed
         """
-        if not self.config.wake_on_request:
+        if not self.config.wakeup_on_request:
             return False
 
         if model_name not in self.sleeping_models:
@@ -271,7 +271,7 @@ class SleepManager:
         logger.info(
             f"Incoming request for sleeping model {model_name}, attempting to wake up"
         )
-        return await self.wake_model(model_name)
+        return await self.wakeup_model(model_name)
 
     def update_config(self, **kwargs):
         """Update sleep manager configuration"""
@@ -309,7 +309,7 @@ class SleepManager:
             logger.error(f"Error calling vLLM sleep API at {url}: {e}")
             return False
 
-    async def _call_vllm_wake_api(self, host: str, port: str) -> bool:
+    async def _call_vllm_wakeup_api(self, host: str, port: str) -> bool:
         """Call vLLM's wake_up API endpoint"""
         url = f"http://{host}:{port}/wake_up"
 

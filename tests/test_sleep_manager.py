@@ -113,7 +113,7 @@ async def test_sleep_wake_functionality(manager):
 
         # Wake up the model
         print("5. Waking up model...")
-        wake_success = await manager.wake_model(test_model)
+        wake_success = await manager.wakeup_model(test_model)
         print(f"   Wake operation success: {wake_success}")
 
         if wake_success:
@@ -170,7 +170,7 @@ async def test_sglang_sleep_wake_functionality(manager):
 
         # Resume memory occupation (wake up the model)
         print("5. Resuming memory occupation...")
-        wake_success = await manager.wake_model(test_model)
+        wake_success = await manager.wakeup_model(test_model)
         print(f"   Resume operation success: {wake_success}")
 
         if wake_success:
@@ -249,7 +249,7 @@ async def test_api_methods_simulation(manager):
     print(
         f"  check_model_sleep_status: {hasattr(manager, 'check_model_sleep_status')}"
     )
-    print(f"  handle_request_wake: {hasattr(manager, 'handle_request_wake')}")
+    print(f"  handle_model_wakeup: {hasattr(manager, 'handle_model_wakeup')}")
 
 
 async def test_sglang_api_methods_simulation(manager):
