@@ -8,16 +8,15 @@ kvcached: # kvcached environment variables for all instances
 
 router: # router configuration
   enable_router: true
-  router_port: 8081
+  router_port: 8080
   router_host: localhost
 
-sleep_manager: # sleep manager configuration
+sleep_manager: # sleep configuration
   idle_threshold_seconds: 300        # 5 minutes - time before putting idle models to sleep
   check_interval_seconds: 60         # Check every minute for idle models
   auto_sleep_enabled: true           # Enable automatic sleep mode for idle models
   wakeup_on_request: true            # Automatically wake models when requests come in
   min_sleep_duration: 120            # Minimum time to keep model asleep (2 minutes)
-  # Note: vllm_models_config and sglang_models_config are automatically extracted from instances
 
 instances: # instances configuration
   - name: instance1
