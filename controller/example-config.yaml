@@ -5,10 +5,20 @@ kvcached: # kvcached environment variables for all instances
   kvcached_max_reserved_pages: 10
   kvcached_sanity_check: false
   kvcached_log_level: INFO
+
 router: # router configuration
   enable_router: true
   router_port: 8081
   router_host: localhost
+
+sleep_manager: # sleep manager configuration
+  idle_threshold_seconds: 300        # 5 minutes - time before putting idle models to sleep
+  check_interval_seconds: 60         # Check every minute for idle models
+  auto_sleep_enabled: true           # Enable automatic sleep mode for idle models
+  wakeup_on_request: true            # Automatically wake models when requests come in
+  min_sleep_duration: 120            # Minimum time to keep model asleep (2 minutes)
+  # Note: vllm_models_config and sglang_models_config are automatically extracted from instances
+
 instances: # instances configuration
   - name: instance1
     model: meta-llama/Llama-3.2-1B
@@ -35,7 +45,7 @@ instances: # instances configuration
     using_venv: true
     venv_path: ../engine_integration/sglang-v0.4.9/.venv
     kvcached_env:
-      - "ENABLE_KVCACHED=false"
+      - "ENABLE_KVCACHED=true"
       - "KVCACHED_IPC_NAME=SGLANG"
     engine_args:
       - "--disable-radix-cache"

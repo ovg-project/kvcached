@@ -26,6 +26,13 @@ class SleepConfig:
         str,
         str]] = None  # model_name -> {"host": "localhost", "port": "8000"} for memory occupation control and full model recovery
 
+    def __post_init__(self):
+        """Initialize default model configs if None"""
+        if self.vllm_models_config is None:
+            self.vllm_models_config = {}
+        if self.sglang_models_config is None:
+            self.sglang_models_config = {}
+
 
 class SleepManager:
     """Manages sleep mode for idle models to save resources"""

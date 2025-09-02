@@ -176,6 +176,101 @@ def _extract_models_mapping(
     return models_mapping
 
 
+def _parse_sleep_manager_config(raw_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse sleep manager configuration from YAML.
+    
+    Parameters
+    ----------
+    raw_cfg : Dict[str, Any]
+        Raw YAML dict containing sleep_manager configuration.
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Parsed sleep manager configuration.
+    """
+    sleep_cfg = raw_cfg.get("sleep_manager", {})
+    
+    # Default sleep manager configuration
+    default_config = {
+        "idle_threshold_seconds": 300,  # 5 minutes
+        "check_interval_seconds": 60,   # Check every minute
+        "auto_sleep_enabled": False,    # Whether to automatically put models to sleep
+        "wakeup_on_request": True,      # Whether to automatically wake models on request
+        "min_sleep_duration": 60,       # Minimum time to keep model asleep (seconds)
+        "vllm_models_config": {},
+        "sglang_models_config": {}
+    }
+    
+    # Merge with user configuration
+    parsed_config = {**default_config, **sleep_cfg}
+    
+    # Ensure model configs are dictionaries
+    if not isinstance(parsed_config["vllm_models_config"], dict):
+        parsed_config["vllm_models_config"] = {}
+    if not isinstance(parsed_config["sglang_models_config"], dict):
+        parsed_config["sglang_models_config"] = {}
+    
+    logger.info(f"Parsed sleep manager configuration: {parsed_config}")
+    return parsed_config
+
+
+def _extract_model_configs_for_sleep_manager(instances_cfg: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    """Extract vLLM and SGLang model configurations for sleep manager.
+    
+    Parameters
+    ----------
+    instances_cfg : List[Dict[str, Any]]
+        Parsed instances configuration.
+        
+    Returns
+    -------
+    tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]
+        Tuple of (vllm_models_config, sglang_models_config)
+    """
+    vllm_models_config = {}
+    sglang_models_config = {}
+    
+    for inst in instances_cfg:
+        model_name = inst["model"]
+        engine = inst["engine"]
+        
+        # Extract host and port from engine arguments
+        host = "localhost"  # default
+        port = None
+        
+        for idx, token in enumerate(inst["args"]):
+            if token.startswith("--host="):
+                host = token.split("=", 1)[1]
+            elif token == "--host" and idx + 1 < len(inst["args"]):
+                host = inst["args"][idx + 1]
+            elif token.startswith("--port="):
+                try:
+                    port = token.split("=", 1)[1]
+                except ValueError:
+                    pass
+            elif token == "--port" and idx + 1 < len(inst["args"]):
+                try:
+                    port = inst["args"][idx + 1]
+                except ValueError:
+                    pass
+        
+        if port is None:
+            logger.warning(f"Could not determine port for model {model_name} - skipping in sleep manager config")
+            continue
+            
+        model_config = {"host": host, "port": str(port)}
+        
+        if engine == "vllm":
+            vllm_models_config[model_name] = model_config
+            logger.info(f"Added vLLM model {model_name} to sleep manager config: {model_config}")
+        elif engine in {"sgl", "sglang"}:
+            sglang_models_config[model_name] = model_config
+            logger.info(f"Added SGLang model {model_name} to sleep manager config: {model_config}")
+    
+    return vllm_models_config, sglang_models_config
+
+
 def _launch_instances(instances_cfg: List[Dict[str, Any]],
                       global_env: Dict[str, str]) -> List[Dict[str, Any]]:
     """Launch each configured model instance in its own dedicated tmux session."""
@@ -266,6 +361,31 @@ def main() -> None:
     except Exception as e:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
+
+    # Parse sleep manager configuration
+    sleep_manager_config = _parse_sleep_manager_config(raw_cfg)
+    
+    # Extract model configurations for sleep manager
+    vllm_models_config, sglang_models_config = _extract_model_configs_for_sleep_manager(instances_cfg)
+    
+    # Update sleep manager config with extracted model configs
+    sleep_manager_config["vllm_models_config"] = vllm_models_config
+    sleep_manager_config["sglang_models_config"] = sglang_models_config
+    
+    # Save sleep manager configuration to a file for other components to use
+    sleep_config_path = cfg_path.parent / "sleep_manager_config.yaml"
+    try:
+        with open(sleep_config_path, "w") as f:
+            yaml.dump(sleep_manager_config, f, default_flow_style=False, indent=2)
+        logger.info(f"Sleep manager configuration saved to: {sleep_config_path}")
+    except Exception as e:
+        logger.error(f"Failed to save sleep manager configuration: {e}")
+    
+    # Also save as environment variables for easy access
+    global_kvcached_env["SLEEP_MANAGER_CONFIG_PATH"] = str(sleep_config_path)
+    global_kvcached_env["SLEEP_MANAGER_AUTO_SLEEP_ENABLED"] = str(sleep_manager_config["auto_sleep_enabled"])
+    global_kvcached_env["SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS"] = str(sleep_manager_config["idle_threshold_seconds"])
+    global_kvcached_env["SLEEP_MANAGER_CHECK_INTERVAL_SECONDS"] = str(sleep_manager_config["check_interval_seconds"])
 
     _launch_instances(instances_cfg, global_kvcached_env)
     _maybe_launch_router(router_cfg, cfg_path)
