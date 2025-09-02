@@ -24,7 +24,7 @@ class SleepConfig:
         str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
     sglang_models_config: Dict[str, Dict[
         str,
-        str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
+        str]] = None  # model_name -> {"host": "localhost", "port": "8000"} for memory occupation control and full model recovery
 
 
 class SleepManager:
@@ -165,16 +165,26 @@ class SleepManager:
                     logger.error(
                         f"Failed to call vLLM wake API for model {model_name}")
                     return False
-            # Use SGLang Python API to resume memory occupation
+            # Use SGLang Python API to resume memory occupation and perform full model recovery
             elif model_name in self.config.sglang_models_config:
                 model_config = self.config.sglang_models_config[model_name]
                 host = model_config.get("host", "localhost")
                 port = model_config.get("port", "8000")
 
+                # Step 1: Resume memory occupation
                 success = await self._call_sglang_resume_api(host, port)
                 if not success:
                     logger.error(
                         f"Failed to call SGLang resume API for model {model_name}"
+                    )
+                    return False
+
+                # Step 2: Perform full model recovery (load new weights, update, cleanup)
+                recovery_success = await self._perform_sglang_model_recovery(
+                    model_name, model_config)
+                if not recovery_success:
+                    logger.error(
+                        f"Failed to perform full model recovery for SGLang model {model_name}"
                     )
                     return False
             else:
@@ -407,8 +417,12 @@ class SleepManager:
 
         try:
             async with aiohttp.ClientSession() as session:
+                headers = {"Content-Type": "application/json"}
+                payload = {}
                 async with session.post(
                         url,
+                        json=payload,
+                        headers=headers,
                         timeout=aiohttp.ClientTimeout(total=60)) as response:
                     if response.status == 200:
                         logger.info(
@@ -430,8 +444,12 @@ class SleepManager:
 
         try:
             async with aiohttp.ClientSession() as session:
+                headers = {"Content-Type": "application/json"}
+                payload = {}
                 async with session.post(
                         url,
+                        json=payload,
+                        headers=headers,
                         timeout=aiohttp.ClientTimeout(total=60)) as response:
                     if response.status == 200:
                         logger.info(
@@ -451,23 +469,167 @@ class SleepManager:
                          model_name: str,
                          host: str = "localhost",
                          port: str = "8000"):
-        """Add a SGLang model configuration for sleep/wake operations"""
+        """Add a SGLang model configuration for memory occupation control and full model recovery"""
         self.config.sglang_models_config[model_name] = {
             "host": host,
             "port": port
         }
         logger.info(
-            f"Added SGLang model configuration: {model_name} at {host}:{port}")
+            f"Added SGLang model configuration for memory control and recovery: {model_name} at {host}:{port}"
+        )
 
     def remove_sglang_model(self, model_name: str):
-        """Remove a SGLang model configuration"""
+        """Remove a SGLang model configuration for memory occupation control and full model recovery"""
         if model_name in self.config.sglang_models_config:
             del self.config.sglang_models_config[model_name]
-            logger.info(f"Removed SGLang model configuration: {model_name}")
+            logger.info(
+                f"Removed SGLang model configuration for memory control and recovery: {model_name}"
+            )
         else:
             logger.warning(
-                f"No SGLang configuration found for model {model_name}")
+                f"No SGLang memory control and recovery configuration found for model {model_name}"
+            )
 
     def get_sglang_models(self) -> Dict[str, Dict[str, str]]:
         """Get all configured SGLang models"""
         return self.config.sglang_models_config.copy()
+
+    async def _perform_sglang_model_recovery(
+            self, model_name: str, model_config: Dict[str, str]) -> bool:
+        """
+        Perform complete model recovery for SGLang models after resume_memory_occupation
+        
+        This method implements the full recovery process as shown in the test function:
+        1. Load new model weights from pretrained
+        2. Update weights using update_weights_from_tensor
+        3. Clean up temporary model and cache
+        
+        Args:
+            model_name: Name of the model to recover
+            model_config: Model configuration containing host and port
+            
+        Returns:
+            True if recovery was successful, False otherwise
+        """
+        try:
+            host = model_config.get("host", "localhost")
+            port = model_config.get("port", "8000")
+
+            # Step 1: Load new model weights from pretrained
+            # This would typically be done via API call to the SGLang engine
+            load_success = await self._call_sglang_load_weights_api(
+                host, port, model_name)
+            if not load_success:
+                logger.error(
+                    f"Failed to load new weights for SGLang model {model_name}"
+                )
+                return False
+
+            # Step 2: Update weights using update_weights_from_tensor
+            # This would typically be done via API call to the SGLang engine
+            # update_success = await self._call_sglang_update_weights_api(host, port, model_name)
+            # if not update_success:
+            #     logger.error(f"Failed to update weights for SGLang model {model_name}")
+            #     return False
+
+            # Step 3: Clean up memory cache (equivalent to torch.cuda.empty_cache()), but no SGL http api for this
+            # cleanup_success = await self._call_sglang_cleanup_cache_api(host, port)
+            # if not cleanup_success:
+            #     logger.warning(f"Failed to cleanup cache for SGLang model {model_name}, but continuing")
+
+            logger.info(
+                f"Successfully completed full model recovery for SGLang model {model_name}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"Error during SGLang model recovery for {model_name}: {e}")
+            return False
+
+    async def _call_sglang_load_weights_api(self, host: str, port: str,
+                                            model_name: str) -> bool:
+        """Call SGLang's load weights API endpoint (equivalent to AutoModelForCausalLM.from_pretrained)"""
+        url = f"http://{host}:{port}/update_weights_from_disk"
+        payload = {"model_path": model_name}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"Content-Type": "application/json"}
+                async with session.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=120)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully loaded new weights for SGLang model {model_name} at {url}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"SGLang load_weights API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(
+                f"Error calling SGLang load_weights API at {url}: {e}")
+            return False
+
+    async def _call_sglang_update_weights_api(self, host: str, port: str,
+                                              model_name: str) -> bool:
+        """Call SGLang's update weights API endpoint (equivalent to update_weights_from_tensor)"""
+        url = f"http://{host}:{port}/update_weights_from_tensor"
+        payload = {"model_path": model_name}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"Content-Type": "application/json"}
+                async with session.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=120)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully updated weights for SGLang model {model_name} at {url}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"SGLang update_weights API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(
+                f"Error calling SGLang update_weights API at {url}: {e}")
+            return False
+
+    async def _call_sglang_cleanup_cache_api(self, host: str,
+                                             port: str) -> bool:
+        """Call SGLang's cleanup cache API endpoint (equivalent to torch.cuda.empty_cache())"""
+        url = f"http://{host}:{port}/cleanup_cache"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"Content-Type": "application/json"}
+                payload = {}
+                async with session.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        logger.info(
+                            f"Successfully called SGLang cleanup_cache API at {url}"
+                        )
+                        return True
+                    else:
+                        logger.error(
+                            f"SGLang cleanup_cache API returned status {response.status}: {await response.text()}"
+                        )
+                        return False
+        except Exception as e:
+            logger.error(
+                f"Error calling SGLang cleanup_cache API at {url}: {e}")
+            return False

@@ -39,7 +39,6 @@ async def test_real_vllm_instances(manager):
 
     # Add the real vLLM instances from the config
     manager.add_vllm_model('meta-llama/Llama-3.2-1B', 'localhost', '12346')
-    manager.add_vllm_model('Qwen/Qwen3-0.6B', 'localhost', '12347')
 
     # Get all models
     models = manager.get_vllm_models()
@@ -55,9 +54,7 @@ async def test_sglang_configuration(manager):
     print("\n=== Testing SGLang Configuration ===")
 
     # Add SGLang models
-    manager.add_sglang_model('meta-llama/Llama-3.2-1B-sglang', 'localhost',
-                             '30000')
-    manager.add_sglang_model('Qwen/Qwen3-0.6B-sglang', 'localhost', '30001')
+    manager.add_sglang_model('Qwen/Qwen3-0.6B', 'localhost', '30000')
 
     # Get all SGLang models
     sglang_models = manager.get_sglang_models()
@@ -65,10 +62,12 @@ async def test_sglang_configuration(manager):
     for model_name, config in sglang_models.items():
         print(f"  {model_name}: {config['host']}:{config['port']}")
 
-    # Test removing a model
-    manager.remove_sglang_model('Qwen/Qwen3-0.6B-sglang')
+    # Test removing a model (but don't remove the one we need for testing)
+    test_remove_model = 'test-remove-model'
+    manager.add_sglang_model(test_remove_model, 'localhost', '30001')
+    manager.remove_sglang_model(test_remove_model)
     sglang_models = manager.get_sglang_models()
-    print(f"✓ After removal, {len(sglang_models)} SGLang models remain")
+    print(f"✓ After removal test, {len(sglang_models)} SGLang models remain")
 
     return sglang_models
 
@@ -135,7 +134,7 @@ async def test_sglang_sleep_wake_functionality(manager):
     print("\n=== Testing SGLang Sleep/Wake Functionality ===")
 
     # Test with the SGLang model
-    test_model = 'meta-llama/Llama-3.2-1B-sglang'
+    test_model = 'Qwen/Qwen3-0.6B'
 
     print(f"Testing SGLang sleep/wake cycle for {test_model}")
 
@@ -263,25 +262,15 @@ async def test_sglang_api_methods_simulation(manager):
     print(f"  get_sglang_models: {hasattr(manager, 'get_sglang_models')}")
 
     # Test model detection logic
-    test_model = 'meta-llama/Llama-3.2-1B-sglang'
+    test_model = 'Qwen/Qwen3-0.6B'
     print(f"\n✓ Model type detection for '{test_model}':")
-    is_vllm = test_model in manager.config.vllm_models_config
     is_sglang = test_model in manager.config.sglang_models_config
-    print(f"  Detected as vLLM model: {is_vllm}")
     print(f"  Detected as SGLang model: {is_sglang}")
 
 
 async def main():
     """Main test function"""
     print("Testing SleepManager with Real vLLM and SGLang Instances")
-    print("=" * 70)
-    print("This test connects to running instances on:")
-    print("vLLM instances:")
-    print("  - meta-llama/Llama-3.2-1B at localhost:12346")
-    print("  - Qwen/Qwen3-0.6B at localhost:12347")
-    print("SGLang instances:")
-    print("  - meta-llama/Llama-3.2-1B-sglang at localhost:30000")
-    print("  - Qwen/Qwen3-0.6B-sglang at localhost:30001")
     print("=" * 70)
 
     try:
