@@ -98,11 +98,20 @@ def alloc_kv_cache(
     raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
                                        device, num_layers)
 
-    assert block_size * blocks_per_page * num_pages >= num_tokens, \
-        "Not enough memory to allocate KV cache."
-    num_tokens = block_size * blocks_per_page * num_pages
+    # Fix: Derive num_tokens from actual tensor capacity instead of GPU memory estimation
+    raw_tensor = raw_kv_tensors[0]
+    elem_per_token = num_layers * 2 * math.prod(kvcache_shape[1:])  # 2 for K/V
+    actual_num_tokens = raw_tensor.numel() // elem_per_token
+    
+    # Align to page boundaries to avoid partial pages
+    tokens_per_page = block_size * blocks_per_page
+    actual_num_tokens = (actual_num_tokens // tokens_per_page) * tokens_per_page
+    
+    print(f"[kvcached] Actual allocated tensor size: {raw_tensor.numel() * raw_tensor.element_size()} bytes")
+    print(f"[kvcached] Derived actual_num_tokens: {actual_num_tokens} (original estimate: {block_size * blocks_per_page * num_pages})")
+    
     actual_kvcache_shape: List[int] = list(kvcache_shape)
-    actual_kvcache_shape[0] = num_tokens
+    actual_kvcache_shape[0] = actual_num_tokens
 
     k_tensors, v_tensors = [], []
 
@@ -113,7 +122,7 @@ def alloc_kv_cache(
             v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
     else:
         contiguous_tensor = raw_kv_tensors[0].view(
-            num_tokens, num_layers, 2,
+            actual_num_tokens, num_layers, 2,
             *actual_kvcache_shape[1:]).view(dtype=dtype)
         for i in range(num_layers):
             k_tensors.append(contiguous_tensor[:, i, 0, :, :])
