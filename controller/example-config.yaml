@@ -30,7 +30,7 @@ instances: # instances configuration
     engine_env:
       - "VLLM_USE_V1=1"
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
-      - "VLLM_SERVER_DEV_MODE=1"
+      - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
     engine_args:
       - "--disable-log-requests"
       - "--no-enable-prefix-caching"
