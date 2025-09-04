@@ -384,27 +384,18 @@ def main() -> None:
     sleep_manager_config["vllm_models_config"] = vllm_models_config
     sleep_manager_config["sglang_models_config"] = sglang_models_config
 
-    # Save sleep manager configuration to a file for other components to use
-    sleep_config_path = cfg_path.parent / "sleep_manager_config.yaml"
-    try:
-        with open(sleep_config_path, "w") as f:
-            yaml.dump(sleep_manager_config,
-                      f,
-                      default_flow_style=False,
-                      indent=2)
-        logger.info(
-            f"Sleep manager configuration saved to: {sleep_config_path}")
-    except Exception as e:
-        logger.error(f"Failed to save sleep manager configuration: {e}")
-
-    # Also save as environment variables for easy access
-    global_kvcached_env["SLEEP_MANAGER_CONFIG_PATH"] = str(sleep_config_path)
+    # Pass sleep manager configuration directly through environment variables
+    global_kvcached_env["SLEEP_MANAGER_CONFIG_PATH"] = str(cfg_path)
     global_kvcached_env["SLEEP_MANAGER_AUTO_SLEEP_ENABLED"] = str(
         sleep_manager_config["auto_sleep_enabled"])
     global_kvcached_env["SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS"] = str(
         sleep_manager_config["idle_threshold_seconds"])
     global_kvcached_env["SLEEP_MANAGER_CHECK_INTERVAL_SECONDS"] = str(
         sleep_manager_config["check_interval_seconds"])
+    global_kvcached_env["SLEEP_MANAGER_WAKEUP_ON_REQUEST"] = str(
+        sleep_manager_config["wakeup_on_request"])
+    global_kvcached_env["SLEEP_MANAGER_MIN_SLEEP_DURATION"] = str(
+        sleep_manager_config["min_sleep_duration"])
 
     _launch_instances(instances_cfg, global_kvcached_env)
     _maybe_launch_router(router_cfg, cfg_path)
