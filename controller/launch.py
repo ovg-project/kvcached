@@ -113,15 +113,11 @@ def _parse_cfg(
     vllm_models_config, sglang_models_config = _extract_model_configs_for_sleep_manager(
         parsed)
 
-    # Update sleep manager config with extracted model configs
-    sleep_manager_config["vllm_models_config"] = vllm_models_config
-    sleep_manager_config["sglang_models_config"] = sglang_models_config
-
-    # Ensure model configs are dictionaries (fallback for user-provided configs)
-    if not isinstance(sleep_manager_config["vllm_models_config"], dict):
-        sleep_manager_config["vllm_models_config"] = {}
-    if not isinstance(sleep_manager_config["sglang_models_config"], dict):
-        sleep_manager_config["sglang_models_config"] = {}
+    # Merge extracted model configs, guaranteeing dict type
+    sleep_manager_config.update(
+        vllm_models_config=dict(vllm_models_config or {}),
+        sglang_models_config=dict(sglang_models_config or {}),
+    )
 
     logger.info(f"Parsed sleep manager configuration: {sleep_manager_config}")
     return parsed, sleep_manager_config
@@ -217,12 +213,12 @@ def _extract_model_configs_for_sleep_manager(
     instances_cfg: List[Dict[str, Any]]
 ) -> tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
     """Extract vLLM and SGLang model configurations for sleep manager.
-    
+
     Parameters
     ----------
     instances_cfg : List[Dict[str, Any]]
         Parsed instances configuration.
-        
+
     Returns
     -------
     tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]
