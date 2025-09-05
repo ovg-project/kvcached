@@ -210,6 +210,9 @@ class TrafficMonitorTest:
                     print(
                         f"❌ Server not responding: {health_result.get('error', 'Unknown error')}"
                     )
+                    print(
+                        "Start server with `python frontend.py --config example-config.yaml --port 8081` under the controller folder."
+                    )
                     return
                 print("✅ Server is responding")
 

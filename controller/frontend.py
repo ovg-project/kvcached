@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,33 +16,53 @@ from kvcached.utils import get_kvcached_logger
 logger = get_kvcached_logger()
 
 
-def _create_sleep_config_from_env() -> SleepConfig:
-    config = SleepConfig()
+def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
+    """Create a SleepConfig object from the YAML config."""
 
-    # Read configuration from environment variables
-    if "SLEEP_MANAGER_AUTO_SLEEP_ENABLED" in os.environ:
-        config.auto_sleep_enabled = os.environ[
-            "SLEEP_MANAGER_AUTO_SLEEP_ENABLED"].lower() == "true"
+    sleep_cfg_dict: Dict[str, Any] = raw_cfg.get("sleep_manager", {}) or {}
 
-    if "SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS" in os.environ:
-        config.idle_threshold_seconds = int(
-            os.environ["SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS"])
+    # Extract model configurations for sleep manager from parsed instances
+    vllm_config, sglang_config = {}, {}
+    endpoints = _extract_models_mapping(
+        raw_cfg)  # {model: {'endpoint': {...}}}
+    for model_name, entry in endpoints.items():
+        endpoint_info = entry["endpoint"]
+        host = endpoint_info["host"]
+        port = str(endpoint_info["port"])
 
-    if "SLEEP_MANAGER_CHECK_INTERVAL_SECONDS" in os.environ:
-        config.check_interval_seconds = int(
-            os.environ["SLEEP_MANAGER_CHECK_INTERVAL_SECONDS"])
+        engine_name = endpoint_info.get("engine") or ""
+        engine_name = engine_name.lower()
 
-    if "SLEEP_MANAGER_WAKEUP_ON_REQUEST" in os.environ:
-        config.wakeup_on_request = os.environ[
-            "SLEEP_MANAGER_WAKEUP_ON_REQUEST"].lower() == "true"
+        target = vllm_config if engine_name == "vllm" else sglang_config
+        target[model_name] = {"host": host, "port": port}
 
-    if "SLEEP_MANAGER_MIN_SLEEP_DURATION" in os.environ:
-        config.min_sleep_duration = int(
-            os.environ["SLEEP_MANAGER_MIN_SLEEP_DURATION"])
+    # Merge extracted model configs, guaranteeing dict type
+    sleep_cfg_dict.update(
+        vllm_models_config=dict(vllm_config or {}),
+        sglang_models_config=dict(sglang_config or {}),
+    )
+
+    # Instantiate with defaults first, then override with provided values
+    config = SleepConfig(
+        idle_threshold_seconds=sleep_cfg_dict.get(
+            "idle_threshold_seconds", SleepConfig.idle_threshold_seconds),
+        check_interval_seconds=sleep_cfg_dict.get(
+            "check_interval_seconds", SleepConfig.check_interval_seconds),
+        auto_sleep_enabled=sleep_cfg_dict.get("auto_sleep_enabled",
+                                              SleepConfig.auto_sleep_enabled),
+        wakeup_on_request=sleep_cfg_dict.get("wakeup_on_request",
+                                             SleepConfig.wakeup_on_request),
+        min_sleep_duration=sleep_cfg_dict.get("min_sleep_duration",
+                                              SleepConfig.min_sleep_duration),
+        vllm_models_config=sleep_cfg_dict.get("vllm_models_config", {}),
+        sglang_models_config=sleep_cfg_dict.get("sglang_models_config", {}),
+    )
 
     logger.info(
-        f"Created SleepConfig from environment: auto_sleep={config.auto_sleep_enabled}, "
-        f"idle_threshold={config.idle_threshold_seconds}s, wakeup_on_request={config.wakeup_on_request}"
+        "Created SleepConfig from YAML: auto_sleep=%s, idle_threshold=%ss, wakeup_on_request=%s",
+        config.auto_sleep_enabled,
+        config.idle_threshold_seconds,
+        config.wakeup_on_request,
     )
 
     return config
@@ -51,10 +70,9 @@ def _create_sleep_config_from_env() -> SleepConfig:
 
 class MultiLLMFrontend:
 
-    def __init__(self, port: int, model_config_json: Dict[str, Any]):
+    def __init__(self, port: int, model_config_json: Dict[str, Any],
+                 sleep_config: SleepConfig):
         self.traffic_monitor = TrafficMonitor()
-        # Create SleepManager with configuration from environment variables
-        sleep_config = _create_sleep_config_from_env()
         self.sleep_manager = SleepManager(config=sleep_config,
                                           traffic_monitor=self.traffic_monitor)
         self.router = LLMRouter(models_config=model_config_json,
@@ -591,6 +609,7 @@ def _extract_models_mapping(
 
     for inst in raw_cfg.get("instances", []):
         model_name = inst["model"]
+        engine_name = inst["engine"]
 
         # Defaults
         host: str = "localhost"
@@ -630,7 +649,13 @@ def _extract_models_mapping(
             )
             continue
 
-        models_mapping[model_name] = {"endpoint": {"host": host, "port": port}}
+        models_mapping[model_name] = {
+            "endpoint": {
+                "host": host,
+                "port": port,
+                "engine": engine_name
+            }
+        }
 
     return models_mapping
 
@@ -640,7 +665,7 @@ async def main():
 
     parser = argparse.ArgumentParser(description='LLM Router Server')
     parser.add_argument(
-        '--config',
+        '--config_path',
         required=True,
         help='Path to YAML configuration file (e.g. example-config.yaml)')
     parser.add_argument('--port',
@@ -650,7 +675,7 @@ async def main():
 
     args = parser.parse_args()
 
-    cfg_path = Path(args.config).expanduser().resolve()
+    cfg_path = Path(args.config_path).expanduser().resolve()
     if not cfg_path.is_file():
         raise SystemExit(f"YAML config file not found: {cfg_path}")
 
@@ -660,9 +685,13 @@ async def main():
     models_mapping = _extract_models_mapping(raw_cfg)
     models_config = {"models": models_mapping}
 
+    # Build SleepConfig from YAML
+    sleep_config = _extract_sleep_config(raw_cfg)
+
     server = MultiLLMFrontend(
         port=args.port,
         model_config_json=models_config,
+        sleep_config=sleep_config,
     )
     await server.start()
 
