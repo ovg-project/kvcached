@@ -83,7 +83,6 @@ def alloc_kv_cache(
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
-    num_tokens = kvcache_shape[0]
     block_mem_size = math.prod(kvcache_shape[1:]) * dtype.itemsize
     blocks_per_page = PAGE_SIZE // block_mem_size
 
@@ -107,8 +106,8 @@ def alloc_kv_cache(
     tokens_per_page = block_size * blocks_per_page
     actual_num_tokens = (actual_num_tokens // tokens_per_page) * tokens_per_page
     
-    print(f"[kvcached] Actual allocated tensor size: {raw_tensor.numel() * raw_tensor.element_size()} bytes")
-    print(f"[kvcached] Derived actual_num_tokens: {actual_num_tokens} (original estimate: {block_size * blocks_per_page * num_pages})")
+    logger.info(f"[kvcached] Actual allocated tensor size: {raw_tensor.numel() * raw_tensor.element_size()} bytes")
+    logger.info(f"[kvcached] Derived actual_num_tokens: {actual_num_tokens} (original estimate: {block_size * blocks_per_page * num_pages})")
     
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[0] = actual_num_tokens
