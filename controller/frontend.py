@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -7,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 from aiohttp import web
 from router import LLMRouter
-from sleep_manager import SleepManager
+from sleep_manager import SleepConfig, SleepManager
 from traffic_monitor import TrafficMonitor
 from utils import set_ulimit
 
@@ -16,11 +17,46 @@ from kvcached.utils import get_kvcached_logger
 logger = get_kvcached_logger()
 
 
+def _create_sleep_config_from_env() -> SleepConfig:
+    config = SleepConfig()
+
+    # Read configuration from environment variables
+    if "SLEEP_MANAGER_AUTO_SLEEP_ENABLED" in os.environ:
+        config.auto_sleep_enabled = os.environ[
+            "SLEEP_MANAGER_AUTO_SLEEP_ENABLED"].lower() == "true"
+
+    if "SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS" in os.environ:
+        config.idle_threshold_seconds = int(
+            os.environ["SLEEP_MANAGER_IDLE_THRESHOLD_SECONDS"])
+
+    if "SLEEP_MANAGER_CHECK_INTERVAL_SECONDS" in os.environ:
+        config.check_interval_seconds = int(
+            os.environ["SLEEP_MANAGER_CHECK_INTERVAL_SECONDS"])
+
+    if "SLEEP_MANAGER_WAKEUP_ON_REQUEST" in os.environ:
+        config.wakeup_on_request = os.environ[
+            "SLEEP_MANAGER_WAKEUP_ON_REQUEST"].lower() == "true"
+
+    if "SLEEP_MANAGER_MIN_SLEEP_DURATION" in os.environ:
+        config.min_sleep_duration = int(
+            os.environ["SLEEP_MANAGER_MIN_SLEEP_DURATION"])
+
+    logger.info(
+        f"Created SleepConfig from environment: auto_sleep={config.auto_sleep_enabled}, "
+        f"idle_threshold={config.idle_threshold_seconds}s, wakeup_on_request={config.wakeup_on_request}"
+    )
+
+    return config
+
+
 class MultiLLMFrontend:
 
     def __init__(self, port: int, model_config_json: Dict[str, Any]):
         self.traffic_monitor = TrafficMonitor()
-        self.sleep_manager = SleepManager(traffic_monitor=self.traffic_monitor)
+        # Create SleepManager with configuration from environment variables
+        sleep_config = _create_sleep_config_from_env()
+        self.sleep_manager = SleepManager(config=sleep_config,
+                                          traffic_monitor=self.traffic_monitor)
         self.router = LLMRouter(models_config=model_config_json,
                                 sleep_manager=self.sleep_manager,
                                 traffic_monitor=self.traffic_monitor)

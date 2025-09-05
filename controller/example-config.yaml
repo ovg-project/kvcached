@@ -14,9 +14,9 @@ router: # router configuration
 sleep_manager: # sleep configuration
   idle_threshold_seconds: 300        # 5 minutes - time before putting idle models to sleep
   check_interval_seconds: 60         # Check every minute for idle models
-  auto_sleep_enabled: true           # Enable automatic sleep mode for idle models
+  auto_sleep_enabled: false           # Enable automatic sleep mode for idle models
   wakeup_on_request: true            # Automatically wake models when requests come in
-  min_sleep_duration: 120            # Minimum time to keep model asleep (2 minutes)
+  min_sleep_duration: 80             # Minimum time to keep model asleep (2 minutes)
 
 instances: # instances configuration
   - name: instance1
