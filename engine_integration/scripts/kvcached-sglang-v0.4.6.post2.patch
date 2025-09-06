@@ -13,7 +13,7 @@ index 8891115c1..34099c61e 100644
                  "token_to_kv_pool_allocator memory leak detected! "
                  f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index f7eef2120..7a6a341fe 100644
+index f7eef2120..7c3f5ac7e 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
@@ -95,8 +95,31 @@ index f7eef2120..7a6a341fe 100644
          self._create_buffers()
          self.start_layer = start_layer or 0
          self.end_layer = end_layer or layer_num - 1
-@@ -248,6 +291,22 @@ class MHATokenToKVPool(KVCache):
-         )
+@@ -243,11 +286,42 @@ class MHATokenToKVPool(KVCache):
+         self.alt_stream = self.device_module.Stream()
+ 
+         k_size, v_size = self.get_kv_size_bytes()
+-        logger.info(
+-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+-        )
++        if self.enable_kvcached:
++            total_tokens = self.size + self.page_size
++            elems_per_token = self.head_num * self.head_dim
++            bytes_per_elem = self.dtype.itemsize
++
++            k_size_phy = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
++            v_size_phy = k_size_phy
++
++            logger.info(
++                f"Virtual KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++            )
++            logger.info(
++                f"Physical KV Cache limits by --mem-fraction-static: #tokens: {size}, K size: {k_size_phy / GB:.2f} GB, V size: {v_size_phy / GB:.2f} GB"
++            )
++        else:
++            logger.info(
++                f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++            )
  
      def _create_buffers(self):
 +        if self.enable_kvcached:

@@ -19,8 +19,8 @@ index 6d06fa103..e4820b981 100644
 +++ b/python/sglang/srt/mem_cache/allocator.py
 @@ -153,6 +153,43 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
          return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
- 
- 
+
+
 +class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 +    def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
 +        super().__init__(size, 1, dtype, device, kvcache)
@@ -60,15 +60,15 @@ index 6d06fa103..e4820b981 100644
 +
  class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
      """Allocator for SWA hybrid KV cache."""
- 
+
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 00ad66552..c35b4a955 100644
+index 00ad66552..0d91a5298 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -438,6 +438,88 @@ class MHATokenToKVPool(KVCache):
+@@ -438,6 +438,107 @@ class MHATokenToKVPool(KVCache):
          )
- 
- 
+
+
 +class ElasticMHATokenToKVPool(MHATokenToKVPool):
 +    def __init__(
 +        self,
@@ -125,8 +125,13 @@ index 00ad66552..c35b4a955 100644
 +        self.alt_stream = self.device_module.Stream() if _is_cuda else None
 +
 +        k_size, v_size = self.get_kv_size_bytes()
++        k_size_phy, v_size_phy = self.get_kv_size_bytes_phy()
++
 +        logger.info(
-+            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++            f"Virtual KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++        )
++        logger.info(
++            f"Physical KV Cache limits by --mem-fraction-static: #tokens: {size}, K size: {k_size_phy / GB:.2f} GB, V size: {v_size_phy / GB:.2f} GB"
 +        )
 +        self.mem_usage = (k_size + v_size) / GB
 +
@@ -150,10 +155,24 @@ index 00ad66552..c35b4a955 100644
 +            kv_layout="NHD",
 +        )
 +
++    def get_kv_size_bytes_phy(self):
++        """Return the physical memory limits of the K/V buffers.
++
++        This limit is enforced by `--mem-fraction-static` option.
++        """
++        total_tokens = self.size + self.page_size
++        elems_per_token = self.head_num * self.head_dim
++        bytes_per_elem = self.dtype.itemsize
++
++        k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
++        v_size_bytes = k_size_bytes
++
++        return k_size_bytes, v_size_bytes
++
 +
  class SWAKVPool(KVCache):
      """KV cache with separate pools for full and SWA attention layers."""
- 
+
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
 index 051f2b75e..742cce652 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
@@ -182,7 +201,7 @@ index 051f2b75e..742cce652 100644
 +        self.is_elastic = get_bool_env_var("ENABLE_KVCACHED", "false")
          self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
          self.attention_chunk_size = model_config.attention_chunk_size
- 
+
 @@ -1182,8 +1186,8 @@ class ModelRunner:
                      device=self.device,
                  )
@@ -211,7 +230,7 @@ index 051f2b75e..742cce652 100644
 +                    self.token_to_kv_pool = ElasticMHATokenToKVPool(
 +                        **elastic_mha_token_to_kv_pool_args
 +                    )
- 
+
          if self.token_to_kv_pool_allocator is None:
              if self.page_size == 1:
 @@ -1208,7 +1225,12 @@ class ModelRunner:
