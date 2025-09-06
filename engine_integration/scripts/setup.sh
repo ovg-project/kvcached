@@ -367,6 +367,9 @@ if [[ "$kc_method" != "source" && "$kc_method" != "pip" ]]; then
     exit 1
 fi
 
+# Pre-flight summary
+echo "[setup.sh] Engine=$engine | Engine-Method=$method | Engine-Version=${version:-default} | kvcached-Method=$kc_method"
+
 # Check for uv before proceeding
 check_uv
 

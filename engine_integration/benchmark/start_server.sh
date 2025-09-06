@@ -5,21 +5,111 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
-DEFAULT_MODEL=meta-llama/Llama-3.2-1B
-DEFAULT_VLLM_PORT=12346
-DEFAULT_SGL_PORT=30000
-DEFAULT_MODE="dev"
+# Default values
+DEFAULT_MODEL="meta-llama/Llama-3.2-1B"
+DEFAULT_PORT_VLLM=12346
+DEFAULT_PORT_SGL=30000
+DEFAULT_TP_SIZE=1
 
-op=$1
-port=$2
-model=$3
-mode=$4
+# CLI args (set via getopt) plus one positional 'engine'
+engine=""      # positional: vllm | sglang
+port=""        # if omitted, falls back to engine-specific defaults
+model=""       # if omitted, falls back to DEFAULT_MODEL
+venv_path=""   # optional
+tp_size=$DEFAULT_TP_SIZE
 
+usage() {
+    cat <<EOF
+Usage: $0 <engine> [--venv-path PATH] [--port PORT] [--model MODEL_ID] [--tp TP_SIZE]
+
+Positional arguments:
+  engine         Target engine (vllm | sglang) [required]
+Options:
+  --venv-path    Path to an existing virtual environment to activate (optional)
+  --port         Port to run the engine on (default: vllm=$DEFAULT_PORT_VLLM, sglang=$DEFAULT_PORT_SGL)
+  --model        Model identifier (default: $DEFAULT_MODEL)
+  --tp           Tensor parallel size (default: $DEFAULT_TP_SIZE)
+  -h, --help     Show this help and exit
+
+Example:
+  $0 vllm --venv-path ../vllm-kvcached-venv --model meta-llama/Llama-3.2-1B
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# GNU getopt parsing
+# -----------------------------------------------------------------------------
+TEMP=$(getopt \
+    --options h \
+    --longoptions port:,model:,venv-path:,tp:,help \
+    --name "$0" -- "$@")
+
+if [[ $? -ne 0 ]]; then
+    exit 1  # getopt already printed an error
+fi
+
+eval set -- "$TEMP"
+
+while true; do
+    case "$1" in
+        --port)
+            port="$2"; shift 2 ;;
+        --model)
+            model="$2"; shift 2 ;;
+        --venv-path)
+            venv_path="$2"; shift 2 ;;
+        --tp)
+            tp_size="$2"; shift 2 ;;
+        --help|-h)
+            usage; exit 0 ;;
+        --)
+            shift; break ;;
+        *)
+            echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+# Remaining arguments after option parsing are treated as positional.
+if [[ $# -lt 1 ]]; then
+    echo "Error: engine (vllm|sglang) positional argument is required" >&2
+    usage; exit 1
+fi
+engine="$1"; shift
+
+# Validate engine positional arg
+if [[ "$engine" != "vllm" && "$engine" != "sglang" ]]; then
+    echo "Error: engine must be 'vllm' or 'sglang'" >&2
+    usage; exit 1
+fi
+
+# Apply defaults
 MODEL=${model:-$DEFAULT_MODEL}
-VLLM_PORT=${port:-$DEFAULT_VLLM_PORT}
-SGL_PORT=${port:-$DEFAULT_SGL_PORT}
-MODE=${mode:-$DEFAULT_MODE}
-TP_SIZE=${tp_arg:-1}
+if [[ -n "$port" ]]; then
+    ENGINE_PORT="$port"
+else
+    if [[ "$engine" == "vllm" ]]; then
+        ENGINE_PORT=$DEFAULT_PORT_VLLM
+    else
+        ENGINE_PORT=$DEFAULT_PORT_SGL
+    fi
+fi
+VENV_PATH="$venv_path"
+TP_SIZE="$tp_size"
+
+# Validate VENV_PATH if provided
+if [[ -n "$VENV_PATH" ]]; then
+    if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
+        echo "Error: --venv-path '$VENV_PATH' is invalid (expected '$VENV_PATH/bin/activate' to exist)" >&2
+        exit 1
+    fi
+fi
+
+# Expose port variables expected later in the script
+if [[ "$engine" == "vllm" ]]; then
+    VLLM_PORT="$ENGINE_PORT"
+else
+    SGL_PORT="$ENGINE_PORT"
+fi
 
 PYTHON=${PYTHON:-python3}
 
@@ -34,10 +124,9 @@ else
     IS_L4=false
 fi
 
-if [ "$op" == "vllm" ]; then
-    if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/vllm-kvcached-venv/bin/activate"
-    fi
+if [ "$engine" == "vllm" ]; then
+    # Activate virtual environment if provided
+    if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     export ENABLE_KVCACHED=true
@@ -54,10 +143,9 @@ if [ "$op" == "vllm" ]; then
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS
-elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
-    if [ "$MODE" = "dev" ]; then
-        source "$ENGINE_DIR/sglang-kvcached-venv/bin/activate"
-    fi
+elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
+    # Activate virtual environment if provided
+    if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
 
@@ -75,6 +163,6 @@ elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     --tp "$TP_SIZE" \
     $SGL_L4_ARGS
 else
-    echo "Invalid option: $op"
+    echo "Invalid engine: $engine"
     exit 1
 fi
