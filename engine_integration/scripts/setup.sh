@@ -109,7 +109,7 @@ EOF
 
 install_kvcached_after_engine() {
     # Install kvcached after installing engines to find the correct torch version
-    if [ "$DEV_MODE" = true ]; then
+    if [[ "$kc_method" == "source" ]]; then
         install_kvcached_editable
     else
         uv pip install kvcached --no-build-isolation --no-cache-dir
@@ -283,57 +283,86 @@ setup_sglang() {
 # -----------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 <vllm|sglang> [pip|source] [VERSION] [dev|prod]
+Usage: $0 --engine <vllm|sglang> [--engine-method pip|source] [--engine-version VERSION] [--kvcached-method source|pip]
 
 Arguments:
-  <engine>   Target engine to set up (vllm, sglang)
-  [method]   Installation method: pip (default) or source
-  [VERSION]  Specific version to install. Supported versions:
-               - vllm   : pip -> 0.9.2 | source -> 0.9.2, 0.8.4
-               - sglang : pip -> 0.4.9 | source -> 0.4.9, 0.4.6.post2
-
-  [dev|prod] Choose whether to install kvcached from source (dev) or from PyPI (prod). Defaults to dev.
+  --engine            Target engine to set up (vllm, sglang) [required]
+  --engine-method     Engine installation method: pip (default) or source
+  --engine-version    Specific engine version to install. Supported versions:
+        - vllm   : pip -> 0.9.2 | source -> 0.9.2, 0.8.4
+        - sglang : pip -> 0.4.9 | source -> 0.4.9, 0.4.6.post2
+  --kvcached-method   source (install kvcached from source) or pip (install from PyPI). Default: source
 
 Examples:
-  $0 vllm                       # vLLM 0.9.2 (pip) with dev kvcached install
-  $0 vllm pip 0.9.2 prod        # vLLM 0.9.2 from PyPI and kvcached from PyPI
-  $0 sglang source 0.4.6.post2  # sglang 0.4.6.post2 built from source, dev kvcached
+  $0 --engine vllm  # vLLM 0.9.2 (pip) + source kvcached
+  $0 --engine vllm --engine-method source --engine-version 0.9.2 --kvcached-method pip
+  $0 --engine sglang --engine-method source --engine-version 0.4.6.post2
 EOF
 }
 
 ###############################################################################
-# CLI argument parsing
-# Usage: ./setup.sh <vllm|sglang> [pip|source] [VERSION]
-#   <engine>  : The engine to prepare (vllm, sglang)
-#   [method]  : Installation method; "pip" (default) or "source"
-#   [VERSION] : Engine version (defaults depend on engine/method)
-#
-# Examples:
-#   ./setup.sh vllm                 # Install vLLM 0.9.2 from PyPI (default)
-#   ./setup.sh vllm source 0.9.2    # Install vLLM v0.9.2 from source
-#   ./setup.sh sglang pip 0.4.9     # Install sglang 0.4.9 from PyPI
+# CLI argument parsing via GNU getopt
 ###############################################################################
 
-engine=${1:-}
-method=${2:-pip}   # pip (default) | source
-version=${3:-}
-# Fourth optional parameter: dev|prod (default dev)
-dev_flag=${4:-dev}
+# Parse options (long opts + -h)
+TEMP=$(getopt \
+    --options h \
+    --longoptions engine:,engine-method:,engine-version:,kvcached-method:,help \
+    --name "$0" -- "$@")
 
-# Help flags
-if [[ "$engine" == "-h" || "$engine" == "--help" || "$engine" == "help" ]]; then
-    usage
-    exit 0
+if [[ $? -ne 0 ]]; then
+    # getopt already printed an error
+    exit 1
 fi
 
+# Note: the eval/set magic is required to handle quoted values with spaces.
+eval set -- "$TEMP"
+
+# Defaults
+engine=""
+method="pip"             # engine installation method (pip|source)
+version=""
+# kvcached installation method (source|pip)
+kc_method="source"
+
+while true; do
+    case "$1" in
+        --engine)
+            engine="$2"; shift 2 ;;
+        --engine-method)
+            method="$2"; shift 2 ;;
+        --engine-version)
+            version="$2"; shift 2 ;;
+        --kvcached-method)
+            kc_method="$2"; shift 2 ;;
+        --help)
+            usage; exit 0 ;;
+        -h)
+            usage; exit 0 ;;
+        --)
+            shift; break ;;
+        *)
+            echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+# Validate required engine option
 if [[ -z "$engine" ]]; then
+    echo "Error: --engine is required" >&2
     usage
     exit 1
 fi
 
-# Ensure dev_flag is valid
-if [[ "$dev_flag" != "dev" && "$dev_flag" != "prod" ]]; then
-    echo "Error: Unknown kvcached installation method '$dev_flag' (expected 'dev' or 'prod')" >&2
+# Validate method
+if [[ "$method" != "pip" && "$method" != "source" ]]; then
+    echo "Error: Unknown --engine-method '$method' (expected 'pip' or 'source')" >&2
+    usage
+    exit 1
+fi
+
+# Validate mode
+if [[ "$kc_method" != "source" && "$kc_method" != "pip" ]]; then
+    echo "Error: Unknown --kvcached-method '$kc_method' (expected 'source' or 'pip')" >&2
     usage
     exit 1
 fi
@@ -342,15 +371,12 @@ fi
 check_uv
 
 case "$engine" in
-    "vllm")
-        setup_vllm
-        ;;
-    "sglang")
-        setup_sglang
-        ;;
+    vllm)
+        setup_vllm ;;
+    sglang)
+        setup_sglang ;;
     *)
-        echo "Error: Unknown engine '$engine' (expected 'vllm', 'sglang')" >&2
+        echo "Error: Unknown engine '$engine' (expected 'vllm' or 'sglang')" >&2
         usage
-        exit 1
-        ;;
+        exit 1 ;;
 esac
