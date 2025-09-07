@@ -45,6 +45,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
         "engine_core": False,
         "kv_cache_coordinator": False,
         "gpu_model_runner": False,
+        "gpu_worker": False,
     }
 
     # Lazily import submodules we need to patch to avoid import-order issues
@@ -67,6 +68,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
         kvcoord_mod, block_pool_mod)
     patch_status["engine_core"] = _patch_engine_core(engine_mod)
     patch_status["gpu_model_runner"] = _patch_gpu_model_runner(gpumr_mod)
+    patch_status["gpu_worker"] = _patch_gpu_worker(importlib.import_module("vllm.v1.worker.gpu_worker"))
 
     # Log overall status
     successful_patches = [name for name, succ in patch_status.items() if succ]
@@ -422,5 +424,57 @@ def _patch_gpu_model_runner(gpumr_mod: types.ModuleType) -> bool:
             _patched_reshape_kv.__kvcached_patched__ = True  # type: ignore[attr-defined]
             setattr(GPUModelRunner, "_reshape_kv_cache_tensors",
                     _patched_reshape_kv)
+
+    return True
+
+
+def _patch_gpu_worker(gpuworker_mod: types.ModuleType) -> bool:
+    """Patch Worker.init_device to ignore GPU free-memory check when kvcached
+    is enabled.
+    """
+
+    Worker = getattr(gpuworker_mod, "Worker", None)
+    if Worker is None:
+        return False
+
+    original_init_device = Worker.init_device
+
+    def _patched_init_device(self, *args: Any, **kwargs: Any):  # type: ignore[no-self-use]
+        self.enable_kvcached = _enable_kvcached()
+        if not self.enable_kvcached:
+            return
+
+        try:
+            return original_init_device(self, *args, **kwargs)
+        except ValueError as e:
+            # If the original impl still raises due to insufficient memory,
+            # replicate the remainder of its logic while skipping the guard.
+            logger.warning("Ignoring GPU free-memory check: %s", e)
+
+            # The steps below mirror the tail of vLLM's Worker.init_device
+            # after the memory-utilization check.
+            try:
+                from vllm.model_executor import set_random_seed  # type: ignore
+                from vllm.v1.utils import report_usage_stats  # type: ignore
+                from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+                from vllm.v1.worker.gpu_worker import (
+                    init_worker_distributed_environment as _init_dist_env,
+                )
+            except Exception:
+                logger.warning("Unable to import vLLM helpers; re-raising OOM")
+                raise
+
+            _init_dist_env(self.vllm_config, self.rank,
+                           self.distributed_init_method, self.local_rank)
+            set_random_seed(self.model_config.seed)
+            self.model_runner = GPUModelRunner(self.vllm_config, self.device)  # type: ignore[attr-defined]
+            if getattr(self, "rank", None) == 0:
+                report_usage_stats(self.vllm_config)
+
+            return None
+
+    if getattr(Worker.init_device, "__kvcached_patched__", False) is not True:  # type: ignore[attr-defined]
+        _patched_init_device.__kvcached_patched__ = True  # type: ignore[attr-defined]
+        Worker.init_device = _patched_init_device  # type: ignore[assignment]
 
     return True
