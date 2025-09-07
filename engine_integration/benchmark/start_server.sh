@@ -143,6 +143,7 @@ if [ "$engine" == "vllm" ]; then
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS
+    if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
@@ -162,6 +163,7 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     --port "$SGL_PORT" \
     --tp "$TP_SIZE" \
     $SGL_L4_ARGS
+    if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 else
     echo "Invalid engine: $engine"
     exit 1
