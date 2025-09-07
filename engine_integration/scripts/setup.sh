@@ -189,8 +189,11 @@ setup_vllm_from_source() {
     uv pip install --editable .
 
     # Apply patch if present for this version
-    if [ -f "$ENGINE_DIR/kvcached-vllm-v${vllm_ver}.patch" ]; then
-        git apply "$ENGINE_DIR/kvcached-vllm-v${vllm_ver}.patch"
+    if [ -f "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch"
+    else
+        echo "Error: patch for vLLM-v${vllm_ver} not found" >&2
+        exit 1
     fi
 
     install_kvcached_after_engine
@@ -200,8 +203,8 @@ setup_vllm_from_source() {
 }
 
 setup_sglang_from_source() {
-    # $1: version (default 0.4.6.post2)
-    local sglang_ver=${1:-0.4.6.post2}
+    # $1: version (default 0.4.9)
+    local sglang_ver=${1:-0.4.9}
 
     pushd "$ENGINE_DIR"
 
@@ -217,8 +220,11 @@ setup_sglang_from_source() {
     uv pip install -e "python[all]"
 
     # Apply patch if present
-    if [ -f "$ENGINE_DIR/kvcached-sglang-v${sglang_ver}.patch" ]; then
-        git apply "$ENGINE_DIR/kvcached-sglang-v${sglang_ver}.patch"
+    if [ -f "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch"
+    else
+        echo "Error: patch for sglang-v${sglang_ver} not found" >&2
+        exit 1
     fi
 
     install_kvcached_after_engine
@@ -250,13 +256,7 @@ setup_vllm() {
 }
 
 setup_sglang() {
-    local _default_ver
-    if [[ "$method" == "source" ]]; then
-        _default_ver="0.4.6.post2"
-    else
-        _default_ver="0.4.9"
-    fi
-    local _version=${version:-"${_default_ver}"}
+    local _version=${version:-"0.4.9"}
 
     # Validate supported versions
     if [[ "$method" == "pip" ]]; then
