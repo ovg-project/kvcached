@@ -163,8 +163,14 @@ def _inject_elastic_mem_pool(mem_pool_mod: types.ModuleType) -> bool:
 
             k_size, v_size = self.get_kv_size_bytes()
             GB = 1024**3
-            logger.info(f"KV Cache is allocated. #tokens: {size}, K size: "
+            k_size_phy, v_size_phy = self.get_kv_size_bytes_phy()
+
+            logger.info(f"VirtualKV Cache is allocated. #tokens: {size}, K size: "
                         f"{k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB")
+            logger.info(f"Physical KV Cache limits by --mem-fraction-static: "
+                        f"#tokens: {size}, K size: "
+                        f"{k_size_phy / GB:.2f} GB, V size: {v_size_phy / GB:.2f} GB")
+            
             self.mem_usage = (k_size + v_size) / GB
 
         def __del__(self):  # best-effort cleanup
@@ -194,6 +200,20 @@ def _inject_elastic_mem_pool(mem_pool_mod: types.ModuleType) -> bool:
                 attention_type="MHA",
                 kv_layout="NHD",
             )
+        
+        def get_kv_size_bytes_phy(self):
+            """Return the physical memory limits of the K/V buffers.
+
+            This limit is enforced by `--mem-fraction-static` option.
+            """
+            total_tokens = self.size + self.page_size
+            elems_per_token = self.head_num * self.head_dim
+            bytes_per_elem = self.dtype.itemsize
+
+            k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
+            v_size_bytes = k_size_bytes
+
+            return k_size_bytes, v_size_bytes
 
     setattr(mem_pool_mod, "ElasticMHATokenToKVPool", ElasticMHATokenToKVPool)
     return True

@@ -13,20 +13,18 @@ from kvcached.utils import get_kvcached_logger
 logger = get_kvcached_logger()
 
 
-def _parse_cfg(cfg: Dict[str, Any], config_dir: Path) -> List[Dict[str, Any]]:
+def _parse_cfg(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Parse and validate the YAML configuration.
 
     Parameters
     ----------
     cfg : Dict[str, Any]
         Raw YAML dict.
-    config_dir : Path
-        Directory of the YAML file (used for resolving relative paths).
 
     Returns
     -------
     List[Dict[str, Any]]
-        A list of normalized instance configuration dictionaries.
+        A list of instances_config.
     """
     if "instances" not in cfg or not isinstance(cfg["instances"], list):
         raise ValueError(
@@ -86,7 +84,6 @@ def _parse_cfg(cfg: Dict[str, Any], config_dir: Path) -> List[Dict[str, Any]]:
                 inst_cfg["venv_path"]).expanduser().resolve()
 
         parsed.append(inst_cfg)
-
     return parsed
 
 
@@ -220,7 +217,7 @@ def _maybe_launch_router(router_cfg: Dict[str, Any],
         "python",
         "-u",
         str(Path(__file__).parent / "frontend.py"),
-        "--config",
+        "--config_path",
         str(config_path),
         "--port",
         str(frontend_port),
@@ -262,7 +259,7 @@ def main() -> None:
     router_cfg: Dict[str, Any] = raw_cfg.get("router", {}) or {}
 
     try:
-        instances_cfg = _parse_cfg(raw_cfg, cfg_path.parent)
+        instances_cfg = _parse_cfg(raw_cfg)
     except Exception as e:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)

@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
-DEV_MODE=true  # Set to false to use the released kvcached package
 
 check_uv() {
     if ! command -v uv &> /dev/null; then
@@ -102,83 +101,285 @@ EOF
     find "$KVCACHED_DIR/kvcached" -maxdepth 1 -name 'vmm_ops*.so' -exec rm -f {} + || true
 
     # 9. Copy the autopatch.pth file to the site-packages directory
-    PYTHON=${PYTHON:-python3}
-    $PYTHON "$KVCACHED_DIR/tools/dev_copy_pth.py"
+    if [[ "$method" == "pip" ]]; then
+        PYTHON=${PYTHON:-python3}
+        $PYTHON "$KVCACHED_DIR/tools/dev_copy_pth.py"
+    fi
 }
 
-setup_vllm() {
-    pushd "$ENGINE_DIR"
-
-    uv venv vllm-kvcached-venv --python=python3.11
-    source vllm-kvcached-venv/bin/activate
-    uv pip install --upgrade pip
-
-    # Install requirements for kvcached first to avoid overwriting vLLM's requirements
-    install_requirements
-    # vLLM-v0.9.2 requires transformers>=4.51.1 but not too new.
-    uv pip install transformers==4.51.1
-    uv pip install vllm==0.9.2
-
-    # Install kvcached after installing VLLM to find the correct torch version
-    if [ "$DEV_MODE" = true ]; then
+install_kvcached_after_engine() {
+    # Install kvcached after installing engines to find the correct torch version
+    if [[ "$kc_method" == "source" ]]; then
         install_kvcached_editable
     else
         uv pip install kvcached --no-build-isolation --no-cache-dir
     fi
+}
+
+setup_python_venv() {
+    uv venv $1 --python=python3.11
+    local venv_dir=$1
+    source $venv_dir/bin/activate
+    uv pip install --upgrade pip
+}
+
+setup_vllm_pip() {
+    # $1: version (default 0.9.2)
+    local vllm_ver=${1:-0.9.2}
+
+    pushd "$ENGINE_DIR"
+
+    setup_python_venv vllm-kvcached-venv
+
+    # Install requirements for kvcached first to avoid overwriting vLLM's requirements
+    install_requirements
+    # vLLM-v0.9.2 requires transformers>=4.51.1 but not too new.
+    if [ "$vllm_ver" == "0.9.2" ]; then
+        uv pip install transformers==4.51.1
+    fi
+    uv pip install "vllm==${vllm_ver}"
+
+    install_kvcached_after_engine
 
     deactivate
     popd
 }
 
-setup_sglang() {
+setup_sglang_pip() {
+    # $1: version (default 0.4.9)
+    local sglang_ver=${1:-0.4.9}
+
     pushd "$ENGINE_DIR"
 
-    uv venv sglang-kvcached-venv --python=python3.11
-    source sglang-kvcached-venv/bin/activate
-    uv pip install --upgrade pip
+    setup_python_venv sglang-kvcached-venv
 
     # Install requirements for kvcached first to avoid overwriting sglang's requirements
     install_requirements
 
     uv pip install torch==2.7.0
-    uv pip install "sglang[all]==0.4.9"
+    uv pip install "sglang[all]==${sglang_ver}"
 
-    # Install kvcached after install sglang to find the correct torch version
-    if [ "$DEV_MODE" = true ]; then
-        install_kvcached_editable
-    else
-        uv pip install kvcached --no-build-isolation --no-cache-dir
-    fi
-
+    install_kvcached_after_engine
 
     deactivate
     popd
 }
 
-op=${1:-}
+setup_vllm_from_source() {
+    # $1: version (default 0.9.2)
+    local vllm_ver=${1:-0.9.2}
 
-if [ -z "$op" ]; then
-    echo "Usage: $0 <vllm|sglang|all>"
+    pushd "$ENGINE_DIR"
+
+    local repo_dir="vllm-v${vllm_ver}"
+    git clone -b "v${vllm_ver}" https://github.com/vllm-project/vllm.git "$repo_dir"
+    cd "$repo_dir"
+
+    setup_python_venv .venv
+
+    # Install requirements for kvcached first to avoid overwriting vLLM's requirements
+    install_requirements
+    if [ "$vllm_ver" == "0.9.2" ]; then
+        uv pip install transformers==4.51.1
+    fi
+
+    # use specific version of precompiled wheel (best effort)
+    pip download "vllm==${vllm_ver}" --no-deps -d /tmp || true
+    export VLLM_PRECOMPILED_WHEEL_LOCATION="/tmp/vllm-${vllm_ver}-cp38-abi3-manylinux1_x86_64.whl"
+    uv pip install --editable .
+
+    # Apply patch if present for this version
+    if [ -f "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch"
+    else
+        echo "Error: patch for vLLM-v${vllm_ver} not found" >&2
+        exit 1
+    fi
+
+    install_kvcached_after_engine
+
+    deactivate
+    popd
+}
+
+setup_sglang_from_source() {
+    # $1: version (default 0.4.9)
+    local sglang_ver=${1:-0.4.9}
+
+    pushd "$ENGINE_DIR"
+
+    local repo_dir="sglang-v${sglang_ver}"
+    git clone -b "v${sglang_ver}" https://github.com/sgl-project/sglang.git "$repo_dir"
+    cd "$repo_dir"
+
+    setup_python_venv .venv
+
+    # Install requirements for kvcached first to avoid overwriting sglang's requirements
+    install_requirements
+
+    uv pip install -e "python[all]"
+
+    # Apply patch if present
+    if [ -f "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch"
+    else
+        echo "Error: patch for sglang-v${sglang_ver} not found" >&2
+        exit 1
+    fi
+
+    install_kvcached_after_engine
+
+    deactivate
+    popd
+}
+
+# Dispatch helper wrappers that pick defaults when VERSION is not provided
+setup_vllm() {
+    local _version=${version:-"0.9.2"}
+    # Validate supported versions
+    if [[ "$method" == "pip" ]]; then
+        if [[ "$_version" != "0.9.2" ]]; then
+            echo "Error: vLLM pip installation supports only version 0.9.2 (requested $_version)" >&2
+            exit 1
+        fi
+    else  # source
+        if [[ "$_version" != "0.9.2" && "$_version" != "0.8.4" ]]; then
+            echo "Error: vLLM source installation supports only versions 0.9.2 and 0.8.4 (requested $_version)" >&2
+            exit 1
+        fi
+    fi
+    if [[ "$method" == "source" ]]; then
+        setup_vllm_from_source "$_version"
+    else
+        setup_vllm_pip "$_version"
+    fi
+}
+
+setup_sglang() {
+    local _version=${version:-"0.4.9"}
+
+    # Validate supported versions
+    if [[ "$method" == "pip" ]]; then
+        if [[ "$_version" != "0.4.9" ]]; then
+            echo "Error: sglang pip installation supports only version 0.4.9 (requested $_version)" >&2
+            exit 1
+        fi
+    else  # source
+        if [[ "$_version" != "0.4.9" && "$_version" != "0.4.6.post2" ]]; then
+            echo "Error: sglang source installation supports only versions 0.4.9 and 0.4.6.post2 (requested $_version)" >&2
+            exit 1
+        fi
+    fi
+
+    if [[ "$method" == "source" ]]; then
+        setup_sglang_from_source "$_version"
+    else
+        setup_sglang_pip "$_version"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Usage helper
+# -----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $0 --engine <vllm|sglang> [--engine-method pip|source] [--engine-version VERSION] [--kvcached-method source|pip]
+
+Arguments:
+  --engine            Target engine to set up (vllm, sglang) [required]
+  --engine-method     Engine installation method: pip (default) or source
+  --engine-version    Specific engine version to install. Supported versions:
+        - vllm   : pip -> 0.9.2 | source -> 0.9.2, 0.8.4
+        - sglang : pip -> 0.4.9 | source -> 0.4.9, 0.4.6.post2
+  --kvcached-method   source (install kvcached from source) or pip (install from PyPI). Default: source
+
+Examples:
+  $0 --engine vllm  # vLLM 0.9.2 (pip) + source kvcached
+  $0 --engine vllm --engine-method source --engine-version 0.9.2 --kvcached-method pip
+  $0 --engine sglang --engine-method source --engine-version 0.4.6.post2
+EOF
+}
+
+###############################################################################
+# CLI argument parsing via GNU getopt
+###############################################################################
+
+# Parse options (long opts + -h)
+TEMP=$(getopt \
+    --options h \
+    --longoptions engine:,engine-method:,engine-version:,kvcached-method:,help \
+    --name "$0" -- "$@")
+
+if [[ $? -ne 0 ]]; then
+    # getopt already printed an error
     exit 1
 fi
+
+# Note: the eval/set magic is required to handle quoted values with spaces.
+eval set -- "$TEMP"
+
+# Defaults
+engine=""
+method="pip"             # engine installation method (pip|source)
+version=""
+# kvcached installation method (source|pip)
+kc_method="source"
+
+while true; do
+    case "$1" in
+        --engine)
+            engine="$2"; shift 2 ;;
+        --engine-method)
+            method="$2"; shift 2 ;;
+        --engine-version)
+            version="$2"; shift 2 ;;
+        --kvcached-method)
+            kc_method="$2"; shift 2 ;;
+        --help)
+            usage; exit 0 ;;
+        -h)
+            usage; exit 0 ;;
+        --)
+            shift; break ;;
+        *)
+            echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+# Validate required engine option
+if [[ -z "$engine" ]]; then
+    echo "Error: --engine is required" >&2
+    usage
+    exit 1
+fi
+
+# Validate method
+if [[ "$method" != "pip" && "$method" != "source" ]]; then
+    echo "Error: Unknown --engine-method '$method' (expected 'pip' or 'source')" >&2
+    usage
+    exit 1
+fi
+
+# Validate mode
+if [[ "$kc_method" != "source" && "$kc_method" != "pip" ]]; then
+    echo "Error: Unknown --kvcached-method '$kc_method' (expected 'source' or 'pip')" >&2
+    usage
+    exit 1
+fi
+
+# Pre-flight summary
+echo "[setup.sh] Engine=$engine | Engine-Method=$method | Engine-Version=${version:-default} | kvcached-Method=$kc_method"
 
 # Check for uv before proceeding
 check_uv
 
-case "$op" in
-    "vllm")
-        setup_vllm
-        ;;
-    "sglang")
-        setup_sglang
-        ;;
-    "all")
-        setup_vllm
-        setup_sglang
-        ;;
+case "$engine" in
+    vllm)
+        setup_vllm ;;
+    sglang)
+        setup_sglang ;;
     *)
-        echo "Error: Unknown option '$op'"
-        echo "Usage: $0 <vllm|sglang|all>"
-        exit 1
-        ;;
+        echo "Error: Unknown engine '$engine' (expected 'vllm' or 'sglang')" >&2
+        usage
+        exit 1 ;;
 esac

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
+from sleep_manager import SleepManager
+from traffic_monitor import TrafficMonitor
 
 from kvcached.utils import get_kvcached_logger
 
@@ -33,17 +35,17 @@ class ModelConfig:
 
 class LLMRouter:
 
-    def __init__(self, models_config: Dict[str, Any]):
+    def __init__(self, models_config: Dict[str, Any], *,
+                 sleep_manager: SleepManager, traffic_monitor: TrafficMonitor):
         """Create a router.
 
-        Parameters
-        ----------
-        models_config : Optional[Dict[str, Any]]
-            In-memory dict mapping model names to endpoint definitions. If
-            provided, this takes precedence over *config_path* so no extra
-            file is required when the controller already knows endpoint
-            details at runtime.
+        Args:
+            models_config: Mapping of model name to endpoint configuration.
+            sleep_manager: SleepManager instance to manage model sleep/wake.
+            traffic_monitor: TrafficMonitor instance for request statistics.
         """
+        self.sleep_manager = sleep_manager
+        self.traffic_monitor = traffic_monitor
 
         self.models: Dict[str, ModelConfig] = {}
 
@@ -124,11 +126,38 @@ class LLMRouter:
         endpoint_path: str = "/v1/completions"
     ) -> Optional[Union[Dict[str, Any], aiohttp.ClientResponse]]:
         """Route a request to the appropriate endpoint"""
+        # Record request start for traffic monitoring
+        request_stats = self.traffic_monitor.record_request_start(
+            model_name, endpoint_path)
+
         endpoint = self.get_endpoint_for_model(model_name)
         if not endpoint:
+            self.traffic_monitor.record_request_end(
+                request_stats,
+                success=False,
+                error_message=f"Model {model_name} not found")
             return None
 
+        # Check if model is sleeping and try to wake it up
+        if self.sleep_manager.is_model_sleeping(model_name):
+            logger.info(
+                f"Model {model_name} is sleeping, attempting to wake up for request"
+            )
+            wakeup_success = await self.sleep_manager.handle_model_wakeup_on_request(
+                model_name)
+            if not wakeup_success:
+                self.traffic_monitor.record_request_end(
+                    request_stats,
+                    success=False,
+                    error_message=
+                    f"Failed to wake up sleeping model {model_name}")
+                return None
+
         if self.session is None or self.session.closed:
+            self.traffic_monitor.record_request_end(
+                request_stats,
+                success=False,
+                error_message="Session not initialized")
             raise Exception("Session not initialised")
 
         try:
@@ -149,11 +178,18 @@ class LLMRouter:
                     logger.info(
                         f"Successfully routed streaming request for model {model_name} to {endpoint.base_url}"
                     )
+                    self.traffic_monitor.record_request_end(request_stats,
+                                                            success=True)
                     return response
                 else:
+                    error_text = await response.text()
                     logger.error(
-                        f"Streaming request failed with status {response.status}: {await response.text()}"
+                        f"Streaming request failed with status {response.status}: {error_text}"
                     )
+                    self.traffic_monitor.record_request_end(
+                        request_stats,
+                        success=False,
+                        error_message=f"HTTP {response.status}: {error_text}")
                     await response.release()
                     return None
             else:
@@ -166,20 +202,33 @@ class LLMRouter:
                         logger.info(
                             f"Successfully routed request for model {model_name} to {endpoint.base_url}"
                         )
+                        self.traffic_monitor.record_request_end(request_stats,
+                                                                success=True)
                         return result
                     else:
+                        error_text = await response.text()
                         logger.error(
-                            f"Request failed with status {response.status}: {await response.text()}"
+                            f"Request failed with status {response.status}: {error_text}"
                         )
+                        self.traffic_monitor.record_request_end(
+                            request_stats,
+                            success=False,
+                            error_message=
+                            f"HTTP {response.status}: {error_text}")
                         return None
 
         except asyncio.TimeoutError:
             logger.error(
                 f"Request timeout for model {model_name} at {endpoint.base_url}"
             )
+            self.traffic_monitor.record_request_end(
+                request_stats, success=False, error_message="Request timeout")
             return None
         except Exception as e:
             logger.error(f"Error routing request for model {model_name}: {e}")
+            self.traffic_monitor.record_request_end(request_stats,
+                                                    success=False,
+                                                    error_message=str(e))
             return None
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:

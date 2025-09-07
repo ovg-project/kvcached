@@ -8,33 +8,17 @@ kvcached is compatible with popular LLM serving engines, including SGLang and vL
 
 ### Prerequisites
 
-* Python (tested with 3.11)
-* PyTorch (tested with 2.6.0 and 2.7.0)
+* Python (tested with 3.9 - 3.11)
+* PyTorch (compatible with SGLang and vLLM)
 
-kvcached can be installed as simple as
-
-```bash
-pip install kvcached --no-build-isolation
-```
-
-Note that `--no-build-isolation` is required for kvcached to find the right PyTorch in the current virtual environment. If PyTorch is re-installed or upgraded, kvcached also needs re-installation.
-
-kvcached now supports both **SGLang** and **vLLM**. While we are in the process of upstreaming the integration interfaces, we provide temporary support via code patches.
-
-To apply a patch:
-
-```bash
-cd $PATH_TO_ENGINE_SRC # Where the source code of installed SGLang or vLLM is
-git apply $PATH_TO_KVCACHED/engine_integration/scripts/$PATCH_FILE
-```
-
-## All-in-One Installation (Recommended for Development)
-
-You can install everything (SGLang+vLLM+kvcached) by running the following commands:
+kvcached can be installed as a plugin with SGLang and vLLM.
 
 ```bash
 cd engine_integration/scripts
-./setup.sh all
+# install kvcached with SGLang v0.4.9
+./setup.sh --engine sglang --engine-method source --engine-version 0.4.9
+# install kvcached with vLLM v0.9.2
+./setup.sh --engine vllm --engine-method source --engine-version 0.9.2
 ```
 
 This script will download the specified versions of SGLang and vLLM, create separate venv environments (using `uv`), compile the code, apply the necessary patches, and install kvcached.
@@ -62,10 +46,11 @@ More instructions can be found [here](./docker/README.md).
 kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of SGLang/vLLM with kvcached, run:
 
 ```bash
-cd engine_integration/benchmark
-./start_server.sh [sgl|vllm]
+cd benchmarks/simple_bench
+export VENV_PATH=../../engine_integration/[sglang|vllm]-kvcached-venv
+./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B 
 # Wait until LLM server is ready
-./start_client.sh [sgl|vllm]
+./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B 
 ```
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run SGLang/vLLM with kvcached.
