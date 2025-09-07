@@ -189,8 +189,8 @@ setup_vllm_from_source() {
     uv pip install --editable .
 
     # Apply patch if present for this version
-    if [ -f "$SCRIPT_DIR/kvcached-vllm-v${vllm_ver}.patch" ]; then
-        git apply "$SCRIPT_DIR/kvcached-vllm-v${vllm_ver}.patch"
+    if [ -f "$ENGINE_DIR/kvcached-vllm-v${vllm_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/kvcached-vllm-v${vllm_ver}.patch"
     fi
 
     install_kvcached_after_engine
@@ -217,8 +217,8 @@ setup_sglang_from_source() {
     uv pip install -e "python[all]"
 
     # Apply patch if present
-    if [ -f "$SCRIPT_DIR/kvcached-sglang-v${sglang_ver}.patch" ]; then
-        git apply "$SCRIPT_DIR/kvcached-sglang-v${sglang_ver}.patch"
+    if [ -f "$ENGINE_DIR/kvcached-sglang-v${sglang_ver}.patch" ]; then
+        git apply "$ENGINE_DIR/kvcached-sglang-v${sglang_ver}.patch"
     fi
 
     install_kvcached_after_engine

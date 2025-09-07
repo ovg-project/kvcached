@@ -2,7 +2,7 @@
 set -x
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+ENGINE_DIR=$(cd "$SCRIPT_DIR/../../engine_integration" && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
 # -----------------------------------------------------------------------------
@@ -34,7 +34,7 @@ Options:
   -h, --help     Show this help and exit
 
 Example:
-  $0 vllm --venv-path ../vllm-kvcached-venv --model meta-llama/Llama-3.2-1B
+  $0 vllm --venv-path ../../engine_integration/vllm-kvcached-venv --model meta-llama/Llama-3.2-1B
 EOF
 }
 
