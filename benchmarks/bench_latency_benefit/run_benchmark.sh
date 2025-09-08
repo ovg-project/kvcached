@@ -12,8 +12,8 @@ export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../
 MODEL="meta-llama/Llama-3.2-1B"
 PROMPT_LEN=1024 # Input length
 COMPLETION_LEN=128  # Output length
-NUM_PROMPTS=10  # Use fewer prompts for quick testing
-REQUEST_RATE=2  # Lower request rate
+NUM_PROMPTS=100  # Use fewer prompts for quick testing
+REQUEST_RATE=20  # Lower request rate
 BACKEND="vllm"
 
 # Generate filenames based on prompt length
@@ -31,7 +31,7 @@ python create_custom_dataset.py \
     --completion-length "$COMPLETION_LEN" \
     --seed 42
 
-# Run benchmark
+# Run benchmark through kvcached router
 python bench_kvcached_vllm.py \
     --backend "$BACKEND" \
     --model "$MODEL" \
@@ -40,6 +40,8 @@ python bench_kvcached_vllm.py \
     --num-prompts "$NUM_PROMPTS" \
     --request-rate "$REQUEST_RATE" \
     --custom-output-len "$COMPLETION_LEN" \
+    --host "localhost" \
+    --port 8080 \
     --endpoint "/v1/completions" \
     --save-result \
     --result-filename "$RESULT_FILE"
