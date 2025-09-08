@@ -139,7 +139,6 @@ if [ "$engine" == "vllm" ]; then
     vllm serve "$MODEL" \
     --disable-log-requests \
     --no-enable-prefix-caching \
-    --gpu-memory-utilization 0.5 \
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS
@@ -159,7 +158,6 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     $PYTHON -m sglang.launch_server --model "$MODEL" \
     --disable-radix-cache \
     --trust-remote-code \
-    --mem-fraction-static 0.5 \
     --port "$SGL_PORT" \
     --tp "$TP_SIZE" \
     $SGL_L4_ARGS

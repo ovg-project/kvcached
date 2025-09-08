@@ -341,3 +341,19 @@ index 5a26e88db..f440124d5 100644
 +            kv_caches[layer_name] = kv_cache_buffers[idx]
 +
 +        return kv_caches
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 9e7e44d06..db5340a5e 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -140,7 +140,10 @@ class Worker(WorkerBase):
+             self.init_snapshot = MemorySnapshot()
+             self.requested_memory = (self.init_snapshot.total_memory *
+                                      self.cache_config.gpu_memory_utilization)
+-            if self.init_snapshot.free_memory < self.requested_memory:
++
++            enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                        "false").lower() == "true"
++            if not enable_kvcached and self.init_snapshot.free_memory < self.requested_memory:
+                 GiB = lambda b: round(b / GiB_bytes, 2)
+                 raise ValueError(
+                     f"Free memory on device "
