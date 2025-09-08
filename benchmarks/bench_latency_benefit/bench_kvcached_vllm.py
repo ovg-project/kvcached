@@ -74,7 +74,7 @@ from benchmark_dataset import (
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from vllm.benchmarks.serve import get_request
 
-from kvcached.benchmarks.common.vllm.datasets import (  # Added custom dataset
+from benchmarks.common.vllm.datasets import (  # Added custom dataset
     MyCustomDataset,
 )
 
@@ -273,8 +273,8 @@ async def benchmark(
         )
     ), "multi_modal_data must be a dict or list[dict]"
     test_input = RequestFuncInput(
-        model=test_prompt,
-        model_name=test_prompt,
+        model=deployments[0][0],
+        model_name=deployments[0][1],
         prompt=test_prompt,
         api_url=deployments[0][2],
         prompt_len=test_prompt_len,
@@ -303,8 +303,8 @@ async def benchmark(
     if profile:
         print("Starting profiler...")
         profile_input = RequestFuncInput(
-            model=test_prompt,
-            model_name=test_prompt,
+            model=deployments[0][0],
+            model_name=deployments[0][1],
             prompt=test_prompt,
             api_url=deployments[0][2] + "/start_profile",
             prompt_len=test_prompt_len,
@@ -380,12 +380,11 @@ async def benchmark(
                     rps_change_events.append({"rps": rps_val, "timestamp": timestamp})
                 last_int_rps = current_int_rps
 
-        prompt, prompt_len, output_len, mm_content, request_id = (
+        prompt, prompt_len, output_len, mm_content = (
             request.prompt,
             request.prompt_len,
             request.expected_output_len,
             request.multi_modal_data,
-            request.request_id,
         )
         # Round-robin selection of deployment.
         req_model_id, req_model_name, req_api_url = next(model_cycle)
@@ -405,7 +404,6 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_body=extra_body,
-            request_id=request_id,
         )
         task = limited_request_func(request_func_input=request_func_input, pbar=pbar)
         tasks.append(asyncio.create_task(task))
@@ -526,7 +524,8 @@ async def benchmark(
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
-            model=test_prompt,
+            model=deployments[0][0],
+            model_name=deployments[0][1],
             prompt=test_prompt,
             api_url=deployments[0][2] + "/stop_profile",
             prompt_len=test_prompt_len,

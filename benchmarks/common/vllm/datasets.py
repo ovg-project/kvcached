@@ -94,10 +94,9 @@ class MyCustomDataset(BenchmarkDataset):
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=exp_output_len,
-                    request_id=f"{request_id_prefix}{idx}",
                 )
             )
 
         # If we have fewer than needed, oversample to pad.
-        self.maybe_oversample_requests(requests, num_requests, request_id_prefix)
+        self.maybe_oversample_requests(requests, num_requests)
         return requests
