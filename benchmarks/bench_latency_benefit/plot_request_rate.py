@@ -8,11 +8,11 @@ Usage:
 
 import argparse
 import json
-import matplotlib.pyplot as plt
-import numpy as np
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def load_benchmark_results(result_files: List[str]) -> Dict[str, dict]:
@@ -233,7 +233,7 @@ def main():
         metrics_pattern = "results/metrics/*.json"
         args.result_files = glob.glob(metrics_pattern)
         if not args.result_files:
-            print(f"Error: No JSON files found in results/metrics/")
+            print("Error: No JSON files found in results/metrics/")
             return 1
         print(f"Auto-discovered {len(args.result_files)} result files: {args.result_files}")
     
