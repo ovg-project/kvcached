@@ -2,7 +2,7 @@
 set -x
 
 # Set environment variables to enable kvcached
-export ENABLE_KVCACHED=false
+export ENABLE_KVCACHED=true
 export KVCACHED_IPC_NAME=VLLM
 export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
