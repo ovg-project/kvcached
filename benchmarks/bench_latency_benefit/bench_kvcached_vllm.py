@@ -353,6 +353,12 @@ async def benchmark(
     tasks: list[asyncio.Task] = []
     # req_counter = 0  # to alternate models when model_id2 is provided
 
+    # Data for req_rate vs time plotting
+    request_timestamps = []  # List of (relative_time, model_name, request_type)
+    
+    # For unified timing across models - will be set via metadata
+    global_start_timestamp = time.time()  # Wall-clock time for synchronization
+    
     rps_change_events = []
     last_int_rps = -1
     if ramp_up_strategy is not None and ramp_up_start_rps is not None:
@@ -393,6 +399,17 @@ async def benchmark(
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
+        # Record request send timestamp (using wall-clock time for synchronization)
+        current_time = time.perf_counter()
+        current_wall_time = time.time()
+        relative_time = current_time - benchmark_start_time
+        request_timestamps.append({
+            "time": relative_time,
+            "wall_time": current_wall_time,  # For cross-model synchronization
+            "model": req_model_name,
+            "type": "send"
+        })
+        
         request_func_input = RequestFuncInput(
             model=req_model_id,
             model_name=req_model_name,
@@ -412,7 +429,25 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Record completion timestamps
+    completion_time = time.perf_counter()
+    benchmark_duration = completion_time - benchmark_start_time
+    
+    # Add completion timestamps for each request (approximation)
+    # Note: Individual completion times would require more complex async tracking
+    for i, output in enumerate(outputs):
+        if output.success and i < len(request_timestamps):
+            # Estimate completion time based on request send time + latency
+            send_time = request_timestamps[i]["time"]
+            send_wall_time = request_timestamps[i]["wall_time"]
+            completion_time_relative = send_time + output.latency
+            completion_wall_time = send_wall_time + output.latency
+            request_timestamps.append({
+                "time": completion_time_relative,
+                "wall_time": completion_wall_time,  # For cross-model synchronization
+                "model": request_timestamps[i]["model"],
+                "type": "complete"
+            })
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -470,6 +505,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_timestamps": request_timestamps,  # For req_rate vs time plotting
+        "global_start_timestamp": global_start_timestamp,  # For cross-model synchronization
     }
 
     if rps_change_events:
