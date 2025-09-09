@@ -11,7 +11,7 @@ export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../
 # Benchmark parameters
 PROMPT_LEN=1024 # Input length
 COMPLETION_LEN=128  # Output length
-NUM_PROMPTS=100  # Use fewer prompts for quick testing
+NUM_PROMPTS=400  # Use fewer prompts for quick testing
 REQUEST_RATE=20  # Request rate (RPS)
 BURSTINESS=1.0  # Use Poisson process (1.0 = Poisson, <1.0 = more bursty, >1.0 = more uniform)
 BACKEND="vllm"
@@ -37,9 +37,9 @@ UNIFIED_START_TIME=$(date +%s.%N)
 echo "Unified benchmark start time: $UNIFIED_START_TIME"
 
 # Model 1
-MODEL_1="meta-llama/Llama-3.2-1B"
+MODEL_1="meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME_1=$(echo "$MODEL_1" | tr '/' '-')
-RESULT_FILE_1="results/metrics/${BACKEND}-${MODEL_NAME_1}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}.json"
+RESULT_FILE_1="results/metrics/${BACKEND}-${MODEL_NAME_1}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-1.json"
 
 echo "Starting benchmark for $MODEL_1..."
 python bench_kvcached_vllm.py \
@@ -68,26 +68,26 @@ if [ "$MODEL_2_DELAY" -gt 0 ]; then
 fi
 
 # Model 2 (run in parallel)
-MODEL_2="Qwen/Qwen3-0.6B"
+MODEL_2="meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME_2=$(echo "$MODEL_2" | tr '/' '-')
-RESULT_FILE_2="results/metrics/${BACKEND}-${MODEL_NAME_2}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}.json"
+RESULT_FILE_2="results/metrics/${BACKEND}-${MODEL_NAME_2}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-2.json"
 
 echo "Starting benchmark for $MODEL_2..."
-python bench_kvcached_vllm.py \
-    --backend "$BACKEND" \
-    --model "$MODEL_2" \
-    --dataset-name mycustom \
-    --dataset-path "$DATASET_PATH" \
-    --num-prompts "$NUM_PROMPTS" \
-    --request-rate "$REQUEST_RATE" \
-    --burstiness 10.0 \
-    --custom-output-len "$COMPLETION_LEN" \
-    --host "localhost" \
-    --port 30000 \
-    --endpoint "/v1/completions" \
-    --save-result \
-    --result-filename "$RESULT_FILE_2" \
-    --metadata "unified_start_time=$UNIFIED_START_TIME" &
+# python bench_kvcached_vllm.py \
+#     --backend "$BACKEND" \
+#     --model "$MODEL_2" \
+#     --dataset-name mycustom \
+#     --dataset-path "$DATASET_PATH" \
+#     --num-prompts "$NUM_PROMPTS" \
+#     --request-rate "$REQUEST_RATE" \
+#     --burstiness 10.0 \
+#     --custom-output-len "$COMPLETION_LEN" \
+#     --host "localhost" \
+#     --port 30000 \
+#     --endpoint "/v1/completions" \
+#     --save-result \
+#     --result-filename "$RESULT_FILE_2" \
+#     --metadata "unified_start_time=$UNIFIED_START_TIME" &
 
 # Start Model 2 in background and get its PID
 MODEL_2_PID=$!

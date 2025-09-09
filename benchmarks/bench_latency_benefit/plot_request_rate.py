@@ -18,6 +18,7 @@ import numpy as np
 def load_benchmark_results(result_files: List[str]) -> Dict[str, dict]:
     """Load benchmark results from JSON files."""
     results = {}
+    model_name_counts = {}
     
     for file_path in result_files:
         try:
@@ -25,7 +26,18 @@ def load_benchmark_results(result_files: List[str]) -> Dict[str, dict]:
                 data = json.load(f)
                 
             # Extract model name from result data or filename
-            model_name = data.get('model_id', Path(file_path).stem)
+            base_model_name = data.get('model_id', Path(file_path).stem.split('-')[0:-4])
+            if isinstance(base_model_name, list):
+                base_model_name = '-'.join(base_model_name)
+            
+            # Handle duplicate model names by adding a suffix
+            if base_model_name in model_name_counts:
+                model_name_counts[base_model_name] += 1
+                model_name = f"{base_model_name}-{model_name_counts[base_model_name]}"
+            else:
+                model_name_counts[base_model_name] = 1
+                model_name = base_model_name
+            
             results[model_name] = data
             
         except Exception as e:
