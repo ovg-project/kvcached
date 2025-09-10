@@ -1,5 +1,5 @@
 #!/bin/bash
-set -x
+set -ex
 
 # Set environment variables to enable kvcached
 export ENABLE_KVCACHED=true
