@@ -8,11 +8,15 @@ from typing import Callable
 
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.vllm.patches import (
+    VLLM_ALL_RANGE,
+    VLLM_V8_RANGE,
+    VLLM_V9_PLUS_RANGE,
     ElasticBlockPoolPatch,
     EngineCorePatch,
     GPUModelRunnerPatch,
     GPUWorkerPatch,
     KVCacheCoordinatorPatch,
+    KVCacheManagerPatch,
 )
 from kvcached.utils import get_kvcached_logger
 
@@ -47,14 +51,17 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
         logger.debug("Disabled by KVCACHED_AUTOPATCH")
         return
 
-    # Create patch manager and register all vLLM patches
+    # Create patch manager and register version-specific vLLM patches
     patch_manager = PatchManager("vllm")
-    patch_manager.register_patches([
-        ElasticBlockPoolPatch(),
-        EngineCorePatch(),
-        KVCacheCoordinatorPatch(),
-        GPUModelRunnerPatch(),
-        GPUWorkerPatch(),
+
+    patch_manager.register_patches_with_versions([
+        (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
+        (EngineCorePatch(), VLLM_ALL_RANGE),
+        (GPUModelRunnerPatch(), VLLM_ALL_RANGE),
+        (GPUWorkerPatch(), VLLM_ALL_RANGE),
+
+        (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
+        (KVCacheManagerPatch(), VLLM_V8_RANGE),
     ])
 
     # Apply all patches

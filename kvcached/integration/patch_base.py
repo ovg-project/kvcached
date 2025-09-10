@@ -6,7 +6,7 @@ import importlib
 import os
 import types
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kvcached.utils import get_kvcached_logger
 
@@ -65,21 +65,26 @@ class PatchManager:
 
     def __init__(self, library_name: str):
         self.library_name = library_name
-        self.patches: List[BasePatch] = []
+        self.patches: List[Tuple[BasePatch, Optional[str]]] = []  # (patch, version_range)
         self.logger = logger
 
-    def register_patch(self, patch: BasePatch) -> None:
-        """Register a patch to be applied"""
+    def register_patch(self, patch: BasePatch, version_range: Optional[str] = None) -> None:
+        """Register a patch to be applied with version constraint"""
         if patch.library != self.library_name:
             raise ValueError(
                 f"Patch {patch.patch_name} is for {patch.library}, not {self.library_name}"
             )
-        self.patches.append(patch)
+        self.patches.append((patch, version_range))
 
     def register_patches(self, patches: List[BasePatch]) -> None:
         """Register multiple patches"""
         for patch in patches:
             self.register_patch(patch)
+
+    def register_patches_with_versions(self, patches: List[Tuple[BasePatch, str]]) -> None:
+        """Register multiple patches with version constraints"""
+        for patch, version_range in patches:
+            self.register_patch(patch, version_range)
 
     def apply_all_patches(self) -> Dict[str, bool]:
         """Apply all registered patches and return results"""
@@ -87,8 +92,17 @@ class PatchManager:
 
         self.logger.info(f"Applying {len(self.patches)} patches for {self.library_name}")
 
-        for patch in self.patches:
+        for patch_entry in self.patches:
+            patch, version_range = patch_entry
             try:
+                # Check version compatibility if specified
+                if version_range is not None:
+                    if not self._is_patch_compatible(patch, version_range):
+                        self.logger.debug(
+                            f"Skipping {patch.patch_name} - version {self._get_library_version()} not in range {version_range}"
+                        )
+                        continue
+
                 success = self._apply_single_patch(patch)
                 results[patch.patch_name] = success
 
@@ -102,6 +116,41 @@ class PatchManager:
                 results[patch.patch_name] = False
 
         return results
+
+    def _get_library_version(self) -> Optional[str]:
+        """Get the version of the target library"""
+        try:
+            lib = importlib.import_module(self.library_name)
+            version = getattr(lib, "__version__", None)
+            if version is None:
+                # Try alternative version attributes
+                for attr_name in ["version", "VERSION", "_version"]:
+                    version = getattr(lib, attr_name, None)
+                    if version is not None:
+                        break
+            return str(version) if version is not None else None
+        except Exception as e:
+            self.logger.warning(f"Error detecting version for {self.library_name}: {e}")
+            return None
+
+    def _is_patch_compatible(self, patch: BasePatch, version_range: str) -> bool:
+        """Check if patch is compatible with the current library version"""
+        library_version = self._get_library_version()
+        if library_version is None:
+            self.logger.warning(
+                f"Could not determine {self.library_name} version, skipping version check"
+            )
+            return True
+
+        try:
+            # Import VersionRange here to avoid circular imports
+            from kvcached.integration.version_utils import VersionRange
+
+            version_range_obj = VersionRange(version_range)
+            return version_range_obj.contains(library_version)
+        except Exception as e:
+            self.logger.warning(f"Error checking version compatibility: {e}")
+            return True
 
     def _apply_single_patch(self, patch: BasePatch) -> bool:
         """Apply a single patch"""
