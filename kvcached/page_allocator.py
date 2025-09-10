@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 contributors to the kvcached project
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import threading
 from collections import deque
 from typing import List, Optional, Tuple, cast

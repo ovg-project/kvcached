@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2025 contributors to the kvcached project
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Copy kvcached_autopatch.pth into the active site-packages.
 Used in dev mode when kvcached is installed as editable.

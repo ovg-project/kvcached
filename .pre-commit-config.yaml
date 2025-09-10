@@ -46,6 +46,24 @@ repos:
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt, --index-strategy, unsafe-best-match, --torch-backend, cu128]
       files: ^requirements/test\.(in|txt)$
+- repo: local
+  hooks:
+    # Python/C/C++/CUDA (normal)
+    - id: reuse-annotate
+      name: Add SPDX headers (Python/C/C++)
+      language: system
+      entry: reuse annotate -l Apache-2.0 -c "contributors to the kvcached project" --copyright-style spdx
+      pass_filenames: true
+      files: '\.(py|c|cpp|cc|h|hpp|cu|cuh)$'
+
+    # .ipp needs explicit style
+    - id: reuse-annotate-ipp
+      name: Add SPDX headers (.ipp with C-style)
+      language: system
+      entry: reuse annotate -l Apache-2.0 -c "contributors to the kvcached project" --copyright-style spdx --style c
+      pass_filenames: true
+      files: '\.ipp$'
+
 # Add mypy hooks for both local runs and CI (manual stage)
 - repo: local
   hooks:
