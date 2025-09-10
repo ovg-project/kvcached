@@ -144,7 +144,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if EngineCore is None:
             return False
 
-        if self._is_already_patched(EngineCore.__init__):
+        if self._is_already_patched(EngineCore.__init__, "init"):
             self.logger.debug("EngineCore.__init__ already patched")
             return True
 
@@ -164,7 +164,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     pass
             return original_init(self, vllm_config, *args, **kwargs)
 
-        self._mark_as_patched(_patched_engine_init)
+        self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
         return True
 
@@ -193,7 +193,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
         if KVCacheCoordinator is None:
             return False
 
-        if self._is_already_patched(KVCacheCoordinator.__init__):
+        if self._is_already_patched(KVCacheCoordinator.__init__, "init"):
             self.logger.debug("KVCacheCoordinator.__init__ already patched")
             return True
 
@@ -256,7 +256,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
         # Add helper methods to the instance
         KVCacheCoordinator._setup_kvcached_coordinator = _setup_kvcached_coordinator
 
-        self._mark_as_patched(_patched_init)
+        self._mark_as_patched(_patched_init, "init")
         KVCacheCoordinator.__init__ = _patched_init  # type: ignore[assignment]
         return True
 
@@ -284,7 +284,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         if KVCacheManager is None:
             return False
 
-        if self._is_already_patched(KVCacheManager.__init__):
+        if self._is_already_patched(KVCacheManager.__init__, "init"):
             self.logger.debug("KVCacheManager.__init__ already patched")
             return True
 
@@ -342,7 +342,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         # Add helper methods to the class
         KVCacheManager._setup_kvcached_manager = _setup_kvcached_manager
 
-        self._mark_as_patched(_patched_init)
+        self._mark_as_patched(_patched_init, "init")
         KVCacheManager.__init__ = _patched_init  # type: ignore[assignment]
         return True
 
@@ -385,7 +385,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
     @version_range(VLLM_ALL_RANGE)
     def patch_model_runner_init(self, GPUModelRunner) -> bool:
         """Patch __init__ to initialize kvcached in workers if enabled"""
-        if self._is_already_patched(GPUModelRunner.__init__):
+        if self._is_already_patched(GPUModelRunner.__init__, "init"):
             return True
 
         original_init = GPUModelRunner.__init__
@@ -426,14 +426,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached
 
-        self._mark_as_patched(_patched_mr_init)
+        self._mark_as_patched(_patched_mr_init, "init")
         GPUModelRunner.__init__ = _patched_mr_init  # type: ignore[assignment]
         return True
 
     @version_range(VLLM_V8_RANGE)
     def patch_initialize_kv_cache(self, GPUModelRunner) -> bool:
         """Patch __init__ to initialize kvcached in workers if enabled"""
-        if self._is_already_patched(GPUModelRunner.initialize_kv_cache):
+        if self._is_already_patched(GPUModelRunner.initialize_kv_cache, "init_kv_cache"):
             return True
 
         original_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
@@ -503,7 +503,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 self.kv_caches,
             )
 
-        self._mark_as_patched(_patched_initialize_kv_cache)
+        self._mark_as_patched(_patched_initialize_kv_cache, "init_kv_cache")
         GPUModelRunner.initialize_kv_cache = _patched_initialize_kv_cache  # type: ignore[assignment]
         return True
 
@@ -589,7 +589,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_allocate_kv_cache_tensors")
-        if self._is_already_patched(original_method):
+        if self._is_already_patched(original_method, "alloc_kv_cache_tensors"):
             return True
 
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
@@ -597,7 +597,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
-        self._mark_as_patched(_patched_alloc_kv)
+        self._mark_as_patched(_patched_alloc_kv, "alloc_kv_cache_tensors")
         setattr(GPUModelRunner, "_allocate_kv_cache_tensors", _patched_alloc_kv)
         return True
 
@@ -630,7 +630,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_reshape_kv_cache_tensors")
-        if self._is_already_patched(original_method):
+        if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
             return True
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors):
@@ -640,7 +640,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 )
             return original_method(self, kv_cache_config, kv_cache_raw_tensors)
 
-        self._mark_as_patched(_patched_reshape_kv)
+        self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)
         return True
 
@@ -700,7 +700,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         if Worker is None:
             return False
 
-        if self._is_already_patched(Worker.init_device):
+        if self._is_already_patched(Worker.init_device, "init_device"):
             self.logger.debug("Worker.init_device already patched")
             return True
 
@@ -741,6 +741,6 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
                 return None
 
-        self._mark_as_patched(_patched_init_device)
+        self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
         return True
