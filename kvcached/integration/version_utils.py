@@ -3,7 +3,10 @@ Version detection and management utilities for kvcached integration.
 """
 
 import importlib
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol
+
+if TYPE_CHECKING:
+    pass
 
 from packaging import version
 
@@ -102,9 +105,25 @@ def library_specific(library: str):
 class VersionManager:
     """Manages version detection and patch selection"""
 
+    _instance: Optional['VersionManager'] = None
+    _initialized: bool = False
+
+    def __new__(cls) -> 'VersionManager':
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self):
-        self.logger = logger
-        self._version_cache: Dict[str, Optional[str]] = {}
+        # Only initialize once to avoid resetting cache
+        if not self._initialized:
+            self.logger = logger
+            self._version_cache: Dict[str, Optional[str]] = {}
+            VersionManager._initialized = True
+
+    @classmethod
+    def get_instance(cls) -> 'VersionManager':
+        """Get the singleton instance of VersionManager"""
+        return cls()
 
     def detect_version(self, library_name: str, force_refresh: bool = False) -> Optional[str]:
         """Detect installed version of library"""
@@ -178,7 +197,7 @@ class VersionAwarePatch:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.version_manager = VersionManager()
+        self.version_manager = VersionManager.get_instance()
         self.detected_version: Optional[str] = None
         self.applicable_methods: List[Callable[..., Any]] = []
 

@@ -8,6 +8,7 @@ import types
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
+from kvcached.integration.version_utils import VersionManager, VersionRange
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
@@ -67,6 +68,7 @@ class PatchManager:
         self.library_name = library_name
         self.patches: List[Tuple[BasePatch, Optional[str]]] = []  # (patch, version_range)
         self.logger = logger
+        self.version_manager = VersionManager.get_instance()
 
     def register_patch(self, patch: BasePatch, version_range: Optional[str] = None) -> None:
         """Register a patch to be applied with version constraint"""
@@ -99,7 +101,7 @@ class PatchManager:
                 if version_range is not None:
                     if not self._is_patch_compatible(patch, version_range):
                         self.logger.debug(
-                            f"Skipping {patch.patch_name} - version {self._get_library_version()} not in range {version_range}"
+                            f"Skipping {patch.patch_name} - version {self.version_manager.detect_version(self.library_name)} not in range {version_range}"
                         )
                         continue
 
@@ -120,25 +122,10 @@ class PatchManager:
 
         return results
 
-    def _get_library_version(self) -> Optional[str]:
-        """Get the version of the target library"""
-        try:
-            lib = importlib.import_module(self.library_name)
-            version = getattr(lib, "__version__", None)
-            if version is None:
-                # Try alternative version attributes
-                for attr_name in ["version", "VERSION", "_version"]:
-                    version = getattr(lib, attr_name, None)
-                    if version is not None:
-                        break
-            return str(version) if version is not None else None
-        except Exception as e:
-            self.logger.warning(f"Error detecting version for {self.library_name}: {e}")
-            return None
 
     def _is_patch_compatible(self, patch: BasePatch, version_range: str) -> bool:
         """Check if patch is compatible with the current library version"""
-        library_version = self._get_library_version()
+        library_version = self.version_manager.detect_version(self.library_name)
         if library_version is None:
             self.logger.warning(
                 f"Could not determine {self.library_name} version, skipping version check"
@@ -146,9 +133,6 @@ class PatchManager:
             return True
 
         try:
-            # Import VersionRange here to avoid circular imports
-            from kvcached.integration.version_utils import VersionRange
-
             version_range_obj = VersionRange(version_range)
             return version_range_obj.contains(library_version)
         except Exception as e:
