@@ -35,7 +35,7 @@ install_sglang_nightly() {
     # Install the python packages
     uv pip install --upgrade pip
     uv pip install -e "python[all]"
-    uv pip install https://github.com/sgl-project/whl/releases/download/v0.3.9/sgl_kernel-0.3.9+cu128-cp310-abi3-manylinux2014_x86_64.whl
+    uv pip install https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl
     popd
 }
 
