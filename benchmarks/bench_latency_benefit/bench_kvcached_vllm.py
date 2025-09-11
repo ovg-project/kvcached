@@ -72,9 +72,6 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
-from benchmarks.common.vllm.datasets import (  # Added custom dataset
-    MyCustomDataset,
-)
 from vllm.benchmarks.serve import get_request
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -823,16 +820,8 @@ def main(args: argparse.Namespace):
             request_id_prefix=args.request_id_prefix,
         )
 
-    elif args.dataset_name == "mycustom":
-        input_requests = MyCustomDataset(dataset_path=args.dataset_path).sample(
-            tokenizer=tokenizer,
-            num_requests=args.num_prompts,
-            request_id_prefix=args.request_id_prefix,
-        )
-
     else:
         # For datasets that follow a similar structure, use a mapping.
-        print("!!!!!!!!!!")
         dataset_mapping = {
             "sharegpt": lambda: ShareGPTDataset(
                 random_seed=args.seed, dataset_path=args.dataset_path
@@ -1033,8 +1022,7 @@ def create_argument_parser():
             "sonnet",
             "random",
             "hf",
-            "custom",
-            "mycustom",
+            "custom"
         ],
         help="Name of the dataset to benchmark on.",
     )
