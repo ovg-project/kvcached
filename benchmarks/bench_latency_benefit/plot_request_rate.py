@@ -7,7 +7,9 @@ Usage:
 """
 
 import argparse
+import glob
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -241,7 +243,6 @@ def main():
     
     # Auto-discover result files if not specified
     if args.result_files is None:
-        import glob
         metrics_pattern = "results/metrics/*.json"
         args.result_files = glob.glob(metrics_pattern)
         if not args.result_files:
@@ -258,8 +259,6 @@ def main():
     
     print(f"Loaded {len(results)} benchmark results")
     
-    # Ensure output directory exists
-    import os
     output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
