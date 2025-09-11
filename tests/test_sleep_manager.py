@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-
-# SPDX-FileCopyrightText: 2025 contributors to the kvcached project
-#
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
 """

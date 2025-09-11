@@ -1,3 +1,21 @@
+# Copyright 2025
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+##
+## SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+## SPDX-License-Identifier: Apache-2.0
+##
 default_install_hook_types:
   - pre-commit
   - commit-msg
@@ -23,6 +41,20 @@ repos:
   rev: 6.0.1
   hooks:
   - id: isort
+- repo: local
+  hooks:
+    - id: addlicense-cpp-like
+      name: Add SPDX headers (C/C++/CUDA/IPP)
+      language: system
+      entry: tools/addlicense.sh
+      pass_filenames: true
+      files: '\.(c|cc|cpp|h|hpp|cu|cuh|ipp)$'
+    - id: addlicense-py
+      name: Add SPDX headers (Python)
+      language: system
+      entry: tools/addlicense.sh
+      pass_filenames: true
+      files: '\.py$'
 - repo: https://github.com/pre-commit/mirrors-clang-format
   rev: v20.1.3
   hooks:
@@ -46,23 +78,6 @@ repos:
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt, --index-strategy, unsafe-best-match, --torch-backend, cu128]
       files: ^requirements/test\.(in|txt)$
-- repo: local
-  hooks:
-    # Python/C/C++/CUDA (normal)
-    - id: reuse-annotate
-      name: Add SPDX headers (Python/C/C++)
-      language: system
-      entry: reuse annotate -l Apache-2.0 -c "contributors to the kvcached project" --copyright-style spdx
-      pass_filenames: true
-      files: '\.(py|c|cpp|cc|h|hpp|cu|cuh)$'
-
-    # .ipp needs explicit style
-    - id: reuse-annotate-ipp
-      name: Add SPDX headers (.ipp with C-style)
-      language: system
-      entry: reuse annotate -l Apache-2.0 -c "contributors to the kvcached project" --copyright-style spdx --style c
-      pass_filenames: true
-      files: '\.ipp$'
 
 # Add mypy hooks for both local runs and CI (manual stage)
 - repo: local
