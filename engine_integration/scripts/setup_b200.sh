@@ -28,8 +28,9 @@ install_vllm_nightly() {
 }
 
 install_sglang_nightly() {
+    pushd $ENGINE_DIR
     git clone https://github.com/sgl-project/sglang.git
-    pushd sglang
+    cd sglang
 
     # Install the python packages
     uv pip install --upgrade pip
