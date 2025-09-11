@@ -58,19 +58,3 @@ instances: # instances configuration
       - "--port=30000"
       # - "--gpu-memory-utilization 0.50"
       - "--enable-sleep-mode"
-
-  # - name: instance2
-  #   model: Qwen/Qwen3-0.6B
-  #   engine: sglang
-  #   using_venv: true
-  #   venv_path: ../engine_integration/sglang-v0.4.9/.venv
-  #   kvcached_env:
-  #     - "ENABLE_KVCACHED=true"
-  #     - "KVCACHED_IPC_NAME=SGLANG"
-  #   engine_args:
-  #     - "--disable-radix-cache"
-  #     - "--trust-remote-code"
-  #     - "--mem-fraction-static 0.5"
-  #     - "--host=localhost"
-  #     - "--port=30000"
-  #     - "--enable-memory-saver"
