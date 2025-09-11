@@ -3,7 +3,7 @@ Version detection and management utilities for kvcached integration.
 """
 
 import importlib
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from packaging import version
 
@@ -65,25 +65,36 @@ class VersionRange:
         return self.range_spec
 
 
+class VersionedCallable(Protocol):
+    """Protocol for callables with version attributes"""
+    _version_ranges: List[VersionRange]
+    _version_spec: str
+
+
 def version_range(range_spec: str):
     """Decorator to mark version compatibility for patch methods"""
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Any]) -> VersionedCallable:
         if not hasattr(func, "_version_ranges"):
-            func._version_ranges = []
-        func._version_ranges.append(VersionRange(range_spec))
-        func._version_spec = range_spec  # For backward compatibility
-        return func
+            func._version_ranges = []  # type: ignore
+        func._version_ranges.append(VersionRange(range_spec))  # type: ignore
+        func._version_spec = range_spec  # type: ignore # For backward compatibility
+        return func  # type: ignore
 
     return decorator
+
+
+class LibrarySpecificCallable(Protocol):
+    """Protocol for callables with library attributes"""
+    _library: str
 
 
 def library_specific(library: str):
     """Decorator to mark library-specific implementations"""
 
-    def decorator(func: Callable) -> Callable:
-        func._library = library
-        return func
+    def decorator(func: Callable[..., Any]) -> LibrarySpecificCallable:
+        func._library = library  # type: ignore
+        return func  # type: ignore
 
     return decorator
 
@@ -124,7 +135,7 @@ class VersionManager:
         self._version_cache[library_name] = detected_version
         return detected_version
 
-    def is_method_applicable(self, method: Callable, library_name: str, version_str: str) -> bool:
+    def is_method_applicable(self, method: Callable[..., Any], library_name: str, version_str: str) -> bool:
         """Check if a method is applicable to the given library version"""
         # Check library specificity
         if hasattr(method, "_library") and method._library != library_name:
@@ -141,8 +152,8 @@ class VersionManager:
         return True
 
     def get_applicable_methods(
-        self, methods: List[Callable], library_name: str, version_str: str
-    ) -> List[Callable]:
+        self, methods: List[Callable[..., Any]], library_name: str, version_str: str
+    ) -> List[Callable[..., Any]]:
         """Get methods applicable to the given library version"""
         applicable = []
         for method in methods:
@@ -153,7 +164,7 @@ class VersionManager:
     def log_version_info(self, library_name: str, detected_version: Optional[str]):
         """Log version detection results"""
         if detected_version:
-            self.logger.debug(f"Detected {library_name} version: {detected_version}")
+            self.logger.info(f"Detected {library_name} version: {detected_version}")
         else:
             self.logger.warning(f"Could not detect {library_name} version")
 
@@ -161,11 +172,15 @@ class VersionManager:
 class VersionAwarePatch:
     """Mixin class to add version awareness to patches"""
 
+    # These attributes should be defined by subclasses
+    library: str
+    logger: Any  # Logger instance
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.version_manager = VersionManager()
         self.detected_version: Optional[str] = None
-        self.applicable_methods: Optional[List[Callable]] = None
+        self.applicable_methods: List[Callable[..., Any]] = []
 
     def initialize_version_info(self) -> bool:
         """Initialize version information for this patch"""

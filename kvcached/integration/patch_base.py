@@ -20,10 +20,10 @@ def enable_kvcached() -> bool:
 class BasePatch(ABC):
     """Base class for all patches"""
 
-    library: str = None  # Override in subclass ("vllm" or "sglang")
-    target_module: str = None  # Module to patch
+    library: Optional[str] = None  # Override in subclass ("vllm" or "sglang")
+    target_module: Optional[str] = None  # Module to patch
     target_class: Optional[str] = None  # Class to patch (optional)
-    patch_name: str = None  # Human-readable name for logging
+    patch_name: Optional[str] = None  # Human-readable name for logging
 
     def __init__(self):
         if self.patch_name is None:
@@ -47,13 +47,13 @@ class BasePatch(ABC):
             raise ValueError(f"target_class not specified for {self.patch_name}")
         return getattr(target_module, self.target_class, None)
 
-    def _is_already_patched(self, obj: Any, patch_marker: str = None) -> bool:
+    def _is_already_patched(self, obj: Any, patch_marker: Optional[str] = None) -> bool:
         """Check if object is already patched"""
         if patch_marker is None:
             patch_marker = f"__kvcached_patched_{self.patch_name}__"
         return getattr(obj, patch_marker, False) is True
 
-    def _mark_as_patched(self, obj: Any, patch_marker: str = None) -> None:
+    def _mark_as_patched(self, obj: Any, patch_marker: Optional[str] = None) -> None:
         """Mark object as patched"""
         if patch_marker is None:
             patch_marker = f"__kvcached_patched_{self.patch_name}__"
@@ -104,7 +104,9 @@ class PatchManager:
                         continue
 
                 success = self._apply_single_patch(patch)
-                results[patch.patch_name] = success
+                # Ensure patch_name is not None for the dictionary key
+                patch_name = patch.patch_name or patch.__class__.__name__
+                results[patch_name] = success
 
                 if success:
                     self.logger.debug(f"Successfully applied {patch.patch_name}")
@@ -112,8 +114,9 @@ class PatchManager:
                     self.logger.warning(f"Failed to apply {patch.patch_name}")
 
             except Exception as e:
-                self.logger.error(f"Error applying {patch.patch_name}: {e}")
-                results[patch.patch_name] = False
+                patch_name = patch.patch_name or patch.__class__.__name__
+                self.logger.error(f"Error applying {patch_name}: {e}")
+                results[patch_name] = False
 
         return results
 
@@ -156,6 +159,9 @@ class PatchManager:
         """Apply a single patch"""
         try:
             # Import target module
+            if patch.target_module is None:
+                self.logger.error(f"target_module not specified for {patch.patch_name}")
+                return False
             target_module = importlib.import_module(patch.target_module)
 
             # Check if patch can be applied
