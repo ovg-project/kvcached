@@ -11,7 +11,6 @@ from kvcached.integration.version_utils import VersionAwarePatch, version_range
 from kvcached.utils import get_kvcached_logger
 
 # Version ranges for SGLang support
-SGLANG_V049_RANGE = ">=0.4.9,<0.5.0"  # SGLang 0.4.9.x versions
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
 
 logger = get_kvcached_logger()
@@ -49,8 +48,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             class ElasticTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
             ):
-                def __init__(self, size: int, dtype, device: str, kvcache) -> None:
-                    super().__init__(size, 1, dtype, device, kvcache)
+                def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
+                    super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
                         raise ValueError(
                             "ElasticTokenToKVPoolAllocator requires elastic MHA pool"
@@ -148,6 +147,8 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     start_layer: Union[int, None] = None,
                     end_layer: Union[int, None] = None,
                     enable_overlap_schedule: bool = True,
+                    *args,
+                    **kwargs,
                 ) -> None:
                     # Call grandparent (KVCache) initializer because we redefine
                     # all member variables.
@@ -160,6 +161,8 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         enable_memory_saver=enable_memory_saver,
                         start_layer=start_layer,
                         end_layer=end_layer,
+                        *args,
+                        **kwargs,
                     )
                     self.head_num = head_num
                     self.head_dim = head_dim
