@@ -14,7 +14,7 @@ check_uv() {
 }
 
 setup_python_venv() {
-    uv venv $1 --python=python3.10
+    uv venv $1 --python=python3.12
     local venv_dir=$1
     source $venv_dir/bin/activate
     uv pip install --upgrade pip
@@ -35,6 +35,7 @@ install_sglang_nightly() {
     # Install the python packages
     uv pip install --upgrade pip
     uv pip install -e "python[all]"
+    # WARNING: (YIFAN) This assumes CUDA 12.8 and Python 3.10, but we have tested it with Python 3.12 and it works.
     uv pip install https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl
     popd
 }
