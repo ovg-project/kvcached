@@ -39,8 +39,10 @@ install_sglang_nightly() {
 }
 
 install_kvcached() {
+    pushd $KVCACHED_DIR
     uv pip install -e . --no-build-isolation --no-cache-dir
     python $KVCACHED_DIR/tools/dev_copy_pth.py
+    popd
 }
 
 
