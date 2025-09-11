@@ -72,9 +72,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self.null_block = None  # type: ignore
 
             def get_cached_block(self, *args: Any, **kwargs: Any) -> Optional[list[KVCacheBlock]]:  # type: ignore[valid-type]
+                """args and kwargs are ignored for compatibility"""
                 return None
 
             def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
+                """args and kwargs are ignored for compatibility"""
                 raise NotImplementedError("Caching is not supported in ElasticBlockPool")
 
             def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:  # type: ignore[valid-type]
@@ -86,10 +88,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 return [KVCacheBlock(bid) for bid in block_ids]
 
-            def touch(
-                self,
-                blocks: tuple[list[KVCacheBlock], ...],  # type: ignore[valid-type]
-            ) -> None:
+            def touch(self, *args, **kwargs) -> None:  # type: ignore[valid-type]
                 raise NotImplementedError("Not supported in ElasticBlockPool")
 
             def free_blocks(
@@ -185,8 +184,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
         # Apply version-specific patches
         return self.patch_coordinator(kvcoord_mod)
 
-    @version_range(VLLM_V10_RANGE)
-    @version_range(VLLM_V9_RANGE)
+    @version_range(VLLM_V9_PLUS_RANGE)
     def patch_coordinator(self, kvcoord_mod: types.ModuleType) -> bool:
         """Patch KVCacheCoordinator"""
         KVCacheCoordinator = self._get_target_class(kvcoord_mod)
@@ -315,6 +313,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
             # Get required attributes from the manager instance
+            # This is a bit hacky but simplest
             kv_cache_spec = getattr(self, "get_kv_cache_spec")().items()[0][1]
             block_size = getattr(self, "block_size")
             num_gpu_blocks = getattr(self, "num_gpu_blocks")

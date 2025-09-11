@@ -14,7 +14,7 @@ check_uv() {
 }
 
 setup_python_venv() {
-    uv venv $1 --python=python3.12
+    uv venv $1 --python=python3.10
     local venv_dir=$1
     source $venv_dir/bin/activate
     uv pip install --upgrade pip
