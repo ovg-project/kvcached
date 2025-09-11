@@ -4,7 +4,8 @@
 import inspect
 import os
 import types
-from typing import Callable
+
+from wrapt.importer import when_imported
 
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.sglang.patches import (
@@ -14,24 +15,6 @@ from kvcached.integration.sglang.patches import (
     SchedulerMemoryLeakPatch,
 )
 from kvcached.utils import get_kvcached_logger
-
-try:
-    from wrapt.importer import when_imported  # type: ignore
-except Exception:
-
-    def when_imported(module_name: str):  # type: ignore
-
-        def decorator(func: Callable[[types.ModuleType], None]):
-            try:
-                import importlib
-                mod = importlib.import_module(module_name)
-            except Exception:
-                return func
-            func(mod)
-            return func
-
-        return decorator
-
 
 logger = get_kvcached_logger()
 
@@ -49,11 +32,13 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
     # Create patch manager and register version-specific SGLang patches
     patch_manager = PatchManager("sglang")
 
-    patch_manager.register_patches_with_versions([
-        (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
-        (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
-        (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
-    ])
+    patch_manager.register_patches_with_versions(
+        [
+            (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
+            (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
+            (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
+        ]
+    )
 
     # Apply all patches
     results = patch_manager.apply_all_patches()

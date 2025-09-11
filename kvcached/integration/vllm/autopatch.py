@@ -4,7 +4,8 @@
 import importlib
 import os
 import types
-from typing import Callable
+
+from wrapt.importer import when_imported
 
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.vllm.patches import (
@@ -19,24 +20,6 @@ from kvcached.integration.vllm.patches import (
     KVCacheManagerPatch,
 )
 from kvcached.utils import get_kvcached_logger
-
-try:
-    from wrapt.importer import when_imported  # type: ignore
-except Exception:
-
-    def when_imported(module_name: str):  # type: ignore
-
-        def decorator(func: Callable[[types.ModuleType], None]):
-            try:
-                import importlib
-                mod = importlib.import_module(module_name)
-            except Exception:
-                return func
-            func(mod)
-            return func
-
-        return decorator
-
 
 logger = get_kvcached_logger()
 
@@ -54,15 +37,16 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
     # Create patch manager and register version-specific vLLM patches
     patch_manager = PatchManager("vllm")
 
-    patch_manager.register_patches_with_versions([
-        (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
-        (EngineCorePatch(), VLLM_ALL_RANGE),
-        (GPUModelRunnerPatch(), VLLM_ALL_RANGE),
-        (GPUWorkerPatch(), VLLM_ALL_RANGE),
-
-        (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
-        (KVCacheManagerPatch(), VLLM_V8_RANGE),
-    ])
+    patch_manager.register_patches_with_versions(
+        [
+            (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
+            (EngineCorePatch(), VLLM_ALL_RANGE),
+            (GPUModelRunnerPatch(), VLLM_ALL_RANGE),
+            (GPUWorkerPatch(), VLLM_ALL_RANGE),
+            (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
+            (KVCacheManagerPatch(), VLLM_V8_RANGE),
+        ]
+    )
 
     # Apply all patches
     results = patch_manager.apply_all_patches()
