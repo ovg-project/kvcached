@@ -19,9 +19,9 @@ Each worker process
 # From repository root
 cd benchmarks/bench_map_parallelism
 
-# Example Run: 
+# Example Run:
 # 100 pages total, 4 procs map 25 each on distinct GPUs (cuda:rank)
-# 20 trials 
+# 20 trials
 python kvcached_map_parallel_benchmark.py --pages-total 100 --procs 4 --iters 20
 ```
 
@@ -48,7 +48,7 @@ Using layout contiguous=True
 Processes           : 1
 Iterations          : 20
 Pages total / iter  : 25
-Pages per proc / iter: 25 
+Pages per proc / iter: 25
 
 +-----------------+-------------+
 | Metric          | ms          |
@@ -63,7 +63,7 @@ Pages per proc / iter: 25
 Processes           : 1
 Iterations          : 20
 Pages total / iter  : 100
-Pages per proc / iter: 100 
+Pages per proc / iter: 100
 
 +-----------------+-------------+
 | Metric          | ms          |
@@ -78,7 +78,7 @@ Pages per proc / iter: 100
 Processes           : 4
 Iterations          : 20
 Pages total / iter  : 100
-Pages per proc / iter: 25 
+Pages per proc / iter: 25
 
 +-----------------+-------------+
 | Metric          | ms          |
@@ -103,7 +103,7 @@ Using layout contiguous=False
 Processes           : 1
 Iterations          : 20
 Pages total / iter  : 25
-Pages per proc / iter: 25 
+Pages per proc / iter: 25
 
 +-----------------+-------------+
 | Metric          | ms          |
@@ -118,7 +118,7 @@ Pages per proc / iter: 25
 Processes           : 1
 Iterations          : 20
 Pages total / iter  : 100
-Pages per proc / iter: 100 
+Pages per proc / iter: 100
 
 +-----------------+-------------+
 | Metric          | ms          |
@@ -133,7 +133,7 @@ Pages per proc / iter: 100
 Processes           : 4
 Iterations          : 20
 Pages total / iter  : 100
-Pages per proc / iter: 25 
+Pages per proc / iter: 25
 
 +-----------------+-------------+
 | Metric          | ms          |

@@ -60,6 +60,13 @@ repos:
     - id: pip-compile
       args: [requirements/test.in, -o, requirements/test.txt, --index-strategy, unsafe-best-match, --torch-backend, cu128]
       files: ^requirements/test\.(in|txt)$
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v4.6.0
+  hooks:
+    - id: trailing-whitespace
+      # optional: keep Markdown linebreaks (two spaces at EOL)
+      args: [--markdown-linebreak-ext=md]
+    # - id: end-of-file-fixer  # nice companion to ensure newline at EOF
 
 # Add mypy hooks for both local runs and CI (manual stage)
 - repo: local

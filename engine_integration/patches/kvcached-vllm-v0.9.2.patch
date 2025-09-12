@@ -122,7 +122,7 @@ index 38de00625..e4435cb04 100644
 @@ -29,8 +29,38 @@ class KVCacheCoordinator(ABC):
          self.max_model_len = max_model_len
          self.enable_caching = enable_caching
- 
+
 -        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
 -                                    enable_kv_cache_events)
 +        import os  # noqa: E501
@@ -157,7 +157,7 @@ index 38de00625..e4435cb04 100644
 +        else:
 +            self.block_pool = BlockPool(kv_cache_config.num_blocks,
 +                                        enable_caching, enable_kv_cache_events)
- 
+
          # Needs special handling for find_longest_cache_hit if eagle is enabled
          self.use_eagle = use_eagle
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
@@ -167,7 +167,7 @@ index e2fdf6f8a..d3bb46d5d 100644
 @@ -86,6 +86,16 @@ class EngineCore:
          self.collective_rpc("initialize_cache",
                              args=(num_gpu_blocks, num_cpu_blocks))
- 
+
 +        enable_kvcached = os.getenv("ENABLE_KVCACHED",
 +                                    "false").lower() == "true"
 +        if enable_kvcached:
@@ -179,7 +179,7 @@ index e2fdf6f8a..d3bb46d5d 100644
 +            )
 +
          self.structured_output_manager = StructuredOutputManager(vllm_config)
- 
+
          # Setup scheduler.
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index 5a26e88db..f440124d5 100644
@@ -198,7 +198,7 @@ index 5a26e88db..f440124d5 100644
 @@ -311,6 +312,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
          self.seq_lens_np = self.seq_lens_cpu.numpy()
- 
+
 +        import os
 +        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
 +                                         "false").lower() == "true"
@@ -261,12 +261,12 @@ index 5a26e88db..f440124d5 100644
 +                    kv_cache_config.kv_cache_groups,
 +                    kv_caches,
 +                )
- 
+
          bind_kv_cache(kv_caches,
                        self.compilation_config.static_forward_context,
 @@ -2737,3 +2765,76 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  "the mamba page size")
- 
+
          return attn_page_size
 +
 +    def _allocate_kv_cache_from_kvcached(
