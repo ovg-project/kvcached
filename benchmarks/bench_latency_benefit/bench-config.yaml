@@ -1,0 +1,60 @@
+kvcached: # kvcached environment variables for all instances
+  kvcached_gpu_utilization: 0.95
+  kvcached_page_prealloc_enabled: true
+  kvcached_min_reserved_pages: 5
+  kvcached_max_reserved_pages: 10
+  kvcached_sanity_check: false
+  kvcached_log_level: INFO
+
+router: # router configuration
+  enable_router: true
+  router_port: 8080
+  router_host: localhost
+
+sleep_manager: # sleep configuration
+  idle_threshold_seconds: 300        # 5 minutes - time before putting idle models to sleep
+  check_interval_seconds: 60         # Check every minute for idle models
+  auto_sleep_enabled: false           # Enable automatic sleep mode for idle models
+  wakeup_on_request: true            # Automatically wake models when requests come in
+  min_sleep_duration: 80             # Minimum time to keep model asleep (2 minutes)
+
+instances: # instances configuration
+  - name: instance1
+    model: meta-llama/Llama-3.1-8B-Instruct
+    engine: vllm
+    using_venv: true
+    venv_path:  ../engine_integration/vllm-v0.9.2/.venv
+    kvcached_env: # kvcached environment variables for this instance
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=VLLM"
+    engine_env:
+      - "VLLM_USE_V1=1"
+      - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+      - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
+    engine_args:
+      - "--disable-log-requests"
+      - "--no-enable-prefix-caching"
+      - "--host=localhost"
+      - "--port=12346"
+      # - "--gpu-memory-utilization 0.40"
+      - "--enable-sleep-mode"
+
+  - name: instance2
+    model: meta-llama/Llama-3.1-8B-Instruct
+    engine: vllm
+    using_venv: true
+    venv_path:  ../engine_integration/vllm-v0.9.2/.venv
+    kvcached_env: # kvcached environment variables for this instance
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_IPC_NAME=VLLM"
+    engine_env:
+      - "VLLM_USE_V1=1"
+      - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
+      - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
+    engine_args:
+      - "--disable-log-requests"
+      - "--no-enable-prefix-caching"
+      - "--host=localhost"
+      - "--port=30000"
+      # - "--gpu-memory-utilization 0.50"
+      - "--enable-sleep-mode"
