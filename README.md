@@ -48,9 +48,9 @@ kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`.
 ```bash
 cd benchmarks/simple_bench
 export VENV_PATH=../../engine_integration/[sglang|vllm]-kvcached-venv
-./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B 
+./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
 # Wait until LLM server is ready
-./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B 
+./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
 ```
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run SGLang/vLLM with kvcached.
