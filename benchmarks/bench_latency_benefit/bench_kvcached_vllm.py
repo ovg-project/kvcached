@@ -1,5 +1,6 @@
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
@@ -350,10 +351,10 @@ async def benchmark(
 
     # Data for req_rate vs time plotting
     request_timestamps = []  # List of (relative_time, model_name, request_type)
-    
+
     # For unified timing across models - will be set via metadata
     global_start_timestamp = time.time()  # Wall-clock time for synchronization
-    
+
     rps_change_events = []
     last_int_rps = -1
     if ramp_up_strategy is not None and ramp_up_start_rps is not None:
@@ -404,7 +405,7 @@ async def benchmark(
             "model": req_model_name,
             "type": "send"
         })
-        
+
         request_func_input = RequestFuncInput(
             model=req_model_id,
             model_name=req_model_name,
@@ -427,7 +428,7 @@ async def benchmark(
     # Record completion timestamps
     completion_time = time.perf_counter()
     benchmark_duration = completion_time - benchmark_start_time
-    
+
     # Add completion timestamps for each request (approximation)
     # Note: Individual completion times would require more complex async tracking
     for i, output in enumerate(outputs):
