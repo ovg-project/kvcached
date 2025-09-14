@@ -78,6 +78,84 @@ from vllm.benchmarks.serve import get_request
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 
+async def get_ramp_up_down_requests(
+    input_requests: list[SampleRequest],
+    min_rps: int,
+    peak_rps: int,
+    rps_increment: int,
+    burstiness: float = 1.0,
+):
+    """
+    Generate requests with ramp-up-down pattern:
+    - Ramp up by rps_increment every second until peak_rps
+    - Ramp down by rps_increment every second until min_rps
+    - Within each second, requests are evenly spaced
+    """
+
+    # Calculate ramp-up and ramp-down durations
+    ramp_up_duration = max(1, (peak_rps - min_rps) // rps_increment)
+    ramp_down_duration = ramp_up_duration
+    total_duration = ramp_up_duration + ramp_down_duration
+
+    print(f"Ramp pattern: {min_rps} -> {peak_rps} -> {min_rps} RPS")
+    print(f"Ramp up: {ramp_up_duration}s, Peak: 0s, Ramp down: {ramp_down_duration}s")
+    print(f"Total duration: {total_duration}s")
+
+    # Generate RPS schedule
+    rps_schedule = []
+
+    # Ramp up phase
+    for second in range(ramp_up_duration):
+        current_rps = min_rps + (second + 1) * rps_increment
+        current_rps = min(current_rps, peak_rps)
+        rps_schedule.append(current_rps)
+
+    # Ramp down phase
+    for second in range(ramp_down_duration):
+        current_rps = peak_rps - (second + 1) * rps_increment
+        current_rps = max(current_rps, min_rps)
+        rps_schedule.append(current_rps)
+
+    print(f"RPS schedule: {rps_schedule}")
+
+    request_index = 0
+    start_time = time.perf_counter()
+
+    for second, rps in enumerate(rps_schedule):
+        if request_index >= len(input_requests):
+            break
+
+        second_start_time = start_time + second
+
+        if rps == 0:
+            continue
+
+        # Generate uniform intervals within this second
+        interval = 1.0 / rps
+
+        for req_in_second in range(rps):
+            if request_index >= len(input_requests):
+                break
+
+            # Calculate exact send time for uniform spacing
+            send_time = second_start_time + req_in_second * interval
+
+            # Wait until it's time to send this request
+            current_time = time.perf_counter()
+            if send_time > current_time:
+                await asyncio.sleep(send_time - current_time)
+
+            yield input_requests[request_index], rps
+            request_index += 1
+
+    # Send any remaining requests at minimum rate
+    while request_index < len(input_requests):
+        if min_rps > 0:
+            await asyncio.sleep(1.0 / min_rps)
+        yield input_requests[request_index], min_rps
+        request_index += 1
+
+
 @dataclass
 class BenchmarkMetrics:
     completed: int
@@ -243,9 +321,12 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
-    ramp_up_strategy: Optional[Literal["linear", "exponential"]] = None,
+    ramp_up_strategy: Optional[Literal["linear", "exponential", "ramp-up-down"]] = None,
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
+    ramp_min_rps: Optional[int] = None,
+    ramp_peak_rps: Optional[int] = None,
+    ramp_increment: Optional[int] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -316,7 +397,12 @@ async def benchmark(
 
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
 
-    if ramp_up_strategy is not None:
+    if ramp_up_strategy == "ramp-up-down":
+        print(
+            f"Traffic ramp-up-down strategy: {ramp_min_rps} -> {ramp_peak_rps} -> {ramp_min_rps} RPS "
+            f"(increment: +/-{ramp_increment} RPS per second)"
+        )
+    elif ramp_up_strategy is not None:
         print(
             f"Traffic ramp-up strategy: {ramp_up_strategy}. Will increase "
             f"RPS from {ramp_up_start_rps} to {ramp_up_end_rps} RPS over "
@@ -366,14 +452,26 @@ async def benchmark(
             }
         )
 
-    async for request, current_request_rate in get_request(
-        input_requests,
-        request_rate,
-        burstiness,
-        ramp_up_strategy,
-        ramp_up_start_rps,
-        ramp_up_end_rps,
-    ):
+    # Choose the appropriate request generator
+    if ramp_up_strategy == "ramp-up-down":
+        request_generator = get_ramp_up_down_requests(
+            input_requests,
+            ramp_min_rps,
+            ramp_peak_rps,
+            ramp_increment,
+            burstiness,
+        )
+    else:
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+        )
+
+    async for request, current_request_rate in request_generator:
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
             if current_int_rps > last_int_rps:
@@ -691,17 +789,32 @@ def main(args: argparse.Namespace):
                 "The request rate will be controlled by ramp-up parameters. "
                 "Please remove the --request-rate argument."
             )
-        if args.ramp_up_start_rps is None or args.ramp_up_end_rps is None:
-            raise ValueError(
-                "When using --ramp-up-strategy, both --ramp-up-start-rps and "
-                "--ramp-up-end-rps must be specified"
-            )
-        if args.ramp_up_start_rps < 0 or args.ramp_up_end_rps < 0:
-            raise ValueError("Ramp-up start and end RPS must be non-negative")
-        if args.ramp_up_start_rps > args.ramp_up_end_rps:
-            raise ValueError("Ramp-up start RPS must be less than end RPS")
-        if args.ramp_up_strategy == "exponential" and args.ramp_up_start_rps == 0:
-            raise ValueError("For exponential ramp-up, the start RPS cannot be 0.")
+
+        if args.ramp_up_strategy == "ramp-up-down":
+            # Validate ramp-up-down specific parameters
+            if args.ramp_min_rps is None or args.ramp_peak_rps is None or args.ramp_increment is None:
+                raise ValueError(
+                    "When using --ramp-up-strategy=ramp-up-down, all of "
+                    "--ramp-min-rps, --ramp-peak-rps, and --ramp-increment must be specified"
+                )
+            if args.ramp_min_rps < 0 or args.ramp_peak_rps < 0 or args.ramp_increment <= 0:
+                raise ValueError(
+                    "ramp-min-rps and ramp-peak-rps must be non-negative, "
+                    "ramp-increment must be positive"
+                )
+            if args.ramp_min_rps >= args.ramp_peak_rps:
+                raise ValueError("ramp-peak-rps must be greater than ramp-min-rps")
+        else:
+            # Validate traditional ramp-up parameters
+            if args.ramp_up_start_rps is None or args.ramp_up_end_rps is None:
+                raise ValueError(
+                    "When using --ramp-up-strategy, both --ramp-up-start-rps and "
+                    "--ramp-up-end-rps must be specified"
+                )
+            if args.ramp_up_start_rps < 0 or args.ramp_up_end_rps < 0:
+                raise ValueError("Ramp-up start and end RPS must be non-negative")
+            if args.ramp_up_strategy == "exponential" and args.ramp_up_start_rps == 0:
+                raise ValueError("For exponential ramp-up, the start RPS cannot be 0.")
 
     # if args.base_url is not None:
     #     api_url = f"{args.base_url}{args.endpoint}"
@@ -907,6 +1020,9 @@ def main(args: argparse.Namespace):
             ramp_up_strategy=args.ramp_up_strategy,
             ramp_up_start_rps=args.ramp_up_start_rps,
             ramp_up_end_rps=args.ramp_up_end_rps,
+            ramp_min_rps=args.ramp_min_rps,
+            ramp_peak_rps=args.ramp_peak_rps,
+            ramp_increment=args.ramp_increment,
         )
     )
 
@@ -941,8 +1057,13 @@ def main(args: argparse.Namespace):
 
         if args.ramp_up_strategy is not None:
             result_json["ramp_up_strategy"] = args.ramp_up_strategy
-            result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
-            result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
+            if args.ramp_up_strategy == "ramp-up-down":
+                result_json["ramp_min_rps"] = args.ramp_min_rps
+                result_json["ramp_peak_rps"] = args.ramp_peak_rps
+                result_json["ramp_increment"] = args.ramp_increment
+            else:
+                result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
+                result_json["ramp_up_end_rps"] = args.ramp_up_end_rps
 
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
@@ -969,7 +1090,9 @@ def main(args: argparse.Namespace):
             if args.max_concurrency is not None
             else ""
         )
-        if args.ramp_up_strategy is not None:
+        if args.ramp_up_strategy == "ramp-up-down":
+            file_name = f"{backend}-ramp-up-down-{args.ramp_min_rps}to{args.ramp_peak_rps}to{args.ramp_min_rps}-inc{args.ramp_increment}{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        elif args.ramp_up_strategy is not None:
             file_name = f"{backend}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
         else:
             file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
@@ -1375,11 +1498,10 @@ def create_argument_parser():
         "--ramp-up-strategy",
         type=str,
         default=None,
-        choices=["linear", "exponential"],
-        help="The ramp-up strategy. This would be used to "
-        "ramp up the request rate from initial RPS to final "
-        "RPS rate (specified by --ramp-up-start-rps and --ramp-up-end-rps). "
-        "over the duration of the benchmark.",
+        choices=["linear", "exponential", "ramp-up-down"],
+        help="The ramp-up strategy. 'linear'/'exponential': ramp up from start to end RPS. "
+        "'ramp-up-down': ramp up by increment/sec to peak, then ramp down by increment/sec. "
+        "Use --ramp-min-rps, --ramp-peak-rps, --ramp-increment for 'ramp-up-down'.",
     )
     parser.add_argument(
         "--ramp-up-start-rps",
@@ -1394,6 +1516,27 @@ def create_argument_parser():
         default=None,
         help="The ending request rate for ramp-up (RPS). "
         "Needs to be specified when --ramp-up-strategy is used.",
+    )
+    parser.add_argument(
+        "--ramp-min-rps",
+        type=int,
+        default=None,
+        help="The minimum request rate for ramp-up-down strategy (RPS). "
+        "Required when --ramp-up-strategy=ramp-up-down.",
+    )
+    parser.add_argument(
+        "--ramp-peak-rps",
+        type=int,
+        default=None,
+        help="The peak request rate for ramp-up-down strategy (RPS). "
+        "Required when --ramp-up-strategy=ramp-up-down.",
+    )
+    parser.add_argument(
+        "--ramp-increment",
+        type=int,
+        default=None,
+        help="The RPS increment per second for ramp-up-down strategy. "
+        "Required when --ramp-up-strategy=ramp-up-down.",
     )
 
     return parser
