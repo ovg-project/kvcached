@@ -162,10 +162,127 @@ setup_sglang() {
     popd
 }
 
+setup_ollama() {
+    pushd "$ENGINE_DIR"
+
+    # Install prerequisites for Linux
+    echo "Installing Ollama build prerequisites..."
+
+    # Install Go if not present
+    if ! command -v go &> /dev/null; then
+        echo "Installing Go..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y golang-go
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y golang
+        else
+            echo "Please install Go manually: https://golang.org/doc/install"
+            exit 1
+        fi
+    fi
+
+    # Install CMake if not present
+    if ! command -v cmake &> /dev/null; then
+        echo "Installing CMake..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get install -y cmake
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y cmake
+        else
+            echo "Please install CMake manually"
+            exit 1
+        fi
+    fi
+
+    # Optional: Install CUDA SDK for NVIDIA GPU support
+    if command -v nvidia-smi &> /dev/null; then
+        echo "NVIDIA GPU detected. Installing CUDA SDK..."
+        # Note: CUDA installation is complex and may require manual setup
+        # This is a placeholder for CUDA installation
+        echo "⚠️  Please install CUDA SDK manually if needed: https://developer.nvidia.com/cuda-downloads"
+    fi
+
+    # Clone Ollama source code
+    if [ ! -d "ollama-v0.11.8" ]; then
+        echo "Cloning Ollama source code..."
+        git clone -b v0.11.8 https://github.com/ollama/ollama.git ollama-v0.11.8
+    else
+        echo "Ollama source code already exists, updating..."
+        cd ollama-v0.11.8
+        git pull
+        cd ..
+    fi
+
+    # Apply kvcached patch to Ollama (this creates the C bridge files)
+    echo "Applying kvcached patch to Ollama..."
+    cd ollama-v0.11.8
+    if [ -f "../scripts/kvcached-ollama-v0.11.8.patch" ]; then
+        git apply "../scripts/kvcached-ollama-v0.11.8.patch"
+        echo "✓ Patch applied successfully - C bridge files created"
+    else
+        echo "❌ Patch file not found at ../scripts/kvcached-ollama-v0.11.8.patch"
+        exit 1
+    fi
+
+    # Build kvcached C bridge library (created by the patch)
+    echo "Building kvcached C bridge library..."
+    # Get Python include and library paths dynamically
+    PYTHON_INCLUDES=$(python3-config --includes)
+    PYTHON_LDFLAGS=$(python3-config --ldflags)
+
+    gcc -shared -fPIC -o kvcached_bridge/libkvcached_bridge.so kvcached_bridge/kvcached_bridge.c \
+        $PYTHON_INCLUDES \
+        $PYTHON_LDFLAGS
+    echo "✓ Built kvcached bridge library successfully"
+
+    # Build Ollama with CMake (following official guide)
+    echo "Building Ollama with CMake..."
+
+    # Configure and build the project
+    cmake -B build
+    cmake --build build
+
+    cd ..
+
+    # Install Python dependencies for kvcached
+    uv venv --python=python3.11
+    source .venv/bin/activate
+    uv pip install --upgrade pip
+
+    # Install requirements for kvcached first
+    install_requirements
+
+    # Install kvcached
+    if [ "$DEV_MODE" = true ]; then
+        install_kvcached_editable
+    else
+        uv pip install kvcached --no-build-isolation --no-cache-dir
+    fi
+
+    deactivate
+
+    echo ""
+    echo "✅ Ollama + kvcached integration built successfully!"
+    echo "📖 See README-kvcached.md for usage instructions"
+    echo ""
+    echo "🚀 Usage (following Ollama developer guide):"
+    echo "   cd ollama-v0.11.8"
+    echo "   LD_LIBRARY_PATH=./kvcached_bridge:$LD_LIBRARY_PATH \\"
+    echo "   PYTHONPATH=/path/to/kvcached:$PYTHONPATH \\"
+    echo "   go run . serve"
+    echo ""
+    echo "   # In another terminal:"
+    echo "   LD_LIBRARY_PATH=./kvcached_bridge:$LD_LIBRARY_PATH \\"
+    echo "   PYTHONPATH=/path/to/kvcached:$PYTHONPATH \\"
+    echo "   go run . run gemma3"
+    popd
+}
+
 op=${1:-}
 
 if [ -z "$op" ]; then
-    echo "Usage: $0 <vllm|sglang|all>"
+    echo "Usage: $0 <vllm|sglang|ollama|all>"
     exit 1
 fi
 
@@ -179,13 +296,17 @@ case "$op" in
     "sglang")
         setup_sglang
         ;;
+    "ollama")
+        setup_ollama
+        ;;
     "all")
         setup_vllm
         setup_sglang
+        setup_ollama
         ;;
     *)
         echo "Error: Unknown option '$op'"
-        echo "Usage: $0 <vllm|sglang|all>"
+        echo "Usage: $0 <vllm|sglang|ollama|all>"
         exit 1
         ;;
 esac
