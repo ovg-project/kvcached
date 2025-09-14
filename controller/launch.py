@@ -5,6 +5,7 @@ import argparse
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -177,11 +178,12 @@ def _extract_models_mapping(
 
 
 def _launch_instances(instances_cfg: List[Dict[str, Any]],
-                      global_env: Dict[str, str]) -> List[Dict[str, Any]]:
+                      global_env: Dict[str, str],
+                      launch_delay: int = 0) -> List[Dict[str, Any]]:
     """Launch each configured model instance in its own dedicated tmux session."""
     launched: List[Dict[str, Any]] = []
 
-    for inst in instances_cfg:
+    for idx, inst in enumerate(instances_cfg):
         session_name = f"kvcached-{inst['name']}"
 
         # Ensure tmux session exists (detached)
@@ -197,6 +199,14 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
                 "Launched %s in tmux session '%s'. tmux attach -t %s to attach",
                 inst["name"], session_name, session_name)
             launched.append(inst)
+            
+            # Add delay between launches if specified and not the last instance
+            if launch_delay > 0 and idx < len(instances_cfg) - 1:
+                logger.info(
+                    "Waiting %d seconds before launching next instance...",
+                    launch_delay)
+                time.sleep(launch_delay)
+                
         except subprocess.CalledProcessError as e:
             logger.error("Failed to launch %s: %s", inst["name"], e)
 
@@ -267,7 +277,10 @@ def main() -> None:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    _launch_instances(instances_cfg, global_kvcached_env)
+    # Extract launch delay from top-level configuration
+    launch_delay = raw_cfg.get("launch_delay_seconds", 0)
+    
+    _launch_instances(instances_cfg, global_kvcached_env, launch_delay)
     _maybe_launch_router(router_cfg, cfg_path)
 
 

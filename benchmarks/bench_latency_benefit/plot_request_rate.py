@@ -103,36 +103,37 @@ def synchronize_timestamps(results: Dict[str, dict]) -> Dict[str, dict]:
     return synchronized_results
 
 
-def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float = 1.0, use_unified_time: bool = True) -> Tuple[List[float], List[float]]:
+def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float = 1.0, use_unified_time: bool = True, event_type: str = "send") -> Tuple[List[float], List[float]]:
     """
     Calculate request rate over time using a sliding window.
-    
+
     Args:
         timestamps: List of timestamp dictionaries with 'time', 'model', 'type' fields
         window_size: Window size in seconds for rate calculation
         use_unified_time: Whether to use unified_time instead of time
-        
+        event_type: Type of event to count ('send' for request rate, 'complete' for completion rate)
+
     Returns:
         Tuple of (time_points, request_rates)
     """
     if not timestamps:
         return [], []
 
-    # Filter for send events only
-    send_events = [t for t in timestamps if t['type'] == 'send']
+    # Filter for specified event type
+    events = [t for t in timestamps if t['type'] == event_type]
 
-    if not send_events:
+    if not events:
         return [], []
 
     # Choose time field
-    time_field = 'unified_time' if use_unified_time and 'unified_time' in send_events[0] else 'time'
+    time_field = 'unified_time' if use_unified_time and 'unified_time' in events[0] else 'time'
 
     # Sort by time
-    send_events.sort(key=lambda x: x.get(time_field, x.get('time', 0)))
+    events.sort(key=lambda x: x.get(time_field, x.get('time', 0)))
 
     # Get time range
-    min_time = send_events[0].get(time_field, send_events[0].get('time', 0))
-    max_time = send_events[-1].get(time_field, send_events[-1].get('time', 0))
+    min_time = events[0].get(time_field, events[0].get('time', 0))
+    max_time = events[-1].get(time_field, events[-1].get('time', 0))
 
     # Create time points
     time_points = np.arange(min_time, max_time + window_size, window_size / 2)
@@ -143,7 +144,7 @@ def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float
         window_start = t - window_size / 2
         window_end = t + window_size / 2
 
-        count = sum(1 for event in send_events
+        count = sum(1 for event in events
                    if window_start <= event.get(time_field, event.get('time', 0)) <= window_end)
 
         # Convert to requests per second
@@ -153,14 +154,15 @@ def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float
     return time_points.tolist(), request_rates
 
 
-def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: float = 1.0):
+def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: float = 1.0, plot_completion: bool = False):
     """
     Plot request rate vs time for multiple models.
-    
+
     Args:
         results: Dictionary of model_name -> benchmark_result
         output_path: Output file path for the plot
         window_size: Window size for rate calculation in seconds
+        plot_completion: Whether to plot completion rates instead of send rates
     """
     # Synchronize timestamps across models
     synchronized_results = synchronize_timestamps(results)
@@ -177,7 +179,8 @@ def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: 
         timestamps = result_data['request_timestamps']
 
         # Calculate request rate timeseries
-        time_points, rates = calculate_request_rate_timeseries(timestamps, window_size)
+        event_type = 'complete' if plot_completion else 'send'
+        time_points, rates = calculate_request_rate_timeseries(timestamps, window_size, event_type=event_type)
 
         if not time_points:
             print(f"Warning: No valid timestamps for {model_name}")
@@ -188,16 +191,21 @@ def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: 
         plt.plot(time_points, rates, label=model_name, color=color, linewidth=2, alpha=0.8)
 
         # Add theoretical average line
-        total_requests = len([t for t in timestamps if t['type'] == 'send'])
+        total_events = len([t for t in timestamps if t['type'] == event_type])
         duration = result_data.get('duration', max(time_points))
-        theoretical_rate = total_requests / duration if duration > 0 else 0
+        theoretical_rate = total_events / duration if duration > 0 else 0
 
+        rate_label = 'completion/s' if plot_completion else 'req/s'
         plt.axhline(y=theoretical_rate, color=color, linestyle='--', alpha=0.5,
-                   label=f'{model_name} (avg: {theoretical_rate:.1f} req/s)')
+                   label=f'{model_name} (avg: {theoretical_rate:.1f} {rate_label})')
 
     plt.xlabel('Time (seconds)', fontsize=12)
-    plt.ylabel('Request Rate (requests/second)', fontsize=12)
-    plt.title('Request Rate vs Time by Model', fontsize=14, fontweight='bold')
+    if plot_completion:
+        plt.ylabel('Completion Rate (completions/second)', fontsize=12)
+        plt.title('Completion Rate vs Time by Model', fontsize=14, fontweight='bold')
+    else:
+        plt.ylabel('Request Rate (requests/second)', fontsize=12)
+        plt.title('Request Rate vs Time by Model', fontsize=14, fontweight='bold')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True, alpha=0.3)
 
@@ -217,29 +225,38 @@ def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: 
     for model_name, result_data in synchronized_results.items():
         if 'request_timestamps' in result_data:
             timestamps = result_data['request_timestamps']
-            send_events = [t for t in timestamps if t['type'] == 'send']
+            events = [t for t in timestamps if t['type'] == event_type]
 
-            if send_events:
-                total_requests = len(send_events)
+            if events:
+                total_events = len(events)
                 duration = result_data.get('duration', 0)
-                avg_rate = total_requests / duration if duration > 0 else 0
+                avg_rate = total_events / duration if duration > 0 else 0
+
+                event_label = 'completions' if plot_completion else 'requests'
+                rate_label = 'completion/s' if plot_completion else 'req/s'
 
                 print(f"{model_name}:")
-                print(f"  Total requests: {total_requests}")
+                print(f"  Total {event_label}: {total_events}")
                 print(f"  Duration: {duration:.2f}s")
-                print(f"  Average rate: {avg_rate:.2f} req/s")
+                print(f"  Average rate: {avg_rate:.2f} {rate_label}")
                 print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Plot request rate vs time from benchmark results')
+    parser = argparse.ArgumentParser(description='Plot request rate vs time from benchmark results (generates both request and completion rate plots by default)')
 
     parser.add_argument('--result-files', nargs='+', default=None,
                        help='Path(s) to benchmark result JSON files (default: all files in results/metrics/)')
-    parser.add_argument('--output', default='results/figures/multi_model_request_rate.png',
-                       help='Output plot file path (default: results/figures/multi_model_request_rate.png)')
+    parser.add_argument('--output', default=None,
+                       help='Output plot file path (default: auto-generated based on plot type)')
     parser.add_argument('--window-size', type=float, default=1.0,
                        help='Window size in seconds for rate calculation (default: 1.0)')
+    parser.add_argument('--plot-completion', action='store_true',
+                       help='Plot completion rates instead of request rates')
+    parser.add_argument('--plot-both', action='store_true', default=True,
+                       help='Plot both request and completion rates (default: True)')
+    parser.add_argument('--plot-single', action='store_true',
+                       help='Plot only one type of rate (overrides --plot-both)')
 
     args = parser.parse_args()
 
@@ -261,7 +278,24 @@ def main():
 
     print(f"Loaded {len(results)} benchmark results")
 
-    output_dir = os.path.dirname(args.output)
+    # Determine which plots to generate
+    if args.plot_single:
+        # Generate single plot type
+        plot_types = [args.plot_completion]
+        plot_names = ['completion' if args.plot_completion else 'request']
+    elif args.plot_both:
+        # Generate both plots (default behavior)
+        plot_types = [False, True]  # [request, completion]
+        plot_names = ['request', 'completion']
+    else:
+        # Fallback to single plot
+        plot_types = [args.plot_completion]
+        plot_names = ['completion' if args.plot_completion else 'request']
+
+    # Create output directory
+    output_dir = 'results/figures'
+    if args.output:
+        output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
         print(f"Created output directory: {output_dir}")
@@ -269,8 +303,17 @@ def main():
     # Synchronize timestamps across models first
     print("Synchronizing timestamps across models...")
 
-    # Create plot
-    plot_request_rates(results, args.output, args.window_size)
+    # Generate plots
+    for i, (plot_completion, plot_name) in enumerate(zip(plot_types, plot_names)):
+        if args.output and len(plot_types) == 1:
+            # Single plot with user-specified output
+            output_path = args.output
+        else:
+            # Auto-generate output paths
+            output_path = f'results/figures/multi_model_{plot_name}_rate.png'
+
+        print(f"\nGenerating {plot_name} rate plot...")
+        plot_request_rates(results, output_path, args.window_size, plot_completion)
 
     return 0
 
