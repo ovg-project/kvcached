@@ -1,8 +1,30 @@
 #!/bin/bash
 set -e
 
-PORT_A=${1:-12346}
-PORT_B=${2:-12347}
+PORT_A=12346
+PORT_B=12347
+
+# Parse flags: --port-a, --port-b
+print_usage() {
+  echo "Usage: $0 [--port-a PORT] [--port-b PORT]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port-a)
+      PORT_A="$2"; shift 2;;
+    --port-b)
+      PORT_B="$2"; shift 2;;
+    -h|--help)
+      print_usage; exit 0;;
+    --)
+      shift; break;;
+    -*)
+      echo "Unknown option: $1" >&2; print_usage; exit 1;;
+    *)
+      echo "Unexpected positional argument: $1" >&2; print_usage; exit 1;;
+  esac
+done
 
 PROMPT_A=${PROMPT_A:-"Explain how LLM works."}
 PROMPT_B=${PROMPT_B:-"Summarize LLM in one sentence."}
