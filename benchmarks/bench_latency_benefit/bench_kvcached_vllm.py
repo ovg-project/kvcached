@@ -80,24 +80,25 @@ MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 async def get_ramp_up_down_requests(
     input_requests: list[SampleRequest],
-    min_rps: int,
+    start_rps: int,
     peak_rps: int,
+    end_rps: int,
     rps_increment: int,
     burstiness: float = 1.0,
 ):
     """
     Generate requests with ramp-up-down pattern:
-    - Ramp up by rps_increment every second until peak_rps
-    - Ramp down by rps_increment every second until min_rps
+    - Ramp up by rps_increment every second from start_rps to peak_rps
+    - Ramp down by rps_increment every second from peak_rps to end_rps
     - Within each second, requests are evenly spaced
     """
 
     # Calculate ramp-up and ramp-down durations
-    ramp_up_duration = max(1, (peak_rps - min_rps) // rps_increment)
-    ramp_down_duration = ramp_up_duration
+    ramp_up_duration = max(1, (peak_rps - start_rps) // rps_increment)
+    ramp_down_duration = max(1, (peak_rps - end_rps) // rps_increment)
     total_duration = ramp_up_duration + ramp_down_duration
 
-    print(f"Ramp pattern: {min_rps} -> {peak_rps} -> {min_rps} RPS")
+    print(f"Ramp pattern: {start_rps} -> {peak_rps} -> {end_rps} RPS")
     print(f"Ramp up: {ramp_up_duration}s, Peak: 0s, Ramp down: {ramp_down_duration}s")
     print(f"Total duration: {total_duration}s")
 
@@ -106,14 +107,14 @@ async def get_ramp_up_down_requests(
 
     # Ramp up phase
     for second in range(ramp_up_duration):
-        current_rps = min_rps + (second + 1) * rps_increment
+        current_rps = start_rps + (second + 1) * rps_increment
         current_rps = min(current_rps, peak_rps)
         rps_schedule.append(current_rps)
 
     # Ramp down phase
     for second in range(ramp_down_duration):
         current_rps = peak_rps - (second + 1) * rps_increment
-        current_rps = max(current_rps, min_rps)
+        current_rps = max(current_rps, end_rps)
         rps_schedule.append(current_rps)
 
     print(f"RPS schedule: {rps_schedule}")
@@ -148,11 +149,11 @@ async def get_ramp_up_down_requests(
             yield input_requests[request_index], rps
             request_index += 1
 
-    # Send any remaining requests at minimum rate
+    # Send any remaining requests at end rate
     while request_index < len(input_requests):
-        if min_rps > 0:
-            await asyncio.sleep(1.0 / min_rps)
-        yield input_requests[request_index], min_rps
+        if end_rps > 0:
+            await asyncio.sleep(1.0 / end_rps)
+        yield input_requests[request_index], end_rps
         request_index += 1
 
 
@@ -324,8 +325,9 @@ async def benchmark(
     ramp_up_strategy: Optional[Literal["linear", "exponential", "ramp-up-down"]] = None,
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
-    ramp_min_rps: Optional[int] = None,
+    ramp_start_rps: Optional[int] = None,
     ramp_peak_rps: Optional[int] = None,
+    ramp_end_rps: Optional[int] = None,
     ramp_increment: Optional[int] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
@@ -399,7 +401,7 @@ async def benchmark(
 
     if ramp_up_strategy == "ramp-up-down":
         print(
-            f"Traffic ramp-up-down strategy: {ramp_min_rps} -> {ramp_peak_rps} -> {ramp_min_rps} RPS "
+            f"Traffic ramp-up-down strategy: {ramp_start_rps} -> {ramp_peak_rps} -> {ramp_end_rps} RPS "
             f"(increment: +/-{ramp_increment} RPS per second)"
         )
     elif ramp_up_strategy is not None:
@@ -456,8 +458,9 @@ async def benchmark(
     if ramp_up_strategy == "ramp-up-down":
         request_generator = get_ramp_up_down_requests(
             input_requests,
-            ramp_min_rps,
+            ramp_start_rps,
             ramp_peak_rps,
+            ramp_end_rps,
             ramp_increment,
             burstiness,
         )
@@ -792,18 +795,18 @@ def main(args: argparse.Namespace):
 
         if args.ramp_up_strategy == "ramp-up-down":
             # Validate ramp-up-down specific parameters
-            if args.ramp_min_rps is None or args.ramp_peak_rps is None or args.ramp_increment is None:
+            if args.ramp_start_rps is None or args.ramp_peak_rps is None or args.ramp_end_rps is None or args.ramp_increment is None:
                 raise ValueError(
                     "When using --ramp-up-strategy=ramp-up-down, all of "
-                    "--ramp-min-rps, --ramp-peak-rps, and --ramp-increment must be specified"
+                    "--ramp-start-rps, --ramp-peak-rps, --ramp-end-rps, and --ramp-increment must be specified"
                 )
-            if args.ramp_min_rps < 0 or args.ramp_peak_rps < 0 or args.ramp_increment <= 0:
+            if args.ramp_start_rps < 0 or args.ramp_peak_rps < 0 or args.ramp_end_rps < 0 or args.ramp_increment <= 0:
                 raise ValueError(
-                    "ramp-min-rps and ramp-peak-rps must be non-negative, "
+                    "ramp-start-rps, ramp-peak-rps, and ramp-end-rps must be non-negative, "
                     "ramp-increment must be positive"
                 )
-            if args.ramp_min_rps >= args.ramp_peak_rps:
-                raise ValueError("ramp-peak-rps must be greater than ramp-min-rps")
+            if args.ramp_start_rps >= args.ramp_peak_rps or args.ramp_end_rps >= args.ramp_peak_rps:
+                raise ValueError("ramp-peak-rps must be greater than both ramp-start-rps and ramp-end-rps")
         else:
             # Validate traditional ramp-up parameters
             if args.ramp_up_start_rps is None or args.ramp_up_end_rps is None:
@@ -1020,8 +1023,9 @@ def main(args: argparse.Namespace):
             ramp_up_strategy=args.ramp_up_strategy,
             ramp_up_start_rps=args.ramp_up_start_rps,
             ramp_up_end_rps=args.ramp_up_end_rps,
-            ramp_min_rps=args.ramp_min_rps,
+            ramp_start_rps=args.ramp_start_rps,
             ramp_peak_rps=args.ramp_peak_rps,
+            ramp_end_rps=args.ramp_end_rps,
             ramp_increment=args.ramp_increment,
         )
     )
@@ -1058,8 +1062,9 @@ def main(args: argparse.Namespace):
         if args.ramp_up_strategy is not None:
             result_json["ramp_up_strategy"] = args.ramp_up_strategy
             if args.ramp_up_strategy == "ramp-up-down":
-                result_json["ramp_min_rps"] = args.ramp_min_rps
+                result_json["ramp_start_rps"] = args.ramp_start_rps
                 result_json["ramp_peak_rps"] = args.ramp_peak_rps
+                result_json["ramp_end_rps"] = args.ramp_end_rps
                 result_json["ramp_increment"] = args.ramp_increment
             else:
                 result_json["ramp_up_start_rps"] = args.ramp_up_start_rps
@@ -1091,7 +1096,7 @@ def main(args: argparse.Namespace):
             else ""
         )
         if args.ramp_up_strategy == "ramp-up-down":
-            file_name = f"{backend}-ramp-up-down-{args.ramp_min_rps}to{args.ramp_peak_rps}to{args.ramp_min_rps}-inc{args.ramp_increment}{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+            file_name = f"{backend}-ramp-up-down-{args.ramp_start_rps}to{args.ramp_peak_rps}to{args.ramp_end_rps}-inc{args.ramp_increment}{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
         elif args.ramp_up_strategy is not None:
             file_name = f"{backend}-ramp-up-{args.ramp_up_strategy}-{args.ramp_up_start_rps}qps-{args.ramp_up_end_rps}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
         else:
@@ -1518,10 +1523,10 @@ def create_argument_parser():
         "Needs to be specified when --ramp-up-strategy is used.",
     )
     parser.add_argument(
-        "--ramp-min-rps",
+        "--ramp-start-rps",
         type=int,
         default=None,
-        help="The minimum request rate for ramp-up-down strategy (RPS). "
+        help="The starting request rate for ramp-up-down strategy (RPS). "
         "Required when --ramp-up-strategy=ramp-up-down.",
     )
     parser.add_argument(
@@ -1529,6 +1534,13 @@ def create_argument_parser():
         type=int,
         default=None,
         help="The peak request rate for ramp-up-down strategy (RPS). "
+        "Required when --ramp-up-strategy=ramp-up-down.",
+    )
+    parser.add_argument(
+        "--ramp-end-rps",
+        type=int,
+        default=None,
+        help="The ending request rate for ramp-up-down strategy (RPS). "
         "Required when --ramp-up-strategy=ramp-up-down.",
     )
     parser.add_argument(

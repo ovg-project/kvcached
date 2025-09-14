@@ -10,23 +10,24 @@ export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../
 
 # Benchmark parameters
 PROMPT_LEN=256
-COMPLETION_LEN=400
+COMPLETION_LEN=$2
 BACKEND="vllm"
 
 
 # Ramp-up-down parameters
-RAMP_MIN_RPS=1            # Minimum request rate (start and end)
-RAMP_PEAK_RPS=20          # Peak request rate (middle)
+RAMP_START_RPS=0          # Starting request rate
+RAMP_PEAK_RPS=$1          # Peak request rate (middle)
+RAMP_END_RPS=1            # Ending request rate
 RAMP_INCREMENT=1          # RPS increment/decrement per second
 
 
 
 # Calculate total number of requests based on ramp pattern
-RAMP_UP_DURATION=$(( (RAMP_PEAK_RPS - RAMP_MIN_RPS) / RAMP_INCREMENT ))
-RAMP_DOWN_DURATION=$RAMP_UP_DURATION
+RAMP_UP_DURATION=$(( (RAMP_PEAK_RPS - RAMP_START_RPS) / RAMP_INCREMENT ))
+RAMP_DOWN_DURATION=$(( (RAMP_PEAK_RPS - RAMP_END_RPS) / RAMP_INCREMENT ))
 TOTAL_DURATION=$((RAMP_UP_DURATION + RAMP_DOWN_DURATION))
 
-MODEL_DELAY=$((5 + $RAMP_UP_DURATION*2))  # Delay in seconds before starting next model
+MODEL_DELAY=$((RAMP_UP_DURATION/4 + RAMP_UP_DURATION*2))  # Delay in seconds before starting next model
 
 # # Calculate total requests: sum of all RPS values across all seconds
 # TOTAL_REQUESTS=$((RAMP_PEAK_RPS * RAMP_PEAK_RPS / 2))
@@ -47,9 +48,10 @@ mkdir -p results results/metrics
 # Define models and their configurations
 MODELS=(
     "meta-llama/Llama-3.1-8B-Instruct:12346"
-    # "meta-llama/Llama-3.1-8B-Instruct:30000"
-    # "meta-llama/Llama-3.1-8B-Instruct:40000"
+    "meta-llama/Llama-3.1-8B-Instruct:30000"
+    "meta-llama/Llama-3.1-8B-Instruct:40000"
 )
+NUM_MODELS=${#MODELS[@]}
 
 # Record unified start time
 UNIFIED_START_TIME=$(date +%s.%N)
@@ -70,7 +72,7 @@ for i in "${!MODELS[@]}"; do
     MODEL_INDEX=$((i + 1))
     
     # Generate result file name for ramp-up-down strategy
-    RESULT_FILE="results/metrics/${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_MIN_RPS}to${RAMP_PEAK_RPS}to${RAMP_MIN_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}.json"
+    RESULT_FILE="results/metrics/${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_START_RPS}to${RAMP_PEAK_RPS}to${RAMP_END_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}-model-num-${NUM_MODELS}.json"
     
     # Add delay before starting next model (except for the first one)
     if [ $i -gt 0 ] && [ "$MODEL_DELAY" -gt 0 ]; then
@@ -79,10 +81,10 @@ for i in "${!MODELS[@]}"; do
     fi
     
     echo "Starting benchmark for $MODEL (Model ${MODEL_INDEX}) on port $PORT..."
-    NUM_MODELS=${#MODELS[@]}
+    
     NUM_PROMPTS=$((NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY))
     # Use ramp-up-down strategy
-    echo "Using ramp-up-down strategy: ${RAMP_MIN_RPS} -> ${RAMP_PEAK_RPS} -> ${RAMP_MIN_RPS} RPS (increment: ±${RAMP_INCREMENT} RPS/sec)"
+    echo "Using ramp-up-down strategy: ${RAMP_START_RPS} -> ${RAMP_PEAK_RPS} -> ${RAMP_END_RPS} RPS (increment: ±${RAMP_INCREMENT} RPS/sec)"
     
     python bench_kvcached_vllm.py \
         --backend "$BACKEND" \
@@ -98,7 +100,8 @@ for i in "${!MODELS[@]}"; do
         --result-filename "$RESULT_FILE" \
         --metadata "unified_start_time=$UNIFIED_START_TIME" \
         --ramp-up-strategy ramp-up-down \
-        --ramp-min-rps "$RAMP_MIN_RPS" \
+        --ramp-start-rps "$RAMP_START_RPS" \
+        --ramp-end-rps "$RAMP_END_RPS" \
         --ramp-peak-rps "$RAMP_PEAK_RPS" \
         --ramp-increment "$RAMP_INCREMENT" &
     
