@@ -12,7 +12,7 @@ This example shows the minimal, end-to-end setup to colocate two models on the s
 
 For vLLM:
 
-```
+```bash
 export ENABLE_KVCACHED=true
 export KVCACHED_IPC_NAME=VLLM
 export VLLM_USE_V1=1
@@ -25,7 +25,7 @@ vllm serve "${MODEL}" \
 
 For SGLang:
 
-```
+```bash
 export ENABLE_KVCACHED=true
 export KVCACHED_IPC_NAME=SGLANG
 python3 -m sglang.launch_server --model "${MODEL}" \
@@ -38,18 +38,13 @@ You might want to start the two engine servers in different terminals.
 
 ### Testing by sending requests
 
-```
-curl -s -X POST http://127.0.0.1:${PORT}/v1/chat/completions \
+```bash
+export PORT=12346
+export MODEL="meta-llama/Llama-3.2-1B"
+export PROMPT="Explain how LLM works."
+curl -s -X POST http://127.0.0.1:${PORT}/v1/completions \
   -H "Content-Type: application/json" \
-  -d @- <<EOF
-{
-  "model": "${MODEL}",
-  "messages": [{"role": "user", "content": "${PROMPT}"}],
-  "max_tokens": 128,
-  "top_p": 1,
-  "seed": 0
-}
-EOF
+  --data-binary @<(printf '{"model":"%s","prompt":"%s","max_tokens":128,"top_p":1,"seed":0}' "$MODEL" "$PROMPT")
 ```
 
 ### Using provided scripts

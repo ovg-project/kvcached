@@ -19,8 +19,8 @@ model_a=""
 model_b=""
 port_a=""
 port_b=""
-tp_a=$DEFAULT_TP_A
-tp_b=$DEFAULT_TP_B
+tp_a=""
+tp_b=""
 venv_vllm_path=""   # optional vLLM venv
 venv_sgl_path=""    # optional sglang venv
 
@@ -89,8 +89,8 @@ MODEL_A=${model_a:-$DEFAULT_MODEL_A}
 MODEL_B=${model_b:-$DEFAULT_MODEL_B}
 PORT_A=${port_a:-$DEFAULT_PORT_A}
 PORT_B=${port_b:-$DEFAULT_PORT_B}
-TP_A=$tp_a
-TP_B=$tp_b
+TP_A=${tp_a:-$DEFAULT_TP_A}
+TP_B=${tp_b:-$DEFAULT_TP_B}
 
 # Validate engine values
 validate_engine() {
@@ -115,14 +115,6 @@ fi
 
 PYTHON=${PYTHON:-python3}
 
-# Detect L4
-GPU_NAME=$(command -v nvidia-smi >/dev/null 2>&1 && \
-           nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 || echo "")
-IS_L4=false
-if [[ "$GPU_NAME" == *"L4"* ]]; then
-    IS_L4=true
-fi
-
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]}"; do
@@ -144,15 +136,12 @@ run_vllm() {
     export KVCACHED_IPC_NAME=VLLM
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-    local extra=""
-    if [ "$IS_L4" = true ]; then extra="--enforce-eager"; fi
     vllm serve "$model" \
       --disable-log-requests \
       --no-enable-prefix-caching \
       --port "$port" \
       --tensor-parallel-size "$tp" \
-      --enable-sleep-mode \
-      $extra &
+      --enable-sleep-mode &
     PIDS+=("$!")
     echo "Started vLLM (model=$model) on port $port, pid=${PIDS[-1]}"
     if [[ -n "$venv" ]]; then deactivate; fi
@@ -167,18 +156,11 @@ run_sgl() {
     if [[ -n "$venv" ]]; then source "$venv/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
-    local extra=""
-    if [ "$IS_L4" = true ]; then
-        export TORCHINDUCTOR_DISABLE=1
-        export TORCHDYNAMO_DISABLE=1
-        extra="--attention-backend torch_native"
-    fi
     $PYTHON -m sglang.launch_server --model "$model" \
       --disable-radix-cache \
       --trust-remote-code \
       --port "$port" \
-      --tp "$tp" \
-      $extra &
+      --tp "$tp" &
     PIDS+=("$!")
     echo "Started sglang (model=$model) on port $port, pid=${PIDS[-1]}"
     if [[ -n "$venv" ]]; then deactivate; fi

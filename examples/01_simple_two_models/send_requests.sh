@@ -54,7 +54,7 @@ request_and_print() {
   RESP=$(curl -s -X POST http://127.0.0.1:${PORT}/v1/completions \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPT}\",\"max_tokens\":64,\"top_p\":1,\"seed\":0}" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("choices") or [{}])[0].get("text","" ).strip())' || true)
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("choices") or [{}])[0].get("text","").strip())' || true)
   if [[ -z "$RESP" ]]; then
     echo "  (no text returned)"
   else
