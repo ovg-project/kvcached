@@ -2,7 +2,6 @@
 set -ex
 
 # Set environment variables
-export ENABLE_KVCACHED=false
 export KVCACHED_IPC_NAME=VLLM
 
 # Add vLLM benchmarks and kvcached to Python path
