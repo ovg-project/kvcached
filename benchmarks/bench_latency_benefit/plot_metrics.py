@@ -91,8 +91,8 @@ def create_charts(data):
         (['mean_e2el_ms', 'p99_e2el_ms'], 'End-to-End Latency (E2E)', 'e2el')
     ]
 
-    completion_lens = [128, 256, 400, 512, 1024]
-    reqrates = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]  # Fixed reqrates
+    completion_lens = [128, 256, 400]
+    reqrates = [4, 8, 12, 16, 20]  # Fixed reqrates
 
     # Get all unique model_ids (1, 2, 3)
     model_ids = set()
@@ -115,9 +115,9 @@ def create_charts(data):
                 bar_width = 0.8 / n_completion_lens
                 x_positions = np.arange(len(reqrates))
 
-                # Colors for true/false pairs
-                colors_true = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-                colors_false = ['#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
+                # # Colors for true/false pairs
+                # colors_true = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+                # colors_false = ['#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
 
                 for comp_idx, comp_len in enumerate(completion_lens):
                     true_values = []
@@ -147,12 +147,23 @@ def create_charts(data):
                     # Calculate positions for grouped bars
                     offset = (comp_idx - n_completion_lens/2 + 0.5) * bar_width
 
-                    ax.bar(x_positions + offset - bar_width/4, true_values,
-                           bar_width/2, label=f'KV Cache-{comp_len}',
-                           color=colors_true[comp_idx], alpha=0.8)
-                    ax.bar(x_positions + offset + bar_width/4, false_values,
-                           bar_width/2, label=f'No Cache-{comp_len}',
-                           color=colors_false[comp_idx], alpha=0.8)
+                    # bars_true = ax.bar(x_positions + offset - bar_width/4, true_values,
+                    #                   bar_width/2, label=f'KV Cache-{comp_len}',
+                    #                   color=colors_true[comp_idx], alpha=0.8)
+                    # bars_false = ax.bar(x_positions + offset + bar_width/4, false_values,
+                    #                    bar_width/2, label=f'No Cache-{comp_len}',
+                    #                    color=colors_false[comp_idx], alpha=0.8)
+
+                    # Add gain annotations (false/true ratio)
+                    for i, (true_val, false_val) in enumerate(zip(true_values, false_values)):
+                        if true_val > 0 and false_val > 0:
+                            gain = false_val / true_val
+                            # Position text above the higher bar
+                            y_pos = max(true_val, false_val) * 1.1
+                            ax.text(x_positions[i] + offset, y_pos, f'{gain:.1f}x',
+                                   ha='center', va='bottom', fontsize=8,
+                                   color='red' if gain > 1 else 'green',
+                                   fontweight='bold')
 
                 # Configure subplot
                 metric_type = 'Mean' if 'mean' in metric else 'P99'
@@ -161,6 +172,7 @@ def create_charts(data):
                 ax.set_title(f'{metric_type} {metric_display_name} - Model {model_id}')
                 ax.set_xticks(x_positions)
                 ax.set_xticklabels(reqrates)
+                ax.set_yscale('log')  # Set y-axis to log scale
                 if subplot_idx == 0:  # Only show legend on first subplot
                     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
                 ax.grid(True, alpha=0.3)
