@@ -85,19 +85,16 @@ def test_basic_alloc_free(setup_kvcache):
 
     # initial available blocks
     initial_available = manager.available_size()
-    print(f"Initial available size: {initial_available}")
 
     # allocate some blocks
     n_blocks = 256
     handle = manager.alloc(n_blocks)
     after_alloc = manager.available_size()
-    print(f"Available size after allocating {n_blocks} tokens: {after_alloc}")
     assert after_alloc + n_blocks == initial_available
 
     # free the allocated blocks
     manager.free(handle)
     after_free = manager.available_size()
-    print(f"Available size after freeing: {after_free}")
     assert after_free == initial_available
 
 
@@ -120,44 +117,35 @@ def test_resize_smaller_and_larger(setup_kvcache):
     # used by resize method, corresponds K (or V) tensor size in 1 layer, typically in few GBs
     manager = setup_kvcache
     initial_total_pages = manager.page_allocator.num_total_pages
-    print(f"Initial page_allocator.num_total_pages: {initial_total_pages}")
     initial_attribute_mem_size = manager.mem_size
-    print(f"Initial self.mem_size: {initial_attribute_mem_size}")
-    initial_shm_mem_size = get_kv_cache_limit(IPC_NAME).total_size // NUM_LAYERS // 2
-    print(f"Initial shm mem_size: {initial_shm_mem_size}")
-    print(f"Initial shm total_size: {get_kv_cache_limit(IPC_NAME).total_size}")
-    print(f"Initial shm used_size: {get_kv_cache_limit(IPC_NAME).used_size}")
+    meminfo = get_kv_cache_limit(IPC_NAME)
+    assert meminfo is not None
+    initial_kv_cache_limit = meminfo.total_size
+    initial_shm_mem_size = meminfo.total_size // NUM_LAYERS // 2
     assert initial_attribute_mem_size == initial_shm_mem_size
 
     # RESIZE SMALLER: deduct half of initial total pages
-    shrink_kv_cache_limit = get_kv_cache_limit(IPC_NAME).total_size - (initial_total_pages // 2) * manager.page_size * NUM_LAYERS * 2
-    print(f"Shrinking to kv cache limit: {shrink_kv_cache_limit}")
+    shrink_kv_cache_limit = initial_kv_cache_limit - (initial_total_pages // 2) * manager.page_size * NUM_LAYERS * 2
     # update the shm total_size field
     update_kv_cache_limit(IPC_NAME, shrink_kv_cache_limit)
-    print(f"After shrinking, shm total_size: {get_kv_cache_limit(IPC_NAME).total_size}")
     # infer the new mem_size based on shm total_size --- workflow in kvcached
     shrink_shm_mem_size = manager.page_allocator.mem_info_tracker.check_and_get_resize_target(
             manager.mem_size, manager.num_layers)
-    print(f"Shrinking to mem_size from check_and_get_resize_target: {shrink_shm_mem_size}")
     # actual resize method
     manager.resize(shrink_shm_mem_size)
     shrink_total_pages = manager.page_allocator.num_total_pages
-    print(f"After shrinking, : page_allocator.num_total_pages: {shrink_total_pages}")
     assert initial_total_pages == shrink_total_pages + initial_total_pages // 2
 
     # RESIZE LARGER: add back the deducted half of initial total pages
     expand_kv_cache_limit =  shrink_kv_cache_limit + (initial_total_pages // 2) * manager.page_size * NUM_LAYERS * 2
     # update the shm total_size field
     update_kv_cache_limit(IPC_NAME, expand_kv_cache_limit)
-    print(f"After expanding, shm total_size: {get_kv_cache_limit(IPC_NAME).total_size}")
     # infer the new mem_size based on shm total_size --- workflow in kvcached
     expand_shm_mem_size = manager.page_allocator.mem_info_tracker.check_and_get_resize_target(
             shrink_shm_mem_size, manager.num_layers)
-    print(f"Expanding to mem_size from check_and_get_resize_target: {expand_shm_mem_size}")
     # actual resize method
     manager.resize(expand_shm_mem_size)
     expand_total_pages = manager.page_allocator.num_total_pages
-    print(f"After expanding, : page_allocator.num_total_pages: {expand_total_pages}")
     assert expand_total_pages == initial_total_pages
 
 
@@ -167,7 +155,6 @@ def test_trim(setup_kvcache):
 
     # initial reserved pages
     initial_reserved = len(manager.page_allocator.reserved_page_list)
-    print(f"Initial reserved pages: {initial_reserved}")
     if manager.page_allocator.enable_page_prealloc:
         assert initial_reserved == manager.page_allocator.min_reserved_pages
 
@@ -175,7 +162,6 @@ def test_trim(setup_kvcache):
     manager.trim()
     time.sleep(1)
     after_trim_reserved = len(manager.page_allocator.reserved_page_list)
-    print(f"Reserved pages after trim: {after_trim_reserved}")
     assert after_trim_reserved == 0
 
 
@@ -185,18 +171,15 @@ def test_reserve_and_free_blocks(setup_kvcache):
 
     # initial reserved blocks
     initial_reserved_blocks = len(manager.reserved_blocks)
-    print(f"Initial reserved blocks: {initial_reserved_blocks}")
 
     # reserve some blocks
     n_blocks = 512
     manager.try_to_reserve(n_blocks)
     time.sleep(1)
     after_reserve_blocks = len(manager.reserved_blocks)
-    print(f"Reserved blocks after reserving {n_blocks} tokens: {after_reserve_blocks}")
     assert after_reserve_blocks == initial_reserved_blocks + n_blocks
 
     # free the reserved blocks
     manager.free_reserved()
     after_free_blocks = len(manager.reserved_blocks)
-    print(f"Reserved blocks after freeing: {after_free_blocks}")
     assert after_free_blocks == 0
