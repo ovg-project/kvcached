@@ -28,16 +28,8 @@ install_vllm_nightly() {
 }
 
 install_sglang_nightly() {
-    pushd $ENGINE_DIR
-    git clone https://github.com/sgl-project/sglang.git
-    cd sglang
-
-    # Install the python packages
-    uv pip install --upgrade pip
-    uv pip install -e "python[all]"
-    # WARNING: (YIFAN) This assumes CUDA 12.8 and Python 3.10, but we have tested it with Python 3.12 and it works.
-    uv pip install https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl
-    popd
+    uv pip install torch==2.8.0 torchvision==0.23.0
+    uv pip install "sglang[all]"
 }
 
 install_kvcached() {
