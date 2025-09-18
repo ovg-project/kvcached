@@ -29,7 +29,7 @@ plt.rcParams.update({
 })
 
 # Configuration
-COMPLETION_LENS = [256, 400]
+COMPLETION_LENS = [256, 400, 1024]
 REQRATES = list(range(12, 21))
 KV_CACHE_COLOR = '#FF6B35'  # Bright Orange
 NO_CACHE_COLOR = '#004E89'  # Deep Blue
@@ -37,7 +37,8 @@ NO_CACHE_COLOR = '#004E89'  # Deep Blue
 
 def parse_filename(filename):
     """Parse filename to extract configuration parameters"""
-    pattern = r'ramp-up-down-0to(\d+)to1.*completion_(\d+)-(\d+)-delay-(\d+)'
+    # pattern = r'ramp-up-down-0to(\d+)to1.*completion_(\d+)-(\d+)-delay-(\d+)'
+    pattern = r"fixed-rate-(\d+)rps.*completion_(\d+)-(\d+)-delay-(\d+)"
     match = re.search(pattern, filename)
     if match:
         return tuple(map(int, match.groups()))
@@ -92,7 +93,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
     bar_width = 0.35
 
     ax.bar(x_positions - bar_width/2, true_values, bar_width,
-           label='w/ kvcached', color=KV_CACHE_COLOR, alpha=0.85,
+           label='with kvcached', color=KV_CACHE_COLOR, alpha=0.85,
            edgecolor='black', linewidth=0.8)
     ax.bar(x_positions + bar_width/2, false_values, bar_width,
            label='w/o kvcached', color=NO_CACHE_COLOR, alpha=0.85,
@@ -102,7 +103,6 @@ def create_chart(true_values, false_values, metric_name, comp_len):
     for i, (true_val, false_val) in enumerate(zip(true_values, false_values)):
         if true_val > 0 and false_val > 0:
             speedup = false_val / true_val
-            print("!!!", false_val, true_val)
             y_pos = max(true_val, false_val) * 1.08
             ax.text(x_positions[i], y_pos, f'{speedup:.1f}×',
                    ha='center', va='bottom', fontsize=12, fontweight='bold',
@@ -111,7 +111,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=16)
     ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=16)
-    # ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
+    ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')

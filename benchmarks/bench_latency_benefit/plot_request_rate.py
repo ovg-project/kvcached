@@ -262,7 +262,7 @@ def main():
 
     # Auto-discover result files if not specified
     if args.result_files is None:
-        metrics_pattern = "results/metrics/*.json"
+        metrics_pattern = "results/metrics/true/*.json"
         args.result_files = glob.glob(metrics_pattern)
         if not args.result_files:
             print("Error: No JSON files found in results/metrics/")

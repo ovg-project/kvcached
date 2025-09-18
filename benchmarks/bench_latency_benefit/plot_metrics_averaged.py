@@ -14,10 +14,13 @@ import numpy as np
 def parse_filename(filename):
     """
     Parse filename to extract configuration parameters
-    Example: vllm-meta-llama-Llama-3.1-8B-Instruct-ramp-up-down-0to12to1-inc1-prompt_256-completion_128-1-delay-27-model-num-3.json
+    Example: 
+    vllm-meta-llama-Llama-3.1-8B-Instruct-ramp-up-down-0to12to1-inc1-prompt_256-completion_128-1-delay-27-model-num-3.json
+    vllm-meta-llama-Llama-3.1-8B-Instruct-fixed-rate-20rps-duration-30s-burstiness-100.0-prompt_256-completion_1024-1-delay-30-model-num-3
     Returns: (reqrate, completion_len, model_id, delay)
     """
-    pattern = r"ramp-up-down-0to(\d+)to1.*completion_(\d+)-(\d+)-delay-(\d+)"
+    # pattern = r"ramp-up-down-0to(\d+)to1.*completion_(\d+)-(\d+)-delay-(\d+)"
+    pattern = r"fixed-rate-(\d+)rps.*completion_(\d+)-(\d+)-delay-(\d+)"
     match = re.search(pattern, filename)
     if match:
         reqrate = int(match.group(1))
@@ -38,6 +41,7 @@ def load_metrics_data(base_path):
             continue
 
         for filename in os.listdir(folder_path):
+            # print("!!!", filename)
             if filename.endswith(".json"):
                 parsed = parse_filename(filename)
                 if parsed:
@@ -57,6 +61,7 @@ def load_metrics_data(base_path):
                             "p99_tpot_ms": json_data.get("p99_tpot_ms", 0),
                             "p99_e2el_ms": json_data.get("p99_e2el_ms", 0),
                         }
+                        print("!!!", filepath)
                     except Exception as e:
                         print(f"Error reading {filepath}: {e}")
 
@@ -72,7 +77,7 @@ def create_charts_by_completion_length(data):
         (["mean_e2el_ms", "p99_e2el_ms"], "End-to-End Latency (E2E)", "e2el"),
     ]
 
-    completion_lens = [256, 400]
+    completion_lens = [256, 400, 1024]
     reqrates = [i for i in range(12, 21)]
 
     # Create charts for each metric group and each completion length
