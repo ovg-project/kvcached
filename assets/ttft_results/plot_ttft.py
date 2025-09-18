@@ -125,7 +125,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     plt.tight_layout()
 
-    output_filename = f'ttft_{metric_name.lower()}_comp{comp_len}_paper.png'
+    output_filename = f'ttft_{metric_name.lower()}_comp{comp_len}.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
