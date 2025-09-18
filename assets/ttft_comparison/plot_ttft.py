@@ -29,7 +29,7 @@ plt.rcParams.update({
 })
 
 # Configuration
-COMPLETION_LENS = [256, 400]
+COMPLETION_LENS = [256]
 REQRATES = list(range(12, 21))
 KV_CACHE_COLOR = '#FF6B35'  # Bright Orange
 NO_CACHE_COLOR = '#004E89'  # Deep Blue
