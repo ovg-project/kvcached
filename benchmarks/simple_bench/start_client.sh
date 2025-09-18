@@ -80,16 +80,16 @@ MODEL=${model:-$DEFAULT_MODEL}
 if [[ -n "$port" ]]; then
     ENGINE_PORT=$port
 else
-    if [[ "$engine" == "vllm" ]]; then 
-        ENGINE_PORT=$DEFAULT_PORT_VLLM; 
-    else 
-        ENGINE_PORT=$DEFAULT_PORT_SGL; 
+    if [[ "$engine" == "vllm" ]]; then
+        ENGINE_PORT=$DEFAULT_PORT_VLLM;
+    else
+        ENGINE_PORT=$DEFAULT_PORT_SGL;
     fi
 fi
-if [[ "$engine" == "vllm" ]]; then 
-    VLLM_PORT=$ENGINE_PORT; 
-else 
-    SGL_PORT=$ENGINE_PORT; 
+if [[ "$engine" == "vllm" ]]; then
+    VLLM_PORT=$ENGINE_PORT;
+else
+    SGL_PORT=$ENGINE_PORT;
 fi
 
 PYTHON=${PYTHON:-python3}

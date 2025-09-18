@@ -53,10 +53,10 @@ def load_benchmark_results(result_files: List[str]) -> Dict[str, dict]:
 def synchronize_timestamps(results: Dict[str, dict]) -> Dict[str, dict]:
     """
     Synchronize timestamps across different models using wall-clock time.
-    
+
     Args:
         results: Dictionary of model_name -> benchmark_result
-        
+
     Returns:
         Dictionary with synchronized timestamps
     """
@@ -106,6 +106,7 @@ def synchronize_timestamps(results: Dict[str, dict]) -> Dict[str, dict]:
 def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float = 1.0, use_unified_time: bool = True, event_type: str = "send") -> Tuple[List[float], List[float]]:
     """
     Calculate request rate over time using a sliding window.
+
 
     Args:
         timestamps: List of timestamp dictionaries with 'time', 'model', 'type' fields
@@ -157,6 +158,7 @@ def calculate_request_rate_timeseries(timestamps: List[dict], window_size: float
 def plot_request_rates(results: Dict[str, dict], output_path: str, window_size: float = 1.0, plot_completion: bool = False):
     """
     Plot request rate vs time for multiple models.
+
 
     Args:
         results: Dictionary of model_name -> benchmark_result
