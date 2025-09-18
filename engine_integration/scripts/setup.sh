@@ -124,8 +124,8 @@ setup_python_venv() {
 }
 
 setup_vllm_pip() {
-    # $1: version (default 0.9.2)
-    local vllm_ver=${1:-0.9.2}
+    # $1: version (default 0.10.1)
+    local vllm_ver=${1:-0.10.1}
 
     pushd "$ENGINE_DIR"
 
@@ -166,8 +166,8 @@ setup_sglang_pip() {
 }
 
 setup_vllm_from_source() {
-    # $1: version (default 0.9.2)
-    local vllm_ver=${1:-0.9.2}
+    # $1: version (default 0.10.1)
+    local vllm_ver=${1:-0.10.1}
 
     pushd "$ENGINE_DIR"
 
@@ -235,16 +235,16 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _version=${version:-"0.9.2"}
+    local _version=${version:-"0.10.1"}
     # Validate supported versions
     if [[ "$method" == "pip" ]]; then
-        if [[ "$_version" != "0.9.2" ]]; then
-            echo "Error: vLLM pip installation supports only version 0.9.2 (requested $_version)" >&2
+        if [[ "$_version" != "0.10.1" ]]; then
+            echo "Error: vLLM pip installation supports only version 0.10.1 (requested $_version)" >&2
             exit 1
         fi
     else  # source
-        if [[ "$_version" != "0.9.2" && "$_version" != "0.8.4" ]]; then
-            echo "Error: vLLM source installation supports only versions 0.9.2 and 0.8.4 (requested $_version)" >&2
+        if [[ "$_version" != "0.10.1" && "$_version" != "0.9.2" && "$_version" != "0.8.4" ]]; then
+            echo "Error: vLLM source installation supports only versions 0.10.1, 0.9.2 and 0.8.4 (requested $_version)" >&2
             exit 1
         fi
     fi
@@ -289,13 +289,13 @@ Arguments:
   --engine            Target engine to set up (vllm, sglang) [required]
   --engine-method     Engine installation method: pip (default) or source
   --engine-version    Specific engine version to install. Supported versions:
-        - vllm   : pip -> 0.9.2 | source -> 0.9.2, 0.8.4
+        - vllm   : pip -> 0.10.1 | source -> 0.10.1, 0.9.2, 0.8.4
         - sglang : pip -> 0.4.9 | source -> 0.4.9, 0.4.6.post2
   --kvcached-method   source (install kvcached from source) or pip (install from PyPI). Default: source
 
 Examples:
-  $0 --engine vllm  # vLLM 0.9.2 (pip) + source kvcached
-  $0 --engine vllm --engine-method source --engine-version 0.9.2 --kvcached-method pip
+  $0 --engine vllm  # vLLM 0.10.1 (pip) + source kvcached
+  $0 --engine vllm --engine-method source --engine-version 0.10.1 --kvcached-method pip
   $0 --engine sglang --engine-method source --engine-version 0.4.6.post2
 EOF
 }

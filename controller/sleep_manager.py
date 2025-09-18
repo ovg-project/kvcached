@@ -84,11 +84,11 @@ class SleepManager:
                                  manual: bool = False) -> bool:
         """
         Put a specific model to sleep
-        
+
         Args:
             model_name: Name of the model to put to sleep
             manual: Whether this is a manual sleep request
-        
+
         Returns:
             True if model was put to sleep, False if already sleeping or error
         """
@@ -140,10 +140,10 @@ class SleepManager:
     async def wakeup_model(self, model_name: str) -> bool:
         """
         Wake up a sleeping model
-        
+
         Args:
             model_name: Name of the model to wake up
-        
+
         Returns:
             True if model was woken up, False if not sleeping or error
         """
@@ -275,10 +275,10 @@ class SleepManager:
     async def handle_model_wakeup_on_request(self, model_name: str) -> bool:
         """
         Handle wake-up request when a request comes for a sleeping model
-        
+
         Args:
             model_name: Name of the model that needs to be woken up
-        
+
         Returns:
             True if model was woken up or already awake, False if wake failed
         """
@@ -354,7 +354,7 @@ class SleepManager:
     async def check_model_sleep_status(self,
                                        model_name: str) -> Optional[bool]:
         """Check if a model is currently sleeping using vLLM's or SGLang's API
-        
+
         Returns:
             True if sleeping, False if awake, None if unable to determine
         """
@@ -508,16 +508,16 @@ class SleepManager:
             self, model_name: str, model_config: Dict[str, str]) -> bool:
         """
         Perform complete model recovery for SGLang models after resume_memory_occupation
-        
+
         This method implements the full recovery process as shown in the test function:
         1. Load new model weights from pretrained
         2. Update weights using update_weights_from_tensor
         3. Clean up temporary model and cache
-        
+
         Args:
             model_name: Name of the model to recover
             model_config: Model configuration containing host and port
-            
+
         Returns:
             True if recovery was successful, False otherwise
         """
