@@ -120,15 +120,9 @@ def alloc_kv_cache(
             k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
             v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
     else:
-<<<<<<< HEAD
         contiguous_shape = (num_tokens, num_layers, num_k_or_v, *actual_kvcache_shape[1:])
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
-=======
-        contiguous_tensor = raw_kv_tensors[0][:actual_kvcache_size].view(
-            num_tokens, num_layers, 2,
-            *actual_kvcache_shape[1:]).view(dtype=dtype)
->>>>>>> 7bd0432 (Fixed version for issue #106)
         for i in range(num_layers):
             k_tensors.append(contiguous_tensor[:, i, 0, :, :])
             v_tensors.append(contiguous_tensor[:, i, 1, :, :])
