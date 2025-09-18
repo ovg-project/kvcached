@@ -199,14 +199,14 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
                 "Launched %s in tmux session '%s'. tmux attach -t %s to attach",
                 inst["name"], session_name, session_name)
             launched.append(inst)
-            
+
             # Add delay between launches if specified and not the last instance
             if launch_delay > 0 and idx < len(instances_cfg) - 1:
                 logger.info(
                     "Waiting %d seconds before launching next instance...",
                     launch_delay)
                 time.sleep(launch_delay)
-                
+
         except subprocess.CalledProcessError as e:
             logger.error("Failed to launch %s: %s", inst["name"], e)
 
@@ -279,7 +279,7 @@ def main() -> None:
 
     # Extract launch delay from top-level configuration
     launch_delay = raw_cfg.get("launch_delay_seconds", 0)
-    
+
     _launch_instances(instances_cfg, global_kvcached_env, launch_delay)
     _maybe_launch_router(router_cfg, cfg_path)
 

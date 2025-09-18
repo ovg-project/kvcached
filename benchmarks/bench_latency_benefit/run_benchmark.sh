@@ -65,26 +65,26 @@ for i in "${!MODELS[@]}"; do
     # Parse model and port
     MODEL=$(echo "${MODELS[$i]}" | cut -d':' -f1)
     PORT=$(echo "${MODELS[$i]}" | cut -d':' -f2)
-    
+
     # Generate model name and result file
     MODEL_NAME=$(echo "$MODEL" | tr '/' '-')
     MODEL_INDEX=$((i + 1))
-    
+
     # Generate result file name for ramp-up-down strategy
     RESULT_FILE="results/metrics/${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_START_RPS}to${RAMP_PEAK_RPS}to${RAMP_END_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}-model-num-${NUM_MODELS}.json"
-    
+
     # Add delay before starting next model (except for the first one)
     if [ $i -gt 0 ] && [ "$MODEL_DELAY" -gt 0 ]; then
         echo "Waiting ${MODEL_DELAY} seconds before starting Model ${MODEL_INDEX}..."
         sleep $MODEL_DELAY
     fi
-    
+
     echo "Starting benchmark for $MODEL (Model ${MODEL_INDEX}) on port $PORT..."
-    
+
     NUM_PROMPTS=$((NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY))
     # Use ramp-up-down strategy
     echo "Using ramp-up-down strategy: ${RAMP_START_RPS} -> ${RAMP_PEAK_RPS} -> ${RAMP_END_RPS} RPS (increment: ±${RAMP_INCREMENT} RPS/sec)"
-    
+
     python bench_kvcached_vllm.py \
         --backend "$BACKEND" \
         --model "$MODEL" \
@@ -103,11 +103,11 @@ for i in "${!MODELS[@]}"; do
         --ramp-end-rps "$RAMP_END_RPS" \
         --ramp-peak-rps "$RAMP_PEAK_RPS" \
         --ramp-increment "$RAMP_INCREMENT" &
-    
+
     # Store PID and result file
     PIDS+=($!)
     RESULT_FILES+=("$RESULT_FILE")
-    
+
     echo "Started Model ${MODEL_INDEX} with PID ${PIDS[$i]}"
 done
 
