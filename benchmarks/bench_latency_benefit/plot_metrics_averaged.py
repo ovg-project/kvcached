@@ -14,7 +14,7 @@ import numpy as np
 def parse_filename(filename):
     """
     Parse filename to extract configuration parameters
-    Example: 
+    Example:
     vllm-meta-llama-Llama-3.1-8B-Instruct-ramp-up-down-0to12to1-inc1-prompt_256-completion_128-1-delay-27-model-num-3.json
     vllm-meta-llama-Llama-3.1-8B-Instruct-fixed-rate-20rps-duration-30s-burstiness-100.0-prompt_256-completion_1024-1-delay-30-model-num-3
     Returns: (reqrate, completion_len, model_id, delay)
