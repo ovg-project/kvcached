@@ -25,7 +25,7 @@ BACKEND="vllm"
 # Fixed request rate parameters
 FIXED_RPS=$1               # Fixed request rate (requests per second)
 DURATION=${3:-30}          # Duration in seconds (default: 60s)
-BURSTINESS=${5:-100.0}      # Higher burstiness for more uniform requests (default: 10.0)
+BURSTINESS=${5:-10000.0}      # Higher burstiness for more uniform requests (default: 10.0)
 
 # Calculate total number of requests
 NUM_PROMPTS=$((FIXED_RPS * $DURATION))

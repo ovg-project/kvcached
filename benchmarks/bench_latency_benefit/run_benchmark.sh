@@ -56,72 +56,71 @@ NUM_MODELS=${#MODELS[@]}
 UNIFIED_START_TIME=$(date +%s.%N)
 echo "Unified benchmark start time: $UNIFIED_START_TIME"
 
-# Model 1
-MODEL_1="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME_1=$(echo "$MODEL_1" | tr '/' '-')
-RESULT_FILE_1="results/metrics/${BACKEND}-${MODEL_NAME_1}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-burstiness-${BURSTINESS}-1.json"
+# Arrays to store PIDs and result files
+PIDS=()
+RESULT_FILES=()
 
-echo "Starting benchmark for $MODEL_1..."
-python bench_kvcached_vllm.py \
-    --backend "$BACKEND" \
-    --model "$MODEL_1" \
-    --dataset-name random \
-    --random-input-len "$PROMPT_LEN" \
-    --random-output-len "$COMPLETION_LEN" \
-    --num-prompts "$NUM_PROMPTS" \
-    --request-rate "$REQUEST_RATE" \
-    --burstiness "$BURSTINESS" \
-    --host "localhost" \
-    --port 12346 \
-    --endpoint "/v1/completions" \
-    --save-result \
-    --result-filename "$RESULT_FILE_1" \
-    --metadata "unified_start_time=$UNIFIED_START_TIME" &
+# Run benchmarks for each model
+for i in "${!MODELS[@]}"; do
+    # Parse model and port
+    MODEL=$(echo "${MODELS[$i]}" | cut -d':' -f1)
+    PORT=$(echo "${MODELS[$i]}" | cut -d':' -f2)
 
-# Start Model 1 in background and get its PID
-MODEL_1_PID=$!
+    # Generate model name and result file
+    MODEL_NAME=$(echo "$MODEL" | tr '/' '-')
+    MODEL_INDEX=$((i + 1))
 
-# Optional delay before starting Model 2
-if [ "$MODEL_2_DELAY" -gt 0 ]; then
-    echo "Waiting ${MODEL_2_DELAY} seconds before starting Model 2..."
-    sleep $MODEL_2_DELAY
-fi
+    # Generate result file name for ramp-up-down strategy
+    RESULT_FILE="results/metrics/${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_START_RPS}to${RAMP_PEAK_RPS}to${RAMP_END_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}-model-num-${NUM_MODELS}.json"
 
-# Model 2 (run in parallel)
-MODEL_2="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME_2=$(echo "$MODEL_2" | tr '/' '-')
-RESULT_FILE_2="results/metrics/${BACKEND}-${MODEL_NAME_2}-qps_${REQUEST_RATE}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-burstiness-${BURSTINESS}-2.json"
+    # Add delay before starting next model (except for the first one)
+    if [ $i -gt 0 ] && [ "$MODEL_DELAY" -gt 0 ]; then
+        echo "Waiting ${MODEL_DELAY} seconds before starting Model ${MODEL_INDEX}..."
+        sleep $MODEL_DELAY
+    fi
 
-echo "Starting benchmark for $MODEL_2..."
-python bench_kvcached_vllm.py \
-    --backend "$BACKEND" \
-    --model "$MODEL_2" \
-    --dataset-name random \
-    --random-input-len "$PROMPT_LEN" \
-    --random-output-len "$COMPLETION_LEN" \
-    --num-prompts "$NUM_PROMPTS" \
-    --request-rate "$REQUEST_RATE" \
-    --burstiness "$BURSTINESS" \
-    --host "localhost" \
-    --port 30000 \
-    --endpoint "/v1/completions" \
-    --save-result \
-    --result-filename "$RESULT_FILE_2" \
-    --metadata "unified_start_time=$UNIFIED_START_TIME" &
+    echo "Starting benchmark for $MODEL (Model ${MODEL_INDEX}) on port $PORT..."
 
-# Start Model 2 in background and get its PID
-MODEL_2_PID=$!
+    NUM_PROMPTS=$((NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY))
+    # Use ramp-up-down strategy
+    echo "Using ramp-up-down strategy: ${RAMP_START_RPS} -> ${RAMP_PEAK_RPS} -> ${RAMP_END_RPS} RPS (increment: ±${RAMP_INCREMENT} RPS/sec)"
 
-# Wait for both benchmarks to complete
-echo "Waiting for both benchmarks to complete..."
-wait $MODEL_1_PID
-MODEL_1_EXIT_CODE=$?
+    python bench_kvcached_vllm.py \
+        --backend "$BACKEND" \
+        --model "$MODEL" \
+        --dataset-name random \
+        --random-input-len "$PROMPT_LEN" \
+        --random-output-len "$COMPLETION_LEN" \
+        --num-prompts "$NUM_PROMPTS" \
+        --host "localhost" \
+        --port "$PORT" \
+        --endpoint "/v1/completions" \
+        --save-result \
+        --result-filename "$RESULT_FILE" \
+        --metadata "unified_start_time=$UNIFIED_START_TIME" \
+        --ramp-up-strategy ramp-up-down \
+        --ramp-start-rps "$RAMP_START_RPS" \
+        --ramp-end-rps "$RAMP_END_RPS" \
+        --ramp-peak-rps "$RAMP_PEAK_RPS" \
+        --ramp-increment "$RAMP_INCREMENT" &
 
-wait $MODEL_2_PID
-MODEL_2_EXIT_CODE=$?
+    # Store PID and result file
+    PIDS+=($!)
+    RESULT_FILES+=("$RESULT_FILE")
 
-echo "Model 1 benchmark exit code: $MODEL_1_EXIT_CODE"
-echo "Model 2 benchmark exit code: $MODEL_2_EXIT_CODE"
+    echo "Started Model ${MODEL_INDEX} with PID ${PIDS[$i]}"
+done
+
+# Wait for all benchmarks to complete
+echo "Waiting for all benchmarks to complete..."
+EXIT_CODES=()
+
+for i in "${!PIDS[@]}"; do
+    wait ${PIDS[$i]}
+    EXIT_CODE=$?
+    EXIT_CODES+=($EXIT_CODE)
+    echo "Model $((i + 1)) benchmark exit code: $EXIT_CODE"
+done
 
 echo "All benchmarks completed!"
 echo "Results saved to:"
