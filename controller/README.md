@@ -11,7 +11,7 @@ It exposes unified **OpenAI-compatible** HTTP endpoints that transparently route
 * **tmux-based process management** – Every engine instance, the router, and optional benchmark clients run in isolated *tmux* sessions.
 * **Traffic monitoring** – Monitors the request status of each model, e.g., request rate, idle time.
 * **Sleep and wakeup** – Idle models can be deactivated to release model weights, and waked up upon receiving requests.
-  
+
 ---
 
 ## Quick Start

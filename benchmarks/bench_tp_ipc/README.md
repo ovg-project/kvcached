@@ -224,7 +224,7 @@ Workers handle vmm ops in a synchronous manner -- since each worker executes one
 In the benchmark script, the code below
 
 ```python
-page_ids = [i for i in range(pages_per_iter)] 
+page_ids = [i for i in range(pages_per_iter)]
 offsets  = [pid * PAGE_SIZE for pid in page_ids]
 ```
 

@@ -5,10 +5,34 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 KVCACHED_DIR=$(cd "$ENGINE_DIR/.." && pwd)
 
+# -----------------------------------------------------------------------------
+# Pretty printing helpers (colors, bold) – disable if stdout is not a TTY
+# -----------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    BOLD=$(tput bold)
+    RESET=$(tput sgr0)
+    CYAN=$(tput setaf 6)
+    GREEN=$(tput setaf 2)
+    YELLOW=$(tput setaf 3)
+    RED=$(tput setaf 1)
+else
+    BOLD=""
+    RESET=""
+    CYAN=""
+    GREEN=""
+    YELLOW=""
+    RED=""
+fi
+
+# Helper to print errors in red
+error() {
+    echo "${BOLD}${RED}Error:${RESET} $*" >&2
+}
+
 check_uv() {
     if ! command -v uv &> /dev/null; then
-        echo "Error: uv is not installed"
-        echo "Please install uv first, e.g., 'curl -LsSf https://astral.sh/uv/install.sh | sh'"
+        error "uv is not installed"
+        error "Please install uv first, e.g., 'curl -LsSf https://astral.sh/uv/install.sh | sh'"
         exit 1
     fi
 }
@@ -124,8 +148,8 @@ setup_python_venv() {
 }
 
 setup_vllm_pip() {
-    # $1: version (default 0.9.2)
-    local vllm_ver=${1:-0.9.2}
+    # $1: version (default 0.10.1)
+    local vllm_ver=${1:-0.10.1}
 
     pushd "$ENGINE_DIR"
 
@@ -192,7 +216,7 @@ setup_vllm_from_source() {
     if [ -f "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch" ]; then
         git apply "$ENGINE_DIR/patches/kvcached-vllm-v${vllm_ver}.patch"
     else
-        echo "Error: patch for vLLM-v${vllm_ver} not found" >&2
+        error "patch for vLLM-v${vllm_ver} not found"
         exit 1
     fi
 
@@ -223,7 +247,7 @@ setup_sglang_from_source() {
     if [ -f "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch" ]; then
         git apply "$ENGINE_DIR/patches/kvcached-sglang-v${sglang_ver}.patch"
     else
-        echo "Error: patch for sglang-v${sglang_ver} not found" >&2
+        error "patch for sglang-v${sglang_ver} not found"
         exit 1
     fi
 
@@ -235,16 +259,20 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _version=${version:-"0.9.2"}
+    local _default_ver="0.10.1"
+    if [[ "$method" == "source" ]]; then
+        _default_ver="0.9.2"
+    fi
+    local _version=${version:-"$_default_ver"}
     # Validate supported versions
     if [[ "$method" == "pip" ]]; then
-        if [[ "$_version" != "0.9.2" ]]; then
-            echo "Error: vLLM pip installation supports only version 0.9.2 (requested $_version)" >&2
+        if [[ "$_version" != "0.10.1" ]]; then
+            error "vLLM pip installation supports only version 0.10.1 (requested $_version)"
             exit 1
         fi
     else  # source
         if [[ "$_version" != "0.9.2" && "$_version" != "0.8.4" ]]; then
-            echo "Error: vLLM source installation supports only versions 0.9.2 and 0.8.4 (requested $_version)" >&2
+            error "vLLM source installation supports only versions 0.9.2 and 0.8.4 (requested $_version)"
             exit 1
         fi
     fi
@@ -261,12 +289,12 @@ setup_sglang() {
     # Validate supported versions
     if [[ "$method" == "pip" ]]; then
         if [[ "$_version" != "0.4.9" ]]; then
-            echo "Error: sglang pip installation supports only version 0.4.9 (requested $_version)" >&2
+            error "sglang pip installation supports only version 0.4.9 (requested $_version)"
             exit 1
         fi
     else  # source
         if [[ "$_version" != "0.4.9" && "$_version" != "0.4.6.post2" ]]; then
-            echo "Error: sglang source installation supports only versions 0.4.9 and 0.4.6.post2 (requested $_version)" >&2
+            error "sglang source installation supports only versions 0.4.9 and 0.4.6.post2 (requested $_version)"
             exit 1
         fi
     fi
@@ -283,20 +311,20 @@ setup_sglang() {
 # -----------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 --engine <vllm|sglang> [--engine-method pip|source] [--engine-version VERSION] [--kvcached-method source|pip]
+${BOLD}${CYAN}Usage:${RESET} $0 --engine <vllm|sglang> [--engine-method pip|source] [--engine-version VERSION] [--kvcached-method source|pip]
 
-Arguments:
-  --engine            Target engine to set up (vllm, sglang) [required]
-  --engine-method     Engine installation method: pip (default) or source
-  --engine-version    Specific engine version to install. Supported versions:
-        - vllm   : pip -> 0.9.2 | source -> 0.9.2, 0.8.4
-        - sglang : pip -> 0.4.9 | source -> 0.4.9, 0.4.6.post2
-  --kvcached-method   source (install kvcached from source) or pip (install from PyPI). Default: source
+${BOLD}${CYAN}Arguments:${RESET}
+  ${BOLD}--engine${RESET}            Target engine to set up (vllm, sglang) [required]
+  ${BOLD}--engine-method${RESET}     Engine installation method: pip (default) or source
+  ${BOLD}--engine-version${RESET}    Specific engine version to install. Supported versions:
+        - vllm   : pip -> 0.10.1 | source -> 0.9.2, 0.8.4
+        - sglang : pip -> 0.4.9  | source -> 0.4.9, 0.4.6.post2
+  ${BOLD}--kvcached-method${RESET}   source (install kvcached from source) or pip (install from PyPI). Default: source
 
-Examples:
-  $0 --engine vllm  # vLLM 0.9.2 (pip) + source kvcached
-  $0 --engine vllm --engine-method source --engine-version 0.9.2 --kvcached-method pip
-  $0 --engine sglang --engine-method source --engine-version 0.4.6.post2
+${BOLD}${CYAN}Examples:${RESET}
+  $0 --engine vllm                                                   # vLLM 0.10.1 (pip) + source kvcached (default)
+  $0 --engine vllm --engine-method source --engine-version 0.9.2     # vLLM 0.9.2 (source) + kvcached (source)
+  $0 --engine sglang --engine-method source --engine-version 0.4.9   # sglang 0.4.9 (source) + kvcached (source)
 EOF
 }
 
@@ -348,21 +376,21 @@ done
 
 # Validate required engine option
 if [[ -z "$engine" ]]; then
-    echo "Error: --engine is required" >&2
+    error "--engine is required"
     usage
     exit 1
 fi
 
 # Validate method
 if [[ "$method" != "pip" && "$method" != "source" ]]; then
-    echo "Error: Unknown --engine-method '$method' (expected 'pip' or 'source')" >&2
+    error "Unknown --engine-method '$method' (expected 'pip' or 'source')"
     usage
     exit 1
 fi
 
 # Validate mode
 if [[ "$kc_method" != "source" && "$kc_method" != "pip" ]]; then
-    echo "Error: Unknown --kvcached-method '$kc_method' (expected 'source' or 'pip')" >&2
+    error "Unknown --kvcached-method '$kc_method' (expected 'source' or 'pip')"
     usage
     exit 1
 fi
@@ -379,7 +407,7 @@ case "$engine" in
     sglang)
         setup_sglang ;;
     *)
-        echo "Error: Unknown engine '$engine' (expected 'vllm' or 'sglang')" >&2
+        error "Unknown engine '$engine' (expected 'vllm' or 'sglang')"
         usage
         exit 1 ;;
 esac

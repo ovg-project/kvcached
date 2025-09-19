@@ -53,10 +53,10 @@ def load_benchmark_results(result_files: List[str]) -> Dict[str, dict]:
 def synchronize_timestamps(results: Dict[str, dict]) -> Dict[str, dict]:
     """
     Synchronize timestamps across different models using wall-clock time.
-    
+
     Args:
         results: Dictionary of model_name -> benchmark_result
-        
+
     Returns:
         Dictionary with synchronized timestamps
     """
