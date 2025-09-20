@@ -103,8 +103,10 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_contiguous_(size, dtype, dev_str, num_layers);
   } else {
+    // For non-contiguous layout, ensure size is aligned to page size
+    size_t aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-    return create_kv_tensors_per_layer_(kv_prefix, size, dtype, dev_str,
+    return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
 }
@@ -142,7 +144,10 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      auto v_base_offset =
+          (((tensor.numel() * tensor.element_size()) / 2 + kPageSize - 1) /
+           kPageSize) *
+          kPageSize;
       for (auto offset : offsets) {
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
@@ -182,7 +187,10 @@ bool FTensorAllocator::unmap_from_kv_tensors(
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      auto v_base_offset =
+          (((tensor.numel() * tensor.element_size()) / 2 + kPageSize - 1) /
+           kPageSize) *
+          kPageSize;
       for (auto offset : offsets) {
         ftensor->unmap(offset);
         ftensor->unmap(offset + v_base_offset);
@@ -247,7 +255,8 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
     assert(tensor.device() == torch::Device(dev_str));
     return tensor;
   }
-  // Create a new FTensor.
+
+  // Create a new FTensor (size is already aligned from previous steps)
   ftensors_[name] =
       std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
   return ftensors_[name]->get_tensor();

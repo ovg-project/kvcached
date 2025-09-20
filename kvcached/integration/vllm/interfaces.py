@@ -97,13 +97,17 @@ def alloc_kv_cache(
     raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
                                        device, num_layers)
 
+    actual_kvcache_size = num_layers * math.prod(
+        kvcache_shape_list)
+    actual_kvcache_size_per_layer = math.prod(kvcache_shape_list)
     if not _contiguous_layout:
         kv_tensors = [
-            t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
+            t[:actual_kvcache_size_per_layer].view(tuple(kvcache_shape_list)).view(dtype=dtype)
+            # t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
             for t in raw_kv_tensors
         ]
     else:
-        contiguous_tensor = raw_kv_tensors[0].view(
+        contiguous_tensor = raw_kv_tensors[0][:actual_kvcache_size].view(
             num_blocks, num_layers, 2,
             *kvcache_shape_list[2:]).view(dtype=dtype)
         kv_tensors = [
