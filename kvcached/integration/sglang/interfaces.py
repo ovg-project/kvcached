@@ -110,6 +110,8 @@ def alloc_kv_cache(
 
     actual_kvcache_size = num_tokens * num_layers * 2 * math.prod(
         kvcache_shape[1:])
+    actual_kvcache_size_per_layer = num_tokens * 2 * math.prod(
+        kvcache_shape[1:])
 
     k_tensors, v_tensors = [], []
 
