@@ -122,6 +122,8 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers);
   } else {
+    // For non-contiguous layout, ensure size is aligned to page size
+    size_t aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
