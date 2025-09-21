@@ -56,10 +56,10 @@ def setup_kvcache():
         num_layers=NUM_LAYERS,
     )
 
-    while True:
-        created = kv_tensors_created()
-        if created:
-            break
+    start_time = time.time()
+    while not kv_tensors_created():
+        if time.time() - start_time > 10.0:
+            pytest.fail("KV tensors not created within 10s.")
         time.sleep(0.1)
 
     # instantiate a kv cache manager
@@ -72,7 +72,15 @@ def setup_kvcache():
     )
 
     # wait a bit for pre-allocation to finish
-    time.sleep(1)
+    if manager.page_allocator.enable_page_prealloc:
+        start_time = time.time()
+        timeout = 5.0  # seconds
+        min_pages = manager.page_allocator.min_reserved_pages
+        while len(manager.page_allocator.reserved_page_list) < min_pages:
+            if time.time() - start_time > timeout:
+                # This is not a hard failure, but test_trim might become flaky.
+                break
+            time.sleep(0.1)
 
     yield manager
 
@@ -160,7 +168,6 @@ def test_trim(setup_kvcache):
 
     # trim reserved pages
     manager.trim()
-    time.sleep(1)
     after_trim_reserved = len(manager.page_allocator.reserved_page_list)
     assert after_trim_reserved == 0
 
@@ -175,7 +182,6 @@ def test_reserve_and_free_blocks(setup_kvcache):
     # reserve some blocks
     n_blocks = 512
     manager.try_to_reserve(n_blocks)
-    time.sleep(1)
     after_reserve_blocks = len(manager.reserved_blocks)
     assert after_reserve_blocks == initial_reserved_blocks + n_blocks
 
