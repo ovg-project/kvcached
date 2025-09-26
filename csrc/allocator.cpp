@@ -32,10 +32,11 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
 }
 
 static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
-  ASSERT((tensor.numel() * tensor.element_size()) % (2 * kPageSize) == 0,
+  size_t num_eles = tensor.numel() * tensor.element_size();
+  ASSERT(num_eles % (2 * kPageSize) == 0,
          "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
-         tensor.numel() * tensor.element_size(), 2 * kPageSize);
-  return (tensor.numel() * tensor.element_size()) / 2;
+         num_eles, 2 * kPageSize);
+  return num_eles / 2;
 }
 
 FTensorAllocator::FTensorAllocator(const torch::Device &device,
@@ -104,9 +105,9 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
   if (size % kPageSize != 0) {
-    LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
-         kPageSize, ((size + kPageSize - 1) / kPageSize) * kPageSize);
     aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+    LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
+         kPageSize, aligned_size);
   }
   kv_tensor_size_per_layer_ = aligned_size;
 

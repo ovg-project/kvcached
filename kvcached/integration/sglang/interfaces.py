@@ -67,8 +67,7 @@ def alloc_kv_cache(
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not _kvcached_initialized:
-        raise RuntimeError(
-            "kvcached is not initialized. Please call init_kvcached() first.")
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
     if attention_type not in ["MHA", "GQA"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
@@ -93,12 +92,11 @@ def alloc_kv_cache(
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # round down to page size
-    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v //
-                                      PAGE_SIZE) * PAGE_SIZE
+    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
     raw_kv_tensors = create_kv_tensors(
-        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device,
-        num_layers)
+        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers
+    )
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_size
     num_tokens = num_blocks_per_layer * block_size
@@ -115,13 +113,11 @@ def alloc_kv_cache(
     if not _contiguous_layout:
         num_eles = num_k_or_v * math.prod(actual_kvcache_shape)
         for t in raw_kv_tensors:
-            t = t[:num_eles].view(
-                num_k_or_v, *actual_kvcache_shape).view(dtype=dtype)
+            t = t.view(dtype=dtype)[:num_eles].view(num_k_or_v, *actual_kvcache_shape)
             k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
             v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
     else:
-        contiguous_shape = (num_tokens, num_layers, num_k_or_v,
-                            *actual_kvcache_shape[1:])
+        contiguous_shape = (num_tokens, num_layers, num_k_or_v, *actual_kvcache_shape[1:])
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         for i in range(num_layers):

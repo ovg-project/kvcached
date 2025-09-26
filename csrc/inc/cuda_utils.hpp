@@ -10,14 +10,14 @@
 #include <iostream>
 
 #define LOGE(format, ...)                                                      \
-  fprintf(stdout, "ERROR: %s:%d: " format "\n", __FILE__, __LINE__,            \
+  fprintf(stderr, "ERROR: %s:%d: " format "\n", __FILE__, __LINE__,            \
           ##__VA_ARGS__);                                                      \
-  fflush(stdout);
+  fflush(stderr);
 
 #define LOGW(format, ...)                                                      \
-  fprintf(stdout, "WARNING: %s:%d: " format "\n", __FILE__, __LINE__,          \
+  fprintf(stderr, "WARNING: %s:%d: " format "\n", __FILE__, __LINE__,          \
           ##__VA_ARGS__);                                                      \
-  fflush(stdout);
+  fflush(stderr);
 
 #define ASSERT(cond, ...)                                                      \
   {                                                                            \
