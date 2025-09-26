@@ -103,7 +103,6 @@ def alloc_kv_cache(
     if not _contiguous_layout:
         kv_tensors = [
             t[:actual_kvcache_size_per_layer].view(tuple(kvcache_shape_list)).view(dtype=dtype)
-            # t.view(tuple(kvcache_shape_list)).view(dtype=dtype)
             for t in raw_kv_tensors
         ]
     else:
