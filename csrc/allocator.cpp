@@ -94,17 +94,26 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
-  kv_tensor_size_per_layer_ = size;
+  // Ensure size is aligned to page size.
+  size_t aligned_size = size;
+  if (size % kPageSize != 0) {
+    LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
+         kPageSize, ((size + kPageSize - 1) / kPageSize) * kPageSize);
+    aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+  }
+  kv_tensor_size_per_layer_ = aligned_size;
 
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page.
     kPageSize *= num_layers * 2;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-    return create_kv_tensors_contiguous_(size, dtype, dev_str, num_layers);
+    // We can use the aligned size directly for contiguous layout too because
+    // both kPageSize and aligned_size are already/will be multiplied by
+    // num_layers.
+    return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
+                                         num_layers);
   } else {
-    // For non-contiguous layout, ensure size is aligned to page size
-    size_t aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
@@ -226,16 +235,10 @@ FTensorAllocator::create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
   // num_layers to get total size
   size_t total_kv_size = size * num_layers;
 
-  // For alignment, we want to align to page boundaries that are kPageSize *
-  // num_layers This ensures proper alignment for Python's page management.
-  // Note that here kPageSize is already multiplied by num_layers.
-  size_t aligned_size =
-      ((total_kv_size + kPageSize - 1) / kPageSize) * kPageSize;
-
   // Create the single contiguous KV tensor (contains K and V for all layers)
   auto contiguous_name = std::string(kv_prefix) + "contiguous";
   contiguous_kv_tensor_ = std::make_unique<FTensor>(
-      contiguous_name, aligned_size, dtype, dev_, zero_page_);
+      contiguous_name, total_kv_size, dtype, dev_, zero_page_);
 
   // Get the contiguous tensor
   auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
