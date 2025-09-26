@@ -31,6 +31,13 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
+static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
+  ASSERT((tensor.numel() * tensor.element_size()) % (2 * kPageSize) == 0,
+         "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
+         tensor.numel() * tensor.element_size(), 2 * kPageSize);
+  return (tensor.numel() * tensor.element_size()) / 2;
+}
+
 FTensorAllocator::FTensorAllocator(const torch::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
@@ -153,10 +160,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset =
-          (((tensor.numel() * tensor.element_size()) / 2 + kPageSize - 1) /
-           kPageSize) *
-          kPageSize;
+      auto v_base_offset = get_v_base_offset(tensor);
       for (auto offset : offsets) {
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
@@ -196,10 +200,7 @@ bool FTensorAllocator::unmap_from_kv_tensors(
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset =
-          (((tensor.numel() * tensor.element_size()) / 2 + kPageSize - 1) /
-           kPageSize) *
-          kPageSize;
+      auto v_base_offset = get_v_base_offset(tensor);
       for (auto offset : offsets) {
         ftensor->unmap(offset);
         ftensor->unmap(offset + v_base_offset);
@@ -259,7 +260,7 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
     return tensor;
   }
 
-  // Create a new FTensor (size is already aligned from previous steps)
+  // Create a new FTensor
   ftensors_[name] =
       std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
   return ftensors_[name]->get_tensor();
