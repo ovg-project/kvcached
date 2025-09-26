@@ -146,8 +146,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       auto tensor = ftensor->get_tensor();
       auto v_base_offset =
           (((tensor.numel() * tensor.element_size()) / 2 + kPageSize - 1) /
-           kPageSize) *
-          kPageSize;
+           kPageSize) * kPageSize;
       for (auto offset : offsets) {
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
