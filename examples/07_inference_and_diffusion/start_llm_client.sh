@@ -1,7 +1,7 @@
 #!/bin/bash
 set -x
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/../../engine_integration" && pwd)
 
 # Default values
@@ -103,14 +103,14 @@ PYTHON=${PYTHON:-python3}
 
 check_and_download_sharegpt() {
     pushd $SCRIPT_DIR
-    if [ ! -f "ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
+    if [[ ! -f "ShareGPT_V3_unfiltered_cleaned_split.json" ]]; then
         echo "Downloading ShareGPT dataset..."
         wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
     fi
     popd
 }
 
-if [ "$engine" == "vllm" ]; then
+if [[ "$engine" == "vllm" ]]; then
     check_and_download_sharegpt
     if [[ -n "$venv_path" ]]; then source "$venv_path/bin/activate"; fi
     vllm bench serve \
@@ -121,7 +121,7 @@ if [ "$engine" == "vllm" ]; then
       --num-prompts $NUM_PROMPTS \
       --port $VLLM_PORT
     if [[ -n "$venv_path" ]]; then deactivate; fi
-elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
+elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
     check_and_download_sharegpt
     if [[ -n "$venv_path" ]]; then source "$venv_path/bin/activate"; fi
 

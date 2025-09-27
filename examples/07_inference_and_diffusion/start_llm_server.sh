@@ -1,7 +1,7 @@
 #!/bin/bash
 set -x
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 ENGINE_DIR=$(cd "$SCRIPT_DIR/../../engine_integration" && pwd)
 
 # Default values
@@ -120,7 +120,7 @@ else
     IS_L4=false
 fi
 
-if [ "$engine" == "vllm" ]; then
+if [[ "$engine" == "vllm" ]]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export VLLM_USE_V1=1
@@ -129,7 +129,7 @@ if [ "$engine" == "vllm" ]; then
     export KVCACHED_IPC_NAME=VLLM
 
     VLLM_L4_ARGS=""
-    if [ "$IS_L4" = true ]; then
+    if [[ "$IS_L4" = true ]]; then
         VLLM_L4_ARGS="--enforce-eager"
     fi
     vllm serve "$MODEL" \
@@ -139,14 +139,14 @@ if [ "$engine" == "vllm" ]; then
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS 2>&1 | tee vllm.log
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
-elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
+elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_IPC_NAME=SGLANG
 
     SGL_L4_ARGS=""
-    if [ "$IS_L4" = true ]; then
+    if [[ "$IS_L4" = true ]]; then
         export TORCHINDUCTOR_DISABLE=1
         export TORCHDYNAMO_DISABLE=1
         SGL_L4_ARGS="--attention-backend torch_native"

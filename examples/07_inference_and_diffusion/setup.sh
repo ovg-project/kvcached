@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_DIR=$(dirname $(realpath $0))
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 DIFFUSERS_VENV_NAME="$SCRIPT_DIR/diffusers-venv"
 
 check_and_install_uv() {
