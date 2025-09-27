@@ -10,9 +10,8 @@ DEFAULT_PORT_VLLM=12346
 DEFAULT_PORT_SGL=30000
 DEFAULT_LLM_TP_SIZE=1
 
-DEFAULT_DIFF_MODEL="stabilityai/stable-diffusion-3.5-medium"
-DEFAULT_DIFF_NUM_INFERENCE_STEPS=20
-DEFAULT_DIFF_SAVE_IMAGES=""
+DEFAULT_FINETUNE_CONFIG="llama3_lora_sft.yaml"
+DEFAULT_FINETUNE_GPUS="0"
 
 # CLI variables
 llm_engine=""
@@ -21,41 +20,40 @@ llm_port=""
 llm_venv_path=""
 llm_tp_size=""
 
-diffusers_venv_path=""
-diff_model=""
-diff_num_inference_steps=""
-diff_save_images=""
+llama_factory_venv_path=""
+finetune_config=""
+finetune_gpus=""
 
 usage() {
     cat <<EOF
-Usage: $0 [--llm-engine ENGINE] [--llm-model MODEL] [--llm-port PORT] [--llm-venv-path PATH] [--llm-tp TP_SIZE] [--diff-model MODEL] [--diff-num-inference-steps N] [--diff-save-images]
+Usage: $0 [--llm-engine ENGINE] [--llm-model MODEL] [--llm-port PORT] [--llm-venv-path PATH] [--llm-tp TP_SIZE] [--llama-factory-venv-path PATH] [--finetune-config CONFIG] [--finetune-gpus GPUS]
 
 Options:
   # For LLM server
-  --llm-engine       LLM engine (vllm | sglang) (default: $DEFAULT_LLM_ENGINE)
-  --llm-model        Model identifier (default: $DEFAULT_LLM_MODEL)
-  --llm-port         Port for LLM server (default: vllm=$DEFAULT_PORT_VLLM, sglang=$DEFAULT_PORT_SGL)
-  --llm-venv-path    Path to virtual environment for LLM engine (optional)
-  --llm-tp-size      Tensor parallel size (default: $DEFAULT_LLM_TP_SIZE)
-  # For diffusion
-  --diff-model                Diffusion model (default: $DEFAULT_DIFF_MODEL)
-  --diff-num-inference-steps  Number of diffusion inference steps (default: $DEFAULT_DIFF_NUM_INFERENCE_STEPS)
-  --diff-save-images          Save generated diffusion images
-  -h, --help     Show this help and exit
+  --llm-engine              LLM engine (vllm | sglang) (default: $DEFAULT_LLM_ENGINE)
+  --llm-model               Model identifier (default: $DEFAULT_LLM_MODEL)
+  --llm-port                Port for LLM server (default: vllm=$DEFAULT_PORT_VLLM, sglang=$DEFAULT_PORT_SGL)
+  --llm-venv-path           Path to virtual environment for LLM engine (optional)
+  --llm-tp-size             Tensor parallel size (default: $DEFAULT_LLM_TP_SIZE)
+  # For finetuning
+  --llama-factory-venv-path Path to LLaMA Factory virtual environment (default: ./llama-factory-venv)
+  --finetune-config         Finetuning configuration file (default: $DEFAULT_FINETUNE_CONFIG)
+  --finetune-gpus           GPU IDs for finetuning (default: $DEFAULT_FINETUNE_GPUS)
+  -h, --help                Show this help and exit
 
-This script runs both a diffusion model and an LLM server concurrently,
+This script runs both an LLM server and LLaMA Factory finetuning concurrently,
 sharing GPU memory through kvcached.
 
 Example:
   $0 --llm-engine vllm --llm-model meta-llama/Llama-3.2-1B
-  $0 --llm-engine sglang --diff-model stabilityai/stable-diffusion-3.5-medium --diff-num-inference-steps 20 --diff-save-images
+  $0 --llm-engine sglang --finetune-config llama3_lora_sft.yaml --finetune-gpus "0,1"
 EOF
 }
 
 # GNU getopt parsing
 TEMP=$(getopt \
     --options h \
-    --longoptions llm-engine:,llm-model:,llm-port:,llm-venv-path:,llm-tp-size:,diffusers-venv-path:,diff-model:,diff-num-inference-steps:,diff-save-images,help \
+    --longoptions llm-engine:,llm-model:,llm-port:,llm-venv-path:,llm-tp-size:,llama-factory-venv-path:,finetune-config:,finetune-gpus:,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then
@@ -76,14 +74,12 @@ while true; do
             llm_venv_path="$2"; shift 2 ;;
         --llm-tp-size)
             llm_tp_size="$2"; shift 2 ;;
-        --diffusers-venv-path)
-            diffusers_venv_path="$2"; shift 2 ;;
-        --diff-model)
-            diff_model="$2"; shift 2 ;;
-        --diff-num-inference-steps)
-            diff_num_inference_steps="$2"; shift 2 ;;
-        --diff-save-images)
-            diff_save_images="--save-images"; shift ;;
+        --llama-factory-venv-path)
+            llama_factory_venv_path="$2"; shift 2 ;;
+        --finetune-config)
+            finetune_config="$2"; shift 2 ;;
+        --finetune-gpus)
+            finetune_gpus="$2"; shift 2 ;;
         --help|-h)
             usage; exit 0 ;;
         --)
@@ -98,11 +94,10 @@ LLM_ENGINE=${llm_engine:-$DEFAULT_LLM_ENGINE}
 LLM_MODEL=${llm_model:-$DEFAULT_LLM_MODEL}
 LLM_TP_SIZE=${llm_tp_size:-$DEFAULT_LLM_TP_SIZE}
 
-# Apply diffusion defaults
-DIFF_MODEL=${diff_model:-$DEFAULT_DIFF_MODEL}
-DIFF_NUM_INFERENCE_STEPS=${diff_num_inference_steps:-$DEFAULT_DIFF_NUM_INFERENCE_STEPS}
-DIFF_SAVE_IMAGES="$diff_save_images"
-DIFFUSERS_VENV_PATH="$diffusers_venv_path"
+# Apply finetuning defaults
+LLAMA_FACTORY_VENV_PATH=${llama_factory_venv_path:-"$SCRIPT_DIR/llama-factory-venv"}
+FINETUNE_CONFIG=${finetune_config:-$DEFAULT_FINETUNE_CONFIG}
+FINETUNE_GPUS=${finetune_gpus:-$DEFAULT_FINETUNE_GPUS}
 
 if [[ -n "$llm_port" ]]; then
     LLM_PORT="$llm_port"
@@ -128,6 +123,19 @@ if [[ -n "$llm_venv_path" ]]; then
     fi
 fi
 
+# Validate LLaMA Factory venv path
+if [[ ! -f "$LLAMA_FACTORY_VENV_PATH/bin/activate" ]]; then
+    echo "Error: LLaMA Factory venv not found at '$LLAMA_FACTORY_VENV_PATH'" >&2
+    echo "Please run setup.sh first to create the virtual environment" >&2
+    exit 1
+fi
+
+# Validate finetuning config file
+if [[ ! -f "$SCRIPT_DIR/$FINETUNE_CONFIG" ]]; then
+    echo "Error: Finetuning config file '$SCRIPT_DIR/$FINETUNE_CONFIG' not found" >&2
+    exit 1
+fi
+
 PIDS=()
 cleanup() {
     echo "Cleaning up processes..."
@@ -141,11 +149,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "Starting diffusion and LLM with kvcached integration..."
-echo "Engine: $LLM_ENGINE"
-echo "Model: $LLM_MODEL"
-echo "Port: $LLM_PORT"
-echo "Tensor Parallel Size: $LLM_TP_SIZE"
+echo "Starting LLM inference and finetuning with kvcached integration..."
+echo "LLM Engine: $LLM_ENGINE"
+echo "LLM Model: $LLM_MODEL"
+echo "LLM Port: $LLM_PORT"
+echo "LLM Tensor Parallel Size: $LLM_TP_SIZE"
+echo "Finetuning Config: $FINETUNE_CONFIG"
+echo "Finetuning GPUs: $FINETUNE_GPUS"
 
 # Start LLM server in background
 echo "Starting LLM server..."
@@ -177,22 +187,33 @@ if ! kill -0 "$LLM_PID" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Start diffusion process
-echo "Starting diffusion process..."
-DIFFUSION_ARGS="--model $DIFF_MODEL --num-inference-steps $DIFF_NUM_INFERENCE_STEPS $DIFF_SAVE_IMAGES"
-if [[ -n "$DIFFUSERS_VENV_PATH" ]]; then
-    DIFFUSION_ARGS="$DIFFUSION_ARGS --venv-path $DIFFUSERS_VENV_PATH"
-fi
+# Start finetuning process
+echo "Starting finetuning process..."
 
-$SCRIPT_DIR/start_diffusion.sh $DIFFUSION_ARGS &
+# Activate LLaMA Factory environment and start finetuning
+(
+    source "$LLAMA_FACTORY_VENV_PATH/bin/activate"
+    export CUDA_VISIBLE_DEVICES=$FINETUNE_GPUS
+    export DISABLE_VERSION_CHECK=1
+    export ENABLE_KVCACHED=true
+    export KVCACHED_IPC_NAME=LLAMAFACTORY
 
-DIFFUSION_PID=$!
-PIDS+=("$DIFFUSION_PID")
-echo "Diffusion process started with PID: $DIFFUSION_PID"
+    # Clean up previous runs
+    rm -rf ${SCRIPT_DIR}/llama_factory_saves
+
+    cd "$SCRIPT_DIR"
+    llamafactory-cli train "$FINETUNE_CONFIG" 2>&1 | tee finetuning.log
+    deactivate
+) &
+
+FINETUNE_PID=$!
+PIDS+=("$FINETUNE_PID")
+echo "Finetuning process started with PID: $FINETUNE_PID"
 
 echo "Both processes are running. Press Ctrl+C to stop."
 echo "LLM server is available at: http://localhost:$LLM_PORT"
 echo "You can test the LLM server with: $SCRIPT_DIR/start_llm_client.sh $LLM_ENGINE --port $LLM_PORT"
+echo "Finetuning logs are available in: $SCRIPT_DIR/finetuning.log"
 
 # Wait for either process to finish
 wait -n
