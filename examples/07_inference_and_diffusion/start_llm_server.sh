@@ -137,7 +137,7 @@ if [[ "$engine" == "vllm" ]]; then
     --no-enable-prefix-caching \
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \
-    $VLLM_L4_ARGS 2>&1 | tee vllm.log
+    $VLLM_L4_ARGS 2>&1 | tee $SCRIPT_DIR/$engine.log
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
     # Activate virtual environment if provided
@@ -156,7 +156,7 @@ elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
     --trust-remote-code \
     --port "$SGL_PORT" \
     --tp "$TP_SIZE" \
-    $SGL_L4_ARGS 2>&1 | tee sglang.log
+    $SGL_L4_ARGS 2>&1 | tee $SCRIPT_DIR/$engine.log
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 else
     echo "Invalid engine: $engine"
