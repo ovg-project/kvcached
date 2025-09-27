@@ -172,11 +172,11 @@ echo "LLM server started with PID: $LLM_PID"
 # Wait a bit for LLM server to initialize
 echo "Waiting for LLM server to initialize..."
 if [[ "$LLM_ENGINE" == "vllm" ]]; then
-    while ! grep -q "Application startup complete" $SCRIPT_DIR/vllm.log; do
+    while ! grep -q "Application startup complete" "$SCRIPT_DIR/vllm.log"; do
         sleep 1
     done
 else
-    while ! grep -q "The server is fired up and ready to roll" $SCRIPT_DIR/sglang.log; do
+    while ! grep -q "The server is fired up and ready to roll" "$SCRIPT_DIR/sglang.log"; do
         sleep 1
     done
 fi
