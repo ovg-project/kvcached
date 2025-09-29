@@ -121,7 +121,7 @@ if [[ "$engine" == "vllm" ]]; then
       --num-prompts $NUM_PROMPTS \
       --port $VLLM_PORT
     if [[ -n "$venv_path" ]]; then deactivate; fi
-elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
+elif [[ "$engine" == "sglang" ]]; then
     check_and_download_sharegpt
     if [[ -n "$venv_path" ]]; then source "$venv_path/bin/activate"; fi
 

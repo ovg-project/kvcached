@@ -21,9 +21,12 @@ setup_llama_factory() {
     echo "uv venv setup complete"
 
     echo "Setting up llama factory..."
-    git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
+    if [ ! -d "LLaMA-Factory" ]; then
+        git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
+    fi
     pushd LLaMA-Factory
     uv pip install -e ".[torch,metrics]" --no-build-isolation
+    popd
     deactivate
     popd
     popd
