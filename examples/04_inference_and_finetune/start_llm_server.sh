@@ -141,7 +141,7 @@ if [[ "$engine" == "vllm" ]]; then
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS 2>&1 | tee $SCRIPT_DIR/$engine.log
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
-elif [[ "$engine" == "sgl" || "$engine" == "sglang" ]]; then
+elif [[ "$engine" == "sglang" ]]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export ENABLE_KVCACHED=true

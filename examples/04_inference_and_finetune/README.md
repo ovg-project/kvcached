@@ -111,7 +111,7 @@ Next, you need to run `./start_llm_client.sh [sglang|vllm]` to launch the LLM cl
 ./start_finetune.sh
 
 # Run finetuning with specific GPUs
-./start_finetune.sh GPUS=1
+./start_finetune.sh 1
 ```
 
 ## Configuration

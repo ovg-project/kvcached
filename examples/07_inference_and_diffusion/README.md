@@ -51,7 +51,8 @@ Benchmarks the LLM server with ShareGPT dataset.
 
    ```bash
    ./start_inference_and_diffusion.sh --llm-engine vllm --diff-num-inference-steps 20 --diff-save-images
-   # Waiting for
+   # Waiting for both server to start, then
+   ./start_llm_client.sh vllm
    ```
 
 3. **Run diffusion only:**
@@ -63,18 +64,18 @@ Benchmarks the LLM server with ShareGPT dataset.
 4. **Run LLM server only:**
 
    ```bash
-   ./start_llm_server.sh vllm --model meta-llama/Llama-3.2-1B --port 12346
+   ./start_llm_server.sh [sglang|vllm] --model meta-llama/Llama-3.2-1B --port 12346
    # Must launch LLM client manually to start sending requests to the LLM server:
    # e.g.,
-   # ./start_llm_client.sh vllm
+   # ./start_llm_client.sh [sglang|vllm]
    ```
 
 5. **Run LLM client:**
 
    ```bash
-   ./start_llm_client.sh vllm
+   ./start_llm_client.sh [sglang|vllm]
    # Test LLM server with a single run
-   # ./start_llm_client.sh vllm --num-prompts 10 --request-rate 1 --port 12346
+   # ./start_llm_client.sh [sglang|vllm] --num-prompts 10 --request-rate 1 --port 12346
    ```
 
 ## Dataset

@@ -193,7 +193,7 @@ echo "Starting finetuning process..."
 # Activate LLaMA Factory environment and start finetuning
 (
     source "$LLAMA_FACTORY_VENV_PATH/bin/activate"
-    $SCRIPT_DIR/start_finetune.sh $FINETUNE_GPUS $FINETUNE_CONFIG 2>&1 | tee $SCRIPT_DIR/finetuning.log
+    $SCRIPT_DIR/start_finetune.sh $FINETUNE_GPUS $FINETUNE_CONFIG
     deactivate
 ) &
 
