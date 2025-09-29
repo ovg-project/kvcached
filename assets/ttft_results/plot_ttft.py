@@ -29,18 +29,19 @@ plt.rcParams.update({
 })
 
 # Configuration
-COMPLETION_LENS = [256]
-REQRATES = list(range(12, 21))
+COMPLETION_LENS = [64, 128, 256]
+REQRATES = list(range(1, 11)) + [15, 20, 25, 30, 40]
 KV_CACHE_COLOR = '#FF6B35'  # Bright Orange
 NO_CACHE_COLOR = '#004E89'  # Deep Blue
 
 
 def parse_filename(filename):
     """Parse filename to extract configuration parameters"""
-    pattern = r'ramp-up-down-0to(\d+)to1.*completion_(\d+)-(\d+)-delay-(\d+)'
+    pattern = r'fixed-rate-(\d+)rps.*completion_(\d+)-'
     match = re.search(pattern, filename)
     if match:
-        return tuple(map(int, match.groups()))
+        reqrate, comp_len = map(int, match.groups())
+        return (reqrate, comp_len)
     return None
 
 
@@ -110,7 +111,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=16)
     ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=16)
-    ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
+    # ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')
@@ -133,7 +134,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
 
 def main():
-    base_path = "results/metrics"
+    base_path = "/workspace/kvcached/benchmarks/bench_latency_benefit/results/metrics/"
 
     print("Loading metrics data...")
     data = load_metrics_data(base_path)

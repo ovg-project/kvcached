@@ -1,15 +1,15 @@
 #!/bin/bash
 set -ex
 
-# Usage: ./run_benchmark_fixed_rate.sh <FIXED_RPS> <COMPLETION_LEN> [DURATION] [MODEL_DELAY] [BURSTINESS]
-# Example: ./run_benchmark_fixed_rate.sh 12 256 60 30 10.0
+# Usage: ./run_benchmark_fixed_rate.sh <FIXED_RPS> <COMPLETION_LEN> <PROMPT_LEN> [DURATION] [BURSTINESS]
+# Example: ./run_benchmark_fixed_rate.sh 12 256 512 30 10.0
 #
 # Parameters:
 #   FIXED_RPS    - Fixed request rate (requests per second)
 #   COMPLETION_LEN - Completion length
-#   DURATION     - Duration in seconds (default: 60)
-#   MODEL_DELAY  - Delay between models in seconds (default: 30)
-#   BURSTINESS   - Higher values = more uniform timing (default: 10.0)
+#   PROMPT_LEN   - Prompt length (input sequence length)
+#   DURATION     - Duration in seconds (default: 30)
+#   BURSTINESS   - Higher values = more uniform timing (default: 10000.0)
 #                  Use high values like 10-100 for near-constant intervals
 
 # Set environment variables
@@ -19,19 +19,19 @@ export KVCACHED_IPC_NAME=VLLM
 export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../benchmarks:$PYTHONPATH"
 
 # Benchmark parameters
-PROMPT_LEN=256
+PROMPT_LEN=$3              # Prompt length from command line
 COMPLETION_LEN=$2
 BACKEND="vllm"
 # Fixed request rate parameters
 FIXED_RPS=$1               # Fixed request rate (requests per second)
-DURATION=${3:-30}          # Duration in seconds (default: 60s)
-BURSTINESS=${5:-10000.0}      # Higher burstiness for more uniform requests (default: 10.0)
+DURATION=${4:-30}          # Duration in seconds (default: 30s)
+BURSTINESS=${5:-10000.0}      # Higher burstiness for more uniform requests (default: 10000.0)
 
 # Calculate total number of requests
 NUM_PROMPTS=$((FIXED_RPS * $DURATION))
 echo "Calculated NUM_PROMPTS: $NUM_PROMPTS (fixed rate: ${FIXED_RPS} RPS for ${DURATION}s)"
 
-mkdir -p results results/metrics
+mkdir -p results results/metrics/seq-len-${PROMPT_LEN}
 
 # Define models and their configurations
 MODELS=(
