@@ -1,6 +1,6 @@
-# Diffusion and KVCached Integration Example
+# Diffusion and kvcached Integration Example
 
-This example demonstrates running diffusion models alongside LLM servers using KVCached for efficient GPU memory sharing.
+This example demonstrates running diffusion models alongside LLM servers using kvcached for efficient GPU memory sharing.
 
 ## Scripts Overview
 
@@ -24,7 +24,7 @@ Runs the diffusion model standalone.
 ```
 
 ### `start_llm_server.sh`
-Launches an LLM server (vLLM or SGLang) with KVCached integration.
+Launches an LLM server (vLLM or SGLang) with kvcached integration.
 
 ```bash
 ./start_llm_server.sh <engine> [--venv-path PATH] [--port PORT] [--model MODEL_ID] [--tp TP_SIZE]
@@ -51,6 +51,7 @@ Benchmarks the LLM server with ShareGPT dataset.
 
    ```bash
    ./start_inference_and_diffusion.sh --llm-engine vllm --diff-num-inference-steps 20 --diff-save-images
+   # Waiting for
    ```
 
 3. **Run diffusion only:**
@@ -63,12 +64,17 @@ Benchmarks the LLM server with ShareGPT dataset.
 
    ```bash
    ./start_llm_server.sh vllm --model meta-llama/Llama-3.2-1B --port 12346
+   # Must launch LLM client manually to start sending requests to the LLM server:
+   # e.g.,
+   # ./start_llm_client.sh vllm
    ```
 
-5. **Test LLM server:**
+5. **Run LLM client:**
 
    ```bash
-   ./start_llm_client.sh vllm --num-prompts 10 --request-rate 1 --port 12346
+   ./start_llm_client.sh vllm
+   # Test LLM server with a single run
+   # ./start_llm_client.sh vllm --num-prompts 10 --request-rate 1 --port 12346
    ```
 
 ## Dataset
