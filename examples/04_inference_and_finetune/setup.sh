@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 LLAMA_FACTORY_VENV_NAME="$SCRIPT_DIR/llama-factory-venv"
