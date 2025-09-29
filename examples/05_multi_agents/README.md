@@ -28,7 +28,7 @@ In a separate terminal, run the multi-agent client:
 
 ```bash
 # Run default example topics (total 3 topics)
-bash start_multi_agent_client.sh --venv-path .../../engine_integration/vllm-v0.9.2/.venv
+bash start_multi_agent_client.sh --venv-path ../../engine_integration/vllm-v0.9.2/.venv
 
 # Explore specific topic
 bash start_multi_agent_client.sh --topic "your topic here"

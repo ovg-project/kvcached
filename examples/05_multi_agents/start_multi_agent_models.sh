@@ -130,7 +130,7 @@ PIDS=()
 cleanup() {
     echo ""
     echo "Shutting down model servers..."
-    for pid in "\${PIDS[@]}"; do
+    for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             echo "  Stopping process $pid"
             kill "$pid"
@@ -169,7 +169,7 @@ run_vllm() {
       --tensor-parallel-size "$tp" &
 
     PIDS+=($!)
-    echo "$agent_name vLLM server started (model=$model, port=$port, pid=\${PIDS[-1]})"
+    echo "$agent_name vLLM server started (model=$model, port=$port, pid=${PIDS[-1]})"
 }
 
 # Function to run SGLang
@@ -197,7 +197,7 @@ run_sgl() {
       --tp-size "$tp" &
 
     PIDS+=($!)
-    echo "$agent_name SGLang server started (model=$model, port=$port, pid=\${PIDS[-1]})"
+    echo "$agent_name SGLang server started (model=$model, port=$port, pid=${PIDS[-1]})"
 }
 
 # Start Research Model
