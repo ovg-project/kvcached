@@ -120,6 +120,8 @@ else
     IS_L4=false
 fi
 
+rm -f $SCRIPT_DIR/$engine.log
+
 if [[ "$engine" == "vllm" ]]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi

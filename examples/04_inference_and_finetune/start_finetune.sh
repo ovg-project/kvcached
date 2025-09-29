@@ -3,7 +3,8 @@
 
 SCRIPT_DIR=$(cd $(dirname ${BASH_SOURCE[0]:-$0}) && pwd -P)
 
-GPUS=${2:-0}
+GPUS=${1:-"0"}
+CONFIG=${2:-"$SCRIPT_DIR/llama3_lora_sft.yaml"}
 
 export CUDA_VISIBLE_DEVICES=$GPUS
 
@@ -12,4 +13,8 @@ export DISABLE_VERSION_CHECK=1
 
 # Clean up previous runs
 rm -rf ${SCRIPT_DIR}/llama_factory_saves
-llamafactory-cli train ${SCRIPT_DIR}/llama3_lora_sft.yaml
+
+echo "Finetuning with config: ${CONFIG}"
+echo "Finetuning with GPUs: ${GPUS}"
+rm -f $SCRIPT_DIR/finetuning.log
+llamafactory-cli train ${CONFIG} 2>&1 | tee $SCRIPT_DIR/finetuning.log

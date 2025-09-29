@@ -96,8 +96,8 @@ LLM_TP_SIZE=${llm_tp_size:-$DEFAULT_LLM_TP_SIZE}
 
 # Apply finetuning defaults
 LLAMA_FACTORY_VENV_PATH=${llama_factory_venv_path:-"$SCRIPT_DIR/llama-factory-venv"}
-FINETUNE_CONFIG=${finetune_config:-$DEFAULT_FINETUNE_CONFIG}
 FINETUNE_GPUS=${finetune_gpus:-$DEFAULT_FINETUNE_GPUS}
+FINETUNE_CONFIG=${finetune_config:-$DEFAULT_FINETUNE_CONFIG}
 
 if [[ -n "$llm_port" ]]; then
     LLM_PORT="$llm_port"
@@ -154,8 +154,8 @@ echo "LLM Engine: $LLM_ENGINE"
 echo "LLM Model: $LLM_MODEL"
 echo "LLM Port: $LLM_PORT"
 echo "LLM Tensor Parallel Size: $LLM_TP_SIZE"
-echo "Finetuning Config: $FINETUNE_CONFIG"
 echo "Finetuning GPUs: $FINETUNE_GPUS"
+echo "Finetuning Config: $FINETUNE_CONFIG"
 
 # Start LLM server in background
 echo "Starting LLM server..."
@@ -193,16 +193,7 @@ echo "Starting finetuning process..."
 # Activate LLaMA Factory environment and start finetuning
 (
     source "$LLAMA_FACTORY_VENV_PATH/bin/activate"
-    export CUDA_VISIBLE_DEVICES=$FINETUNE_GPUS
-    export DISABLE_VERSION_CHECK=1
-    export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=LLAMAFACTORY
-
-    # Clean up previous runs
-    rm -rf ${SCRIPT_DIR}/llama_factory_saves
-
-    cd "$SCRIPT_DIR"
-    llamafactory-cli train "$FINETUNE_CONFIG" 2>&1 | tee finetuning.log
+    $SCRIPT_DIR/start_finetune.sh $FINETUNE_GPUS $FINETUNE_CONFIG 2>&1 | tee $SCRIPT_DIR/finetuning.log
     deactivate
 ) &
 
