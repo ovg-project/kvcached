@@ -51,7 +51,7 @@ This benchmark shows the performance benefits of kvcached when serving three `Ll
 
 ### Prerequisites
 
-- Python (tested with 3.9 - 3.11)
+- Python (tested with 3.9 - 3.12)
 - PyTorch (compatible with SGLang and vLLM)
 
 kvcached can be installed as a plugin with SGLang and vLLM.
