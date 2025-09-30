@@ -9,9 +9,18 @@
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   </p>
 
-  <p><strong>On-demand KV cache for LLM serving. GPU-like virtual memory for KV.</strong></p>
 </div>
 
+<h3 align="center">Elastic KV Cache for Dynamic GPU Sharing</h3>
+
+<p align="center">
+  <a href="#kvcached-installation"><b>Installation</b></a> |
+  <a href="#run-kvcached-with-docker"><b>Docker</b></a> |
+  <a href="#testing"><b>Testing</b></a> |
+  <a href="#memory-monitoring-and-control-via-kvcached-cli"><b>CLI</b></a> |
+  <a href="#contributing"><b>Contributing</b></a> |
+  <a href="#contacts"><b>Contacts</b></a>
+</p>
 
 kvcached is a new KV cache management system that supports on-demand KV cache allocation. It implements the concept of GPU virtual memory, allowing applications to reserve virtual address space without immediately committing physical memory. Physical memory is then automatically allocated and mapped as needed at runtime. This capability allows multiple LLMs to run concurrently on a single GPU or a group of GPUs (TP) and flexibly share the GPU memory, significantly improving GPU utilization and reducing memory fragmentation.
 
