@@ -13,12 +13,10 @@
 
 <h2 align="center">Virtualized Elastic KV Cache for Dynamic GPU Sharing and Beyond </h2>
 
-kvcached is a new KV cache management system that enables elastic KV cache memory for autoregressive LLMs.
-
-It brings the benefits of virtual memory in operating systems to LLM serving: instead of statically reserving large blocks of GPU memory at startup (the common practice today), it allows serving engines to allocate and release KV cache on demand based on actual workload needs.
+kvcached is a new KV cache management system that enables elastic KV cache memory for autoregressive LLMs. It brings the benefits of virtual memory in operating systems to LLM serving: instead of statically reserving large blocks of GPU memory at startup (the common practice today), it allows serving engines to allocate and release KV cache on demand based on actual workload needs.
 
 <p align="center">
-  <img src="assets/vmm.svg" alt="kvcached virtual memory model" width="820" />
+  <img src="assets/vmm.svg" alt="kvcached virtual memory model" width="600" />
 </p>
 
 kvcached is compatible with popular LLM serving engines, including SGLang and vLLM.
