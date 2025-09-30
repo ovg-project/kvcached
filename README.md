@@ -1,4 +1,16 @@
-# kvcached
+<div align="center">
+  <img src="assets/logo-v2.svg" alt="kvcached logo" height="120" />
+
+
+  <p>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue"></a>
+    <img alt="Engines" src="https://img.shields.io/badge/engines-SGLang%20%7C%20vLLM-blueviolet">
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
+  </p>
+
+  <p><strong>On-demand KV cache for LLM serving. GPU-like virtual memory for KV.</strong></p>
+</div>
+
 
 kvcached is a new KV cache management system that supports on-demand KV cache allocation. It implements the concept of GPU virtual memory, allowing applications to reserve virtual address space without immediately committing physical memory. Physical memory is then automatically allocated and mapped as needed at runtime. This capability allows multiple LLMs to run concurrently on a single GPU or a group of GPUs (TP) and flexibly share the GPU memory, significantly improving GPU utilization and reducing memory fragmentation.
 
