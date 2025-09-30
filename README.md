@@ -40,7 +40,7 @@ See concrete example here: [kvcached/examples](./examples).
 
 kvcached enables dynamic memory sharing between LLMs, allowing them to share the same GPU memory elastically. As a comparison, the current serving engines need to statically reserve GPU memory at startup.
 
-This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks.
+This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
 
 <p align="center">
   <img src="assets/ttft_results/ttft_mean.png" alt="TTFT mean" width="400" />
