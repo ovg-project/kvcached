@@ -37,11 +37,12 @@ NO_CACHE_COLOR = '#004E89'  # Deep Blue
 
 def parse_filename(filename):
     """Parse filename to extract configuration parameters"""
-    pattern = r'fixed-rate-(\d+)rps.*completion_(\d+)-'
+    # Match pattern: fixed-rate-{rate}rps...prompt_{length}...completion_{length}
+    pattern = r'fixed-rate-(\d+)rps.*prompt_(\d+).*completion_(\d+)(?:-|\.)'
     match = re.search(pattern, filename)
     if match:
-        reqrate, comp_len = map(int, match.groups())
-        return (reqrate, comp_len)
+        reqrate, prompt_len, comp_len = map(int, match.groups())
+        return (reqrate, prompt_len, comp_len)
     return None
 
 
@@ -61,6 +62,7 @@ def load_metrics_data(base_path):
                     try:
                         with open(os.path.join(folder_path, filename), 'r') as f:
                             json_data = json.load(f)
+                        # Key is now (reqrate, prompt_len, comp_len)
                         data[folder][parsed] = {
                             'mean_ttft_ms': json_data.get('mean_ttft_ms', 0),
                             'p99_ttft_ms': json_data.get('p99_ttft_ms', 0)
@@ -70,15 +72,15 @@ def load_metrics_data(base_path):
     return data
 
 
-def get_metric_values(data, metric, comp_len):
-    """Extract metric values for a specific completion length"""
+def get_metric_values(data, metric, prompt_len, comp_len):
+    """Extract metric values for a specific prompt and completion length"""
     true_values, false_values = [], []
 
     for reqrate in REQRATES:
         true_vals = [metrics[metric] for key, metrics in data['true'].items()
-                     if key[0] == reqrate and key[1] == comp_len]
+                     if key[0] == reqrate and key[1] == prompt_len and key[2] == comp_len]
         false_vals = [metrics[metric] for key, metrics in data['false'].items()
-                      if key[0] == reqrate and key[1] == comp_len]
+                      if key[0] == reqrate and key[1] == prompt_len and key[2] == comp_len]
 
         true_values.append(np.mean(true_vals) if true_vals else 0)
         false_values.append(np.mean(false_vals) if false_vals else 0)
@@ -86,7 +88,7 @@ def get_metric_values(data, metric, comp_len):
     return true_values, false_values
 
 
-def create_chart(true_values, false_values, metric_name, comp_len):
+def create_chart(true_values, false_values, metric_name, prompt_len, comp_len):
     """Create a single chart"""
     fig, ax = plt.subplots(figsize=(10, 6))
     x_positions = np.arange(len(REQRATES))
@@ -126,7 +128,7 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     plt.tight_layout()
 
-    output_filename = f'ttft_{metric_name.lower()}_comp{comp_len}.png'
+    output_filename = f'ttft_{metric_name.lower()}_prompt{prompt_len}_comp{comp_len}.png'
     plt.savefig(output_filename, dpi=300, bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
@@ -139,15 +141,24 @@ def main():
     print("Loading metrics data...")
     data = load_metrics_data(base_path)
 
+    # Discover all unique (prompt_len, comp_len) combinations
+    prompt_comp_combinations = set()
+    for folder in ['true', 'false']:
+        for key in data[folder].keys():
+            prompt_len, comp_len = key[1], key[2]
+            prompt_comp_combinations.add((prompt_len, comp_len))
+
+    print(f"Found {len(prompt_comp_combinations)} prompt/completion combinations")
     print("Creating publication-ready TTFT charts...")
-    for comp_len in COMPLETION_LENS:
+
+    for prompt_len, comp_len in sorted(prompt_comp_combinations):
         # Mean TTFT
-        true_values, false_values = get_metric_values(data, 'mean_ttft_ms', comp_len)
-        create_chart(true_values, false_values, 'Mean', comp_len)
+        true_values, false_values = get_metric_values(data, 'mean_ttft_ms', prompt_len, comp_len)
+        create_chart(true_values, false_values, 'Mean', prompt_len, comp_len)
 
         # P99 TTFT
-        true_values, false_values = get_metric_values(data, 'p99_ttft_ms', comp_len)
-        create_chart(true_values, false_values, 'P99', comp_len)
+        true_values, false_values = get_metric_values(data, 'p99_ttft_ms', prompt_len, comp_len)
+        create_chart(true_values, false_values, 'P99', prompt_len, comp_len)
 
     print("Chart generation completed!")
 
