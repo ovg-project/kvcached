@@ -13,7 +13,7 @@
 
 <h2 align="center">Virtualized Elastic KV Cache for Dynamic GPU Sharing and Beyond </h2>
 
-kvcached is a new KV cache management system that enables elastic KV cache memory for autoregressive LLMs. It brings the benefits of virtual memory in operating systems to LLM serving: instead of statically reserving large blocks of GPU memory at startup (the common practice today), it allows serving engines to allocate and release KV cache on demand based on actual workload needs.
+kvcached is a new KV cache management system that enables **elastic KV cache** memory for autoregressive LLMs. It brings the benefits of **virtual memory** in operating systems to LLM serving: instead of statically reserving large blocks of GPU memory at startup (the common practice today), it allows serving engines to **allocate and release KV cache on demand** based on actual workload needs.
 
 <p align="center">
   <img src="assets/vmm.svg" alt="kvcached virtual memory model" width="600" />
@@ -23,10 +23,10 @@ kvcached is compatible with popular LLM serving engines, including SGLang and vL
 
 kvcached enables/enhances a line of use cases. For example:
 
-- Multi-LLM serving: kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
-- Serverless LLM: By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
-- Compound AI systems: kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
-- GPU workload colocation: kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
+- 🔀 **Multi‑LLM serving**: kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
+- ⚡ **Serverless LLM**: By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
+- 🧩 **Compound AI systems**: kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
+- 🖥️ **GPU workload colocation**: kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
 
 See concrete example here: [kvcached/examples](./examples).
 
