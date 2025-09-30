@@ -11,7 +11,7 @@
 
 </div>
 
-<h3 align="center">Elastic KV Cache for Dynamic GPU Sharing</h3>
+<h3 align="center">Virtualized Elastic KV Cache for Dynamic GPU Sharing and More</h3>
 
 <p align="center">
   <a href="#kvcached-installation"><b>Installation</b></a> |
