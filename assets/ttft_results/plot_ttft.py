@@ -12,7 +12,7 @@ import numpy as np
 import seaborn as sns
 
 # Set paper-ready style
-plt.style.use('seaborn-v0_8-white')
+plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
 plt.rcParams.update({
     'font.size': 14,
@@ -114,10 +114,8 @@ def create_chart(true_values, false_values, metric_name, comp_len):
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')
-    ax.tick_params(axis='y', which='minor', size=4)
-    ax.tick_params(axis='y', which='major', size=8)
     ax.legend(loc='upper left', framealpha=0.95, fontsize=14)
-    ax.grid(False)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
 
     # Clean layout
     for spine in ['top', 'right']:
@@ -127,16 +125,16 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     plt.tight_layout()
 
-    output_filename = f'ttft_{metric_name.lower()}.svg'
-    plt.savefig(output_filename, format='svg', bbox_inches='tight',
+    output_filename = f'ttft_{metric_name.lower()}_comp{comp_len}.png'
+    plt.savefig(output_filename, dpi=300, bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
     print(f"Saved: {output_filename}")
 
 
 def main():
-    # base_path = "results/metrics"
-    base_path = "/workspace/kvcached/benchmarks/bench_latency_benefit/results/metrics/ttft_raw_data"
+    base_path = "results/metrics"
+
     print("Loading metrics data...")
     data = load_metrics_data(base_path)
 
