@@ -15,7 +15,7 @@ import seaborn as sns
 plt.style.use('seaborn-v0_8-white')
 sns.set_palette("husl")
 plt.rcParams.update({
-    'font.size': 14,
+    'font.size': 18,
     'font.family': 'serif',
     'axes.linewidth': 1.2,
     'axes.spines.left': True,
@@ -104,19 +104,19 @@ def create_chart(true_values, false_values, metric_name, comp_len):
             speedup = false_val / true_val
             y_pos = max(true_val, false_val) * 1.08
             ax.text(x_positions[i], y_pos, f'{speedup:.1f}×',
-                   ha='center', va='bottom', fontsize=12, fontweight='bold',
+                   ha='center', va='bottom', fontsize=16, fontweight='bold',
                    color='#FFFFFF', bbox=dict(boxstyle="round,pad=0.3",
                                             facecolor='#2E7D32', alpha=0.9))
 
-    ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=16)
-    ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=16)
-    ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
+    ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=20)
+    ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=20)
+    ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=22, pad=20)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')
     ax.tick_params(axis='y', which='minor', size=4)
     ax.tick_params(axis='y', which='major', size=8)
-    ax.legend(loc='upper left', framealpha=0.95, fontsize=14)
+    ax.legend(loc='upper left', framealpha=0.95, fontsize=18)
     ax.grid(False)
 
     # Clean layout
