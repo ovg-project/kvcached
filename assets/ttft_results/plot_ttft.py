@@ -114,10 +114,8 @@ def create_chart(true_values, false_values, metric_name, comp_len):
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')
-    ax.tick_params(axis='y', which='minor', size=4)
-    ax.tick_params(axis='y', which='major', size=8)
-    ax.legend(loc='upper left', framealpha=0.95, fontsize=18)
-    ax.grid(False)
+    ax.legend(loc='upper left', framealpha=0.95, fontsize=14)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
 
     # Clean layout
     for spine in ['top', 'right']:

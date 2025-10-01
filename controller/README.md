@@ -41,6 +41,18 @@ python frontend.py --config example-config.yaml --port 8080
 
 `frontend.py` will parse the YAML, extract the host/port for each instance, and start routing immediately.
 
+### 2.2 Session Management
+
+For managing tmux sessions created by `launch.py`:
+
+```bash
+# List all running kvcached tmux sessions
+python launch.py --list-sessions
+
+# Kill all running kvcached tmux sessions (useful for clean restarts)
+python launch.py --kill-all
+```
+
 ### 3. Talk to the router
 
 ```bash

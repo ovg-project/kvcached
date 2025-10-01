@@ -12,14 +12,36 @@ import random
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from test_utils import load_example_config
+
+
+def load_config_from_file():
+    """Load configuration from example-config.yaml"""
+    return load_example_config()
+
+
+# Load configuration once at module level for efficiency
+CONFIG = load_config_from_file()
 
 
 class TrafficMonitorTest:
     """Test suite for traffic monitoring functionality"""
 
-    def __init__(self, base_url: str = "http://localhost:8081"):
-        self.base_url = base_url
-        self.test_models = ["meta-llama/Llama-3.2-1B", "Qwen/Qwen3-0.6B"]
+    def __init__(self, base_url: Optional[str] = None):
+        if base_url:
+            self.base_url = base_url
+        else:
+            # Extract router URL from pre-loaded config
+            router_config = CONFIG.get("router", {})
+            host = router_config.get("router_host", "localhost")
+            port = router_config.get("router_port", 8080)
+            self.base_url = f"http://{host}:{port}"
+
+        # Extract model names from pre-loaded config
+        self.test_models = [
+            model_name for instance in CONFIG.get("instances", [])
+            if (model_name := instance.get("model"))
+        ]
 
     async def test_endpoint(
             self,
@@ -213,8 +235,10 @@ class TrafficMonitorTest:
                     print(
                         f"❌ Server not responding: {health_result.get('error', 'Unknown error')}"
                     )
+                    router_config = CONFIG.get("router", {})
+                    port = router_config.get("router_port", 8080)
                     print(
-                        "Start server with `python frontend.py --config example-config.yaml --port 8081` under the controller folder."
+                        f"Start server with `python frontend.py --config example-config.yaml --port {port}` under the controller folder."
                     )
                     return
                 print("✅ Server is responding")
@@ -281,9 +305,9 @@ async def main():
     parser = argparse.ArgumentParser(description='Traffic Monitor Test Suite')
     parser.add_argument(
         '--url',
-        default='http://localhost:8081',
+        default=None,
         help=
-        'Base URL for the controller server (default: http://localhost:8081)')
+        'Base URL for the controller server (default: loaded from example-config.yaml)')
     parser.add_argument(
         '--quick',
         action='store_true',
@@ -291,17 +315,20 @@ async def main():
 
     args = parser.parse_args()
 
+    router_config = CONFIG.get("router", {})
+    port = router_config.get("router_port", 8080)
+
     print("Traffic Monitor Test Suite")
     print("==========================")
     print("Make sure the controller server is running!")
-    print(f"Expected server URL: {args.url}")
-    print()
     print("To start the server:")
     print("  cd /workspace/kvcached/controller")
-    print("  python frontend.py --config example-config.yaml --port 8081")
+    print(f"  python frontend.py --config example-config.yaml --port {port}")
     print()
 
     tester = TrafficMonitorTest(args.url)
+    print(f"Server URL: {tester.base_url}")
+    print()
     await tester.run_all_tests()
 
 
