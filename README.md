@@ -43,8 +43,8 @@ kvcached enables dynamic memory sharing between LLMs, allowing them to share the
 This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
 
 <p align="center">
-  <img src="assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="420" />
-  <img src="assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="420" style="margin-left:12px;" />
+  <img src="assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="410" />
+  <img src="assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="410" style="margin-left:12px;" />
 </p>
 
 ## Installation
