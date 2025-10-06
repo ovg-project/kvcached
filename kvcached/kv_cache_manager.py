@@ -334,8 +334,33 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
+    @synchronized
     def clear(self):
-        raise NotImplementedError("kvcached does not support clear() for now")
+
+        self._wait_post_init()
+
+        # Clear reserved blocks
+        self.free_reserved()
+        self.reserved_blocks.clear()
+
+        # Free all blocks from avail_pages and full_pages
+        pages_to_free: List[int] = []
+        for page_id, page in self.avail_pages.items():
+            pages_to_free.append(page.page_id)
+        for page_id, page in self.full_pages.items():
+            pages_to_free.append(page.page_id)
+
+        if pages_to_free:
+            self.page_allocator.free_pages(pages_to_free)
+        self.avail_pages.clear()
+        self.full_pages.clear()
+
+        # Trim the page allocator to free up reserved pages
+        self.trim()
+
+        self.target_num_blocks = None
+        self.in_shrink = False
+        self.num_avail_blocks = 0
 
     # Private methods
     @synchronized
