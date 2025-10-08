@@ -349,11 +349,7 @@ class KVCacheManager:
         self.free_reserved()
 
         # Free all blocks from avail_pages and full_pages
-        pages_to_free: List[int] = []
-        for page_id, page in self.avail_pages.items():
-            pages_to_free.append(page.page_id)
-        for page_id, page in self.full_pages.items():
-            pages_to_free.append(page.page_id)
+        pages_to_free: List[int] = list(self.avail_pages.keys()) + list(self.full_pages.keys())
 
         if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
