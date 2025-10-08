@@ -336,6 +336,12 @@ class KVCacheManager:
 
     @synchronized
     def clear(self):
+        """
+        Releases all memory blocks and pages managed by the KVCacheManager.
+
+        This is a destructive operation that invalidates all previously
+        allocated blocks. The manager is reset to a clean state.
+        """
 
         self._wait_post_init()
 
