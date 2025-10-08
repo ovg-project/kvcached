@@ -347,7 +347,6 @@ class KVCacheManager:
 
         # Clear reserved blocks
         self.free_reserved()
-        self.reserved_blocks.clear()
 
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = []
