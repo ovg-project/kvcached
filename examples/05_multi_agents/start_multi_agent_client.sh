@@ -11,20 +11,20 @@ DEFAULT_VENV_PATH="../../engine_integration/vllm-v0.9.2/.venv"
 # CLI variables
 research_port=""
 writing_port=""
-venv_path=""
+langchain_venv_path=""
 single_topic=""
 streaming=false
 
 usage() {
     cat <<EOF
-Multi-Agent System Client
+Multi-Agent System Client (LangChain-powered)
 
 Usage: $0 [OPTIONS]
 
 OPTIONS:
   --research-port PORT       Research Agent port (default: $DEFAULT_RESEARCH_PORT)
   --writing-port PORT        Writing Agent port (default: $DEFAULT_WRITING_PORT)
-  --venv-path PATH           Path to AutoGen virtual environment (default: $DEFAULT_VENV_PATH)
+  --langchain-venv-path PATH Path to LangChain virtual environment (default: $DEFAULT_LANGCHAIN_VENV_PATH)
   --topic "TOPIC"            Run single topic instead of examples
   --streaming                Enable streaming mode
   -h, --help                 Show this help and exit
@@ -47,7 +47,7 @@ EOF
 # GNU getopt parsing
 TEMP=$(getopt \
     --options h \
-    --longoptions research-port:,writing-port:,topic:,streaming,help \
+    --longoptions research-port:,writing-port:,langchain-venv-path:,topic:,streaming,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then
@@ -60,7 +60,7 @@ while true; do
     case "$1" in
         --research-port) research_port="$2"; shift 2;;
         --writing-port) writing_port="$2"; shift 2;;
-        --venv-path) venv_path="$2"; shift 2;;
+        --langchain-venv-path) langchain_venv_path="$2"; shift 2;;
         --topic) single_topic="$2"; shift 2;;
         --streaming) streaming=true; shift;;
         --help|-h) usage; exit 0;;
@@ -72,15 +72,16 @@ done
 # Apply defaults
 RESEARCH_PORT=${research_port:-$DEFAULT_RESEARCH_PORT}
 WRITING_PORT=${writing_port:-$DEFAULT_WRITING_PORT}
-VENV_PATH=${venv_path:-$DEFAULT_VENV_PATH}
+LANGCHAIN_VENV_PATH=${langchain_venv_path:-$DEFAULT_LANGCHAIN_VENV_PATH}
 
-# Validate venv path
-if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
-    echo "Error: Virtual environment not found at '$VENV_PATH'"
-    echo "Please specify correct path with --venv-path"
+# Validate LangChain venv path
+if [[ ! -f "$LANGCHAIN_VENV_PATH/bin/activate" ]]; then
+    echo "Error: LangChain virtual environment not found at '$LANGCHAIN_VENV_PATH'"
+    echo "Please run setup.sh first to create the LangChain environment"
+    echo "Or specify correct path with --langchain-venv-path"
     exit 1
 fi
-source "$VENV_PATH/bin/activate"
+source "$LANGCHAIN_VENV_PATH/bin/activate"
 
 # Check if model servers are running
 echo "Checking model servers..."

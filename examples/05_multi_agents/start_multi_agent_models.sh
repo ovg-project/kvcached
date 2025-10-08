@@ -4,8 +4,8 @@ set -x
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Defaults for multi-agent system
-DEFAULT_RESEARCH_ENGINE="vllm"
-DEFAULT_WRITING_ENGINE="vllm"
+DEFAULT_RESEARCH_ENGINE="vllm"      # vllm | sglang
+DEFAULT_WRITING_ENGINE="vllm"       # vllm | sglang
 DEFAULT_RESEARCH_MODEL="meta-llama/Llama-3.2-3B"
 DEFAULT_WRITING_MODEL="Qwen/Qwen3-4B"
 DEFAULT_RESEARCH_PORT=12346
@@ -59,7 +59,11 @@ Examples:
      --venv-vllm-path ../../engine_integration/vllm-v0.9.2/.venv \
      --venv-sgl-path ../../engine_integration/sglang-v0.4.9/.venv
 
-After starting the models, run the multi-agent system with:
+After starting the models, run the multi-agent system with LangChain:
+  # First, activate the LangChain environment
+  source langchain-venv/bin/activate
+
+  # Then run the multi-agent system
   python3 multi_agent_system.py --research-port $DEFAULT_RESEARCH_PORT --writing-port $DEFAULT_WRITING_PORT
 EOF
 }
@@ -104,13 +108,28 @@ WRITING_PORT=${writing_port:-$DEFAULT_WRITING_PORT}
 RESEARCH_TP=${research_tp:-$DEFAULT_RESEARCH_TP}
 WRITING_TP=${writing_tp:-$DEFAULT_WRITING_TP}
 
-# Validate engines
-for engine in "$RESEARCH_ENGINE" "$WRITING_ENGINE"; do
-    if [[ "$engine" != "vllm" && "$engine" != "sglang" ]]; then
-        echo "Error: Invalid engine '$engine'. Must be 'vllm' or 'sglang'"
+# Validate engine values
+validate_engine() {
+    local e="$1"
+    if [[ "$e" != "vllm" && "$e" != "sglang" ]]; then
+        echo "Error: engine must be 'vllm' or 'sglang' (got '$e')" >&2
         exit 1
     fi
-done
+}
+validate_engine "$RESEARCH_ENGINE"
+validate_engine "$WRITING_ENGINE"
+
+# Validate venvs if provided
+if [[ -n "$venv_vllm_path" && ! -f "$venv_vllm_path/bin/activate" ]]; then
+    echo "Error: --venv-vllm-path '$venv_vllm_path' is invalid (activate not found)" >&2
+    exit 1
+fi
+if [[ -n "$venv_sgl_path" && ! -f "$venv_sgl_path/bin/activate" ]]; then
+    echo "Error: --venv-sgl-path '$venv_sgl_path' is invalid (activate not found)" >&2
+    exit 1
+fi
+
+PYTHON=${PYTHON:-python3}
 
 echo "========================================"
 echo "Multi-Agent System Model Startup"
@@ -141,19 +160,17 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-# Function to run vLLM
 run_vllm() {
     local model="$1"
     local port="$2"
     local tp="$3"
-    local venv_path="$4"
+    local venv="$4"
     local agent_name="$5"
 
     echo "Starting vLLM server for $agent_name..."
 
-    local PYTHON="python3"
-    if [[ -n "$venv_path" ]]; then
-        PYTHON="$venv_path/bin/python3"
+    if [[ -n "$venv" ]]; then
+        source "$venv/bin/activate"
     fi
 
     export ENABLE_KVCACHED=true
@@ -161,12 +178,12 @@ run_vllm() {
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
-    $PYTHON -m vllm.entrypoints.openai.api_server \
-      --model "$model" \
+    vllm serve "$model" \
       --disable-log-requests \
-      --disable-log-stats \
+      --no-enable-prefix-caching \
       --port "$port" \
-      --tensor-parallel-size "$tp" &
+      --tensor-parallel-size "$tp" \
+      --enable-sleep-mode &
 
     PIDS+=($!)
     echo "$agent_name vLLM server started (model=$model, port=$port, pid=${PIDS[-1]})"
@@ -177,14 +194,13 @@ run_sgl() {
     local model="$1"
     local port="$2"
     local tp="$3"
-    local venv_path="$4"
+    local venv="$4"
     local agent_name="$5"
 
     echo "Starting SGLang server for $agent_name..."
 
-    local PYTHON="python3"
-    if [[ -n "$venv_path" ]]; then
-        PYTHON="$venv_path/bin/python3"
+    if [[ -n "$venv" ]]; then
+        source "$venv/bin/activate"
     fi
 
     export ENABLE_KVCACHED=true
