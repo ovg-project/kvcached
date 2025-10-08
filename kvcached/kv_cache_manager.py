@@ -363,6 +363,13 @@ class KVCacheManager:
         self.in_shrink = False
         self.num_avail_blocks = 0
 
+        if self.reserve_null_block:
+            # After clearing, we must re-reserve the null block to maintain a consistent state.
+            self.null_block = self.alloc(1)
+            if self.null_block != [0]:
+                logger.error(f"Failed to re-reserve null block after clear, got {self.null_block}")
+                raise RuntimeError("Failed to re-reserve null block at index 0 after clear")
+
     # Private methods
     @synchronized
     def _get_num_alloced_blocks(self) -> int:
