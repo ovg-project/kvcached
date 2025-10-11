@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo-v2.svg" alt="kvcached logo" height="196" />
+  <img src="assets/logo-v2.svg" alt="kvcached logo" height="96" />
 
   <br>
   <br>
