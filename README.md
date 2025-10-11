@@ -107,7 +107,7 @@ The latest roadmap is also tracked in [issue #125](https://github.com/ovg-projec
 
 - **Engine integration**
   - [x] SGLang and vLLM
-  - [-] Ollama
+  - [ ] Ollama (in progress)
   - [ ] llama.cpp and LMStudio
 - **Features**
   - [x] Tensor parallelism
@@ -117,7 +117,7 @@ The latest roadmap is also tracked in [issue #125](https://github.com/ovg-projec
 - **Performance optimizations**
   - [x] Contiguous KV tensor layout
   - [x] Physical memory management
-- **Hardwares**
+- **Hardware**
   - [x] NVIDIA GPUs
   - [ ] AMD GPUs
 
