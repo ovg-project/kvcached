@@ -32,27 +32,37 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
 ## Example use cases
 
 <div align="center">
-  <table>
+  <table border="0" cellspacing="0" cellpadding="0" style="border: none; border-collapse: collapse; width: auto;">
     <tr>
-      <td align="center" width="25%">
-        <img src="assets/uc-multillm.svg" alt="Multi‑LLM serving" width="180" />
-        <br><b>Multi‑LLM serving</b>
-        <br><sub>Share GPU memory elastically across concurrent models</sub>
+      <td align="left" style="border: none; vertical-align: middle; width: 86px;">
+        <img src="assets/uc-multillm.svg" alt="Multi‑LLM serving" width="86" />
       </td>
-      <td align="center" width="25%">
-        <img src="assets/uc-serverless.svg" alt="Serverless LLM" width="180" />
-        <br><b>Serverless LLM</b>
-        <br><sub>Allocate KV cache only when needed</sub>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Multi‑LLM serving</b><br>kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
       </td>
-      <td align="center" width="25%">
-        <img src="assets/uc-compound.svg" alt="Compound AI systems" width="180" />
-        <br><b>Compound AI systems</b>
-        <br><sub>Elastic memory across specialized models</sub>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 86px;">
+        <img src="assets/uc-serverless.svg" alt="Serverless LLM" width="86" />
       </td>
-      <td align="center" width="25%">
-        <img src="assets/uc-colocate.svg" alt="GPU workload colocation" width="180" />
-        <br><b>GPU workload colocation</b>
-        <br><sub>Coexist with training, vision, and other GPU apps</sub>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Serverless LLM</b><br>By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 86px;">
+        <img src="assets/uc-compound.svg" alt="Compound AI systems" width="86" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Compound AI systems</b><br>kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 86px;">
+        <img src="assets/uc-colocate.svg" alt="GPU workload colocation" width="86" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>GPU workload colocation</b><br>kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
       </td>
     </tr>
   </table>
