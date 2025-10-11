@@ -21,11 +21,11 @@ kvcached is a new KV cache management system that enables **elastic KV cache** m
 
 <h3 align="left">Key Features</h3>
 
-- 🔄 **Elastic KV cache**: allocate and reclaim KV memory dynamically to match live load.
-- 🗺️ **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
-- 🛠️ **Memory control CLI**: enforce memory limits with kvcached CLI.
-- 🧭 **Frontend router and sleep manager**: route requests to the corresponding backend and put models to sleep when idle.
-- 🤝 **Support SGLang and vLLM**: integrate with SGLang and vLLM.
+- **Elastic KV cache**: allocate and reclaim KV memory dynamically to match live load.
+- **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
+- **Memory control CLI**: enforce memory limits with kvcached CLI.
+- **Frontend router and sleep manager**: route requests to the corresponding backend and put models to sleep when idle.
+- **Support SGLang and vLLM**: integrate with SGLang and vLLM.
 
 <h3 align="left">Example use cases</h3>
 
