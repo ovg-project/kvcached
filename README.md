@@ -103,7 +103,7 @@ The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to 
 
 ## Roadmap
 
-The latest roadmap is also tracked in [GitHub issue #125](https://github.com/ovg-project/kvcached/issues/125).
+The latest roadmap is also tracked in [issue #125](https://github.com/ovg-project/kvcached/issues/125).
 
 - **Engine integration**
   - [x] SGLang and vLLM
