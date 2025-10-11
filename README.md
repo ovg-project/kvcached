@@ -71,11 +71,12 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
 
 See concrete examples here: [kvcached/examples](./examples).
 
-## Performance: Dynamic memory sharing
+## Performance: Multi-LLM serving
 
 kvcached enables dynamic memory sharing between LLMs, allowing them to share the same GPU memory elastically. As a comparison, the current serving engines need to statically reserve GPU memory at startup.
 
-This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
+This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. kvcached can achieve 2-28x TTFT reduction compared to the current serving engines. This performance gain can be converted to significant cost savings for LLM serving. Without kvcached, the systems have to provision more GPUs to achieve the same performance.
+Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
 
 <p align="center">
   <img src="assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="410" />
