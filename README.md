@@ -29,7 +29,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
 - **Frontend router and sleep manager**: route requests to the corresponding backend and put models to sleep when idle.
 - **Support SGLang and vLLM**: integrate with SGLang and vLLM.
 
-<h3 align="left">Example use cases</h3>
+## Example use cases
 
 <div align="center">
   <table>
