@@ -58,19 +58,22 @@ kvcached can be installed as a plugin with SGLang and vLLM.
 
 ```bash
 cd engine_integration/scripts
+# check installation instructions
+./setup.sh --help
+
 # install kvcached with SGLang v0.4.9
-./setup.sh --engine sglang --engine-method source --engine-version 0.4.9
-# install kvcached with vLLM v0.9.2
-./setup.sh --engine vllm --engine-method source --engine-version 0.9.2
+./setup.sh --engine sglang --engine-version 0.4.9
+# install kvcached with vLLM v0.10.1
+./setup.sh --engine vllm --engine-version 0.10.1
 ```
 
-This script will download the specified versions of SGLang and vLLM, create separate venv environments (using `uv`), compile the code, apply the necessary patches, and install kvcached.
+This script will install the specified versions of engines, create separate venv environments (using `uv`), and install kvcached. Should you require more versions, please let us know by opening an issue.
 
 ## Run kvcached with Docker
 
 You can test or develop kvcached with Docker.
 
-To test kvcached with SGLang or VLLM.
+To test kvcached with SGLang or vLLM.
 
 ```bash
 docker pull ghcr.io/ovg-project/[kvcached-sglang|kvcached-vllm]:latest
