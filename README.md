@@ -101,6 +101,26 @@ export VENV_PATH=../../engine_integration/[sglang|vllm]-kvcached-venv
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
 
+## Roadmap
+
+The latest roadmap is also tracked in [GitHub issue #125](https://github.com/ovg-project/kvcached/issues/125).
+
+- **Engine integration**
+  - [x] SGLang and vLLM
+  - [-] Ollama
+  - [ ] llama.cpp and LMStudio
+- **Features**
+  - [x] Tensor parallelism
+  - [ ] Prefix caching
+  - [ ] KV cache offloading to host memory
+  - [ ] More attention types (sliding window attention, linear attention, vision encoder, etc.)
+- **Performance optimizations**
+  - [x] Contiguous KV tensor layout
+  - [x] Physical memory management
+- **Hardwares**
+  - [x] NVIDIA GPUs
+  - [ ] AMD GPUs
+
 ## Contributing
 
 We are grateful for and open to contributions and collaborations of any kind.
