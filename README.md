@@ -31,10 +31,33 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
 
 <h3 align="left">Example use cases</h3>
 
-- 🔀 **Multi‑LLM serving**: kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
-- ⚡ **Serverless LLM**: By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
-- 🧩 **Compound AI systems**: kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
-- 🖥️ **GPU workload colocation**: kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
+<div align="center">
+  <table>
+    <tr>
+      <td align="center" width="25%">
+        <img src="https://img.icons8.com/fluency/96/merge-git.png" alt="Multi‑LLM serving" width="96" />
+        <br><b>Multi‑LLM serving</b>
+        <br><sub>Share GPU memory elastically across concurrent models</sub>
+      </td>
+      <td align="center" width="25%">
+        <img src="https://img.icons8.com/fluency/96/server.png" alt="Serverless LLM" width="96" />
+        <br><b>Serverless LLM</b>
+        <br><sub>Allocate KV cache only when needed</sub>
+      </td>
+      <td align="center" width="25%">
+        <img src="https://img.icons8.com/fluency/96/puzzle.png" alt="Compound AI systems" width="96" />
+        <br><b>Compound AI systems</b>
+        <br><sub>Elastic memory across specialized models</sub>
+      </td>
+      <td align="center" width="25%">
+        <img src="https://img.icons8.com/fluency/96/video-card.png" alt="GPU workload colocation" width="96" />
+        <br><b>GPU workload colocation</b>
+        <br><sub>Coexist with training, vision, and other GPU apps</sub>
+      </td>
+    </tr>
+  </table>
+
+</div>
 
 See concrete example here: [kvcached/examples](./examples).
 
