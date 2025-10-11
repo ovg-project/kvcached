@@ -120,10 +120,30 @@ pre-commit run --all-files
 
 ## Contacts
 
-Feel free to contact us for contributions and collaborations.
+kvcached is developed by many contributors from the community. Feel free to contact us for contributions and collaborations.
 
 ```
 Jiarong Xing (jxing@rice.edu)
 Yifan Qiao (yifanqiao@berkeley.edu)
 Shan Yu (shanyu1@g.ucla.edu)
+```
+
+## Citation
+
+If you find kvcached useful, please cite our paper:
+
+```bibtex
+@article{xing2025towards,
+  title={Towards Efficient and Practical GPU Multitasking in the Era of LLM},
+  author={Xing, Jiarong and Qiao, Yifan and Mo, Simon and Cui, Xingqi and Sela, Gur-Eyal and Zhou, Yang and Gonzalez, Joseph and Stoica, Ion},
+  journal={arXiv preprint arXiv:2508.08448},
+  year={2025}
+}
+
+@article{yu2025prism,
+  title={Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving},
+  author={Yu, Shan and Xing, Jiarong and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Wang, Yang and Yang, Shuo and Xie, Zhiqiang and Cao, Shiyi and Bao, Ke and others},
+  journal={arXiv preprint arXiv:2505.04021},
+  year={2025}
+}
 ```
