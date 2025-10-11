@@ -35,22 +35,22 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
   <table>
     <tr>
       <td align="center" width="25%">
-        <img src="https://img.icons8.com/fluency/96/merge-git.png" alt="Multi‑LLM serving" width="96" />
+        <img src="assets/uc-multillm.svg" alt="Multi‑LLM serving" width="180" />
         <br><b>Multi‑LLM serving</b>
         <br><sub>Share GPU memory elastically across concurrent models</sub>
       </td>
       <td align="center" width="25%">
-        <img src="https://img.icons8.com/fluency/96/server.png" alt="Serverless LLM" width="96" />
+        <img src="assets/uc-serverless.svg" alt="Serverless LLM" width="180" />
         <br><b>Serverless LLM</b>
         <br><sub>Allocate KV cache only when needed</sub>
       </td>
       <td align="center" width="25%">
-        <img src="https://img.icons8.com/fluency/96/puzzle.png" alt="Compound AI systems" width="96" />
+        <img src="assets/uc-compound.svg" alt="Compound AI systems" width="180" />
         <br><b>Compound AI systems</b>
         <br><sub>Elastic memory across specialized models</sub>
       </td>
       <td align="center" width="25%">
-        <img src="https://img.icons8.com/fluency/96/video-card.png" alt="GPU workload colocation" width="96" />
+        <img src="assets/uc-colocate.svg" alt="GPU workload colocation" width="180" />
         <br><b>GPU workload colocation</b>
         <br><sub>Coexist with training, vision, and other GPU apps</sub>
       </td>
