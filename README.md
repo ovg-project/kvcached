@@ -4,7 +4,7 @@
   <br>
   <br>
   <p>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue"></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/python-3.9%E2%80%933.12-blue"></a>
     <img alt="Engines" src="https://img.shields.io/badge/engines-SGLang%20%7C%20vLLM-blueviolet">
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   </p>
