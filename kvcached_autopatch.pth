@@ -1,7 +1,7 @@
 try:
-    import importlib
     import os
     if os.getenv("ENABLE_KVCACHED", "false").lower() in ("true", "1"):
+        import importlib
         os.environ.setdefault("KVCACHED_AUTOPATCH", "1")
         importlib.import_module("kvcached.autopatch")
 except ImportError:
