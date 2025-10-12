@@ -79,8 +79,8 @@ This benchmark shows the performance benefits of kvcached when serving three `Ll
 Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="410" />
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="410" style="margin-left:12px;" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="49%" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="49%" />
 </p>
 
 ## Installation
