@@ -92,6 +92,18 @@ Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_la
 
 kvcached can be installed as a plugin with SGLang and vLLM.
 
+### Quick Install
+
+To install kvcached into an existing SGLang or vLLM environment:
+
+```bash
+uv pip install kvcached --no-build-isolation
+```
+
+### All-in-One Setup Script
+
+For a complete setup with kvcached and a specific inference engine version, use our automated setup script. This script creates a separate virtual environment (using `uv`) and installs kvcached with your chosen engine:
+
 ```bash
 cd engine_integration/scripts
 # check installation instructions
