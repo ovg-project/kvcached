@@ -19,7 +19,7 @@ The above figure shows the system architecture of Prism. It has two key designs:
 1. kvcached-enabled elastic KV cache
 2. A two-level scheduling algorithm
 
-For more details, please refer to the Prism paper and code repository.
+For more details, please refer to the Prism paper and its code repository.
 
-- Prism paper: [Prism — Unleashing GPU Sharing for Cost‑Efficient Multi‑LLM Serving (arXiv:2505.04021)](https://arxiv.org/abs/2505.04021)
+- Prism paper: [Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving](https://arxiv.org/abs/2505.04021)
 - Code repository: https://github.com/Multi-LLM/prism-research
