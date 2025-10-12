@@ -7,7 +7,7 @@ Serverless LLM spins up models on demand and scales to zero when idle. Serverles
 - **GPU virtual memory abstraction**: Decouples logical KV from physical GPU memory, enabling dynamic remapping and higher GPU utilization across mixed, bursty workloads.
 - **Lower TTFT and cost**: Thanks to the above features, kvcached reduces time‑to‑first‑token (TTFT) and saves money compared to conventional systems that can't adapt to dynamic traffic.
 
-## Example: Prism integration
+## Example: Prism
 
 Prism is a multi-LLM serving (serverless) system that achieves more than 2× cost savings and 3.3× more SLO attainment through kvcached-enabled dynamic GPU sharing.
 
