@@ -4,7 +4,7 @@
 from importlib import import_module
 
 
-def _autopatch_all() -> None:
+def autopatch_all() -> None:
     # Importing these modules registers their when_imported hooks
     try:
         import_module("kvcached.integration.vllm.autopatch")
@@ -16,4 +16,4 @@ def _autopatch_all() -> None:
         pass
 
 
-_autopatch_all()
+autopatch_all()
