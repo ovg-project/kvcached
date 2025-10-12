@@ -12,7 +12,7 @@ Serverless LLM spins up models on demand and scales to zero when idle. Serverles
 Prism is a multi-LLM serving (serverless) system that achieves more than 2× cost savings and 3.3× more SLO attainment through kvcached-enabled dynamic GPU sharing.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Multi-LLM/prism-research/main/pic/prism_overview.png" alt="Prism" width="800" />
+  <img src="https://raw.githubusercontent.com/Multi-LLM/prism-research/main/pic/prism_overview.png" alt="Prism" width="600" />
 </p>
 
 The above figure shows the system architecture of Prism. It has two key designs:
