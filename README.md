@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo-v2.svg" alt="kvcached logo" height="96" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/logo-v2.svg" alt="kvcached logo" height="96" />
 
   <br>
   <br>
@@ -18,7 +18,7 @@ kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By 
 As shown in the figure below, kvcached decouples GPU virtual addressing from physical memory allocation for KV caches. Serving engines initially reserve virtual address space only and later back it with physical GPU memory when the cache is actively used. This decoupling allows on-demand allocation and release of KV cache, leading to better GPU memory utilization under dynamic and mixed workloads.
 
 <p align="center">
-  <img src="assets/vmm_v2.svg" alt="kvcached virtual memory model" width="600" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/vmm_v2.svg" alt="kvcached virtual memory model" width="600" />
 </p>
 
 <h3 align="left">Key Features</h3>
@@ -35,7 +35,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
   <table border="0" cellspacing="0" cellpadding="0" style="border: none; border-collapse: collapse; width: auto;">
     <tr>
       <td align="left" style="border: none; vertical-align: middle; width: 196px;">
-        <img src="assets/uc-multillm.svg" alt="Multi‑LLM serving" width="196" />
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-multillm.svg" alt="Multi‑LLM serving" width="196" />
       </td>
       <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
         <b>Multi‑LLM serving</b><br>kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
@@ -43,7 +43,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
     </tr>
     <tr>
       <td align="left" style="border: none; vertical-align: middle; width: 196px;">
-        <img src="assets/uc-serverless.svg" alt="Serverless LLM" width="196" />
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-serverless.svg" alt="Serverless LLM" width="196" />
       </td>
       <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
         <b>Serverless LLM</b><br>By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
@@ -51,7 +51,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
     </tr>
     <tr>
       <td align="left" style="border: none; vertical-align: middle; width: 196px;">
-        <img src="assets/uc-compound.svg" alt="Compound AI systems" width="196" />
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-compound.svg" alt="Compound AI systems" width="196" />
       </td>
       <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
         <b>Compound AI systems</b><br>kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
@@ -59,7 +59,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
     </tr>
     <tr>
       <td align="left" style="border: none; vertical-align: middle; width: 196px;">
-        <img src="assets/uc-colocate.svg" alt="GPU workload colocation" width="196" />
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-colocate.svg" alt="GPU workload colocation" width="196" />
       </td>
       <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
         <b>GPU workload colocation</b><br>kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
@@ -79,8 +79,8 @@ This benchmark shows the performance benefits of kvcached when serving three `Ll
 Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_latency_benefit).
 
 <p align="center">
-  <img src="assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="410" />
-  <img src="assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="410" style="margin-left:12px;" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="410" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="410" style="margin-left:12px;" />
 </p>
 
 ## Installation
