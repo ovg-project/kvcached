@@ -334,8 +334,41 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
+    @synchronized
     def clear(self):
-        raise NotImplementedError("kvcached does not support clear() for now")
+        """
+        Releases all memory blocks and pages managed by the KVCacheManager.
+
+        This is a destructive operation that invalidates all previously
+        allocated blocks. The manager is reset to a clean state.
+        """
+
+        self._wait_post_init()
+
+        # Clear reserved blocks
+        self.free_reserved()
+
+        # Free all blocks from avail_pages and full_pages
+        pages_to_free: List[int] = list(self.avail_pages.keys()) + list(self.full_pages.keys())
+
+        if pages_to_free:
+            self.page_allocator.free_pages(pages_to_free)
+        self.avail_pages.clear()
+        self.full_pages.clear()
+
+        # Trim the page allocator to free up reserved pages
+        self.trim()
+
+        self.target_num_blocks = None
+        self.in_shrink = False
+        self.num_avail_blocks = 0
+
+        if self.reserve_null_block:
+            # After clearing, we must re-reserve the null block to maintain a consistent state.
+            self.null_block = self.alloc(1)
+            if self.null_block != [0]:
+                logger.error(f"Failed to re-reserve null block after clear, got {self.null_block}")
+                raise RuntimeError("Failed to re-reserve null block at index 0 after clear")
 
     # Private methods
     @synchronized
