@@ -71,9 +71,6 @@ exclude = ["*__pycache__*"]
 [tool.setuptools.package-data]
 kvcached = ["*.so", "*.pyi", "py.typed"]
 
-[tool.setuptools.data-files]
-"" = ["kvcached_autopatch.pth"]
-
 [tool.mypy]
 plugins = ['pydantic.mypy']
 ignore_missing_imports = true
