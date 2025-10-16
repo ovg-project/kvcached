@@ -138,7 +138,7 @@ More instructions can be found [here](./docker/README.md). GB200 dockers are on 
 
 ## Testing
 
-kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. 
+kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`.
 
 If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts.
 

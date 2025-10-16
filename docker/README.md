@@ -68,6 +68,7 @@ vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts
 ```
 
 NOTE: If installed correctly, you should see that kvcached patches the vLLM:
+
 ```
 [kvcached][INFO][2025-10-15 23:01:33][patch_base.py:98] Applying 6 patches for vllm
 INFO 10-15 23:01:35 [__init__.py:216] Automatically detected platform cuda.
