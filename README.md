@@ -138,7 +138,11 @@ More instructions can be found [here](./docker/README.md). GB200 dockers are on 
 
 ## Testing
 
-kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of SGLang/vLLM with kvcached, run:
+kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. 
+
+If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts.
+
+If you installed kvcached using its source code, you can do the following:
 
 ```bash
 cd benchmarks/simple_bench
