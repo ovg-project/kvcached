@@ -102,6 +102,8 @@ pip install kvcached --no-build-isolation
 ### Install from source
 
 ```bash
+# under the project root folder
+
 pip install -e . --no-build-isolation --no-cache-dir
 python tools/dev_copy_pth.py
 ```
@@ -127,15 +129,29 @@ More instructions can be found [here](./docker/README.md). GB200 dockers are on 
 
 ## Testing
 
-kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`.
+kvcached can be enabled by setting the following environmental variables:
 
-If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts.
+```
+export ENABLE_KVCACHED=true
+export KVCACHED_AUTOPATCH=1
+```
 
-If you installed kvcached using its source code, you can do the following:
+If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts. For example:
+
+```bash
+# for sglang
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B --disable-radix-cache --port 30000
+python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
+
+# for vllm
+vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-caching --port=12346
+vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
+```
+
+If you installed kvcached using its source code, you can also do the following:
 
 ```bash
 cd benchmarks/simple_bench
-export VENV_PATH=../../engine_integration/[sglang|vllm]-kvcached-venv
 ./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
 # Wait until LLM server is ready
 ./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
