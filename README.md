@@ -134,6 +134,9 @@ kvcached can be enabled by setting the following environmental variables:
 ```
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
+
+# memory stats ipc name (optional)
+export KVCACHED_IPC_NAME=[SGLANG|VLLM]
 ```
 
 If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts. For example:
