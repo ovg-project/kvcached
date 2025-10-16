@@ -97,7 +97,7 @@ kvcached can be installed as a plugin with SGLang and vLLM.
 To install kvcached into an existing SGLang or vLLM environment:
 
 ```bash
-uv pip install kvcached --no-build-isolation
+pip install kvcached --no-build-isolation
 ```
 
 ### All-in-One Setup Script
