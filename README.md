@@ -121,10 +121,11 @@ This script will install the specified versions of engines, create separate venv
 
 You can test or develop kvcached with Docker.
 
-To test kvcached with SGLang or vLLM.
+To test kvcached with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/[kvcached-sglang|kvcached-vllm]:latest
+docker pull ghcr.io/ovg-project/sglang-v0.5.2-kvcached:latest
+docker pull ghcr.io/ovg-project/vllm-v0.10.2-kvcached:latest
 ```
 
 For developmenet:
