@@ -84,40 +84,6 @@ Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_la
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="49%" />
 </p>
 
-## Installation
-
-### Prerequisites
-
-- Python (tested with 3.9 - 3.12)
-- PyTorch (compatible with SGLang and vLLM)
-
-kvcached can be installed as a plugin with SGLang and vLLM.
-
-### Quick Install
-
-To install kvcached into an existing SGLang or vLLM environment:
-
-```bash
-pip install kvcached --no-build-isolation
-```
-
-### All-in-One Setup Script
-
-For a complete setup with kvcached and a specific inference engine version, use our automated setup script. This script creates a separate virtual environment (using `uv`) and installs kvcached with your chosen engine:
-
-```bash
-cd engine_integration/scripts
-# check installation instructions
-./setup.sh --help
-
-# install kvcached with SGLang v0.4.9
-./setup.sh --engine sglang --engine-version 0.4.9
-# install kvcached with vLLM v0.10.1
-./setup.sh --engine vllm --engine-version 0.10.1
-```
-
-This script will install the specified versions of engines, create separate venv environments (using `uv`), and install kvcached. Should you require more versions, please let us know by opening an issue.
-
 ## Run kvcached with Docker
 
 You can test or develop kvcached with Docker.
@@ -136,6 +102,30 @@ docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
 More instructions can be found [here](./docker/README.md). GB200 dockers are on the way.
+
+## Installation
+
+### Prerequisites
+
+- Python (tested with 3.9 - 3.12)
+- PyTorch (compatible with SGLang and vLLM)
+
+kvcached can be installed as a plugin with SGLang and vLLM.
+
+### Install from PyPI
+
+To install kvcached into an existing SGLang or vLLM environment:
+
+```bash
+pip install kvcached --no-build-isolation
+```
+
+### Install from source
+
+```bash
+pip install -e . --no-build-isolation --no-cache-dir
+python tools/dev_copy_pth.py
+```
 
 ## Testing
 
