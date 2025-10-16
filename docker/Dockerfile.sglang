@@ -1,22 +1,9 @@
-FROM lmsysorg/sglang:v0.4.9-cu126
-
+FROM lmsysorg/sglang:v0.5.2-cu126
+RUN pip install kvcached --no-build-isolation
 
 ENV ENABLE_KVCACHED=true
-ENV PATH="/root/.local/bin:${PATH}"
-
-WORKDIR /sgl-workspace
-RUN git clone https://github.com/ovg-project/kvcached.git
-WORKDIR /sgl-workspace/kvcached
-RUN pip install -r requirements.txt
-
-WORKDIR /sgl-workspace/sglang
-RUN git fetch --all --tags
-RUN git checkout v0.4.9
-RUN git apply /sgl-workspace/kvcached/engine_integration/scripts/kvcached-sglang-v0.4.9.patch
-
-
-WORKDIR /sgl-workspace/kvcached
-RUN pip install -e . --no-build-isolation
+ENV KVCACHED_AUTOPATCH=1
+ENV KVCACHED_IPC_NAME=SGLANG
 
 EXPOSE 8080 12346 30000 30001
 

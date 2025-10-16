@@ -1,20 +1,9 @@
-FROM vllm/vllm-openai:v0.9.2
+FROM vllm/vllm-openai:v0.10.2
+RUN pip install kvcached --no-build-isolation
 
-WORKDIR /vllm-workspace
-RUN git clone https://github.com/ovg-project/kvcached.git
-WORKDIR /vllm-workspace/kvcached
-RUN pip install -r requirements.txt
-
-WORKDIR /vllm-workspace
-RUN git clone -b v0.9.2 https://github.com/vllm-project/vllm.git vllm-v0.9.2
-WORKDIR /vllm-workspace/vllm-v0.9.2
-RUN git apply /vllm-workspace/kvcached/engine_integration/scripts/kvcached-vllm-v0.9.2.patch
-
-RUN pip install transformers==4.51.1
-RUN VLLM_USE_PRECOMPILED=1 pip install --editable .
-
-WORKDIR /vllm-workspace/kvcached
-RUN pip install -e . --no-build-isolation
+ENV ENABLE_KVCACHED=true
+ENV KVCACHED_AUTOPATCH=1
+ENV KVCACHED_IPC_NAME=VLLM
 
 EXPOSE 8080 12346 30000 30001
 
