@@ -134,7 +134,7 @@ For developmenet:
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
-More instructions can be found [here](./docker/README.md).
+More instructions can be found [here](./docker/README.md). GB200 dockers are on the way.
 
 ## Testing
 
