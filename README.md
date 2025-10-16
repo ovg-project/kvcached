@@ -131,7 +131,7 @@ More instructions can be found [here](./docker/README.md). GB200 dockers are on 
 
 kvcached can be enabled by setting the following environmental variables:
 
-```
+```bash
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
 
