@@ -84,6 +84,28 @@ Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_la
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="49%" />
 </p>
 
+## Installation
+
+### Prerequisites
+
+- Python (tested with 3.9 - 3.12)
+- SGLang (tested with v0.5.2) or vLLM (tested with v0.10.2)
+
+kvcached can be installed as a plugin with existing SGLang or vLLM environment.
+
+### Install from PyPI
+
+```bash
+pip install kvcached --no-build-isolation
+```
+
+### Install from source
+
+```bash
+pip install -e . --no-build-isolation --no-cache-dir
+python tools/dev_copy_pth.py
+```
+
 ## Run kvcached with Docker
 
 You can test or develop kvcached with Docker.
@@ -102,30 +124,6 @@ docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
 More instructions can be found [here](./docker/README.md). GB200 dockers are on the way.
-
-## Installation
-
-### Prerequisites
-
-- Python (tested with 3.9 - 3.12)
-- PyTorch (compatible with SGLang and vLLM)
-
-kvcached can be installed as a plugin with SGLang and vLLM.
-
-### Install from PyPI
-
-To install kvcached into an existing SGLang or vLLM environment:
-
-```bash
-pip install kvcached --no-build-isolation
-```
-
-### Install from source
-
-```bash
-pip install -e . --no-build-isolation --no-cache-dir
-python tools/dev_copy_pth.py
-```
 
 ## Testing
 
