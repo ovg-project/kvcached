@@ -18,13 +18,13 @@
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/readme/pr/assets/ads2.svg" alt="Make GPU Sharing Flexible and Easy" width="500" />
 </p>
 
-kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstractions to LLM systems, it supports **elastic and demand-driven** KV cache allocation and reclamation, improving utilization under dynamic workloads.
+kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstraction to LLM systems, it enables **elastic and demand-driven** KV cache allocation, improving GPU utilization under dynamic workloads.
 
-As shown in the figure below, kvcached decouples GPU virtual addressing from physical memory allocation for KV caches. Serving engines initially reserve virtual address space only and later back it with physical GPU memory when the cache is actively used. This decoupling allows on-demand allocation and release of KV cache, leading to better GPU memory utilization under dynamic and mixed workloads.
+kvcached achieves this by decoupling GPU virtual addressing from physical memory allocation for KV caches. It allows serving engines to initially reserve virtual memory only and later back it with physical GPU memory when the cache is actively used. This decoupling enables on-demand allocation and flexible sharing, bringing better GPU memory utilization under dynamic and mixed workloads. Check out more details in the [blog](#).
 
-<p align="center">
+<!-- <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/vmm_v2.svg" alt="kvcached virtual memory model" width="600" />
-</p>
+</p> -->
 
 <h3 align="left">Key Features</h3>
 
@@ -32,7 +32,7 @@ As shown in the figure below, kvcached decouples GPU virtual addressing from phy
 - **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
 - **Memory control CLI**: enforce memory limits with kvcached CLI.
 - **Frontend router and sleep manager**: route requests to the corresponding backend and put models to sleep when idle.
-- **Support SGLang and vLLM**: integrate with SGLang and vLLM.
+- **Support mainstream serving engines**: integrate with SGLang and vLLM.
 
 ## Example use cases
 
