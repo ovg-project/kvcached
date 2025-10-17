@@ -16,6 +16,10 @@
 
 kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstractions to LLM systems, it supports **elastic and demand-driven** KV cache allocation and reclamation, improving utilization under dynamic workloads.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.svg" alt="kvcached virtual memory model" width="600" />
+</p>
+
 As shown in the figure below, kvcached decouples GPU virtual addressing from physical memory allocation for KV caches. Serving engines initially reserve virtual address space only and later back it with physical GPU memory when the cache is actively used. This decoupling allows on-demand allocation and release of KV cache, leading to better GPU memory utilization under dynamic and mixed workloads.
 
 <p align="center">
