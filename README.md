@@ -15,7 +15,7 @@
 <h2 align="center">Make GPU Sharing Flexible and Easy </h2>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads2.svg" alt="Make GPU Sharing Flexible and Easy" width="500" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.svg" alt="Make GPU Sharing Flexible and Easy" width="500" />
 </p>
 
 kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstraction to LLM systems, it enables **elastic and demand-driven** KV cache allocation, improving GPU utilization under dynamic workloads.
