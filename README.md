@@ -119,7 +119,7 @@ docker pull ghcr.io/ovg-project/sglang-v0.5.2-kvcached:latest
 docker pull ghcr.io/ovg-project/vllm-v0.10.2-kvcached:latest
 ```
 
-For developmenet:
+For developmenet, we prepare an all-in-one docker:
 
 ```bash
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
