@@ -163,15 +163,12 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         *args,
                         **kwargs,
                     )
-                    try:
-                        import kvcached.integration.sglang.interfaces as kvi
+                    import kvcached.integration.sglang.interfaces as kvi
 
-                        self.cell_size = self.head_num * self.head_dim * dtype.itemsize
-                        self.kvcached_allocator = kvi.get_kv_cache_manager(
-                            size + page_size, page_size, self.cell_size, layer_num
-                        )
-                    except Exception:
-                        raise
+                    self.cell_size = self.head_num * self.head_dim * dtype.itemsize
+                    self.kvcached_allocator = kvi.get_kv_cache_manager(
+                        size + page_size, page_size, self.cell_size, layer_num
+                    )
 
                     k_size, v_size = self.get_kv_size_bytes()
                     GB = 1024**3
@@ -198,13 +195,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         pass
 
                 def _create_buffers(self):
-                    try:
-                        import kvcached.integration.sglang.interfaces as kvi
+                    import kvcached.integration.sglang.interfaces as kvi
 
-                        # Initialize kvcached with overlap scheduling to be conservative
-                        kvi.init_kvcached(async_sched=True)
-                    except Exception:
-                        raise
+                    # Initialize kvcached with overlap scheduling to be conservative
+                    kvi.init_kvcached(async_sched=True)
 
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
