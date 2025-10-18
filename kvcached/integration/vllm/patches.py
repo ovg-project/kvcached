@@ -285,6 +285,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
     def patch_kvcache_manager(self,
                               kvcache_manager_mod: types.ModuleType) -> bool:
         """Patch KVCacheManager"""
+        import inspect
         KVCacheManager = self._get_target_class(kvcache_manager_mod)
         if KVCacheManager is None:
             return False
@@ -294,12 +295,10 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = KVCacheManager.__init__
+        sig = inspect.signature(original_init)
         logger = self.logger  # Capture logger in closure
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
-            import inspect
-
-            sig = inspect.signature(original_init)
             bound_args = sig.bind(self, *args, **kwargs)
             bound_args.apply_defaults()
             kv_cache_config = bound_args.arguments.get('kv_cache_config')
