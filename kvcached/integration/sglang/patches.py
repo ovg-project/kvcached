@@ -15,8 +15,6 @@ from kvcached.utils import get_kvcached_logger
 
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
-SGLANG_PRE_V053_RANGE = "<0.5.3"
-SGLANG_POST_V053_RANGE = ">=0.5.3"
 
 logger = get_kvcached_logger()
 
@@ -165,8 +163,6 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         *args,
                         **kwargs,
                     )
-                    self.head_num = head_num
-                    self.head_dim = head_dim
                     try:
                         import kvcached.integration.sglang.interfaces as kvi
 
@@ -205,7 +201,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     try:
                         import kvcached.integration.sglang.interfaces as kvi
 
-                        # Initialize kvcached with overlap scheduling if requested
+                        # Initialize kvcached with overlap scheduling to be conservative
                         kvi.init_kvcached(async_sched=True)
                     except Exception:
                         raise
