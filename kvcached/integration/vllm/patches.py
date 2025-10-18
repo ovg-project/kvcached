@@ -345,10 +345,10 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             # Determine number of layers
             if hasattr(kv_cache_config, "tensors"):
                 num_layers = len(kv_cache_config.tensors)
-            elif hasattr(self, "kv_cache_tensors"):
-                num_layers = len(getattr(self, "kv_cache_tensors"))
+            elif hasattr(kv_cache_config, "kv_cache_tensors"):
+                num_layers = len(kv_cache_config.kv_cache_tensors)
             else:
-                raise ValueError("kv_cache_config has no tensors")
+                raise ValueError("Unable to determine num_layers: expected tensors or kv_cache_tensors in kv_cache_config")
 
             # Replace the block pool with ElasticBlockPool
             self.block_pool = ElasticBlockPool(
