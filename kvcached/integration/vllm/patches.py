@@ -299,18 +299,18 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         logger = self.logger  # Capture logger in closure
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
-            bound_args = sig.bind(self, *args, **kwargs)
-            bound_args.apply_defaults()
-            kv_cache_config = bound_args.arguments.get('kv_cache_config')
-            if kv_cache_config is None:
-                raise ValueError("kv_cache_config is required")
-
             original_init(self, *args, **kwargs)
 
             if not enable_kvcached():
                 return
 
             try:
+                bound_args = sig.bind(self, *args, **kwargs)
+                bound_args.apply_defaults()
+                kv_cache_config = bound_args.arguments.get('kv_cache_config')
+                if kv_cache_config is None:
+                    raise ValueError("kv_cache_config is required")
+
                 self._setup_kvcached_manager(kv_cache_config)
             except Exception as e:
                 logger.warning("Failed to patch kv_cache_manager: %s", e)
@@ -336,7 +336,9 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 kv_cache_spec = getattr(self,
                                         "specialized_manager").kv_cache_spec
             else:
-                raise ValueError("Unable to determine kv_cache_spec: expected get_kv_cache_spec or specialized_manager")
+                raise ValueError(
+                    "Unable to determine kv_cache_spec: expected get_kv_cache_spec or specialized_manager"
+                )
 
             block_size = getattr(self, "block_size")
             num_gpu_blocks = getattr(self, "num_gpu_blocks")
