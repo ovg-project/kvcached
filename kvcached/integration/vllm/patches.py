@@ -332,9 +332,12 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             if hasattr(self, "get_kv_cache_spec"):
                 kv_cache_spec = getattr(self,
                                         "get_kv_cache_spec")().items()[0][1]
-            else:
+            elif hasattr(self, "specialized_manager"):
                 kv_cache_spec = getattr(self,
                                         "specialized_manager").kv_cache_spec
+            else:
+                raise ValueError("Unable to determine kv_cache_spec: expected get_kv_cache_spec or specialized_manager")
+
             block_size = getattr(self, "block_size")
             num_gpu_blocks = getattr(self, "num_gpu_blocks")
 
@@ -347,7 +350,9 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             elif hasattr(kv_cache_config, "kv_cache_tensors"):
                 num_layers = len(kv_cache_config.kv_cache_tensors)
             else:
-                raise ValueError("Unable to determine num_layers: expected tensors or kv_cache_tensors in kv_cache_config")
+                raise ValueError(
+                    "Unable to determine num_layers: expected tensors or kv_cache_tensors in kv_cache_config"
+                )
 
             # Replace the block pool with ElasticBlockPool
             self.block_pool = ElasticBlockPool(
