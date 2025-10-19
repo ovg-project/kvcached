@@ -146,7 +146,5 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=100)
-    parser.add_argument("--result-file", type=str, default="sglang_result.jsonl")
-    parser.add_argument("--raw-result-file", type=str, default="sglang_eval_raw.jsonl")
     args = add_common_sglang_args_and_parse(parser)
     main(args)
