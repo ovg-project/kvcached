@@ -14,7 +14,7 @@ vllm serve Qwen/Qwen2.5-Math-1.5B --disable-log-requests --no-enable-prefix-cach
 python -m sglang.launch_server --model Qwen/Qwen2.5-Math-1.5B --disable-radix-cache --port 30000
 ```
 
-Or using the script in in `benchmarks/simple_bench/start_server.sh`. 
+Or using the script in in `benchmarks/simple_bench/start_server.sh`.
 
 ## Run GSM8K client
 
