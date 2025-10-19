@@ -38,11 +38,11 @@ ARG CACHE_BREAKER=none
 RUN git pull
 WORKDIR /workspace/kvcached/engine_integration/scripts
 RUN chmod +x setup.sh
-RUN ./setup.sh --engine vllm --method source --version 0.10.2
-RUN ./setup.sh --engine sglang --method source --version 0.5.2
+RUN ./setup.sh --engine vllm --method source --version 0.11.0
+RUN ./setup.sh --engine sglang --method source --version 0.5.3
 
-RUN ./setup.sh --engine vllm --method pip --version 0.10.2
-RUN ./setup.sh --engine sglang --method pip --version 0.5.2
+RUN ./setup.sh --engine vllm --method pip --version 0.11.0
+RUN ./setup.sh --engine sglang --method pip --version 0.5.3
 
 ENV ENABLE_KVCACHED=true
 ENV KVCACHED_AUTOPATCH=1

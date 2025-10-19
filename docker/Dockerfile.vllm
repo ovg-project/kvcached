@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.10.2
+FROM vllm/vllm-openai:v0.11.0
 RUN pip install kvcached --no-build-isolation
 
 ENV ENABLE_KVCACHED=true

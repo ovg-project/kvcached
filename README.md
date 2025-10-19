@@ -93,7 +93,7 @@ Details can be found in [benchmarks/bench_latency_benefit](./benchmarks/bench_la
 ### Prerequisites
 
 - Python (tested with 3.9 - 3.12)
-- SGLang (tested with v0.5.2) or vLLM (tested with v0.10.2)
+- SGLang (tested with v0.5.3) or vLLM (tested with v0.11.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
@@ -119,8 +119,8 @@ You can test or develop kvcached with Docker.
 To test kvcached with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.2
-docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.10.2
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.3
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.11.0
 ```
 
 For developmenet, we prepare an all-in-one docker:
