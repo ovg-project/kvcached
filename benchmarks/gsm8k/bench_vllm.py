@@ -10,9 +10,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Tuple
 
-import numpy as np  # type: ignore
+import numpy as np
 import requests
-from tqdm import tqdm  # type: ignore
+from tqdm import tqdm
 
 INVALID = -9999999
 
