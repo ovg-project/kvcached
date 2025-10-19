@@ -16,7 +16,7 @@ cd benchmarks/gsm8k
 
 ### vLLM client
 
-Use `bench_vllm.py` to hit an OpenAI-compatible vLLM server (`/v1/completions`). You must specify `--model` matching the served model. Need to be the same model as server, like `Qwen/Qwen2.5-Math-1.5B`. 
+Use `bench_vllm.py` to hit an OpenAI-compatible vLLM server (`/v1/completions`). You must specify `--model` matching the served model. Need to be the same model as server, like `Qwen/Qwen2.5-Math-1.5B`.
 
 ```bash
 # Activate the same venv as the server if needed
