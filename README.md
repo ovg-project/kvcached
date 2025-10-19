@@ -119,8 +119,8 @@ You can test or develop kvcached with Docker.
 To test kvcached with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/sglang-v0.5.2-kvcached:latest
-docker pull ghcr.io/ovg-project/vllm-v0.10.2-kvcached:latest
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.2
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.10.2
 ```
 
 For developmenet, we prepare an all-in-one docker:
