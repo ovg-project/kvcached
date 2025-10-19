@@ -4,7 +4,17 @@ This folder contains scripts to evaluate GSM8K accuracy and throughput against e
 
 ## Start the engine server
 
-Start the vLLM or SGLang engine server with the same commands as in `benchmarks/simple_bench/start_server.sh`. Can use math models like `Qwen/Qwen2.5-Math-1.5B`.
+Start the vLLM or SGLang engine server regularly. For example
+
+```
+# Activate the same venv as the server if needed
+source /path/to/your/vllm-venv/bin/activate
+
+vllm serve Qwen/Qwen2.5-Math-1.5B --disable-log-requests --no-enable-prefix-caching --port=12346
+python -m sglang.launch_server --model Qwen/Qwen2.5-Math-1.5B --disable-radix-cache --port 30000
+```
+
+Or using the script in in `benchmarks/simple_bench/start_server.sh`. 
 
 ## Run GSM8K client
 
@@ -23,7 +33,7 @@ Use `bench_vllm.py` to hit an OpenAI-compatible vLLM server (`/v1/completions`).
 source /path/to/your/vllm-venv/bin/activate
 
 python bench_vllm.py \
-  --model meta-llama/Llama-3.2-1B \
+  --model Qwen/Qwen2.5-Math-1.5B \
   --port 12346 \
   --num-questions 100 \
   --num-shots 5 \
