@@ -4,7 +4,7 @@ This folder contains scripts to evaluate GSM8K accuracy and throughput against e
 
 ## Start the engine server
 
-Start the vLLM or SGLang engine server with the same commands as in `benchmarks/simple_bench/start_server.sh`.
+Start the vLLM or SGLang engine server with the same commands as in `benchmarks/simple_bench/start_server.sh`. Can use math models like `Qwen/Qwen2.5-Math-1.5B`.
 
 ## Run GSM8K client
 
@@ -16,7 +16,7 @@ cd benchmarks/gsm8k
 
 ### vLLM client
 
-Use `bench_vllm.py` to hit an OpenAI-compatible vLLM server (`/v1/completions`). You must specify `--model` matching the served model.
+Use `bench_vllm.py` to hit an OpenAI-compatible vLLM server (`/v1/completions`). You must specify `--model` matching the served model. Need to be the same model as server, like `Qwen/Qwen2.5-Math-1.5B`. 
 
 ```bash
 # Activate the same venv as the server if needed
