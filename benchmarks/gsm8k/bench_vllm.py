@@ -179,8 +179,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-questions", type=int, default=100)
     parser.add_argument("--parallel", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=512)
-    parser.add_argument("--result-file", type=str, default="eval_results.jsonl")
-    parser.add_argument("--raw-result-file", type=str, default="eval_raw.jsonl")
+    parser.add_argument("--result-file", type=str, default="vllm_eval_result.jsonl")
+    parser.add_argument("--raw-result-file", type=str, default="vllm_eval_raw.jsonl")
 
     # vLLM connection
     parser.add_argument("--model", type=str, required=True, help="HuggingFace model id served by vLLM")
