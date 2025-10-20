@@ -81,7 +81,7 @@ See concrete examples here: [kvcached/examples](./examples).
 The following simple example shows how kvcached enables an unmodified vLLM engine run with dynamically allocated memory.
 
 <p align="center">
-  <img src="https://github.com/ovg-project/kvcached/raw/refs/heads/readme/video/assets/kvcached-example.mp4" alt="kvcached in action" width="90%">
+  <img src="assets/kvcached-example.gif" alt="kvcached in action" width="90%">
 </p>
 
 ## Performance: Multi-LLM serving
