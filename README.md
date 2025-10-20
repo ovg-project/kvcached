@@ -7,8 +7,9 @@
     <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue"></a>
     <img alt="Engines" src="https://img.shields.io/badge/Engines-SGLang%20%7C%20vLLM-blueviolet">
     <a href="https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141"><img alt="Blog" src="https://img.shields.io/badge/Blog-Read-FF5722?logo=rss&logoColor=white&labelColor=555555"></a>
-    <a href="https://arxiv.org/pdf/2508.08448.pdf"><img alt="arXiv: GPU OS vision" src="https://img.shields.io/badge/arXiv-GPU%20OS%20vision-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
+    <a href="https://arxiv.org/abs/2508.08448"><img alt="arXiv: GPU OS vision" src="https://img.shields.io/badge/arXiv-GPU%20OS%20vision-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
     <a href="https://arxiv.org/abs/2505.04021"><img alt="arXiv: Multi LLM Serving" src="https://img.shields.io/badge/arXiv-Multi%20LLM%20Serving-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
+    <br>
     <a href="https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw"><img alt="Slack Join" src="https://img.shields.io/badge/Slack-Join-4A154B?logo=slack&logoColor=white&labelColor=555555"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   </p>
