@@ -78,7 +78,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 </div>
 
-See concrete examples here: [kvcached/examples](https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/examples).
+See concrete examples here: [kvcached/examples](https://github.com/ovg-project/kvcached/tree/main/examples).
 
 ## kvcached in action
 
@@ -93,7 +93,7 @@ The following simple example shows how kvcached enables an unmodified vLLM engin
 kvcached enables dynamic memory sharing between LLMs, allowing them to share the same GPU memory elastically. As a comparison, the current serving engines need to statically reserve GPU memory at startup.
 
 This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. kvcached can achieve **2-28x TTFT reduction** compared to the current serving engines. This performance gain can be converted to **significant cost savings** for LLM serving. Without kvcached, the systems have to provision more GPUs to achieve the same performance.
-Details can be found in [benchmarks/bench_latency_benefit](https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/benchmarks/bench_latency_benefit).
+Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ovg-project/kvcached/tree/main/benchmarks/bench_latency_benefit).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="49%" />
@@ -141,7 +141,7 @@ For developmenet, we prepare an all-in-one docker:
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
-More instructions can be found [here](https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/docker/README.md). GB200 dockers are on the way.
+More instructions can be found [here](https://github.com/ovg-project/kvcached/blob/main/docker/README.md). GB200 dockers are on the way.
 
 ## Testing
 
