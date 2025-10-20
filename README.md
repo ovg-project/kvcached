@@ -15,12 +15,12 @@
 <h2 align="center">Make GPU Sharing Flexible and Easy </h2>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.jpg" alt="Make GPU Sharing Flexible and Easy" width="500" />
+  <img src="assets/ads.jpg" alt="Make GPU Sharing Flexible and Easy" width="500" />
 </p>
 
 kvcached is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstraction to LLM systems, it enables **elastic and demand-driven** KV cache allocation, improving GPU utilization under dynamic workloads.
 
-kvcached achieves this by decoupling GPU virtual addressing from physical memory allocation for KV caches. It allows serving engines to initially reserve virtual memory only and later back it with physical GPU memory when the cache is actively used. This decoupling enables on-demand allocation and flexible sharing, bringing better GPU memory utilization under dynamic and mixed workloads. Check out more details in the [blog](https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141?source=copy_link).
+kvcached achieves this by decoupling GPU virtual addressing from physical memory allocation for KV caches. It allows serving engines to initially reserve virtual memory only and later back it with physical GPU memory when the cache is actively used. This decoupling enables on-demand allocation and flexible sharing, bringing better GPU memory utilization under dynamic and mixed workloads. Check out more details in the [blog](https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141).
 
 <!-- <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/vmm_v2.svg" alt="kvcached virtual memory model" width="600" />
@@ -80,7 +80,7 @@ See concrete examples here: [kvcached/examples](./examples).
 
 The following simple example shows how kvcached enables an unmodified vLLM engine run with dynamically allocated memory.
 
-[![](https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/kvcached-example-thumbnail.png)](https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/kvcached-example.mp4)
+[![](assets/kvcached-example-thumbnail.png)](assets/kvcached-example.mp4)
 
 ## Performance: Multi-LLM serving
 
