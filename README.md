@@ -124,18 +124,16 @@ pip install -e . --no-build-isolation --no-cache-dir
 python tools/dev_copy_pth.py
 ```
 
-## Run kvcached with Docker
+### Using Docker
 
-You can test or develop kvcached with Docker.
-
-To test kvcached with original engine dockers.
+kvcached installed with original engine dockers.
 
 ```bash
 docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.3
 docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.11.0
 ```
 
-For developmenet, we prepare an all-in-one docker:
+We prepare an all-in-one docker for developers:
 
 ```bash
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
