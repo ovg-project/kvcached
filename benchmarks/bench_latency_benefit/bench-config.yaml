@@ -20,6 +20,8 @@ sleep_manager: # sleep configuration
 
 launch_delay_seconds: 30  # Delay between launching each instance
 
+launch_delay_seconds: 30  # Delay between launching each instance
+
 instances: # instances configuration
   - name: instance1
     model: meta-llama/Llama-3.1-8B-Instruct
@@ -39,8 +41,8 @@ instances: # instances configuration
       - "--host=localhost"
       - "--port=12346"
       # - "--gpu-memory-utilization 0.31"
+      # - "--max-model-len 62000"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
 
   - name: instance2
     model: meta-llama/Llama-3.1-8B-Instruct
@@ -60,8 +62,8 @@ instances: # instances configuration
       - "--host=localhost"
       - "--port=30000"
       # - "--gpu-memory-utilization 0.31"
+      # - "--max-model-len 62000"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
 
   - name: instance3
     model: meta-llama/Llama-3.1-8B-Instruct
@@ -81,5 +83,5 @@ instances: # instances configuration
       - "--host=localhost"
       - "--port=40000"
       # - "--gpu-memory-utilization 0.31"
+      # - "--max-model-len 62000"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
