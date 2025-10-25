@@ -165,6 +165,9 @@ vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-cac
 vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
 ```
 
+> [!NOTE]
+> kvcached hasn't supported prefix caching/sharing yet because that will prevent kvcached from releasing the memory after requests finish. Remember to use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+
 If you installed kvcached using its source code, you can also do the following:
 
 ```bash
