@@ -1,8 +1,89 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import logging
 import os
+
+
+def _sanitize_segment(segment: str) -> str:
+    """Sanitize a segment to safe characters for SHM names."""
+    allowed = []
+    for ch in segment:
+        if ch.isalnum() or ch in ("_", "-"):
+            allowed.append(ch)
+        else:
+            allowed.append("-")
+    # Collapse to at most 64 chars to keep names short
+    return "".join(allowed)[:64]
+
+
+def _detect_engine_tag() -> str:
+    """Best-effort detection of the hosting engine for naming.
+    """
+    if importlib.util.find_spec("vllm") is not None:
+        return "vLLM"
+    if importlib.util.find_spec("sglang") is not None:
+        return "SGLang"
+    return "proc"
+
+
+def _ipc_segment_exists(name: str) -> bool:
+    """Return True if a shared-memory segment/file with this name exists.
+    """
+    try:
+        return os.path.exists(os.path.join(SHM_DIR, name))
+    except Exception:
+        return False
+
+
+def _obtain_default_ipc_name() -> str:
+    """Return a default IPC name like kvcached_<Engine>_<PGID>.
+
+    Precedence:
+    1) KVCACHED_IPC_NAME: explicit full name
+    2) Otherwise, derive from engine tag and process group id (PGID).
+    Using PGID ensures all processes within the same instance share a
+    single segment, while separate launches get distinct names.
+    """
+
+    engine_tag = _detect_engine_tag()
+    try:
+        group_id = os.getpgid(0)
+    except Exception:
+        try:
+            group_id = os.getsid(0)
+        except Exception:
+            group_id = os.getpid()
+
+    explicit = os.getenv("KVCACHED_IPC_NAME")
+    if explicit:
+        preferred = _sanitize_segment(explicit)
+
+        if not _ipc_segment_exists(preferred):
+            return preferred
+
+        base_candidate = f"{preferred}_{engine_tag}_{group_id}"
+        if not _ipc_segment_exists(base_candidate):
+            return base_candidate
+        # As a last resort, append a small numeric suffix until unique
+        for i in range(1, 100):
+            candidate = f"{base_candidate}_{i}"
+            if not _ipc_segment_exists(candidate):
+                return candidate
+        # If everything somehow exists, fall back to PID-specific name
+        return f"{base_candidate}_{os.getpid()}"
+
+    # No explicit override: start from conventional base and ensure uniqueness
+    base = "kvcached"
+    name = f"{base}_{engine_tag}_{group_id}"
+    if not _ipc_segment_exists(name):
+        return name
+    for i in range(1, 100):
+        candidate = f"{name}_{i}"
+        if not _ipc_segment_exists(candidate):
+            return candidate
+    return f"{name}_{os.getpid()}"
 
 
 def _get_page_size() -> int:
@@ -49,9 +130,7 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
                               "true").lower() == "true"
 
-# Allow overriding the shared-memory segment name via env var so multiple
-# kvcached deployments on one machine can coexist without collision.
-DEFAULT_IPC_NAME = os.getenv("KVCACHED_IPC_NAME", "kvcached_mem_info")
+DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
