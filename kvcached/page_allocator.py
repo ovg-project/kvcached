@@ -421,14 +421,14 @@ class PageAllocator:
 
     def get_avail_physical_pages(self) -> int:
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
-        headroom = total_phy_mem_size * (1 - self.gpu_utilization)
+        headroom = int(total_phy_mem_size * (1 - self.gpu_utilization))
         avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
 
         # Calculate available pages considering layers and K/V split
         avail_phy_pages = avail_phy_mem_size // self.page_size
         # Each layer needs to reserve K and V tensors so we divide by 2.
         avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
-        return avail_pages_per_layer
+        return int(avail_pages_per_layer)
 
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
         return block_id * block_mem_size // self.page_size
