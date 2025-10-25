@@ -1,106 +1,203 @@
-# kvcached
+<div align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/logo-v2.svg" alt="kvcached logo" height="96" />
 
-kvcached is a new KV cache management system that supports on-demand KV cache allocation. It implements the concept of GPU virtual memory, allowing applications to reserve virtual address space without immediately committing physical memory. Physical memory is then automatically allocated and mapped as needed at runtime. This capability allows multiple LLMs to run concurrently on a single GPU or a group of GPUs (TP) and flexibly share the GPU memory, significantly improving GPU utilization and reducing memory fragmentation.
+  <br>
+  <br>
+  <p>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue"></a>
+    <img alt="Engines" src="https://img.shields.io/badge/Engines-SGLang%20%7C%20vLLM-blueviolet">
+    <a href="https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141"><img alt="Blog" src="https://img.shields.io/badge/Blog-Read-FF5722?logo=rss&logoColor=white&labelColor=555555"></a>
+    <a href="https://arxiv.org/abs/2508.08448"><img alt="arXiv: GPU OS vision" src="https://img.shields.io/badge/arXiv-GPU%20OS%20vision-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
+    <br>
+    <a href="https://arxiv.org/abs/2505.04021"><img alt="arXiv: Multi LLM Serving" src="https://img.shields.io/badge/arXiv-Multi%20LLM%20Serving-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
+    <a href="https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw"><img alt="Slack Join" src="https://img.shields.io/badge/Slack-Join-4A154B?logo=slack&logoColor=white&labelColor=555555"></a>
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
+  </p>
 
-kvcached is compatible with popular LLM serving engines, including SGLang and vLLM.
+</div>
 
-## kvcached Installation
+<h2 align="center">Make GPU Sharing Flexible and Easy </h2>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ads.jpg" alt="Make GPU Sharing Flexible and Easy" width="500" />
+</p>
+
+kvcached (KV cache daemon) is a KV cache library for LLM serving/training on **shared GPUs**.  By bringing OS-style **virtual memory** abstraction to LLM systems, it enables **elastic and demand-driven** KV cache allocation, improving GPU utilization under dynamic workloads.
+
+kvcached achieves this by decoupling GPU virtual addressing from physical memory allocation for KV caches. It allows serving engines to initially reserve virtual memory only and later back it with physical GPU memory when the cache is actively used. This decoupling enables on-demand allocation and flexible sharing, bringing better GPU memory utilization under dynamic and mixed workloads. Check out more details in the [blog](https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141).
+
+<!-- <p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/vmm_v2.svg" alt="kvcached virtual memory model" width="600" />
+</p> -->
+
+<h3 align="left">Key Features</h3>
+
+- **Elastic KV cache**: allocate and reclaim KV memory dynamically to match live load.
+- **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
+- **Memory control CLI**: enforce memory limits with kvcached CLI.
+- **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
+- **Support mainstream serving engines**: integrate with SGLang and vLLM.
+
+## Example use cases
+
+<div align="center">
+  <table border="0" cellspacing="0" cellpadding="0" style="border: none; border-collapse: collapse; width: auto;">
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 196px;">
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-multillm.svg" alt="Multi‑LLM serving" width="196" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Multi‑LLM serving</b><br>kvcached allows multiple LLMs to share a GPU's memory elastically, enabling concurrent deployment without the rigid memory partitioning used today. This improves GPU utilization and saves serving costs.
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 196px;">
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-serverless.svg" alt="Serverless LLM" width="196" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Serverless LLM</b><br>By allocating KV cache only when needed, kvcached supports serverless deployments where models can spin up and down on demand.
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 196px;">
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-compound.svg" alt="Compound AI systems" width="196" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>Compound AI systems</b><br>kvcached makes compound AI systems practical on limited hardware by elastically allocating memory across specialized models in a pipeline (e.g., retrieval, reasoning, and summarization).
+      </td>
+    </tr>
+    <tr>
+      <td align="left" style="border: none; vertical-align: middle; width: 196px;">
+        <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/uc-colocate.svg" alt="GPU workload colocation" width="196" />
+      </td>
+      <td align="left" style="border: none; vertical-align: middle; padding-left: 8px;">
+        <b>GPU workload colocation</b><br>kvcached allows LLM inference to coexist with other GPU workloads such as training jobs, fine-tuning, or vision models.
+      </td>
+    </tr>
+  </table>
+
+</div>
+
+See concrete examples here: [kvcached/examples](https://github.com/ovg-project/kvcached/tree/main/examples).
+
+## kvcached in action
+
+The following simple example shows how kvcached enables an unmodified vLLM engine run with dynamically allocated memory.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/kvcached-example.gif" alt="kvcached in action" width="90%">
+</p>
+
+## Performance: Multi-LLM serving
+
+kvcached enables dynamic memory sharing between LLMs, allowing them to share the same GPU memory elastically. As a comparison, the current serving engines need to statically reserve GPU memory at startup.
+
+This benchmark shows the performance benefits of kvcached when serving three `Llama-3.1-8B` models on an A100-80G GPU under workloads with intermittent peaks. kvcached can achieve **2-28x TTFT reduction** compared to the current serving engines. This performance gain can be converted to **significant cost savings** for LLM serving. Without kvcached, the systems have to provision more GPUs to achieve the same performance.
+Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ovg-project/kvcached/tree/main/benchmarks/bench_latency_benefit).
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_mean.svg" alt="TTFT mean" width="49%" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/ttft_results/ttft_p99.svg" alt="TTFT p99" width="49%" />
+</p>
+
+## Installation
 
 ### Prerequisites
 
-* Python (tested with 3.9 - 3.11)
-* PyTorch (compatible with SGLang and vLLM)
+- Python (tested with 3.9 - 3.12)
+- SGLang (tested with v0.5.3) or vLLM (tested with v0.11.0)
 
-kvcached can be installed as a plugin with SGLang and vLLM.
+kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
-```bash
-cd engine_integration/scripts
-# install kvcached with SGLang v0.4.9
-./setup.sh --engine sglang --engine-method source --engine-version 0.4.9
-# install kvcached with vLLM v0.9.2
-./setup.sh --engine vllm --engine-method source --engine-version 0.9.2
-```
-
-This script will download the specified versions of SGLang and vLLM, create separate venv environments (using `uv`), compile the code, apply the necessary patches, and install kvcached.
-
-## Run kvcached with Docker
-
-You can test or develop kvcached with Docker.
-
-To test kvcached with SGLang or VLLM.
+### Install from PyPI
 
 ```bash
-docker pull ghcr.io/ovg-project/[kvcached-sglang|kvcached-vllm]:latest
+pip install kvcached --no-build-isolation
 ```
 
-For developmenet:
+### Install from source
+
+```bash
+# under the project root folder
+
+pip install -e . --no-build-isolation --no-cache-dir
+python tools/dev_copy_pth.py
+```
+
+### Using Docker
+
+kvcached installed with original engine dockers.
+
+```bash
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.3
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.11.0
+```
+
+We prepare an all-in-one docker for developers:
 
 ```bash
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
-More instructions can be found [here](./docker/README.md).
+More instructions can be found [here](https://github.com/ovg-project/kvcached/blob/main/docker/README.md). GB200 dockers are on the way.
 
 ## Testing
 
-kvcached can be enabled or disabled by `export ENABLE_KVCACHED=true` or `false`. To verify the successful installation and benchmark the performance of SGLang/vLLM with kvcached, run:
+kvcached can be enabled by setting the following environmental variables:
+
+```bash
+export ENABLE_KVCACHED=true
+export KVCACHED_AUTOPATCH=1
+
+# memory stats ipc name (optional)
+export KVCACHED_IPC_NAME=[SGLANG|VLLM]
+```
+
+If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts. For example:
+
+```bash
+# for sglang
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B --disable-radix-cache --port 30000
+python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
+
+# for vllm
+vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-caching --port=12346
+vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
+```
+
+> [!NOTE]
+> kvcached hasn't supported prefix caching/sharing yet because that will prevent kvcached from releasing the memory after requests finish. Remember to use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+
+If you installed kvcached using its source code, you can also do the following:
 
 ```bash
 cd benchmarks/simple_bench
-export VENV_PATH=../../engine_integration/[sglang|vllm]-kvcached-venv
 ./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
 # Wait until LLM server is ready
 ./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
 ```
 
-The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run SGLang/vLLM with kvcached.
+The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
 
-## Memory monitoring and control via kvcached CLI
+## Roadmap
 
-kvcached includes a built-in CLI tool that allows you to monitor GPU memory usage and manage memory limits across different applications. A command `kvctl` is installed along with kvcached package:
+The latest roadmap is also tracked in [issue #125](https://github.com/ovg-project/kvcached/issues/125).
 
-```bash
-kvctl
-```
-
-Once inside the CLI, type `help` to view all supported commands:
-
-```
-kvcached> help
-Available commands:
-  list [ipc ...]               List IPC segments and usage
-  limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
-  limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
-  watch [-n sec] [ipc ...]     Continuously display usage table
-  kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
-  !<shell cmd>                 Run command in system shell
-  help                         Show this help message
-  delete <ipc>                 Delete IPC segment and its limit entry
-  exit | quit                  Exit the shell
-
-kvcached>
-```
-
-Use the `kvtop` command for real-time visualization of memory usage:
-
-<!-- KVCache memory monitor (muted colours) -->
-<pre>
-<span style="color:#009ACD; font-weight:bold;">KVCache Memory Usage</span>
-
-<span style="color:#009ACD;">IPC: SGLANG</span>
-<span style="color:#009ACD;">[</span><span style="color:#B7A800;">==</span><span style="color:#009E8F;">##################</span><span style="color:#666666;">----------------------------------------</span><span style="color:#009ACD;">]</span>
-Prealloc: 792.0&nbsp;MB | Used: 11.2&nbsp;GB / 39.9&nbsp;GB (30.1%) | Free: 27.9&nbsp;GB
-
-<span style="color:#009ACD;">IPC: VLLM</span>
-<span style="color:#009ACD;">[</span><span style="color:#B7A800;">==</span><span style="color:#009E8F;">#######</span><span style="color:#666666;">--------------------------------------------------- </span><span style="color:#009ACD;">]</span>
-Prealloc: 768.0&nbsp;MB | Used: 3.6&nbsp;GB / 37.4&nbsp;GB (11.7%) | Free: 33.0&nbsp;GB
-
-<span style="color:#009ACD;">GPU Memory Usage</span>
-<span style="color:#009ACD;">[</span><span style="color:#B7A800;">########################################</span><span style="color:#666666;">--------------------</span><span style="color:#009ACD;">]</span>
-Used: 52.9&nbsp;GB / 79.2&nbsp;GB (66.8%) | Free: 26.3&nbsp;GB
-
-<span style="color:#555555;">Press 'q' to quit</span>
-</pre>
+- **Engine integration**
+  - [x] SGLang and vLLM
+  - [ ] Ollama (in progress)
+  - [ ] llama.cpp and LMStudio
+- **Features**
+  - [x] Tensor parallelism
+  - [ ] Prefix caching
+  - [ ] KV cache offloading to host memory
+  - [ ] More attention types (sliding window attention, linear attention, vision encoder, etc.)
+- **Performance optimizations**
+  - [x] Contiguous KV tensor layout
+  - [x] Physical memory management
+- **Hardware**
+  - [x] NVIDIA GPUs
+  - [ ] AMD GPUs
 
 ## Contributing
 
@@ -121,10 +218,30 @@ pre-commit run --all-files
 
 ## Contacts
 
-Feel free to contact us for contributions and collaborations.
+kvcached is developed by many contributors from the community. Feel free to contact us for contributions and collaborations.
 
 ```
 Jiarong Xing (jxing@rice.edu)
 Yifan Qiao (yifanqiao@berkeley.edu)
 Shan Yu (shanyu1@g.ucla.edu)
+```
+
+## Citation
+
+If you find kvcached useful, please cite our paper:
+
+```bibtex
+@article{xing2025towards,
+  title={Towards Efficient and Practical GPU Multitasking in the Era of LLM},
+  author={Xing, Jiarong and Qiao, Yifan and Mo, Simon and Cui, Xingqi and Sela, Gur-Eyal and Zhou, Yang and Gonzalez, Joseph and Stoica, Ion},
+  journal={arXiv preprint arXiv:2508.08448},
+  year={2025}
+}
+
+@article{yu2025prism,
+  title={Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving},
+  author={Yu, Shan and Xing, Jiarong and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Wang, Yang and Yang, Shuo and Xie, Zhiqiang and Cao, Shiyi and Bao, Ke and others},
+  journal={arXiv preprint arXiv:2505.04021},
+  year={2025}
+}
 ```

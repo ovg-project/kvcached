@@ -63,15 +63,16 @@ def alloc_kv_cache(
     device: str,
     num_layers: int,
     page_size: int = 1,
-    attention_type: str = "MHA",  # TODO: support MLA
+    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not _kvcached_initialized:
-        raise RuntimeError(
-            "kvcached is not initialized. Please call init_kvcached() first.")
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type != "MHA":
+    if attention_type not in ["MHA", "GQA"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
+    num_k_or_v = 2
+    requested_num_tokens = kvcache_shape[0]
 
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
@@ -86,38 +87,39 @@ def alloc_kv_cache(
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
-    num_tokens = kvcache_shape[0]
     block_mem_size = math.prod(kvcache_shape[1:]) * dtype.itemsize
-    blocks_per_page = PAGE_SIZE // block_mem_size
 
-    gpu_mem_size = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
+    # round down to page size
+    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
-    # Calculate virtual memory size based on layout
-    # For contiguous layout, C++ will handle num_layers multiplication
-    # So we still calculate per-layer size and let C++ multiply
-    num_pages = gpu_mem_size // num_layers // 2 // PAGE_SIZE
-    virtual_mem_size = num_pages * PAGE_SIZE * 2
+    raw_kv_tensors = create_kv_tensors(
+        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers
+    )
 
-    raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
-                                       device, num_layers)
+    num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_size
+    num_tokens = num_blocks_per_layer * block_size
+    if requested_num_tokens > num_tokens:
+        logger.warning(
+            f"Requested {requested_num_tokens} tokens, but only {num_tokens} tokens are available."
+        )
 
-    assert block_size * blocks_per_page * num_pages >= num_tokens, \
-        "Not enough memory to allocate KV cache."
-    num_tokens = block_size * blocks_per_page * num_pages
     actual_kvcache_shape: List[int] = list(kvcache_shape)
-    actual_kvcache_shape[0] = num_tokens
+    actual_kvcache_shape[0] = block_size * num_blocks_per_layer
 
     k_tensors, v_tensors = [], []
 
     if not _contiguous_layout:
+        num_eles = num_k_or_v * math.prod(actual_kvcache_shape)
         for t in raw_kv_tensors:
-            t = t.view(2, *actual_kvcache_shape).view(dtype=dtype)
+            t = t.view(dtype=dtype)[:num_eles].view(num_k_or_v, *actual_kvcache_shape)
             k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
             v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
     else:
-        contiguous_tensor = raw_kv_tensors[0].view(
-            num_tokens, num_layers, 2,
-            *actual_kvcache_shape[1:]).view(dtype=dtype)
+        contiguous_shape = (num_tokens, num_layers, num_k_or_v, *actual_kvcache_shape[1:])
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         for i in range(num_layers):
             k_tensors.append(contiguous_tensor[:, i, 0, :, :])
             v_tensors.append(contiguous_tensor[:, i, 1, :, :])
@@ -125,14 +127,15 @@ def alloc_kv_cache(
     return k_tensors, v_tensors
 
 
-def get_kv_cache_manager(num_blocks: int,
-                         block_size: int,
-                         cell_size: int,
-                         num_layers: int,
-                         reserve_null_block: bool = True) -> KVCacheManager:
+def get_kv_cache_manager(
+    num_blocks: int,
+    block_size: int,
+    cell_size: int,
+    num_layers: int,
+    reserve_null_block: bool = True,
+) -> KVCacheManager:
     if not _kvcached_initialized:
-        raise RuntimeError(
-            "kvcached is not initialized. Please call init_kvcached() first.")
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
     return KVCacheManager(
         num_blocks,

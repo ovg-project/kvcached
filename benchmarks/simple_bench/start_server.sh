@@ -32,7 +32,7 @@ Options:
   -h, --help     Show this help and exit
 
 Example:
-  $0 vllm --venv-path ../../engine_integration/vllm-kvcached-venv --model meta-llama/Llama-3.2-1B
+  $0 vllm --venv-path ../../engine_integration/vllm-pip-venv --model meta-llama/Llama-3.2-1B
 EOF
 }
 

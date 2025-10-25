@@ -12,11 +12,11 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 
 # Version ranges for vLLM support
-VLLM_V8_RANGE = "<0.8.5"  # vLLM 0.8.x versions
-VLLM_V9_PLUS_RANGE = ">=0.8.5"  # vLLM 0.9.x+ versions
-VLLM_V9_RANGE = ">=0.8.5,<=0.9.2"  # vLLM 0.9.x versions
+VLLM_V8_RANGE = ">=0.8.4,<=0.8.5"  # vLLM 0.8.x versions
+VLLM_V9_PLUS_RANGE = ">0.8.5"  # vLLM 0.9.x+ versions
+VLLM_V9_RANGE = ">0.8.5,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions
-VLLM_ALL_RANGE = ">=0.8.1"  # All supported versions
+VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
 
 
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
@@ -253,6 +253,9 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=getattr(self, "enable_caching", False),
             )
+            for manager in self.single_type_managers:
+                manager.block_pool = self.block_pool
+                manager._null_block = self.block_pool.null_block
 
         # Add helper methods to the instance
         KVCacheCoordinator._setup_kvcached_coordinator = _setup_kvcached_coordinator
@@ -279,8 +282,10 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         return self.patch_kvcache_manager(kvcache_manager_mod)
 
     @version_range(VLLM_V8_RANGE)
-    def patch_kvcache_manager(self, kvcache_manager_mod: types.ModuleType) -> bool:
+    def patch_kvcache_manager(self,
+                              kvcache_manager_mod: types.ModuleType) -> bool:
         """Patch KVCacheManager"""
+        import inspect
         KVCacheManager = self._get_target_class(kvcache_manager_mod)
         if KVCacheManager is None:
             return False
@@ -290,6 +295,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = KVCacheManager.__init__
+        sig = inspect.signature(original_init)
         logger = self.logger  # Capture logger in closure
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
@@ -299,12 +305,18 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 return
 
             try:
-                self._setup_kvcached_manager()
+                bound_args = sig.bind(self, *args, **kwargs)
+                bound_args.apply_defaults()
+                kv_cache_config = bound_args.arguments.get('kv_cache_config')
+                if kv_cache_config is None:
+                    raise ValueError("kv_cache_config is required")
+
+                self._setup_kvcached_manager(kv_cache_config)
             except Exception as e:
                 logger.warning("Failed to patch kv_cache_manager: %s", e)
                 return
 
-        def _setup_kvcached_manager(self) -> None:
+        def _setup_kvcached_manager(self, kv_cache_config: Any) -> None:
             enable_caching = getattr(self, "enable_caching", False)
             if enable_caching:
                 raise ValueError("Caching is not supported for kvcached")
@@ -317,20 +329,32 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
 
             # Get required attributes from the manager instance
             # This is a bit hacky but simplest
-            kv_cache_spec = getattr(self, "get_kv_cache_spec")().items()[0][1]
+            if hasattr(self, "get_kv_cache_spec"):
+                kv_cache_spec = getattr(self,
+                                        "get_kv_cache_spec")().items()[0][1]
+            elif hasattr(self, "specialized_manager"):
+                kv_cache_spec = getattr(self,
+                                        "specialized_manager").kv_cache_spec
+            else:
+                raise ValueError(
+                    "Unable to determine kv_cache_spec: expected get_kv_cache_spec or specialized_manager"
+                )
+
             block_size = getattr(self, "block_size")
             num_gpu_blocks = getattr(self, "num_gpu_blocks")
-            kv_cache_config = getattr(self, "kv_cache_config", None)
 
             # Calculate cell_size
             cell_size = kv_cache_spec.page_size_bytes // block_size // 2
 
             # Determine number of layers
-            if kv_cache_config and hasattr(kv_cache_config, "tensors"):
+            if hasattr(kv_cache_config, "tensors"):
                 num_layers = len(kv_cache_config.tensors)
+            elif hasattr(kv_cache_config, "kv_cache_tensors"):
+                num_layers = len(kv_cache_config.kv_cache_tensors)
             else:
-                # Fallback - try to get from other attributes
-                num_layers = getattr(self, "num_layers", 1)
+                raise ValueError(
+                    "Unable to determine num_layers: expected tensors or kv_cache_tensors in kv_cache_config"
+                )
 
             # Replace the block pool with ElasticBlockPool
             self.block_pool = ElasticBlockPool(
@@ -340,6 +364,10 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=enable_caching,
             )
+            if hasattr(self, "specialized_manager"):
+                self.specialized_manager.block_pool = self.block_pool
+                if hasattr(self.specialized_manager, "_null_block"):
+                    self.specialized_manager._null_block = self.block_pool.null_block
 
         # Add helper methods to the class
         KVCacheManager._setup_kvcached_manager = _setup_kvcached_manager

@@ -12,10 +12,10 @@ import numpy as np
 import seaborn as sns
 
 # Set paper-ready style
-plt.style.use('seaborn-v0_8-whitegrid')
+plt.style.use('seaborn-v0_8-white')
 sns.set_palette("husl")
 plt.rcParams.update({
-    'font.size': 14,
+    'font.size': 18,
     'font.family': 'serif',
     'axes.linewidth': 1.2,
     'axes.spines.left': True,
@@ -104,17 +104,17 @@ def create_chart(true_values, false_values, metric_name, comp_len):
             speedup = false_val / true_val
             y_pos = max(true_val, false_val) * 1.08
             ax.text(x_positions[i], y_pos, f'{speedup:.1f}×',
-                   ha='center', va='bottom', fontsize=12, fontweight='bold',
+                   ha='center', va='bottom', fontsize=16, fontweight='bold',
                    color='#FFFFFF', bbox=dict(boxstyle="round,pad=0.3",
                                             facecolor='#2E7D32', alpha=0.9))
 
-    ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=16)
-    ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=16)
-    # ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=18, pad=20)
+    ax.set_xlabel('Request Rate (req/s)', fontweight='bold', fontsize=20)
+    ax.set_ylabel(f'{metric_name} TTFT (ms)', fontweight='bold', fontsize=20)
+    ax.set_title(f'{metric_name} Time to First Token', fontweight='bold', fontsize=22, pad=20)
     ax.set_xticks(x_positions)
     ax.set_xticklabels(REQRATES)
     ax.set_yscale('log')
-    ax.legend(loc='upper left', framealpha=0.95, fontsize=14)
+    ax.legend(loc='upper left', framealpha=0.95, fontsize=18)
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
 
     # Clean layout
@@ -125,16 +125,16 @@ def create_chart(true_values, false_values, metric_name, comp_len):
 
     plt.tight_layout()
 
-    output_filename = f'ttft_{metric_name.lower()}.png'
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight',
+    output_filename = f'ttft_{metric_name.lower()}.svg'
+    plt.savefig(output_filename, format='svg', bbox_inches='tight',
                facecolor='white', edgecolor='none')
     plt.close()
     print(f"Saved: {output_filename}")
 
 
 def main():
+    # base_path = "results/metrics"
     base_path = "/workspace/kvcached/benchmarks/bench_latency_benefit/results/metrics/ttft_raw_data"
-
     print("Loading metrics data...")
     data = load_metrics_data(base_path)
 

@@ -219,25 +219,41 @@ class PageAllocator:
 
     def alloc_page(self) -> Page:
         with self._lock:
-            if self.num_free_pages <= 0:
-                raise ValueError("No free pages left")
-            self.num_free_pages -= 1
+            page_id: Optional[int] = None
 
-            # Fast path: allocate pages with reserved physical memory mapping.
-            if self.reserved_page_list:
-                page_id = self.reserved_page_list.popleft()
+            while page_id is None:
+                # Fast path: allocate pages with reserved physical memory mapping.
+                if self.reserved_page_list:
+                    page_id = self.reserved_page_list.popleft()
+                    self.num_free_pages -= 1
 
-                # Trigger preallocation to refill reserved pool if getting low
-                if len(self.reserved_page_list) < self.min_reserved_pages:
-                    self.prealloc_needed = True
-                    self._cond.notify()
+                    # Trigger preallocation to refill reserved pool if getting low
+                    if len(self.reserved_page_list) < self.min_reserved_pages:
+                        self.prealloc_needed = True
+                        self._cond.notify_all()
 
-                # Update memory usage after fast path allocation
-                self._update_memory_usage()
-                return Page(page_id, self.page_size)
+                    # Update memory usage after fast path allocation
+                    self._update_memory_usage()
+                    return Page(page_id, self.page_size)
 
-            # Slow path: allocate pages with new physical memory mapping.
-            page_id = self.free_page_list.popleft()
+                # Slow path: allocate pages with new physical memory mapping.
+                if self.free_page_list:
+                    page_id = self.free_page_list.popleft()
+                    self.num_free_pages -= 1
+                    break
+
+                if self.num_free_pages <= 0:
+                    raise ValueError("No free pages left")
+
+                if not self.enable_page_prealloc:
+                    raise RuntimeError(
+                        "Inconsistent page allocator state: no free pages "
+                        "available to allocate")
+
+                # Wait for background preallocation or page freeing to finish.
+                self._cond.wait()
+
+        assert page_id is not None
 
         try:
             self._map_pages([page_id])
@@ -246,6 +262,7 @@ class PageAllocator:
             with self._lock:
                 self.free_page_list.appendleft(page_id)
                 self.num_free_pages += 1
+                self._cond.notify_all()
             raise RuntimeError(f"Failed to map page {page_id}: {e}") from e
 
         if self.enable_page_prealloc:
@@ -268,6 +285,7 @@ class PageAllocator:
                 self.reserved_page_list.append(page_id)
                 # Update memory usage after fast path free/reserve
                 self._update_memory_usage()
+                self._cond.notify_all()
                 return
 
         # Slow path: free page and its physical memory mapping.
@@ -276,6 +294,7 @@ class PageAllocator:
             self.free_page_list.append(page_id)
             # Update memory usage after unmapping pages
             self._update_memory_usage()
+            self._cond.notify_all()
 
     def free_pages(self, page_ids: List[int]) -> None:
         with self._lock:
@@ -292,6 +311,7 @@ class PageAllocator:
             if num_to_reserve > 0:
                 # Fast path: reserve pages with their physical memory mapping.
                 self.reserved_page_list.extend(page_ids[:num_to_reserve])
+                self._cond.notify_all()
                 page_ids = page_ids[num_to_reserve:]
 
         if len(page_ids) == 0:
@@ -305,6 +325,7 @@ class PageAllocator:
             self.free_page_list.extend(page_ids)
             # Update memory usage after unmapping pages
             self._update_memory_usage()
+            self._cond.notify_all()
 
     def resize(self, new_mem_size: int) -> bool:
         new_num_pages = new_mem_size // self.page_size
@@ -449,6 +470,7 @@ class PageAllocator:
                         self.reserved_page_list.extend(pages_to_reserve)
                         # Update memory usage after mapping pages
                         self._update_memory_usage()
+                        self._cond.notify_all()
                     logger.debug(
                         f"Preallocated {len(pages_to_reserve)} pages, "
                         f"reserved={len(self.reserved_page_list)}")
@@ -456,6 +478,7 @@ class PageAllocator:
                     # If mapping fails, return pages to free list
                     with self._lock:
                         self.free_page_list.extendleft(pages_to_reserve)
+                        self._cond.notify_all()
                     logger.error(
                         f"Failed to preallocate {len(pages_to_reserve)} pages: "
                         f"{e}")
@@ -486,7 +509,7 @@ class PageAllocator:
         """Trigger the preallocation thread to fill up reserved blocks"""
         with self._lock:
             self.prealloc_needed = True
-            self._cond.notify()
+            self._cond.notify_all()
 
     def _map_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:

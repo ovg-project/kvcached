@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvcached"
-version = "0.0.2"
+version = "0.1.2"
 authors = [
     {name = "The kvcached team"}
 ]
@@ -70,9 +70,6 @@ exclude = ["*__pycache__*"]
 
 [tool.setuptools.package-data]
 kvcached = ["*.so", "*.pyi", "py.typed"]
-
-[tool.setuptools.data-files]
-"" = ["kvcached_autopatch.pth"]
 
 [tool.mypy]
 plugins = ['pydantic.mypy']

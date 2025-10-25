@@ -31,6 +31,14 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
+static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
+  size_t num_eles = tensor.numel() * tensor.element_size();
+  ASSERT(num_eles % (2 * kPageSize) == 0,
+         "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
+         num_eles, 2 * kPageSize);
+  return num_eles / 2;
+}
+
 FTensorAllocator::FTensorAllocator(const torch::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
@@ -94,17 +102,28 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
-  kv_tensor_size_per_layer_ = size;
+  // Ensure size is aligned to page size.
+  size_t aligned_size = size;
+  if (size % kPageSize != 0) {
+    aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+    LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
+         kPageSize, aligned_size);
+  }
+  kv_tensor_size_per_layer_ = aligned_size;
 
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page.
     kPageSize *= num_layers * 2;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-    return create_kv_tensors_contiguous_(size, dtype, dev_str, num_layers);
+    // We can use the aligned size directly for contiguous layout too because
+    // both kPageSize and aligned_size are already/will be multiplied by
+    // num_layers.
+    return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
+                                         num_layers);
   } else {
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-    return create_kv_tensors_per_layer_(kv_prefix, size, dtype, dev_str,
+    return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
 }
@@ -142,7 +161,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      auto v_base_offset = get_v_base_offset(tensor);
       for (auto offset : offsets) {
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
@@ -182,7 +201,7 @@ bool FTensorAllocator::unmap_from_kv_tensors(
        * FIXME: (YIFAN) we may support other KV cache layouts later.
        */
       auto tensor = ftensor->get_tensor();
-      auto v_base_offset = (tensor.numel() * tensor.element_size()) / 2;
+      auto v_base_offset = get_v_base_offset(tensor);
       for (auto offset : offsets) {
         ftensor->unmap(offset);
         ftensor->unmap(offset + v_base_offset);
@@ -218,16 +237,10 @@ FTensorAllocator::create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
   // num_layers to get total size
   size_t total_kv_size = size * num_layers;
 
-  // For alignment, we want to align to page boundaries that are kPageSize *
-  // num_layers This ensures proper alignment for Python's page management.
-  // Note that here kPageSize is already multiplied by num_layers.
-  size_t aligned_size =
-      ((total_kv_size + kPageSize - 1) / kPageSize) * kPageSize;
-
   // Create the single contiguous KV tensor (contains K and V for all layers)
   auto contiguous_name = std::string(kv_prefix) + "contiguous";
   contiguous_kv_tensor_ = std::make_unique<FTensor>(
-      contiguous_name, aligned_size, dtype, dev_, zero_page_);
+      contiguous_name, total_kv_size, dtype, dev_, zero_page_);
 
   // Get the contiguous tensor
   auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
@@ -247,7 +260,8 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
     assert(tensor.device() == torch::Device(dev_str));
     return tensor;
   }
-  // Create a new FTensor.
+
+  // Create a new FTensor
   ftensors_[name] =
       std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
   return ftensors_[name]->get_tensor();

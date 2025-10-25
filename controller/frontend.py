@@ -3,16 +3,15 @@
 
 import asyncio
 import json
-import shlex
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import yaml
 from aiohttp import web
 from router import LLMRouter
 from sleep_manager import SleepConfig, SleepManager
 from traffic_monitor import TrafficMonitor
-from utils import set_ulimit
+from utils import extract_models_mapping, set_ulimit
 
 from kvcached.utils import get_kvcached_logger
 
@@ -26,7 +25,7 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
 
     # Extract model configurations for sleep manager from parsed instances
     vllm_config, sglang_config = {}, {}
-    endpoints = _extract_models_mapping(
+    endpoints = extract_models_mapping(
         raw_cfg)  # {model: {'endpoint': {...}}}
     for model_name, entry in endpoints.items():
         endpoint_info = entry["endpoint"]
@@ -463,7 +462,7 @@ class MultiLLMFrontend:
                 "idle_threshold_seconds":
                 self.sleep_manager.config.idle_threshold_seconds,
                 "wakeup_on_request":
-                self.sleep_manager.config.wake_on_request
+                self.sleep_manager.config.wakeup_on_request
             }),
                                 status=200,
                                 content_type='application/json')
@@ -600,67 +599,6 @@ class MultiLLMFrontend:
             await runner.cleanup()
 
 
-def _extract_models_mapping(
-        raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Build the model→endpoint mapping consumed by the router frontend.
-
-    This mirrors the logic in controller.launch so that the frontend can run
-    standalone given only the master YAML config file.
-    """
-
-    models_mapping: Dict[str, Dict[str, Any]] = {}
-
-    for inst in raw_cfg.get("instances", []):
-        model_name = inst["model"]
-        engine_name = inst["engine"]
-
-        # Defaults
-        host: str = "localhost"
-        port: Optional[int] = None
-
-        raw_args = inst.get("engine_args", inst.get("args", []))
-
-        # Normalize args to a flat list of strings
-        if isinstance(raw_args, str):
-            arg_list: List[str] = shlex.split(raw_args)
-        else:
-            arg_list: List[str] = []
-            for item in raw_args:
-                arg_list.extend(shlex.split(str(item)))
-
-        # Detect --host / --port options
-        for idx, token in enumerate(arg_list):
-            if token.startswith("--host="):
-                host = token.split("=", 1)[1]
-            elif token == "--host" and idx + 1 < len(arg_list):
-                host = arg_list[idx + 1]
-            elif token.startswith("--port="):
-                try:
-                    port = int(token.split("=", 1)[1])
-                except ValueError:
-                    pass
-            elif token == "--port" and idx + 1 < len(arg_list):
-                try:
-                    port = int(arg_list[idx + 1])
-                except ValueError:
-                    pass
-
-        if port is None:
-            logger.warning(
-                "Could not determine port for model %s – skipping in router mapping",
-                model_name,
-            )
-            continue
-
-        models_mapping[model_name] = {
-            "endpoint": {
-                "host": host,
-                "port": port,
-                "engine": engine_name
-            }
-        }
-
-    return models_mapping
 
 
 async def main():
@@ -685,7 +623,7 @@ async def main():
     with cfg_path.open("r") as f:
         raw_cfg = yaml.safe_load(f)
 
-    models_mapping = _extract_models_mapping(raw_cfg)
+    models_mapping = extract_models_mapping(raw_cfg)
     models_config = {"models": models_mapping}
 
     # Build SleepConfig from YAML

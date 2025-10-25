@@ -56,7 +56,7 @@ bash start_two_models.sh \
   --engine-a vllm --engine-b vllm \
   --model-a meta-llama/Llama-3.2-1B --port-a 12346 \
   --model-b Qwen/Qwen3-0.6B        --port-b 12347 \
-  --venv-vllm-path ../../engine_integration/vllm-v0.9.2/.venv
+  --venv-vllm-path ${VENV_PATH}
 ```
 
 (2) In a separate terminal, send simple requests:

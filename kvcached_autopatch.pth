@@ -1,1 +1,1 @@
-import importlib, os; os.environ.setdefault("KVCACHED_AUTOPATCH", "1"); importlib.import_module("kvcached.autopatch")
+import os, importlib, importlib.util; (os.environ.setdefault("KVCACHED_AUTOPATCH", "1"), getattr(importlib.import_module("kvcached.autopatch"), "autopatch_all", lambda: None)()) if os.getenv("ENABLE_KVCACHED", "false").lower() in ("true", "1") and importlib.util.find_spec("kvcached.autopatch") is not None else None

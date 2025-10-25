@@ -32,9 +32,17 @@ ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 WORKDIR /workspace
 
 RUN git clone https://github.com/ovg-project/kvcached.git
+WORKDIR /workspace/kvcached
+# Force refresh
+ARG CACHE_BREAKER=none
+RUN git pull
 WORKDIR /workspace/kvcached/engine_integration/scripts
-RUN chmod +x setup.sh && ./setup.sh all
+RUN chmod +x setup.sh
+RUN ./setup.sh --engine vllm --method source --version 0.11.0
+RUN ./setup.sh --engine sglang --method source --version 0.5.3
 
+ENV ENABLE_KVCACHED=true
+ENV KVCACHED_AUTOPATCH=1
 
 EXPOSE 8080 12346 30000 30001
 

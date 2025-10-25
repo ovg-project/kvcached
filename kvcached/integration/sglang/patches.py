@@ -46,6 +46,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
 
         try:
             import torch
+
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
 
             class ElasticTokenToKVPoolAllocator(
@@ -54,13 +55,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                 def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
                     super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
-                        raise ValueError(
-                            "ElasticTokenToKVPoolAllocator requires elastic MHA pool"
-                        )
+                        raise ValueError("ElasticTokenToKVPoolAllocator requires elastic MHA pool")
                     if "cuda" not in device:
-                        raise ValueError(
-                            "ElasticTokenToKVPoolAllocator only supports cuda device"
-                        )
+                        raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
                     self.kvcached_allocator = kvcache.kvcached_allocator
 
                 def available_size(self):
@@ -149,16 +146,15 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     enable_memory_saver: bool,
                     start_layer: Union[int, None] = None,
                     end_layer: Union[int, None] = None,
-                    enable_overlap_schedule: bool = True,
                     *args,
                     **kwargs,
                 ) -> None:
-                    # Call grandparent (KVCache) initializer because we redefine
-                    # all member variables.
-                    super(MHATokenToKVPool, self).__init__(
+                    super().__init__(
                         size=size,
                         page_size=page_size,
                         dtype=dtype,
+                        head_num=head_num,
+                        head_dim=head_dim,
                         layer_num=layer_num,
                         device=device,
                         enable_memory_saver=enable_memory_saver,
@@ -167,31 +163,12 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         *args,
                         **kwargs,
                     )
-                    self.head_num = head_num
-                    self.head_dim = head_dim
-                    try:
-                        import torch
-                        from sglang.srt.utils import is_cuda
+                    import kvcached.integration.sglang.interfaces as kvi
 
-                        import kvcached.integration.sglang.interfaces as kvi
-
-                        # Initialize kvcached with overlap scheduling if requested
-                        kvi.init_kvcached(async_sched=enable_overlap_schedule)
-                        # Per-token KV bytes
-                        self.cell_size = self.head_num * self.head_dim * dtype.itemsize
-                        # Elastic allocator
-                        self.kvcached_allocator = kvi.get_kv_cache_manager(
-                            size + page_size, page_size, self.cell_size, layer_num
-                        )
-                    except Exception:
-                        raise
-
-                    # Allocate K/V buffers via kvcached
-                    self._create_buffers()
-
-                    self.layer_transfer_counter = None
-                    self.device_module = torch.get_device_module(self.device)
-                    self.alt_stream = self.device_module.Stream() if is_cuda() else None
+                    self.cell_size = self.head_num * self.head_dim * dtype.itemsize
+                    self.kvcached_allocator = kvi.get_kv_cache_manager(
+                        size + page_size, page_size, self.cell_size, layer_num
+                    )
 
                     k_size, v_size = self.get_kv_size_bytes()
                     GB = 1024**3
@@ -220,6 +197,9 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # Initialize kvcached with overlap scheduling to be conservative
+                    kvi.init_kvcached(async_sched=True)
+
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
                     self.k_buffer, self.v_buffer = kvi.alloc_kv_cache(
@@ -245,9 +225,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     elems_per_token = self.head_num * self.head_dim
                     bytes_per_elem = self.dtype.itemsize
 
-                    k_size_bytes = (
-                        self.layer_num * total_tokens * elems_per_token * bytes_per_elem
-                    )
+                    k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
                     v_size_bytes = k_size_bytes
 
                     return k_size_bytes, v_size_bytes

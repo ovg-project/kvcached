@@ -5,6 +5,7 @@ import argparse
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -14,6 +15,39 @@ from utils import collect_env_mods, ensure_tmux_session, launch_in_tmux
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
+
+# Tmux session name prefix for kvcached sessions
+TMUX_SESSION_PREFIX = "kvcached-"
+
+
+def _list_kvcached_sessions() -> List[str]:
+    """List all running kvcached tmux sessions."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        sessions = [s for s in result.stdout.strip().split('\n') if s.startswith(TMUX_SESSION_PREFIX)]
+        return sessions
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+
+def _kill_all_kvcached_sessions() -> None:
+    """Kill all running kvcached tmux sessions."""
+    sessions = _list_kvcached_sessions()
+    if not sessions:
+        logger.info("No kvcached tmux sessions found.")
+        return
+
+    for session in sessions:
+        logger.info("Killing tmux session: %s", session)
+        try:
+            subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.error("Failed to kill session %s: %s", session, e)
 
 
 def _parse_cfg(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -129,53 +163,6 @@ def _build_command(inst: Dict[str, Any]) -> List[str]:
     return cmd
 
 
-def _extract_models_mapping(
-        raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Build the model→endpoint mapping consumed by the router frontend."""
-    models_mapping: Dict[str, Dict[str, Any]] = {}
-
-    for inst in raw_cfg.get("instances", []):
-        model_name = inst["model"]
-
-        # Defaults
-        host = "localhost"
-        port = None
-
-        raw_args = inst.get("engine_args", inst.get("args", []))
-        if isinstance(raw_args, str):
-            arg_list = shlex.split(raw_args)
-        else:
-            arg_list: List[str] = []
-            for item in raw_args:
-                arg_list.extend(shlex.split(str(item)))
-
-        for idx, token in enumerate(arg_list):
-            if token.startswith("--host="):
-                host = token.split("=", 1)[1]
-            elif token == "--host" and idx + 1 < len(arg_list):
-                host = arg_list[idx + 1]
-            elif token.startswith("--port="):
-                try:
-                    port = int(token.split("=", 1)[1])
-                except ValueError:
-                    pass
-            elif token == "--port" and idx + 1 < len(arg_list):
-                try:
-                    port = int(arg_list[idx + 1])
-                except ValueError:
-                    pass
-
-        if port is None:
-            logger.warning(
-                "Could not determine port for model %s – skipping in router mapping",
-                model_name)
-            continue
-
-        models_mapping[model_name] = {"endpoint": {"host": host, "port": port}}
-
-    return models_mapping
-
-
 def _launch_instances(instances_cfg: List[Dict[str, Any]],
                       global_env: Dict[str, str],
                       launch_delay: int = 0) -> List[Dict[str, Any]]:
@@ -183,7 +170,7 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
     launched: List[Dict[str, Any]] = []
 
     for idx, inst in enumerate(instances_cfg):
-        session_name = f"kvcached-{inst['name']}"
+        session_name = f"{TMUX_SESSION_PREFIX}{inst['name']}"
 
         # Ensure tmux session exists (detached)
         if not ensure_tmux_session(session_name):
@@ -198,6 +185,14 @@ def _launch_instances(instances_cfg: List[Dict[str, Any]],
                 "Launched %s in tmux session '%s'. tmux attach -t %s to attach",
                 inst["name"], session_name, session_name)
             launched.append(inst)
+
+            # Add delay between launches if specified and not the last instance
+            if launch_delay > 0 and idx < len(instances_cfg) - 1:
+                logger.info(
+                    "Waiting %d seconds before launching next instance...",
+                    launch_delay)
+                time.sleep(launch_delay)
+
         except subprocess.CalledProcessError as e:
             logger.error("Failed to launch %s: %s", inst["name"], e)
 
@@ -211,7 +206,7 @@ def _maybe_launch_router(router_cfg: Dict[str, Any],
         logger.info("Router launch disabled via configuration.")
         return
 
-    frontend_session = "kvcached-frontend"
+    frontend_session = f"{TMUX_SESSION_PREFIX}frontend"
     if not ensure_tmux_session(frontend_session):
         return
 
@@ -244,6 +239,13 @@ def main() -> None:
                         type=Path,
                         default="example-config.yaml",
                         help="Path to YAML config file")
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument("--kill-all",
+                               action="store_true",
+                               help="Kill all existing kvcached tmux sessions and exit")
+    session_group.add_argument("--list-sessions",
+                               action="store_true",
+                               help="List all running kvcached tmux sessions and exit")
     args = parser.parse_args()
 
     cfg_path = args.config.expanduser().resolve()
@@ -268,7 +270,23 @@ def main() -> None:
         logger.error("Invalid configuration: %s", e)
         sys.exit(1)
 
-    _launch_instances(instances_cfg, global_kvcached_env)
+    # Handle special command flags
+    if args.kill_all:
+        _kill_all_kvcached_sessions()
+        return
+
+    if args.list_sessions:
+        sessions = _list_kvcached_sessions()
+        if sessions:
+            logger.info("Running kvcached tmux sessions: %s", ", ".join(sessions))
+        else:
+            logger.info("No kvcached tmux sessions found.")
+        return
+
+    # Extract launch delay from top-level configuration
+    launch_delay = raw_cfg.get("launch_delay_seconds", 0)
+
+    _launch_instances(instances_cfg, global_kvcached_env, launch_delay)
     _maybe_launch_router(router_cfg, cfg_path)
 
 

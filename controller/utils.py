@@ -1,15 +1,74 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import resource
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
+
+
+def extract_models_mapping(
+        raw_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build the model→endpoint mapping consumed by the router frontend.
+
+    This mirrors the logic in controller.launch so that the frontend can run
+    standalone given only the master YAML config file.
+    """
+
+    models_mapping: Dict[str, Dict[str, Any]] = {}
+
+    for inst in raw_cfg.get("instances", []):
+        model_name = inst["model"]
+        engine_name = inst["engine"]
+
+        # Defaults
+        host: str = "localhost"
+        port: Optional[int] = None
+
+        raw_args = inst.get("engine_args", inst.get("args", []))
+
+        # Normalize args to a flat list of strings
+        if isinstance(raw_args, str):
+            arg_list: List[str] = shlex.split(raw_args)
+        else:
+            arg_list: List[str] = []
+            for item in raw_args:
+                arg_list.extend(shlex.split(str(item)))
+
+        # Detect --host / --port options
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--host")
+        parser.add_argument("--port", type=int)
+
+        known_args, _ = parser.parse_known_args(arg_list)
+
+        if known_args.host:
+            host = known_args.host
+        if known_args.port is not None:
+            port = known_args.port
+
+        if port is None:
+            logger.warning(
+                "Could not determine port for model %s – skipping in router mapping",
+                model_name,
+            )
+            continue
+
+        models_mapping[model_name] = {
+            "endpoint": {
+                "host": host,
+                "port": port,
+                "engine": engine_name
+            }
+        }
+
+    return models_mapping
 
 
 # Ensure this process has a sufficiently high file-descriptor limit.

@@ -9,13 +9,45 @@ This test connects to real vLLM instances running on localhost.
 import asyncio
 import sys
 from pathlib import Path
+from typing import Dict, List
 
 # Add the controller directory to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "controller"))
 
+from test_utils import load_example_config
+
 from controller.sleep_manager import SleepConfig, SleepManager
 from controller.traffic_monitor import TrafficMonitor
+from controller.utils import extract_models_mapping
+
+
+def load_config_models():
+    """Load model configurations from example-config.yaml"""
+    config = load_example_config()
+
+    models_mapping = extract_models_mapping(config)
+
+    # Transform the result to the format expected by tests
+    models: Dict[str, List[Dict[str, str]]] = {"vllm": [], "sglang": []}
+
+    for model_name, mapping in models_mapping.items():
+        endpoint = mapping["endpoint"]
+        engine = endpoint["engine"]
+        host = endpoint["host"]
+        port = str(endpoint["port"])  # Convert to string for consistency
+
+        if engine in models:
+            models[engine].append({
+                "name": model_name,
+                "host": host,
+                "port": port
+            })
+
+    return models
+
+
+MODELS_CONFIG = load_config_models()
 
 
 async def test_basic_functionality():
@@ -40,8 +72,12 @@ async def test_real_vllm_instances(manager):
     """Test with real vLLM instances from example-config.yaml"""
     print("\n=== Testing Real vLLM Instances ===")
 
-    # Add the real vLLM instances from the config
-    manager.add_vllm_model('meta-llama/Llama-3.2-1B', 'localhost', '12346')
+    # Load vLLM models from the pre-loaded config
+    vllm_models = MODELS_CONFIG["vllm"]
+
+    # Add vLLM instances from the config
+    for model_info in vllm_models:
+        manager.add_vllm_model(model_info["name"], model_info["host"], model_info["port"])
 
     # Get all models
     models = manager.get_vllm_models()
@@ -56,8 +92,12 @@ async def test_sglang_configuration(manager):
     """Test SGLang model configuration management"""
     print("\n=== Testing SGLang Configuration ===")
 
-    # Add SGLang models
-    manager.add_sglang_model('Qwen/Qwen3-0.6B', 'localhost', '30000')
+    # Load SGLang models from the pre-loaded config
+    sglang_models_config = MODELS_CONFIG["sglang"]
+
+    # Add SGLang models from config
+    for model_info in sglang_models_config:
+        manager.add_sglang_model(model_info["name"], model_info["host"], model_info["port"])
 
     # Get all SGLang models
     sglang_models = manager.get_sglang_models()
@@ -79,8 +119,13 @@ async def test_sleep_wake_functionality(manager):
     """Test actual sleep and wake functionality with real vLLM instances"""
     print("\n=== Testing Sleep/Wake Functionality ===")
 
-    # Test with the first model (Llama)
-    test_model = 'meta-llama/Llama-3.2-1B'
+    # Load vLLM models from the pre-loaded config and test with the first one
+    vllm_models = MODELS_CONFIG["vllm"]
+    if not vllm_models:
+        print("⚠ No vLLM models found in config, skipping sleep/wake test")
+        return
+
+    test_model = vllm_models[0]["name"]
 
     print(f"Testing sleep/wake cycle for {test_model}")
 
@@ -136,8 +181,13 @@ async def test_sglang_sleep_wake_functionality(manager):
     """Test actual sleep and wake functionality with SGLang instances"""
     print("\n=== Testing SGLang Sleep/Wake Functionality ===")
 
-    # Test with the SGLang model
-    test_model = 'Qwen/Qwen3-0.6B'
+    # Load SGLang models from the pre-loaded config and test with the first one
+    sglang_models = MODELS_CONFIG["sglang"]
+    if not sglang_models:
+        print("⚠ No SGLang models found in config, skipping SGLang sleep/wake test")
+        return
+
+    test_model = sglang_models[0]["name"]
 
     print(f"Testing SGLang sleep/wake cycle for {test_model}")
 
@@ -265,10 +315,14 @@ async def test_sglang_api_methods_simulation(manager):
     print(f"  get_sglang_models: {hasattr(manager, 'get_sglang_models')}")
 
     # Test model detection logic
-    test_model = 'Qwen/Qwen3-0.6B'
-    print(f"\n✓ Model type detection for '{test_model}':")
-    is_sglang = test_model in manager.config.sglang_models_config
-    print(f"  Detected as SGLang model: {is_sglang}")
+    sglang_models = MODELS_CONFIG["sglang"]
+    if sglang_models:
+        test_model = sglang_models[0]["name"]
+        print(f"\n✓ Model type detection for '{test_model}':")
+        is_sglang = test_model in manager.config.sglang_models_config
+        print(f"  Detected as SGLang model: {is_sglang}")
+    else:
+        print("\n⚠ No SGLang models found in config, skipping model detection test")
 
 
 async def main():
