@@ -12,10 +12,10 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 
 # Version ranges for vLLM support
-VLLM_V8_RANGE = ">=0.8.4,<=0.8.5"  # vLLM 0.8.x versions
-VLLM_V9_PLUS_RANGE = ">0.8.5"  # vLLM 0.9.x+ versions
-VLLM_V9_RANGE = ">0.8.5,<=0.9.2"  # vLLM 0.9.x versions
-VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions
+VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
+VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
+VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
+VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
 
 
