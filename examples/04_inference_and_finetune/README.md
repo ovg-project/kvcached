@@ -131,7 +131,8 @@ You can modify this file or create new configuration files for different finetun
 
 The scripts automatically set up kvcached environment variables:
 
-- `ENABLE_kvcached=true`: Enables kvcached memory sharing
+- `ENABLE_KVCACHED=true`: Enables kvcached memory sharing
+- `KVCACHED_AUTOPATCH=1`: Enables kvcached autopatching
 - `KVCACHED_IPC_NAME`: Sets unique IPC names for different processes, e.g.,
   - `VLLM` for vLLM servers
   - `SGLANG` for SGLang servers
@@ -170,5 +171,6 @@ While both processes are running, you can test the LLM server:
 Key environment variables that affect behavior:
 
 - `CUDA_VISIBLE_DEVICES`: Controls GPU visibility
-- `ENABLE_kvcached`: Enables memory sharing (set automatically)
+- `ENABLE_KVCACHED`: Enables memory sharing (set automatically)
+- `KVCACHED_AUTOPATCH`: Enables autopatching (set automatically)
 - `PYTHON`: Python executable to use (default: python3)

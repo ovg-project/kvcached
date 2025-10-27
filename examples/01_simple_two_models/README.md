@@ -14,7 +14,7 @@ For vLLM:
 
 ```bash
 export ENABLE_KVCACHED=true
-export KVCACHED_IPC_NAME=VLLM
+export KVCACHED_AUTOPATCH=1
 export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 vllm serve "${MODEL}" \
@@ -27,7 +27,7 @@ For SGLang:
 
 ```bash
 export ENABLE_KVCACHED=true
-export KVCACHED_IPC_NAME=SGLANG
+export KVCACHED_AUTOPATCH=1
 python3 -m sglang.launch_server --model "${MODEL}" \
   --disable-radix-cache \
   --trust-remote-code \

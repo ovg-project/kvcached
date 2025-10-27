@@ -16,7 +16,7 @@ if [ "$op" == "vllm" ]; then
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=VLLM
+    export KVCACHED_AUTOPATCH=1
     vllm serve "$MODEL" \
     --disable-log-requests \
     --no-enable-prefix-caching \
@@ -24,7 +24,7 @@ if [ "$op" == "vllm" ]; then
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
     source "$ENGINE_DIR/sglang-v0.4.6.post2/.venv/bin/activate"
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=SGLANG
+    export KVCACHED_AUTOPATCH=1
     export KVCACHED_PAGE_PREALLOC_ENABLED=true
     export KVCACHED_MIN_RESERVED_PAGES=5
     export KVCACHED_MAX_RESERVED_PAGES=100

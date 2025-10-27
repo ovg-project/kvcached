@@ -133,7 +133,7 @@ run_vllm() {
 
     if [[ -n "$venv" ]]; then source "$venv/bin/activate"; fi
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=VLLM
+    export KVCACHED_AUTOPATCH=1
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     vllm serve "$model" \
@@ -155,7 +155,7 @@ run_sgl() {
 
     if [[ -n "$venv" ]]; then source "$venv/bin/activate"; fi
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=SGLANG
+    export KVCACHED_AUTOPATCH=1
     $PYTHON -m sglang.launch_server --model "$model" \
       --disable-radix-cache \
       --trust-remote-code \

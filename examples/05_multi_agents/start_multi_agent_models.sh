@@ -174,7 +174,7 @@ run_vllm() {
     fi
 
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=VLLM
+    export KVCACHED_AUTOPATCH=1
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
@@ -204,7 +204,7 @@ run_sgl() {
     fi
 
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=SGLANG
+    export KVCACHED_AUTOPATCH=1
 
     $PYTHON -m sglang.launch_server --model "$model" \
       --disable-radix-cache \

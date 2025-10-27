@@ -130,7 +130,7 @@ if [ "$engine" == "vllm" ]; then
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=VLLM
+    export KVCACHED_AUTOPATCH=1
 
     VLLM_L4_ARGS=""
     if [ "$IS_L4" = true ]; then
@@ -147,7 +147,7 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export ENABLE_KVCACHED=true
-    export KVCACHED_IPC_NAME=SGLANG
+    export KVCACHED_AUTOPATCH=1
 
     SGL_L4_ARGS=""
     if [ "$IS_L4" = true ]; then

@@ -62,7 +62,6 @@ export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
-export KVCACHED_IPC_NAME=VLLM
 vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-caching --port=12346 --tensor-parallel-size=1
 vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
 ```
