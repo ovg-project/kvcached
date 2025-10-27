@@ -164,6 +164,8 @@ vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts
 
 > [!NOTE]
 > kvcached hasn't supported prefix caching/sharing yet because that will prevent kvcached from releasing the memory after requests finish. Remember to use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+> 
+> When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
 If you installed kvcached using its source code, you can also do the following:
 
@@ -175,6 +177,9 @@ cd benchmarks/simple_bench
 ```
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
+
+> [!NOTE]
+> We haven’t fully tested kvcached with every version of SGLang and vLLM (there are too many!). If you run into issues with a specific version, please open an issue---we'll look into it and fix it within a few hours.
 
 ## Roadmap
 
