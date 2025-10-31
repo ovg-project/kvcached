@@ -130,7 +130,7 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
 bool FTensor::init_with_zero_() {
   assert(reinterpret_cast<uintptr_t>(vaddr_) % kPageSize ==
          0); // Ensure alignment.
-  assert(size_ % kPageSize == 0); // Ensure alignment.
+  assert(size_ % kPageSize == 0);  // Ensure alignment.
 
   bool succ = true;
   for (size_t offset = 0; offset < size_; offset += kPageSize) {
