@@ -1,0 +1,1308 @@
+diff --git a/kvcached_bridge/kvcached_bridge.c b/kvcached_bridge/kvcached_bridge.c
+new file mode 100644
+index 00000000..cb9184f4
+--- /dev/null
++++ b/kvcached_bridge/kvcached_bridge.c
+@@ -0,0 +1,526 @@
++#include <Python.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++#include <unistd.h>
++#include "kvcached_bridge.h"
++#include <stdarg.h>
++
++// Global Python module reference and thread state
++static PyObject* kvcached_module = NULL;
++static PyThreadState* main_thread_state = NULL;
++
++// Global logging level - can be changed at runtime
++static log_level_t current_log_level = LOG_INFO;
++
++// Simple logging utility function
++void cbridge_log(log_level_t level, const char* fmt, ...) {
++    if (level < current_log_level) {
++        return;  // Skip messages below current log level
++    }
++
++    // Level prefix
++    const char* level_str;
++    switch (level) {
++        case LOG_DEBUG: level_str = "DEBUG"; break;
++        case LOG_INFO:  level_str = "INFO";  break;
++        case LOG_WARN:  level_str = "WARN";  break;
++        case LOG_ERROR: level_str = "ERROR"; break;
++        default:        level_str = "UNKNOWN"; break;
++    }
++
++    fprintf(stderr, "C_BRIDGE [%s]: ", level_str);
++
++    va_list args;
++    va_start(args, fmt);
++    vfprintf(stderr, fmt, args);
++    va_end(args);
++
++    fprintf(stderr, "\n");
++}
++
++// Synchronous bridge using dedicated thread
++typedef struct {
++    bridge_operation_t type;  // Operation type enum
++    union {
++        struct {
++            const char* device;
++            int async_sched;
++        } init;
++        struct {
++            int num_blocks;
++            int block_size;
++            int head_num;
++            int head_dim;
++            int num_layers;
++            const char* device;
++        } alloc_cache;
++        struct {
++            int num_blocks;
++        } alloc_bridge;
++        struct {
++            long long* block_ids;
++            int num_blocks;
++        } free;
++    } data;
++    int result;
++    long long* result_blocks;
++    int processed;  // Flag to indicate processing is complete
++} bridge_message_t;
++
++static pthread_t python_thread;
++static int thread_running = 0;
++static int thread_initialized = 0;
++static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t init_cond = PTHREAD_COND_INITIALIZER;
++static bridge_message_t* current_message = NULL;
++static int shutdown_requested = 0;
++
++// Python thread function that handles all Python operations
++void* python_thread_func(void* arg) {
++    // Python is already initialized in main thread
++    // Signal that thread is initialized
++    pthread_mutex_lock(&queue_mutex);
++    thread_initialized = 1;
++    pthread_cond_signal(&init_cond);
++    pthread_mutex_unlock(&queue_mutex);
++
++    cbridge_log(LOG_DEBUG, "Python thread started");
++
++    while (!shutdown_requested) {
++        // Wait for a message
++        pthread_mutex_lock(&queue_mutex);
++        while (current_message == NULL && !shutdown_requested) {
++            pthread_cond_wait(&queue_cond, &queue_mutex);
++        }
++
++        if (shutdown_requested) {
++            pthread_mutex_unlock(&queue_mutex);
++            break;
++        }
++
++        bridge_message_t* msg = current_message;
++        current_message = NULL;
++        pthread_mutex_unlock(&queue_mutex);
++
++        // Process the message
++        switch (msg->type) {
++            case BRIDGE_OP_INIT: { // init_kvcached
++                cbridge_log(LOG_DEBUG, "processing init message");
++                PyEval_RestoreThread(main_thread_state);
++
++                // kvcached_module is already imported in main thread
++
++                if (kvcached_module) {
++                    // Call init_kvcached
++                    PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "init_kvcached");
++                    if (pFunc && PyCallable_Check(pFunc)) {
++                        PyObject* pArgs = PyTuple_New(5);
++                        PyTuple_SetItem(pArgs, 0, PyLong_FromLong(0));
++                        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(1));
++                        PyTuple_SetItem(pArgs, 2, PyBool_FromLong(0));
++                        PyTuple_SetItem(pArgs, 3, PyUnicode_FromString(msg->data.init.device));
++                        PyTuple_SetItem(pArgs, 4, PyBool_FromLong(msg->data.init.async_sched));
++
++                        PyObject* pResult = PyObject_CallObject(pFunc, pArgs);
++                        if (pResult) {
++                            cbridge_log(LOG_DEBUG, "init_kvcached succeeded");
++                            msg->result = 0;
++                            Py_DECREF(pResult);
++                        } else {
++                            cbridge_log(LOG_ERROR, "init_kvcached failed");
++                            msg->result = -1;
++                            PyErr_Print();
++                        }
++                        Py_DECREF(pArgs);
++                        Py_DECREF(pFunc);
++                    } else {
++                        cbridge_log(LOG_ERROR, "cannot find init_kvcached function");
++                        msg->result = -1;
++                    }
++                } else {
++                    cbridge_log(LOG_ERROR, "failed to import kvcached module");
++                    msg->result = -1;
++                    PyErr_Print();
++                }
++
++                main_thread_state = PyEval_SaveThread();
++                cbridge_log(LOG_DEBUG, "finished processing init message, result=%d", msg->result);
++                msg->processed = 1;
++                break;
++            }
++            case BRIDGE_OP_ALLOC_KV_CACHE: { // alloc_kv_cache
++                cbridge_log(LOG_DEBUG, "processing alloc_kv_cache message");
++                PyEval_RestoreThread(main_thread_state);
++
++                if (kvcached_module) {
++                    PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "alloc_kv_cache");
++                    if (pFunc && PyCallable_Check(pFunc)) {
++                        // Create kvcache_shape tuple: (2, num_blocks, head_num, head_dim)
++                        PyObject* shape_tuple = PyTuple_New(4);
++                        PyTuple_SetItem(shape_tuple, 0, PyLong_FromLong(2));
++                        PyTuple_SetItem(shape_tuple, 1, PyLong_FromLong(msg->data.alloc_cache.num_blocks));
++                        PyTuple_SetItem(shape_tuple, 2, PyLong_FromLong(msg->data.alloc_cache.head_num));
++                        PyTuple_SetItem(shape_tuple, 3, PyLong_FromLong(msg->data.alloc_cache.head_dim));
++
++                        // Create arguments
++                        PyObject* pArgs = PyTuple_New(6);
++                        PyTuple_SetItem(pArgs, 0, shape_tuple);
++                        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(msg->data.alloc_cache.block_size));
++                        PyTuple_SetItem(pArgs, 2, PyUnicode_FromString("float16"));
++                        PyTuple_SetItem(pArgs, 3, PyUnicode_FromString(msg->data.alloc_cache.device));
++                        PyTuple_SetItem(pArgs, 4, PyLong_FromLong(msg->data.alloc_cache.num_layers));
++                        PyTuple_SetItem(pArgs, 5, PyUnicode_FromString("MHA"));
++
++                        PyObject* pResult = PyObject_CallObject(pFunc, pArgs);
++                        if (pResult && PyList_Check(pResult)) {
++                            cbridge_log(LOG_DEBUG, "alloc_kv_cache succeeded");
++                            msg->result = 0;
++                            Py_DECREF(pResult);
++                        } else {
++                            cbridge_log(LOG_ERROR, "alloc_kv_cache failed");
++                            msg->result = -1;
++                            PyErr_Print();
++                        }
++                        Py_DECREF(pArgs);
++                        Py_DECREF(pFunc);
++                    } else {
++                        cbridge_log(LOG_ERROR, "cannot find alloc_kv_cache function");
++                        msg->result = -1;
++                    }
++                } else {
++                    cbridge_log(LOG_ERROR, "kvcached module not available");
++                    msg->result = -1;
++                }
++
++                main_thread_state = PyEval_SaveThread();
++                msg->processed = 1;
++                break;
++            }
++            case BRIDGE_OP_ALLOC_KV_BRIDGE: { // alloc_kv_bridge
++                PyEval_RestoreThread(main_thread_state);
++
++                if (kvcached_module) {
++                    PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "alloc_kv_bridge");
++                    if (pFunc && PyCallable_Check(pFunc)) {
++                        PyObject* pArgs = PyTuple_New(1);
++                        PyTuple_SetItem(pArgs, 0, PyLong_FromLong(msg->data.alloc_bridge.num_blocks));
++
++                        PyObject* pValue = PyObject_CallObject(pFunc, pArgs);
++                        if (pValue && PyList_Check(pValue)) {
++                            Py_ssize_t list_size = PyList_Size(pValue);
++                            msg->result_blocks = (long long*)malloc(list_size * sizeof(long long));
++                            if (msg->result_blocks) {
++                                for (Py_ssize_t i = 0; i < list_size; i++) {
++                                    PyObject* item = PyList_GetItem(pValue, i);
++                                    if (PyLong_Check(item)) {
++                                        msg->result_blocks[i] = PyLong_AsLongLong(item);
++                                    }
++                                }
++                                msg->result = 0;
++                            } else {
++                                msg->result = -1;
++                            }
++                        } else {
++                            msg->result = -1;
++                            if (pValue) PyErr_Print();
++                        }
++
++                        Py_XDECREF(pValue);
++                        Py_DECREF(pArgs);
++                        Py_DECREF(pFunc);
++                    } else {
++                        msg->result = -1;
++                    }
++                } else {
++                    msg->result = -1;
++                }
++
++                main_thread_state = PyEval_SaveThread();
++                msg->processed = 1;
++                break;
++            }
++            case BRIDGE_OP_FREE_KV: { // free_kv
++                PyEval_RestoreThread(main_thread_state);
++
++                if (kvcached_module) {
++                    PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "free_kv_bridge");
++                    if (pFunc && PyCallable_Check(pFunc)) {
++                        PyObject* pList = PyList_New(msg->data.free.num_blocks);
++                        for (int i = 0; i < msg->data.free.num_blocks; i++) {
++                            PyList_SetItem(pList, i, PyLong_FromLongLong(msg->data.free.block_ids[i]));
++                        }
++
++                        PyObject* pArgs = PyTuple_New(1);
++                        PyTuple_SetItem(pArgs, 0, pList);
++
++                        PyObject* pValue = PyObject_CallObject(pFunc, pArgs);
++                        if (pValue && PyLong_Check(pValue)) {
++                            msg->result = (int)PyLong_AsLong(pValue);
++                        } else {
++                            msg->result = -1;
++                            if (pValue) PyErr_Print();
++                        }
++
++                        Py_XDECREF(pValue);
++                        Py_DECREF(pArgs);
++                        Py_DECREF(pFunc);
++                    } else {
++                        msg->result = -1;
++                    }
++                } else {
++                    msg->result = -1;
++                }
++
++                // Don't free block_ids - it's managed by Go
++                main_thread_state = PyEval_SaveThread();
++                msg->processed = 1;
++                break;
++            }
++            case BRIDGE_OP_SHUTDOWN: { // shutdown
++                PyEval_RestoreThread(main_thread_state);
++
++                if (kvcached_module) {
++                    PyObject* pFunc = PyObject_GetAttrString(kvcached_module, "shutdown_kvcached");
++                    if (pFunc && PyCallable_Check(pFunc)) {
++                        PyObject* pResult = PyObject_CallObject(pFunc, NULL);
++                        if (pResult) {
++                            msg->result = 0;
++                            Py_DECREF(pResult);
++                        } else {
++                            msg->result = -1;
++                            PyErr_Print();
++                        }
++                        Py_DECREF(pFunc);
++                    }
++                    Py_XDECREF(kvcached_module);
++                    kvcached_module = NULL;
++                }
++
++                main_thread_state = PyEval_SaveThread();
++                msg->processed = 1;
++                break;
++            }
++        }
++    }
++
++    // Finalize Python
++    PyEval_RestoreThread(main_thread_state);
++    if (kvcached_module) {
++        Py_XDECREF(kvcached_module);
++        kvcached_module = NULL;
++    }
++    Py_Finalize();
++
++    cbridge_log(LOG_DEBUG, "Python thread exiting");
++    return NULL;
++}
++
++// Initialize the synchronous bridge
++int bridge_init() {
++    cbridge_log(LOG_DEBUG, "bridge_init called");
++
++    if (thread_running) {
++        cbridge_log(LOG_DEBUG, "thread already running");
++        return 0;
++    }
++
++    // Initialize Python in the main thread
++    if (!Py_IsInitialized()) {
++        cbridge_log(LOG_INFO, "initializing Python");
++        Py_InitializeEx(1);
++        if (!Py_IsInitialized()) {
++            cbridge_log(LOG_ERROR, "Python initialization failed");
++            return -1;
++        }
++        PyEval_InitThreads();
++        main_thread_state = PyEval_SaveThread();
++        cbridge_log(LOG_INFO, "Python initialized in main thread");
++
++        // Import the kvcached module while we have the GIL
++        PyEval_RestoreThread(main_thread_state);
++        PyObject* sys = PyImport_ImportModule("sys");
++        if (sys) {
++            PyObject* path = PyObject_GetAttrString(sys, "path");
++            if (path) {
++                PyObject* pPath = PyUnicode_FromString("/home/ztang23/kvcached");
++                if (pPath) {
++                    PyList_Append(path, pPath);
++                    Py_DECREF(pPath);
++                }
++                Py_DECREF(path);
++            }
++            Py_DECREF(sys);
++        }
++
++        kvcached_module = PyImport_ImportModule("kvcached.integration.ollama.interfaces");
++        if (!kvcached_module) {
++            cbridge_log(LOG_ERROR, "failed to import kvcached module");
++            PyErr_Print();
++            main_thread_state = PyEval_SaveThread();
++            return -1;
++        }
++        cbridge_log(LOG_INFO, "kvcached module imported successfully");
++        main_thread_state = PyEval_SaveThread();
++    }
++
++    shutdown_requested = 0;
++    current_message = NULL;
++    thread_initialized = 0;
++
++    cbridge_log(LOG_INFO, "creating Python thread");
++
++    if (pthread_create(&python_thread, NULL, python_thread_func, NULL) != 0) {
++        cbridge_log(LOG_ERROR, "failed to create thread");
++        return -1;
++    }
++
++    thread_running = 1;
++
++    // Wait for thread to initialize
++    cbridge_log(LOG_DEBUG, "waiting for thread initialization");
++    pthread_mutex_lock(&queue_mutex);
++    while (!thread_initialized) {
++        pthread_cond_wait(&init_cond, &queue_mutex);
++    }
++    pthread_mutex_unlock(&queue_mutex);
++
++    cbridge_log(LOG_INFO, "Python thread fully initialized");
++
++    return 0;
++}
++
++// Send a message to the Python thread and wait for response
++int send_message(bridge_message_t* msg) {
++    if (!thread_running) return -1;
++
++    msg->processed = 0;  // Initialize processed flag
++
++    pthread_mutex_lock(&queue_mutex);
++    current_message = msg;
++    pthread_cond_signal(&queue_cond);
++    pthread_mutex_unlock(&queue_mutex);
++
++    // Wait for completion (polling since we can't use cond vars easily for response)
++    while (!msg->processed) {
++        usleep(1000); // 1ms
++    }
++
++    return msg->result;
++}
++
++// Initialize Python interpreter and import kvcached module
++int kvcached_bridge_init() {
++    return bridge_init();
++}
++
++// Call Python init_kvcached function
++int kvcached_bridge_init_kvcached(const char* device, int async_sched) {
++    cbridge_log(LOG_INFO, "init_kvcached called with device=%s, async_sched=%d", device, async_sched);
++
++    // Initialize bridge if not already done
++    if (kvcached_bridge_init() != 0) {
++        cbridge_log(LOG_ERROR, "bridge_init failed");
++        return -1;
++    }
++
++    bridge_message_t msg;
++    msg.type = BRIDGE_OP_INIT;
++    msg.data.init.device = device;
++    msg.data.init.async_sched = async_sched;
++
++    cbridge_log(LOG_DEBUG, "init_kvcached calling Python thread");
++    int result = send_message(&msg);
++    cbridge_log(LOG_INFO, "init_kvcached result=%d", result);
++    return result;
++}
++
++// Call Python alloc_kv_cache function (Stage 2)
++int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device) {
++    cbridge_log(LOG_INFO, "alloc_kv_cache called: blocks=%d, head=(%d,%d), layers=%d, device=%s",
++                num_blocks, head_num, head_dim, num_layers, device);
++
++    bridge_message_t msg;
++    msg.type = BRIDGE_OP_ALLOC_KV_CACHE;
++    msg.data.alloc_cache.num_blocks = num_blocks;
++    msg.data.alloc_cache.block_size = block_size;
++    msg.data.alloc_cache.head_num = head_num;
++    msg.data.alloc_cache.head_dim = head_dim;
++    msg.data.alloc_cache.num_layers = num_layers;
++    msg.data.alloc_cache.device = device;
++
++    int result = send_message(&msg);
++    cbridge_log(LOG_INFO, "alloc_kv_cache result=%d", result);
++    return result;
++}
++
++// Call Python shutdown_kvcached function
++int kvcached_bridge_shutdown_kvcached() {
++    cbridge_log(LOG_INFO, "shutdown_kvcached called");
++
++    bridge_message_t msg;
++    msg.type = BRIDGE_OP_SHUTDOWN;
++
++    int result = send_message(&msg);
++
++    // Shutdown the thread
++    shutdown_requested = 1;
++    pthread_cond_broadcast(&queue_cond);
++    if (thread_running) {
++        pthread_join(python_thread, NULL);
++        thread_running = 0;
++    }
++
++    return result;
++}
++
++// Call Python alloc_kv function (allocate blocks for a request)
++long long* kvcached_bridge_alloc_kv(int num_blocks) {
++    cbridge_log(LOG_DEBUG, "alloc_kv called for %d blocks", num_blocks);
++
++    bridge_message_t msg;
++    msg.type = BRIDGE_OP_ALLOC_KV_BRIDGE;
++    msg.data.alloc_bridge.num_blocks = num_blocks;
++    msg.result_blocks = NULL;
++
++    int result = send_message(&msg);
++
++    if (result == 0 && msg.result_blocks) {
++        cbridge_log(LOG_DEBUG, "alloc_kv succeeded");
++        return msg.result_blocks;
++    } else {
++        cbridge_log(LOG_WARN, "alloc_kv failed, falling back to dummy allocation");
++        long long* dummy = (long long*)malloc(num_blocks * sizeof(long long));
++        if (dummy) {
++            for (int i = 0; i < num_blocks; i++) {
++                dummy[i] = i + 1; // dummy block IDs: 1, 2, 3, ...
++            }
++        }
++        return dummy;
++    }
++}
++
++// Call Python free_kv function (free blocks for a request)
++int kvcached_bridge_free_kv(long long* block_ids, int num_blocks) {
++    if (!block_ids) {
++        return -1;
++    }
++
++    cbridge_log(LOG_DEBUG, "free_kv called for %d blocks", num_blocks);
++
++    bridge_message_t msg;
++    msg.type = BRIDGE_OP_FREE_KV;
++    msg.data.free.block_ids = block_ids;
++    msg.data.free.num_blocks = num_blocks;
++
++    return send_message(&msg);
++}
++
++// Set logging level at runtime
++void kvcached_bridge_set_log_level(int level) {
++    if (level >= LOG_DEBUG && level <= LOG_ERROR) {
++        current_log_level = (log_level_t)level;
++        cbridge_log(LOG_INFO, "Log level set to %d", level);
++    }
++}
+\ No newline at end of file
+diff --git a/kvcached_bridge/kvcached_bridge.h b/kvcached_bridge/kvcached_bridge.h
+new file mode 100644
+index 00000000..0a19ab0f
+--- /dev/null
++++ b/kvcached_bridge/kvcached_bridge.h
+@@ -0,0 +1,53 @@
++#ifndef KVCACHED_BRIDGE_H
++#define KVCACHED_BRIDGE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Operation types for the bridge message
++typedef enum {
++    BRIDGE_OP_INIT = 0,
++    BRIDGE_OP_ALLOC_KV_CACHE = 1,
++    BRIDGE_OP_ALLOC_KV_BRIDGE = 2,
++    BRIDGE_OP_FREE_KV = 3,
++    BRIDGE_OP_SHUTDOWN = 4
++} bridge_operation_t;
++
++// Logging levels for the bridge
++typedef enum {
++    LOG_DEBUG = 0,
++    LOG_INFO = 1,
++    LOG_WARN = 2,
++    LOG_ERROR = 3
++} log_level_t;
++
++// Initialize the Python bridge
++int kvcached_bridge_init();
++
++// Call Python init_kvcached function (Stage 1)
++int kvcached_bridge_init_kvcached(const char* device, int async_sched);
++
++// Call Python alloc_kv_cache function (Stage 2)
++int kvcached_bridge_alloc_kv_cache(int num_blocks, int block_size, int head_num, int head_dim, int num_layers, const char* device);
++
++// Call Python alloc_kv_bridge function (Stage 3 - allocate blocks for a request)
++long long* kvcached_bridge_alloc_kv(int num_blocks);
++
++// Call Python free_kv function (free blocks for a request)
++int kvcached_bridge_free_kv(long long* block_ids, int num_blocks);
++
++// Call Python shutdown_kvcached function
++int kvcached_bridge_shutdown_kvcached();
++
++// Cleanup function
++void kvcached_bridge_cleanup();
++
++// Set logging level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR)
++void kvcached_bridge_set_log_level(int level);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // KVCACHED_BRIDGE_H
+\ No newline at end of file
+diff --git a/runner/ollamarunner/cache.go b/runner/ollamarunner/cache.go
+index 02827cd0..9a76bc01 100644
+--- a/runner/ollamarunner/cache.go
++++ b/runner/ollamarunner/cache.go
+@@ -1,11 +1,20 @@
+ package ollamarunner
+
++/*
++#cgo CFLAGS: -I../../kvcached_bridge
++#cgo LDFLAGS: -L../../kvcached_bridge -lkvcached_bridge
++#include <stdlib.h>
++#include "kvcached_bridge.h"
++*/
++import "C"
++
+ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"math"
+ 	"time"
++	"unsafe"
+
+ 	"github.com/ollama/ollama/kvcache"
+ 	"github.com/ollama/ollama/ml"
+@@ -28,33 +37,62 @@ type InputCache struct {
+ 	// optimize cache eviction for multiple users
+ 	multiUserCache bool
+
++	// kvcached enabled flag
++	kvcachedEnabled bool
++
+ 	cache kvcache.Cache
+ }
+
+-func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool) (*InputCache, error) {
++func NewInputCache(model model.Model, kvCacheType string, kvSize int32, numSlots int, batchSize int, multiUserCache bool, kvcachedEnabled bool) (*InputCache, error) {
++	slog.Debug("NewInputCache called", "kvCacheType", kvCacheType, "kvSize", kvSize, "numSlots", numSlots, "batchSize", batchSize, "kvcachedEnabled", kvcachedEnabled)
++
+ 	numCtx := kvSize / int32(numSlots)
++	slog.Debug("Calculated numCtx", "numCtx", numCtx)
+
+ 	if numCtx < 1 {
+ 		return nil, fmt.Errorf("must have at least one kv cache entry per parallel sequence (kv: %v parallel: %v)", kvSize, numSlots)
+ 	}
+
+ 	slots := make([]InputCacheSlot, numSlots)
++	slog.Debug("Created cache slots", "numSlots", numSlots)
+
+ 	for i := range slots {
+ 		slots[i] = InputCacheSlot{Id: i}
+ 	}
+
+-	cache := model.Config().Cache
+-	if cache != nil {
+-		cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
+-	}
++    // Choose cache implementation
++    var cache kvcache.Cache = nil
++    if kvcachedEnabled {
++        // For correctness, use the model's native WrapperCache so attention gets valid K/V tensors.
++        // kvcached will still manage block memory separately (Stage 3) without interfering here.
++        slog.Info("kvcached enabled - using native WrapperCache for model attention")
++        cache = model.Config().Cache
++        if cache != nil {
++            kvcachedCapacity := int(numCtx)
++            slog.Debug("Initializing native cache (kvcached mode)", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "kvcachedCapacity", kvcachedCapacity, "batchSize", batchSize)
++            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, kvcachedCapacity, batchSize)
++        } else {
++            slog.Debug("Model has no native cache - disabling cache")
++        }
++    } else {
++        // Native (non-kvcached) path
++        slog.Info("Using native Ollama cache management")
++        cache = model.Config().Cache
++        if cache != nil {
++            slog.Debug("Initializing native cache", "kvCacheType", kvCacheTypeFromStr(kvCacheType), "numSlots", numSlots, "numCtx", numCtx, "batchSize", batchSize)
++            cache.Init(model.Backend(), kvCacheTypeFromStr(kvCacheType), numSlots, int(numCtx), batchSize)
++        } else {
++            slog.Debug("Model has no native cache - disabling cache")
++        }
++    }
+
+ 	return &InputCache{
+-		numCtx:         numCtx,
+-		enabled:        cache != nil,
+-		slots:          slots,
+-		multiUserCache: multiUserCache,
+-		cache:          cache,
++		numCtx:          numCtx,
++		enabled:         cache != nil || kvcachedEnabled,
++		slots:           slots,
++		multiUserCache:  multiUserCache,
++		kvcachedEnabled: kvcachedEnabled,
++		cache:           cache,
+ 	}, nil
+ }
+
+@@ -74,7 +112,9 @@ func (c *InputCache) Close() {
+ 		return
+ 	}
+
+-	c.cache.Close()
++	if c.cache != nil {
++		c.cache.Close()
++	}
+ }
+
+ // Locking: Operations on InputCacheSlot (including finding one
+@@ -93,9 +133,16 @@ type InputCacheSlot struct {
+
+ 	// last time this cache was used (as of start of processing)
+ 	lastUsed time.Time
++
++	// kvcached blocks associated with this cache slot
++	// These blocks persist across sequence completions for conversation continuity
++	// and are only freed when the cache slot is actually evicted
++	kvCacheBlocks []int32
+ }
+
+ func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []input.Input, error) {
++	slog.Debug("LoadCacheSlot called", "promptLen", len(prompt), "enabled", c.enabled, "cache", c.cache != nil, "kvcachedEnabled", c.kvcachedEnabled)
++
+ 	var slot *InputCacheSlot
+ 	var numPast int32
+ 	var err error
+@@ -121,19 +168,55 @@ func (c *InputCache) LoadCacheSlot(prompt []input.Input) (*InputCacheSlot, []inp
+ 		numPast--
+ 	}
+
+-	if c.cache != nil {
+-		if numPast > 0 && !c.cache.CanResume(slot.Id, numPast) {
+-			numPast = 0
++	// Memory management: choose between native cache and kvcached
++	if c.kvcachedEnabled {
++		// kvcached memory management (primary mode)
++		slog.Debug("Using kvcached memory management")
++		// Check if we need to reset cache due to conversation mismatch
++		if numPast == 0 && len(slot.kvCacheBlocks) > 0 {
++			// No prefix match - free old blocks and allocate new ones
++			slog.Debug("Conversation mismatch - freeing old kvcached blocks for slot", "slot", slot.Id)
++			c.freeSlotKvcachedBlocks(slot)
+ 		}
+
+-		err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
+-		if err != nil {
+-			// Some models don't support partial erasure
+-			err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
++		// Dynamic allocation with prefix caching preservation
++		if numPast == 0 {
++			// New conversation - free old blocks and allocate fresh
++			slog.Debug("No prefix match - allocating fresh kvcached blocks", "slot", slot.Id, "promptLen", len(prompt))
++			c.ensureKvcachedBlocks(slot, len(prompt))
++		} else {
++			// Prefix match - clean up tensor cache to match prefix, then allocate blocks
++			if c.cache != nil {
++				err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
++				if err != nil {
++					// Some models don't support partial erasure
++					err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
++					if err != nil {
++						return nil, nil, err
++					}
++					numPast = 0
++				}
++			}
++			slog.Debug("Prefix match found - cleaned tensor cache, allocating kvcached blocks", "slot", slot.Id, "numPast", numPast, "promptLen", len(prompt), "existingBlocks", len(slot.kvCacheBlocks))
++			c.ensureKvcachedBlocks(slot, len(prompt))
++		}
++	} else {
++		// Native Ollama cache management (fallback mode)
++		slog.Debug("Using native cache management")
++		if c.cache != nil {
++			if numPast > 0 && !c.cache.CanResume(slot.Id, numPast) {
++				numPast = 0
++			}
++
++			err = c.cache.Remove(slot.Id, numPast, math.MaxInt32)
+ 			if err != nil {
+-				return nil, nil, err
++				// Some models don't support partial erasure
++				err = c.cache.Remove(slot.Id, 0, math.MaxInt32)
++				if err != nil {
++					return nil, nil, err
++				}
++				numPast = 0
+ 			}
+-			numPast = 0
+ 		}
+ 	}
+
+@@ -200,6 +283,9 @@ func (c *InputCache) findBestCacheSlot(prompt []input.Input) (*InputCacheSlot, i
+ 	if len(oldestSlot.Inputs) != 0 {
+ 		slog.Debug("evicting cache slot", "id", oldestSlot.Id, "inputs", len(oldestSlot.Inputs),
+ 			"used", oldestSlot.lastUsed)
++
++		// Free kvcached blocks when slot is actually evicted
++		c.freeSlotKvcachedBlocks(oldestSlot)
+ 	}
+
+ 	if longest > 0 && longestSlot != oldestSlot {
+@@ -207,7 +293,7 @@ func (c *InputCache) findBestCacheSlot(prompt []input.Input) (*InputCacheSlot, i
+ 			len(longestSlot.Inputs))
+ 		oldestSlot.Inputs = make([]input.Input, longest)
+ 		copy(oldestSlot.Inputs, longestSlot.Inputs[:longest])
+-		if c.cache != nil {
++		if !c.kvcachedEnabled && c.cache != nil {
+ 			c.cache.CopyPrefix(longestSlot.Id, oldestSlot.Id, longest)
+ 		}
+ 	}
+@@ -276,7 +362,109 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
+ 	slog.Debug("context limit hit - shifting", "id", slot.Id, "limit", c.numCtx, "input", len(slot.Inputs),
+ 		"keep", numKeep, "discard", discard)
+
+-	if c.cache != nil {
++	if c.kvcachedEnabled {
++		// For kvcached mode: preserve prefix caching by adjusting block allocation dynamically
++		slog.Debug("Shifting kvcached blocks for slot", "id", slot.Id, "oldBlocks", len(slot.kvCacheBlocks))
++
++		// Calculate how many blocks we need for remaining tokens after shift
++		remainingTokens := numKeep + inputLen - (numKeep + discard)
++		if remainingTokens > 0 {
++			// Calculate needed blocks for remaining tokens
++			blockSize := int32(32) // Standard kvcached block size
++			promptTokens := int32(remainingTokens)
++			estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
++			totalEstimatedTokens := promptTokens + estimatedResponseTokens
++			neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
++
++			// Cap at max blocks
++			maxBlocks := c.numCtx / blockSize
++			if neededBlocks > maxBlocks {
++				neededBlocks = maxBlocks
++			}
++			if neededBlocks < 1 {
++				neededBlocks = 1
++			}
++
++			currentBlocks := int32(len(slot.kvCacheBlocks))
++
++			if currentBlocks > neededBlocks {
++				// Need to free excess blocks
++				blocksToFree := currentBlocks - neededBlocks
++				slog.Debug("Freeing excess kvcached blocks", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "freeing", blocksToFree)
++
++				// Free excess blocks from the end
++				excessBlocks := slot.kvCacheBlocks[neededBlocks:]
++				slot.kvCacheBlocks = slot.kvCacheBlocks[:neededBlocks]
++
++				if len(excessBlocks) > 0 {
++					// Convert Go slice to C array
++					blockIds := make([]C.longlong, len(excessBlocks))
++					for i, blockId := range excessBlocks {
++						blockIds[i] = C.longlong(blockId)
++					}
++
++					// Free excess blocks
++					result := C.kvcached_bridge_free_kv(&blockIds[0], C.int(len(excessBlocks)))
++					if result != 0 {
++						slog.Warn("Failed to free excess kvcached blocks", "slot", slot.Id, "blocks", len(excessBlocks))
++					} else {
++						slog.Debug("Freed excess kvcached blocks", "slot", slot.Id, "freed", len(excessBlocks))
++					}
++				}
++			} else if currentBlocks < neededBlocks {
++				// Need to allocate additional blocks (preserve existing)
++				blocksToAllocate := neededBlocks - currentBlocks
++				slog.Debug("Growing kvcached blocks during shift", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "allocating", blocksToAllocate)
++
++				// Allocate additional blocks
++				blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(blocksToAllocate))
++				if blockIdsPtr != nil {
++					blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:blocksToAllocate:blocksToAllocate]
++
++					// Append new block IDs to existing list
++					newBlocks := make([]int32, blocksToAllocate)
++					for i := 0; i < int(blocksToAllocate); i++ {
++						newBlocks[i] = int32(blockIdsSlice[i])
++					}
++					slot.kvCacheBlocks = append(slot.kvCacheBlocks, newBlocks...)
++					C.free(unsafe.Pointer(blockIdsPtr))
++
++					slog.Debug("Grew kvcached blocks during shift", "slot", slot.Id, "totalBlocks", len(slot.kvCacheBlocks), "addedBlocks", blocksToAllocate)
++				} else {
++					slog.Warn("Failed to allocate additional kvcached blocks during shift", "slot", slot.Id, "requested", blocksToAllocate)
++				}
++			} else {
++				// Current allocation is sufficient, preserve prefix caching
++				slog.Debug("Sufficient kvcached blocks already allocated during shift", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks)
++			}
++		} else {
++			// No remaining tokens, free all blocks
++			slog.Debug("No remaining tokens after shift, freeing all kvcached blocks", "slot", slot.Id)
++			c.freeSlotKvcachedBlocks(slot)
++		}
++
++		// In kvcached mode, we still need to update the tensor cache bookkeeping
++		// to synchronize cell ownership with the shifted sequence positions.
++		// kvcached manages the actual GPU memory, but the tensor cache tracks which
++		// cells belong to which sequences for attention operations.
++		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
++		if err != nil {
++			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
++				"id", slot.Id, "error", err)
++
++			// Create new input slice with preserved tokens (numKeep + remaining tokens after discard)
++			newInputs := make([]input.Input, numKeep+inputLen-(numKeep+discard))
++			copy(newInputs[:numKeep], slot.Inputs[:numKeep])
++			copy(newInputs[numKeep:], slot.Inputs[numKeep+discard:])
++
++			// Reset the cache
++			_ = c.cache.Remove(slot.Id, 0, math.MaxInt32)
++			slot.Inputs = []input.Input{}
++
++			// Return error with inputs that need to be reprocessed
++			return &ErrReprocessInputs{Inputs: newInputs}
++		}
++	} else if c.cache != nil {
+ 		err := c.cache.Remove(slot.Id, numKeep, numKeep+discard)
+ 		if err != nil {
+ 			slog.Debug("kv cache removal unsupported, clearing cache and returning inputs for reprocessing",
+@@ -303,3 +491,76 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
+
+ 	return nil
+ }
++
++// freeSlotKvcachedBlocks frees kvcached blocks associated with a cache slot during eviction
++func (c *InputCache) freeSlotKvcachedBlocks(slot *InputCacheSlot) {
++	if len(slot.kvCacheBlocks) > 0 {
++		// Convert Go slice to C array
++		numBlocks := len(slot.kvCacheBlocks)
++		blockIds := make([]C.longlong, numBlocks)
++		for i, blockId := range slot.kvCacheBlocks {
++			blockIds[i] = C.longlong(blockId)
++		}
++
++		// Stage 3: Free blocks using kvcached bridge during slot eviction
++		result := C.kvcached_bridge_free_kv(&blockIds[0], C.int(numBlocks))
++		if result == 0 {
++			slog.Debug("Stage 3: Freed kvcached blocks during slot eviction",
++				"slot", slot.Id, "blocks", numBlocks)
++		} else {
++			slog.Warn("Stage 3: Failed to free kvcached blocks during slot eviction",
++				"slot", slot.Id, "blocks", numBlocks)
++		}
++
++		slot.kvCacheBlocks = nil
++	}
++}
++
++// ensureKvcachedBlocks allocates or grows kvcached blocks for a cache slot as needed
++func (c *InputCache) ensureKvcachedBlocks(slot *InputCacheSlot, promptLen int) {
++	slog.Debug("ensureKvcachedBlocks called", "slotId", slot.Id, "currentBlocks", len(slot.kvCacheBlocks), "promptLen", promptLen)
++
++	// Calculate how many blocks we need for this request
++	blockSize := int32(32) // Standard kvcached block size
++	promptTokens := int32(promptLen)
++	estimatedResponseTokens := c.numCtx / 32  // Conservative estimate
++	totalEstimatedTokens := promptTokens + estimatedResponseTokens
++	neededBlocks := (totalEstimatedTokens + blockSize - 1) / blockSize
++
++	// Cap at max blocks
++	maxBlocks := c.numCtx / blockSize
++	if neededBlocks > maxBlocks {
++		neededBlocks = maxBlocks
++	}
++	if neededBlocks < 1 {
++		neededBlocks = 1
++	}
++
++	currentBlocks := int32(len(slot.kvCacheBlocks))
++
++	if currentBlocks < neededBlocks {
++		// Need to allocate additional blocks
++		blocksToAllocate := neededBlocks - currentBlocks
++		slog.Debug("Growing kvcached blocks", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks, "allocating", blocksToAllocate)
++
++		// Allocate additional blocks
++		blockIdsPtr := C.kvcached_bridge_alloc_kv(C.int(blocksToAllocate))
++		if blockIdsPtr != nil {
++			blockIdsSlice := (*[1 << 30]C.longlong)(unsafe.Pointer(blockIdsPtr))[:blocksToAllocate:blocksToAllocate]
++
++			// Append new block IDs to existing list
++			newBlocks := make([]int32, blocksToAllocate)
++			for i := 0; i < int(blocksToAllocate); i++ {
++				newBlocks[i] = int32(blockIdsSlice[i])
++			}
++			slot.kvCacheBlocks = append(slot.kvCacheBlocks, newBlocks...)
++			C.free(unsafe.Pointer(blockIdsPtr))
++
++			slog.Debug("Grew kvcached blocks for cache slot", "slot", slot.Id, "totalBlocks", len(slot.kvCacheBlocks), "addedBlocks", blocksToAllocate)
++		} else {
++			slog.Warn("Failed to allocate additional kvcached blocks", "slot", slot.Id, "requested", blocksToAllocate)
++		}
++	} else {
++		slog.Debug("Sufficient kvcached blocks already allocated", "slotId", slot.Id, "current", currentBlocks, "needed", neededBlocks)
++	}
++}
+diff --git a/runner/ollamarunner/runner.go b/runner/ollamarunner/runner.go
+index 2f41f68f..003f02e7 100644
+--- a/runner/ollamarunner/runner.go
++++ b/runner/ollamarunner/runner.go
+@@ -1,5 +1,13 @@
+ package ollamarunner
+
++/*
++#cgo CFLAGS: -I../../kvcached_bridge
++#cgo LDFLAGS: -L../../kvcached_bridge -lkvcached_bridge
++#include <stdlib.h>
++#include "kvcached_bridge.h"
++*/
++import "C"
++
+ import (
+ 	"bytes"
+ 	"context"
+@@ -22,11 +30,13 @@ import (
+ 	"sync"
+ 	"time"
+ 	"unicode/utf8"
++	"unsafe"
+
+ 	"golang.org/x/image/bmp"
+ 	"golang.org/x/sync/semaphore"
+
+ 	"github.com/ollama/ollama/api"
++	"github.com/ollama/ollama/discover"
+ 	"github.com/ollama/ollama/envconfig"
+ 	"github.com/ollama/ollama/llm"
+ 	"github.com/ollama/ollama/logutil"
+@@ -310,6 +320,10 @@ type Server struct {
+ 	// next sequence for prompt processing to avoid starvation
+ 	nextSeq int
+
++	// kvcached integration
++	kvCacheInitialized bool
++	kvCachePtr uintptr // Reference to allocated virtual memory
++
+ 	// multimodalHash generates hashes for comparing equality
+ 	// of non-text data
+ 	multimodalHash maphash.Hash
+@@ -357,7 +371,18 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
+ 	seq.doneReason = reason
+ 	close(seq.responses)
+ 	close(seq.embedding)
++
++	// Cache Slot Lifetime Management: Do NOT free kvcached blocks here!
++	// Blocks will be freed only when the cache slot is actually evicted
++	// This preserves conversation continuity for prefix caching
++
++	// Mark cache slot as available for reuse but preserve kvcached blocks
+ 	seq.cache.InUse = false
++	seq.cache.lastUsed = time.Now()
++
++	slog.Debug("Sequence completed, preserving kvcached blocks for conversation continuity",
++		"slot", seq.cache.Id, "blocks", len(seq.cache.kvCacheBlocks))
++
+ 	s.seqs[seqIndex] = nil
+ 	s.seqsSem.Release(1)
+ }
+@@ -490,6 +515,18 @@ func (s *Server) processBatch() error {
+
+ 	modelOutput, err := model.Forward(ctx, s.model, batchInputs, batch)
+ 	if err != nil {
++		// Check if this is a CUDA memory access error, which indicates kvcached memory issue
++		errStr := err.Error()
++		if strings.Contains(errStr, "illegal memory access") ||
++		   strings.Contains(errStr, "cuda") ||
++		   strings.Contains(errStr, "CUDA") {
++			slog.Warn("CUDA memory access error detected, likely due to kvcached memory mapping issue. Consider using native cache for CUDA devices.")
++
++			// For now, re-raise the error. In a production system, you might want to:
++			// 1. Fall back to native cache
++			// 2. Retry the request with native caching
++			// 3. Disable kvcached for this session
++		}
+ 		return fmt.Errorf("failed to decode batch: %w", err)
+ 	}
+
+@@ -673,6 +710,9 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
+ 				return
+ 			}
+
++			// Note: kvcached block allocation is now handled in LoadCacheSlot
++			// for proper Cache Slot Lifetime Management
++
+ 			s.seqs[i] = seq
+ 			s.cond.Signal()
+ 			found = true
+@@ -702,6 +742,8 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
+ 					return
+ 				}
+
++				// kvcached manages virtual memory automatically - no manual updates needed
++
+ 				flusher.Flush()
+ 			} else {
+ 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
+@@ -732,10 +774,25 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+ }
+
+ func (s *Server) reserveWorstCaseGraph() error {
+-	ctx := s.model.Backend().NewContext()
++	slog.Debug("Starting reserveWorstCaseGraph")
++
++	if s.model == nil {
++		return fmt.Errorf("model is nil")
++	}
++
++	backend := s.model.Backend()
++	if backend == nil {
++		return fmt.Errorf("model backend is nil")
++	}
++
++	ctx := backend.NewContext()
++	if ctx == nil {
++		return fmt.Errorf("failed to create context")
++	}
+ 	defer ctx.Close()
+
+ 	var err error
++	slog.Debug("Created context for reserveWorstCaseGraph")
+ 	inputs := make([]input.Input, s.batchSize)
+ 	mmStore := newMultimodalStore()
+
+@@ -810,11 +867,28 @@ func (s *Server) reserveWorstCaseGraph() error {
+
+ 	batch.Inputs = ctx.Input().FromIntSlice(batchInputs, len(batchInputs))
+
+-	cache := s.model.Config().Cache
+-	if cache != nil {
+-		err := cache.StartForward(ctx, batch, true)
+-		if err != nil {
+-			return err
++	// For kvcached warmup, skip invoking any cache StartForward to avoid ggml
++	// context prerequisites during model initialization.
++	if s.kvCacheInitialized {
++		slog.Debug("Skipping cache StartForward during warmup (kvcached)")
++	} else {
++		// Call cache StartForward for backend compatibility (native path)
++		if s.cache != nil && s.cache.cache != nil {
++			slog.Debug("Calling cache StartForward for backend compatibility")
++			err := s.cache.cache.StartForward(ctx, batch, true)
++			if err != nil {
++				slog.Debug("Cache StartForward failed", "error", err)
++				return err
++			}
++			slog.Debug("Cache StartForward completed")
++		} else {
++			slog.Debug("Cache is nil or not initialized")
++		}
++
++		// Also initialize the model's cache (may be a distinct WrapperCache instance)
++		if mc := s.model.Config().Cache; mc != nil {
++			slog.Debug("Calling model cache StartForward as well")
++			_ = mc.StartForward(ctx, batch, false)
+ 		}
+ 	}
+
+@@ -825,6 +899,10 @@ func (s *Server) reserveWorstCaseGraph() error {
+
+ 	ctx.Forward(t).Reserve()
+
++	if s.kvCacheInitialized {
++		slog.Debug("kvcached enabled - native WrapperCache in use (memory managed by kvcached)")
++	}
++
+ 	return nil
+ }
+
+@@ -845,7 +923,8 @@ func (s *Server) allocModel(
+ 			if err, ok := r.(error); ok {
+ 				panicErr = err
+ 			} else {
+-				panic(r)
++				// Convert runtime panics to errors
++				panicErr = fmt.Errorf("runtime panic: %v", r)
+ 			}
+ 		}
+ 	}()
+@@ -861,7 +940,79 @@ func (s *Server) allocModel(
+ 		return errors.New("loras are not yet implemented")
+ 	}
+
+-	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache)
++	if params.AllocMemory {
++		// Check if kvcached is enabled via environment variable
++		enableKVCached := strings.ToLower(os.Getenv("ENABLE_KVCACHED")) == "true" ||
++			os.Getenv("ENABLE_KVCACHED") == "1"
++
++		if enableKVCached {
++			// Initialize kvcached with dynamic device detection
++			gpus := discover.GetGPUInfo()
++			slog.Info("Initializing kvcached integration...")
++			deviceStr := "cpu" // Default to CPU
++			if len(gpus) > 0 && gpus[0].Library == "cuda" {
++				deviceStr = "cuda:0" // Use device 0 for now
++			} else if len(gpus) > 0 && gpus[0].Library == "metal" {
++				deviceStr = "metal"
++			}
++			device := C.CString(deviceStr)
++			defer C.free(unsafe.Pointer(device))
++
++			// Stage 1: Initialize kvcached system
++			result := C.kvcached_bridge_init_kvcached(device, 1)
++			if result != 0 {
++				slog.Warn("Failed to initialize kvcached, continuing without it", "error", result)
++			} else {
++				s.kvCacheInitialized = true
++				slog.Info("Stage 1: kvcached initialized successfully", "device", deviceStr)
++
++				// Initialize the model's native cache so attention tensors are valid in kvcached mode
++				if mc := s.model.Config().Cache; mc != nil {
++					var numCtx int
++					if parallel > 0 {
++						numCtx = kvSize / parallel
++					} else {
++						numCtx = kvSize
++					}
++					slog.Debug("Initializing model native cache (kvcached mode)")
++					mc.Init(s.model.Backend(), kvCacheTypeFromStr(kvCacheType), parallel, numCtx, s.batchSize)
++				}
++
++				// Stage 2: Allocate KV cache for this model
++				// Get model-specific parameters for KV cache allocation
++				config := s.model.Backend().Config()
++				numBlocks := 1024  // Cache capacity parameter (may be adjusted based on memory)
++				blockSize := 32    // Block size parameter
++				headNum := int(config.Uint("attention.head_count_kv"))   // KV heads from model
++				headDim := int(config.Uint("attention.key_length"))      // Head dimension from model
++				numLayers := int(config.Uint("block_count"))            // Number of layers from model
++
++				slog.Info("Stage 2: Allocating KV cache with model parameters",
++					"model_arch", config.Architecture(),
++					"head_num", headNum, "head_dim", headDim, "layers", numLayers,
++					"num_blocks", numBlocks, "block_size", blockSize)
++
++				cacheResult := C.kvcached_bridge_alloc_kv_cache(
++					C.int(numBlocks),
++					C.int(blockSize),
++					C.int(headNum),
++					C.int(headDim),
++					C.int(numLayers),
++					device)
++
++				if cacheResult != 0 {
++					slog.Warn("Stage 2: Failed to allocate KV cache, continuing without it", "error", cacheResult)
++					s.kvCacheInitialized = false
++				} else {
++					slog.Info("Stage 2: KV cache allocated successfully",
++						"blocks", numBlocks, "block_size", blockSize,
++						"head_num", headNum, "head_dim", headDim, "layers", numLayers)
++				}
++			}
++		}
++	}
++
++	s.cache, err = NewInputCache(s.model, kvCacheType, int32(kvSize), parallel, s.batchSize, multiUserCache, s.kvCacheInitialized)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -875,7 +1026,13 @@ func (s *Server) allocModel(
+ 	s.seqs = make([]*Sequence, s.parallel)
+ 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
+
+-	return s.reserveWorstCaseGraph()
++    if s.kvCacheInitialized {
++        // With kvcached enabled, skip ggml warmup graph to avoid cache/tensor setup pitfalls
++        slog.Debug("Skipping reserveWorstCaseGraph (kvcached enabled)")
++        return nil
++    }
++
++    return s.reserveWorstCaseGraph()
+ }
+
+ // closeModel frees all memory associated with a model
+@@ -1012,6 +1169,7 @@ func Execute(args []string) error {
+ 		modelPath: *mpath,
+ 		status:    llm.ServerStatusLaunched,
+ 	}
++	defer server.shutdownKVCache()
+
+ 	server.cond = sync.NewCond(&server.mu)
+ 	server.ready.Add(1)
+@@ -1041,10 +1199,26 @@ func Execute(args []string) error {
+ 	}
+
+ 	log.Println("Server listening on", addr)
+-	if err := httpServer.Serve(listener); err != nil {
+-		log.Fatal("server error:", err)
+-		return err
++        if err := httpServer.Serve(listener); err != nil {
++                log.Fatal("server error:", err)
++                return err
++        }
++
++        return nil
++}
++
++// kvcached manages virtual memory automatically - no manual token-level updates needed
++
++// shutdownKVCache shuts down the kvcached system
++func (s *Server) shutdownKVCache() {
++	if !s.kvCacheInitialized {
++		return
+ 	}
+
+-	return nil
++	result := C.kvcached_bridge_shutdown_kvcached()
++	if result != 0 {
++		slog.Warn("Failed to shutdown kvcached", "error", result)
++	}
++	s.kvCacheInitialized = false
++	s.kvCachePtr = 0
+ }
