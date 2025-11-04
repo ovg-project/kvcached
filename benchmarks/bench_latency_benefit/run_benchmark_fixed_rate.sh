@@ -42,9 +42,9 @@ mkdir -p results results/metrics
 
 # Define models and their configurations
 MODELS=(
-    "meta-llama/Llama-3.1-8B-Instruct:12346"
-    "meta-llama/Llama-3.1-8B-Instruct:30000"
-    "meta-llama/Llama-3.1-8B-Instruct:40000"
+    "Qwen/Qwen2-7B-Instruct:12346"
+    "Qwen/Qwen2-7B-Instruct:30000"
+    "Qwen/Qwen2-7B-Instruct:40000"
 )
 NUM_MODELS=${#MODELS[@]}
 
