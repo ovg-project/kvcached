@@ -18,7 +18,7 @@ import time
 from typing import Dict
 
 import requests
-from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
@@ -55,29 +55,17 @@ class LangChainAgent:
             }
         )
 
-        # Create AgentExecutor
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", self.system_prompt),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
 
-        self.agent = create_openai_tools_agent(self.llm, [], prompt)
-        self.agent_executor = AgentExecutor(
-            agent=self.agent,
-            tools=[],
-            verbose=False,
-            handle_parsing_errors=True,
-            max_iterations=1
-        )
+        self.agent = create_agent(self.llm, tools=[], system_prompt=system_prompt)
 
     def as_runnable(self):
         """Return the agent as a LangChain Runnable for chaining."""
         def process(input_dict):
             user_input = input_dict.get("input", "")
             try:
-                result = self.agent_executor.invoke({"input": user_input})
-                return result.get("output", "")
+                inputs = {"messages": [{"role": "user", "content": user_input}]}
+                result = self.agent.invoke(inputs)
+                return result.get('messages', '')[1].content
             except Exception as e:
                 print(f"AgentExecutor error in {self.name}: {e}")
                 return ""
@@ -239,13 +227,13 @@ def main():
                        help="Research Agent port (default: 12346)")
     parser.add_argument("--writing-port", type=int, default=12347,
                        help="Writing Agent port (default: 12347)")
-    parser.add_argument("--topic", type=str,
+    parser.add_argument("--topic", type=str, default="AI",
                        help="Topic for collaboration")
+
     parser.add_argument("--streaming", action="store_true",
-                       help="Enable streaming mode (real-time responses)")
-
+                        help="Enable streaming output instead of invoking the chain.")
     args = parser.parse_args()
-
+    print(args)
     try:
         system = MultiAgentResearchWriter(
             research_port=args.research_port,
@@ -258,6 +246,7 @@ def main():
             else:
                 system.invoke(args.topic)
         else:
+            print("Running Multi-Agent Examples with LangChain Chains")
             examples = [
                 "artificial intelligence and machine learning",
                 "renewable energy technologies",
