@@ -19,7 +19,6 @@ from typing import Dict
 
 import requests
 from langchain.agents import create_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 
