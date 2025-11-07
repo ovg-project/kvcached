@@ -35,7 +35,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         return self.inject_elastic_block_pool(block_pool_mod)
 
     @version_range(VLLM_ALL_RANGE)
-    def inject_elastic_block_pool(self, block_pool_mod: types.ModuleType) -> bool:
+    def inject_elastic_block_pool(self,
+                                  block_pool_mod: types.ModuleType) -> bool:
         """Inject ElasticBlockPool"""
         if hasattr(block_pool_mod, "ElasticBlockPool"):
             self.logger.debug("ElasticBlockPool already exists")
@@ -59,8 +60,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 assert not enable_caching, "Caching is not supported in ElasticBlockPool"
                 assert not enable_kv_cache_events, (
-                    "KV cache events are not supported in ElasticBlockPool"
-                )
+                    "KV cache events are not supported in ElasticBlockPool")
 
                 self.num_gpu_blocks = num_gpu_blocks
                 self.enable_kv_cache_events = enable_kv_cache_events
@@ -69,34 +69,48 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
                 self.kv_cache_manager = get_kv_cache_manager(
-                    num_gpu_blocks, block_size, cell_size, num_layers
-                )
+                    num_gpu_blocks, block_size, cell_size, num_layers)
 
                 self.null_block = None  # type: ignore
 
-            def get_cached_block(self, *args: Any, **kwargs: Any) -> Optional[list[KVCacheBlock]]:  # type: ignore[valid-type]
+            def get_cached_block(
+                self, *args: Any, **kwargs: Any
+            ) -> Optional[list[KVCacheBlock]]:  # type: ignore[valid-type]
                 """args and kwargs are ignored for compatibility"""
                 return None
 
             def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
                 """args and kwargs are ignored for compatibility"""
-                raise NotImplementedError("Caching is not supported in ElasticBlockPool")
+                self.logger.warning(
+                    "kvcached does not support prefix cache yet, "
+                    "double check vLLM is not launched with prefix cache enabled."
+                )
+                return
 
-            def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:  # type: ignore[valid-type]
+            def get_new_blocks(
+                self, num_blocks: int
+            ) -> list[KVCacheBlock]:  # type: ignore[valid-type]
                 if num_blocks > self.get_num_free_blocks():
-                    raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+                    raise ValueError(
+                        f"Cannot get {num_blocks} free blocks from the pool")
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
 
                 return [KVCacheBlock(bid) for bid in block_ids]
 
-            def touch(self, *args, **kwargs) -> None:  # type: ignore[valid-type]
-                raise NotImplementedError("Not supported in ElasticBlockPool")
+            def touch(self, *args,
+                      **kwargs) -> None:  # type: ignore[valid-type]
+                self.logger.warning(
+                    "kvcached does not support prefix cache yet, "
+                    "double check vLLM is not launched with prefix cache enabled."
+                )
+                return
 
             def free_blocks(
                 self,
-                ordered_blocks: Iterable[KVCacheBlock],  # type: ignore[valid-type]
+                ordered_blocks: Iterable[
+                    KVCacheBlock],  # type: ignore[valid-type]
             ) -> None:  # type: ignore[valid-type]
                 block_ids = [
                     block.block_id  # type: ignore[attr-defined]
@@ -106,7 +120,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager.free(block_ids)
 
             def reset_prefix_cache(self) -> bool:
-                raise NotImplementedError("Not supported in ElasticBlockPool")
+                self.logger.warning(
+                    "kvcached does not support prefix cache yet, "
+                    "double check vLLM is not launched with prefix cache enabled."
+                )
+                return True
 
             def get_num_free_blocks(self) -> int:
                 return self.kv_cache_manager.available_size()
@@ -116,7 +134,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def take_events(
                 self,
-            ) -> list["KVCacheEvent"]:  # type: ignore[name-defined] # noqa: F821
+            ) -> list[
+                    "KVCacheEvent"]:  # type: ignore[name-defined] # noqa: F821
                 return []
 
         setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
