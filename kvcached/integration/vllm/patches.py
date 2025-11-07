@@ -45,6 +45,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         BlockPool = getattr(block_pool_mod, "BlockPool")
         KVCacheBlock = getattr(block_pool_mod, "KVCacheBlock")
 
+        logger = self.logger  # Capture logger in closure
+
+        _PREFIX_CACHE_WARNING_MSG = (
+            "kvcached does not support prefix cache yet, "
+            "double check vLLM is not launched with prefix cache enabled.")
+
         class ElasticBlockPool(BlockPool):  # type: ignore
             """ElasticBlockPool that manages KVCacheBlocks using kvcached."""
 
@@ -81,10 +87,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
                 """args and kwargs are ignored for compatibility"""
-                self.logger.warning(
-                    "kvcached does not support prefix cache yet, "
-                    "double check vLLM is not launched with prefix cache enabled."
-                )
+                logger.warning(_PREFIX_CACHE_WARNING_MSG)
                 return
 
             def get_new_blocks(
@@ -101,10 +104,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def touch(self, *args,
                       **kwargs) -> None:  # type: ignore[valid-type]
-                self.logger.warning(
-                    "kvcached does not support prefix cache yet, "
-                    "double check vLLM is not launched with prefix cache enabled."
-                )
+                logger.warning(_PREFIX_CACHE_WARNING_MSG)
                 return
 
             def free_blocks(
@@ -120,10 +120,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager.free(block_ids)
 
             def reset_prefix_cache(self) -> bool:
-                self.logger.warning(
-                    "kvcached does not support prefix cache yet, "
-                    "double check vLLM is not launched with prefix cache enabled."
-                )
+                logger.warning(_PREFIX_CACHE_WARNING_MSG)
                 return True
 
             def get_num_free_blocks(self) -> int:
@@ -301,10 +298,10 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         return self.patch_kvcache_manager(kvcache_manager_mod)
 
     @version_range(VLLM_V8_RANGE)
-    def patch_kvcache_manager(self,
-                              kvcache_manager_mod: types.ModuleType) -> bool:
+    def patch_kvcache_manager(self, kvcache_manager_mod: types.ModuleType) -> bool:
         """Patch KVCacheManager"""
         import inspect
+
         KVCacheManager = self._get_target_class(kvcache_manager_mod)
         if KVCacheManager is None:
             return False
@@ -326,7 +323,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             try:
                 bound_args = sig.bind(self, *args, **kwargs)
                 bound_args.apply_defaults()
-                kv_cache_config = bound_args.arguments.get('kv_cache_config')
+                kv_cache_config = bound_args.arguments.get("kv_cache_config")
                 if kv_cache_config is None:
                     raise ValueError("kv_cache_config is required")
 
@@ -349,11 +346,9 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             # Get required attributes from the manager instance
             # This is a bit hacky but simplest
             if hasattr(self, "get_kv_cache_spec"):
-                kv_cache_spec = getattr(self,
-                                        "get_kv_cache_spec")().items()[0][1]
+                kv_cache_spec = getattr(self, "get_kv_cache_spec")().items()[0][1]
             elif hasattr(self, "specialized_manager"):
-                kv_cache_spec = getattr(self,
-                                        "specialized_manager").kv_cache_spec
+                kv_cache_spec = getattr(self, "specialized_manager").kv_cache_spec
             else:
                 raise ValueError(
                     "Unable to determine kv_cache_spec: expected get_kv_cache_spec or specialized_manager"
