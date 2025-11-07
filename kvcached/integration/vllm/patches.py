@@ -5,11 +5,24 @@
 vLLM-specific patches using unified patch infrastructure.
 """
 
+from __future__ import annotations
+
 import types
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
+
+if TYPE_CHECKING:
+    # These types are imported from vLLM at runtime via getattr()
+    # Import them here for type checking only
+    try:
+        from vllm.v1.core.block_pool import KVCacheBlock  # type: ignore[import-untyped]
+        from vllm.v1.core.block_pool import KVCacheEvent  # type: ignore[import-untyped]
+    except ImportError:
+        # Fallback if vLLM is not available during type checking
+        KVCacheBlock = Any  # type: ignore[misc,assignment]
+        KVCacheEvent = Any  # type: ignore[misc,assignment]
 
 # Version ranges for vLLM support
 VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
@@ -43,7 +56,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             return True
 
         BlockPool = getattr(block_pool_mod, "BlockPool")
-        KVCacheBlock = getattr(block_pool_mod, "KVCacheBlock")
+        KVCacheBlockClass = getattr(block_pool_mod, "KVCacheBlock")
 
         logger = self.logger  # Capture logger in closure
 
@@ -81,7 +94,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def get_cached_block(
                 self, *args: Any, **kwargs: Any
-            ) -> Optional[list[KVCacheBlock]]:  # type: ignore[valid-type]
+            ) -> Optional[list["KVCacheBlock"]]:
                 """args and kwargs are ignored for compatibility"""
                 return None
 
@@ -92,7 +105,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def get_new_blocks(
                 self, num_blocks: int
-            ) -> list[KVCacheBlock]:  # type: ignore[valid-type]
+            ) -> list["KVCacheBlock"]:
                 if num_blocks > self.get_num_free_blocks():
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
@@ -100,18 +113,16 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
 
-                return [KVCacheBlock(bid) for bid in block_ids]
+                return [KVCacheBlockClass(bid) for bid in block_ids]
 
-            def touch(self, *args,
-                      **kwargs) -> None:  # type: ignore[valid-type]
+            def touch(self, *args, **kwargs) -> None:
                 logger.warning(_PREFIX_CACHE_WARNING_MSG)
                 return
 
             def free_blocks(
                 self,
-                ordered_blocks: Iterable[
-                    KVCacheBlock],  # type: ignore[valid-type]
-            ) -> None:  # type: ignore[valid-type]
+                ordered_blocks: Iterable["KVCacheBlock"],
+            ) -> None:
                 block_ids = [
                     block.block_id  # type: ignore[attr-defined]
                     for block in ordered_blocks
@@ -131,8 +142,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def take_events(
                 self,
-            ) -> list[
-                    "KVCacheEvent"]:  # type: ignore[name-defined] # noqa: F821
+            ) -> list["KVCacheEvent"]:
                 return []
 
         setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
