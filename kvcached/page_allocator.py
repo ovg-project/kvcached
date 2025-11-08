@@ -387,6 +387,9 @@ class PageAllocator:
         return True
 
     def trim(self) -> None:
+        '''
+        Trim the reserved pages to free up physical memory.
+        '''
         with self._lock:
             pages_to_unmap = list(self.reserved_page_list)  # copy
             self.reserved_page_list.clear()
