@@ -136,9 +136,9 @@ class KVCacheManager:
             self._post_init_done.wait()
 
     def _reserve_null_block(self) -> None:
-        '''
+        """
         Reserve the first block as null block for padding tokens.
-        '''
+        """
         if self.reserve_null_block:
             self.null_block = self._alloc(1, _skip_wait=True)
             if self.null_block != [0]:
@@ -305,9 +305,9 @@ class KVCacheManager:
 
     @synchronized
     def trim(self) -> None:
-        '''
+        """
         Trim the reserved pages to free up physical memory.
-        '''
+        """
         self._wait_post_init()
         self.page_allocator.trim()
 
@@ -344,9 +344,9 @@ class KVCacheManager:
 
     @synchronized
     def clear(self):
-        '''
+        """
         Free all allocated blocks and reset the allocator to initial state.
-        '''
+        """
 
         self._wait_post_init()
 
@@ -355,9 +355,9 @@ class KVCacheManager:
 
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = []
-        for _, page in self.avail_pages.items():
+        for page in self.avail_pages.values():
             pages_to_free.append(page.page_id)
-        for _, page in self.full_pages.items():
+        for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
         if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
