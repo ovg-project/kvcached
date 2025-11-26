@@ -75,13 +75,26 @@ def alloc_kv_cache(
     if attention_type not in ["MHA", "GQA"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
     num_k_or_v = 2
-    requested_num_blocks = kvcache_shape[1]
 
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
-    if len(kvcache_shape) <= 3 or kvcache_shape[0] != num_k_or_v or kvcache_shape[2] != block_size:
+    if (len(kvcache_shape) <= 3 or (kvcache_shape[0] != num_k_or_v and kvcache_shape[1] != num_k_or_v
+    ) or kvcache_shape[2] != block_size):
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+    # FlashAttn (num_k_or_v, num_blocks, block_size, head_num, head_dim)
+    if kvcache_shape[0] == num_k_or_v:
+        blocks_dim_idx = 1
+        permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
+    # FlashInfer (num_blocks, num_k_or_v, block_size, head_num, head_dim)
+    elif kvcache_shape[1] == num_k_or_v:
+        blocks_dim_idx = 0
+        permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+    else:
+        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+    requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
     assert torch.cuda.is_available(), "CUDA is not available."
 
@@ -102,7 +115,7 @@ def alloc_kv_cache(
     )
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
-    actual_kvcache_shape[1] = num_blocks_per_layer
+    actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
     if not _contiguous_layout:
         num_eles = math.prod(actual_kvcache_shape)
         kv_tensors = [
@@ -113,7 +126,7 @@ def alloc_kv_cache(
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         kv_tensors = [
-            contiguous_tensor[:, i, :, :, :].permute(1, 0, *range(2, len(actual_kvcache_shape)))
+            contiguous_tensor[:, i, :, :, :].permute(*permute_order)
             for i in range(num_layers)
         ]
     return kv_tensors

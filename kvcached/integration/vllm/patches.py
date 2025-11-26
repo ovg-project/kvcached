@@ -661,7 +661,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if hasattr(GPUModelRunner, "_reshape_kv_cache_tensors_from_kvcached"):
             return True
 
-        def _reshape_kv_cache_tensors_from_kvcached(self, kv_cache_config, kv_cache_raw_tensors):
+        def _reshape_kv_cache_tensors_from_kvcached(
+            self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
+        ):
             import torch
 
             kv_caches: dict[str, torch.Tensor] = {}
@@ -687,12 +689,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
             return True
 
-        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors):
+        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
             if enable_kvcached():
                 return self._reshape_kv_cache_tensors_from_kvcached(
-                    kv_cache_config, kv_cache_raw_tensors
+                    kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )
-            return original_method(self, kv_cache_config, kv_cache_raw_tensors)
+            return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
 
         self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)
