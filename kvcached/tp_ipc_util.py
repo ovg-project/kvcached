@@ -6,21 +6,51 @@ import os
 import pickle
 import socket
 import threading
+import uuid
 from typing import Any, Dict, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
+
+def _get_socket_dir_name() -> str:
+    """
+    Build a human-readable, IPC-name-based directory with a short hash suffix.
+
+    This keeps the original text-based IPC name visible while adding a hash
+    for extra uniqueness. The hash is deterministic so all workers in the same
+    engine instance agree on the directory.
+    """
+    # Deterministic short hash derived from the base name
+    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, DEFAULT_IPC_NAME).hex[:8]
+    return f"kvcached-tp-{DEFAULT_IPC_NAME}-{suffix}"
+
+
 # Socket directory for tensor parallel (TP) worker communication.
-SOCKET_DIR = f"/tmp/kvcached-tp-sockets-{DEFAULT_IPC_NAME}"
+# Unix domain socket paths are limited to 108 characters on Linux, so we keep
+# the directory name short and validate the final socket path length below.
+SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
 
 
 def get_worker_socket_path(rank: int) -> str:
     """
     Get the path for the worker socket.
     The socket is used for inter-process communication.
+
+    The full path is guaranteed to be <= 108 characters (Unix domain socket limit on Linux).
     """
-    return os.path.join(SOCKET_DIR, f"worker_{rank}.sock")
+    # Use shorter name to ensure path stays under 108 chars.
+    # Format: /tmp/kvcached-tp-{sanitized_ipc}-{hash8}/w{rank}.sock
+    # Worst case (sanitized_ipc length 64) is still well under 108 characters.
+    socket_path = os.path.join(SOCKET_DIR, f"w{rank}.sock")
+
+    # Safety check: ensure path is within Unix domain socket limit
+    if len(socket_path) > 108:
+        raise RuntimeError(
+            f"Socket path too long ({len(socket_path)} chars, max 108): {socket_path}"
+        )
+
+    return socket_path
 
 
 # NOTE: All messages exchanged through the IPC layer are dictionaries with
