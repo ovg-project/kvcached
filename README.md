@@ -11,6 +11,7 @@
     <br>
     <a href="https://arxiv.org/abs/2505.04021"><img alt="arXiv: Multi LLM Serving" src="https://img.shields.io/badge/arXiv-Multi%20LLM%20Serving-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
     <a href="https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw"><img alt="Slack Join" src="https://img.shields.io/badge/Slack-Join-4A154B?logo=slack&logoColor=white&labelColor=555555"></a>
+    <a href="https://deepwiki.com/ovg-project/kvcached"><img alt="DeepWiki" src="https://img.shields.io/badge/DeepWiki-Docs-6B46C1?logo=book&logoColor=white&labelColor=555555"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   </p>
 
@@ -140,6 +141,18 @@ docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
 More instructions can be found [here](https://github.com/ovg-project/kvcached/blob/main/docker/README.md). GB200 dockers are on the way.
+
+## Documentation
+
+kvcached is indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for LLM-powered documentation.
+
+The documentation covers:
+- Core architecture and memory management system
+- Integration with vLLM and SGLang
+- Multi-model serving and controller system
+- Deployment guides and configuration reference
+- Performance benchmarking and analysis
+- Development tools and testing
 
 ## Testing
 
