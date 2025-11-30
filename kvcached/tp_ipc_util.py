@@ -8,9 +8,11 @@ import socket
 import threading
 from typing import Any, Dict, cast
 
+from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
-SOCKET_DIR = "/tmp/kvcached-ipc"
+# Socket directory for tensor parallel (TP) worker communication.
+SOCKET_DIR = f"/tmp/kvcached-tp-sockets-{DEFAULT_IPC_NAME}"
 
 
 def get_worker_socket_path(rank: int) -> str:
