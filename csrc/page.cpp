@@ -26,18 +26,18 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx)
 
 GPUPage::~GPUPage() { CHECK_DRV(cuMemRelease(handle_)); }
 
-bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
+bool GPUPage::map(generic_ptr_t vaddr, int access_dev_idx) {
   CUmemAccessDesc accessDesc_{
       .location =
           {
               .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev_,
+              .id = (access_dev_idx >= 0) ? access_dev_idx : 0,
           },
       .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
   };
   CHECK_DRV(
       cuMemMap(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize, 0, handle_, 0));
-  if (set_access)
+  if (access_dev_idx >= 0)
     CHECK_DRV(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize,
                              &accessDesc_, 1));
   return true;
@@ -49,7 +49,7 @@ CPUPage::CPUPage(page_id_t page_id)
 
 CPUPage::~CPUPage() {}
 
-bool CPUPage::map(void *vaddr, bool set_access) {
+bool CPUPage::map(void *vaddr, int access_dev_idx) {
   mapped_addr_ = vaddr;
   return true;
 }

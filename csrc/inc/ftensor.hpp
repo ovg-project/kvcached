@@ -19,7 +19,7 @@ public:
   FTensor(const std::string &name, size_t size, torch::Dtype dtype,
           torch::Device dev, std::shared_ptr<Page> zero_page);
   ~FTensor();
-  bool map(offset_t offset);
+  bool map(offset_t offset, int phys_dev_id = -1);
   bool unmap(offset_t offset);
 
   inline torch::Tensor get_tensor() noexcept { return tensor_; }

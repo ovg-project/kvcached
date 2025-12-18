@@ -34,9 +34,11 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::Device &dev,
 }
 
 static inline std::unique_ptr<Page> make_unique_page(const torch::Device &dev,
-                                                     page_id_t page_id) {
+                                                     page_id_t page_id,
+                                                     int phys_dev_id = -1) {
   if (dev.is_cuda()) {
-    return std::make_unique<GPUPage>(page_id, dev.index());
+    int dev_idx = (phys_dev_id == -1) ? dev.index() : phys_dev_id;
+    return std::make_unique<GPUPage>(page_id, dev_idx);
   } else if (dev.is_cpu()) {
     return std::make_unique<CPUPage>(page_id);
   }
@@ -67,7 +69,7 @@ FTensor::~FTensor() {
   }
 }
 
-bool FTensor::map(offset_t offset) {
+bool FTensor::map(offset_t offset, int phys_dev_id) {
   assert(offset % kPageSize == 0); // Ensure alignment.
 
   page_id_t page_id = offset / kPageSize;
@@ -80,8 +82,10 @@ bool FTensor::map(offset_t offset) {
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
   CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize));
 
-  mapping_[page_id] = make_unique_page(dev_, page_id);
-  mapping_[page_id]->map(vaddr);
+  mapping_[page_id] = make_unique_page(dev_, page_id, phys_dev_id);
+  // Pass the access device ID (where the memory is accessed from), which is
+  // dev_.index()
+  mapping_[page_id]->map(vaddr, dev_.index());
   return true;
 }
 
@@ -110,7 +114,7 @@ bool FTensor::map_(Page *page, offset_t offset, bool set_access) {
   assert(page);
   auto vaddr =
       reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  return page->map(vaddr, set_access);
+  return page->map(vaddr, set_access ? dev_.index() : -1);
 }
 
 bool FTensor::set_access_(generic_ptr_t addr, size_t size) {

@@ -6,9 +6,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from kvcached.cli.utils import get_shared_config
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, DEFAULT_IPC_NAME, PAGE_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -137,6 +138,11 @@ def get_kv_cache_manager(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
+    # Load shared memory configuration if available
+    shared_config = get_shared_config(DEFAULT_IPC_NAME)
+    if shared_config:
+        logger.info(f"Loaded shared memory config: {shared_config}")
+
     return KVCacheManager(
         num_blocks,
         block_size,
@@ -144,4 +150,5 @@ def get_kv_cache_manager(
         num_layers,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
+        shared_memory_config=shared_config,
     )

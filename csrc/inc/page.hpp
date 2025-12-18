@@ -15,7 +15,7 @@ namespace kvcached {
 class Page {
 public:
   virtual ~Page() = default;
-  virtual bool map(void *vaddr, bool set_access = true) = 0;
+  virtual bool map(void *vaddr, int access_dev_idx = -1) = 0;
   // unmap() is left for the caller to implement.
 };
 
@@ -24,7 +24,7 @@ public:
   GPUPage(page_id_t page_id, int dev_idx);
   ~GPUPage();
 
-  bool map(void *vaddr, bool set_access = true);
+  bool map(void *vaddr, int access_dev_idx = -1) override;
 
 private:
   page_id_t page_id_;
@@ -37,7 +37,7 @@ public:
   CPUPage(page_id_t page_id);
   ~CPUPage();
 
-  bool map(void *vaddr, bool set_access = true);
+  bool map(void *vaddr, int access_dev_idx = -1) override;
 
 private:
   page_id_t page_id_;

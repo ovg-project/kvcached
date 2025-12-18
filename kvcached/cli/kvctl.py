@@ -12,7 +12,7 @@ import time
 from typing import List, Optional, TypedDict
 
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import _format_size, get_kv_cache_limit, update_kv_cache_limit, update_shared_config
 
 try:
     import readline  # type: ignore
@@ -61,7 +61,7 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 COMMANDS = [
     'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
-    'exit', 'quit'
+    'config-shared', 'exit', 'quit'
 ]
 
 # Nicely formatted help text for the interactive shell.
@@ -75,6 +75,7 @@ Available commands:
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
   delete <ipc>                 Delete IPC segment and its limit entry
+  config-shared <ipc> <gpu> <size>  Configure shared memory limit for a GPU
   exit | quit                  Exit the shell
 """
 
@@ -288,6 +289,17 @@ def cmd_limit_percent(ipc: str, percent: float):
     update_kv_cache_limit(ipc, size_bytes)
 
 
+def cmd_config_shared(ipc: str, gpu_str: str, size_str: str):
+    """Configure shared memory limit for a specific GPU."""
+    try:
+        gpu_id = int(gpu_str)
+        size_bytes = _parse_size(size_str)
+        from kvcached.cli.utils import update_shared_config
+        update_shared_config(ipc, gpu_id, size_bytes)
+    except ValueError as e:
+        print(_clr(f"Error: {e}", 'red', bold=True), file=sys.stderr)
+
+
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
     try:
         while True:
@@ -357,6 +369,8 @@ def interactive_shell():
                 cmd_limit(tokens[1], tokens[2])
             elif cmd == 'limit-percent' and len(tokens) == 3:
                 cmd_limit_percent(tokens[1], float(tokens[2]))
+            elif cmd == 'config-shared' and len(tokens) == 4:
+                cmd_config_shared(tokens[1], tokens[2], tokens[3])
             elif cmd == 'watch':
                 # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
                 interval: float = 1.0
@@ -436,6 +450,12 @@ def main():
     p_lp.add_argument('ipc')
     p_lp.add_argument('percent', type=float)
 
+    # config-shared
+    p_cs = sub.add_parser('config-shared', help='Configure shared memory limit')
+    p_cs.add_argument('ipc')
+    p_cs.add_argument('gpu', help="GPU ID")
+    p_cs.add_argument('size', help="Size limit for this GPU")
+
     # watch
     p_watch = sub.add_parser('watch', help='Continuously list')
     p_watch.add_argument('-n', '--interval', type=float, default=1.0)
@@ -465,6 +485,8 @@ def main():
         cmd_limit(args.ipc, args.size)
     elif args.command == 'limit-percent':
         cmd_limit_percent(args.ipc, args.percent)
+    elif args.command == 'config-shared':
+        cmd_config_shared(args.ipc, args.gpu, args.size)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
