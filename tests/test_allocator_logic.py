@@ -73,8 +73,6 @@ class TestPageAllocatorRemote(unittest.TestCase):
         
         # Redo Alloc 5 pages logic with decreasing memory
         for i in range(5):
-            # Check before
-            expected_local = (current_free - 50*1024*1024) // allocator.page_size // 16 // 2
             # Alloc
             current_free -= page_phy_size # Mimic driver consumption
             
