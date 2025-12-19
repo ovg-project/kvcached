@@ -64,8 +64,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_tensors_created", &kvcached::kv_tensors_created,
         "kv_tensors_created");
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
-        py::arg("offsets"),
-        py::arg("phys_device_ids") = std::vector<int>());
+        py::arg("offsets"), py::arg("phys_device_ids") = std::vector<int>());
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors");
 }

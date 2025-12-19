@@ -12,7 +12,7 @@ GPU_A=${GPU_A:-4}
 GPU_B=${GPU_B:-5}
 POOL_GPU_ID=${POOL_GPU_ID:-6}
 
-# Memory limit for each pool on GPU 'POOL_GPU_ID'. 
+# Memory limit for each pool on GPU 'POOL_GPU_ID'.
 # Total used on GPU 'POOL_GPU_ID' = POOL_SIZE_A + POOL_SIZE_B
 # Adjust based on your GPU memory. Here we set each to ~10GB.
 POOL_SIZE_BYTES_A=$((60 * 1024 * 1024 * 1024))
@@ -62,7 +62,7 @@ $PYTHON -m kvcached.cli.kvctl config-shared "$IPC_NAME_B" "1" "$POOL_SIZE_BYTES_
 
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
-# Force extremely low local utilization (0.01) to simulate full local memory 
+# Force extremely low local utilization (0.01) to simulate full local memory
 # and trigger spillover to the remote KV cache pool for demonstration purposes.
 export KVCACHED_GPU_UTILIZATION=0.99
 

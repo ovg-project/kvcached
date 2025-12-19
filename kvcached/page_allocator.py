@@ -403,14 +403,14 @@ class PageAllocator:
             # Try to reserve local pages
             num_to_reserve = self.max_reserved_pages - len(
                 self.reserved_page_list)
-            
+
             pages_to_unmap = []
-            
+
             if num_to_reserve > 0 and local_pages:
                 reserved = local_pages[:num_to_reserve]
                 self.reserved_page_list.extend(reserved)
                 self._cond.notify_all()
-                
+
                 # Remaining local pages need to be unmapped
                 pages_to_unmap.extend(local_pages[num_to_reserve:])
             else:
@@ -432,7 +432,7 @@ class PageAllocator:
                 if pid in self.page_locations:
                     del self.page_locations[pid]
                     self.remote_allocated_bytes -= self.page_size * self.num_layers * 2
-            
+
             # Remove local pages from tracking if present (though defaults to -1)
             for pid in local_pages:
                 if pid in self.page_locations:
@@ -543,14 +543,14 @@ class PageAllocator:
         Get total available physical pages (Local + Remote).
         """
         local_avail = self._get_local_avail_physical_pages()
-        
+
         # Calculate remote available pages
         remote_limit = sum(self.shared_memory_config.values())
         remote_avail_bytes = max(0, remote_limit - self.remote_allocated_bytes)
         # Convert bytes to KV cache pages
-        # Note: mem_size_per_layer in init includes K+V for 1 layer? 
+        # Note: mem_size_per_layer in init includes K+V for 1 layer?
         # Actually init says: mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
-        # So one "Page" (which spans all layers K+V?) 
+        # So one "Page" (which spans all layers K+V?)
         # Wait, PageAllocator logic:
         # page_size is "Page size in bytes" (e.g. 2MB).
         # We allocations are 1 page id.
@@ -564,9 +564,9 @@ class PageAllocator:
         # avail_phy_pages = avail_phy_mem_size // self.page_size
         # avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
         # Yes.
-        
+
         remote_avail_pages = remote_avail_bytes // self.page_size // self.num_layers // 2
-        
+
         return local_avail + int(remote_avail_pages)
 
     def _get_local_avail_physical_pages(self) -> int:

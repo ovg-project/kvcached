@@ -166,7 +166,7 @@ def update_shared_config(ipc_name: str, gpu_id: int, limit: int) -> bool:
     import json
     config_path = get_config_path(ipc_name)
     config = {}
-    
+
     # Read existing config
     if os.path.exists(config_path):
         try:
@@ -174,11 +174,11 @@ def update_shared_config(ipc_name: str, gpu_id: int, limit: int) -> bool:
                 config = json.load(f)
         except Exception as e:
             print(f"Error reading config: {e}")
-            
+
     # Update config
     # We store keys as strings in JSON
     config[str(gpu_id)] = limit
-    
+
     try:
         with open(config_path, 'w') as f:
             json.dump(config, f)

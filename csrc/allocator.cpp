@@ -161,8 +161,7 @@ bool FTensorAllocator::map_to_kv_tensors(
 
     for (size_t i = 0; i < offsets.size(); ++i) {
       offset_t offset = offsets[i];
-      int phys_dev_id =
-          phys_device_ids.empty() ? -1 : phys_device_ids[i];
+      int phys_dev_id = phys_device_ids.empty() ? -1 : phys_device_ids[i];
       // Map K and V regions for this block (covers all layers)
       ftensor->map(offset, phys_dev_id);
     }
@@ -180,8 +179,7 @@ bool FTensorAllocator::map_to_kv_tensors(
       auto v_base_offset = get_v_base_offset(tensor);
       for (size_t j = 0; j < offsets.size(); ++j) {
         offset_t offset = offsets[j];
-        int phys_dev_id =
-            phys_device_ids.empty() ? -1 : phys_device_ids[j];
+        int phys_dev_id = phys_device_ids.empty() ? -1 : phys_device_ids[j];
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
         ftensor->map(koffset, phys_dev_id);
