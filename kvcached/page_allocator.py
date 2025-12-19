@@ -257,7 +257,7 @@ class PageAllocator:
                     # But Page object needs phys_dev_id. If we recreate Page object here, we lose it?
                     # The reserved_page_list stores ints.
                     # We might need to store (int, phys_dev_id) in reserved list if we want to preserve location.
-                    # OR we just assume reserved pages are re-usable valid mappings.
+                    # OR we just assume reserved pages are reusable valid mappings.
                     # But the Page constructor needs phys_dev_id.
                     # Force it to -1 (local) for now or track it.
                     # Given the scope, let's assume reserved pages are local (-1) for now,
