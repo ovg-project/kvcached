@@ -502,54 +502,51 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             if not enable_kvcached():
                 return original_initialize_kv_cache(self, kv_cache_config)
 
-            if len(kv_cache_config.kv_cache_groups) > 1:
-                raise NotImplementedError(
-                    "Hybrid models with more than one KV cache type are not supported yet."
-                )
-
-            kv_caches: dict[str, torch.Tensor] = {}
+            # Validate all groups use FullAttentionSpec
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
+                if not isinstance(kv_cache_spec, FullAttentionSpec):
+                    raise ValueError(
+                        f"kvcached only supports FullAttentionSpec layers, "
+                        f"got {type(kv_cache_spec).__name__}"
+                    )
                 for layer_name in kv_cache_group.layer_names:
-                    if not isinstance(kv_cache_spec, FullAttentionSpec):
-                        raise ValueError("kvcached only supports full attention")
                     tensor_config = kv_cache_config.tensors[layer_name]
                     assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
                     num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
 
-            num_layers = len(kv_cache_config.tensors)
-            layer_name = list(kv_cache_config.tensors.keys())[0]
-            kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-            tensor_config = kv_cache_config.tensors[layer_name]
-
-            # kv_cache_spec is guaranteed to be FullAttentionSpec
-            # due to the check above
-            assert isinstance(kv_cache_spec, FullAttentionSpec)
-            dtype = kv_cache_spec.dtype
-            num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
-            assert num_blocks >= kv_cache_config.num_blocks
-            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-            )
-
-            kv_cache_buffers = kvi.alloc_kv_cache(
-                kv_cache_shape,
-                kv_cache_spec.block_size,
-                dtype,
-                self.device.type,
-                num_layers,
-                attention_type="MHA",
-                kv_layout="NHD",
-            )
-            layer_id = 0
+            # Allocate KV cache for each group separately to support hybrid models
+            kv_caches: dict[str, torch.Tensor] = {}
             for kv_cache_group in kv_cache_config.kv_cache_groups:
-                for layer_name in kv_cache_group.layer_names:
-                    kv_caches[layer_name] = kv_cache_buffers[layer_id]
-                    layer_id += 1
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                num_group_layers = len(kv_cache_group.layer_names)
+
+                # Get tensor config from first layer in this group
+                first_layer_name = kv_cache_group.layer_names[0]
+                tensor_config = kv_cache_config.tensors[first_layer_name]
+
+                dtype = kv_cache_spec.dtype
+                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                    num_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                )
+
+                kv_cache_buffers = kvi.alloc_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    self.device.type,
+                    num_group_layers,
+                    attention_type="MHA",
+                    kv_layout="NHD",
+                )
+
+                for idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    kv_caches[layer_name] = kv_cache_buffers[idx]
 
             bind_kv_cache(
                 kv_caches,
@@ -576,60 +573,66 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            if len(kv_cache_config.kv_cache_groups) > 1:
-                raise NotImplementedError(
-                    "Hybrid models with more than one KV cache type are not supported yet."
-                )
-
-            kv_cache_group = kv_cache_config.kv_cache_groups[0]
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if not isinstance(kv_cache_spec, FullAttentionSpec):
-                raise ValueError("kvcached only supports FullAttentionSpec layers")
-
+            # Build layer-to-tensor mapping
             layer_to_tensor_cfg: dict[str, KVCacheTensor] = {}
             for tensor_cfg in kv_cache_config.kv_cache_tensors:
                 for ln in tensor_cfg.shared_by:
                     layer_to_tensor_cfg[ln] = tensor_cfg
 
-            for layer_name in kv_cache_group.layer_names:
-                tensor_cfg = layer_to_tensor_cfg[layer_name]
-                assert tensor_cfg.size % kv_cache_spec.page_size_bytes == 0, (
-                    f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "
-                    "is not a multiple of page size "
-                    f"{kv_cache_spec.page_size_bytes}."
+            # Validate all groups and collect allocations
+            all_kv_cache_tensors: list = []
+
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                if not isinstance(kv_cache_spec, FullAttentionSpec):
+                    raise ValueError(
+                        f"kvcached only supports FullAttentionSpec layers, "
+                        f"got {type(kv_cache_spec).__name__}"
+                    )
+
+                # Validate each layer in this group
+                for layer_name in kv_cache_group.layer_names:
+                    tensor_cfg = layer_to_tensor_cfg[layer_name]
+                    assert tensor_cfg.size % kv_cache_spec.page_size_bytes == 0, (
+                        f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "
+                        "is not a multiple of page size "
+                        f"{kv_cache_spec.page_size_bytes}."
+                    )
+                    num_blocks = tensor_cfg.size // kv_cache_spec.page_size_bytes
+                    assert num_blocks >= kv_cache_config.num_blocks, (
+                        "Number of blocks derived from tensor size is smaller than "
+                        "kv_cache_config.num_blocks"
+                    )
+
+                # Allocate KV cache for this group
+                first_layer_name = kv_cache_group.layer_names[0]
+                rep_tensor_cfg = layer_to_tensor_cfg[first_layer_name]
+                num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes
+
+                # Use version-aware attention backend access
+                attn_backend_cls = patch_instance._get_version_specific_attention_backend(self)
+                kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
+                    num_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
                 )
-                num_blocks = tensor_cfg.size // kv_cache_spec.page_size_bytes
-                assert num_blocks >= kv_cache_config.num_blocks, (
-                    "Number of blocks derived from tensor size is smaller than "
-                    "kv_cache_config.num_blocks"
+
+                num_group_layers = len(kv_cache_group.layer_names)
+                dtype = kv_cache_spec.dtype
+
+                group_tensors = kvi.alloc_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    getattr(self, "device", torch.device("cuda")).type,
+                    num_group_layers,
+                    attention_type="MHA",
+                    kv_layout="NHD",
                 )
+                all_kv_cache_tensors.extend(group_tensors)
 
-            first_layer_name = kv_cache_group.layer_names[0]
-            rep_tensor_cfg = layer_to_tensor_cfg[first_layer_name]
-            num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes
-
-            # Use version-aware attention backend access
-            attn_backend_cls = patch_instance._get_version_specific_attention_backend(self)
-            kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-            )
-
-            num_layers = len(kv_cache_group.layer_names)
-            dtype = kv_cache_spec.dtype
-
-            kv_cache_raw_tensors = kvi.alloc_kv_cache(
-                kv_cache_shape,
-                kv_cache_spec.block_size,
-                dtype,
-                getattr(self, "device", torch.device("cuda")).type,
-                num_layers,
-                attention_type="MHA",
-                kv_layout="NHD",
-            )
-            return kv_cache_raw_tensors
+            return all_kv_cache_tensors
 
         setattr(
             GPUModelRunner, "_allocate_kv_cache_from_kvcached", _allocate_kv_cache_from_kvcached
@@ -666,10 +669,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         ):
             import torch
 
+            # Map tensors to layer names across all groups
             kv_caches: dict[str, torch.Tensor] = {}
-            kv_cache_group = kv_cache_config.kv_cache_groups[0]
-            for idx, layer_name in enumerate(kv_cache_group.layer_names):
-                kv_caches[layer_name] = kv_cache_raw_tensors[idx]
+            tensor_idx = 0
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                for layer_name in kv_cache_group.layer_names:
+                    kv_caches[layer_name] = kv_cache_raw_tensors[tensor_idx]
+                    tensor_idx += 1
             return kv_caches
 
         setattr(
