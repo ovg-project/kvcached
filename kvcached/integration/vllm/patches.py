@@ -106,9 +106,15 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list["KVCacheBlock"]:
-                if num_blocks > self.get_num_free_blocks():
+                free_blocks = self.get_num_free_blocks()
+                if num_blocks > free_blocks:
+                    usage_pct = self.get_usage() * 100
                     raise ValueError(
-                        f"Cannot get {num_blocks} free blocks from the pool")
+                        f"Cannot get {num_blocks} free blocks from the pool. "
+                        f"Available: {free_blocks}, Total: {self.num_gpu_blocks}, "
+                        f"Usage: {usage_pct:.1f}%. "
+                        f"Try reducing concurrent requests or increasing kvcached_gpu_utilization."
+                    )
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
