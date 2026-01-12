@@ -22,7 +22,8 @@ launch_delay_seconds: 30  # Delay between launching each instance
 
 instances: # instances configuration
   - name: instance1
-    model: meta-llama/Llama-3.1-8B-Instruct
+    # model: meta-llama/Llama-3.1-8B-Instruct
+    model: Qwen/Qwen2-7B-Instruct
     engine: vllm
     using_venv: true
     venv_path:  ../engine_integration/vllm-v0.9.2/.venv
@@ -38,12 +39,14 @@ instances: # instances configuration
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=12346"
-      # - "--gpu-memory-utilization 0.31"
+      - "--gpu-memory-utilization=0.31"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
+      # - "--max-model-len=62000"
+      - "--max-num-batched-tokens=8192"
 
   - name: instance2
-    model: meta-llama/Llama-3.1-8B-Instruct
+    # model: meta-llama/Llama-3.1-8B-Instruct
+    model: Qwen/Qwen2-7B-Instruct
     engine: vllm
     using_venv: true
     venv_path:  ../engine_integration/vllm-v0.9.2/.venv
@@ -59,12 +62,14 @@ instances: # instances configuration
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=30000"
-      # - "--gpu-memory-utilization 0.31"
+      - "--gpu-memory-utilization=0.31"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
+      # - "--max-model-len=62000"
+      - "--max-num-batched-tokens=8192"
 
   - name: instance3
-    model: meta-llama/Llama-3.1-8B-Instruct
+    # model: meta-llama/Llama-3.1-8B-Instruct
+    model: Qwen/Qwen2-7B-Instruct
     engine: vllm
     using_venv: true
     venv_path:  ../engine_integration/vllm-v0.9.2/.venv
@@ -80,6 +85,7 @@ instances: # instances configuration
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=40000"
-      # - "--gpu-memory-utilization 0.31"
+      - "--gpu-memory-utilization=0.31"
       - "--enable-sleep-mode"
-      - "--max-model-len 62000"
+      # - "--max-model-len=62000"
+      - "--max-num-batched-tokens=8192"
