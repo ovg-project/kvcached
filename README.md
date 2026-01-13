@@ -214,6 +214,48 @@ The latest roadmap is also tracked in [issue #125](https://github.com/ovg-projec
   - [x] NVIDIA GPUs
   - [ ] AMD GPUs
 
+## FAQ
+
+### What is the difference between kvcached and Paged Attention?
+
+Both technologies involve GPU memory management for LLM inference, but they differ fundamentally in their approach:
+
+| Aspect | Paged Attention | kvcached |
+|--------|-----------------|----------|
+| **Memory Allocation** | Static reservation at startup | Dynamic on-demand allocation |
+| **Scope** | Optimizes single-model serving | Enables multi-model GPU sharing |
+| **Idle Memory Usage** | Reserved memory stays allocated | Zero GPU memory when idle |
+| **Virtual Memory** | Maps logical blocks to physical | Full OS-style virtual memory abstraction |
+
+**Paged Attention** (used in vLLM, SGLang) organizes KV cache into fixed-size blocks and uses a page table to map logical blocks to physical GPU memory. However, the physical memory is **statically reserved** during engine initialization.
+
+**kvcached** builds on top of this by adding true virtual memory semantics: engines reserve only *virtual* address space initially, and physical GPU memory is allocated **on-demand** as requests arrive. When a model is idle, its physical memory can be reclaimed for other models.
+
+This enables multiple LLMs to elastically share the same GPU without rigid memory partitioning.
+
+### Do I need to set `--gpu-memory-utilization` when using kvcached?
+
+**No.** When kvcached is enabled, it automatically manages GPU memory allocation. Do NOT use:
+- vLLM: `--gpu-memory-utilization`
+- SGLang: `--mem-fraction-static`
+
+Instead, configure memory limits via kvcached settings (e.g., `kvcached_gpu_utilization` in the controller YAML or via `kvctl`).
+
+### Can kvcached work with prefix caching?
+
+Not yet. Prefix caching requires keeping KV cache blocks allocated across requests, which prevents kvcached from reclaiming memory when models are idle. Use:
+- vLLM: `--no-enable-prefix-caching`
+- SGLang: `--disable-radix-cache`
+
+### How do I monitor kvcached memory usage?
+
+Use the `kvctl` CLI tool:
+```bash
+kvctl shell          # Interactive shell
+kvctl list           # Show IPC segments and usage
+kvctl kvtop          # Launch curses UI for real-time monitoring
+```
+
 ## Contributing
 
 We are grateful for and open to contributions and collaborations of any kind.
