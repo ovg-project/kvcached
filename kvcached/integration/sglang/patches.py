@@ -197,8 +197,28 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    # Initialize kvcached with overlap scheduling to be conservative
-                    kvi.init_kvcached(async_sched=True)
+                    # Detect tensor parallel configuration from SGLang's distributed state
+                    tp_rank, tp_size = 0, 1
+                    try:
+                        from sglang.srt.distributed.parallel_state import (
+                            get_tp_group,
+                        )
+                        tp_group = get_tp_group()
+                        if tp_group is not None:
+                            tp_rank = tp_group.rank_in_group
+                            tp_size = tp_group.world_size
+                    except (ImportError, AttributeError):
+                        pass  # Fall back to single-GPU mode
+
+                    # Initialize kvcached with overlap scheduling to be conservative.
+                    # Workers need to start the IPC listener for tensor parallel sync.
+                    is_worker = tp_rank > 0  # rank 0 is typically the scheduler
+                    kvi.init_kvcached(
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        is_worker=is_worker,
+                        async_sched=True,
+                    )
 
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
