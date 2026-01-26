@@ -521,10 +521,11 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:  # map pages across all tensor parallel workers.
+        # Always map locally on rank 0 (coordinator)
+        map_to_kv_tensors(offsets)
+        if self.tp_size > 1:
+            # Broadcast to workers (ranks 1..tp_size-1) to map on their GPUs
             broadcast_map_to_kv_tensors(self.tp_size, offsets)
-        else:
-            map_to_kv_tensors(offsets)
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
@@ -533,12 +534,13 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
+        # Always unmap locally on rank 0 (coordinator)
+        if self.async_sched:
+            torch.cuda.synchronize()
+        unmap_from_kv_tensors(offsets)
+        if self.tp_size > 1:
+            # Broadcast to workers (ranks 1..tp_size-1) to unmap on their GPUs
             broadcast_unmap_from_kv_tensors(self.tp_size, offsets)
-        else:
-            if self.async_sched:
-                torch.cuda.synchronize()
-            unmap_from_kv_tensors(offsets)
 
     def _update_memory_usage(self):
         """Update memory usage information in shared memory."""

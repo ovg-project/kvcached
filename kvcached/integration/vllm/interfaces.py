@@ -18,8 +18,8 @@ from kvcached.vmm_ops import (
 logger = get_kvcached_logger()
 
 _kvcached_initialized: bool = False
-_kvcached_device = None
-_async_sched = False
+_kvcached_device: Optional[str] = None
+_async_sched: bool = False
 _tp_size: int = 1
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 
@@ -62,13 +62,14 @@ def init_kvcached(
 
 def shutdown_kvcached() -> None:
     """Shutdown kvcached and release resources."""
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
     if not _kvcached_initialized:
         return
 
     _shutdown_kvcached_impl()
     _kvcached_initialized = False
     _kvcached_device = None
+    _tp_size = 1
     _async_sched = False
 
 

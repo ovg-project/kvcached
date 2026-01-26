@@ -171,14 +171,22 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
                                        offsets: list[int]) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
+
+    Note: This sends to workers (ranks 1 to tp_size-1) only. Rank 0 (the
+    coordinator) should call map_to_kv_tensors locally before/after this.
     """
+    if tp_size <= 1:
+        return  # No workers to broadcast to
+
     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
+    # Skip rank 0 (coordinator) - it maps locally, workers are ranks 1..tp_size-1
     tasks = [
-        _send_and_receive_message(rank, map_message) for rank in range(tp_size)
+        _send_and_receive_message(rank, map_message) for rank in range(1, tp_size)
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
-    for rank, response in enumerate(responses):
+    for i, response in enumerate(responses):
+        rank = i + 1  # Adjust for skipped rank 0
         if isinstance(response, Exception):
             raise RuntimeError(f"Worker {rank} failed to map: {response}")
         elif not isinstance(response,
@@ -190,15 +198,23 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
                                            offsets: list[int]) -> None:
     """
     Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
+
+    Note: This sends to workers (ranks 1 to tp_size-1) only. Rank 0 (the
+    coordinator) should call unmap_from_kv_tensors locally before/after this.
     """
+    if tp_size <= 1:
+        return  # No workers to broadcast to
+
     unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets}
+    # Skip rank 0 (coordinator) - it unmaps locally, workers are ranks 1..tp_size-1
     tasks = [
         _send_and_receive_message(rank, unmap_message)
-        for rank in range(tp_size)
+        for rank in range(1, tp_size)
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
-    for rank, response in enumerate(responses):
+    for i, response in enumerate(responses):
+        rank = i + 1  # Adjust for skipped rank 0
         if isinstance(response, Exception):
             raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
         elif not isinstance(response,
@@ -208,18 +224,26 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
 
 async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
     """
-    Broadcast the "kv_tensors_created" operation to all workers concurrently.
+    Broadcast the "kv_tensors_created" check to all workers concurrently.
+
     Returns True if all workers report that KV tensors are created, False otherwise.
+    Note: This only checks workers (ranks 1 to tp_size-1). The caller should
+    also check locally on rank 0.
     """
+    if tp_size <= 1:
+        return True  # No workers to check
+
     check_message = {"cmd": "kv_tensors_created"}
+    # Skip rank 0 (coordinator) - it checks locally, workers are ranks 1..tp_size-1
     tasks = [
         _send_and_receive_message(rank, check_message)
-        for rank in range(tp_size)
+        for rank in range(1, tp_size)
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     all_created = True
-    for rank, response in enumerate(responses):
+    for i, response in enumerate(responses):
+        rank = i + 1  # Adjust for skipped rank 0
         if isinstance(response, Exception):
             raise RuntimeError(
                 f"Worker {rank} failed to check KV tensors created: {response}"

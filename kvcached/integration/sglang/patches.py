@@ -207,8 +207,13 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         if tp_group is not None:
                             tp_rank = tp_group.rank_in_group
                             tp_size = tp_group.world_size
-                    except (ImportError, AttributeError):
-                        pass  # Fall back to single-GPU mode
+                            logger.debug(
+                                f"Detected TP configuration: rank={tp_rank}, size={tp_size}"
+                            )
+                    except (ImportError, AttributeError) as e:
+                        logger.debug(
+                            f"TP detection unavailable, using single-GPU mode: {e}"
+                        )
 
                     # Initialize kvcached with overlap scheduling to be conservative.
                     # Workers need to start the IPC listener for tensor parallel sync.
