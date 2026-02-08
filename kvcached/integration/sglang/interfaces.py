@@ -81,8 +81,8 @@ def alloc_kv_cache(
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
     assert torch.cuda.is_available(), "CUDA is not available."
-    if page_size != 1:
-        logger.warning("kvcached is only tested with page_size=1 for SGLang.")
+    # if page_size != 1:
+    #     logger.warning("kvcached is only tested with page_size=1 for SGLang.")
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
