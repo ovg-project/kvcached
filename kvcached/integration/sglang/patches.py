@@ -255,6 +255,170 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
+    """Inject ElasticMLATokenToKVPool into SGLang's memory pool module"""
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.memory_pool"
+    patch_name = "elastic_mla_memory_pool"
+
+    def apply(self, mem_pool_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        # Apply version-specific patches
+        success = self.inject_elastic_mla_mem_pool(mem_pool_mod)
+        if success:
+            success &= self.alias_mla_mem_pool_to_elastic(mem_pool_mod)
+        return success
+
+    @version_range(SGLANG_ALL_RANGE)
+    def inject_elastic_mla_mem_pool(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Inject ElasticMLATokenToKVPool"""
+        if hasattr(mem_pool_mod, "ElasticMLATokenToKVPool"):
+            self.logger.debug("ElasticMLATokenToKVPool already exists")
+            return True
+
+        try:
+            import torch
+
+            MLATokenToKVPool = getattr(mem_pool_mod, "MLATokenToKVPool")
+            KVCache = getattr(mem_pool_mod, "KVCache")
+
+            class ElasticMLATokenToKVPool(MLATokenToKVPool):  # type: ignore
+                def __init__(
+                    self,
+                    size: int,
+                    page_size: int,
+                    dtype,
+                    kv_lora_rank: int,
+                    qk_rope_head_dim: int,
+                    layer_num: int,
+                    device: str,
+                    enable_memory_saver: bool,
+                    start_layer: Union[int, None] = None,
+                    end_layer: Union[int, None] = None,
+                    *args,
+                    **kwargs,
+                ) -> None:
+                    # Skip MLATokenToKVPool.__init__ which inlines torch.zeros
+                    # buffer allocation. Call KVCache.__init__ directly and set
+                    # MLA-specific attributes ourselves.
+                    KVCache.__init__(
+                        self,
+                        size,
+                        page_size,
+                        dtype,
+                        layer_num,
+                        device,
+                        enable_memory_saver,
+                        start_layer,
+                        end_layer,
+                    )
+
+                    # MLA-specific attributes (mirroring MLATokenToKVPool)
+                    self.kv_lora_rank = kv_lora_rank
+                    self.qk_rope_head_dim = qk_rope_head_dim
+                    self.use_nsa = kwargs.get("use_nsa", False)
+                    self.nsa_kv_cache_store_fp8 = (
+                        self.use_nsa and dtype == torch.float8_e4m3fn
+                    )
+                    override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.kv_cache_dim = (
+                        override_kv_cache_dim
+                        if self.use_nsa and self.nsa_kv_cache_store_fp8
+                        else (kv_lora_rank + qk_rope_head_dim)
+                    )
+                    # Attributes from parent that we skip but inherited methods may need
+                    self.custom_mem_pool = None
+
+                    import kvcached.integration.sglang.interfaces as kvi
+
+                    # Initialize kvcached and create virtual memory buffers
+                    kvi.init_kvcached(async_sched=True)
+
+                    if "cuda" not in device:
+                        raise ValueError("ElasticMLATokenToKVPool only supports cuda device")
+                    self.kv_buffer = kvi.alloc_mla_kv_cache(
+                        kvcache_shape=(
+                            size + page_size,
+                            1,
+                            self.kv_cache_dim,
+                        ),
+                        dtype=dtype,
+                        device=device,
+                        num_layers=layer_num,
+                        page_size=page_size,
+                    )
+
+                    self.data_ptrs = torch.tensor(
+                        [x.data_ptr() for x in self.kv_buffer],
+                        dtype=torch.uint64,
+                        device=self.device,
+                    )
+
+                    self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
+                    self.kvcached_allocator = kvi.get_kv_cache_manager(
+                        size + page_size, page_size, self.cell_size, layer_num
+                    )
+
+                    kv_size = self.get_kv_size_bytes()
+                    GB = 1024**3
+                    kv_size_phy = self.get_kv_size_bytes_phy()
+
+                    logger.info(
+                        f"VirtualKV Cache is allocated. #tokens: {size}, "
+                        f"KV size: {kv_size / GB:.2f} GB"
+                    )
+                    logger.info(
+                        f"Physical KV Cache limits by --mem-fraction-static: "
+                        f"#tokens: {size}, KV size: {kv_size_phy / GB:.2f} GB"
+                    )
+
+                    self.mem_usage = kv_size / GB
+
+                def __del__(self):  # best-effort cleanup
+                    try:
+                        import kvcached.integration.sglang.interfaces as kvi
+
+                        kvi.shutdown_kvcached()
+                    except Exception:
+                        pass
+
+                def get_kv_size_bytes_phy(self):
+                    """Return the physical memory limits of the KV buffer."""
+                    total_tokens = self.size + self.page_size
+                    elems_per_token = self.kv_cache_dim
+                    bytes_per_elem = self.dtype.itemsize
+
+                    return self.layer_num * total_tokens * elems_per_token * bytes_per_elem
+
+            setattr(mem_pool_mod, "ElasticMLATokenToKVPool", ElasticMLATokenToKVPool)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to inject ElasticMLATokenToKVPool: {e}")
+            return False
+
+    @version_range(SGLANG_ALL_RANGE)
+    def alias_mla_mem_pool_to_elastic(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Alias MLATokenToKVPool to ElasticMLATokenToKVPool"""
+        if self._is_already_patched(mem_pool_mod, "__kvcached_mla_mempool_aliased__"):
+            return True
+
+        try:
+            ElasticMLATokenToKVPool = getattr(mem_pool_mod, "ElasticMLATokenToKVPool")
+            if ElasticMLATokenToKVPool is None:
+                return False
+            # Alias defaults so core code will use elastic variants
+            mem_pool_mod.MLATokenToKVPool = ElasticMLATokenToKVPool  # type: ignore
+            self._mark_as_patched(mem_pool_mod, "__kvcached_mla_mempool_aliased__")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to alias MLA memory_pool to elastic one: {e}")
+            return False
+
+
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
     """Patch SGLang scheduler to suppress memory leak check when kvcached is enabled"""
 

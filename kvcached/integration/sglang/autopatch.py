@@ -11,6 +11,7 @@ from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     ElasticAllocatorPatch,
     ElasticMemoryPoolPatch,
+    ElasticMLAMemoryPoolPatch,
     SchedulerMemoryLeakPatch,
 )
 from kvcached.utils import get_kvcached_logger
@@ -35,6 +36,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
         [
             (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
             (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
+            (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
         ]
     )

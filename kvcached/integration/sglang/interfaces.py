@@ -127,6 +127,69 @@ def alloc_kv_cache(
     return k_tensors, v_tensors
 
 
+def alloc_mla_kv_cache(
+    kvcache_shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: str,
+    num_layers: int,
+    page_size: int = 1,
+) -> List[torch.Tensor]:
+    """Allocate MLA-style KV cache with a single combined kv_buffer per layer.
+
+    MLA uses a single buffer of shape (num_tokens, 1, kv_cache_dim) per layer
+    instead of separate K and V buffers.
+    """
+    if not _kvcached_initialized:
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+
+    num_k_or_v = 1
+    requested_num_tokens = kvcache_shape[0]
+
+    if len(kvcache_shape) <= 2:
+        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+    assert torch.cuda.is_available(), "CUDA is not available."
+    if page_size != 1:
+        logger.warning("kvcached is only tested with page_size=1 for SGLang.")
+
+    block_size = page_size
+    block_mem_size = math.prod(kvcache_shape[1:]) * dtype.itemsize
+
+    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes_per_layer = gpu_mem_bytes // num_layers // num_k_or_v
+    # round down to page size
+    gpu_mem_bytes_per_layer = (gpu_mem_bytes_per_layer // PAGE_SIZE) * PAGE_SIZE
+
+    raw_kv_tensors = create_kv_tensors(
+        gpu_mem_bytes_per_layer * num_k_or_v, dtype.itemsize, device, num_layers
+    )
+
+    num_blocks_per_layer = gpu_mem_bytes_per_layer // block_mem_size
+    num_tokens = num_blocks_per_layer * block_size
+    if requested_num_tokens > num_tokens:
+        logger.warning(
+            f"Requested {requested_num_tokens} tokens, but only {num_tokens} tokens are available."
+        )
+
+    actual_kvcache_shape: List[int] = list(kvcache_shape)
+    actual_kvcache_shape[0] = block_size * num_blocks_per_layer
+
+    kv_tensors: List[torch.Tensor] = []
+
+    if not _contiguous_layout:
+        num_eles = math.prod(actual_kvcache_shape)
+        for t in raw_kv_tensors:
+            kv_tensors.append(t.view(dtype=dtype)[:num_eles].view(actual_kvcache_shape))
+    else:
+        contiguous_shape = (num_tokens, num_layers, *actual_kvcache_shape[1:])
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+        for i in range(num_layers):
+            kv_tensors.append(contiguous_tensor[:, i, :, :])
+
+    return kv_tensors
+
+
 def get_kv_cache_manager(
     num_blocks: int,
     block_size: int,
