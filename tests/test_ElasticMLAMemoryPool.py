@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+
 import os
+
 os.environ["ENABLE_KVCACHED"] = "1"
 
 import torch
-import kvcached.autopatch 
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool # 0.5.3
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool  # 0.5.3
 
 print(f"MLATokenToKVPool class: {MLATokenToKVPool.__name__}")
 assert "Elastic" in MLATokenToKVPool.__name__, "MLA pool was not patched!"
@@ -28,7 +31,7 @@ try:
         device=device,
         enable_memory_saver=False,
     )
-    print(f"Pool created successfully!")
+    print("Pool created successfully!")
     print(f"  kv_buffer count: {len(pool.kv_buffer)}")
     print(f"  kv_buffer[0] shape: {pool.kv_buffer[0].shape}")
     print(f"  kv_cache_dim: {pool.kv_cache_dim}")
