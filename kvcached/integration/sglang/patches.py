@@ -6,6 +6,7 @@ SGLang-specific patches using unified patch infrastructure.
 """
 
 import inspect
+import math
 import types
 from typing import Any, Union
 
@@ -167,7 +168,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.cell_size = self.head_num * self.head_dim * dtype.itemsize
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num
+                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
