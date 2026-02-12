@@ -6,6 +6,7 @@ SGLang-specific patches using unified patch infrastructure.
 """
 
 import inspect
+import math
 import types
 from typing import Any, Union
 
@@ -35,6 +36,18 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
         success = self.inject_elastic_allocator(alloc_mod)
         if success:
             success &= self.alias_allocator_to_elastic(alloc_mod)
+
+        # Also inject and alias the paged variant for page_size > 1
+        paged_success = self.inject_elastic_paged_allocator(alloc_mod)
+        if paged_success:
+            paged_success &= self.alias_paged_allocator_to_elastic(alloc_mod)
+        success &= paged_success
+
+        if success:
+            logger.info(
+                "Elastic allocators patched (TokenToKVPool + PagedTokenToKVPool)"
+            )
+
         return success
 
     @version_range(SGLANG_ALL_RANGE)
@@ -59,6 +72,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if "cuda" not in device:
                         raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
                     self.kvcached_allocator = kvcache.kvcached_allocator
+                    logger.info(
+                        f"[kvcached] ElasticTokenToKVPoolAllocator in use: size={size} "
+                        "(page_size=1 path)"
+                    )
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size()
@@ -102,6 +119,208 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             return True
         except Exception as e:
             self.logger.warning(f"Failed to alias allocator to elastic one: {e}")
+            return False
+
+    @version_range(SGLANG_ALL_RANGE)
+    def inject_elastic_paged_allocator(self, alloc_mod: types.ModuleType) -> bool:
+        """Inject ElasticPagedTokenToKVPoolAllocator for page_size > 1"""
+        if hasattr(alloc_mod, "ElasticPagedTokenToKVPoolAllocator"):
+            self.logger.debug("ElasticPagedTokenToKVPoolAllocator already exists")
+            return True
+
+        try:
+            import torch
+
+            BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
+            alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+
+            from sglang.srt.utils import get_num_new_pages, next_power_of_2
+
+            class ElasticPagedTokenToKVPoolAllocator(
+                BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
+            ):
+                def __init__(
+                    self, size: int, page_size: int, dtype, device: str, kvcache, *args, **kwargs
+                ) -> None:
+                    super().__init__(size, page_size, dtype, device, kvcache, *args, **kwargs)
+                    if not hasattr(kvcache, "kvcached_allocator"):
+                        raise ValueError(
+                            "ElasticPagedTokenToKVPoolAllocator requires elastic MHA pool"
+                        )
+                    if "cuda" not in device:
+                        raise ValueError(
+                            "ElasticPagedTokenToKVPoolAllocator only supports cuda device"
+                        )
+                    self.kvcached_allocator = kvcache.kvcached_allocator
+                    self.num_pages = size // page_size
+                    self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    logger.info(
+                        f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
+                        f"page_size={page_size}"
+                    )
+                    # Base class expects these tensors for backup_state / free_group_end
+                    self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+                    self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+                def available_size(self):
+                    return self.kvcached_allocator.available_size() * self.page_size
+
+                def alloc(self, need_size: int):
+                    num_pages = need_size // self.page_size
+                    block_ids = self.kvcached_allocator.alloc(num_pages)
+                    if block_ids is None:
+                        return None
+                    page_ids = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
+                    out_indices = (
+                        page_ids[:, None] * self.page_size
+                        + torch.arange(self.page_size, device=self.device)
+                    ).reshape(-1)
+                    return out_indices
+
+                def alloc_extend(
+                    self,
+                    prefix_lens: torch.Tensor,
+                    prefix_lens_cpu: torch.Tensor,
+                    seq_lens: torch.Tensor,
+                    seq_lens_cpu: torch.Tensor,
+                    last_loc: torch.Tensor,
+                    extend_num_tokens: int,
+                ):
+                    self.seen_max_num_extend_tokens_next_power_of_2 = max(
+                        self.seen_max_num_extend_tokens_next_power_of_2,
+                        next_power_of_2(extend_num_tokens),
+                    )
+                    bs = len(prefix_lens)
+
+                    num_new_pages = get_num_new_pages(
+                        seq_lens=seq_lens_cpu,
+                        page_size=self.page_size,
+                        prefix_lens=prefix_lens_cpu,
+                    )
+
+                    if num_new_pages > 0:
+                        block_ids = self.kvcached_allocator.alloc(num_new_pages)
+                        if block_ids is None:
+                            return None
+                        free_pages = torch.tensor(
+                            block_ids, dtype=torch.int64, device=self.device
+                        )
+                    else:
+                        free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+                    out_indices = torch.empty(
+                        (extend_num_tokens,), dtype=torch.int64, device=self.device
+                    )
+                    alloc_extend_kernel[(bs,)](
+                        prefix_lens,
+                        seq_lens,
+                        last_loc,
+                        free_pages,
+                        out_indices,
+                        next_power_of_2(bs),
+                        self.page_size,
+                        self.seen_max_num_extend_tokens_next_power_of_2,
+                    )
+                    return out_indices
+
+                def alloc_decode(
+                    self,
+                    seq_lens: torch.Tensor,
+                    seq_lens_cpu: torch.Tensor,
+                    last_loc: torch.Tensor,
+                ):
+                    bs = len(seq_lens)
+
+                    num_new_pages = get_num_new_pages(
+                        seq_lens=seq_lens_cpu,
+                        page_size=self.page_size,
+                        decode=True,
+                    )
+
+                    if num_new_pages > 0:
+                        block_ids = self.kvcached_allocator.alloc(num_new_pages)
+                        if block_ids is None:
+                            return None
+                        free_pages = torch.tensor(
+                            block_ids, dtype=torch.int64, device=self.device
+                        )
+                    else:
+                        free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+                    out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+                    alloc_decode_kernel[(bs,)](
+                        seq_lens,
+                        last_loc,
+                        free_pages,
+                        out_indices,
+                        next_power_of_2(bs),
+                        self.page_size,
+                    )
+                    return out_indices
+
+                def free(self, free_index):
+                    if free_index.numel() == 0:
+                        return
+
+                    if self.is_not_in_free_group:
+                        page_ids = torch.unique(free_index // self.page_size)
+                        try:
+                            indices: list[int] = page_ids.cpu().numpy().tolist()
+                        except Exception:
+                            indices = list(page_ids)
+                        return self.kvcached_allocator.free(indices)
+                    else:
+                        self.free_group.append(free_index)
+
+                def clear(self):
+                    if hasattr(self, "kvcached_allocator"):
+                        self.kvcached_allocator.clear()
+                    self.free_pages = torch.empty(
+                        (0,), dtype=torch.int64, device=self.device
+                    )
+                    self.release_pages = torch.empty(
+                        (0,), dtype=torch.int64, device=self.device
+                    )
+                    self.is_not_in_free_group = True
+                    self.free_group = []
+
+                def merge_and_sort_free(self):
+                    pass  # No-op: kvcached manages the free list
+
+                def get_cpu_copy(self, indices):
+                    return self._kvcache.get_cpu_copy(indices)
+
+                def load_cpu_copy(self, kv_cache_cpu, indices):
+                    return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+            setattr(
+                alloc_mod,
+                "ElasticPagedTokenToKVPoolAllocator",
+                ElasticPagedTokenToKVPoolAllocator,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to inject ElasticPagedTokenToKVPoolAllocator: {e}")
+            return False
+
+    @version_range(SGLANG_ALL_RANGE)
+    def alias_paged_allocator_to_elastic(self, alloc_mod: types.ModuleType) -> bool:
+        """Alias PagedTokenToKVPoolAllocator to ElasticPagedTokenToKVPoolAllocator"""
+        if self._is_already_patched(alloc_mod, "__kvcached_paged_allocator_aliased__"):
+            return True
+
+        try:
+            ElasticPagedTokenToKVPoolAllocator = getattr(
+                alloc_mod, "ElasticPagedTokenToKVPoolAllocator"
+            )
+            if ElasticPagedTokenToKVPoolAllocator is None:
+                return False
+            alloc_mod.PagedTokenToKVPoolAllocator = ElasticPagedTokenToKVPoolAllocator  # type: ignore
+            self._mark_as_patched(alloc_mod, "__kvcached_paged_allocator_aliased__")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to alias paged allocator to elastic one: {e}")
             return False
 
 
@@ -167,7 +386,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.cell_size = self.head_num * self.head_dim * dtype.itemsize
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num
+                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
