@@ -14,6 +14,8 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
 from kvcached.utils import get_kvcached_logger
 
+BYTES_PER_GB = 1024**3
+
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
 
@@ -390,20 +392,19 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
-                    GB = 1024**3
                     k_size_phy, v_size_phy = self.get_kv_size_bytes_phy()
 
                     logger.info(
                         f"VirtualKV Cache is allocated. #tokens: {size}, K size: "
-                        f"{k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+                        f"{k_size / BYTES_PER_GB:.2f} GB, V size: {v_size / BYTES_PER_GB:.2f} GB"
                     )
                     logger.info(
                         f"Physical KV Cache limits by --mem-fraction-static: "
                         f"#tokens: {size}, K size: "
-                        f"{k_size_phy / GB:.2f} GB, V size: {v_size_phy / GB:.2f} GB"
+                        f"{k_size_phy / BYTES_PER_GB:.2f} GB, V size: {v_size_phy / BYTES_PER_GB:.2f} GB"
                     )
 
-                    self.mem_usage = (k_size + v_size) / GB
+                    self.mem_usage = (k_size + v_size) / BYTES_PER_GB
 
                 def __del__(self):  # best-effort cleanup
                     try:
@@ -584,19 +585,18 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
 
                     kv_size = self.get_kv_size_bytes()
-                    GB = 1024**3
                     kv_size_phy = self.get_kv_size_bytes_phy()
 
                     logger.info(
                         f"VirtualKV Cache is allocated. #tokens: {size}, "
-                        f"KV size: {kv_size / GB:.2f} GB"
+                        f"KV size: {kv_size / BYTES_PER_GB:.2f} GB"
                     )
                     logger.info(
                         f"Physical KV Cache limits by --mem-fraction-static: "
-                        f"#tokens: {size}, KV size: {kv_size_phy / GB:.2f} GB"
+                        f"#tokens: {size}, KV size: {kv_size_phy / BYTES_PER_GB:.2f} GB"
                     )
 
-                    self.mem_usage = kv_size / GB
+                    self.mem_usage = kv_size / BYTES_PER_GB
 
                 def __del__(self):  # best-effort cleanup
                     try:
