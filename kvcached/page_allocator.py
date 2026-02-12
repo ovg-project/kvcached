@@ -138,7 +138,8 @@ class PageAllocator:
                  tp_size: int = 1,
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
-                 enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
+                 enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,
+                 num_kv_buffers: int = 2):
         """
         Args:
             num_layers: Number of layers (for physical memory calculation).
@@ -148,12 +149,14 @@ class PageAllocator:
             async_sched: Whether asynchronous scheduling is enabled.
             contiguous_layout: Whether to use contiguous layout.
             enable_page_prealloc: Whether to enable page preallocation.
+            num_kv_buffers: Number of KV buffers per layer (2 for MHA K+V,
+                1 for MLA combined KV).
         """
         logger.info(
             f"Init kvcached KV cache allocator: "
             f"num_layers={num_layers}, "
             f"mem_size_per_layer={mem_size_per_layer//(1024*1024)}MB, "
-            f"total_mem_size={2 * num_layers * mem_size_per_layer//(1024*1024)}MB, "
+            f"total_mem_size={num_kv_buffers * num_layers * mem_size_per_layer//(1024*1024)}MB, "
             f"page_size={page_size//(1024*1024)}MB, "
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
@@ -168,6 +171,7 @@ class PageAllocator:
         self.tp_size = tp_size
         self.async_sched = async_sched
         self.contiguous_layout = contiguous_layout
+        self.num_kv_buffers = num_kv_buffers
         # TODO: make this compatible with engine's memory limit after getting
         # better configuration management.
         self.gpu_utilization = GPU_UTILIZATION
@@ -184,7 +188,7 @@ class PageAllocator:
 
         # Initialize memory info tracker
         self.mem_info_tracker = MemInfoTracker(self.mem_size_per_layer *
-                                               num_layers * 2)
+                                               num_layers * num_kv_buffers)
 
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc
@@ -427,10 +431,10 @@ class PageAllocator:
         headroom = int(total_phy_mem_size * (1 - self.gpu_utilization))
         avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
 
-        # Calculate available pages considering layers and K/V split
+        # Calculate available pages considering layers and KV buffers
         avail_phy_pages = avail_phy_mem_size // self.page_size
-        # Each layer needs to reserve K and V tensors so we divide by 2.
-        avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
+        # Each layer needs num_kv_buffers pages (2 for MHA K+V, 1 for MLA).
+        avail_pages_per_layer = avail_phy_pages // self.num_layers // self.num_kv_buffers
         return int(avail_pages_per_layer)
 
     def get_page_id(self, block_id: int, block_mem_size: int) -> int:
@@ -517,7 +521,8 @@ class PageAllocator:
     def _map_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
             offsets = [
-                pid * self.page_size * self.num_layers * 2 for pid in page_ids
+                pid * self.page_size * self.num_layers * self.num_kv_buffers
+                for pid in page_ids
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
@@ -529,7 +534,8 @@ class PageAllocator:
     def _unmap_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
             offsets = [
-                pid * self.page_size * self.num_layers * 2 for pid in page_ids
+                pid * self.page_size * self.num_layers * self.num_kv_buffers
+                for pid in page_ids
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
@@ -544,10 +550,11 @@ class PageAllocator:
         """Update memory usage information in shared memory."""
         # Memory actively used by allocations (excludes preallocated pages).
         used_phy_mem_size = (self.get_num_inuse_pages() * self.num_layers *
-                             self.page_size * 2)
+                             self.page_size * self.num_kv_buffers)
         # Memory held by preallocated pages that are not yet actively used.
         prealloc_phy_mem_size = (self.get_num_reserved_pages() *
-                                 self.num_layers * self.page_size * 2)
+                                 self.num_layers * self.page_size *
+                                 self.num_kv_buffers)
 
         self.mem_info_tracker.update_memory_usage(
             used_size=used_phy_mem_size, prealloc_size=prealloc_phy_mem_size)

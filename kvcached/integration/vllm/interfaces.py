@@ -111,7 +111,8 @@ def alloc_kv_cache(
         )
 
     raw_kv_tensors = create_kv_tensors(
-        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers
+        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,
+        num_kv_buffers=num_k_or_v,
     )
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
@@ -133,7 +134,11 @@ def alloc_kv_cache(
 
 
 def get_kv_cache_manager(
-    num_blocks: int, block_size: int, cell_size: int, num_layers: int
+    num_blocks: int,
+    block_size: int,
+    cell_size: int,
+    num_layers: int,
+    num_kv_buffers: int = 2,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -145,4 +150,5 @@ def get_kv_cache_manager(
         num_layers,
         _tp_size,
         async_sched=_async_sched,
+        num_kv_buffers=num_kv_buffers,
     )

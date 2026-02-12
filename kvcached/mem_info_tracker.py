@@ -31,7 +31,8 @@ class MemInfoTracker:
         self._register_cleanup()
 
     def check_and_get_resize_target(self, current_mem_size: int,
-                                    num_layers: int) -> Optional[int]:
+                                    num_layers: int,
+                                    num_kv_buffers: int = 2) -> Optional[int]:
         """
         Check if memory size has changed and return new target size if needed.
 
@@ -41,7 +42,7 @@ class MemInfoTracker:
         with RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
                          RwLockedShm.RLOCK) as mm:
             mem_info = MemInfoStruct.from_buffer(mm)
-            new_mem_size = mem_info.total_size // num_layers // 2
+            new_mem_size = mem_info.total_size // num_layers // num_kv_buffers
             if new_mem_size != current_mem_size:
                 return new_mem_size
         return None

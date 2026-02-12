@@ -50,6 +50,7 @@ class KVCacheManager:
         tp_size: int = 1,
         async_sched: bool = False,
         reserve_null_block: bool = False,
+        num_kv_buffers: int = 2,
     ):
         """
         Args:
@@ -62,10 +63,13 @@ class KVCacheManager:
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
                 first block is always reserved as padded tokens.
+            num_kv_buffers: Number of KV buffers per layer (2 for MHA K+V,
+                1 for MLA combined KV).
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
+        self.num_kv_buffers = num_kv_buffers
         self.reserve_null_block = reserve_null_block
 
         # The physical page size used by kvcached page allocator.
@@ -79,6 +83,7 @@ class KVCacheManager:
             self.page_size,
             self.tp_size,
             async_sched=async_sched,
+            num_kv_buffers=self.num_kv_buffers,
         )
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
@@ -161,7 +166,7 @@ class KVCacheManager:
             self._wait_post_init()
 
         new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-            self.mem_size, self.num_layers)
+            self.mem_size, self.num_layers, self.num_kv_buffers)
         if new_mem_size is not None:
             self.resize(new_mem_size)
 
@@ -329,7 +334,8 @@ class KVCacheManager:
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = (self.page_allocator.get_num_inuse_pages() *
-                        self.num_layers * self.page_size * 2)
+                        self.num_layers * self.page_size *
+                        self.num_kv_buffers)
 
         if unit == 'bytes':
             return memory_bytes

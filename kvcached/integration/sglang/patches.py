@@ -360,7 +360,8 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num
+                        size + page_size, page_size, self.cell_size, layer_num,
+                        num_kv_buffers=1,
                     )
 
                     kv_size = self.get_kv_size_bytes()

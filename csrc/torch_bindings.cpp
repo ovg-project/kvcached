@@ -25,11 +25,13 @@ void shutdown_kvcached() {
 
 std::vector<torch::Tensor> create_kv_tensors(size_t size, size_t dtype_size,
                                              const std::string &dev_str,
-                                             int64_t num_layers) {
+                                             int64_t num_layers,
+                                             int64_t num_kv_buffers = 2) {
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator();
   auto dtype_ = torch_dtype_from_size(dtype_size);
-  return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers);
+  return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers,
+                                      num_kv_buffers);
 }
 
 bool kv_tensors_created() {
@@ -59,7 +61,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dev_str"), py::arg("page_size") = 0,
         py::arg("contiguous_layout") = true);
   m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
-  m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors");
+  m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
+        py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
+        py::arg("num_layers"), py::arg("num_kv_buffers") = 2);
   m.def("kv_tensors_created", &kvcached::kv_tensors_created,
         "kv_tensors_created");
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors");

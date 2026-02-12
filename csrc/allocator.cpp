@@ -94,10 +94,9 @@ void FTensorAllocator::shutdown() {
   }
 }
 
-std::vector<torch::Tensor>
-FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
-                                    const std::string &dev_str,
-                                    int64_t num_layers) {
+std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
+    size_t size, torch::Dtype dtype, const std::string &dev_str,
+    int64_t num_layers, int64_t num_kv_buffers) {
   std::lock_guard<std::mutex> lock(mtx_);
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
@@ -113,8 +112,9 @@ FTensorAllocator::create_kv_tensors(size_t size, torch::Dtype dtype,
 
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
-    // together for a single page.
-    kPageSize *= num_layers * 2;
+    // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
+    // 1 for MLA (combined KV).
+    kPageSize *= num_layers * num_kv_buffers;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     // We can use the aligned size directly for contiguous layout too because
     // both kPageSize and aligned_size are already/will be multiplied by
