@@ -38,10 +38,11 @@ bool kv_tensors_created() {
   return allocator->kv_tensors_created();
 }
 
-bool map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
+                       const std::vector<int> &phys_device_ids = {}) {
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator();
-  return allocator->map_to_kv_tensors(offsets);
+  return allocator->map_to_kv_tensors(offsets, phys_device_ids);
 }
 
 bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets) {
@@ -62,7 +63,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors");
   m.def("kv_tensors_created", &kvcached::kv_tensors_created,
         "kv_tensors_created");
-  m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors");
+  m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
+        py::arg("offsets"), py::arg("phys_device_ids") = std::vector<int>());
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors");
 }

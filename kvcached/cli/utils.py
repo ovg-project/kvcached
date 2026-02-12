@@ -25,6 +25,11 @@ def get_ipc_name(ipc_path: str) -> str:
     return os.path.basename(ipc_path)
 
 
+def get_config_path(ipc_name: str) -> str:
+    """Get path to config file for the IPC name."""
+    return os.path.join(SHM_DIR, f"{ipc_name}.config.json")
+
+
 @dataclass
 class MemInfoStruct:
     total_size: int
@@ -153,6 +158,50 @@ def update_kv_cache_limit(ipc_name: str,
         return None
 
 
+def update_shared_config(ipc_name: str, gpu_id: int, limit: int) -> bool:
+    """
+    Update shared memory configuration for a specific GPU.
+    Writes to a JSON file that the engine process monitors.
+    """
+    import json
+    config_path = get_config_path(ipc_name)
+    config = {}
+
+    # Read existing config
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"Error reading config: {e}")
+
+    # Update config
+    # We store keys as strings in JSON
+    config[str(gpu_id)] = limit
+
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+        print(f"Updated shared config for IPC {ipc_name}: GPU {gpu_id} -> {limit} bytes")
+        return True
+    except Exception as e:
+        print(f"Error writing config: {e}")
+        return False
+
+def get_shared_config(ipc_name: str) -> dict:
+    import json
+    config_path = get_config_path(ipc_name)
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                # Convert keys back to int
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # IPC cleanup helpers
 # ---------------------------------------------------------------------------
@@ -179,6 +228,12 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
     try:
         os.unlink(get_ipc_path(shm_name))
         removed = True or removed
+    except FileNotFoundError:
+        pass
+
+    # Remove config file
+    try:
+        os.unlink(get_config_path(ipc_name))
     except FileNotFoundError:
         pass
 

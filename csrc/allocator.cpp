@@ -20,10 +20,14 @@ size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
 
+// make_shared_page now accepts phys_dev_id
 static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
-                                                     page_id_t page_id) {
+                                                     page_id_t page_id,
+                                                     int phys_dev_id = -1) {
   if (dev.is_cuda()) {
-    return std::make_shared<GPUPage>(page_id, dev.index());
+    // If phys_dev_id is not specified (-1), use the device index from dev
+    int dev_idx = (phys_dev_id == -1) ? dev.index() : phys_dev_id;
+    return std::make_shared<GPUPage>(page_id, dev_idx);
   } else if (dev.is_cpu()) {
     return std::make_shared<CPUPage>(page_id);
   }
@@ -133,10 +137,19 @@ bool FTensorAllocator::kv_tensors_created() {
   return num_layers_ > 0;
 }
 
-bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+bool FTensorAllocator::map_to_kv_tensors(
+    const std::vector<offset_t> &offsets,
+    const std::vector<int> &phys_device_ids) {
   std::unique_lock<std::mutex> lock(mtx_);
   if (num_layers_ == 0) {
     LOGE("try to map to KV tensors when KV tensors are not created");
+    return false;
+  }
+
+  // If phys_device_ids is provided, it must match offsets size
+  if (!phys_device_ids.empty() && phys_device_ids.size() != offsets.size()) {
+    LOGE("phys_device_ids size %zu does not match offsets size %zu",
+         phys_device_ids.size(), offsets.size());
     return false;
   }
 
@@ -146,9 +159,11 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     auto ftensor = contiguous_kv_tensor_.get();
     auto tensor = ftensor->get_tensor();
 
-    for (auto offset : offsets) {
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      offset_t offset = offsets[i];
+      int phys_dev_id = phys_device_ids.empty() ? -1 : phys_device_ids[i];
       // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
+      ftensor->map(offset, phys_dev_id);
     }
   } else {
     // Original per-layer mapping
@@ -162,15 +177,21 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
        */
       auto tensor = ftensor->get_tensor();
       auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
+      for (size_t j = 0; j < offsets.size(); ++j) {
+        offset_t offset = offsets[j];
+        int phys_dev_id = phys_device_ids.empty() ? -1 : phys_device_ids[j];
         auto koffset = offset;
         auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
+        ftensor->map(koffset, phys_dev_id);
+        ftensor->map(voffset, phys_dev_id);
       }
     }
   }
   return true;
+}
+
+bool FTensorAllocator::map(offset_t offset, int phys_dev_id) {
+  return map_to_kv_tensors({offset}, {phys_dev_id});
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(

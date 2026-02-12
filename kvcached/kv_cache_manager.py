@@ -50,6 +50,7 @@ class KVCacheManager:
         tp_size: int = 1,
         async_sched: bool = False,
         reserve_null_block: bool = False,
+        shared_memory_config: Optional[Dict[int, int]] = None,
     ):
         """
         Args:
@@ -62,6 +63,8 @@ class KVCacheManager:
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
                 first block is always reserved as padded tokens.
+            shared_memory_config: Configuration for shared memory (NVLink).
+                Dict mapping GPU ID to memory limit (bytes).
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -79,6 +82,7 @@ class KVCacheManager:
             self.page_size,
             self.tp_size,
             async_sched=async_sched,
+            shared_memory_config=shared_memory_config,
         )
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages

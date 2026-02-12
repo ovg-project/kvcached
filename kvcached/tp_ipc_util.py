@@ -119,7 +119,8 @@ def start_worker_listener_thread(rank: int):
                 msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
                 if msg["cmd"] == "map_to_kv_tensors":
-                    map_to_kv_tensors(msg["offsets"])
+                    phys_device_ids = msg.get("phys_device_ids", [])
+                    map_to_kv_tensors(msg["offsets"], phys_device_ids)
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "unmap_from_kv_tensors":
                     unmap_from_kv_tensors(msg["offsets"])
@@ -168,11 +169,16 @@ async def _send_and_receive_message(rank: int, message: Message) -> Message:
 
 
 async def _broadcast_map_to_kv_tensors(tp_size: int,
-                                       offsets: list[int]) -> None:
+                                       offsets: list[int],
+                                       phys_device_ids: list[int] = []) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
     """
-    map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
+    map_message = {
+        "cmd": "map_to_kv_tensors",
+        "offsets": offsets,
+        "phys_device_ids": phys_device_ids
+    }
     tasks = [
         _send_and_receive_message(rank, map_message) for rank in range(tp_size)
     ]
@@ -236,8 +242,10 @@ async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
 
 
 # Wrapper functions to call the async function from sync code
-def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
-    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets))
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int],
+                                phys_device_ids: list[int] = []) -> None:
+    asyncio.run(
+        _broadcast_map_to_kv_tensors(tp_size, offsets, phys_device_ids))
 
 
 def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int]) -> None:

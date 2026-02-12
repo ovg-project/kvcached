@@ -29,8 +29,10 @@ public:
                                                const std::string &dev_str,
                                                int64_t num_layers);
   bool kv_tensors_created();
-  bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
+                         const std::vector<int> &phys_device_ids = {});
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  bool map(offset_t offset, int phys_dev_id = -1);
 
   // Global status interfaces.
   static void init(const std::string &dev_str, size_t page_size = 0,

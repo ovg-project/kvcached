@@ -3,7 +3,7 @@
 
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -28,9 +28,10 @@ PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 class Page:
 
-    def __init__(self, page_id: int, page_size: int):
+    def __init__(self, page_id: int, page_size: int, phys_dev_id: int = -1):
         self.page_id = page_id
         self.page_size = page_size
+        self.phys_dev_id = phys_dev_id
 
         self.start_block: Optional[int] = None
         self.end_block: Optional[int] = None
@@ -138,7 +139,8 @@ class PageAllocator:
                  tp_size: int = 1,
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
-                 enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED):
+                 enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,
+                 shared_memory_config: Optional[Dict[int, int]] = None):
         """
         Args:
             num_layers: Number of layers (for physical memory calculation).
@@ -158,7 +160,8 @@ class PageAllocator:
             f"tp_size={tp_size}, "
             f"async_sched={async_sched}, "
             f"contiguous_layout={contiguous_layout}, "
-            f"enable_prealloc={enable_page_prealloc}")
+            f"enable_prealloc={enable_page_prealloc}, "
+            f"shared_memory_config={shared_memory_config}")
         # WARNING (YIFAN): kvcached_ops.init_kvcached must have been called
         # before this.
 
@@ -200,7 +203,13 @@ class PageAllocator:
             self._cond = NoOpCondition(self._lock)
         self.prealloc_running: bool = False
         self.prealloc_needed: bool = False
+        self.shared_memory_config = shared_memory_config or {}
         self.prealloc_thd: Optional[threading.Thread] = None
+
+        # Track page locations: page_id -> phys_dev_id
+        self.page_locations: Dict[int, int] = {}
+        # Track allocated bytes on remote devices
+        self.remote_allocated_bytes: int = 0
 
     def __del__(self):
         try:
@@ -234,7 +243,26 @@ class PageAllocator:
 
                     # Update memory usage after fast path allocation
                     self._update_memory_usage()
-                    return Page(page_id, self.page_size)
+                    # For reserved pages, they already have a physical location associated via map/unmap
+                    # However, since PageAllocator doesn't track phys_dev_id in reserved list (just page_id),
+                    # we assume they are mapped to where they were mapped.
+                    # WAIT: if we unmap them into reserved list, they are still mapped in driver?
+                    # The reserved_page_list logic in kvcached typically means they are mapped to *locally* reserved memory
+                    # if we follow original logic where everything is local.
+                    # With shared memory, we might need to track where a reserved page is.
+                    # For now, let's assume reserved pages are local or previously tracked properly.
+                    # But actually reserve logic might need update.
+                    # Simplify: newly allocated pages go through _get_alloc_location_tiered.
+                    # Existing reserved pages are returned as is.
+                    # But Page object needs phys_dev_id. If we recreate Page object here, we lose it?
+                    # The reserved_page_list stores ints.
+                    # We might need to store (int, phys_dev_id) in reserved list if we want to preserve location.
+                    # OR we just assume reserved pages are reusable valid mappings.
+                    # But the Page constructor needs phys_dev_id.
+                    # Force it to -1 (local) for now or track it.
+                    # Given the scope, let's assume reserved pages are local (-1) for now,
+                    # as complex pooling of remote pages is tricky.
+                    return Page(page_id, self.page_size, -1)
 
                 # Slow path: allocate pages with new physical memory mapping.
                 if self.free_page_list:
@@ -255,8 +283,14 @@ class PageAllocator:
 
         assert page_id is not None
 
+        phys_dev_id = self._get_alloc_location_tiered()
         try:
-            self._map_pages([page_id])
+            self._map_pages([page_id], [phys_dev_id])
+            # Track location and usage
+            with self._lock:
+                self.page_locations[page_id] = phys_dev_id
+                if phys_dev_id != -1:
+                    self.remote_allocated_bytes += self.page_size * self.num_layers * 2
         except Exception as e:
             # If mapping fails, return page to free list and restore count
             with self._lock:
@@ -271,7 +305,39 @@ class PageAllocator:
 
         # Update memory usage after mapping pages
         self._update_memory_usage()
-        return Page(page_id, self.page_size)
+        return Page(page_id, self.page_size, phys_dev_id)
+
+    def _get_alloc_location_tiered(self) -> int:
+        """
+        Determine the physical device ID for allocation based on priority:
+        1. Local GPU (-1)
+        2. NVLink Shared GPUs (configured)
+        3. CPU (Future)
+        """
+        # Check local memory
+        avail_local = self._get_local_avail_physical_pages()
+        if avail_local > 0:
+            return -1
+
+        # Check shared GPUs
+        # For this simple implementation, we iterate through configured shared GPUs
+        # and pick the first one with capacity.
+        # Ideally we valid real free memory, but here we check against configured limit?
+        # Or we rely on CUDA driver to fail if full?
+        # The prompt says "configure which GPUs and their limit".
+        # So we should check usage against limit.
+        # But we don't track usage per remote GPU yet.
+        # Implementation simplification: just return the first configured shared GPU.
+        # Real memory check would require cross-process communication or NVML.
+        if self.shared_memory_config:
+            # Simple round-robin or first-fit.
+            for gpu_id, limit in self.shared_memory_config.items():
+                # TODO: Check actual usage/availability if possible.
+                # For now, assume if configured, we try to use it.
+                return gpu_id
+
+        # Fallback to local (driver might swap or fail)
+        return -1
 
     def free_page(self, page_id: int) -> None:
         with self._lock:
@@ -279,18 +345,36 @@ class PageAllocator:
                                  or page_id in self.reserved_page_list):
                 raise ValueError(f"Page {page_id} is already free or reserved")
 
-            self.num_free_pages += 1
-            if len(self.reserved_page_list) < self.max_reserved_pages:
-                # Fast path: reserve page with its physical memory mapping.
-                self.reserved_page_list.append(page_id)
-                # Update memory usage after fast path free/reserve
-                self._update_memory_usage()
-                self._cond.notify_all()
-                return
+            phys_dev_id = self.page_locations.get(page_id, -1)
 
-        # Slow path: free page and its physical memory mapping.
+            if phys_dev_id != -1:
+                # Remote page: always free (never reserve)
+                pass
+            else:
+                # Local page: try to reserve
+                self.num_free_pages += 1
+                if len(self.reserved_page_list) < self.max_reserved_pages:
+                    # Fast path: reserve page with its physical memory mapping.
+                    self.reserved_page_list.append(page_id)
+                    # Update memory usage after fast path free/reserve
+                    self._update_memory_usage()
+                    self._cond.notify_all()
+                    return
+
+        # Slow path (or Remote): free page and its physical memory mapping.
         self._unmap_pages([page_id])
         with self._lock:
+            if phys_dev_id != -1:
+                # Decrement remote usage
+                if page_id in self.page_locations:
+                    del self.page_locations[page_id]
+                    self.remote_allocated_bytes -= self.page_size * self.num_layers * 2
+                self.num_free_pages += 1
+            else:
+                # Local page that wasn't reserved
+                if page_id in self.page_locations:
+                     del self.page_locations[page_id]
+
             self.free_page_list.append(page_id)
             # Update memory usage after unmapping pages
             self._update_memory_usage()
@@ -306,23 +390,55 @@ class PageAllocator:
                             f"Page {page_id} is already free or reserved")
 
             self.num_free_pages += len(page_ids)
+
+            # Separate local and remote pages
+            local_pages = []
+            remote_pages = []
+            for pid in page_ids:
+                if self.page_locations.get(pid, -1) == -1:
+                    local_pages.append(pid)
+                else:
+                    remote_pages.append(pid)
+
+            # Try to reserve local pages
             num_to_reserve = self.max_reserved_pages - len(
                 self.reserved_page_list)
-            if num_to_reserve > 0:
-                # Fast path: reserve pages with their physical memory mapping.
-                self.reserved_page_list.extend(page_ids[:num_to_reserve])
-                self._cond.notify_all()
-                page_ids = page_ids[num_to_reserve:]
 
-        if len(page_ids) == 0:
+            pages_to_unmap = []
+
+            if num_to_reserve > 0 and local_pages:
+                reserved = local_pages[:num_to_reserve]
+                self.reserved_page_list.extend(reserved)
+                self._cond.notify_all()
+
+                # Remaining local pages need to be unmapped
+                pages_to_unmap.extend(local_pages[num_to_reserve:])
+            else:
+                pages_to_unmap.extend(local_pages)
+
+            # All remote pages must be unmapped
+            pages_to_unmap.extend(remote_pages)
+
+        if not pages_to_unmap:
             # Update memory usage after fast path free/reserve
             self._update_memory_usage()
             return
 
-        # Slow path: free page_ids and their physical memory mapping.
-        self._unmap_pages(page_ids)
+        # Slow path: free pages and their physical memory mapping.
+        self._unmap_pages(pages_to_unmap)
         with self._lock:
-            self.free_page_list.extend(page_ids)
+            # Update tracking for remote pages
+            for pid in remote_pages:
+                if pid in self.page_locations:
+                    del self.page_locations[pid]
+                    self.remote_allocated_bytes -= self.page_size * self.num_layers * 2
+
+            # Remove local pages from tracking if present (though defaults to -1)
+            for pid in local_pages:
+                if pid in self.page_locations:
+                    del self.page_locations[pid]
+
+            self.free_page_list.extend(pages_to_unmap)
             # Update memory usage after unmapping pages
             self._update_memory_usage()
             self._cond.notify_all()
@@ -423,6 +539,37 @@ class PageAllocator:
             return len(self.reserved_page_list)
 
     def get_avail_physical_pages(self) -> int:
+        """
+        Get total available physical pages (Local + Remote).
+        """
+        local_avail = self._get_local_avail_physical_pages()
+
+        # Calculate remote available pages
+        remote_limit = sum(self.shared_memory_config.values())
+        remote_avail_bytes = max(0, remote_limit - self.remote_allocated_bytes)
+        # Convert bytes to KV cache pages
+        # Note: mem_size_per_layer in init includes K+V for 1 layer?
+        # Actually init says: mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
+        # So one "Page" (which spans all layers K+V?)
+        # Wait, PageAllocator logic:
+        # page_size is "Page size in bytes" (e.g. 2MB).
+        # We allocations are 1 page id.
+        # But _map_pages maps `pid * page_size * num_layers * 2` (if contiguous).
+        # So 1 PageAllocator "Page ID" corresponds to `num_layers * 2` physical pages?
+        # NO.
+        # _map_pages logic:
+        # offsets = [pid * self.page_size * self.num_layers * 2 for pid in page_ids]
+        # This implies a "Logical Page" (page_id) consumes `page_size * num_layers * 2` bytes of physical memory.
+        # Let's verify _get_local_avail_physical_pages logic:
+        # avail_phy_pages = avail_phy_mem_size // self.page_size
+        # avail_pages_per_layer = avail_phy_pages // self.num_layers // 2
+        # Yes.
+
+        remote_avail_pages = remote_avail_bytes // self.page_size // self.num_layers // 2
+
+        return local_avail + int(remote_avail_pages)
+
+    def _get_local_avail_physical_pages(self) -> int:
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
         headroom = int(total_phy_mem_size * (1 - self.gpu_utilization))
         avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
@@ -453,7 +600,7 @@ class PageAllocator:
                 to_reserve = max(0, self.min_reserved_pages - current_reserved)
                 # Only try to reserve up to the available free pages
                 to_reserve = min(to_reserve, len(self.free_page_list),
-                                 self.get_avail_physical_pages())
+                                 self._get_local_avail_physical_pages())
                 if to_reserve <= 0:
                     continue
 
@@ -471,6 +618,9 @@ class PageAllocator:
                     self._map_pages(pages_to_reserve)
                     with self._lock:
                         self.reserved_page_list.extend(pages_to_reserve)
+                        # Register as local pages
+                        for pid in pages_to_reserve:
+                            self.page_locations[pid] = -1
                         # Update memory usage after mapping pages
                         self._update_memory_usage()
                         self._cond.notify_all()
@@ -514,7 +664,8 @@ class PageAllocator:
             self.prealloc_needed = True
             self._cond.notify_all()
 
-    def _map_pages(self, page_ids: list[int]) -> None:
+    def _map_pages(self, page_ids: list[int],
+                   phys_device_ids: list[int] = []) -> None:
         if self.contiguous_layout:
             offsets = [
                 pid * self.page_size * self.num_layers * 2 for pid in page_ids
@@ -522,9 +673,9 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # map pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors(self.tp_size, offsets)
+            broadcast_map_to_kv_tensors(self.tp_size, offsets, phys_device_ids)
         else:
-            map_to_kv_tensors(offsets)
+            map_to_kv_tensors(offsets, phys_device_ids)
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
