@@ -43,6 +43,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             paged_success &= self.alias_paged_allocator_to_elastic(alloc_mod)
         success &= paged_success
 
+        if success:
+            logger.info(
+                "Elastic allocators patched (TokenToKVPool + PagedTokenToKVPool)"
+            )
+
         return success
 
     @version_range(SGLANG_ALL_RANGE)
@@ -67,6 +72,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if "cuda" not in device:
                         raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
                     self.kvcached_allocator = kvcache.kvcached_allocator
+                    logger.info(
+                        f"[kvcached] ElasticTokenToKVPoolAllocator in use: size={size} "
+                        "(page_size=1 path)"
+                    )
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size()
@@ -146,6 +155,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    logger.info(
+                        f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
+                        f"page_size={page_size}"
+                    )
                     # Base class expects these tensors for backup_state / free_group_end
                     self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
