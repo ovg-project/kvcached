@@ -17,7 +17,8 @@ namespace kvcached {
 class FTensor {
 public:
   FTensor(const std::string &name, size_t size, torch::Dtype dtype,
-          torch::Device dev, std::shared_ptr<Page> zero_page);
+          torch::Device dev, std::shared_ptr<Page> zero_page,
+          size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
   bool unmap(offset_t offset);
@@ -32,6 +33,7 @@ private:
   std::string name_;
   generic_ptr_t vaddr_;
   size_t size_;
+  size_t page_size_;
   torch::Dtype dtype_;
   torch::Device dev_;
   std::shared_ptr<Page> zero_page_;

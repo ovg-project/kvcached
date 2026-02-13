@@ -21,7 +21,7 @@ public:
 
 class GPUPage : public Page {
 public:
-  GPUPage(page_id_t page_id, int dev_idx);
+  GPUPage(page_id_t page_id, int dev_idx, size_t page_size = 0);
   ~GPUPage();
 
   bool map(void *vaddr, bool set_access = true);
@@ -29,18 +29,20 @@ public:
 private:
   page_id_t page_id_;
   CUdevice dev_;
+  size_t page_size_;
   CUmemGenericAllocationHandle handle_;
 };
 
 class CPUPage : public Page {
 public:
-  CPUPage(page_id_t page_id);
+  CPUPage(page_id_t page_id, size_t page_size = 0);
   ~CPUPage();
 
   bool map(void *vaddr, bool set_access = true);
 
 private:
   page_id_t page_id_;
+  size_t page_size_;
   generic_ptr_t mapped_addr_;
 };
 

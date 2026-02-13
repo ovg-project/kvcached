@@ -49,7 +49,8 @@ private:
                                int64_t num_layers);
   std::vector<torch::Tensor>
   create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
-                                const std::string &dev_str, int64_t num_layers);
+                                const std::string &dev_str, int64_t num_layers,
+                                size_t compound_page_size);
   torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
                                 const std::string &dev_str,
                                 std::string name = "");

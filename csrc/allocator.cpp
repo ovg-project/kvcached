@@ -21,11 +21,12 @@ std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
 
 static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
-                                                     page_id_t page_id) {
+                                                     page_id_t page_id,
+                                                     size_t page_size = 0) {
   if (dev.is_cuda()) {
-    return std::make_shared<GPUPage>(page_id, dev.index());
+    return std::make_shared<GPUPage>(page_id, dev.index(), page_size);
   } else if (dev.is_cpu()) {
-    return std::make_shared<CPUPage>(page_id);
+    return std::make_shared<CPUPage>(page_id, page_size);
   }
   ASSERT(false, "Unsupported device type.");
   return nullptr;
@@ -114,13 +115,13 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
-    kPageSize *= num_layers * num_kv_buffers;
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
     // We can use the aligned size directly for contiguous layout too because
-    // both kPageSize and aligned_size are already/will be multiplied by
-    // num_layers.
+    // both compound_page_size and aligned_size are already/will be multiplied
+    // by num_layers.
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
-                                         num_layers);
+                                         num_layers, compound_page_size);
   } else {
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
@@ -229,18 +230,18 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
   return ftensors;
 }
 
-std::vector<torch::Tensor>
-FTensorAllocator::create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
-                                                const std::string &dev_str,
-                                                int64_t num_layers) {
+std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
+    size_t size, torch::Dtype dtype, const std::string &dev_str,
+    int64_t num_layers, size_t compound_page_size) {
   // In contiguous layout, Python passes per-layer size, and we multiply by
   // num_layers to get total size
   size_t total_kv_size = size * num_layers;
 
   // Create the single contiguous KV tensor (contains K and V for all layers)
   auto contiguous_name = std::string(kv_prefix) + "contiguous";
-  contiguous_kv_tensor_ = std::make_unique<FTensor>(
-      contiguous_name, total_kv_size, dtype, dev_, zero_page_);
+  contiguous_kv_tensor_ =
+      std::make_unique<FTensor>(contiguous_name, total_kv_size, dtype, dev_,
+                                zero_page_, compound_page_size);
 
   // Get the contiguous tensor
   auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();

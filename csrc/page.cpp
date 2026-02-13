@@ -9,8 +9,9 @@
 
 namespace kvcached {
 
-GPUPage::GPUPage(page_id_t page_id, int dev_idx)
-    : page_id_(page_id), dev_(dev_idx), handle_(0) {
+GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
+    : page_id_(page_id), dev_(dev_idx),
+      page_size_(page_size > 0 ? page_size : kPageSize), handle_(0) {
   // CHECK_DRV(cuCtxGetDevice(&dev_));
 
   CUmemAllocationProp prop = {
@@ -21,7 +22,7 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx)
               .id = dev_,
           },
   };
-  CHECK_DRV(cuMemCreate(&handle_, kPageSize, &prop, 0));
+  CHECK_DRV(cuMemCreate(&handle_, page_size_, &prop, 0));
 }
 
 GPUPage::~GPUPage() { CHECK_DRV(cuMemRelease(handle_)); }
@@ -35,17 +36,18 @@ bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
           },
       .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
   };
-  CHECK_DRV(
-      cuMemMap(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize, 0, handle_, 0));
+  CHECK_DRV(cuMemMap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_, 0,
+                     handle_, 0));
   if (set_access)
-    CHECK_DRV(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize,
+    CHECK_DRV(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(vaddr), page_size_,
                              &accessDesc_, 1));
   return true;
 }
 
 // TODO: finish CPUPage impl.
-CPUPage::CPUPage(page_id_t page_id)
-    : page_id_(page_id), mapped_addr_(nullptr) {}
+CPUPage::CPUPage(page_id_t page_id, size_t page_size)
+    : page_id_(page_id), page_size_(page_size > 0 ? page_size : kPageSize),
+      mapped_addr_(nullptr) {}
 
 CPUPage::~CPUPage() {}
 

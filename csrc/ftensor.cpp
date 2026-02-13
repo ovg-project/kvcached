@@ -34,20 +34,23 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::Device &dev,
 }
 
 static inline std::unique_ptr<Page> make_unique_page(const torch::Device &dev,
-                                                     page_id_t page_id) {
+                                                     page_id_t page_id,
+                                                     size_t page_size = 0) {
   if (dev.is_cuda()) {
-    return std::make_unique<GPUPage>(page_id, dev.index());
+    return std::make_unique<GPUPage>(page_id, dev.index(), page_size);
   } else if (dev.is_cpu()) {
-    return std::make_unique<CPUPage>(page_id);
+    return std::make_unique<CPUPage>(page_id, page_size);
   }
   ASSERT(false, "Unsupported device type.");
   return nullptr;
 }
 
 FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
-                 torch::Device dev, std::shared_ptr<Page> zero_page)
-    : name_(name), vaddr_(nullptr), size_(size), dtype_(dtype), dev_(dev),
-      zero_page_(zero_page) {
+                 torch::Device dev, std::shared_ptr<Page> zero_page,
+                 size_t page_size)
+    : name_(name), vaddr_(nullptr), size_(size),
+      page_size_(page_size > 0 ? page_size : kPageSize), dtype_(dtype),
+      dev_(dev), zero_page_(zero_page) {
   vaddr_ = alloc_virtual_mem(dev_, size_);
   init_with_zero_();
 
@@ -68,9 +71,9 @@ FTensor::~FTensor() {
 }
 
 bool FTensor::map(offset_t offset) {
-  assert(offset % kPageSize == 0); // Ensure alignment.
+  assert(offset % page_size_ == 0); // Ensure alignment.
 
-  page_id_t page_id = offset / kPageSize;
+  page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) != mapping_.end()) {
     LOGE("Page %ld is already mapped.", page_id);
     return false;
@@ -78,17 +81,17 @@ bool FTensor::map(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize));
+  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
 
-  mapping_[page_id] = make_unique_page(dev_, page_id);
+  mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
   mapping_[page_id]->map(vaddr);
   return true;
 }
 
 bool FTensor::unmap(offset_t offset) {
-  assert(offset % kPageSize == 0); // Ensure alignment.
+  assert(offset % page_size_ == 0); // Ensure alignment.
 
-  page_id_t page_id = offset / kPageSize;
+  page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) == mapping_.end()) {
     LOGE("Page %ld is not mapped.", page_id);
     return false;
@@ -96,7 +99,7 @@ bool FTensor::unmap(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), kPageSize));
+  CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
 
   // Map the zero page instead to ensure memory integrity.
   map_(zero_page_.get(), offset);
@@ -106,7 +109,7 @@ bool FTensor::unmap(offset_t offset) {
 }
 
 bool FTensor::map_(Page *page, offset_t offset, bool set_access) {
-  assert(offset % kPageSize == 0); // Ensure alignment.
+  assert(offset % page_size_ == 0); // Ensure alignment.
   assert(page);
   auto vaddr =
       reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(vaddr_) + offset);
@@ -128,12 +131,12 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
 }
 
 bool FTensor::init_with_zero_() {
-  assert(reinterpret_cast<uintptr_t>(vaddr_) % kPageSize ==
-         0);                      // Ensure alignment.
-  assert(size_ % kPageSize == 0); // Ensure alignment.
+  assert(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ ==
+         0);                       // Ensure alignment.
+  assert(size_ % page_size_ == 0); // Ensure alignment.
 
   bool succ = true;
-  for (size_t offset = 0; offset < size_; offset += kPageSize) {
+  for (size_t offset = 0; offset < size_; offset += page_size_) {
     if (!map_(zero_page_.get(), offset, /* set_access = */ true)) {
       succ = false;
       break;
