@@ -1,0 +1,28 @@
+--- a/src/semantic-router/pkg/extproc/request_handler.go
++++ b/src/semantic-router/pkg/extproc/request_handler.go
+@@ -464,6 +464,12 @@
+ 				endpointAddress, endpointFound := r.Config.SelectBestEndpointAddressForModel(matchedModel)
+ 				if endpointFound {
+ 					selectedEndpoint = endpointAddress
++					// Map to Docker gateway IP but keep the port
++					if parts := strings.Split(endpointAddress, ":"); len(parts) == 2 {
++						selectedEndpoint = "172.17.0.1:" + parts[1]
++					} else {
++						selectedEndpoint = "172.17.0.1"
++					}
+ 					observability.Infof("Selected endpoint address: %s for model: %s", selectedEndpoint, matchedModel)
+ 				} else {
+ 					observability.Warnf("No endpoint found for model %s, using fallback", matchedModel)
+@@ -592,6 +598,12 @@
+		endpointAddress, endpointFound := r.Config.SelectBestEndpointAddressForModel(originalModel)
+		if endpointFound {
+			selectedEndpoint = endpointAddress
++			// Map to Docker gateway IP but keep the port
++			if parts := strings.Split(endpointAddress, ":"); len(parts) == 2 {
++				selectedEndpoint = "172.17.0.1:" + parts[1]
++			} else {
++				selectedEndpoint = "172.17.0.1"
++			}
+			observability.Infof("Selected endpoint address: %s for model: %s", selectedEndpoint, originalModel)
+		} else {
+			observability.Warnf("No endpoint found for model %s, using fallback", originalModel)
