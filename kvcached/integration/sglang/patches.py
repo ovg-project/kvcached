@@ -406,14 +406,6 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.mem_usage = (k_size + v_size) / BYTES_PER_GB
 
-                def __del__(self):  # best-effort cleanup
-                    try:
-                        import kvcached.integration.sglang.interfaces as kvi
-
-                        kvi.shutdown_kvcached()
-                    except Exception:
-                        pass
-
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
@@ -597,14 +589,6 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
 
                     self.mem_usage = kv_size / BYTES_PER_GB
-
-                def __del__(self):  # best-effort cleanup
-                    try:
-                        import kvcached.integration.sglang.interfaces as kvi
-
-                        kvi.shutdown_kvcached()
-                    except Exception:
-                        pass
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the KV buffer."""
