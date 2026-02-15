@@ -154,7 +154,7 @@ def alloc_mla_kv_cache(
         logger.warning("kvcached is only tested with page_size=1 for SGLang.")
 
     block_size = page_size
-    block_mem_size = math.prod(kvcache_shape[1:]) * dtype.itemsize
+    block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
 
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer = gpu_mem_bytes // num_layers // num_k_or_v
