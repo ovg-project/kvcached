@@ -494,10 +494,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _patched_initialize_kv_cache(self, kv_cache_config: Any) -> None:
             import torch
-
-            from kvcached.integration.vllm import interfaces as kvi
             from vllm.v1.kv_cache_interface import FullAttentionSpec
             from vllm.v1.utils import bind_kv_cache
+
+            from kvcached.integration.vllm import interfaces as kvi
 
             if not enable_kvcached():
                 return original_initialize_kv_cache(self, kv_cache_config)
@@ -572,9 +572,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 
             from kvcached.integration.vllm import interfaces as kvi
-            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 
             if len(kv_cache_config.kv_cache_groups) > 1:
                 raise NotImplementedError(
