@@ -777,7 +777,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 # The steps below mirror the tail of vLLM's Worker.init_device
                 # after the memory-utilization check.
                 try:
-                    from vllm.model_executor import set_random_seed  # type: ignore
+                    from vllm.utils.torch_utils import set_random_seed  # type: ignore
                     from vllm.v1.utils import report_usage_stats  # type: ignore
                     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
                     from vllm.v1.worker.gpu_worker import (
