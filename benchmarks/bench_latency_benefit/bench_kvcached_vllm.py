@@ -73,7 +73,6 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
-
 from vllm.benchmarks.serve import get_request
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
