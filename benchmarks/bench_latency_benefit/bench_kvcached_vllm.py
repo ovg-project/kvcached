@@ -36,12 +36,6 @@ from datetime import datetime
 from typing import Any, Literal, Optional
 
 import numpy as np
-from backend_request_func import (
-    ASYNC_REQUEST_FUNCS,
-    OPENAI_COMPATIBLE_BACKENDS,
-    RequestFuncInput,
-    RequestFuncOutput,
-)
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 from typing_extensions import deprecated
@@ -56,6 +50,12 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+from backend_request_func import (
+    ASYNC_REQUEST_FUNCS,
+    OPENAI_COMPATIBLE_BACKENDS,
+    RequestFuncInput,
+    RequestFuncOutput,
+)
 from benchmark_dataset import (
     AIMODataset,
     ASRDataset,
@@ -73,6 +73,7 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+
 from vllm.benchmarks.serve import get_request
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000

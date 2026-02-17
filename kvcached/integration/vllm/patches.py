@@ -494,10 +494,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _patched_initialize_kv_cache(self, kv_cache_config: Any) -> None:
             import torch
-            from vllm.v1.kv_cache_interface import FullAttentionSpec
-            from vllm.v1.utils import bind_kv_cache
 
             from kvcached.integration.vllm import interfaces as kvi
+            from vllm.v1.kv_cache_interface import FullAttentionSpec
+            from vllm.v1.utils import bind_kv_cache
 
             if not enable_kvcached():
                 return original_initialize_kv_cache(self, kv_cache_config)
@@ -572,9 +572,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
-            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 
             from kvcached.integration.vllm import interfaces as kvi
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 
             if len(kv_cache_config.kv_cache_groups) > 1:
                 raise NotImplementedError(
@@ -777,10 +777,10 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 # The steps below mirror the tail of vLLM's Worker.init_device
                 # after the memory-utilization check.
                 try:
+                    from vllm.utils.mem_utils import MemorySnapshot
                     from vllm.utils.torch_utils import set_random_seed  # type: ignore
                     from vllm.v1.utils import report_usage_stats  # type: ignore
                     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-                    from vllm.utils.mem_utils import MemorySnapshot
                     from vllm.v1.worker.gpu_worker import (
                         init_worker_distributed_environment as _init_dist_env,
                     )
