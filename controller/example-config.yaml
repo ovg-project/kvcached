@@ -36,7 +36,8 @@ instances: # instances configuration
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=12346"
-      - "--gpu-memory-utilization 0.5"
+      # NOTE: Do NOT use --gpu-memory-utilization with kvcached.
+      # kvcached manages memory dynamically via kvcached_gpu_utilization above.
       - "--enable-sleep-mode"
   - name: instance2
     model: Qwen/Qwen3-0.6B
@@ -49,7 +50,8 @@ instances: # instances configuration
     engine_args:
       - "--disable-radix-cache"
       - "--trust-remote-code"
-      - "--mem-fraction-static 0.5"
+      # NOTE: Do NOT use --mem-fraction-static with kvcached.
+      # kvcached manages memory dynamically via kvcached_gpu_utilization above.
       - "--host=localhost"
       - "--port=30000"
       - "--enable-memory-saver"

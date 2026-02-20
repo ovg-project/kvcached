@@ -166,3 +166,63 @@ python test_traffic_monitor.py
 | `/action/sleep/{model_name}` | Manually put a model to sleep |
 | `/action/wakeup/{model_name}` | Manually wake up a sleeping model |
 | `/sleep/candidates` | Models that are candidates for sleep mode |
+
+---
+
+## Troubleshooting Multi-Model Setups
+
+### Memory Allocation Failures
+
+If you encounter errors like "cannot allocate memory" or OOM when starting multiple models:
+
+**1. Do NOT use static memory allocation flags with kvcached**
+
+When kvcached is enabled, it manages GPU memory dynamically. Remove these conflicting flags:
+- vLLM: `--gpu-memory-utilization`
+- SGLang: `--mem-fraction-static`
+
+Instead, use `kvcached_gpu_utilization` in your YAML config (default: 0.95).
+
+**2. Add startup delays between instances**
+
+When launching multiple models, add delays to allow kvcached to stabilize:
+```yaml
+instances:
+  - name: model1
+    # ... config ...
+  - name: model2
+    launch_delay_seconds: 30  # Wait 30s after model1 starts
+```
+
+**3. Monitor memory usage with kvctl**
+
+Use the kvcached CLI to monitor real-time memory allocation:
+```bash
+# Interactive shell
+kvctl shell
+
+# List active IPC segments
+kvcached> list
+
+# Watch memory usage in real-time
+kvcached> watch -n 2
+
+# Launch curses UI for detailed view
+kvcached> kvtop
+```
+
+### Model Not Responding
+
+1. Check if the model is sleeping: `curl http://localhost:8080/sleep/status`
+2. Wake it up: `curl -X POST "http://localhost:8080/action/wakeup/model-name"`
+3. Check backend health: `curl "http://localhost:8080/health/model-name"`
+
+### Understanding kvcached vs Engine Memory Settings
+
+| Setting | Purpose | When to Use |
+|---------|---------|-------------|
+| `kvcached_gpu_utilization` | Max GPU fraction kvcached can use | Always with kvcached |
+| `--gpu-memory-utilization` | vLLM static reservation | **Never** with kvcached |
+| `--mem-fraction-static` | SGLang static reservation | **Never** with kvcached |
+
+kvcached allocates memory **on-demand** as requests arrive, unlike static allocation which reserves memory upfront. This enables elastic sharing between multiple models.
