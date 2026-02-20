@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-
 #include <cassert>
+#include <cstdio>
 #include <iostream>
+
+#include "gpu_vmm.hpp"
 
 #define LOGE(format, ...)                                                      \
   fprintf(stderr, "ERROR: %s:%d: " format "\n", __FILE__, __LINE__,            \
@@ -30,54 +30,24 @@
 #define WARN(cond, ...)                                                        \
   {                                                                            \
     if (!(cond)) {                                                             \
-      LOGE(__VA_ARGS__);                                                       \
+      LOGW(__VA_ARGS__);                                                       \
     }                                                                          \
   }
 
 #define DRV_CALL(call)                                                         \
-  {                                                                            \
-    CUresult result = (call);                                                  \
-    if (CUDA_SUCCESS != result) {                                              \
-      const char *errMsg;                                                      \
-      cuGetErrorString(result, &errMsg);                                       \
-      ASSERT(0, "Error when exec " #call " %s-%d code:%d err:%s",              \
-             __FUNCTION__, __LINE__, result, errMsg);                          \
-    }                                                                          \
-  }
+  CHECK_GPU(call)
 
 #define DRV_CALL_RET(call, status_val)                                         \
   {                                                                            \
-    CUresult result = (call);                                                  \
-    if (CUDA_SUCCESS != result) {                                              \
-      const char *errMsg;                                                      \
-      cuGetErrorString(result, &errMsg);                                       \
+    auto result = (call);                                                      \
+    if (!kvcached::gpu_vmm::is_success(result)) {                              \
       WARN(0, "Error when exec " #call " %s-%d code:%d err:%s", __FUNCTION__,  \
-           __LINE__, result, errMsg);                                          \
+           __LINE__, static_cast<int>(result),                                  \
+           kvcached::gpu_vmm::error_string(result));                           \
     }                                                                          \
     status_val = result;                                                       \
   }
 
-static inline void checkRtError(cudaError_t res, const char *tok,
-                                const char *file, unsigned line) {
-  if (res != cudaSuccess) {
-    std::cerr << file << ':' << line << ' ' << tok
-              << " failed in CUDA runtime (" << (unsigned)res
-              << "): " << cudaGetErrorString(res) << std::endl;
-    abort();
-  }
-}
-
-#define CHECK_RT(x) checkRtError(x, #x, __FILE__, __LINE__)
-
-static inline void checkDrvError(CUresult res, const char *tok,
-                                 const char *file, unsigned line) {
-  if (res != CUDA_SUCCESS) {
-    const char *errStr = nullptr;
-    (void)cuGetErrorString(res, &errStr);
-    std::cerr << file << ':' << line << ' ' << tok << " failed in CUDA driver ("
-              << (unsigned)res << "): " << errStr << std::endl;
-    abort();
-  }
-}
-
-#define CHECK_DRV(x) checkDrvError(x, #x, __FILE__, __LINE__)
+#define CHECK_GPU(x) kvcached::gpu_vmm::check((x), #x, __FILE__, __LINE__)
+#define CHECK_RT(x) CHECK_GPU(x)
+#define CHECK_DRV(x) CHECK_GPU(x)

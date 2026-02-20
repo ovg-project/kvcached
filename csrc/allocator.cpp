@@ -3,7 +3,6 @@
 
 #include <memory>
 #include <mutex>
-#include <torch/extension.h>
 #include <unordered_map>
 
 #include "allocator.hpp"
@@ -11,7 +10,6 @@
 #include "cuda_utils.hpp"
 #include "ftensor.hpp"
 #include "page.hpp"
-#include "torch_utils.hpp"
 
 namespace kvcached {
 // Global configurable page size
@@ -20,11 +18,19 @@ size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
 
-static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
+static inline std::shared_ptr<Page> make_shared_page(const c10::Device &dev,
                                                      page_id_t page_id,
                                                      size_t page_size = 0) {
+  auto resolve_device_index = [](const c10::Device &device) -> int {
+    if (device.index() >= 0) {
+      return device.index();
+    }
+    return gpu_vmm::current_device();
+  };
+
   if (dev.is_cuda()) {
-    return std::make_shared<GPUPage>(page_id, dev.index(), page_size);
+    return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
+                                     page_size);
   } else if (dev.is_cpu()) {
     return std::make_shared<CPUPage>(page_id, page_size);
   }
@@ -32,7 +38,7 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
-static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
+static inline size_t get_v_base_offset(const at::Tensor &tensor) {
   size_t num_eles = tensor.numel() * tensor.element_size();
   ASSERT(num_eles % (2 * kPageSize) == 0,
          "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
@@ -40,12 +46,12 @@ static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
   return num_eles / 2;
 }
 
-FTensorAllocator::FTensorAllocator(const torch::Device &device,
+FTensorAllocator::FTensorAllocator(const c10::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
       kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
-    init_cuda_();
+    init_gpu_();
   }
 }
 
@@ -78,7 +84,7 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
     kPageSize = page_size;
   }
 
-  auto device = torch::Device(dev_str);
+  auto device = c10::Device(dev_str);
   g_allocator_ = std::make_unique<FTensorAllocator>(device, contiguous_layout);
 }
 
@@ -95,8 +101,8 @@ void FTensorAllocator::shutdown() {
   }
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
-    size_t size, torch::Dtype dtype, const std::string &dev_str,
+std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
+    size_t size, c10::ScalarType dtype, const std::string &dev_str,
     int64_t num_layers, int64_t num_kv_buffers) {
   std::lock_guard<std::mutex> lock(mtx_);
 
@@ -218,10 +224,10 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
   return std::string(prefix) + std::to_string(counter++);
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
-    std::string_view prefix, size_t size, torch::Dtype dtype,
+std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
+    std::string_view prefix, size_t size, c10::ScalarType dtype,
     const std::string &dev_str, int64_t num_layers) {
-  std::vector<torch::Tensor> ftensors;
+  std::vector<at::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
     auto tensor = create_ftensor_(size, dtype, dev_str, name);
@@ -230,8 +236,8 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
   return ftensors;
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
-    size_t size, torch::Dtype dtype, const std::string &dev_str,
+std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
+    size_t size, c10::ScalarType dtype, const std::string &dev_str,
     int64_t num_layers, size_t compound_page_size) {
   // In contiguous layout, Python passes per-layer size, and we multiply by
   // num_layers to get total size
@@ -249,16 +255,17 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 }
 
 /** this function is not thread-safe */
-torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
-                                                const std::string &dev_str,
-                                                std::string name) {
+at::Tensor FTensorAllocator::create_ftensor_(size_t size,
+                                             c10::ScalarType dtype,
+                                             const std::string &dev_str,
+                                             std::string name) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
   if (ftensors_.find(name) != ftensors_.end()) {
     auto tensor = ftensors_[name].get()->get_tensor();
     assert(tensor.numel() * tensor.element_size() == size);
-    assert(tensor.device() == torch::Device(dev_str));
+    assert(tensor.device() == c10::Device(dev_str));
     return tensor;
   }
 
@@ -269,7 +276,7 @@ torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
 }
 
 /** this function is not thread-safe */
-void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
+void FTensorAllocator::free_ftensor_(at::Tensor &ftensor) {
   auto name = ftensor.name();
   if (ftensors_.find(name) == ftensors_.end()) {
     return;
@@ -277,36 +284,25 @@ void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
   ftensors_.erase(name);
 }
 
-void FTensorAllocator::init_cuda_() {
-  CHECK_RT(cudaFree(0));
+void FTensorAllocator::init_gpu_() {
+  CHECK_GPU(gpu_vmm::initialize_runtime());
 
-  CUdevice dev;
-  CHECK_DRV(cuCtxGetDevice(&dev));
+  int dev_idx = dev_.index() >= 0 ? dev_.index() : gpu_vmm::current_device();
+  CHECK_GPU(gpu_vmm::set_device(dev_idx));
 
-  int supportsVMM = 0;
-  CHECK_DRV(cuDeviceGetAttribute(
-      &supportsVMM, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
-      dev));
-  // LOGE("Supports VMM: %d", supportsVMM);
+  int supports_vmm = 0;
+  CHECK_GPU(gpu_vmm::get_vmm_support(&supports_vmm, dev_idx));
+  ASSERT(supports_vmm != 0,
+         "VMM is not supported on %s device %d. kvcached requires GPU VMM "
+         "support.",
+         gpu_vmm::backend_name(), dev_idx);
 
-  CUcontext context;
-  CHECK_DRV(cuCtxGetCurrent(&context));
-
-  CUmemAllocationProp prop{
-      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev,
-          },
-  };
-
+  auto prop = gpu_vmm::make_pinned_device_allocation_prop(dev_idx);
   size_t chunk_sz = 0;
-  CHECK_DRV(cuMemGetAllocationGranularity(&chunk_sz, &prop,
-                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  CHECK_GPU(gpu_vmm::get_allocation_granularity(&chunk_sz, &prop));
   ASSERT(kPageSize % chunk_sz == 0,
-         "Invalid page size: %lu must be a multiple of CUDA granularity %lu\n",
-         kPageSize, chunk_sz);
+         "Invalid page size: %lu must be a multiple of %s granularity %lu\n",
+         kPageSize, gpu_vmm::backend_name(), chunk_sz);
 }
 
 } // namespace kvcached

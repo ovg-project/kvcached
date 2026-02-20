@@ -80,7 +80,7 @@ def alloc_kv_cache(
     if len(kvcache_shape) <= 2:
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     # if page_size != 1:
     #     logger.warning("kvcached is only tested with page_size=1 for SGLang.")
 
@@ -149,7 +149,7 @@ def alloc_mla_kv_cache(
     if len(kvcache_shape) <= 2:
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     if page_size != 1:
         logger.warning("kvcached is only tested with page_size=1 for SGLang.")
 
