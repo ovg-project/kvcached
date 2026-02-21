@@ -185,7 +185,8 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
                     init_kvcached(
                         tp_rank=0,
-                        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                        world_size=(vllm_config.parallel_config.tensor_parallel_size *
+                                 vllm_config.parallel_config.pipeline_parallel_size),
                         is_worker=False,
                     )
                 except Exception:
@@ -263,7 +264,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            kvi.init_kvcached(tp_rank=0, tp_size=tp_size, is_worker=False)
+            kvi.init_kvcached(tp_rank=0, world_size=tp_size, is_worker=False)
 
             # Import ElasticBlockPool from the patched module
             import importlib
@@ -461,12 +462,19 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 from vllm.distributed.parallel_state import (
                     get_tensor_model_parallel_rank,
                     get_tensor_model_parallel_world_size,
+                    get_pipeline_model_parallel_rank,
+                    get_pipeline_model_parallel_world_size,
                 )
 
                 tp_rank = int(get_tensor_model_parallel_rank())
                 tp_size = int(get_tensor_model_parallel_world_size())
+                pp_rank = int(get_pipeline_model_parallel_rank())
+                pp_size = int(get_pipeline_model_parallel_world_size())
+
+                global_rank = pp_rank * tp_size + tp_rank
+                global_world_size = tp_size * pp_size
             except Exception:
-                tp_rank, tp_size = 0, 1
+                global_rank, global_world_size = 0, 1
 
             try:
                 device_str = str(getattr(self, "device", "cuda"))
@@ -475,7 +483,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            kvi.init_kvcached(tp_rank=tp_rank, tp_size=tp_size, is_worker=True, device=device_str)
+            kvi.init_kvcached(tp_rank=global_rank, world_size=global_world_size, is_worker=True, device=device_str)
 
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached
