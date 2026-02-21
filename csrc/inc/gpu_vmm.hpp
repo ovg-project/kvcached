@@ -56,7 +56,8 @@ inline int current_device() {
 
 inline status_t get_vmm_support(int *supports_vmm, int dev_idx) {
   return hipDeviceGetAttribute(
-      supports_vmm, hipDeviceAttributeVirtualMemoryManagementSupported, dev_idx);
+      supports_vmm, hipDeviceAttributeVirtualMemoryManagementSupported,
+      dev_idx);
 }
 
 inline allocation_prop_t make_pinned_device_allocation_prop(int dev_idx) {
@@ -76,10 +77,10 @@ inline access_desc_t make_device_rw_access_desc(int dev_idx) {
   return desc;
 }
 
-inline status_t
-get_allocation_granularity(size_t *granularity, const allocation_prop_t *prop) {
-  return hipMemGetAllocationGranularity(
-      granularity, prop, hipMemAllocationGranularityMinimum);
+inline status_t get_allocation_granularity(size_t *granularity,
+                                           const allocation_prop_t *prop) {
+  return hipMemGetAllocationGranularity(granularity, prop,
+                                        hipMemAllocationGranularityMinimum);
 }
 
 inline status_t mem_create(allocation_handle_t *handle, size_t size,
@@ -172,9 +173,11 @@ inline drv_status_t get_vmm_support(int *supports_vmm, int dev_idx) {
 #if defined(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)
   constexpr auto attr = CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED;
 #else
-  constexpr auto attr = CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED;
+  constexpr auto attr =
+      CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED;
 #endif
-  return cuDeviceGetAttribute(supports_vmm, attr, static_cast<CUdevice>(dev_idx));
+  return cuDeviceGetAttribute(supports_vmm, attr,
+                              static_cast<CUdevice>(dev_idx));
 }
 
 inline allocation_prop_t make_pinned_device_allocation_prop(int dev_idx) {
@@ -193,8 +196,8 @@ inline access_desc_t make_device_rw_access_desc(int dev_idx) {
   return desc;
 }
 
-inline drv_status_t
-get_allocation_granularity(size_t *granularity, const allocation_prop_t *prop) {
+inline drv_status_t get_allocation_granularity(size_t *granularity,
+                                               const allocation_prop_t *prop) {
   return cuMemGetAllocationGranularity(granularity, prop,
                                        CU_MEM_ALLOC_GRANULARITY_MINIMUM);
 }
@@ -210,10 +213,9 @@ inline drv_status_t mem_release(allocation_handle_t handle) {
 
 inline drv_status_t address_reserve(void **ptr, size_t size, size_t alignment,
                                     void *preferred_addr = nullptr) {
-  return cuMemAddressReserve(reinterpret_cast<CUdeviceptr *>(ptr), size,
-                             alignment,
-                             reinterpret_cast<CUdeviceptr>(preferred_addr),
-                             0ULL);
+  return cuMemAddressReserve(
+      reinterpret_cast<CUdeviceptr *>(ptr), size, alignment,
+      reinterpret_cast<CUdeviceptr>(preferred_addr), 0ULL);
 }
 
 inline drv_status_t address_free(void *ptr, size_t size) {
@@ -230,8 +232,8 @@ inline drv_status_t mem_unmap(void *ptr, size_t size) {
   return cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size);
 }
 
-inline drv_status_t set_access(void *ptr, size_t size, const access_desc_t *desc,
-                               size_t count) {
+inline drv_status_t set_access(void *ptr, size_t size,
+                               const access_desc_t *desc, size_t count) {
   return cuMemSetAccess(reinterpret_cast<CUdeviceptr>(ptr), size, desc, count);
 }
 

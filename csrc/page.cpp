@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include "page.hpp"
 #include "constants.hpp"
 #include "cuda_utils.hpp"
-#include "page.hpp"
 
 namespace kvcached {
 

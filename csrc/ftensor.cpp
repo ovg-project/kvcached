@@ -67,8 +67,10 @@ FTensor::FTensor(const std::string &name, size_t size, c10::ScalarType dtype,
   init_with_zero_();
 
   auto num_elems = static_cast<int64_t>(size / c10::elementSize(dtype_));
-  auto options = at::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
-  tensor_ = at::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+  auto options =
+      at::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
+  tensor_ =
+      at::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
 }
 
 FTensor::~FTensor() {
@@ -138,7 +140,8 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
   if (!dev_.is_cuda()) {
     return true;
   }
-  auto access_desc = gpu_vmm::make_device_rw_access_desc(resolve_device_index(dev_));
+  auto access_desc =
+      gpu_vmm::make_device_rw_access_desc(resolve_device_index(dev_));
   CHECK_GPU(gpu_vmm::set_access(addr, size, &access_desc, 1));
   return true;
 }

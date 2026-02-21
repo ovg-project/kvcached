@@ -47,15 +47,13 @@ private:
   std::vector<at::Tensor>
   create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
                                c10::ScalarType dtype,
-                               const std::string &dev_str,
-                               int64_t num_layers);
+                               const std::string &dev_str, int64_t num_layers);
   std::vector<at::Tensor>
   create_kv_tensors_contiguous_(size_t size, c10::ScalarType dtype,
                                 const std::string &dev_str, int64_t num_layers,
                                 size_t compound_page_size);
   at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
-                             const std::string &dev_str,
-                             std::string name = "");
+                             const std::string &dev_str, std::string name = "");
   void free_ftensor_(at::Tensor &ftensor);
 
   // GPU VMM util functions.

@@ -34,15 +34,14 @@
     }                                                                          \
   }
 
-#define DRV_CALL(call)                                                         \
-  CHECK_GPU(call)
+#define DRV_CALL(call) CHECK_GPU(call)
 
 #define DRV_CALL_RET(call, status_val)                                         \
   {                                                                            \
     auto result = (call);                                                      \
     if (!kvcached::gpu_vmm::is_success(result)) {                              \
       WARN(0, "Error when exec " #call " %s-%d code:%d err:%s", __FUNCTION__,  \
-           __LINE__, static_cast<int>(result),                                  \
+           __LINE__, static_cast<int>(result),                                 \
            kvcached::gpu_vmm::error_string(result));                           \
     }                                                                          \
     status_val = result;                                                       \

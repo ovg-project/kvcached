@@ -255,8 +255,7 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 }
 
 /** this function is not thread-safe */
-at::Tensor FTensorAllocator::create_ftensor_(size_t size,
-                                             c10::ScalarType dtype,
+at::Tensor FTensorAllocator::create_ftensor_(size_t size, c10::ScalarType dtype,
                                              const std::string &dev_str,
                                              std::string name) {
   if (name.empty())
