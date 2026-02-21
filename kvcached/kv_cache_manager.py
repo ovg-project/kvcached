@@ -110,10 +110,13 @@ class KVCacheManager:
             return
 
         def _check_kv_tensors_created():
+            # Always check locally on rank 0 (coordinator)
+            local_created = kv_tensors_created()
             if self.tp_size > 1:
-                return broadcast_kv_tensors_created(self.tp_size)
-            else:
-                return kv_tensors_created()
+                # Also check all workers (ranks 1..tp_size-1)
+                workers_created = broadcast_kv_tensors_created(self.tp_size)
+                return local_created and workers_created
+            return local_created
 
         try:
             total_wait = 0.0
