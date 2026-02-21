@@ -221,6 +221,7 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     --port "$SGL_PORT" \
     --tp "$TP_SIZE" \
     --dp "$DP_SIZE" \
+    --pipeline-parallel-size "$PP_SIZE" \
     $SGL_L4_ARGS
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 else
