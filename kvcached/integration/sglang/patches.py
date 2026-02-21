@@ -84,7 +84,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
 
                 def alloc(self, need_size: int):
                     indices: list[int] = self.kvcached_allocator.alloc(need_size)
-                    return torch.tensor(indices, dtype=torch.int32, device="cuda")
+                    return torch.tensor(indices, dtype=torch.int64, device="cuda")
 
                 def free(self, free_index):
                     if self.is_not_in_free_group:
