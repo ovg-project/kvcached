@@ -135,7 +135,7 @@ class PageAllocator:
                  num_layers: int,
                  mem_size_per_layer: int,
                  page_size: int,
-                 tp_size: int = 1,
+                 world_size: int = 1,
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,

@@ -42,7 +42,7 @@ EOF
 # Parse long options via getopt
 TEMP=$(getopt \
     --options h \
-    --longoptions port:,model:,venv-path:,dataset-path:,help \
+    --longoptions port:,model:,venv-path:,dataset-path:,tp:,pp:,dp:,pcp:,ep:,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then exit 1; fi
@@ -55,6 +55,11 @@ while true; do
         --model) model="$2"; shift 2;;
         --venv-path) venv_path="$2"; shift 2;;
         --dataset-path) dataset_path="$2"; shift 2;;
+        --tp) tp_size="$2"; shift 2;;
+        --pp) pp_size="$2"; shift 2;;
+        --dp) dp_size="$2"; shift 2;;
+        --pcp) pcp_size="$2"; shift 2;;
+        --ep) ep_size="$2"; shift 2;;
         --help|-h) usage; exit 0;;
         --) shift; break;;
         *) echo "Unknown option: $1" >&2; usage; exit 1;;
