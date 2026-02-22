@@ -43,3 +43,15 @@ curl -s -X POST http://127.0.0.1:${PORT}/v1/completions \
   -H "Content-Type: application/json" \
   --data-binary @<(printf '{"model":"%s","prompt":"%s","max_tokens":128,"top_p":1,"seed":0}' "$MODEL" "$PROMPT")
 ```
+
+## SGLang support
+
+GPT-OSS (`openai/gpt-oss-20b`) is also supported via SGLang. Although GPT-OSS is a hybrid attention model (alternating sliding-window and full-attention layers), SGLang manages this entirely at the attention kernel level — each layer passes its own `sliding_window_size` to `RadixAttention`. The KV pool itself remains a single standard `MHATokenToKVPool`, which kvcached replaces with `ElasticMHATokenToKVPool`. No special configuration is needed.
+
+```bash
+python -m sglang.launch_server \
+--model openai/gpt-oss-20b \
+--disable-radix-cache \
+--port 30001 \
+--page-size 1
+```
