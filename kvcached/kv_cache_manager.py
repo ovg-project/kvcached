@@ -48,6 +48,7 @@ class KVCacheManager:
         cell_size: int,
         num_layers: int,
         world_size: int = 1,
+        pp_rank: int = 0,
         async_sched: bool = False,
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
@@ -77,6 +78,7 @@ class KVCacheManager:
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
+        self.pp_rank = pp_rank
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -111,7 +113,7 @@ class KVCacheManager:
 
         def _check_kv_tensors_created():
             if self.world_size > 1:
-                return broadcast_kv_tensors_created(self.world_size)
+                return broadcast_kv_tensors_created(self.world_size, self.pp_rank)
             else:
                 return kv_tensors_created()
 

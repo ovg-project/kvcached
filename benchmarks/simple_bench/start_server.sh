@@ -53,7 +53,7 @@ EOF
 # -----------------------------------------------------------------------------
 TEMP=$(getopt \
     --options h \
-    --longoptions port:,model:,venv-path:,tp:,pp:,dp:,pcp:,ep:,help \
+    --longoptions port:,model:,venv-path:,tp:,pp:,dp:,pcp:,ep:,chat-template:,speculative-config:,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then
@@ -80,6 +80,10 @@ while true; do
             pcp_size="$2"; shift 2 ;;
         --ep)
             ep_size="$2"; shift 2 ;;
+        --chat-template)
+            chat_template="$2"; shift 2 ;;
+        --speculative-config)
+            spec_config="$2"; shift 2 ;;
         --help|-h)
             usage; exit 0 ;;
         --)
@@ -114,6 +118,8 @@ else
     fi
 fi
 VENV_PATH="$venv_path"
+CHAT_TEMPLATE="$chat_template"
+SPEC_CONFIG="$spec_config"
 TP_SIZE="$tp_size"
 PP_SIZE="$pp_size"
 DP_SIZE="$dp_size"
@@ -158,18 +164,18 @@ if [ "$engine" == "vllm" ]; then
     ATTN_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
     ALL2ALL_BACKEND=${VLLM_ALL2ALL_BACKEND:-deepep_low_latency}
 
-    export ENABLE_KVCACHED=true
-    export KVCACHED_AUTOPATCH=1
+    export ENABLE_KVCACHED=${ENABLE_KVCACHED:-true}
+    export KVCACHED_AUTOPATCH=${KVCACHED_AUTOPATCH:-1}
     
-    VLLM_L4_ARGS=""
+    VLLM_L4_ARGS=()
     if [ "$IS_L4" = true ]; then
-        VLLM_L4_ARGS="--enforce-eager"
+        VLLM_L4_ARGS+=("--enforce-eager")
     fi
 
     # Handle EP configuration
-    VLLM_EP_ARGS=""
+    VLLM_EP_ARGS=()
     if [[ "$EP_SIZE" -gt 1 ]]; then
-        VLLM_EP_ARGS="--enable-expert-parallel"
+        VLLM_EP_ARGS+=("--enable-expert-parallel" "--enforce-eager")
         
         # If user requested EP > 1 but DP is 1, infer DP size from EP and TP.
         # Formula: EP_SIZE = TP_SIZE * DP_SIZE
@@ -183,13 +189,21 @@ if [ "$engine" == "vllm" ]; then
         fi
 
         # Pass All2All backend via CLI
-        VLLM_EP_ARGS="$VLLM_EP_ARGS --all2all-backend $ALL2ALL_BACKEND"
+        VLLM_EP_ARGS+=("--all2all-backend" "$ALL2ALL_BACKEND")
     fi
 
     # Pass Data Parallelism argument if > 1 (supported by vLLM for EP/MoE contexts)
     # Even if EP=1, if user set DP>1 explicitly, we should pass it.
     if [[ "$DP_SIZE" -gt 1 ]]; then
-        VLLM_EP_ARGS="$VLLM_EP_ARGS --data-parallel-size $DP_SIZE"
+        VLLM_EP_ARGS+=("--data-parallel-size" "$DP_SIZE")
+    fi
+
+    if [[ -n "$CHAT_TEMPLATE" ]]; then
+        VLLM_EP_ARGS+=("--chat-template" "$CHAT_TEMPLATE")
+    fi
+
+    if [[ -n "$SPEC_CONFIG" ]]; then
+        VLLM_EP_ARGS+=("--speculative_config" "$SPEC_CONFIG")
     fi
 
     vllm serve "$MODEL" \
@@ -200,14 +214,14 @@ if [ "$engine" == "vllm" ]; then
     --pipeline-parallel-size="$PP_SIZE" \
     --prefill-context-parallel-size="$PCP_SIZE" \
     --attention-backend "$ATTN_BACKEND" \
-    $VLLM_EP_ARGS \
-    $VLLM_L4_ARGS
+    "${VLLM_EP_ARGS[@]}" \
+    "${VLLM_L4_ARGS[@]}"
     if [[ -n "$VENV_PATH" ]]; then deactivate; fi
 elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
-    export ENABLE_KVCACHED=true
-    export KVCACHED_AUTOPATCH=1
+    export ENABLE_KVCACHED=${ENABLE_KVCACHED:-true}
+    export KVCACHED_AUTOPATCH=${KVCACHED_AUTOPATCH:-1}
 
     SGL_L4_ARGS=""
     if [ "$IS_L4" = true ]; then

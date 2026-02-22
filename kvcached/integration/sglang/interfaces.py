@@ -22,15 +22,17 @@ _kvcached_device = None
 _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
+_pp_rank: int = 0
 
 
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,
+    pp_rank: int = 0,
     device: Optional[str] = None,
     async_sched: bool = False,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched, _world_size
+    global _kvcached_initialized, _kvcached_device, _async_sched, _world_size, _pp_rank
     if _kvcached_initialized:
         return
 
@@ -42,10 +44,11 @@ def init_kvcached(
     _kvcached_device = device
     _async_sched = async_sched
     _world_size = world_size
+    _pp_rank = pp_rank
 
     if world_size > 1:
         # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(tp_rank)
+        start_worker_listener_thread(tp_rank, pp_rank)
 
 
 def shutdown_kvcached() -> None:
@@ -211,6 +214,7 @@ def get_kv_cache_manager(
         cell_size,
         num_layers,
         world_size=_world_size,
+        pp_rank=_pp_rank,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
