@@ -31,6 +31,8 @@ static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
 
   generic_ptr_t vaddr;
   size_t offset = g_vaddr_allocated_offset.fetch_add(size);
+  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
+  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
   if (dev.is_cuda()) {
     CHECK_GPU(gpu_vmm::address_reserve(
         reinterpret_cast<void **>(&vaddr), size, alignment_2mb,

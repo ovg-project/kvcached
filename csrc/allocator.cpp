@@ -28,6 +28,8 @@ static inline std::shared_ptr<Page> make_shared_page(const c10::Device &dev,
     return gpu_vmm::current_device();
   };
 
+  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
+  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
   if (dev.is_cuda()) {
     return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
