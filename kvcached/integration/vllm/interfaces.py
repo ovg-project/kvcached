@@ -20,18 +20,19 @@ logger = get_kvcached_logger()
 _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
-_tp_size: int = 1
+_world_size: int = 1
+_pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
-
 
 def init_kvcached(
     tp_rank: int = 0,
-    tp_size: int = 1,
+    world_size: int = 1,
+    pp_rank: int = 0,
     is_worker: bool = False,
     device: Optional[str] = None,
     async_sched: bool = False,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
+    global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank
     if _kvcached_initialized:
         return
 
@@ -41,12 +42,13 @@ def init_kvcached(
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
     _kvcached_device = device
-    _tp_size = tp_size
+    _world_size = world_size
+    _pp_rank = pp_rank
     _async_sched = async_sched
 
-    if tp_size > 1 and is_worker:
+    if world_size > 1 and is_worker:
         # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(tp_rank)
+        start_worker_listener_thread(tp_rank, pp_rank)
 
 
 def shutdown_kvcached() -> None:
@@ -148,7 +150,8 @@ def get_kv_cache_manager(
         block_size,
         cell_size,
         num_layers,
-        _tp_size,
+        _world_size,
+        pp_rank=_pp_rank,
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
     )

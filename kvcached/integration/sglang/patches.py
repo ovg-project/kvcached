@@ -403,8 +403,30 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # Resolve TP rank and size for IPC socket registration.
+                    # SGLang workers each call _create_buffers() independently,
+                    # so we query the distributed state at this point (which is
+                    # guaranteed to be initialised by the time buffers are created).
+                    try:
+                        from sglang.srt.distributed import (
+                            get_tensor_model_parallel_rank,
+                            get_tensor_model_parallel_world_size,
+                            get_pipeline_model_parallel_rank,
+                        )
+                        tp_rank = int(get_tensor_model_parallel_rank())
+                        tp_size = int(get_tensor_model_parallel_world_size())
+                        pp_rank = int(get_pipeline_model_parallel_rank())
+                    except Exception:
+                        try:
+                            import torch.distributed as dist
+                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
+                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
+                            pp_rank = 0
+                        except Exception:
+                            tp_rank, tp_size, pp_rank = 0, 1, 0
+
                     # Initialize kvcached with overlap scheduling to be conservative
-                    kvi.init_kvcached(async_sched=True)
+                    kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
 
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
@@ -541,8 +563,28 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    # Initialize kvcached and create virtual memory buffers
-                    kvi.init_kvcached(async_sched=True)
+                    # Initialize kvcached and create virtual memory buffers.
+                    # Resolve TP rank and size so IPC sockets are registered correctly
+                    # across all TP workers in this SGLang instance.
+                    try:
+                        from sglang.srt.distributed import (
+                            get_tensor_model_parallel_rank,
+                            get_tensor_model_parallel_world_size,
+                            get_pipeline_model_parallel_rank,
+                        )
+                        tp_rank = int(get_tensor_model_parallel_rank())
+                        tp_size = int(get_tensor_model_parallel_world_size())
+                        pp_rank = int(get_pipeline_model_parallel_rank())
+                    except Exception:
+                        try:
+                            import torch.distributed as dist
+                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
+                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
+                            pp_rank = 0
+                        except Exception:
+                            tp_rank, tp_size, pp_rank = 0, 1, 0
+
+                    kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
 
                     if "cuda" not in device:
                         raise ValueError("ElasticMLATokenToKVPool only supports cuda device")

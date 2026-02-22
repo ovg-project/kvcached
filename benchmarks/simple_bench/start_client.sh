@@ -23,7 +23,7 @@ venv_path=""
 
 usage() {
     cat <<EOF
-Usage: $0 <engine> [--venv-path PATH] [--port PORT] [--model MODEL_ID]
+Usage: $0 <engine> [--venv-path PATH] [--port PORT] [--model MODEL_ID] [--dataset-path PATH]
 
 Positional arguments:
   engine         Target engine (vllm | sglang) [required]
@@ -31,6 +31,7 @@ Options:
   --venv-path    Path to a virtual environment to activate (optional)
   --port         Server port (default: vllm=$DEFAULT_PORT_VLLM, sglang=$DEFAULT_PORT_SGL)
   --model        Model identifier (default: $DEFAULT_MODEL)
+  --dataset-path Path to the dataset json file (optional, default: downloads ShareGPT_V3_unfiltered_cleaned_split.json)
   -h, --help     Show this help and exit
 
 Example:
@@ -41,7 +42,7 @@ EOF
 # Parse long options via getopt
 TEMP=$(getopt \
     --options h \
-    --longoptions port:,model:,venv-path:,help \
+    --longoptions port:,model:,venv-path:,dataset-path:,tp:,pp:,dp:,pcp:,ep:,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then exit 1; fi
@@ -53,6 +54,12 @@ while true; do
         --port) port="$2"; shift 2;;
         --model) model="$2"; shift 2;;
         --venv-path) venv_path="$2"; shift 2;;
+        --dataset-path) dataset_path="$2"; shift 2;;
+        --tp) tp_size="$2"; shift 2;;
+        --pp) pp_size="$2"; shift 2;;
+        --dp) dp_size="$2"; shift 2;;
+        --pcp) pcp_size="$2"; shift 2;;
+        --ep) ep_size="$2"; shift 2;;
         --help|-h) usage; exit 0;;
         --) shift; break;;
         *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -96,12 +103,18 @@ PYTHON=${PYTHON:-python3}
 
 source "$SCRIPT_DIR/env_detect.sh"
 
+# Allow user to override dataset path
+DATASET_PATH=${dataset_path:-"$SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json"}
+
 check_and_download_sharegpt() {
-    pushd $SCRIPT_DIR
-    if [ ! -f "ShareGPT_V3_unfiltered_cleaned_split.json" ]; then
-        wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+    # Only download if using the default path and it doesn't exist
+    if [[ "$DATASET_PATH" == "$SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json" ]]; then
+        if [ ! -f "$DATASET_PATH" ]; then
+            pushd $SCRIPT_DIR
+            wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+            popd
+        fi
     fi
-    popd
 }
 
 if [ "$engine" == "vllm" ]; then
@@ -110,7 +123,7 @@ if [ "$engine" == "vllm" ]; then
     vllm bench serve \
       --model $MODEL \
       --dataset-name sharegpt \
-      --dataset-path $SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json \
+      --dataset-path "$DATASET_PATH" \
       --request-rate $REQUEST_RATE \
       --num-prompts $NUM_PROMPTS \
       --port $VLLM_PORT
@@ -122,7 +135,7 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
     $PYTHON -m sglang.bench_serving --backend sglang-oai \
         --model $MODEL \
         --dataset-name sharegpt \
-        --dataset-path $SCRIPT_DIR/ShareGPT_V3_unfiltered_cleaned_split.json \
+        --dataset-path "$DATASET_PATH" \
         --request-rate $REQUEST_RATE \
         --num-prompts $NUM_PROMPTS \
         --port $SGL_PORT

@@ -47,7 +47,8 @@ class KVCacheManager:
         block_size: int,
         cell_size: int,
         num_layers: int,
-        tp_size: int = 1,
+        world_size: int = 1,
+        pp_rank: int = 0,
         async_sched: bool = False,
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
@@ -58,7 +59,7 @@ class KVCacheManager:
             block_size: Size of each block in bytes.
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
-            tp_size: Number of tensor parallel processes.
+            world_size: Number of parallel processes (TP * PP).
             async_sched: Whether asynchronous scheduling is enabled.
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
@@ -76,12 +77,13 @@ class KVCacheManager:
         self.page_size = PAGE_SIZE
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
-        self.tp_size = tp_size
+        self.world_size = world_size
+        self.pp_rank = pp_rank
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
             self.page_size,
-            self.tp_size,
+            self.world_size,
             async_sched=async_sched,
             num_kv_buffers=self.num_kv_buffers,
         )
@@ -110,8 +112,8 @@ class KVCacheManager:
             return
 
         def _check_kv_tensors_created():
-            if self.tp_size > 1:
-                return broadcast_kv_tensors_created(self.tp_size)
+            if self.world_size > 1:
+                return broadcast_kv_tensors_created(self.world_size, self.pp_rank)
             else:
                 return kv_tensors_created()
 
