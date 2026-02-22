@@ -9,8 +9,8 @@
 #include <thread>
 #include <vector>
 
-#include "gpu_vmm.hpp"
 #include "gpu_utils.hpp"
+#include "gpu_vmm.hpp"
 
 namespace vmm = kvcached::gpu_vmm;
 
@@ -140,8 +140,7 @@ void print_stats(const std::string &op_name,
             << std::setw(15) << max << std::endl;
 }
 
-int bench_mmap(void *addr,
-               std::vector<vmm::allocation_handle_t> &handles) {
+int bench_mmap(void *addr, std::vector<vmm::allocation_handle_t> &handles) {
   std::vector<std::thread> thds;
   std::vector<double> latencies[kNumThds];
   char *base = static_cast<char *>(addr);
@@ -238,9 +237,7 @@ void free_physical(std::vector<vmm::allocation_handle_t> &handles) {
   }
 }
 
-void free_virtual(void *addr) {
-  CHECK_DRV(vmm::address_free(addr, kMemSize));
-}
+void free_virtual(void *addr) { CHECK_DRV(vmm::address_free(addr, kMemSize)); }
 
 int main() {
   init_gpu();
