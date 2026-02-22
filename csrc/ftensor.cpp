@@ -8,8 +8,8 @@
 #include <c10/core/ScalarType.h>
 
 #include "constants.hpp"
-#include "cuda_utils.hpp"
 #include "ftensor.hpp"
+#include "gpu_utils.hpp"
 #include "page.hpp"
 
 namespace kvcached {

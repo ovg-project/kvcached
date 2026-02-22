@@ -3,7 +3,7 @@
 
 #include "page.hpp"
 #include "constants.hpp"
-#include "cuda_utils.hpp"
+#include "gpu_utils.hpp"
 
 namespace kvcached {
 
