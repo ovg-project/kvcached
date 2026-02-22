@@ -249,6 +249,7 @@ kvcached is developed by many contributors from the community. Feel free to cont
 ```
 Jiarong Xing (jxing@rice.edu)
 Yifan Qiao (yifanqiao@berkeley.edu)
+Xingqi Cui (xc66@rice.edu)
 Shan Yu (shanyu1@g.ucla.edu)
 ```
 
