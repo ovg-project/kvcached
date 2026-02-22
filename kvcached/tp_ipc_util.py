@@ -32,19 +32,19 @@ def _get_socket_dir_name() -> str:
 SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
 
 
-def get_worker_socket_path(rank: int) -> str:
+def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
     """
-    Get the path for the worker socket.
-    The socket is used for inter-process communication.
+    Get the path for the worker socket, namespaced by pp_rank.
+    Each PP stage uses its own subdirectory to avoid EADDRINUSE races
+    when multiple stages start simultaneously (SGLang PP behaviour).
 
-    The full path is guaranteed to be <= 108 characters (Unix domain socket limit on Linux).
+    The full path is guaranteed to be <= 108 characters (Unix domain socket limit).
     """
-    # Use shorter name to ensure path stays under 108 chars.
-    # Format: /tmp/kvcached-tp-{sanitized_ipc}-{hash8}/w{rank}.sock
-    # Worst case (sanitized_ipc length 64) is still well under 108 characters.
-    socket_path = os.path.join(SOCKET_DIR, f"w{rank}.sock")
+    if pp_rank > 0:
+        socket_path = os.path.join(SOCKET_DIR, f"pp{pp_rank}", f"w{rank}.sock")
+    else:
+        socket_path = os.path.join(SOCKET_DIR, f"w{rank}.sock")
 
-    # Safety check: ensure path is within Unix domain socket limit
     if len(socket_path) > 108:
         raise RuntimeError(
             f"Socket path too long ({len(socket_path)} chars, max 108): {socket_path}"
@@ -93,13 +93,15 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
-def start_worker_listener_thread(rank: int):
+def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     """
     Start a thread that listens for messages on the worker socket.
-    The callback is called with the received message.
+    pp_rank is used to create a PP-stage-specific subdirectory so that
+    concurrent SGLang PP stages do not bind the same socket path.
     """
-    os.makedirs(SOCKET_DIR, exist_ok=True)
-    socket_path = get_worker_socket_path(rank)
+    socket_dir = os.path.join(SOCKET_DIR, f"pp{pp_rank}") if pp_rank > 0 else SOCKET_DIR
+    os.makedirs(socket_dir, exist_ok=True)
+    socket_path = get_worker_socket_path(rank, pp_rank)
 
     if os.path.exists(socket_path):
         try:
@@ -142,11 +144,11 @@ def start_worker_listener_thread(rank: int):
     t.start()
 
 
-async def _send_and_receive_message(rank: int, message: Message) -> Message:
+async def _send_and_receive_message(rank: int, message: Message, pp_rank: int = 0) -> Message:
     """
     Send a message to the worker and receive a response asynchronously.
     """
-    socket_path = get_worker_socket_path(rank)
+    socket_path = get_worker_socket_path(rank, pp_rank)
     reader, writer = await asyncio.open_unix_connection(socket_path)
 
     try:
@@ -168,13 +170,14 @@ async def _send_and_receive_message(rank: int, message: Message) -> Message:
 
 
 async def _broadcast_map_to_kv_tensors(tp_size: int,
-                                       offsets: list[int]) -> None:
+                                       offsets: list[int],
+                                       pp_rank: int = 0) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
     """
     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
     tasks = [
-        _send_and_receive_message(rank, map_message) for rank in range(tp_size)
+        _send_and_receive_message(rank, map_message, pp_rank) for rank in range(tp_size)
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -187,13 +190,14 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
 
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,
-                                           offsets: list[int]) -> None:
+                                           offsets: list[int],
+                                           pp_rank: int = 0) -> None:
     """
     Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
     """
     unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets}
     tasks = [
-        _send_and_receive_message(rank, unmap_message)
+        _send_and_receive_message(rank, unmap_message, pp_rank)
         for rank in range(tp_size)
     ]
 
@@ -206,14 +210,14 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
             raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
 
 
-async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
+async def _broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0) -> bool:
     """
     Broadcast the "kv_tensors_created" operation to all workers concurrently.
     Returns True if all workers report that KV tensors are created, False otherwise.
     """
     check_message = {"cmd": "kv_tensors_created"}
     tasks = [
-        _send_and_receive_message(rank, check_message)
+        _send_and_receive_message(rank, check_message, pp_rank)
         for rank in range(tp_size)
     ]
 
@@ -236,13 +240,13 @@ async def _broadcast_kv_tensors_created(tp_size: int) -> bool:
 
 
 # Wrapper functions to call the async function from sync code
-def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
-    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets))
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int], pp_rank: int = 0) -> None:
+    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank))
 
 
-def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int]) -> None:
-    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets))
+def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int], pp_rank: int = 0) -> None:
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank))
 
 
-def broadcast_kv_tensors_created(tp_size: int) -> bool:
-    return asyncio.run(_broadcast_kv_tensors_created(tp_size))
+def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0) -> bool:
+    return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank))
