@@ -10,8 +10,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cuda_runtime.h>
-#include <torch/extension.h>
+#include <ATen/core/Tensor.h>
+#include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
 
 #include "constants.hpp"
 #include "ftensor.hpp"
@@ -21,14 +22,14 @@ namespace kvcached {
 
 class FTensorAllocator {
 public:
-  FTensorAllocator(const torch::Device &device, bool contiguous_layout);
+  FTensorAllocator(const c10::Device &device, bool contiguous_layout);
   ~FTensorAllocator();
 
   // KV cache interfaces.
-  std::vector<torch::Tensor> create_kv_tensors(size_t size, torch::Dtype dtype,
-                                               const std::string &dev_str,
-                                               int64_t num_layers,
-                                               int64_t num_kv_buffers = 2);
+  std::vector<at::Tensor> create_kv_tensors(size_t size, c10::ScalarType dtype,
+                                            const std::string &dev_str,
+                                            int64_t num_layers,
+                                            int64_t num_kv_buffers = 2);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
@@ -43,26 +44,25 @@ public:
 private:
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
-  std::vector<torch::Tensor>
+  std::vector<at::Tensor>
   create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
-                               torch::Dtype dtype, const std::string &dev_str,
-                               int64_t num_layers);
-  std::vector<torch::Tensor>
-  create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
+                               c10::ScalarType dtype,
+                               const std::string &dev_str, int64_t num_layers);
+  std::vector<at::Tensor>
+  create_kv_tensors_contiguous_(size_t size, c10::ScalarType dtype,
                                 const std::string &dev_str, int64_t num_layers,
                                 size_t compound_page_size);
-  torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
-                                const std::string &dev_str,
-                                std::string name = "");
-  void free_ftensor_(torch::Tensor &ftensor);
+  at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
+                             const std::string &dev_str, std::string name = "");
+  void free_ftensor_(at::Tensor &ftensor);
 
-  // CUDA util functions.
-  void init_cuda_();
+  // GPU VMM util functions.
+  void init_gpu_();
 
   static std::unique_ptr<FTensorAllocator> g_allocator_;
   static std::mutex g_allocator_mutex_;
 
-  torch::Device dev_;
+  c10::Device dev_;
 
   int64_t num_layers_;
   bool contiguous_layout_;

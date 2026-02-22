@@ -427,6 +427,9 @@ class PageAllocator:
             return len(self.reserved_page_list)
 
     def get_avail_physical_pages(self) -> int:
+        if not torch.cuda.is_available():
+            logger.warning("No GPU available, reporting 0 available physical pages.")
+            return 0
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
         headroom = int(total_phy_mem_size * (1 - self.gpu_utilization))
         avail_phy_mem_size = max(avail_phy_mem_size - headroom, 0)
@@ -542,7 +545,7 @@ class PageAllocator:
         if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
             broadcast_unmap_from_kv_tensors(self.tp_size, offsets)
         else:
-            if self.async_sched:
+            if self.async_sched and torch.cuda.is_available():
                 torch.cuda.synchronize()
             unmap_from_kv_tensors(offsets)
 

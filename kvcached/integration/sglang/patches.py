@@ -22,6 +22,11 @@ SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
 logger = get_kvcached_logger()
 
 
+def _is_supported_gpu_device(device: str) -> bool:
+    device_str = str(device).lower()
+    return device_str.startswith("cuda") or device_str.startswith("hip")
+
+
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticTokenToKVPoolAllocator into SGLang's allocator module"""
 
@@ -71,8 +76,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
                         raise ValueError("ElasticTokenToKVPoolAllocator requires elastic MHA pool")
-                    if "cuda" not in device:
-                        raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
+                    if not _is_supported_gpu_device(device):
+                        raise ValueError(
+                            "ElasticTokenToKVPoolAllocator only supports GPU "
+                            "devices (cuda/hip)"
+                        )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     logger.info(
                         f"[kvcached] ElasticTokenToKVPoolAllocator in use: size={size} "
@@ -84,7 +92,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
 
                 def alloc(self, need_size: int):
                     indices: list[int] = self.kvcached_allocator.alloc(need_size)
-                    return torch.tensor(indices, dtype=torch.int32, device="cuda")
+                    return torch.tensor(indices, dtype=torch.int32, device=self.device)
 
                 def free(self, free_index):
                     if self.is_not_in_free_group:
@@ -150,9 +158,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         raise ValueError(
                             "ElasticPagedTokenToKVPoolAllocator requires elastic MHA pool"
                         )
-                    if "cuda" not in device:
+                    if not _is_supported_gpu_device(device):
                         raise ValueError(
-                            "ElasticPagedTokenToKVPoolAllocator only supports cuda device"
+                            "ElasticPagedTokenToKVPoolAllocator only supports GPU "
+                            "devices (cuda/hip)"
                         )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
@@ -406,8 +415,11 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # Initialize kvcached with overlap scheduling to be conservative
                     kvi.init_kvcached(async_sched=True)
 
-                    if "cuda" not in self.device:
-                        raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+                    if not _is_supported_gpu_device(self.device):
+                        raise ValueError(
+                            "ElasticMHATokenToKVPool only supports GPU devices "
+                            "(cuda/hip)"
+                        )
                     self.k_buffer, self.v_buffer = kvi.alloc_kv_cache(
                         kvcache_shape=(
                             self.size + self.page_size,
@@ -544,8 +556,11 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # Initialize kvcached and create virtual memory buffers
                     kvi.init_kvcached(async_sched=True)
 
-                    if "cuda" not in device:
-                        raise ValueError("ElasticMLATokenToKVPool only supports cuda device")
+                    if not _is_supported_gpu_device(device):
+                        raise ValueError(
+                            "ElasticMLATokenToKVPool only supports GPU devices "
+                            "(cuda/hip)"
+                        )
                     self.kv_buffer = kvi.alloc_mla_kv_cache(
                         kvcache_shape=(
                             size + page_size,

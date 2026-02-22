@@ -12,7 +12,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "cuda_utils.hpp"
+#include "gpu_utils.hpp"
 
 static constexpr int kNumThds = 1;
 static constexpr size_t kPageSize = 2ul << 20; // MB
