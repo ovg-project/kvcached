@@ -9,10 +9,10 @@
 #include <thread>
 #include <vector>
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-
+#include "gpu_vmm.hpp"
 #include "gpu_utils.hpp"
+
+namespace vmm = kvcached::gpu_vmm;
 
 static constexpr int kNumThds = 1;
 static constexpr size_t kPageSize = 2ul << 20; // MB
@@ -23,30 +23,27 @@ void print_header();
 void print_stats(const std::string &op_name,
                  const std::vector<double> latencies[kNumThds]);
 
-int init_cuda() {
-  size_t free;
-  typedef unsigned char ElemType;
-  CUcontext ctx;
-  CUdevice dev;
-  int supportsVMM = 0;
+int init_gpu() {
+  int supports_vmm = 0;
 
-  CHECK_RT(cudaFree(0));
+  CHECK_GPU(vmm::initialize_runtime());
+  CHECK_GPU(vmm::set_device(0));
+  int dev_idx = vmm::current_device();
 
-  CHECK_DRV(cuInit(0));
-  CHECK_DRV(cuDevicePrimaryCtxRetain(&ctx, 0));
-  CHECK_DRV(cuCtxSetCurrent(ctx));
-  CHECK_DRV(cuCtxGetDevice(&dev));
+  size_t free_mem = 0, total_mem = 0;
+#if defined(KVCACHED_USE_HIP)
+  CHECK_GPU(hipMemGetInfo(&free_mem, &total_mem));
+#elif defined(KVCACHED_USE_CUDA)
+  CHECK_GPU(cudaMemGetInfo(&free_mem, &total_mem));
+#endif
 
-  CHECK_DRV(cuMemGetInfo(&free, NULL));
-  std::cout << "Total Free Memory: " << (float)free / std::giga::num << "GB"
+  std::cout << "Backend: " << vmm::backend_name() << std::endl;
+  std::cout << "Total Free Memory: " << (float)free_mem / std::giga::num << "GB"
             << std::endl;
 
-  CHECK_DRV(cuDeviceGetAttribute(
-      &supportsVMM, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
-      dev));
-  if (supportsVMM) {
-    std::cout << "====== cuMemMap ElemSz=" << sizeof(ElemType)
-              << " ======" << std::endl;
+  CHECK_DRV(vmm::get_vmm_support(&supports_vmm, dev_idx));
+  if (supports_vmm) {
+    std::cout << "====== VMM Benchmark ======" << std::endl;
   } else {
     std::cout << "VMM not supported" << std::endl;
   }
@@ -54,29 +51,20 @@ int init_cuda() {
   return 0;
 }
 
-CUdeviceptr alloc_virtual(size_t size) {
-  CUdeviceptr addr;
-  CHECK_DRV(cuMemAddressReserve(&addr, size, kPageSize, 0, 0));
+void *alloc_virtual(size_t size) {
+  void *addr = nullptr;
+  CHECK_DRV(vmm::address_reserve(&addr, size, kPageSize));
   return addr;
 }
 
-int bench_physical_alloc(std::vector<CUmemGenericAllocationHandle> &handles) {
+int bench_physical_alloc(std::vector<vmm::allocation_handle_t> &handles) {
   std::vector<std::thread> thds;
   std::vector<double> latencies[kNumThds];
 
   handles.resize(kNumPages);
 
-  CUdevice dev;
-  CHECK_DRV(cuCtxGetDevice(&dev));
-
-  CUmemAllocationProp prop = {
-      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev,
-          },
-  };
+  int dev_idx = vmm::current_device();
+  auto prop = vmm::make_pinned_device_allocation_prop(dev_idx);
 
   for (int i = 0; i < kNumThds; i++) {
     thds.emplace_back([&, tid = i]() {
@@ -84,7 +72,7 @@ int bench_physical_alloc(std::vector<CUmemGenericAllocationHandle> &handles) {
       auto end_page = kNumPages / kNumThds * (tid + 1);
       for (size_t page_idx = stt_page; page_idx < end_page; page_idx++) {
         auto stt = std::chrono::high_resolution_clock::now();
-        CHECK_DRV(cuMemCreate(&handles[page_idx], kPageSize, &prop, 0));
+        CHECK_DRV(vmm::mem_create(&handles[page_idx], kPageSize, &prop));
         auto end = std::chrono::high_resolution_clock::now();
         latencies[tid].push_back(
             std::chrono::duration_cast<std::chrono::microseconds>(end - stt)
@@ -97,7 +85,7 @@ int bench_physical_alloc(std::vector<CUmemGenericAllocationHandle> &handles) {
     thd.join();
   }
 
-  print_stats("cuMemCreate", latencies);
+  print_stats("mem_create", latencies);
 
   return 0;
 }
@@ -152,10 +140,11 @@ void print_stats(const std::string &op_name,
             << std::setw(15) << max << std::endl;
 }
 
-int bench_mmap(CUdeviceptr addr,
-               std::vector<CUmemGenericAllocationHandle> &handles) {
+int bench_mmap(void *addr,
+               std::vector<vmm::allocation_handle_t> &handles) {
   std::vector<std::thread> thds;
   std::vector<double> latencies[kNumThds];
+  char *base = static_cast<char *>(addr);
 
   for (int i = 0; i < kNumThds; i++) {
     thds.emplace_back([&, tid = i]() {
@@ -163,7 +152,7 @@ int bench_mmap(CUdeviceptr addr,
       auto end = kNumPages / kNumThds * (tid + 1);
       for (size_t i = stt; i < end; i++) {
         auto stt = std::chrono::high_resolution_clock::now();
-        CHECK_DRV(cuMemMap(addr + i * kPageSize, kPageSize, 0, handles[i], 0));
+        CHECK_DRV(vmm::mem_map(base + i * kPageSize, kPageSize, 0, handles[i]));
         auto end = std::chrono::high_resolution_clock::now();
         latencies[tid].push_back(
             std::chrono::duration_cast<std::chrono::microseconds>(end - stt)
@@ -176,25 +165,18 @@ int bench_mmap(CUdeviceptr addr,
     thd.join();
   }
 
-  print_stats("cuMemMap", latencies);
+  print_stats("mem_map", latencies);
 
   return 0;
 }
 
-int bench_setaccess(CUdeviceptr addr) {
+int bench_setaccess(void *addr) {
   std::vector<std::thread> thds;
   std::vector<double> latencies[kNumThds];
-  CUdevice dev;
+  char *base = static_cast<char *>(addr);
 
-  CHECK_DRV(cuCtxGetDevice(&dev));
-  CUmemAccessDesc accessDesc{
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev,
-          },
-      .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-  };
+  int dev_idx = vmm::current_device();
+  auto access_desc = vmm::make_device_rw_access_desc(dev_idx);
 
   for (int i = 0; i < kNumThds; i++) {
     thds.emplace_back([&, tid = i]() {
@@ -203,7 +185,7 @@ int bench_setaccess(CUdeviceptr addr) {
       for (size_t i = stt; i < end; i++) {
         auto stt = std::chrono::high_resolution_clock::now();
         CHECK_DRV(
-            cuMemSetAccess(addr + i * kPageSize, kPageSize, &accessDesc, 1));
+            vmm::set_access(base + i * kPageSize, kPageSize, &access_desc, 1));
         auto end = std::chrono::high_resolution_clock::now();
         latencies[tid].push_back(
             std::chrono::duration_cast<std::chrono::microseconds>(end - stt)
@@ -216,14 +198,15 @@ int bench_setaccess(CUdeviceptr addr) {
     thd.join();
   }
 
-  print_stats("cuMemSetAccess", latencies);
+  print_stats("set_access", latencies);
 
   return 0;
 }
 
-int bench_munmap(CUdeviceptr addr) {
+int bench_munmap(void *addr) {
   std::vector<std::thread> thds;
   std::vector<double> latencies[kNumThds];
+  char *base = static_cast<char *>(addr);
 
   for (int i = 0; i < kNumThds; i++) {
     thds.emplace_back([&, tid = i]() {
@@ -231,7 +214,7 @@ int bench_munmap(CUdeviceptr addr) {
       auto end = kNumPages / kNumThds * (tid + 1);
       for (size_t i = stt; i < end; i++) {
         auto stt = std::chrono::high_resolution_clock::now();
-        CHECK_DRV(cuMemUnmap(addr + i * kPageSize, kPageSize));
+        CHECK_DRV(vmm::mem_unmap(base + i * kPageSize, kPageSize));
         auto end = std::chrono::high_resolution_clock::now();
         latencies[tid].push_back(
             std::chrono::duration_cast<std::chrono::microseconds>(end - stt)
@@ -244,34 +227,34 @@ int bench_munmap(CUdeviceptr addr) {
     thd.join();
   }
 
-  print_stats("cuMemUnmap", latencies);
+  print_stats("mem_unmap", latencies);
 
   return 0;
 }
 
-void free_physical(std::vector<CUmemGenericAllocationHandle> &handles) {
+void free_physical(std::vector<vmm::allocation_handle_t> &handles) {
   for (const auto &handle : handles) {
-    CHECK_DRV(cuMemRelease(handle));
+    CHECK_DRV(vmm::mem_release(handle));
   }
 }
 
-void free_virtual(CUdeviceptr addr) {
-  CHECK_DRV(cuMemAddressFree(addr, kMemSize));
+void free_virtual(void *addr) {
+  CHECK_DRV(vmm::address_free(addr, kMemSize));
 }
 
 int main() {
-  init_cuda();
+  init_gpu();
 
   auto stt = std::chrono::high_resolution_clock::now();
-  CUdeviceptr addr = alloc_virtual(kMemSize);
+  void *addr = alloc_virtual(kMemSize);
   auto end = std::chrono::high_resolution_clock::now();
   auto lat =
       std::chrono::duration_cast<std::chrono::microseconds>(end - stt).count();
-  std::cout << "\ncuMemAddressReserve (" << (kMemSize >> 30)
+  std::cout << "\naddress_reserve (" << (kMemSize >> 30)
             << "GB) latency: " << lat << " us\n"
             << std::endl;
 
-  std::vector<CUmemGenericAllocationHandle> handles;
+  std::vector<vmm::allocation_handle_t> handles;
 
   print_header();
   bench_physical_alloc(handles);
