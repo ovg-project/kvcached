@@ -428,6 +428,7 @@ class PageAllocator:
 
     def get_avail_physical_pages(self) -> int:
         if not torch.cuda.is_available():
+            logger.warning("No GPU available, reporting 0 available physical pages.")
             return 0
         avail_phy_mem_size, total_phy_mem_size = torch.cuda.mem_get_info()
         headroom = int(total_phy_mem_size * (1 - self.gpu_utilization))
