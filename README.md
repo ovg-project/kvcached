@@ -39,9 +39,11 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
 
-## News
+## 📢 Updates
 
-- **[2026-02]** kvcached now supports **vLLM v0.14.0** and **SGLang v0.5.6**. MLA models (DeepSeek-V3, DeepSeek-V2 etc.) are supported in SGLang with both `page_size=1` and `page_size>1`. GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang.
+- **[2026-02]** kvcached now supports **vLLM v0.14.0** and **SGLang v0.5.6**.
+MLA models (DeepSeek-V3, DeepSeek-V2 etc.) are supported in SGLang with both `page_size=1` and `page_size>1`.
+GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang.
 
 ### Supported engines and models
 
