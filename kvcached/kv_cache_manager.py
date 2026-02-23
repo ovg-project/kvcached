@@ -84,6 +84,7 @@ class KVCacheManager:
             self.mem_size,
             self.page_size,
             self.world_size,
+            pp_rank=self.pp_rank,
             async_sched=async_sched,
             num_kv_buffers=self.num_kv_buffers,
         )
