@@ -188,9 +188,6 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
                     # Each PP stage manages its own KV memory independently, so
                     # cross-stage IPC is neither needed nor correct.
-                    # Using tp*pp here would set _world_size=4 (for TP=2, PP=2),
-                    # causing broadcast_kv_tensors_created to look for w2/w3.sock
-                    # which never exist, triggering "[Errno 2] No such file".
                     init_kvcached(
                         tp_rank=0,
                         world_size=vllm_config.parallel_config.tensor_parallel_size,
@@ -469,10 +466,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _init_kvcached(self) -> None:
             # Get TP rank/size: these are always available at model runner init time.
-            # PP rank/size may NOT be available yet (PP process groups initialise later),
-            # so we use only TP rank for the Unix socket registration and only TP size
-            # for the IPC world. Each PP stage has independent KV memory, so there is
-            # no need to cross-stage IPC coordination.
             try:
                 from vllm.distributed.parallel_state import (
                     get_tensor_model_parallel_rank,
@@ -483,6 +476,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             except Exception:
                 tp_rank, tp_size = 0, 1
 
+            # Try to get PP rank; it may not be available if PP process groups
+            # initialise later, so default to 0 (works for PP=1 and PP stage 0).
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_pp_group,
+                )
+                pp_rank = int(get_pp_group().rank_in_group)
+            except Exception:
+                pp_rank = 0
+
             try:
                 device_str = str(getattr(self, "device", "cuda"))
             except Exception:
@@ -492,7 +495,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             # Register this worker's IPC socket using tp_rank so all TP workers
             # within this PP stage listen on w0.sock … w(tp_size-1).sock.
-            kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, is_worker=True, device=device_str)
+            kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank,
+                              is_worker=True, device=device_str)
 
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached

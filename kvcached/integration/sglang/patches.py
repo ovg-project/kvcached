@@ -409,9 +409,9 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # guaranteed to be initialised by the time buffers are created).
                     try:
                         from sglang.srt.distributed import (
+                            get_pipeline_model_parallel_rank,
                             get_tensor_model_parallel_rank,
                             get_tensor_model_parallel_world_size,
-                            get_pipeline_model_parallel_rank,
                         )
                         tp_rank = int(get_tensor_model_parallel_rank())
                         tp_size = int(get_tensor_model_parallel_world_size())
@@ -568,9 +568,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # across all TP workers in this SGLang instance.
                     try:
                         from sglang.srt.distributed import (
+                            get_pipeline_model_parallel_rank,
                             get_tensor_model_parallel_rank,
                             get_tensor_model_parallel_world_size,
-                            get_pipeline_model_parallel_rank,
                         )
                         tp_rank = int(get_tensor_model_parallel_rank())
                         tp_size = int(get_tensor_model_parallel_world_size())
