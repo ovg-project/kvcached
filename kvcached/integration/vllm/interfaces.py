@@ -23,6 +23,7 @@ _async_sched = False
 _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
+_is_worker: bool = False
 
 def init_kvcached(
     tp_rank: int = 0,
@@ -32,7 +33,7 @@ def init_kvcached(
     device: Optional[str] = None,
     async_sched: bool = False,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank
+    global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank, _is_worker
     if _kvcached_initialized:
         return
 
@@ -45,9 +46,11 @@ def init_kvcached(
     _world_size = world_size
     _pp_rank = pp_rank
     _async_sched = async_sched
+    _is_worker = is_worker
 
-    if world_size > 1 and is_worker:
-        # start the listener thread for tensor parallel kv cache management
+    if is_worker:
+        # start the listener thread for kv cache management regardless of TP size
+        # because the vLLM EngineCore might need to reach this worker if PP > 1
         start_worker_listener_thread(tp_rank, pp_rank)
 
 
