@@ -245,7 +245,7 @@ class KVCacheManager:
 
         # If prefix caching is enabled, check refcounts before freeing
         blocks_to_free = []
-        if self.enable_prefix_cache:
+        if self.enable_prefix_cache and self.prefix_cache_manager is not None:
             for idx in indices:
                 # First, decrement PrefixCacheManager refcount if block is cached
                 can_free_from_cache = True
