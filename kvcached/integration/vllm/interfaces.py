@@ -8,7 +8,7 @@ import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, PREFIX_CACHE_MAX_SIZE, get_kvcached_logger
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -139,6 +139,7 @@ def get_kv_cache_manager(
     cell_size: int,
     num_layers: int,
     num_kv_buffers: int = 2,
+    enable_prefix_cache: bool = False,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -151,4 +152,6 @@ def get_kv_cache_manager(
         _tp_size,
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
+        enable_prefix_cache=enable_prefix_cache,
+        prefix_cache_max_size=PREFIX_CACHE_MAX_SIZE,
     )
