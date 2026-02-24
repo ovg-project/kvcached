@@ -136,6 +136,7 @@ class PageAllocator:
                  mem_size_per_layer: int,
                  page_size: int,
                  world_size: int = 1,
+                 pp_rank: int = 0,
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,
@@ -146,6 +147,7 @@ class PageAllocator:
             mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
             page_size: Page size in bytes.
             world_size: Total parallel processes (TP * PP).
+            pp_rank: Pipeline parallel rank (for IPC socket namespacing).
             async_sched: Whether asynchronous scheduling is enabled.
             contiguous_layout: Whether to use contiguous layout.
             enable_page_prealloc: Whether to enable page preallocation.
@@ -169,6 +171,7 @@ class PageAllocator:
         self.mem_size_per_layer = mem_size_per_layer
         self.page_size = page_size
         self.world_size = world_size
+        self.pp_rank = pp_rank
         self.async_sched = async_sched
         self.contiguous_layout = contiguous_layout
         self.num_kv_buffers = num_kv_buffers
@@ -527,7 +530,7 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.world_size > 1:  # map pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors(self.world_size, offsets)
+            broadcast_map_to_kv_tensors(self.world_size, offsets, self.pp_rank)
         else:
             map_to_kv_tensors(offsets)
 
@@ -540,7 +543,7 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.world_size > 1:  # unmap pages across all tensor parallel workers.
-            broadcast_unmap_from_kv_tensors(self.world_size, offsets)
+            broadcast_unmap_from_kv_tensors(self.world_size, offsets, self.pp_rank)
         else:
             if self.async_sched:
                 torch.cuda.synchronize()
