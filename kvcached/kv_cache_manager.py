@@ -253,7 +253,7 @@ class KVCacheManager:
                     block_hash = self.prefix_cache_manager.block_to_hash[idx]
                     can_free_from_cache = self.prefix_cache_manager.decrement_refcount(block_hash)
                     logger.debug(f"Block {idx}: decremented prefix cache refcount for hash {block_hash}, can_free={can_free_from_cache}")
-                
+
                 # Then handle KVCacheManager refcount
                 if idx in self.block_refcounts:
                     old_refcount = self.block_refcounts[idx]
@@ -281,7 +281,7 @@ class KVCacheManager:
         if len(blocks_to_free) == 0:
             logger.debug(f"All {len(indices)} blocks are still referenced, not freeing any")
             return  # All blocks are still referenced
-        
+
         logger.debug(f"Freeing {len(blocks_to_free)} out of {len(indices)} blocks")
 
         # Group indices by page_id
@@ -449,32 +449,32 @@ class KVCacheManager:
     def increment_block_refcount(self, block_ids: List[int]) -> None:
         """
         Increment reference count for blocks.
-        
+
         Called when blocks are added to the prefix cache or reused.
-        
+
         Args:
             block_ids: List of block IDs to increment refcount for
         """
         if not self.enable_prefix_cache:
             return
-        
+
         for block_id in block_ids:
             self.block_refcounts[block_id] = self.block_refcounts.get(block_id, 0) + 1
-            
+
         logger.debug(f"Incremented refcount for {len(block_ids)} blocks")
 
     def decrement_block_refcount(self, block_ids: List[int]) -> None:
         """
         Decrement reference count for blocks.
-        
+
         Called when blocks are evicted from the prefix cache.
-        
+
         Args:
             block_ids: List of block IDs to decrement refcount for
         """
         if not self.enable_prefix_cache:
             return
-        
+
         blocks_to_free = []
         for block_id in block_ids:
             if block_id in self.block_refcounts:
@@ -482,90 +482,90 @@ class KVCacheManager:
                 if self.block_refcounts[block_id] <= 0:
                     blocks_to_free.append(block_id)
                     del self.block_refcounts[block_id]
-        
+
         # Free blocks that are no longer referenced
         if blocks_to_free:
             self.free(blocks_to_free)
-            
+
         logger.debug(f"Decremented refcount for {len(block_ids)} blocks, freed {len(blocks_to_free)}")
 
     def get_cached_blocks(self, block_hash: Any) -> Optional[List[int]]:
         """
         Look up cached blocks by hash.
-        
+
         Args:
             block_hash: Hash key for the blocks
-            
+
         Returns:
             List of block IDs if found, None otherwise
         """
         if not self.enable_prefix_cache or self.prefix_cache_manager is None:
             return None
-        
+
         # Get single cached block
         # For now, kvcached only supports single group (group_id=0)
         block_id = self.prefix_cache_manager.get_cached_block(block_hash)
         if block_id is None:
             return None
-        
+
         return [block_id]
 
     def cache_blocks(self, block_hash: Any, block_ids: List[int]) -> None:
         """
         Store blocks in the prefix cache.
-        
+
         NOTE: In vLLM's design, each block has its own individual hash.
         This method is called once per block, so block_ids should contain
         exactly ONE block ID.
-        
+
         Args:
             block_hash: Hash key for the block
             block_ids: List containing a single block ID to cache
         """
         if not self.enable_prefix_cache or self.prefix_cache_manager is None:
             return
-        
+
         # Validate: should be exactly one block
         if len(block_ids) != 1:
             logger.error(f"cache_blocks expects exactly 1 block, got {len(block_ids)}. "
                         f"Each block should have its own hash!")
             return
-        
+
         block_id = block_ids[0]
-        
+
         # Cache the block with its hash
         self.prefix_cache_manager.cache_block(block_hash, block_id)
-        
+
         # Increment refcount since block is now cached
         self.increment_block_refcount(block_ids)
-        
+
         logger.debug(f"Cached block {block_id} with hash {block_hash}")
 
     def touch_cached_blocks(self, block_ids: List[int]) -> None:
         """
         Update LRU timestamp for cached blocks.
-        
+
         Args:
             block_ids: List of block IDs to touch
         """
         if not self.enable_prefix_cache or self.prefix_cache_manager is None:
             return
-        
+
         self.prefix_cache_manager.touch(block_ids)
 
     def evict_blocks_from_cache(self, block_ids: List[int]) -> None:
         """
         Evict specific blocks from the prefix cache by their block IDs.
-        
+
         This removes blocks from the prefix cache hash table. Used when vLLM
         explicitly requests eviction (e.g., blocks are being freed or reused).
-        
+
         Args:
             block_ids: List of block IDs to evict from cache
         """
         if not self.enable_prefix_cache or self.prefix_cache_manager is None:
             return
-        
+
         self.prefix_cache_manager.evict_blocks_by_id(block_ids)
 
     def reset_prefix_cache(self) -> None:
@@ -574,16 +574,16 @@ class KVCacheManager:
         """
         if not self.enable_prefix_cache or self.prefix_cache_manager is None:
             return
-        
+
         self.prefix_cache_manager.reset()
         logger.info("Prefix cache reset")
 
     def _on_cache_evict(self, block_ids: List[int]) -> None:
         """
         Callback invoked when blocks are evicted from the prefix cache.
-        
+
         This decrements the refcount and frees blocks if no longer referenced.
-        
+
         Args:
             block_ids: List of block IDs being evicted
         """

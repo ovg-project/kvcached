@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Test script for validating vLLM prefix cache eviction with kvcached.
 
@@ -10,22 +13,23 @@ This test demonstrates cache eviction behavior by:
 """
 
 import argparse
-import time
-import requests
 import os
-from typing import List, Tuple, Dict
+import time
+from typing import Dict, List, Tuple
+
+import requests
 
 
 def get_prefix_variant(variant: str) -> str:
     """
     Generate different prefixes for testing eviction.
-    
+
     Each prefix is distinct to create separate cache entries.
     Prefixes are moderately long (~500-800 tokens) to fill cache meaningfully.
-    
+
     Args:
         variant: One of "A", "B", "C", "D", "E"
-    
+
     Returns:
         A unique prefix string for the specified variant
     """
@@ -126,10 +130,10 @@ Answer: cos(θ) = adjacent/hypotenuse = 4/5 = 0.8.
 
 """,
     }
-    
+
     if variant not in prefixes:
         raise ValueError(f"Invalid variant: {variant}. Must be one of A, B, C, D, E")
-    
+
     return prefixes[variant]
 
 
@@ -148,7 +152,7 @@ def get_variant_question(variant: str) -> str:
 def send_completion(base_url: str, model: str, prompt: str, max_tokens: int) -> Tuple[str, float]:
     """
     Send completion request and measure latency.
-    
+
     Returns:
         Tuple of (response_text, latency_seconds)
     """
@@ -159,24 +163,24 @@ def send_completion(base_url: str, model: str, prompt: str, max_tokens: int) -> 
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
-    
+
     start = time.perf_counter()
     r = requests.post(url, json=body, timeout=120)
     latency = time.perf_counter() - start
-    
+
     if r.status_code != 200:
         raise RuntimeError(f"Request failed with status {r.status_code}: {r.text}")
-    
+
     response_data = r.json()
     response_text = response_data["choices"][0]["text"]
-    
+
     return response_text, latency
 
 
 def test_eviction(base_url: str, model: str, cache_size: int = 10):
     """
     Test cache eviction with multiple distinct prefixes.
-    
+
     Strategy:
     1. Send requests with prefix A (fills cache partially)
     2. Send requests with prefix B (fills more)
@@ -184,87 +188,87 @@ def test_eviction(base_url: str, model: str, cache_size: int = 10):
     4. Send requests with prefix D (may trigger eviction)
     5. Send requests with prefix E (should trigger eviction)
     6. Return to prefix A - should be cache miss due to eviction
-    
+
     Args:
         base_url: Base URL for the vLLM server
         model: Model name to use
         cache_size: Expected cache size (for display purposes)
     """
     variants = ["A", "B", "C", "D", "E"]
-    
+
     print(f"\n{'='*80}")
-    print(f"CACHE EVICTION TEST - LRU Eviction Behavior")
+    print("CACHE EVICTION TEST - LRU Eviction Behavior")
     print(f"{'='*80}")
-    print(f"\nTest configuration:")
+    print("\nTest configuration:")
     print(f"  Cache size: {cache_size} blocks (set via KVCACHED_PREFIX_CACHE_MAX_SIZE)")
     print(f"  Number of prefixes: {len(variants)}")
     print(f"  Model: {model}")
-    print(f"\nTest strategy:")
-    print(f"  1. Send requests with prefixes A, B, C, D, E (fills cache)")
-    print(f"  2. Cache should fill up and start evicting LRU entries")
-    print(f"  3. Return to prefix A - should be cache miss (evicted)")
-    print(f"\nExpected eviction pattern:")
-    print(f"  - Prefix A cached first → evicted first (LRU)")
-    print(f"  - Later prefixes remain in cache")
+    print("\nTest strategy:")
+    print("  1. Send requests with prefixes A, B, C, D, E (fills cache)")
+    print("  2. Cache should fill up and start evicting LRU entries")
+    print("  3. Return to prefix A - should be cache miss (evicted)")
+    print("\nExpected eviction pattern:")
+    print("  - Prefix A cached first → evicted first (LRU)")
+    print("  - Later prefixes remain in cache")
     print(f"\n{'='*80}\n")
-    
+
     latencies: Dict[str, List[float]] = {v: [] for v in variants}
-    
+
     # Phase 1: Fill cache with different prefixes
     print("Phase 1: Filling cache with distinct prefixes\n")
-    
+
     for variant in variants:
         prefix = get_prefix_variant(variant)
         question = get_variant_question(variant)
         prompt = prefix + question
-        
+
         try:
             response, latency = send_completion(base_url, model, prompt, max_tokens=50)
             latencies[variant].append(latency)
-            
+
             prefix_words = len(prefix.split())
             print(f"Prefix {variant}: {latency:.3f}s - MISS (first use, ~{prefix_words * 1.3:.0f} tokens)")
-            
+
         except Exception as e:
             print(f"ERROR with prefix {variant}: {e}")
             raise
-    
+
     print(f"\n{'─'*80}\n")
-    
+
     # Phase 2: Return to prefix A - should be evicted
     print("Phase 2: Returning to prefix A (testing if evicted)\n")
-    
+
     time.sleep(0.5)
-    
+
     prefix_a = get_prefix_variant("A")
     question_a = get_variant_question("A")
     prompt_a = prefix_a + question_a
-    
+
     try:
         response, latency = send_completion(base_url, model, prompt_a, max_tokens=50)
         latencies["A"].append(latency)
-        
+
         first_a_latency = latencies["A"][0]
         second_a_latency = latencies["A"][1]
-        
+
         print(f"Prefix A (revisit): {latency:.3f}s")
         print(f"  First use:  {first_a_latency:.3f}s")
         print(f"  Second use: {second_a_latency:.3f}s")
-        
+
         if second_a_latency >= first_a_latency * 0.8:
-            print(f"  └─ Likely EVICTED (similar latency to first request)")
+            print("  └─ Likely EVICTED (similar latency to first request)")
         else:
-            print(f"  └─ Likely CACHED (faster than first request)")
-    
+            print("  └─ Likely CACHED (faster than first request)")
+
     except Exception as e:
         print(f"ERROR revisiting prefix A: {e}")
         raise
-    
+
     print(f"\n{'='*80}")
-    
+
     # Analysis
-    print(f"\n=== RESULTS ===\n")
-    print(f"Latency summary:")
+    print("\n=== RESULTS ===\n")
+    print("Latency summary:")
     for variant in variants:
         if len(latencies[variant]) > 0:
             print(f"  Prefix {variant}: {latencies[variant][0]:.3f}s", end="")
@@ -272,40 +276,40 @@ def test_eviction(base_url: str, model: str, cache_size: int = 10):
                 print(f" (revisit: {latencies[variant][1]:.3f}s)")
             else:
                 print()
-    
+
     # Check if prefix A was evicted
     if len(latencies["A"]) > 1:
         first_a = latencies["A"][0]
         second_a = latencies["A"][1]
         ratio = second_a / first_a
-        
-        print(f"\nPrefix A eviction check:")
+
+        print("\nPrefix A eviction check:")
         print(f"  First request:  {first_a:.3f}s (cache miss)")
         print(f"  Second request: {second_a:.3f}s (after filling cache with B, C, D, E)")
         print(f"  Latency ratio:  {ratio:.2f}x")
-        
+
         if ratio >= 0.8:
-            print(f"\n✓ EVICTION DETECTED: Prefix A was likely evicted from cache")
+            print("\n✓ EVICTION DETECTED: Prefix A was likely evicted from cache")
             print(f"  Second request is {ratio:.2f}x as slow as first (near 1.0 = evicted)")
         else:
-            print(f"\n⚠ NO CLEAR EVICTION: Prefix A may still be cached")
+            print("\n⚠ NO CLEAR EVICTION: Prefix A may still be cached")
             print(f"  Second request is only {ratio:.2f}x as slow as first")
-            print(f"  Try reducing cache size or using longer prefixes")
-    
-    print(f"\nTo verify eviction in server logs, run:")
-    print(f"  grep -i 'evict' server.log")
-    print(f"  grep -i 'cache_size' server.log")
-    print(f"\nExpected log patterns:")
+            print("  Try reducing cache size or using longer prefixes")
+
+    print("\nTo verify eviction in server logs, run:")
+    print("  grep -i 'evict' server.log")
+    print("  grep -i 'cache_size' server.log")
+    print("\nExpected log patterns:")
     print(f"  [kvcached][DEBUG] Cached block X with hash ..., cache_size=Y/{cache_size}")
-    print(f"  [kvcached][DEBUG] Evicting LRU entry with hash b'...' : block_id=X")
-    
+    print("  [kvcached][DEBUG] Evicting LRU entry with hash b'...' : block_id=X")
+
     print(f"\n{'='*80}\n")
 
 
 def test_eviction_with_repeated_access(base_url: str, model: str, cache_size: int = 10):
     """
     Alternative eviction test: Send multiple requests per prefix to better fill cache.
-    
+
     Strategy:
     1. Send 3 requests with prefix A (caches A)
     2. Send 3 requests with prefix B (caches B)
@@ -315,123 +319,123 @@ def test_eviction_with_repeated_access(base_url: str, model: str, cache_size: in
     """
     variants = ["A", "B", "C", "D"]
     requests_per_prefix = 3
-    
+
     print(f"\n{'='*80}")
-    print(f"CACHE EVICTION TEST (REPEATED ACCESS) - LRU Eviction Behavior")
+    print("CACHE EVICTION TEST (REPEATED ACCESS) - LRU Eviction Behavior")
     print(f"{'='*80}")
-    print(f"\nTest configuration:")
+    print("\nTest configuration:")
     print(f"  Cache size: {cache_size} blocks")
     print(f"  Prefixes: {len(variants)} (A, B, C, D)")
     print(f"  Requests per prefix: {requests_per_prefix}")
     print(f"  Total requests: {len(variants) * requests_per_prefix + requests_per_prefix}")
-    print(f"\nStrategy:")
+    print("\nStrategy:")
     print(f"  - Send {requests_per_prefix} requests with each prefix (A→B→C→D)")
-    print(f"  - Each prefix should cache ~3-4 blocks")
+    print("  - Each prefix should cache ~3-4 blocks")
     print(f"  - With cache_size={cache_size}, prefix A should be evicted")
-    print(f"  - Return to A to verify eviction")
+    print("  - Return to A to verify eviction")
     print(f"\n{'='*80}\n")
-    
+
     latencies: Dict[str, List[float]] = {v: [] for v in variants}
-    
+
     # Phase 1: Send multiple requests per prefix
     print("Phase 1: Filling cache with multiple requests per prefix\n")
-    
+
     for variant in variants:
         prefix = get_prefix_variant(variant)
         question = get_variant_question(variant)
-        
+
         print(f"Prefix {variant}:")
-        
+
         for req_num in range(requests_per_prefix):
             prompt = prefix + question + f" (request {req_num + 1})"
-            
+
             try:
                 response, latency = send_completion(base_url, model, prompt, max_tokens=50)
                 latencies[variant].append(latency)
-                
+
                 status = "MISS" if req_num == 0 else "HIT"
                 print(f"  Request {req_num + 1}: {latency:.3f}s - Cache {status}")
-                
+
             except Exception as e:
                 print(f"  ERROR: {e}")
                 raise
-        
+
         print()
-    
+
     print(f"{'─'*80}\n")
-    
+
     # Phase 2: Return to prefix A
     print("Phase 2: Returning to prefix A (checking for eviction)\n")
-    
+
     time.sleep(0.5)
-    
+
     prefix_a = get_prefix_variant("A")
     question_a = get_variant_question("A")
     prompt_a = prefix_a + question_a + " (eviction check)"
-    
+
     try:
         response, latency = send_completion(base_url, model, prompt_a, max_tokens=50)
         latencies["A"].append(latency)
-        
+
         avg_initial_a = sum(latencies["A"][:requests_per_prefix]) / requests_per_prefix
         final_a = latencies["A"][-1]
-        
-        print(f"Prefix A (revisit):")
+
+        print("Prefix A (revisit):")
         print(f"  Initial requests avg: {avg_initial_a:.3f}s")
         print(f"  Revisit latency:      {final_a:.3f}s")
         print(f"  Ratio:                {final_a / latencies["A"][0]:.2f}x")
-        
+
         if final_a >= latencies["A"][0] * 0.75:
-            print(f"  └─ Status: Likely EVICTED (high latency similar to first request)")
+            print("  └─ Status: Likely EVICTED (high latency similar to first request)")
         else:
-            print(f"  └─ Status: Likely CACHED (lower latency)")
-            
+            print("  └─ Status: Likely CACHED (lower latency)")
+
     except Exception as e:
         print(f"ERROR revisiting prefix A: {e}")
         raise
-    
+
     print(f"\n{'='*80}")
-    
+
     # Final analysis
-    print(f"\n=== FINAL ANALYSIS ===\n")
-    
+    print("\n=== FINAL ANALYSIS ===\n")
+
     first_latencies = {v: latencies[v][0] for v in variants if len(latencies[v]) > 0}
-    cached_latencies = {v: sum(latencies[v][1:requests_per_prefix]) / (requests_per_prefix - 1) 
+    cached_latencies = {v: sum(latencies[v][1:requests_per_prefix]) / (requests_per_prefix - 1)
                        for v in variants if len(latencies[v]) >= requests_per_prefix}
-    
+
     print("First request latency (cache miss) per prefix:")
     for variant in variants:
         if variant in first_latencies:
             print(f"  Prefix {variant}: {first_latencies[variant]:.3f}s")
-    
-    print(f"\nAverage cached request latency per prefix:")
+
+    print("\nAverage cached request latency per prefix:")
     for variant in variants:
         if variant in cached_latencies:
             speedup = first_latencies[variant] / cached_latencies[variant]
             print(f"  Prefix {variant}: {cached_latencies[variant]:.3f}s (speedup: {speedup:.2f}x)")
-    
+
     if len(latencies["A"]) > requests_per_prefix:
         final_a = latencies["A"][-1]
         first_a = latencies["A"][0]
         ratio = final_a / first_a
-        
-        print(f"\nEviction verification for Prefix A:")
+
+        print("\nEviction verification for Prefix A:")
         print(f"  First access:      {first_a:.3f}s")
         print(f"  After eviction:    {final_a:.3f}s")
         print(f"  Latency ratio:     {ratio:.2f}x")
-        
+
         if ratio >= 0.75:
-            print(f"\n✓ SUCCESS: Eviction detected!")
-            print(f"  Prefix A was evicted and had to be reprocessed")
+            print("\n✓ SUCCESS: Eviction detected!")
+            print("  Prefix A was evicted and had to be reprocessed")
             print(f"  Latency increased to {ratio:.2f}x of original (near 1.0 confirms eviction)")
         else:
-            print(f"\n⚠ UNCLEAR: Eviction not clearly demonstrated")
+            print("\n⚠ UNCLEAR: Eviction not clearly demonstrated")
             print(f"  Latency ratio {ratio:.2f}x suggests prefix may still be cached")
-            print(f"  Try: smaller cache size or longer prefixes")
-    
-    print(f"\nVerify in server logs with:")
-    print(f"  grep -E '(Evicting|cache_size)' server.log | tail -30")
-    
+            print("  Try: smaller cache size or longer prefixes")
+
+    print("\nVerify in server logs with:")
+    print("  grep -E '(Evicting|cache_size)' server.log | tail -30")
+
     print(f"\n{'='*80}\n")
 
 
@@ -470,27 +474,27 @@ def main():
         default="repeated",
         help="Test mode: 'simple' (one request per prefix) or 'repeated' (multiple requests per prefix)"
     )
-    
+
     args = parser.parse_args()
-    
+
     base_url = f"http://{args.host}:{args.port}"
-    
+
     # Check environment variable
     env_cache_size = os.environ.get("KVCACHED_PREFIX_CACHE_MAX_SIZE")
     if env_cache_size:
         print(f"\n✓ KVCACHED_PREFIX_CACHE_MAX_SIZE is set to: {env_cache_size}")
     else:
-        print(f"\n⚠ WARNING: KVCACHED_PREFIX_CACHE_MAX_SIZE not set")
-        print(f"  Set it before starting the server for this test to work:")
+        print("\n⚠ WARNING: KVCACHED_PREFIX_CACHE_MAX_SIZE not set")
+        print("  Set it before starting the server for this test to work:")
         print(f"  export KVCACHED_PREFIX_CACHE_MAX_SIZE={args.cache_size}")
-        print(f"  Then restart the vLLM server")
-        print(f"\n  Continuing anyway...\n")
-    
-    print(f"\nConfiguration:")
+        print("  Then restart the vLLM server")
+        print("\n  Continuing anyway...\n")
+
+    print("\nConfiguration:")
     print(f"  Server: {base_url}")
     print(f"  Model: {args.model}")
     print(f"  Test mode: {args.mode}")
-    
+
     # Test server health
     try:
         health_response = requests.get(f"{base_url}/health", timeout=5)
@@ -502,9 +506,9 @@ def main():
         print(f"\nERROR: Cannot connect to server at {base_url}")
         print(f"  {e}")
         print("\nMake sure to start the server first:")
-        print(f"  bash benchmarks/test_prefix_cache/start_server.sh")
+        print("  bash benchmarks/test_prefix_cache/start_server.sh")
         return 1
-    
+
     # Run the test
     try:
         if args.mode == "simple":

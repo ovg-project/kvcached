@@ -10,7 +10,6 @@ Prefix caching allows vLLM to reuse KV cache blocks from previously processed pr
 - ✅ Basic prefix caching and cache hits
 - ✅ Speedup with long shared prefixes (1.2-1.5x typical)
 - ✅ LRU eviction with small cache sizes
-- ✅ Refcount synchronization between KVCacheManager and PrefixCacheManager
 
 ---
 
@@ -35,15 +34,6 @@ cd ../bench_prefix_cache
 python test_prefix_cache.py --num-questions 10
 ```
 
-**Expected Output:**
-```
-First request (cache miss):     2.450s
-Avg cached requests (hit):      1.120s
-Speedup from caching:           2.19x
-
-✓ SUCCESS: Cache speedup detected
-```
-
 ---
 
 ## Available Tests
@@ -58,13 +48,12 @@ Speedup from caching:           2.19x
 - 5-10 test questions
 
 **Run:**
+
 ```bash
 ./run_test.sh
 # or
 python test_prefix_cache.py --num-questions 10
 ```
-
-**Expected:** 1.2-2x speedup on cached requests
 
 ---
 
@@ -78,12 +67,12 @@ python test_prefix_cache.py --num-questions 10
 - 15-20 test questions
 
 **Run:**
+
 ```bash
 bash run_advanced_tests.sh 1 --num-questions 15
 ```
 
 **Expected:** 1.2-1.5x speedup (higher with larger models)
-
 
 ---
 
@@ -97,6 +86,7 @@ bash run_advanced_tests.sh 1 --num-questions 15
 - Multiple requests per prefix
 
 **Run:**
+
 ```bash
 # Stop any running server
 pkill -f "vllm serve"
@@ -113,15 +103,6 @@ python test_eviction.py --mode repeated --cache-size 10
 # Or use the runner
 bash run_advanced_tests.sh 2 --mode repeated
 ```
-
-**Expected Results:**
-
-✅ **With Fixed Refcount Synchronization (Current):**
-- Cache fills to 10/10 capacity
-- LRU eviction succeeds (20+ evictions logged)
-- Latency ratio ~1.16x (indicates successful eviction and re-caching)
-- Cache hit rate ~45.7% (accurate rate with working eviction)
-- Debug logs show "Evicting LRU entry with hash..."
 
 ---
 
@@ -160,6 +141,7 @@ Set before starting the vLLM server:
 | `KVCACHED_PREFIX_CACHE_ENABLED` | true | Enable/disable prefix caching |
 
 **Example:**
+
 ```bash
 export KVCACHED_PREFIX_CACHE_MAX_SIZE=10
 export KVCACHED_LOG_LEVEL=DEBUG
@@ -171,6 +153,7 @@ bash start_server_small_cache.sh > server.log 2>&1 &
 ### Command-Line Arguments
 
 #### test_prefix_cache.py
+
 ```bash
 python test_prefix_cache.py \
   --model meta-llama/Llama-3.2-1B \
@@ -180,6 +163,7 @@ python test_prefix_cache.py \
 ```
 
 #### test_high_speedup.py
+
 ```bash
 python test_high_speedup.py \
   --num-questions 15 \
@@ -188,6 +172,7 @@ python test_high_speedup.py \
 ```
 
 #### test_eviction.py
+
 ```bash
 python test_eviction.py \
   --mode simple \              # or 'repeated'
@@ -203,6 +188,7 @@ python test_eviction.py \
 ### 1. Check Test Output
 
 All tests report success/failure and key metrics:
+
 ```
 ✓ EVICTION DETECTED: Prefix A was likely evicted from cache
   Second request is 1.16x as slow as first (near 1.0 = evicted)
@@ -216,23 +202,27 @@ export KVCACHED_LOG_LEVEL=DEBUG
 ```
 
 **Cache population (first request):**
+
 ```
 [kvcached][DEBUG] Cached block 0 with hash b'...', cache_size=1/10
 [kvcached][DEBUG] Cached block 1 with hash b'...', cache_size=2/10
 ```
 
 **Cache hits (subsequent requests):**
+
 ```
 [kvcached][DEBUG] Cache hit for hash b'...': block_id=5, refcount=2
 ```
 
 **Refcount management:**
+
 ```
 [kvcached][DEBUG] Block 17: decremented prefix cache refcount for hash b'...', can_free=True
 [kvcached][DEBUG] Decremented refcount for hash b'...': refcount=0
 ```
 
 **Successful evictions:**
+
 ```
 [kvcached][DEBUG] Evicting LRU entry with hash b'...': block_id=0
 [kvcached][DEBUG] Evicting LRU entry with hash b'...': block_id=1
@@ -257,6 +247,7 @@ grep 'PrefixCacheManager initialized' server.log
 ### 4. vLLM Metrics
 
 Check cache hit rate from vLLM logs:
+
 ```bash
 grep 'Prefix cache hit rate' server.log | tail -5
 ```
@@ -268,6 +259,7 @@ grep 'Prefix cache hit rate' server.log | tail -5
 ### No Cache Hits Detected
 
 1. **Verify prefix caching is enabled:**
+
    ```bash
    grep "enable-prefix-caching" ../simple_bench/start_server.sh
    # Should see: --enable-prefix-caching (line 141)
@@ -275,14 +267,17 @@ grep 'Prefix cache hit rate' server.log | tail -5
    ```
 
 2. **Check cache was initialized:**
-   ```bash
+
+```bash
    grep 'PrefixCacheManager initialized' server.log
    ```
 
-3. **Enable debug logging:**
+1. **Enable debug logging:**
+
    ```bash
-   export KVCACHED_LOG_LEVEL=DEBUG
-   # Restart server and re-run test
+export KVCACHED_LOG_LEVEL=DEBUG
+# Restart server and re-run test
+
    ```
 
 ### Low or No Speedup
@@ -301,20 +296,24 @@ grep 'Prefix cache hit rate' server.log | tail -5
 ### Eviction Not Working
 
 1. **Verify you're running the latest code:**
+
    ```bash
    grep "decrement_refcount" kvcached/kv_cache_manager.py
    # Should find the synchronized refcount decrement in free() method
    ```
 
-2. **Check debug logs show decrements:**
-   ```bash
+1. **Check debug logs show decrements:**
+
+```bash
    grep "decremented prefix cache refcount" server_eviction.log | head -5
    ```
 
-3. **Verify evictions are occurring:**
+1. **Verify evictions are occurring:**
+
    ```bash
-   grep "Evicting LRU entry" server_eviction.log | wc -l
-   # Should see 10+ successful evictions
+grep "Evicting LRU entry" server_eviction.log | wc -l
+# Should see 10+ successful evictions
+
    ```
 
 ### Server Fails to Start
@@ -333,7 +332,7 @@ huggingface-cli download meta-llama/Llama-3.2-1B
 ls ../../engine_integration/vllm-pip-venv/bin/vllm
 ```
 
-### Cache Size Not Applied
+## Cache Size Not Applied
 
 ```bash
 # Check environment variable was set
@@ -359,13 +358,11 @@ grep "max_cache_size=" server.log
 - Prefix blocks reused from cache
 - Only new tokens computed
 
-
 ### Eviction Behavior
 
 **Normal eviction warnings (expected):**
 - Occur when all cached blocks have refcount > 0 (actively in use)
 - Resolve when requests complete
-- Should be < 20% of total eviction attempts
 
 **Successful evictions (working correctly):**
 - Appear as "Evicting LRU entry with hash..." in DEBUG logs
@@ -374,16 +371,14 @@ grep "max_cache_size=" server.log
 
 ---
 
-
 ## References
 
-- **vLLM Prefix Caching:** https://docs.vllm.ai/en/latest/automatic_prefix_caching/prefix_caching.html
+- **vLLM Prefix Caching:** https://docs.vllm.ai/en/latest/automatic_prefix_caching
 - **kvcached Integration:** `kvcached/integration/vllm/patches.py`
 - **PrefixCacheManager:** `kvcached/prefix_cache_manager.py`
 - **KVCacheManager:** `kvcached/kv_cache_manager.py`
 
 ---
-
 
 When adding new tests:
 

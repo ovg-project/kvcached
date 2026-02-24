@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Advanced test for vLLM prefix caching with long shared prefix.
 
@@ -10,14 +13,15 @@ This test demonstrates high latency improvement (2-3x speedup) by using:
 
 import argparse
 import time
-import requests
 from typing import List, Tuple
+
+import requests
 
 
 def get_long_prefix() -> str:
     """
     Generate a long prefix with many examples for high cache benefit.
-    
+
     Returns a prefix with ~2500-3000 tokens including:
     - Detailed instructions
     - 25 few-shot examples
@@ -33,7 +37,7 @@ def get_long_prefix() -> str:
 Here are examples to guide your responses:
 
 """
-    
+
     # Generate 25 diverse few-shot examples
     examples = [
         """Question: Roger has 5 tennis balls. He buys 2 more cans of tennis balls. Each can has 3 tennis balls. How many tennis balls does he have now?
@@ -157,7 +161,7 @@ Answer: Total seats: 240 + 180 + 120 = 540 seats. Tickets sold: 540 × 0.85 = 45
 
 """,
     ]
-    
+
     return instruction + "".join(examples)
 
 
@@ -186,7 +190,7 @@ def generate_test_questions(num_questions: int) -> List[str]:
 def send_completion(base_url: str, model: str, prompt: str, max_tokens: int) -> Tuple[str, float]:
     """
     Send completion request and measure latency.
-    
+
     Returns:
         Tuple of (response_text, latency_seconds)
     """
@@ -197,113 +201,113 @@ def send_completion(base_url: str, model: str, prompt: str, max_tokens: int) -> 
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
-    
+
     start = time.perf_counter()
     r = requests.post(url, json=body, timeout=120)
     latency = time.perf_counter() - start
-    
+
     if r.status_code != 200:
         raise RuntimeError(f"Request failed with status {r.status_code}: {r.text}")
-    
+
     response_data = r.json()
     response_text = response_data["choices"][0]["text"]
-    
+
     return response_text, latency
 
 
 def test_high_speedup(base_url: str, model: str, num_questions: int = 15):
     """
     Test prefix caching with very long shared prefix for high speedup.
-    
+
     Args:
         base_url: Base URL for the vLLM server
         model: Model name to use
         num_questions: Number of questions to test (default: 15)
     """
     prefix = get_long_prefix()
-    
+
     # Count tokens (rough estimate)
     prefix_words = len(prefix.split())
     prefix_chars = len(prefix)
-    
+
     questions = generate_test_questions(num_questions)
-    
+
     latencies = []
     responses = []
-    
+
     print(f"\n{'='*80}")
-    print(f"HIGH SPEEDUP TEST - Long Prefix Caching")
+    print("HIGH SPEEDUP TEST - Long Prefix Caching")
     print(f"{'='*80}")
-    print(f"\nTest configuration:")
+    print("\nTest configuration:")
     print(f"  Shared prefix length: {prefix_chars} chars (~{prefix_words} words, ~{prefix_words * 1.3:.0f} tokens)")
     print(f"  Number of requests: {num_questions}")
     print(f"  Model: {model}")
-    print(f"\nExpected behavior:")
+    print("\nExpected behavior:")
     print(f"  - First request: Processes full prefix (~{prefix_words * 1.3:.0f} tokens) - SLOW")
-    print(f"  - Cached requests: Only process unique question (~50 tokens) - FAST")
-    print(f"  - Expected speedup: 2-3x or higher\n")
+    print("  - Cached requests: Only process unique question (~50 tokens) - FAST")
+    print("  - Expected speedup: 2-3x or higher\n")
     print(f"{'='*80}\n")
-    
+
     for i, question in enumerate(questions):
         prompt = prefix + question
-        
+
         try:
             response, latency = send_completion(base_url, model, prompt, max_tokens=50)
             latencies.append(latency)
             responses.append(response.strip())
-            
+
             status = "MISS (populating cache)" if i == 0 else "HIT (reusing cached prefix)"
             print(f"Request {i+1}/{num_questions}: {latency:.3f}s - Cache {status}")
-            
+
             if i == 0:
                 print(f"  └─ Processing ~{prefix_words * 1.3:.0f} tokens (full prefix)")
             else:
-                print(f"  └─ Processing ~50 tokens (question only)")
-            
+                print("  └─ Processing ~50 tokens (question only)")
+
         except Exception as e:
             print(f"ERROR in request {i+1}: {e}")
             raise
-    
+
     print(f"\n{'='*80}")
-    
+
     # Analysis
     if len(latencies) > 1:
         first_latency = latencies[0]
         avg_cached_latency = sum(latencies[1:]) / len(latencies[1:])
         speedup = first_latency / avg_cached_latency if avg_cached_latency > 0 else 0
-        
+
         min_cached = min(latencies[1:])
         max_cached = max(latencies[1:])
-        
-        print(f"\n=== RESULTS ===\n")
+
+        print("\n=== RESULTS ===\n")
         print(f"First request (cache miss):     {first_latency:.3f}s")
         print(f"Cached requests (avg):          {avg_cached_latency:.3f}s")
         print(f"Cached requests (min/max):      {min_cached:.3f}s / {max_cached:.3f}s")
         print(f"\n🚀 Speedup from caching:         {speedup:.2f}x")
         print(f"   Latency reduction:            {(1 - 1/speedup) * 100:.1f}%")
-        
+
         if speedup >= 2.0:
             print(f"\n✓ SUCCESS: High cache speedup achieved! ({speedup:.2f}x faster)")
             print(f"  The long prefix ({prefix_words * 1.3:.0f} tokens) provides significant benefit.")
         elif speedup >= 1.5:
             print(f"\n✓ GOOD: Moderate cache speedup detected ({speedup:.2f}x faster)")
-            print(f"  Check server logs for cache hit confirmations.")
+            print("  Check server logs for cache hit confirmations.")
         else:
             print(f"\n⚠ WARNING: Lower than expected speedup ({speedup:.2f}x)")
-            print(f"  Expected: 2-3x speedup with long prefix")
-            print(f"  Possible causes:")
-            print(f"    - Cache not enabled or not working")
-            print(f"    - Network overhead dominating")
-            print(f"    - Server load or throttling")
-        
-        print(f"\nTo verify caching behavior, check server logs for:")
-        print(f"  - Request 1: 'Cached block' messages (populating cache)")
+            print("  Expected: 2-3x speedup with long prefix")
+            print("  Possible causes:")
+            print("    - Cache not enabled or not working")
+            print("    - Network overhead dominating")
+            print("    - Server load or throttling")
+
+        print("\nTo verify caching behavior, check server logs for:")
+        print("  - Request 1: 'Cached block' messages (populating cache)")
         print(f"  - Requests 2-{num_questions}: 'Cache hit for hash' messages (using cache)")
-        print(f"\nCommand: grep -i 'cache' server.log | tail -20")
+        print("\nCommand: grep -i 'cache' server.log | tail -20")
     else:
-        print(f"\n=== RESULTS ===")
+        print("\n=== RESULTS ===")
         print(f"Only {len(latencies)} request(s) sent. Need at least 2 to compare.")
-    
+
     print(f"\n{'='*80}\n")
 
 
@@ -335,16 +339,16 @@ def main():
         default=15,
         help="Number of questions to test (default: 15)"
     )
-    
+
     args = parser.parse_args()
-    
+
     base_url = f"http://{args.host}:{args.port}"
-    
-    print(f"\nConfiguration:")
+
+    print("\nConfiguration:")
     print(f"  Server: {base_url}")
     print(f"  Model: {args.model}")
     print(f"  Questions: {args.num_questions}")
-    
+
     # Test server health
     try:
         health_response = requests.get(f"{base_url}/health", timeout=5)
@@ -356,9 +360,9 @@ def main():
         print(f"\nERROR: Cannot connect to server at {base_url}")
         print(f"  {e}")
         print("\nMake sure to start the server first:")
-        print(f"  bash benchmarks/test_prefix_cache/start_server.sh")
+        print("  bash benchmarks/test_prefix_cache/start_server.sh")
         return 1
-    
+
     # Run the test
     try:
         test_high_speedup(base_url, args.model, args.num_questions)

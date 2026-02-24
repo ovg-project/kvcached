@@ -3,7 +3,7 @@ set -e
 
 # =============================================================================
 # Automated test runner for vLLM prefix caching with kvcached
-# 
+#
 # This script:
 # 1. Starts vLLM server with prefix caching enabled
 # 2. Waits for server readiness
@@ -47,18 +47,18 @@ else
     # Start vLLM server with prefix caching
     echo "Starting vLLM server with prefix caching enabled..."
     echo ""
-    
+
     bash ../simple_bench/start_server.sh vllm \
         --venv-path "$VENV_PATH" \
         --model "$MODEL" \
         --port "$PORT" \
         --tp 1 \
         > server.log 2>&1 &
-    
+
     SERVER_PID=$!
     echo "Server PID: $SERVER_PID"
     echo ""
-    
+
     # Wait for server to be ready
     echo "Waiting for server to be ready (max 120 seconds)..."
     READY=false
@@ -72,7 +72,7 @@ else
         sleep 2
     done
     echo ""
-    
+
     if [ "$READY" = false ]; then
         echo "ERROR: Server failed to start within 120 seconds"
         echo "Check server.log for details:"
@@ -106,7 +106,7 @@ echo ""
 if [ -n "$SERVER_PID" ]; then
     echo "Looking for cache-related messages in server logs..."
     echo ""
-    
+
     if grep -i "cache hit\|cached block" server.log 2>/dev/null | head -20; then
         echo ""
         echo "✓ Cache activity detected in logs"
@@ -122,13 +122,13 @@ fi
 if [ -n "$SERVER_PID" ]; then
     echo "Cleaning up (killing server PID $SERVER_PID)..."
     kill $SERVER_PID 2>/dev/null || true
-    
+
     # Give it a moment to shutdown gracefully
     sleep 2
-    
+
     # Force kill if still running
     kill -9 $SERVER_PID 2>/dev/null || true
-    
+
     echo "Server stopped."
 fi
 

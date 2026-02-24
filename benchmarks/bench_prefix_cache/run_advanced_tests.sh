@@ -147,15 +147,15 @@ if [[ "$TEST_NUM" == "1" ]]; then
     echo "This test demonstrates speedup using a very long shared prefix"
     echo "with 25+ few-shot examples (~2,000 tokens)."
     echo ""
-    
+
     python3 test_high_speedup.py \
         --model "$MODEL" \
         --port "$PORT" \
         --host "$HOST" \
         --num-questions "$NUM_QUESTIONS"
-    
+
     TEST_EXIT=$?
-    
+
 elif [[ "$TEST_NUM" == "2" ]]; then
     #
     # TEST 2: Cache Eviction Test
@@ -166,7 +166,7 @@ elif [[ "$TEST_NUM" == "2" ]]; then
     echo ""
     echo "This test demonstrates cache eviction using multiple distinct prefixes."
     echo ""
-    
+
     # Check if cache size is properly configured
     if [[ -z "$KVCACHED_PREFIX_CACHE_MAX_SIZE" ]]; then
         echo "⚠️  WARNING: KVCACHED_PREFIX_CACHE_MAX_SIZE is not set!"
@@ -188,14 +188,14 @@ elif [[ "$TEST_NUM" == "2" ]]; then
         echo "✓ KVCACHED_PREFIX_CACHE_MAX_SIZE=${KVCACHED_PREFIX_CACHE_MAX_SIZE} (good for eviction test)"
         echo ""
     fi
-    
+
     python3 test_eviction.py \
         --model "$MODEL" \
         --port "$PORT" \
         --host "$HOST" \
         --mode "$TEST_MODE" \
         --cache-size 10
-    
+
     TEST_EXIT=$?
 fi
 
