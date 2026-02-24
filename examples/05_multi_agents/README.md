@@ -26,7 +26,7 @@ Start the model servers (these can use the existing vLLM or SGLang environments)
 ```bash
 # Start with default models (recommended for multi-agent demo)
 bash start_multi_agent_models.sh \
-    --research-model meta-llama/Llama-3.2-3B \
+    --research-model meta-llama/Llama-3.2-3B-Instruct \
     --writing-model Qwen/Qwen3-4B \
     --research-engine vllm \
     --writing-engine vllm \

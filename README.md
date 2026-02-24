@@ -180,12 +180,12 @@ If you are using the engine-specific dockers, you can test kvcached by running t
 
 ```bash
 # for sglang
-python -m sglang.launch_server --model meta-llama/Llama-3.2-1B --disable-radix-cache --port 30000
-python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --disable-radix-cache --port 30000
+python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B-Instruct --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
 
 # for vllm
-vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-caching --port=12346
-vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
+vllm serve meta-llama/Llama-3.2-1B-Instruct --disable-log-requests --no-enable-prefix-caching --port=12346
+vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --num-prompts 1000 --port 12346
 ```
 
 > [!NOTE]
@@ -197,12 +197,15 @@ If you installed kvcached using its source code, you can also do the following:
 
 ```bash
 cd benchmarks/simple_bench
-./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
+./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B-Instruct
 # Wait until LLM server is ready
-./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
+./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B-Instruct
 ```
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
+
+> [!TIP]
+> Starting from transformers >= 4.44, there is no fallback “default” chat template. If the tokenizer does not define a chat_template, `apply_chat_template` cannot be used without explicitly providing one. If you encounter chat template errors during its chat warmup at startup, use an Instruct model (e.g., `meta-llama/Llama-3.2-1B-Instruct`) instead of the base model.
 
 > [!NOTE]
 > We haven’t fully tested kvcached with every version of SGLang and vLLM (there are too many!). If you run into issues with a specific version, please open an issue---we'll look into it and fix it within a few hours.

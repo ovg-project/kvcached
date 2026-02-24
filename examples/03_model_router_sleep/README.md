@@ -23,16 +23,16 @@ monitor = TrafficMonitor(idle_threshold_seconds=300)
 await monitor.start()
 
 # Record requests
-stats = monitor.record_request_start("meta-llama/Llama-3.2-1B", "/v1/completions")
+stats = monitor.record_request_start("meta-llama/Llama-3.2-1B-Instruct", "/v1/completions")
 monitor.record_request_end(stats, success=True)
 
 # Check status
 idle_models = monitor.get_idle_models(idle_threshold_seconds=300)
-# Returns: ['meta-llama/Llama-3.2-1B']
+# Returns: ['meta-llama/Llama-3.2-1B-Instruct']
 
 summary = monitor.get_traffic_summary(window_seconds=60)
 # Returns: {
-#   'meta-llama/Llama-3.2-1B': {
+#   'meta-llama/Llama-3.2-1B-Instruct': {
 #     'total_requests': 10,
 #     'successful_requests': 10,
 #     'failed_requests': 0,
@@ -49,17 +49,17 @@ from controller.sleep_manager import SleepManager, SleepConfig
 config = SleepConfig(idle_threshold_seconds=300, auto_sleep_enabled=True)
 sleep_manager = SleepManager(config, traffic_monitor=monitor)
 
-sleep_manager.add_vllm_model("meta-llama/Llama-3.2-1B", "localhost", "12346")
+sleep_manager.add_vllm_model("meta-llama/Llama-3.2-1B-Instruct", "localhost", "12346")
 await sleep_manager.start()
 
 # Manual control
-await sleep_manager.put_model_to_sleep("meta-llama/Llama-3.2-1B", manual=True)
+await sleep_manager.put_model_to_sleep("meta-llama/Llama-3.2-1B-Instruct", manual=True)
 # Returns: True (success)
 
-await sleep_manager.wakeup_model("meta-llama/Llama-3.2-1B")
+await sleep_manager.wakeup_model("meta-llama/Llama-3.2-1B-Instruct")
 # Returns: True (success)
 
-is_sleeping = sleep_manager.is_model_sleeping("meta-llama/Llama-3.2-1B")
+is_sleeping = sleep_manager.is_model_sleeping("meta-llama/Llama-3.2-1B-Instruct")
 # Returns: False (after wakeup)
 ```
 
