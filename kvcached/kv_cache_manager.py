@@ -112,7 +112,15 @@ class KVCacheManager:
             return
 
         def _check_kv_tensors_created():
-            if self.world_size > 1:
+            vllm_remote = False
+            try:
+                from kvcached.integration.vllm.interfaces import _kvcached_initialized as vllm_inited, _is_worker
+                if vllm_inited and not _is_worker:
+                    vllm_remote = True
+            except ImportError:
+                pass
+
+            if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(self.world_size, self.pp_rank)
             else:
                 return kv_tensors_created()

@@ -53,7 +53,7 @@ EOF
 # -----------------------------------------------------------------------------
 TEMP=$(getopt \
     --options h \
-    --longoptions port:,model:,venv-path:,tp:,pp:,dp:,pcp:,ep:,chat-template:,speculative-config:,help \
+    --longoptions port:,model:,venv-path:,tp:,pp:,dp:,pcp:,ep:,chat-template:,speculative-config:,speculative-model:,num-speculative-tokens:,ngram-prompt-lookup-max:,help \
     --name "$0" -- "$@")
 
 if [[ $? -ne 0 ]]; then
@@ -84,6 +84,12 @@ while true; do
             chat_template="$2"; shift 2 ;;
         --speculative-config)
             spec_config="$2"; shift 2 ;;
+        --speculative-model)
+            spec_model="$2"; shift 2 ;;
+        --num-speculative-tokens)
+            num_spec_tokens="$2"; shift 2 ;;
+        --ngram-prompt-lookup-max)
+            ngram_prompt_lookup_max="$2"; shift 2 ;;
         --help|-h)
             usage; exit 0 ;;
         --)
@@ -202,8 +208,39 @@ if [ "$engine" == "vllm" ]; then
         VLLM_EP_ARGS+=("--chat-template" "$CHAT_TEMPLATE")
     fi
 
-    if [[ -n "$SPEC_CONFIG" ]]; then
-        VLLM_EP_ARGS+=("--speculative_config" "$SPEC_CONFIG")
+    # In vLLM newer versions, speculative decoding parameters are collapsed into a single JSON config string.
+    # We construct it dynamically based on the inputs provided.
+    SPEC_JSON="{}"
+    if [[ -n "$spec_model" ]] || [[ -n "$num_spec_tokens" ]] || [[ -n "$ngram_prompt_lookup_max" ]]; then
+        SPEC_JSON="{"
+        first=true
+        if [[ -n "$spec_model" ]]; then
+            SPEC_JSON="$SPEC_JSON\"speculative_model\": \"$spec_model\""
+            first=false
+        fi
+        if [[ -n "$num_spec_tokens" ]]; then
+            if ! $first; then SPEC_JSON="$SPEC_JSON, "; fi
+            SPEC_JSON="$SPEC_JSON\"num_speculative_tokens\": $num_spec_tokens"
+            first=false
+        fi
+        if [[ -n "$ngram_prompt_lookup_max" ]]; then
+            if ! $first; then SPEC_JSON="$SPEC_JSON, "; fi
+            SPEC_JSON="$SPEC_JSON\"ngram_prompt_lookup_max\": $ngram_prompt_lookup_max"
+            first=false
+        fi
+        SPEC_JSON="$SPEC_JSON}"
+    fi
+
+    if [[ "$SPEC_JSON" != "{}" ]]; then
+        # Merge with existing SPEC_CONFIG if any, though usually only one is provided
+        if [[ -n "$SPEC_CONFIG" ]]; then
+            # Not building a perfect JSON merger in bash, just use the built one
+            VLLM_EP_ARGS+=("--speculative-config" "$SPEC_JSON")
+        else
+            VLLM_EP_ARGS+=("--speculative-config" "$SPEC_JSON")
+        fi
+    elif [[ -n "$SPEC_CONFIG" ]]; then
+        VLLM_EP_ARGS+=("--speculative-config" "$SPEC_CONFIG")
     fi
 
     vllm serve "$MODEL" \
@@ -229,6 +266,11 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
         export TORCHDYNAMO_DISABLE=1
         SGL_L4_ARGS="--attention-backend torch_native"
     fi
+    
+    # SGLang uses python requests to check localhost:30000 at startup.
+    # Exclude localhost from proxy so it doesn't try to route through Squid.
+    export no_proxy="localhost,127.0.0.1,::1"
+    export NO_PROXY="localhost,127.0.0.1,::1"
     $PYTHON -m sglang.launch_server --model "$MODEL" \
     --disable-radix-cache \
     --trust-remote-code \
