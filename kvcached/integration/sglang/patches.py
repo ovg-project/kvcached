@@ -416,13 +416,13 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         tp_rank = int(get_tensor_model_parallel_rank())
                         tp_size = int(get_tensor_model_parallel_world_size())
                         pp_rank = int(get_pipeline_model_parallel_rank())
-                    except Exception:
+                    except (ImportError, AttributeError):
                         try:
                             import torch.distributed as dist
                             tp_rank = dist.get_rank() if dist.is_initialized() else 0
                             tp_size = dist.get_world_size() if dist.is_initialized() else 1
                             pp_rank = 0
-                        except Exception:
+                        except (ImportError, AttributeError, RuntimeError, ValueError, TypeError):
                             tp_rank, tp_size, pp_rank = 0, 1, 0
 
                     # Initialize kvcached with overlap scheduling to be conservative

@@ -146,7 +146,7 @@ class PageAllocator:
             num_layers: Number of layers (for physical memory calculation).
             mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
             page_size: Page size in bytes.
-            world_size: Total parallel processes (TP * PP).
+            world_size: Tensor parallel world size within a pipeline stage.
             pp_rank: Pipeline parallel rank (for IPC socket namespacing).
             async_sched: Whether asynchronous scheduling is enabled.
             contiguous_layout: Whether to use contiguous layout.

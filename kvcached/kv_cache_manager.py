@@ -59,7 +59,7 @@ class KVCacheManager:
             block_size: Size of each block in bytes.
             cell_size: Size of each cell in bytes.
             num_layers: Number of layers.
-            world_size: Number of parallel processes (TP * PP).
+            world_size: Tensor parallel world size within a pipeline stage.
             async_sched: Whether asynchronous scheduling is enabled.
             reserve_null_block: Whether to reserve the first block as null block
                 for padding tokens. This is required by SGLang which assumes the
