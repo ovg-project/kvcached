@@ -94,7 +94,6 @@ setup_sglang_pip() {
         uv pip install transformers==4.57.0
     fi
 
-    # uv pip install torch==2.7.0
     uv pip install "sglang[all]==${sglang_ver}" --prerelease=allow
 
     install_kvcached_from_source
@@ -157,7 +156,7 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _default_ver="0.11.0"
+    local _default_ver="0.14.0"
     local _version=${version:-"$_default_ver"}
 
     if [[ "$method" == "source" ]]; then
@@ -168,7 +167,7 @@ setup_vllm() {
 }
 
 setup_sglang() {
-    local _version=${version:-"0.5.3"}
+    local _version=${version:-"0.5.6"}
 
     if [[ "$method" == "source" ]]; then
         setup_sglang_from_source "$_version"
@@ -188,13 +187,13 @@ ${BOLD}${CYAN}Arguments:${RESET}
   ${BOLD}--engine${RESET}            Target engine to set up (vllm, sglang) [required]
   ${BOLD}--method${RESET}            Engine installation method: pip (default) or source
   ${BOLD}--version${RESET}           Specific engine version to install. Default versions:
-        - vllm   : 0.11.0
-        - sglang : 0.5.3
+        - vllm   : 0.14.0
+        - sglang : 0.5.6
 
 ${BOLD}${CYAN}Examples:${RESET}
-  $0 --engine vllm                                     # vLLM 0.11.0 (pip) + kvcached (source)
-  $0 --engine vllm --method source --version 0.11.0    # vLLM 0.11.0 (source) + kvcached (source)
-  $0 --engine sglang --method source --version 0.5.3   # sglang 0.5.3 (source) + kvcached (source)
+  $0 --engine vllm                                     # vLLM 0.14.0 (pip) + kvcached (source)
+  $0 --engine vllm --method source --version 0.14.0    # vLLM 0.14.0 (source) + kvcached (source)
+  $0 --engine sglang --method source --version 0.5.6  # sglang 0.5.6 (source) + kvcached (source)
 EOF
 }
 
