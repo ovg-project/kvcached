@@ -120,7 +120,12 @@ setup_vllm_from_source() {
 
     # use specific version of precompiled wheel (best effort)
     pip download "vllm==${vllm_ver}" --no-deps -d /tmp || true
-    export VLLM_PRECOMPILED_WHEEL_LOCATION="/tmp/vllm-${vllm_ver}-cp38-abi3-manylinux1_x86_64.whl"
+    vllm_wheel=$(ls /tmp/vllm-${vllm_ver}-*.whl 2>/dev/null | head -1)
+    if [[ -n "$vllm_wheel" && -f "$vllm_wheel" ]]; then
+        export VLLM_PRECOMPILED_WHEEL_LOCATION="file://${vllm_wheel}"
+    else
+        export VLLM_PRECOMPILED_WHEEL_LOCATION=""
+    fi
     uv pip install --editable .
 
     install_kvcached_from_source
