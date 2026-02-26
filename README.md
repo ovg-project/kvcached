@@ -119,7 +119,7 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 ### Prerequisites
 
 - Python (tested with 3.9 - 3.12)
-- SGLang (tested with v0.5.3) or vLLM (tested with v0.11.0)
+- SGLang (tested with v0.5.6) or vLLM (tested with v0.14.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
