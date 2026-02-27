@@ -128,7 +128,7 @@ if [ "$engine" == "vllm" ]; then
     # Activate virtual environment if provided
     if [[ -n "$VENV_PATH" ]]; then source "$VENV_PATH/bin/activate"; fi
     export VLLM_USE_V1=1
-    export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+    export VLLM_ATTENTION_BACKEND=TRITON_ATTN
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
 

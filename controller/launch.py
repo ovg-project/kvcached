@@ -130,12 +130,11 @@ def _build_command(inst: Dict[str, Any]) -> List[str]:
     # Determine which virtualenv to use
     if inst.get("using_venv") and inst.get("venv_path"):
         venv_dir = Path(inst["venv_path"]).expanduser().resolve()
-
-    def _vbin(program: str) -> Path:
-        return venv_dir / "bin" / program
+        python_exec = str(venv_dir / "bin" / "python")
+    else:
+        python_exec = sys.executable
 
     if engine == "vllm":
-        python_exec = _vbin("python")
         # Always launch via module to avoid relying on the 'vllm' CLI entrypoint script
         cmd = [
             str(python_exec),

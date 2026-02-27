@@ -1,11 +1,12 @@
 #!/bin/bash
 set -ex
 
-# Set environment variables
-export KVCACHED_IPC_NAME=VLLM
+# Add kvcached to Python path (no separate venv needed with py12-vllm-0.14.0-pip)
+export PYTHONPATH="../../:../../benchmarks:$PYTHONPATH"
 
-# Add vLLM benchmarks and kvcached to Python path
-export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../benchmarks:$PYTHONPATH"
+# Run tag — pass as third argument to distinguish experiments, e.g. "kvcached" or "baseline"
+# Usage: bash run_benchmark.sh <peak_rps> <completion_len> [tag]
+RUN_TAG="${3:-kvcached}"
 
 # Benchmark parameters
 PROMPT_LEN=256
@@ -43,12 +44,8 @@ NUM_PROMPTS=$((RAMP_PEAK_RPS * RAMP_PEAK_RPS))
 echo "Calculated NUM_PROMPTS: $NUM_PROMPTS (based on ramp pattern: ${TOTAL_DURATION}s duration)"
 
 mkdir -p results results/metrics
+1
 
-# Define models and their configurations
-MODELS=(
-    "meta-llama/Llama-3.1-8B-Instruct:12346"
-    "meta-llama/Llama-3.1-8B-Instruct:30000"
-    "meta-llama/Llama-3.1-8B-Instruct:40000"
 )
 NUM_MODELS=${#MODELS[@]}
 
@@ -71,7 +68,7 @@ for i in "${!MODELS[@]}"; do
     MODEL_INDEX=$((i + 1))
 
     # Generate result file name for ramp-up-down strategy
-    RESULT_FILE="results/metrics/${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_START_RPS}to${RAMP_PEAK_RPS}to${RAMP_END_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}-model-num-${NUM_MODELS}.json"
+    RESULT_FILE="results/metrics/${RUN_TAG}-${BACKEND}-${MODEL_NAME}-ramp-up-down-${RAMP_START_RPS}to${RAMP_PEAK_RPS}to${RAMP_END_RPS}-inc${RAMP_INCREMENT}-prompt_${PROMPT_LEN}-completion_${COMPLETION_LEN}-${MODEL_INDEX}-delay-${MODEL_DELAY}-model-num-${NUM_MODELS}.json"
 
     # Add delay before starting next model (except for the first one)
     if [ $i -gt 0 ] && [ "$MODEL_DELAY" -gt 0 ]; then

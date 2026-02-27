@@ -1,0 +1,60 @@
+kvcached: # kvcached environment variables for all instances
+  kvcached_gpu_utilization: 0.25
+  kvcached_page_prealloc_enabled: true
+  kvcached_min_reserved_pages: 5
+  kvcached_max_reserved_pages: 20
+  kvcached_sanity_check: false
+  kvcached_log_level: INFO
+
+router: # router configuration
+  enable_router: true
+  router_port: 8080
+  router_host: localhost
+
+sleep_manager: # sleep configuration
+  idle_threshold_seconds: 300
+  check_interval_seconds: 60
+  auto_sleep_enabled: false
+  wakeup_on_request: true
+  min_sleep_duration: 10
+
+launch_delay_seconds: 60
+
+instances: # instances configuration
+  - name: instance1
+    model: Qwen/Qwen2.5-32B-Instruct
+    engine: vllm
+    using_venv: false
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_AUTOPATCH=1"
+    engine_env:
+      - "VLLM_USE_V1=1"
+      - "VLLM_SERVER_DEV_MODE=1"
+    engine_args:
+      - "--disable-log-requests"
+      - "--no-enable-prefix-caching"
+      - "--host=localhost"
+      - "--port=12346"
+      - "--gpu-memory-utilization=0.50"
+      - "--enable-sleep-mode"
+      - "--max-model-len=8192"
+
+  - name: instance2
+    model: Qwen/Qwen2.5-32B-Instruct
+    engine: vllm
+    using_venv: false
+    kvcached_env:
+      - "ENABLE_KVCACHED=true"
+      - "KVCACHED_AUTOPATCH=1"
+    engine_env:
+      - "VLLM_USE_V1=1"
+      - "VLLM_SERVER_DEV_MODE=1"
+    engine_args:
+      - "--disable-log-requests"
+      - "--no-enable-prefix-caching"
+      - "--host=localhost"
+      - "--port=30000"
+      - "--gpu-memory-utilization=0.50"
+      - "--enable-sleep-mode"
+      - "--max-model-len=8192"
