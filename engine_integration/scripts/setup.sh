@@ -161,7 +161,7 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _default_ver="0.14.0"
+    local _default_ver="0.16.0"
     local _version=${version:-"$_default_ver"}
 
     if [[ "$method" == "source" ]]; then
@@ -192,12 +192,12 @@ ${BOLD}${CYAN}Arguments:${RESET}
   ${BOLD}--engine${RESET}            Target engine to set up (vllm, sglang) [required]
   ${BOLD}--method${RESET}            Engine installation method: pip (default) or source
   ${BOLD}--version${RESET}           Specific engine version to install. Default versions:
-        - vllm   : 0.14.0
+        - vllm   : 0.16.0
         - sglang : 0.5.9
 
 ${BOLD}${CYAN}Examples:${RESET}
-  $0 --engine vllm                                     # vLLM 0.14.0 (pip) + kvcached (source)
-  $0 --engine vllm --method source --version 0.14.0    # vLLM 0.14.0 (source) + kvcached (source)
+  $0 --engine vllm                                     # vLLM 0.16.0 (pip) + kvcached (source)
+  $0 --engine vllm --method source --version 0.16.0    # vLLM 0.16.0 (source) + kvcached (source)
   $0 --engine sglang --method source --version 0.5.9  # sglang 0.5.9 (source) + kvcached (source)
 EOF
 }
