@@ -4,7 +4,7 @@
   <br>
   <br>
   <p>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue"></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.13-blue"></a>
     <img alt="Engines" src="https://img.shields.io/badge/Engines-SGLang%20%7C%20vLLM-blueviolet">
     <a href="https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141"><img alt="Blog" src="https://img.shields.io/badge/Blog-Read-FF5722?logo=rss&logoColor=white&labelColor=555555"></a>
     <a href="https://arxiv.org/abs/2508.08448"><img alt="arXiv: GPU OS vision" src="https://img.shields.io/badge/arXiv-GPU%20OS%20vision-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
@@ -118,7 +118,7 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 
 ### Prerequisites
 
-- Python (tested with 3.9 - 3.12)
+- Python (tested with 3.9 - 3.13)
 - SGLang (tested with v0.5.9) or vLLM (tested with v0.16.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
