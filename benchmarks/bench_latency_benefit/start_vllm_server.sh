@@ -8,7 +8,7 @@ export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model configuration
-MODEL="meta-llama/Llama-3.2-1B"  # Use smaller model for testing
+MODEL="meta-llama/Llama-3.1-8B-Instruct"
 PORT=8000
 
 # Start vLLM server
@@ -17,4 +17,5 @@ vllm serve "$MODEL" \
     --no-enable-prefix-caching \
     --gpu-memory-utilization 0.5 \
     --port="$PORT" \
-    --tensor-parallel-size=1
+    --tensor-parallel-size=1 \
+    --max-num-batched-tokens 16384
