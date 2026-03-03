@@ -473,7 +473,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 )
                 tp_rank = int(get_tensor_model_parallel_rank())
                 tp_size = int(get_tensor_model_parallel_world_size())
-            except (ImportError, AttributeError) as e:
+            except (ImportError, AttributeError):
                 tp_rank, tp_size = 0, 1
 
             # Try to get PP rank; it may not be available if PP process groups
