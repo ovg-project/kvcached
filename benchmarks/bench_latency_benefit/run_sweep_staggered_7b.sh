@@ -12,18 +12,21 @@
 
 set -e
 
-PYTHON="${PYTHON:-/home/sz81/kvcached/py12-vllm-0.14.0-pip/bin/python}"
+PYTHON="${PYTHON:-/home/amd-rice-collab/home/kvcached/py12-vllm-0.14.0-pip/bin/python}"
 export PYTHONPATH="../../:../../benchmarks:$PYTHONPATH"
 
 RUN_TAG="${1:-kvcached-7b}"
 RESULTS_DIR="${2:-results/sweep}"
 
 PROMPT_LEN=256
-COMPLETION_LEN=2048
+COMPLETION_LEN=1024
 BACKEND="vllm"
 RAMP_START_RPS=0
 RAMP_END_RPS=1
 RAMP_INCREMENT=1
+# Range of peak RPS to sweep.
+PEAK_START_RPS=25
+PEAK_END_RPS=40
 
 MODELS=(
     "Qwen/Qwen2.5-7B-Instruct:12346"
@@ -37,10 +40,10 @@ NUM_MODELS=${#MODELS[@]}
 
 mkdir -p "$RESULTS_DIR"
 
-echo "=== Staggered 7B sweep: peaks 19-20, tag=${RUN_TAG}, results=${RESULTS_DIR} ==="
+echo "=== Staggered 7B sweep: peaks ${PEAK_START_RPS}-${PEAK_END_RPS}, tag=${RUN_TAG}, results=${RESULTS_DIR} ==="
 echo "    Instances: ${NUM_MODELS}, prompt=${PROMPT_LEN}, completion=${COMPLETION_LEN}"
 
-for RAMP_PEAK_RPS in $(seq 19 1 20); do
+for RAMP_PEAK_RPS in $(seq $PEAK_START_RPS 1 $PEAK_END_RPS); do
     RAMP_UP_DURATION=$(( (RAMP_PEAK_RPS - RAMP_START_RPS) / RAMP_INCREMENT ))
     RAMP_DOWN_DURATION=$(( (RAMP_PEAK_RPS - RAMP_END_RPS) / RAMP_INCREMENT ))
     # Stagger delay: enough that each model's peak doesn't overlap with the next.
@@ -52,6 +55,19 @@ for RAMP_PEAK_RPS in $(seq 19 1 20); do
 
     PIDS=()
     RESULT_FILES=()
+    INST_START_TIMES=()
+    # Stagger process launches by LAUNCH_STAGGER seconds so initialization
+    # (tokenizer load + dataset gen) doesn't all compete for CPU simultaneously.
+    # After the last process is launched, allow INIT_BUFFER_EXTRA more seconds
+    # before the first send, so even the last process finishes init in time.
+    LAUNCH_STAGGER=20
+    INIT_BUFFER_EXTRA=30
+    LAST_LAUNCH_OFFSET=$(( (NUM_MODELS - 1) * LAUNCH_STAGGER ))
+    INIT_BUFFER=$(( LAST_LAUNCH_OFFSET + INIT_BUFFER_EXTRA ))
+    SWEEP_START=$(date +%s%3N)  # milliseconds
+    FIRST_START_AT=$(echo "scale=3; ($SWEEP_START + $INIT_BUFFER * 1000) / 1000" | bc)
+
+    echo "  Launch stagger: ${LAUNCH_STAGGER}s  Init buffer: ${INIT_BUFFER}s  First send at: t=+${INIT_BUFFER}s"
 
     for i in "${!MODELS[@]}"; do
         MODEL=$(echo "${MODELS[$i]}" | cut -d':' -f1)
@@ -60,14 +76,18 @@ for RAMP_PEAK_RPS in $(seq 19 1 20); do
         INST=$((i + 1))
         RESULT_FILE="${RESULTS_DIR}/${RUN_TAG}-${BACKEND}-peak${RAMP_PEAK_RPS}-prompt${PROMPT_LEN}-completion${COMPLETION_LEN}-inst${INST}.json"
 
-        # Stagger: sleep before launching each subsequent instance
-        if [ $i -gt 0 ] && [ "$MODEL_DELAY" -gt 0 ]; then
-            echo "  Waiting ${MODEL_DELAY}s before starting instance ${INST}..."
-            sleep "$MODEL_DELAY"
+        # Stagger the process launch to reduce CPU contention during init.
+        if [ $i -gt 0 ]; then
+            sleep "$LAUNCH_STAGGER"
         fi
 
-        # Extra prompts to cover the delay window (model runs while others are staggering)
-        INST_NUM_PROMPTS=$(( BASE_NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY ))
+        # Each instance's designated send start time, evenly spaced by MODEL_DELAY.
+        START_AT=$(echo "scale=3; $FIRST_START_AT + $i * $MODEL_DELAY" | bc)
+
+        INST_START_TIMES[$i]=$(date +%s)
+
+        # Fixed prompts per instance — no extra padding so runs complete cleanly.
+        INST_NUM_PROMPTS=$BASE_NUM_PROMPTS
 
         "$PYTHON" bench_kvcached_vllm.py \
             --backend "$BACKEND" \
@@ -86,17 +106,31 @@ for RAMP_PEAK_RPS in $(seq 19 1 20); do
             --ramp-start-rps "$RAMP_START_RPS" \
             --ramp-end-rps "$RAMP_END_RPS" \
             --ramp-peak-rps "$RAMP_PEAK_RPS" \
-            --ramp-increment "$RAMP_INCREMENT" &
+            --ramp-increment "$RAMP_INCREMENT" \
+            --start-at "$START_AT" &
 
         PIDS+=($!)
         RESULT_FILES+=("$RESULT_FILE")
-        echo "  Started instance ${INST} (port ${PORT}) PID=${PIDS[$i]}"
+        echo "  Launched instance ${INST} (port ${PORT}) PID=${PIDS[$i]}, start_at=+$(echo "scale=1; $i * $MODEL_DELAY + $INIT_BUFFER" | bc)s"
     done
 
     echo "  Waiting for all instances to finish..."
     FAILED=0
+    INST_END_TIMES=()
     for i in "${!PIDS[@]}"; do
         wait "${PIDS[$i]}" || { echo "  WARNING: instance $((i+1)) failed"; FAILED=1; }
+        INST_END_TIMES[$i]=$(date +%s)
+    done
+
+    echo ""
+    echo "  --- Instance timing (wall clock) ---"
+    for i in "${!INST_START_TIMES[@]}"; do
+        INST=$((i + 1))
+        START=${INST_START_TIMES[$i]}
+        END=${INST_END_TIMES[$i]}
+        DURATION=$(( END - START ))
+        OFFSET=$(( START - SWEEP_START ))
+        echo "  Instance ${INST}: started at t=+${OFFSET}s, duration=${DURATION}s, finished at t=+$(( OFFSET + DURATION ))s"
     done
 
     if [ "$FAILED" -eq 0 ]; then
