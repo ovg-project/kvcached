@@ -37,15 +37,15 @@ from typing import Any, Literal, Optional
 
 import aiohttp
 import numpy as np
+from tqdm.asyncio import tqdm
+from transformers import PreTrainedTokenizerBase
+from typing_extensions import deprecated
 from vllm.benchmarks.lib.endpoint_request_func import (
     ASYNC_REQUEST_FUNCS,
     OPENAI_COMPATIBLE_BACKENDS,
     RequestFuncInput,
     RequestFuncOutput,
 )
-from tqdm.asyncio import tqdm
-from transformers import PreTrainedTokenizerBase
-from typing_extensions import deprecated
 
 try:
     from vllm.transformers_utils.tokenizer import get_tokenizer
@@ -347,7 +347,7 @@ async def benchmark(
         timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
     )
 
-    try: 
+    try:
         print("Starting initial single prompt test run...")
         test_prompt, test_prompt_len, test_output_len, test_mm_content = (
             input_requests[0].prompt,
@@ -695,7 +695,7 @@ async def benchmark(
                 print("Profiler stopped")
 
         return result
-    
+
     finally:
         await session.close()
 
