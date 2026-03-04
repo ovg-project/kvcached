@@ -45,7 +45,7 @@ def setup_kvcache():
     # initialize kvcached
     os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = "true"
     torch.cuda.set_device(TP_RANK)
-    init_kvcached(tp_rank=TP_RANK, tp_size=TP_SIZE, is_worker=True, async_sched=False)
+    init_kvcached(tp_rank=TP_RANK, world_size=TP_SIZE, is_worker=True, async_sched=False)
 
     # allocate kv cache tensors in virtual memory
     alloc_kv_cache(
@@ -68,7 +68,7 @@ def setup_kvcache():
         block_size=BLOCK_SIZE,
         cell_size=1024,
         num_layers=NUM_LAYERS,
-        tp_size=TP_SIZE,
+        world_size=TP_SIZE,
     )
 
     # wait a bit for pre-allocation to finish
