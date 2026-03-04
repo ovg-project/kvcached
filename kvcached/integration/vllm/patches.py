@@ -111,7 +111,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         f"Cannot get {num_blocks} free blocks from the pool")
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
-                assert block_ids is not None and len(block_ids) == num_blocks
+                if block_ids is None:
+                    raise ValueError(
+                        f"Cannot get {num_blocks} free blocks from the pool: "
+                        f"physical pool exhausted by concurrent instance "
+                        f"(available: {self.get_num_free_blocks()})")
+                assert len(block_ids) == num_blocks
 
                 return [KVCacheBlockClass(bid) for bid in block_ids]
 
@@ -819,4 +824,57 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class KVCacheAllocatorPatch(VersionAwarePatch, BasePatch):
+    """Patch KVCacheManager.allocate_slots to handle TOCTOU pool exhaustion gracefully.
+
+    When multiple kvcached instances share a physical KV pool, a race can occur:
+    the free-block check passes, but by the time alloc() runs, another instance
+    has consumed those pages. Without this patch that raises an AssertionError
+    which kills the EngineCore. With this patch, the ValueError is caught and
+    converted to None, triggering vLLM's normal preemption path.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.kv_cache_manager"
+    target_class = "KVCacheManager"
+    patch_name = "kv_cache_allocator"
+
+    def apply(self, kvcache_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_allocate_slots(kvcache_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_allocate_slots(self, kvcache_mod: types.ModuleType) -> bool:
+        KVCacheManager = self._get_target_class(kvcache_mod)
+        if KVCacheManager is None:
+            return False
+
+        if self._is_already_patched(KVCacheManager.allocate_slots, "allocate_slots"):
+            self.logger.debug("KVCacheManager.allocate_slots already patched")
+            return True
+
+        original_allocate_slots = KVCacheManager.allocate_slots
+        logger = self.logger
+
+        def _patched_allocate_slots(self, *args: Any, **kwargs: Any):
+            try:
+                return original_allocate_slots(self, *args, **kwargs)
+            except (ValueError, AssertionError) as e:
+                if not enable_kvcached():
+                    raise
+                # TOCTOU race: the free-block check passed but the physical pool
+                # was consumed by another kvcached instance before alloc() ran.
+                # Return None so vLLM's scheduler triggers graceful preemption
+                # instead of crashing the EngineCore.
+                logger.warning(
+                    "kvcached: KV block allocation failed due to cross-instance "
+                    "pool race; triggering preemption: %s", e)
+                return None
+
+        self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
+        KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]
         return True
