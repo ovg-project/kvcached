@@ -330,14 +330,22 @@ async def benchmark(
     ramp_peak_rps: Optional[int] = None,
     ramp_end_rps: Optional[int] = None,
     ramp_increment: Optional[int] = None,
+    start_at: Optional[float] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    connector = aiohttp.TCPConnector(
+    limit=0, # no limit on the number of concurrent connections
+    limit_per_host=0, # no limit on the number of concurrent connections per host
+    ttl_dns_cache=300,
+    )
     session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60))
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
+    )
 
     try: 
         print("Starting initial single prompt test run...")
@@ -438,6 +446,17 @@ async def benchmark(
         from itertools import cycle
 
         model_cycle = cycle(deployments)
+
+        # Wait until start_at if specified (after warmup, so the warmup doesn't
+        # shift the actual benchmark start time).
+        if start_at is not None:
+            wait = start_at - time.time()
+            if wait > 0:
+                print(f"Warmup complete. Waiting {wait:.1f}s until start_at={start_at:.3f}...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"Warning: start_at={start_at:.3f} is {-wait:.1f}s in the past after warmup; starting immediately.")
+
         benchmark_start_time = time.perf_counter()
         tasks: list[asyncio.Task] = []
         # req_counter = 0  # to alternate models when model_id2 is provided
@@ -1035,6 +1054,7 @@ def main(args: argparse.Namespace):
             ramp_peak_rps=args.ramp_peak_rps,
             ramp_end_rps=args.ramp_end_rps,
             ramp_increment=args.ramp_increment,
+            start_at=args.start_at,
         )
     )
 
@@ -1557,6 +1577,15 @@ def create_argument_parser():
         default=None,
         help="The RPS increment per second for ramp-up-down strategy. "
         "Required when --ramp-up-strategy=ramp-up-down.",
+    )
+    parser.add_argument(
+        "--start-at",
+        type=float,
+        default=None,
+        help="Unix timestamp at which to start sending requests. "
+        "The client will complete all initialization (tokenizer load, dataset "
+        "generation) and then sleep until this time. Use this to synchronize "
+        "staggered instances so that first-send offsets are exactly as intended.",
     )
 
     return parser
