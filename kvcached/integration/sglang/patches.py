@@ -74,10 +74,24 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if "cuda" not in device:
                         raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
                     self.kvcached_allocator = kvcache.kvcached_allocator
+                    # Prefix cache support: track whether prefix cache is enabled
+                    # and whether we're currently in an eviction context
+                    self._prefix_cache_enabled = False
+                    self._in_eviction = False
                     logger.info(
                         f"[kvcached] ElasticTokenToKVPoolAllocator in use: size={size} "
                         "(page_size=1 path)"
                     )
+
+                def set_prefix_cache_enabled(self, enabled: bool):
+                    """Enable/disable prefix cache mode. When enabled, free() becomes
+                    a no-op unless we're in an eviction context."""
+                    self._prefix_cache_enabled = enabled
+
+                def set_eviction_context(self, in_eviction: bool):
+                    """Set whether we're currently in an eviction context.
+                    When True, free() will actually release physical pages."""
+                    self._in_eviction = in_eviction
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size()
@@ -88,11 +102,16 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
 
                 def free(self, free_index):
                     if self.is_not_in_free_group:
-                        try:
-                            indices: list[int] = free_index.cpu().numpy().tolist()
-                        except Exception:
-                            indices = list(free_index)
-                        return self.kvcached_allocator.free(indices)
+                        # Only free physical pages if:
+                        # 1. Prefix cache is disabled, OR
+                        # 2. We're in eviction context (RadixCache is evicting nodes)
+                        if not self._prefix_cache_enabled or self._in_eviction:
+                            try:
+                                indices: list[int] = free_index.cpu().numpy().tolist()
+                            except Exception:
+                                indices = list(free_index)
+                            return self.kvcached_allocator.free(indices)
+                        # Otherwise, blocks stay allocated (RadixCache owns them)
                     else:
                         self.free_group.append(free_index)
 
@@ -157,6 +176,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    # Prefix cache support: track whether prefix cache is enabled
+                    # and whether we're currently in an eviction context
+                    self._prefix_cache_enabled = False
+                    self._in_eviction = False
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
                         f"page_size={page_size}"
@@ -164,6 +187,16 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # Base class expects these tensors for backup_state / free_group_end
                     self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+                def set_prefix_cache_enabled(self, enabled: bool):
+                    """Enable/disable prefix cache mode. When enabled, free() becomes
+                    a no-op unless we're in an eviction context."""
+                    self._prefix_cache_enabled = enabled
+
+                def set_eviction_context(self, in_eviction: bool):
+                    """Set whether we're currently in an eviction context.
+                    When True, free() will actually release physical pages."""
+                    self._in_eviction = in_eviction
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size() * self.page_size
@@ -266,12 +299,17 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         return
 
                     if self.is_not_in_free_group:
-                        page_ids = torch.unique(free_index // self.page_size)
-                        try:
-                            indices: list[int] = page_ids.cpu().numpy().tolist()
-                        except Exception:
-                            indices = list(page_ids)
-                        return self.kvcached_allocator.free(indices)
+                        # Only free physical pages if:
+                        # 1. Prefix cache is disabled, OR
+                        # 2. We're in eviction context (RadixCache is evicting nodes)
+                        if not self._prefix_cache_enabled or self._in_eviction:
+                            page_ids = torch.unique(free_index // self.page_size)
+                            try:
+                                indices: list[int] = page_ids.cpu().numpy().tolist()
+                            except Exception:
+                                indices = list(page_ids)
+                            return self.kvcached_allocator.free(indices)
+                        # Otherwise, blocks stay allocated (RadixCache owns them)
                     else:
                         self.free_group.append(free_index)
 
@@ -669,4 +707,111 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_wrapped)
         setattr(Scheduler, target_method_name, _wrapped)
+        return True
+
+
+class RadixCachePrefixPatch(VersionAwarePatch, BasePatch):
+    """Patch SGLang RadixCache to enable prefix caching with kvcached.
+
+    This patch:
+    1. Wraps RadixCache.__init__ to enable prefix cache mode on the allocator
+    2. Wraps RadixCache.evict() to signal eviction context to the allocator
+    3. Wraps RadixCache.reset() to properly free all cached blocks
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.radix_cache"
+    target_class = "RadixCache"
+    patch_name = "radix_cache_prefix"
+
+    def apply(self, radix_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        # Apply all patches
+        success = self.patch_init_method(radix_mod)
+        success &= self.patch_evict_method(radix_mod)
+        success &= self.patch_reset_method(radix_mod)
+
+        if success:
+            logger.info("[kvcached] RadixCache patched for prefix cache support")
+
+        return success
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_init_method(self, radix_mod: types.ModuleType) -> bool:
+        """Wrap __init__ to enable prefix cache mode on allocator."""
+        RadixCache = self._get_target_class(radix_mod)
+        if RadixCache is None:
+            return False
+
+        if self._is_already_patched(radix_mod, "__kvcached_radix_init_patched__"):
+            return True
+
+        original_init = RadixCache.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            # Enable prefix cache mode on the allocator if radix cache is enabled
+            if not getattr(self, "disable", True):
+                allocator = getattr(self, "token_to_kv_pool_allocator", None)
+                if allocator is not None and hasattr(allocator, "set_prefix_cache_enabled"):
+                    allocator.set_prefix_cache_enabled(True)
+                    logger.info("[kvcached] Prefix cache mode enabled on allocator")
+
+        RadixCache.__init__ = patched_init
+        self._mark_as_patched(radix_mod, "__kvcached_radix_init_patched__")
+        return True
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_evict_method(self, radix_mod: types.ModuleType) -> bool:
+        """Wrap evict() to signal eviction context to allocator."""
+        RadixCache = self._get_target_class(radix_mod)
+        if RadixCache is None:
+            return False
+
+        if self._is_already_patched(radix_mod, "__kvcached_radix_evict_patched__"):
+            return True
+
+        original_evict = RadixCache.evict
+
+        def patched_evict(self, num_tokens: int):
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            if allocator is not None and hasattr(allocator, "set_eviction_context"):
+                allocator.set_eviction_context(True)
+            try:
+                return original_evict(self, num_tokens)
+            finally:
+                if allocator is not None and hasattr(allocator, "set_eviction_context"):
+                    allocator.set_eviction_context(False)
+
+        RadixCache.evict = patched_evict
+        self._mark_as_patched(radix_mod, "__kvcached_radix_evict_patched__")
+        return True
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_reset_method(self, radix_mod: types.ModuleType) -> bool:
+        """Wrap reset() to properly free all cached blocks during eviction context."""
+        RadixCache = self._get_target_class(radix_mod)
+        if RadixCache is None:
+            return False
+
+        if self._is_already_patched(radix_mod, "__kvcached_radix_reset_patched__"):
+            return True
+
+        original_reset = RadixCache.reset
+
+        def patched_reset(self):
+            allocator = getattr(self, "token_to_kv_pool_allocator", None)
+            if allocator is not None and hasattr(allocator, "set_eviction_context"):
+                allocator.set_eviction_context(True)
+            try:
+                return original_reset(self)
+            finally:
+                if allocator is not None and hasattr(allocator, "set_eviction_context"):
+                    allocator.set_eviction_context(False)
+
+        RadixCache.reset = patched_reset
+        self._mark_as_patched(radix_mod, "__kvcached_radix_reset_patched__")
         return True
