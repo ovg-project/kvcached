@@ -143,8 +143,8 @@ python tools/dev_copy_pth.py
 kvcached installed with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.3
-docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.11.0
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.4-sglang-v0.5.9
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.4-vllm-v0.16.0
 ```
 
 We prepare an all-in-one docker for developers:
