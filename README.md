@@ -43,13 +43,13 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 - **[2026-02]** kvcached now supports **vLLM v0.16.0** and **SGLang v0.5.9**.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) are supported in SGLang with both `page_size=1` and `page_size>1`.
-GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang.
+GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang (up to v0.5.6).
 
 ### Supported engines and models
 
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
-| SGLang | ≥ v0.4.9 (tested up to v0.5.9) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b, etc. |
+| SGLang | ≥ v0.4.9 (tested up to v0.5.9) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b (up to v0.5.6), etc. |
 | vLLM | ≥ v0.8.4 (tested up to v0.16.0) | MHA / GQA | Llama 3.1/3.3, Qwen 2.5 |
 
 ## Example use cases
