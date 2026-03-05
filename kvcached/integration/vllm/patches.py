@@ -75,6 +75,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 num_layers: int,
                 enable_caching: bool,
                 enable_kv_cache_events: bool = False,
+                num_kv_buffers: int = 2,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 assert not enable_caching, "Caching is not supported in ElasticBlockPool"
@@ -88,7 +89,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
                 self.kv_cache_manager = get_kv_cache_manager(
-                    num_gpu_blocks, block_size, cell_size, num_layers)
+                    num_gpu_blocks, block_size, cell_size, num_layers,
+                    num_kv_buffers=num_kv_buffers)
 
                 self.null_block = None  # type: ignore
 
@@ -252,7 +254,19 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             kv_cache_group = kv_groups[0]
             kv_cache_spec = kv_cache_group.kv_cache_spec
             block_size = kv_cache_spec.block_size
-            cell_size = kv_cache_spec.page_size_bytes // block_size // 2
+
+            from vllm.v1.kv_cache_interface import MLAAttentionSpec
+            is_mla = isinstance(kv_cache_spec, MLAAttentionSpec)
+            if is_mla:
+                # MLA: single combined KV buffer per layer
+                # page_size_bytes = block_size * num_kv_heads * head_size * dtype_size
+                cell_size = kv_cache_spec.page_size_bytes // block_size
+                num_kv_buffers = 1
+            else:
+                # MHA/GQA: separate K and V buffers
+                # page_size_bytes = 2 * block_size * num_kv_heads * head_size * dtype_size
+                cell_size = kv_cache_spec.page_size_bytes // block_size // 2
+                num_kv_buffers = 2
 
             try:
                 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
@@ -278,6 +292,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 cell_size=cell_size,
                 num_layers=num_layers,
                 enable_caching=getattr(self, "enable_caching", False),
+                num_kv_buffers=num_kv_buffers,
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -367,8 +382,16 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
             block_size = getattr(self, "block_size")
             num_gpu_blocks = getattr(self, "num_gpu_blocks")
 
-            # Calculate cell_size
-            cell_size = kv_cache_spec.page_size_bytes // block_size // 2
+            from vllm.v1.kv_cache_interface import MLAAttentionSpec
+            is_mla = isinstance(kv_cache_spec, MLAAttentionSpec)
+            if is_mla:
+                # MLA: single combined KV buffer
+                cell_size = kv_cache_spec.page_size_bytes // block_size
+                num_kv_buffers = 1
+            else:
+                # MHA/GQA: separate K and V buffers
+                cell_size = kv_cache_spec.page_size_bytes // block_size // 2
+                num_kv_buffers = 2
 
             # Determine number of layers
             if hasattr(kv_cache_config, "tensors"):
@@ -387,6 +410,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 cell_size=cell_size,
                 num_layers=num_layers,
                 enable_caching=enable_caching,
+                num_kv_buffers=num_kv_buffers,
             )
             if hasattr(self, "specialized_manager"):
                 self.specialized_manager.block_pool = self.block_pool
@@ -494,7 +518,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _patched_initialize_kv_cache(self, kv_cache_config: Any) -> None:
             import torch
-            from vllm.v1.kv_cache_interface import FullAttentionSpec
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
             from vllm.v1.utils import bind_kv_cache
 
             from kvcached.integration.vllm import interfaces as kvi
@@ -526,6 +550,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             # kv_cache_spec is guaranteed to be FullAttentionSpec
             # due to the check above
             assert isinstance(kv_cache_spec, FullAttentionSpec)
+            is_mla = isinstance(kv_cache_spec, MLAAttentionSpec)
+
             dtype = kv_cache_spec.dtype
             num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
             assert num_blocks >= kv_cache_config.num_blocks
@@ -536,15 +562,24 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 kv_cache_spec.head_size,
             )
 
-            kv_cache_buffers = kvi.alloc_kv_cache(
-                kv_cache_shape,
-                kv_cache_spec.block_size,
-                dtype,
-                self.device.type,
-                num_layers,
-                attention_type="MHA",
-                kv_layout="NHD",
-            )
+            if is_mla:
+                kv_cache_buffers = kvi.alloc_mla_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    self.device.type,
+                    num_layers,
+                )
+            else:
+                kv_cache_buffers = kvi.alloc_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    self.device.type,
+                    num_layers,
+                    attention_type="MHA",
+                    kv_layout="NHD",
+                )
             layer_id = 0
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 for layer_name in kv_cache_group.layer_names:
@@ -572,7 +607,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
-            from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
+            from vllm.v1.kv_cache_interface import (
+                FullAttentionSpec,
+                KVCacheTensor,
+                MLAAttentionSpec,
+            )
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -583,6 +622,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             kv_cache_group = kv_cache_config.kv_cache_groups[0]
             kv_cache_spec = kv_cache_group.kv_cache_spec
+
+            is_mla = isinstance(kv_cache_spec, MLAAttentionSpec)
+
             if not isinstance(kv_cache_spec, FullAttentionSpec):
                 raise ValueError("kvcached only supports FullAttentionSpec layers")
 
@@ -619,16 +661,26 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             num_layers = len(kv_cache_group.layer_names)
             dtype = kv_cache_spec.dtype
+            device_type = getattr(self, "device", torch.device("cuda")).type
 
-            kv_cache_raw_tensors = kvi.alloc_kv_cache(
-                kv_cache_shape,
-                kv_cache_spec.block_size,
-                dtype,
-                getattr(self, "device", torch.device("cuda")).type,
-                num_layers,
-                attention_type="MHA",
-                kv_layout="NHD",
-            )
+            if is_mla:
+                kv_cache_raw_tensors = kvi.alloc_mla_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    device_type,
+                    num_layers,
+                )
+            else:
+                kv_cache_raw_tensors = kvi.alloc_kv_cache(
+                    kv_cache_shape,
+                    kv_cache_spec.block_size,
+                    dtype,
+                    device_type,
+                    num_layers,
+                    attention_type="MHA",
+                    kv_layout="NHD",
+                )
             return kv_cache_raw_tensors
 
         setattr(

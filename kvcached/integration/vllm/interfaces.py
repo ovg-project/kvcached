@@ -66,7 +66,7 @@ def alloc_kv_cache(
     dtype: torch.dtype,
     device: str,
     num_layers: int,
-    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
+    attention_type: str = "MHA",  # GQA is also supported.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> List[torch.Tensor]:
     if not _kvcached_initialized:
@@ -130,6 +130,71 @@ def alloc_kv_cache(
             contiguous_tensor[:, i, :, :, :].permute(*permute_order)
             for i in range(num_layers)
         ]
+    return kv_tensors
+
+
+def alloc_mla_kv_cache(
+    kvcache_shape: Tuple[int, ...],  # (num_blocks, block_size, head_size)
+    block_size: int,
+    dtype: torch.dtype,
+    device: str,
+    num_layers: int,
+) -> List[torch.Tensor]:
+    """Allocate MLA-style KV cache with a single combined kv_buffer per layer.
+
+    MLA uses a single buffer of shape (num_blocks, block_size, head_size) per layer
+    instead of separate K and V buffers.
+    """
+    if not _kvcached_initialized:
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+
+    num_k_or_v = 1
+
+    if len(kvcache_shape) <= 2:
+        raise ValueError(f"Unsupported MLA kv cache shape: {kvcache_shape}")
+
+    if kvcache_shape[1] != block_size:
+        raise ValueError(
+            f"block_size mismatch: kvcache_shape[1]={kvcache_shape[1]} != block_size={block_size}"
+        )
+
+    assert torch.cuda.is_available(), "CUDA is not available."
+
+    requested_num_blocks = kvcache_shape[0]
+    block_mem_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize
+
+    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes_per_layer = gpu_mem_bytes // num_layers // num_k_or_v
+    # round down to page size
+    gpu_mem_bytes_per_layer = (gpu_mem_bytes_per_layer // PAGE_SIZE) * PAGE_SIZE
+
+    num_blocks_per_layer = gpu_mem_bytes_per_layer // block_mem_bytes
+    if requested_num_blocks > num_blocks_per_layer:
+        logger.warning(
+            f"Requested {requested_num_blocks} blocks, but only {num_blocks_per_layer} blocks are available."
+        )
+
+    raw_kv_tensors = create_kv_tensors(
+        gpu_mem_bytes_per_layer * num_k_or_v, dtype.itemsize, device, num_layers,
+        num_kv_buffers=num_k_or_v,
+    )
+
+    actual_kvcache_shape: List[int] = list(kvcache_shape)
+    actual_kvcache_shape[0] = num_blocks_per_layer
+
+    kv_tensors: List[torch.Tensor] = []
+
+    if not _contiguous_layout:
+        num_eles = math.prod(actual_kvcache_shape)
+        for t in raw_kv_tensors:
+            kv_tensors.append(t.view(dtype=dtype)[:num_eles].view(actual_kvcache_shape))
+    else:
+        contiguous_shape = (num_blocks_per_layer, num_layers, *actual_kvcache_shape[1:])
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+        for i in range(num_layers):
+            kv_tensors.append(contiguous_tensor[:, i, :, :])
+
     return kv_tensors
 
 
