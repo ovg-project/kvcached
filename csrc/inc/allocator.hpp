@@ -25,13 +25,19 @@ public:
   ~FTensorAllocator();
 
   // KV cache interfaces.
+  // group_id allows multiple independent KV cache pools (e.g., for hybrid
+  // attention models with separate full-attention and sliding-window groups).
+  // Default group_id=0 preserves backward compatibility.
   std::vector<torch::Tensor> create_kv_tensors(size_t size, torch::Dtype dtype,
                                                const std::string &dev_str,
                                                int64_t num_layers,
-                                               int64_t num_kv_buffers = 2);
-  bool kv_tensors_created();
-  bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
-  bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+                                               int64_t num_kv_buffers = 2,
+                                               int64_t group_id = 0);
+  bool kv_tensors_created(int64_t group_id = 0);
+  bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
+                         int64_t group_id = 0);
+  bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                             int64_t group_id = 0);
 
   // Global status interfaces.
   static void init(const std::string &dev_str, size_t page_size = 0,
@@ -41,20 +47,35 @@ public:
   void destroy();
 
 private:
+  // Per-group state that holds FTensors and metadata for one KV cache pool.
+  struct KVGroup {
+    int64_t num_layers = 0;
+    size_t kv_tensor_size_per_layer = 0;
+    // For per-layer layout: one tensor per layer
+    std::unordered_map<std::string, std::unique_ptr<FTensor>> ftensors;
+    // For contiguous layout: single tensor containing all layers
+    std::unique_ptr<FTensor> contiguous_kv_tensor;
+    std::shared_ptr<Page> zero_page;
+  };
+
+  // Get or create a KVGroup for the given group_id.  Must be called with
+  // mtx_ held.
+  KVGroup &get_or_create_group_(int64_t group_id);
+
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
   std::vector<torch::Tensor>
-  create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
-                               torch::Dtype dtype, const std::string &dev_str,
-                               int64_t num_layers);
+  create_kv_tensors_per_layer_(KVGroup &group, std::string_view prefix,
+                               size_t size, torch::Dtype dtype,
+                               const std::string &dev_str, int64_t num_layers);
   std::vector<torch::Tensor>
-  create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
+  create_kv_tensors_contiguous_(KVGroup &group, size_t size, torch::Dtype dtype,
                                 const std::string &dev_str, int64_t num_layers,
                                 size_t compound_page_size);
-  torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
+  torch::Tensor create_ftensor_(KVGroup &group, size_t size, torch::Dtype dtype,
                                 const std::string &dev_str,
                                 std::string name = "");
-  void free_ftensor_(torch::Tensor &ftensor);
+  void free_ftensor_(KVGroup &group, torch::Tensor &ftensor);
 
   // CUDA util functions.
   void init_cuda_();
@@ -63,17 +84,11 @@ private:
   static std::mutex g_allocator_mutex_;
 
   torch::Device dev_;
-
-  int64_t num_layers_;
   bool contiguous_layout_;
-  size_t kv_tensor_size_per_layer_;
 
   mutable std::mutex mtx_;
-  // For per-layer layout: one tensor per layer
-  std::unordered_map<std::string, std::unique_ptr<FTensor>> ftensors_;
-  // For contiguous layout: single tensor containing all layers
-  std::unique_ptr<FTensor> contiguous_kv_tensor_;
-  std::shared_ptr<Page> zero_page_;
+  // Map from group_id to per-group KV cache state.
+  std::unordered_map<int64_t, KVGroup> kv_groups_;
 };
 
 } // namespace kvcached

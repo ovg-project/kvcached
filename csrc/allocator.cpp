@@ -42,8 +42,7 @@ static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
 
 FTensorAllocator::FTensorAllocator(const torch::Device &device,
                                    bool contiguous_layout)
-    : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
-      kv_tensor_size_per_layer_(0) {
+    : dev_(device), contiguous_layout_(contiguous_layout) {
   if (dev_.is_cuda()) {
     init_cuda_();
   }
@@ -53,9 +52,7 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
-  ftensors_.clear();
-  contiguous_kv_tensor_.reset();
-  zero_page_.reset();
+  kv_groups_.clear();
 }
 
 void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
@@ -95,13 +92,22 @@ void FTensorAllocator::shutdown() {
   }
 }
 
+FTensorAllocator::KVGroup &
+FTensorAllocator::get_or_create_group_(int64_t group_id) {
+  // mtx_ must be held by the caller.
+  return kv_groups_[group_id]; // default-constructs if absent
+}
+
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     size_t size, torch::Dtype dtype, const std::string &dev_str,
-    int64_t num_layers, int64_t num_kv_buffers) {
+    int64_t num_layers, int64_t num_kv_buffers, int64_t group_id) {
   std::lock_guard<std::mutex> lock(mtx_);
 
-  assert(num_layers_ == 0 || num_layers_ == num_layers);
-  num_layers_ = num_layers;
+  auto &group = get_or_create_group_(group_id);
+
+  assert(group.num_layers == 0 || group.num_layers == num_layers);
+  group.num_layers = num_layers;
+
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
   if (size % kPageSize != 0) {
@@ -109,42 +115,51 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
          kPageSize, aligned_size);
   }
-  kv_tensor_size_per_layer_ = aligned_size;
+  group.kv_tensor_size_per_layer = aligned_size;
+
+  // Build a group-specific prefix so FTensor names don't collide across groups.
+  auto prefix = std::string(kv_prefix) + "g" + std::to_string(group_id) + "_";
 
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
     size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
-    // We can use the aligned size directly for contiguous layout too because
-    // both compound_page_size and aligned_size are already/will be multiplied
-    // by num_layers.
-    return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
+    group.zero_page = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    return create_kv_tensors_contiguous_(group, aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
-    return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
-                                        num_layers);
+    group.zero_page = make_shared_page(dev_, ZERO_PAGE_ID);
+    return create_kv_tensors_per_layer_(group, prefix, aligned_size, dtype,
+                                        dev_str, num_layers);
   }
 }
 
-bool FTensorAllocator::kv_tensors_created() {
+bool FTensorAllocator::kv_tensors_created(int64_t group_id) {
   std::lock_guard<std::mutex> lock(mtx_);
-  return num_layers_ > 0;
-}
-
-bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
-  std::unique_lock<std::mutex> lock(mtx_);
-  if (num_layers_ == 0) {
-    LOGE("try to map to KV tensors when KV tensors are not created");
+  auto it = kv_groups_.find(group_id);
+  if (it == kv_groups_.end()) {
     return false;
   }
+  return it->second.num_layers > 0;
+}
+
+bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets,
+                                         int64_t group_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  auto it = kv_groups_.find(group_id);
+  if (it == kv_groups_.end() || it->second.num_layers == 0) {
+    LOGE("try to map to KV tensors when KV tensors are not created "
+         "(group_id=%ld)",
+         group_id);
+    return false;
+  }
+  auto &group = it->second;
 
   if (contiguous_layout_) {
     // In contiguous layout, use the single contiguous tensor for mapping
     // Each offset maps a block that contains all layers
-    auto ftensor = contiguous_kv_tensor_.get();
+    auto ftensor = group.contiguous_kv_tensor.get();
     auto tensor = ftensor->get_tensor();
 
     for (auto offset : offsets) {
@@ -152,10 +167,11 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       ftensor->map(offset);
     }
   } else {
-    // Original per-layer mapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
+    // Per-layer mapping within this group
+    for (int64_t i = 0; i < group.num_layers; i++) {
+      auto kv_name = std::string(kv_prefix) + "g" + std::to_string(group_id) +
+                     "_" + std::to_string(i);
+      auto ftensor = group.ftensors[kv_name].get();
       /**
        * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
        * dim. This is used for calculating the offset of the V tensor.
@@ -175,16 +191,20 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
-    const std::vector<offset_t> &offsets) {
+    const std::vector<offset_t> &offsets, int64_t group_id) {
   std::unique_lock<std::mutex> lock(mtx_);
-  if (num_layers_ == 0) {
-    LOGE("try to unmap from KV tensors when KV tensors are not created");
+  auto it = kv_groups_.find(group_id);
+  if (it == kv_groups_.end() || it->second.num_layers == 0) {
+    LOGE("try to unmap from KV tensors when KV tensors are not created "
+         "(group_id=%ld)",
+         group_id);
     return false;
   }
+  auto &group = it->second;
 
   if (contiguous_layout_) {
     // In contiguous layout, unmap using the single contiguous tensor
-    auto ftensor = contiguous_kv_tensor_.get();
+    auto ftensor = group.contiguous_kv_tensor.get();
     auto tensor = ftensor->get_tensor();
 
     for (auto offset : offsets) {
@@ -192,10 +212,11 @@ bool FTensorAllocator::unmap_from_kv_tensors(
       ftensor->unmap(offset);
     }
   } else {
-    // Original per-layer unmapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
+    // Per-layer unmapping within this group
+    for (int64_t i = 0; i < group.num_layers; i++) {
+      auto kv_name = std::string(kv_prefix) + "g" + std::to_string(group_id) +
+                     "_" + std::to_string(i);
+      auto ftensor = group.ftensors[kv_name].get();
       /**
        * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
        * dim. This is used for calculating the offset of the V tensor.
@@ -219,19 +240,19 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
 }
 
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
-    std::string_view prefix, size_t size, torch::Dtype dtype,
+    KVGroup &group, std::string_view prefix, size_t size, torch::Dtype dtype,
     const std::string &dev_str, int64_t num_layers) {
   std::vector<torch::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
-    auto tensor = create_ftensor_(size, dtype, dev_str, name);
+    auto tensor = create_ftensor_(group, size, dtype, dev_str, name);
     ftensors.push_back(tensor);
   }
   return ftensors;
 }
 
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
-    size_t size, torch::Dtype dtype, const std::string &dev_str,
+    KVGroup &group, size_t size, torch::Dtype dtype, const std::string &dev_str,
     int64_t num_layers, size_t compound_page_size) {
   // In contiguous layout, Python passes per-layer size, and we multiply by
   // num_layers to get total size
@@ -239,42 +260,43 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 
   // Create the single contiguous KV tensor (contains K and V for all layers)
   auto contiguous_name = std::string(kv_prefix) + "contiguous";
-  contiguous_kv_tensor_ =
+  group.contiguous_kv_tensor =
       std::make_unique<FTensor>(contiguous_name, total_kv_size, dtype, dev_,
-                                zero_page_, compound_page_size);
+                                group.zero_page, compound_page_size);
 
   // Get the contiguous tensor
-  auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
+  auto contiguous_tensor = group.contiguous_kv_tensor->get_tensor();
   return {contiguous_tensor};
 }
 
 /** this function is not thread-safe */
-torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
+torch::Tensor FTensorAllocator::create_ftensor_(KVGroup &group, size_t size,
+                                                torch::Dtype dtype,
                                                 const std::string &dev_str,
                                                 std::string name) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
-  if (ftensors_.find(name) != ftensors_.end()) {
-    auto tensor = ftensors_[name].get()->get_tensor();
+  if (group.ftensors.find(name) != group.ftensors.end()) {
+    auto tensor = group.ftensors[name].get()->get_tensor();
     assert(tensor.numel() * tensor.element_size() == size);
     assert(tensor.device() == torch::Device(dev_str));
     return tensor;
   }
 
   // Create a new FTensor
-  ftensors_[name] =
-      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
-  return ftensors_[name]->get_tensor();
+  group.ftensors[name] =
+      std::make_unique<FTensor>(name, size, dtype, dev_, group.zero_page);
+  return group.ftensors[name]->get_tensor();
 }
 
 /** this function is not thread-safe */
-void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
+void FTensorAllocator::free_ftensor_(KVGroup &group, torch::Tensor &ftensor) {
   auto name = ftensor.name();
-  if (ftensors_.find(name) == ftensors_.end()) {
+  if (group.ftensors.find(name) == group.ftensors.end()) {
     return;
   }
-  ftensors_.erase(name);
+  group.ftensors.erase(name);
 }
 
 void FTensorAllocator::init_cuda_() {
