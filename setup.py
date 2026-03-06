@@ -16,6 +16,7 @@ try:
     import torch
     from torch.utils.cpp_extension import (
         BuildExtension,
+        CppExtension,
         CUDAExtension,
         include_paths,
         library_paths,
@@ -43,21 +44,63 @@ def get_extensions():
     # Get the C++ ABI flag from PyTorch
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
+    is_hip_build = bool(getattr(torch.version, "hip", None))
+    is_cuda_build = bool(getattr(torch.version, "cuda", None))
+    if is_hip_build:
+        backend_define = "-DKVCACHED_USE_HIP"
+        backend_name = "HIP/ROCm"
+    elif is_cuda_build:
+        backend_define = "-DKVCACHED_USE_CUDA"
+        backend_name = "CUDA"
+    else:
+        raise RuntimeError(
+            "Unable to determine GPU backend from PyTorch. "
+            "Expected either torch.version.hip or torch.version.cuda."
+        )
+
     extra_compile_args = [
-        "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
+        "-std=c++17",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
+        backend_define,
     ]
 
-    vmm_ops_module = CUDAExtension(
-        "kvcached.vmm_ops",
-        csrc_files,
-        include_dirs=include_paths() + [os.path.join(CSRC_PATH, "inc")],
-        library_dirs=library_paths(),
-        libraries=["torch", "torch_cpu", "torch_python", "cuda"],
-        extra_compile_args={
-            "cxx": extra_compile_args,
-            "nvcc": extra_compile_args
-        },
-    )
+    ext_include_dirs = include_paths(device_type="cuda") + [
+        os.path.join(CSRC_PATH, "inc")
+    ]
+    ext_library_dirs = library_paths(device_type="cuda")
+
+    if is_hip_build:
+        # HIP builds: use CppExtension to avoid PyTorch's hipify step.
+        # Our code already handles HIP natively via gpu_vmm.hpp conditional
+        # compilation, so hipify is unnecessary and breaks torch headers.
+        extra_compile_args.extend([
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-DUSE_ROCM=1",
+        ])
+        ext_libraries = ["amdhip64"]
+        vmm_ops_module = CppExtension(
+            "kvcached.vmm_ops",
+            csrc_files,
+            include_dirs=ext_include_dirs,
+            library_dirs=ext_library_dirs,
+            libraries=ext_libraries,
+            extra_compile_args={"cxx": extra_compile_args},
+        )
+    else:
+        # CUDA driver APIs require libcuda for cuMem* symbols.
+        ext_libraries = ["cuda"]
+        vmm_ops_module = CUDAExtension(
+            "kvcached.vmm_ops",
+            csrc_files,
+            include_dirs=ext_include_dirs,
+            library_dirs=ext_library_dirs,
+            libraries=ext_libraries,
+            extra_compile_args={
+                "cxx": extra_compile_args,
+                "nvcc": extra_compile_args,
+            },
+        )
+    print(f"Building kvcached.vmm_ops with backend: {backend_name}")
     return [vmm_ops_module], {"build_ext": BuildExtension}
 
 
