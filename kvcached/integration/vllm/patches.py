@@ -19,10 +19,12 @@ if TYPE_CHECKING:
     try:
         from vllm.v1.core.block_pool import KVCacheBlock  # type: ignore[import-untyped]
         from vllm.v1.core.block_pool import KVCacheEvent  # type: ignore[import-untyped]
+        from vllm.v1.core.scheduler import Request  # type: ignore[import-untyped]
     except ImportError:
         # Fallback if vLLM is not available during type checking
         KVCacheBlock = Any  # type: ignore[misc,assignment]
         KVCacheEvent = Any  # type: ignore[misc,assignment]
+        Request = Any  # type: ignore[misc,assignment]
 
 # Version ranges for vLLM support
 VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
@@ -60,10 +62,6 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger  # Capture logger in closure
 
-        _PREFIX_CACHE_WARNING_MSG = (
-            "kvcached does not support prefix cache yet, "
-            "double check vLLM is not launched with prefix cache enabled.")
-
         class ElasticBlockPool(BlockPool):  # type: ignore
             """ElasticBlockPool that manages KVCacheBlocks using kvcached."""
 
@@ -77,7 +75,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 enable_kv_cache_events: bool = False,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
-                assert not enable_caching, "Caching is not supported in ElasticBlockPool"
+                # Allow prefix caching when enabled
+                self.enable_prefix_cache = enable_caching
+                if enable_caching:
+                    logger.info("Prefix caching enabled for ElasticBlockPool")
+
                 assert not enable_kv_cache_events, (
                     "KV cache events are not supported in ElasticBlockPool")
 
@@ -88,20 +90,95 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
                 self.kv_cache_manager = get_kv_cache_manager(
-                    num_gpu_blocks, block_size, cell_size, num_layers)
+                    num_gpu_blocks, block_size, cell_size, num_layers,
+                    enable_prefix_cache=enable_caching)
 
                 self.null_block = None  # type: ignore
 
             def get_cached_block(
-                self, *args: Any, **kwargs: Any
+                self,
+                block_hash: Any,
+                kv_cache_group_ids: list[int]
             ) -> Optional[list["KVCacheBlock"]]:
-                """args and kwargs are ignored for compatibility"""
-                return None
+                """
+                Look up cached blocks by hash.
 
-            def cache_full_blocks(self, *args: Any, **kwargs: Any) -> None:
-                """args and kwargs are ignored for compatibility"""
-                logger.warning(_PREFIX_CACHE_WARNING_MSG)
-                return
+                Args:
+                    block_hash: Hash key for the block
+                    kv_cache_group_ids: List of KV cache group IDs to query
+
+                Returns:
+                    List containing a single KVCacheBlock if found, None otherwise
+                """
+                if not self.enable_prefix_cache:
+                    return None
+
+                # For now, kvcached only supports single group (group_id=0)
+                # Ignore kv_cache_group_ids parameter
+                if len(kv_cache_group_ids) > 1:
+                    logger.warning(f"ElasticBlockPool only supports single KV cache group, "
+                                  f"got {len(kv_cache_group_ids)} groups")
+                    return None
+
+                cached_block_ids = self.kv_cache_manager.get_cached_blocks(block_hash)
+                if cached_block_ids is None:
+                    return None
+
+                # Increment refcount for the cached blocks (they're being reused)
+                self.kv_cache_manager.increment_block_refcount(cached_block_ids)
+
+                # Touch blocks to update LRU
+                self.kv_cache_manager.touch_cached_blocks(cached_block_ids)
+
+                return [KVCacheBlockClass(bid) for bid in cached_block_ids]
+
+            def cache_full_blocks(
+                self,
+                request: "Request",
+                blocks: list["KVCacheBlock"],
+                num_cached_blocks: int,
+                num_full_blocks: int,
+                block_size: int,
+                kv_cache_group_id: int,
+            ) -> None:
+                """
+                Store blocks in the prefix cache.
+
+                Args:
+                    request: Request object containing block hashes
+                    blocks: List of KVCacheBlock objects to cache
+                    num_cached_blocks: Number of blocks already cached
+                    num_full_blocks: Number of blocks that should be cached after this call
+                    block_size: Tokens per block
+                    kv_cache_group_id: KV cache group ID
+                """
+                if not self.enable_prefix_cache:
+                    return
+
+                # Only process blocks that aren't already cached
+                if num_cached_blocks >= num_full_blocks:
+                    return
+
+                new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+
+                # Get block hashes from the request
+                # request.block_hashes contains per-block hashes
+                assert hasattr(request, 'block_hashes'), "Request missing block_hashes attribute"
+                assert len(request.block_hashes) >= num_full_blocks, \
+                    f"Request has {len(request.block_hashes)} hashes but need {num_full_blocks}"
+
+                # Cache each new full block individually with its hash
+                for i, block in enumerate(new_full_blocks):
+                    # Skip null blocks (used for sliding window attention)
+                    if hasattr(block, 'is_null') and block.is_null:
+                        continue
+
+                    block_idx = num_cached_blocks + i
+                    block_hash = request.block_hashes[block_idx]
+                    block_id = block.block_id  # type: ignore[attr-defined]
+
+                    # Cache this single block with its individual hash
+                    self.kv_cache_manager.cache_blocks(block_hash, [block_id])
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -115,9 +192,32 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 return [KVCacheBlockClass(bid) for bid in block_ids]
 
-            def touch(self, *args, **kwargs) -> None:
-                logger.warning(_PREFIX_CACHE_WARNING_MSG)
-                return
+            def touch(
+                self, blocks: list["KVCacheBlock"] | tuple[list["KVCacheBlock"], ...]
+            ) -> None:
+                """
+                Update LRU timestamp for cached blocks.
+
+                Args:
+                    blocks: Either a single list of KVCacheBlock objects or a tuple
+                           of lists (for multiple sequences)
+                """
+                if not self.enable_prefix_cache:
+                    return
+
+                # Handle both single list and tuple of lists
+                all_block_ids = []
+                if isinstance(blocks, tuple):
+                    for block_list in blocks:
+                        all_block_ids.extend([
+                            b.block_id for b in block_list  # type: ignore[attr-defined]
+                        ])
+                else:
+                    all_block_ids = [
+                        block.block_id for block in blocks  # type: ignore[attr-defined]
+                    ]
+
+                self.kv_cache_manager.touch_cached_blocks(all_block_ids)
 
             def free_blocks(
                 self,
@@ -130,8 +230,39 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if len(block_ids) > 0:
                     self.kv_cache_manager.free(block_ids)
 
+            def evict_blocks(self, block_ids: set[int]) -> None:
+                """
+                Evict blocks from the prefix cache by their block IDs.
+
+                Only evicts blocks that are currently cached (have a hash). Blocks
+                with positive reference counts are only evicted from the prefix cache
+                hash table, not freed from the block pool.
+
+                Args:
+                    block_ids: Set of block IDs to evict from cache
+                """
+                if not self.enable_prefix_cache:
+                    return
+
+                # Convert set to list for compatibility
+                block_ids_list = list(block_ids)
+
+                # Evict blocks from the prefix cache
+                self.kv_cache_manager.evict_blocks_from_cache(block_ids_list)
+
+                logger.debug(f"Evicted {len(block_ids)} blocks from prefix cache")
+
             def reset_prefix_cache(self) -> bool:
-                logger.warning(_PREFIX_CACHE_WARNING_MSG)
+                """
+                Clear all cached blocks from the prefix cache.
+
+                Returns:
+                    True on success
+                """
+                if not self.enable_prefix_cache:
+                    return True
+
+                self.kv_cache_manager.reset_prefix_cache()
                 return True
 
             def get_num_free_blocks(self) -> int:
@@ -242,7 +373,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
         def _setup_kvcached_coordinator(self) -> None:
             enable_caching = getattr(self, "enable_caching", False)
             if enable_caching:
-                raise ValueError("Caching is not supported for kvcached")
+                logger.info("Prefix caching enabled for kvcached")
 
             kv_cache_config = getattr(self, "kv_cache_config")
             kv_groups = kv_cache_config.kv_cache_groups
@@ -345,7 +476,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         def _setup_kvcached_manager(self, kv_cache_config: Any) -> None:
             enable_caching = getattr(self, "enable_caching", False)
             if enable_caching:
-                raise ValueError("Caching is not supported for kvcached")
+                logger.info("Prefix caching enabled for kvcached")
 
             # Import ElasticBlockPool from the patched module
             import importlib
