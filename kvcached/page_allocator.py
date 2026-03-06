@@ -139,7 +139,8 @@ class PageAllocator:
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,
-                 num_kv_buffers: int = 2):
+                 num_kv_buffers: int = 2,
+                 group_id: int = 0):
         """
         Args:
             num_layers: Number of layers (for physical memory calculation).
@@ -151,6 +152,8 @@ class PageAllocator:
             enable_page_prealloc: Whether to enable page preallocation.
             num_kv_buffers: Number of KV buffers per layer (2 for MHA K+V,
                 1 for MLA combined KV).
+            group_id: KV cache group identifier for hybrid attention models.
+                Different groups have independent FTensors and page spaces.
         """
         logger.info(
             f"Init kvcached KV cache allocator: "
@@ -172,6 +175,7 @@ class PageAllocator:
         self.async_sched = async_sched
         self.contiguous_layout = contiguous_layout
         self.num_kv_buffers = num_kv_buffers
+        self.group_id = group_id
         # TODO: make this compatible with engine's memory limit after getting
         # better configuration management.
         self.gpu_utilization = GPU_UTILIZATION
@@ -413,6 +417,19 @@ class PageAllocator:
             # Update memory usage after unmapping pages
             self._update_memory_usage()
 
+    def reset_free_page_order(self) -> None:
+        """Reset the free page list to sorted order.
+
+        After free_pages + trim cycles, freed pages are appended to the
+        end of the deque so the ordering becomes scrambled.  This method
+        re-sorts the free list so that low-numbered pages (starting with
+        page 0) are allocated first — important because SGLang expects
+        the very first block (on page 0) to be reserved as the null block.
+        """
+        with self._lock:
+            sorted_pages = sorted(self.free_page_list)
+            self.free_page_list = deque(sorted_pages)
+
     def get_num_free_pages(self) -> int:
         return self.num_free_pages
 
@@ -527,9 +544,10 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # map pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors(self.tp_size, offsets)
+            broadcast_map_to_kv_tensors(self.tp_size, offsets,
+                                        group_id=self.group_id)
         else:
-            map_to_kv_tensors(offsets)
+            map_to_kv_tensors(offsets, group_id=self.group_id)
 
     def _unmap_pages(self, page_ids: list[int]) -> None:
         if self.contiguous_layout:
@@ -540,11 +558,12 @@ class PageAllocator:
         else:
             offsets = [pid * self.page_size for pid in page_ids]
         if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
-            broadcast_unmap_from_kv_tensors(self.tp_size, offsets)
+            broadcast_unmap_from_kv_tensors(self.tp_size, offsets,
+                                            group_id=self.group_id)
         else:
             if self.async_sched:
                 torch.cuda.synchronize()
-            unmap_from_kv_tensors(offsets)
+            unmap_from_kv_tensors(offsets, group_id=self.group_id)
 
     def _update_memory_usage(self):
         """Update memory usage information in shared memory."""

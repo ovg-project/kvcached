@@ -80,7 +80,15 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
 
                 def available_size(self):
-                    return self.kvcached_allocator.available_size()
+                    # Cap at the pool's token capacity.  KVCacheManager
+                    # internally manages size+1 blocks (the extra slot is
+                    # the null/padding block) and considers physical GPU
+                    # memory availability, so its reported available_size
+                    # can slightly exceed the pool's declared size.
+                    # SGLang's SWATokenToKVPoolAllocator asserts
+                    # available <= size.
+                    return min(self.kvcached_allocator.available_size(),
+                               self.size)
 
                 def alloc(self, need_size: int):
                     indices: list[int] = self.kvcached_allocator.alloc(need_size)
@@ -349,6 +357,12 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
+                # Auto-incrementing group_id so that each pool instance
+                # (e.g., full-attention pool and SWA pool in SWAKVPool)
+                # gets independent FTensors and page spaces in the C++
+                # FTensorAllocator.
+                _next_group_id = 0
+
                 def __init__(
                     self,
                     size: int,
@@ -364,6 +378,11 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     *args,
                     **kwargs,
                 ) -> None:
+                    # Assign group_id BEFORE super().__init__() because it
+                    # calls _create_buffers() which needs self._group_id.
+                    self._group_id = ElasticMHATokenToKVPool._next_group_id
+                    ElasticMHATokenToKVPool._next_group_id += 1
+
                     super().__init__(
                         size=size,
                         page_size=page_size,
@@ -382,14 +401,16 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.cell_size = self.head_num * self.head_dim * dtype.itemsize
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num
+                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
+                        group_id=self._group_id,
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
                     k_size_phy, v_size_phy = self.get_kv_size_bytes_phy()
 
                     logger.info(
-                        f"VirtualKV Cache is allocated. #tokens: {size}, K size: "
+                        f"VirtualKV Cache is allocated (group_id={self._group_id}). "
+                        f"#tokens: {size}, #layers: {layer_num}, K size: "
                         f"{k_size / BYTES_PER_GB:.2f} GB, V size: {v_size / BYTES_PER_GB:.2f} GB"
                     )
                     logger.info(
@@ -420,6 +441,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         page_size=self.page_size,
                         attention_type="MHA",
                         kv_layout="NHD",
+                        group_id=self._group_id,
                     )
 
                 def get_kv_size_bytes_phy(self):

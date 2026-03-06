@@ -34,10 +34,13 @@ public:
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
+  // init() creates the default allocator (group_id=0).
+  // global_allocator(group_id) returns the allocator for the given group,
+  // lazily creating one if it doesn't exist yet.
   static void init(const std::string &dev_str, size_t page_size = 0,
                    bool contiguous_layout = false);
   static void shutdown();
-  static FTensorAllocator *global_allocator();
+  static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();
 
 private:
@@ -59,8 +62,13 @@ private:
   // CUDA util functions.
   void init_cuda_();
 
-  static std::unique_ptr<FTensorAllocator> g_allocator_;
+  // Multiton: one allocator per group_id.
+  static std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
+      g_allocators_;
   static std::mutex g_allocator_mutex_;
+  // Device and layout from init(), used to create new group allocators.
+  static torch::Device g_device_;
+  static bool g_contiguous_layout_;
 
   torch::Device dev_;
 
