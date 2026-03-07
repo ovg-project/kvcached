@@ -49,10 +49,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-
+import numpy as np
 
 # --------------------------- helper processes --------------------------------
 
@@ -247,7 +246,7 @@ def generate_google_style_workload(cfg: WorkloadConfig) -> Tuple[np.ndarray, np.
     # We will build intensity as:
     #   λ_i(t) = base_i + corr * shared + (1-corr) * unique_i
     # but keep everything in additive space then clip.
-    
+
     shared = shared_trend + shared_ou + shared_crowd
 
     intensities = np.zeros((cfg.N, n), dtype=np.float64)
