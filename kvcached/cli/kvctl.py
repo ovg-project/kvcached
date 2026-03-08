@@ -277,12 +277,17 @@ def cmd_limit_percent(ipc: str, percent: float):
               file=sys.stderr)
         return
 
+    if not 0.0 <= percent <= 100.0:
+        print(_clr(f"Error: Percentage must be between 0 and 100, got {percent}.",
+                   'red', bold=True), file=sys.stderr)
+        return
+
     from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        print("CUDA unavailable; cannot compute size from percentage",
-              file=sys.stderr)
+        print(_clr("Error: CUDA unavailable; cannot compute size from percentage.",
+                   'red', bold=True), file=sys.stderr)
         sys.exit(1)
     size_bytes = int(total_mem * percent / 100.0)
     update_kv_cache_limit(ipc, size_bytes)

@@ -18,8 +18,8 @@ from kvcached.vmm_ops import (
 logger = get_kvcached_logger()
 
 _kvcached_initialized: bool = False
-_kvcached_device = None
-_async_sched = False
+_kvcached_device: Optional[str] = None
+_async_sched: bool = False
 _tp_size: int = 1
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 
@@ -31,6 +31,16 @@ def init_kvcached(
     device: Optional[str] = None,
     async_sched: bool = False,
 ) -> None:
+    """Initialize kvcached for vLLM integration.
+
+    Args:
+        tp_rank: Tensor parallel rank of this process.
+        tp_size: Total number of tensor parallel processes.
+        is_worker: Whether this process is a worker (not the main engine).
+            Only workers should start the IPC listener thread.
+        device: CUDA device string (e.g., "cuda:0"). If None, uses current device.
+        async_sched: Whether to enable asynchronous scheduling.
+    """
     global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
     if _kvcached_initialized:
         return
@@ -45,18 +55,21 @@ def init_kvcached(
     _async_sched = async_sched
 
     if tp_size > 1 and is_worker:
-        # start the listener thread for tensor parallel kv cache management
+        # Start the listener thread for tensor parallel KV cache management.
+        # Use tp_rank to ensure correct socket path matching.
         start_worker_listener_thread(tp_rank)
 
 
 def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    """Shutdown kvcached and release resources."""
+    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
     if not _kvcached_initialized:
         return
 
     _shutdown_kvcached_impl()
     _kvcached_initialized = False
     _kvcached_device = None
+    _tp_size = 1
     _async_sched = False
 
 
@@ -69,6 +82,29 @@ def alloc_kv_cache(
     attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> List[torch.Tensor]:
+    """Allocate KV cache tensors with elastic memory management for vLLM.
+
+    This function creates combined K/V tensors for each layer using kvcached's
+    virtual memory abstraction. Supports both FlashAttn and FlashInfer layouts.
+
+    Args:
+        kvcache_shape: Shape of the KV cache. Supports two layouts:
+            - FlashAttn: (2, num_blocks, block_size, head_num, head_dim)
+            - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
+        block_size: Number of tokens per block.
+        dtype: Data type of the tensors (e.g., torch.float16, torch.bfloat16).
+        device: CUDA device type string (e.g., "cuda").
+        num_layers: Number of transformer layers.
+        attention_type: Attention mechanism type ("MHA" or "GQA").
+        kv_layout: Layout of KV cache tensors (only "NHD" supported).
+
+    Returns:
+        List of KV tensors, one per layer.
+
+    Raises:
+        RuntimeError: If kvcached is not initialized.
+        ValueError: If attention_type, kv_layout, or kvcache_shape is not supported.
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
@@ -140,6 +176,20 @@ def get_kv_cache_manager(
     num_layers: int,
     num_kv_buffers: int = 2,
 ) -> KVCacheManager:
+    """Create a KVCacheManager for vLLM.
+
+    Args:
+        num_blocks: Number of KV cache blocks to manage.
+        block_size: Size of each block in tokens.
+        cell_size: Size of each cell in bytes (page_size_bytes / block_size / 2).
+        num_layers: Number of transformer layers.
+
+    Returns:
+        KVCacheManager instance configured for the specified parameters.
+
+    Raises:
+        RuntimeError: If kvcached is not initialized.
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
