@@ -61,49 +61,75 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-    kvcache_shape: Tuple[int, ...],  # (2, num_blocks, block_size, head_num, head_dim)
+    kvcache_shape: Tuple[int, ...],
     block_size: int,
     dtype: torch.dtype,
     device: str,
     num_layers: int,
-    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
+    attention_type: str = "MHA",  # MHA, GQA, or MLA.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> List[torch.Tensor]:
+    """Allocate KV cache tensors for all supported attention types.
+
+    For MHA/GQA, kvcache_shape is expected to be:
+      - FlashAttn:  (2, num_blocks, block_size, head_num, head_dim)
+      - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
+    For MLA, kvcache_shape is expected to be:
+      - (num_blocks, block_size, head_size)
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA"]:
+    if attention_type not in ["MHA", "GQA", "MLA"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
-    num_k_or_v = 2
 
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
-    if (len(kvcache_shape) <= 3 or (kvcache_shape[0] != num_k_or_v and kvcache_shape[1] != num_k_or_v
-    ) or kvcache_shape[2] != block_size):
-        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+    is_mla = attention_type == "MLA"
+    num_k_or_v = 1 if is_mla else 2
 
-    # FlashAttn (num_k_or_v, num_blocks, block_size, head_num, head_dim)
-    if kvcache_shape[0] == num_k_or_v:
-        blocks_dim_idx = 1
-        permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
-    # FlashInfer (num_blocks, num_k_or_v, block_size, head_num, head_dim)
-    elif kvcache_shape[1] == num_k_or_v:
+    # --- Validate shape and determine layout indices ---
+    if is_mla:
+        # MLA shape: (num_blocks, block_size, head_size)
+        if len(kvcache_shape) <= 2:
+            raise ValueError(f"Unsupported MLA kv cache shape: {kvcache_shape}")
+        if kvcache_shape[1] != block_size:
+            raise ValueError(
+                f"block_size mismatch: kvcache_shape[1]={kvcache_shape[1]} != block_size={block_size}"
+            )
         blocks_dim_idx = 0
-        permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+        block_mem_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize
     else:
-        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+        # MHA/GQA shape with K/V dimension
+        if (len(kvcache_shape) <= 3
+                or (kvcache_shape[0] != num_k_or_v and kvcache_shape[1] != num_k_or_v)
+                or kvcache_shape[2] != block_size):
+            raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+        # FlashAttn (num_k_or_v, num_blocks, block_size, head_num, head_dim)
+        if kvcache_shape[0] == num_k_or_v:
+            blocks_dim_idx = 1
+            permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
+        # FlashInfer (num_blocks, num_k_or_v, block_size, head_num, head_dim)
+        elif kvcache_shape[1] == num_k_or_v:
+            blocks_dim_idx = 0
+            permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+        else:
+            raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+        block_mem_bytes = math.prod(kvcache_shape[2:]) * dtype.itemsize
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
     assert torch.cuda.is_available(), "CUDA is not available."
 
+    # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # round down to page size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
-    block_mem_bytes = math.prod(kvcache_shape[2:]) * dtype.itemsize
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
     if requested_num_blocks > num_blocks_per_layer:
         logger.warning(
@@ -117,19 +143,35 @@ def alloc_kv_cache(
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
-    if not _contiguous_layout:
-        num_eles = math.prod(actual_kvcache_shape)
-        kv_tensors = [
-            t.view(dtype=dtype)[:num_eles].view(tuple(actual_kvcache_shape)) for t in raw_kv_tensors
-        ]
+
+    # --- Reshape raw tensors into per-layer KV cache views ---
+    if is_mla:
+        kv_tensors: List[torch.Tensor] = []
+        if not _contiguous_layout:
+            num_eles = math.prod(actual_kvcache_shape)
+            for t in raw_kv_tensors:
+                kv_tensors.append(t.view(dtype=dtype)[:num_eles].view(actual_kvcache_shape))
+        else:
+            contiguous_shape = (num_blocks_per_layer, num_layers, *actual_kvcache_shape[1:])
+            num_eles = math.prod(contiguous_shape)
+            contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+            for i in range(num_layers):
+                kv_tensors.append(contiguous_tensor[:, i, :, :])
     else:
-        contiguous_shape = (num_blocks_per_layer, num_layers, num_k_or_v, *actual_kvcache_shape[2:])
-        num_eles = math.prod(contiguous_shape)
-        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
-        kv_tensors = [
-            contiguous_tensor[:, i, :, :, :].permute(*permute_order)
-            for i in range(num_layers)
-        ]
+        if not _contiguous_layout:
+            num_eles = math.prod(actual_kvcache_shape)
+            kv_tensors = [
+                t.view(dtype=dtype)[:num_eles].view(tuple(actual_kvcache_shape)) for t in raw_kv_tensors
+            ]
+        else:
+            contiguous_shape = (num_blocks_per_layer, num_layers, num_k_or_v, *actual_kvcache_shape[2:])
+            num_eles = math.prod(contiguous_shape)
+            contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+            kv_tensors = [
+                contiguous_tensor[:, i, :, :, :].permute(*permute_order)
+                for i in range(num_layers)
+            ]
+
     return kv_tensors
 
 

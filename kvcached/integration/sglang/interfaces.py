@@ -63,7 +63,7 @@ def alloc_kv_cache(
     device: str,
     num_layers: int,
     page_size: int = 1,
-    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
+    attention_type: str = "MHA",  # GQA is also supported.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not _kvcached_initialized:
