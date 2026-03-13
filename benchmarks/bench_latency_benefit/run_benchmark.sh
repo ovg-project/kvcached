@@ -1,14 +1,11 @@
 #!/bin/bash
 set -ex
 
-# Ensure Ctrl+C kills all background benchmark clients
-trap 'echo "Caught interrupt, killing all benchmark clients..."; kill $(jobs -p) 2>/dev/null; exit 1' INT TERM
-
 # Set environment variables
 export KVCACHED_IPC_NAME=VLLM
 
 # Add vLLM benchmarks and kvcached to Python path
-export PYTHONPATH="../../:../../benchmarks:$PYTHONPATH"
+export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../benchmarks:$PYTHONPATH"
 
 # Benchmark parameters
 PROMPT_LEN=256
