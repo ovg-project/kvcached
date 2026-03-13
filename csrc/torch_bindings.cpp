@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
-#include <pybind11/pybind11.h>
 #include <string>
-#include <torch/extension.h>
 #include <vector>
+
+#include <torch/csrc/utils/pybind.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -23,10 +23,10 @@ void shutdown_kvcached() {
   FTensorAllocator::shutdown();
 }
 
-std::vector<torch::Tensor> create_kv_tensors(size_t size, size_t dtype_size,
-                                             const std::string &dev_str,
-                                             int64_t num_layers,
-                                             int64_t num_kv_buffers = 2) {
+std::vector<at::Tensor> create_kv_tensors(size_t size, size_t dtype_size,
+                                          const std::string &dev_str,
+                                          int64_t num_layers,
+                                          int64_t num_kv_buffers = 2) {
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator();
   auto dtype_ = torch_dtype_from_size(dtype_size);
