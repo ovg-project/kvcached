@@ -68,6 +68,7 @@ def alloc_kv_cache(
     num_layers: int,
     attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
+    group_id: int = 0,
 ) -> List[torch.Tensor]:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -112,7 +113,7 @@ def alloc_kv_cache(
 
     raw_kv_tensors = create_kv_tensors(
         gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,
-        num_kv_buffers=num_k_or_v,
+        num_kv_buffers=num_k_or_v, group_id=group_id,
     )
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
@@ -139,6 +140,7 @@ def get_kv_cache_manager(
     cell_size: int,
     num_layers: int,
     num_kv_buffers: int = 2,
+    group_id: int = 0,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -151,4 +153,5 @@ def get_kv_cache_manager(
         _tp_size,
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
+        group_id=group_id,
     )
