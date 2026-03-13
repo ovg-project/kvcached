@@ -183,9 +183,14 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 try:
                     from kvcached.integration.vllm.interfaces import init_kvcached
 
+                    # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
+                    # The kvcached IPC mechanism coordinates KV tensor readiness
+                    # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
+                    # Each PP stage manages its own KV memory independently, so
+                    # cross-stage IPC is neither needed nor correct.
                     init_kvcached(
                         tp_rank=0,
-                        tp_size=vllm_config.parallel_config.tensor_parallel_size,
+                        world_size=vllm_config.parallel_config.tensor_parallel_size,
                         is_worker=False,
                     )
                 except Exception:
@@ -263,7 +268,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            kvi.init_kvcached(tp_rank=0, tp_size=tp_size, is_worker=False)
+            # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
+            # Each PP stage manages its own KV tensors independently. The IPC sockets
+            # are registered per TP rank within each stage (w0.sock … w(tp_size-1).sock).
+            kvi.init_kvcached(tp_rank=0, world_size=tp_size, is_worker=False)
 
             # Import ElasticBlockPool from the patched module
             import importlib
@@ -457,16 +465,26 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 logger.warning("Failed to initialize kvcached, disabling: %s", e)
 
         def _init_kvcached(self) -> None:
+            # Get TP rank/size: these are always available at model runner init time.
             try:
                 from vllm.distributed.parallel_state import (
                     get_tensor_model_parallel_rank,
                     get_tensor_model_parallel_world_size,
                 )
-
                 tp_rank = int(get_tensor_model_parallel_rank())
                 tp_size = int(get_tensor_model_parallel_world_size())
-            except Exception:
+            except (ImportError, AttributeError):
                 tp_rank, tp_size = 0, 1
+
+            # Try to get PP rank; it may not be available if PP process groups
+            # initialise later, so default to 0 (works for PP=1 and PP stage 0).
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_pp_group,
+                )
+                pp_rank = int(get_pp_group().rank_in_group)
+            except Exception:
+                pp_rank = 0
 
             try:
                 device_str = str(getattr(self, "device", "cuda"))
@@ -475,7 +493,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            kvi.init_kvcached(tp_rank=tp_rank, tp_size=tp_size, is_worker=True, device=device_str)
+            # Register this worker's IPC socket using tp_rank so all TP workers
+            # within this PP stage listen on w0.sock … w(tp_size-1).sock.
+            kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank,
+                              is_worker=True, device=device_str)
 
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached
