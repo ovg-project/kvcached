@@ -136,8 +136,10 @@ if [ "$engine" == "vllm" ]; then
     if [ "$IS_L4" = true ]; then
         VLLM_L4_ARGS="--enforce-eager"
     fi
+    # --no-enable-prefix-caching for disabling prefix caching
     vllm serve "$MODEL" \
-    --no-enable-prefix-caching \
+    --disable-log-requests \
+    --enable-prefix-caching \
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \
     $VLLM_L4_ARGS

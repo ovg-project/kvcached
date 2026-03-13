@@ -130,6 +130,9 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
                               "true").lower() == "true"
 
+# Prefix cache configuration
+PREFIX_CACHE_ENABLED = os.environ.get("KVCACHED_PREFIX_CACHE_ENABLED", "false").lower() == "true"
+
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
 

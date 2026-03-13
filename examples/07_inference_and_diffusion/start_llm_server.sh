@@ -133,6 +133,7 @@ if [[ "$engine" == "vllm" ]]; then
         VLLM_L4_ARGS="--enforce-eager"
     fi
     vllm serve "$MODEL" \
+    --disable-log-requests \
     --no-enable-prefix-caching \
     --port="$VLLM_PORT" \
     --tensor-parallel-size="$TP_SIZE" \

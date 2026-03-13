@@ -18,6 +18,7 @@ export KVCACHED_AUTOPATCH=1
 export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 vllm serve "${MODEL}" \
+  --disable-log-requests \
   --no-enable-prefix-caching \
   --port "${PORT}"
 ```
@@ -39,7 +40,7 @@ You might want to start the two engine servers in different terminals.
 
 ```bash
 export PORT=12346
-export MODEL="meta-llama/Llama-3.2-1B-Instruct"
+export MODEL="meta-llama/Llama-3.2-1B"
 export PROMPT="Explain how LLM works."
 curl -s -X POST http://127.0.0.1:${PORT}/v1/completions \
   -H "Content-Type: application/json" \
@@ -53,7 +54,7 @@ curl -s -X POST http://127.0.0.1:${PORT}/v1/completions \
 ```
 bash start_two_models.sh \
   --engine-a vllm --engine-b vllm \
-  --model-a meta-llama/Llama-3.2-1B-Instruct --port-a 12346 \
+  --model-a meta-llama/Llama-3.2-1B --port-a 12346 \
   --model-b Qwen/Qwen3-0.6B        --port-b 12347 \
   --venv-vllm-path ${VENV_PATH}
 ```

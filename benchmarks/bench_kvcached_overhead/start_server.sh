@@ -18,6 +18,7 @@ if [ "$op" == "vllm" ]; then
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
     vllm serve "$MODEL" \
+    --disable-log-requests \
     --no-enable-prefix-caching \
     --port="$VLLM_PORT"
 elif [ "$op" == "sgl" -o "$op" == "sglang" ]; then
