@@ -24,6 +24,7 @@ from kvcached.vmm_ops import kv_tensors_created
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
 def synchronized(method):
@@ -52,6 +53,7 @@ class KVCacheManager:
         async_sched: bool = False,
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
+        group_id: int = 0,
     ):
         """
         Args:
@@ -66,12 +68,15 @@ class KVCacheManager:
                 first block is always reserved as padded tokens.
             num_kv_buffers: Number of KV buffers per layer (2 for MHA K+V,
                 1 for MLA combined KV).
+            group_id: KV cache group identifier for hybrid attention models.
+                Different groups have independent FTensors and page spaces.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
         self.reserve_null_block = reserve_null_block
+        self.group_id = group_id
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -87,6 +92,7 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             num_kv_buffers=self.num_kv_buffers,
+            group_id=self.group_id,
         )
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
@@ -122,9 +128,11 @@ class KVCacheManager:
                 pass
 
             if self.world_size > 1 or vllm_remote:
-                return broadcast_kv_tensors_created(self.world_size, self.pp_rank)
+                return broadcast_kv_tensors_created(
+                    self.world_size, self.pp_rank,
+                    group_id=self.group_id)
             else:
-                return kv_tensors_created()
+                return kv_tensors_created(group_id=self.group_id)
 
         try:
             total_wait = 0.0
@@ -367,6 +375,12 @@ class KVCacheManager:
 
         self._wait_post_init()
 
+        # Stop the prealloc thread first — it runs on the PageAllocator's
+        # lock and can grab pages between our trim/reset/reserve steps,
+        # causing the null-block reservation to get a non-zero block.
+        self.page_allocator._stop_prealloc_thread(
+            timeout=PREALLOC_THREAD_TIMEOUT)
+
         # Clear reserved blocks
         self.free_reserved()
 
@@ -384,12 +398,22 @@ class KVCacheManager:
         # Trim the page allocator to free up reserved pages
         self.trim()
 
+        # Reset the page allocator's free list to its original sorted order.
+        # After free_pages + trim, freed pages are appended to the END of
+        # free_page_list, so the order is scrambled.  This matters because
+        # _reserve_null_block() pops from the LEFT and expects to get page 0
+        # (which yields block 0 — the null block SGLang requires).
+        self.page_allocator.reset_free_page_order()
+
         self.target_num_blocks = None
         self.in_shrink = False
         self.num_avail_blocks = 0
 
         # Possibly reserve the first block as null block for padding tokens
         self._reserve_null_block()
+
+        # Restart the prealloc thread now that null block is safely reserved.
+        self.page_allocator.start_prealloc_thread()
 
     # Private methods
     @synchronized

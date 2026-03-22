@@ -179,7 +179,6 @@ run_vllm() {
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
     vllm serve "$model" \
-      --disable-log-requests \
       --no-enable-prefix-caching \
       --port "$port" \
       --tensor-parallel-size "$tp" \

@@ -4,7 +4,7 @@
   <br>
   <br>
   <p>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue"></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.9%E2%80%933.13-blue"></a>
     <img alt="Engines" src="https://img.shields.io/badge/Engines-SGLang%20%7C%20vLLM-blueviolet">
     <a href="https://yifanqiao.notion.site/Solve-the-GPU-Cost-Crisis-with-kvcached-289da9d1f4d68034b17bf2774201b141"><img alt="Blog" src="https://img.shields.io/badge/Blog-Read-FF5722?logo=rss&logoColor=white&labelColor=555555"></a>
     <a href="https://arxiv.org/abs/2508.08448"><img alt="arXiv: GPU OS vision" src="https://img.shields.io/badge/arXiv-GPU%20OS%20vision-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
@@ -38,6 +38,19 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **Memory control CLI**: enforce memory limits with kvcached CLI.
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
+
+## 📢 Updates
+
+- **[2026-02]** kvcached now supports **vLLM v0.16.0** and **SGLang v0.5.9**.
+MLA models (DeepSeek-V3, DeepSeek-V2 etc.) are supported in SGLang with both `page_size=1` and `page_size>1`.
+GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang (up to v0.5.6).
+
+### Supported engines and models
+
+| Engine | Versions | Attention types | Example models |
+|--------|----------|-----------------|----------------|
+| SGLang | ≥ v0.4.9 (tested up to v0.5.9) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b (up to v0.5.6), etc. |
+| vLLM | ≥ v0.8.4 (tested up to v0.16.0) | MHA / GQA | Llama 3.1/3.3, Qwen 2.5 |
 
 ## Example use cases
 
@@ -105,8 +118,8 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 
 ### Prerequisites
 
-- Python (tested with 3.9 - 3.12)
-- SGLang (tested with v0.5.3) or vLLM (tested with v0.11.0)
+- Python (tested with 3.9 - 3.13)
+- SGLang (tested with v0.5.9) or vLLM (tested with v0.16.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
@@ -130,8 +143,8 @@ python tools/dev_copy_pth.py
 kvcached installed with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.1-sglang-v0.5.3
-docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.1-vllm-v0.11.0
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.4-sglang-v0.5.9
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.4-vllm-v0.16.0
 ```
 
 We prepare an all-in-one docker for developers:
@@ -167,12 +180,12 @@ If you are using the engine-specific dockers, you can test kvcached by running t
 
 ```bash
 # for sglang
-python -m sglang.launch_server --model meta-llama/Llama-3.2-1B --disable-radix-cache --port 30000
-python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --disable-radix-cache --port 30000
+python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B-Instruct --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
 
 # for vllm
-vllm serve meta-llama/Llama-3.2-1B --disable-log-requests --no-enable-prefix-caching --port=12346
-vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts 1000 --port 12346
+vllm serve meta-llama/Llama-3.2-1B-Instruct --no-enable-prefix-caching --port=12346
+vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --num-prompts 1000 --port 12346
 ```
 
 > [!NOTE]
@@ -184,12 +197,15 @@ If you installed kvcached using its source code, you can also do the following:
 
 ```bash
 cd benchmarks/simple_bench
-./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
+./start_server.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B-Instruct
 # Wait until LLM server is ready
-./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B
+./start_client.sh [sglang|vllm] --venv-path $VENV_PATH --model meta-llama/Llama-3.2-1B-Instruct
 ```
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
+
+> [!TIP]
+> Starting from transformers >= 4.44, there is no fallback “default” chat template. If the tokenizer does not define a chat_template, `apply_chat_template` cannot be used without explicitly providing one. If you encounter chat template errors during its chat warmup at startup, use an Instruct model (e.g., `meta-llama/Llama-3.2-1B-Instruct`) instead of the base model.
 
 > [!NOTE]
 > We haven’t fully tested kvcached with every version of SGLang and vLLM (there are too many!). If you run into issues with a specific version, please open an issue---we'll look into it and fix it within a few hours.
@@ -238,6 +254,7 @@ kvcached is developed by many contributors from the community. Feel free to cont
 ```
 Jiarong Xing (jxing@rice.edu)
 Yifan Qiao (yifanqiao@berkeley.edu)
+Xingqi Cui (xc66@rice.edu)
 Shan Yu (shanyu1@g.ucla.edu)
 ```
 

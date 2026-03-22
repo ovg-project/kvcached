@@ -13,7 +13,6 @@ PORT=8000
 
 # Start vLLM server
 vllm serve "$MODEL" \
-    --disable-log-requests \
     --no-enable-prefix-caching \
     --gpu-memory-utilization 0.5 \
     --port="$PORT" \

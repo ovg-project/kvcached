@@ -120,14 +120,15 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
             try:
                 msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
+                group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    map_to_kv_tensors(msg["offsets"])
+                    map_to_kv_tensors(msg["offsets"], group_id=group_id)
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "unmap_from_kv_tensors":
-                    unmap_from_kv_tensors(msg["offsets"])
+                    unmap_from_kv_tensors(msg["offsets"], group_id=group_id)
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "kv_tensors_created":
-                    created: bool = kv_tensors_created()
+                    created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
                 else:
                     send_msg(conn, {
@@ -171,11 +172,13 @@ async def _send_and_receive_message(rank: int, message: Message, pp_rank: int = 
 
 async def _broadcast_map_to_kv_tensors(tp_size: int,
                                        offsets: list[int],
-                                       pp_rank: int = 0) -> None:
+                                       pp_rank: int = 0,
+                                       group_id: int = 0) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
     """
-    map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
+    map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets,
+                   "group_id": group_id}
     tasks = [
         _send_and_receive_message(rank, map_message, pp_rank) for rank in range(tp_size)
     ]
@@ -191,11 +194,13 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,
                                            offsets: list[int],
-                                           pp_rank: int = 0) -> None:
+                                           pp_rank: int = 0,
+                                           group_id: int = 0) -> None:
     """
     Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
     """
-    unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets}
+    unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets,
+                     "group_id": group_id}
     tasks = [
         _send_and_receive_message(rank, unmap_message, pp_rank)
         for rank in range(tp_size)
@@ -210,12 +215,14 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
             raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
 
 
-async def _broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0) -> bool:
+async def _broadcast_kv_tensors_created(tp_size: int,
+                                        pp_rank: int = 0,
+                                        group_id: int = 0) -> bool:
     """
     Broadcast the "kv_tensors_created" operation to all workers concurrently.
     Returns True if all workers report that KV tensors are created, False otherwise.
     """
-    check_message = {"cmd": "kv_tensors_created"}
+    check_message = {"cmd": "kv_tensors_created", "group_id": group_id}
     tasks = [
         _send_and_receive_message(rank, check_message, pp_rank)
         for rank in range(tp_size)
@@ -240,13 +247,21 @@ async def _broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0) -> bool:
 
 
 # Wrapper functions to call the async function from sync code
-def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int], pp_rank: int = 0) -> None:
-    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank))
+def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int],
+                                pp_rank: int = 0,
+                                group_id: int = 0) -> None:
+    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank,
+                                             group_id))
 
 
-def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int], pp_rank: int = 0) -> None:
-    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank))
+def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int],
+                                    pp_rank: int = 0,
+                                    group_id: int = 0) -> None:
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank,
+                                                 group_id))
 
 
-def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0) -> bool:
-    return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank))
+def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0,
+                                 group_id: int = 0) -> bool:
+    return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank,
+                                                     group_id))

@@ -10,7 +10,7 @@ Start the vLLM or SGLang engine server regularly. For example
 # Activate the same venv as the server if needed
 source /path/to/your/vllm-venv/bin/activate
 
-vllm serve Qwen/Qwen2.5-Math-1.5B --disable-log-requests --no-enable-prefix-caching --port=12346
+vllm serve Qwen/Qwen2.5-Math-1.5B --no-enable-prefix-caching --port=12346
 python -m sglang.launch_server --model Qwen/Qwen2.5-Math-1.5B --disable-radix-cache --port 30000
 ```
 

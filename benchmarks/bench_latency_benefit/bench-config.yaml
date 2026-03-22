@@ -34,7 +34,6 @@ instances: # instances configuration
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
       - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
     engine_args:
-      - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=12346"
@@ -55,7 +54,6 @@ instances: # instances configuration
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
       - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
     engine_args:
-      - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=30000"
@@ -76,7 +74,6 @@ instances: # instances configuration
       - "VLLM_ATTENTION_BACKEND=FLASH_ATTN"
       - "VLLM_SERVER_DEV_MODE=1" # To enable model sleep
     engine_args:
-      - "--disable-log-requests"
       - "--no-enable-prefix-caching"
       - "--host=localhost"
       - "--port=40000"

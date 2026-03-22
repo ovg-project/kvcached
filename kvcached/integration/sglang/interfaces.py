@@ -68,8 +68,9 @@ def alloc_kv_cache(
     device: str,
     num_layers: int,
     page_size: int = 1,
-    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
+    attention_type: str = "MHA",  # GQA is also supported.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
+    group_id: int = 0,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -101,7 +102,7 @@ def alloc_kv_cache(
 
     raw_kv_tensors = create_kv_tensors(
         gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,
-        num_kv_buffers=num_k_or_v,
+        num_kv_buffers=num_k_or_v, group_id=group_id,
     )
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_size
@@ -139,6 +140,7 @@ def alloc_mla_kv_cache(
     device: str,
     num_layers: int,
     page_size: int = 1,
+    group_id: int = 0,
 ) -> List[torch.Tensor]:
     """Allocate MLA-style KV cache with a single combined kv_buffer per layer.
 
@@ -168,7 +170,7 @@ def alloc_mla_kv_cache(
 
     raw_kv_tensors = create_kv_tensors(
         gpu_mem_bytes_per_layer * num_k_or_v, dtype.itemsize, device, num_layers,
-        num_kv_buffers=num_k_or_v,
+        num_kv_buffers=num_k_or_v, group_id=group_id,
     )
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer // block_mem_size
@@ -204,6 +206,7 @@ def get_kv_cache_manager(
     num_layers: int,
     reserve_null_block: bool = True,
     num_kv_buffers: int = 2,
+    group_id: int = 0,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -218,4 +221,5 @@ def get_kv_cache_manager(
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
+        group_id=group_id,
     )

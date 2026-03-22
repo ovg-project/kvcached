@@ -17,8 +17,11 @@ namespace kvcached {
 // Global configurable page size
 size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 
-std::unique_ptr<FTensorAllocator> FTensorAllocator::g_allocator_;
+std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
+    FTensorAllocator::g_allocators_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
+torch::Device FTensorAllocator::g_device_(torch::kCPU);
+bool FTensorAllocator::g_contiguous_layout_ = false;
 
 static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
                                                      page_id_t page_id,
@@ -61,9 +64,9 @@ void FTensorAllocator::destroy() {
 void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
                             bool contiguous_layout) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
-  if (g_allocator_) {
+  if (!g_allocators_.empty()) {
     LOGE("FTensorAllocator has been initialized. Re-initializing...")
-    g_allocator_.reset();
+    g_allocators_.clear();
   }
 
   // Set global page size if provided (0 means use default)
@@ -79,20 +82,30 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   }
 
   auto device = torch::Device(dev_str);
-  g_allocator_ = std::make_unique<FTensorAllocator>(device, contiguous_layout);
+  g_device_ = device;
+  g_contiguous_layout_ = contiguous_layout;
+  g_allocators_[0] =
+      std::make_unique<FTensorAllocator>(device, contiguous_layout);
 }
 
-FTensorAllocator *FTensorAllocator::global_allocator() {
+FTensorAllocator *FTensorAllocator::global_allocator(int64_t group_id) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
-  assert(g_allocator_);
-  return g_allocator_.get();
+  auto it = g_allocators_.find(group_id);
+  if (it == g_allocators_.end()) {
+    // Lazily create a new allocator for this group,
+    // using the device/layout from init().
+    assert(!g_allocators_.empty() &&
+           "FTensorAllocator::init() must be called first");
+    g_allocators_[group_id] =
+        std::make_unique<FTensorAllocator>(g_device_, g_contiguous_layout_);
+    return g_allocators_[group_id].get();
+  }
+  return it->second.get();
 }
 
 void FTensorAllocator::shutdown() {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
-  if (g_allocator_) {
-    g_allocator_.reset();
-  }
+  g_allocators_.clear();
 }
 
 std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(

@@ -161,7 +161,7 @@ class LLMRouter:
                 request_stats,
                 success=False,
                 error_message="Session not initialized")
-            raise Exception("Session not initialised")
+            raise Exception("Session not initialized")
 
         try:
             url = f"{endpoint.base_url}{endpoint_path}"
@@ -249,7 +249,7 @@ class LLMRouter:
         health_status = {}
 
         if self.session is None or self.session.closed:
-            raise Exception("Session not initialised")
+            raise Exception("Session not initialized")
 
         endpoint = model_config.endpoint
         try:

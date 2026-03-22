@@ -1,11 +1,14 @@
 #!/bin/bash
 set -ex
 
+# Ensure Ctrl+C kills all background benchmark clients
+trap 'echo "Caught interrupt, killing all benchmark clients..."; kill $(jobs -p) 2>/dev/null; exit 1' INT TERM
+
 # Set environment variables
 export KVCACHED_IPC_NAME=VLLM
 
 # Add vLLM benchmarks and kvcached to Python path
-export PYTHONPATH="../../engine_integration/vllm-v0.9.2/benchmarks:../../:../../benchmarks:$PYTHONPATH"
+export PYTHONPATH="../../:../../benchmarks:$PYTHONPATH"
 
 # Benchmark parameters
 PROMPT_LEN=256
@@ -81,8 +84,7 @@ for i in "${!MODELS[@]}"; do
 
     echo "Starting benchmark for $MODEL (Model ${MODEL_INDEX}) on port $PORT..."
 
-    NUM_PROMPTS=$((NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY))
-    # Use ramp-up-down strategy
+    MODEL_NUM_PROMPTS=$((NUM_PROMPTS + (NUM_MODELS - i) * MODEL_DELAY * RAMP_END_RPS))
     echo "Using ramp-up-down strategy: ${RAMP_START_RPS} -> ${RAMP_PEAK_RPS} -> ${RAMP_END_RPS} RPS (increment: ±${RAMP_INCREMENT} RPS/sec)"
 
     python bench_kvcached_vllm.py \
@@ -91,7 +93,7 @@ for i in "${!MODELS[@]}"; do
         --dataset-name random \
         --random-input-len "$PROMPT_LEN" \
         --random-output-len "$COMPLETION_LEN" \
-        --num-prompts "$NUM_PROMPTS" \
+        --num-prompts "$MODEL_NUM_PROMPTS" \
         --host "localhost" \
         --port "$PORT" \
         --endpoint "/v1/completions" \

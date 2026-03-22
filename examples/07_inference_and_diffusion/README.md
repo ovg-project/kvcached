@@ -28,7 +28,7 @@ Launches an LLM server (vLLM or SGLang) with kvcached integration.
 
 ```bash
 ./start_llm_server.sh <engine> [--venv-path PATH] [--port PORT] [--model MODEL_ID] [--tp TP_SIZE]
-# Example: ./start_llm_server.sh vllm --model meta-llama/Llama-3.2-1B --port 12346
+# Example: ./start_llm_server.sh vllm --model meta-llama/Llama-3.2-1B-Instruct --port 12346
 ```
 
 ### `start_llm_client.sh`
@@ -64,7 +64,7 @@ Benchmarks the LLM server with ShareGPT dataset.
 4. **Run LLM server only:**
 
    ```bash
-   ./start_llm_server.sh [sglang|vllm] --model meta-llama/Llama-3.2-1B --port 12346
+   ./start_llm_server.sh [sglang|vllm] --model meta-llama/Llama-3.2-1B-Instruct --port 12346
    # Must launch LLM client manually to start sending requests to the LLM server:
    # e.g.,
    # ./start_llm_client.sh [sglang|vllm]
