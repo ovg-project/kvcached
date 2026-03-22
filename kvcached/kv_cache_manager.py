@@ -121,7 +121,10 @@ class KVCacheManager:
         def _check_kv_tensors_created():
             vllm_remote = False
             try:
-                from kvcached.integration.vllm.interfaces import _kvcached_initialized as vllm_inited, _is_worker
+                from kvcached.integration.vllm.interfaces import (
+                    _is_worker,
+                    _kvcached_initialized as vllm_inited,
+                )
                 if vllm_inited and not _is_worker:
                     vllm_remote = True
             except ImportError:

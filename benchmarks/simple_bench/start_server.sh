@@ -154,7 +154,7 @@ elif [ "$engine" == "sgl" -o "$engine" == "sglang" ]; then
         export TORCHDYNAMO_DISABLE=1
         SGL_L4_ARGS="--attention-backend torch_native"
     fi
-    
+
     # SGLang uses python requests to check localhost:30000 at startup.
     # Exclude localhost from proxy so it doesn't try to route through Squid.
     export no_proxy="localhost,127.0.0.1,::1"
