@@ -159,6 +159,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 # Prefix cache: hash -> KVCacheBlock object (direct lookup)
                 self._cached_blocks: dict[Any, "KVCacheBlock"] = {}
+                # Reverse index: block_id -> hash for O(1) eviction
+                self._block_id_to_hash: dict[int, Any] = {}
+                self._warned_multi_group = False
 
             def get_cached_block(
                 self,
@@ -169,8 +172,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     return None
 
                 if len(kv_cache_group_ids) > 1:
-                    logger.warning(f"ElasticBlockPool only supports single KV cache group, "
-                                  f"got {len(kv_cache_group_ids)} groups")
+                    if not self._warned_multi_group:
+                        logger.warning("ElasticBlockPool only supports single KV cache group, "
+                                      f"got {len(kv_cache_group_ids)} groups")
+                        self._warned_multi_group = True
                     return None
 
                 block = self._cached_blocks.get(block_hash)
@@ -212,6 +217,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         continue
 
                     self._cached_blocks[block_hash] = block
+                    self._block_id_to_hash[block.block_id] = block_hash
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -228,6 +234,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def touch(
                 self, blocks: list["KVCacheBlock"] | tuple[list["KVCacheBlock"], ...]
             ) -> None:
+                if not self.enable_prefix_cache:
+                    return
                 if isinstance(blocks, tuple):
                     for block_list in blocks:
                         for block in block_list:
@@ -259,35 +267,34 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         block_id = block.block_id
                         blocks_to_free.append(block_id)
                 if blocks_to_free:
-                    # Remove freed blocks from cache to prevent
-                    # stale hits on unmapped memory
-                    to_remove = [
-                        h for h, b in self._cached_blocks.items()
-                        if b.block_id in blocks_to_free
-                    ]
-                    for h in to_remove:
-                        del self._cached_blocks[h]
+                    # Remove freed blocks from cache via reverse index (O(1) per block)
+                    for bid in blocks_to_free:
+                        h = self._block_id_to_hash.pop(bid, None)
+                        if h is not None:
+                            self._cached_blocks.pop(h, None)
                     self.kv_cache_manager.free(blocks_to_free)
 
             def evict_blocks(self, block_ids: set[int]) -> None:
                 if not self.enable_prefix_cache:
                     return
 
-                # Remove from cache lookup so future requests won't hit these
-                to_remove = []
-                for block_hash, block in self._cached_blocks.items():
-                    if block.block_id in block_ids:
-                        to_remove.append(block_hash)
-                for block_hash in to_remove:
-                    del self._cached_blocks[block_hash]
+                # Remove from cache via reverse index (O(1) per block)
+                removed = 0
+                for bid in block_ids:
+                    h = self._block_id_to_hash.pop(bid, None)
+                    if h is not None:
+                        self._cached_blocks.pop(h, None)
+                        removed += 1
 
-                logger.debug(f"Evicted {len(to_remove)} blocks from prefix cache")
+                if removed:
+                    logger.debug(f"Evicted {removed} blocks from prefix cache")
 
             def reset_prefix_cache(self) -> bool:
                 if not self.enable_prefix_cache:
                     return True
 
                 self._cached_blocks.clear()
+                self._block_id_to_hash.clear()
                 logger.info("Prefix cache reset")
                 return True
 
@@ -517,7 +524,11 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         def _setup_kvcached_manager(self, kv_cache_config: Any) -> None:
             enable_caching = getattr(self, "enable_caching", False)
             if enable_caching:
-                logger.info("Prefix caching enabled for kvcached")
+                # v0.8 scheduler may not wire cache_full_blocks / block_hashes
+                # the same way as v0.9+; disable until verified.
+                logger.warning(
+                    "Prefix caching not yet supported for kvcached on vLLM v0.8.x, disabling")
+                enable_caching = False
 
             # Import ElasticBlockPool from the patched module
             import importlib
