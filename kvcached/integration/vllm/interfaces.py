@@ -20,18 +20,20 @@ logger = get_kvcached_logger()
 _kvcached_initialized: bool = False
 _kvcached_device = None
 _async_sched = False
-_tp_size: int = 1
+_world_size: int = 1
+_pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
-
+_is_worker: bool = False
 
 def init_kvcached(
     tp_rank: int = 0,
-    tp_size: int = 1,
+    world_size: int = 1,
+    pp_rank: int = 0,
     is_worker: bool = False,
     device: Optional[str] = None,
     async_sched: bool = False,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _tp_size, _async_sched
+    global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank, _is_worker
     if _kvcached_initialized:
         return
 
@@ -41,12 +43,15 @@ def init_kvcached(
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
     _kvcached_device = device
-    _tp_size = tp_size
+    _world_size = world_size
+    _pp_rank = pp_rank
     _async_sched = async_sched
+    _is_worker = is_worker
 
-    if tp_size > 1 and is_worker:
-        # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(tp_rank)
+    if is_worker:
+        # start the listener thread for kv cache management regardless of TP size
+        # because the vLLM EngineCore might need to reach this worker if PP > 1
+        start_worker_listener_thread(tp_rank, pp_rank)
 
 
 def shutdown_kvcached() -> None:
@@ -61,50 +66,77 @@ def shutdown_kvcached() -> None:
 
 
 def alloc_kv_cache(
-    kvcache_shape: Tuple[int, ...],  # (2, num_blocks, block_size, head_num, head_dim)
+    kvcache_shape: Tuple[int, ...],
     block_size: int,
     dtype: torch.dtype,
     device: str,
     num_layers: int,
-    attention_type: str = "MHA",  # GQA is also supported. TODO: support MLA
+    attention_type: str = "MHA",  # MHA, GQA, or MLA.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
     group_id: int = 0,
 ) -> List[torch.Tensor]:
+    """Allocate KV cache tensors for all supported attention types.
+
+    For MHA/GQA, kvcache_shape is expected to be:
+      - FlashAttn:  (2, num_blocks, block_size, head_num, head_dim)
+      - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
+    For MLA, kvcache_shape is expected to be:
+      - (num_blocks, block_size, head_size)
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA"]:
+    if attention_type not in ["MHA", "GQA", "MLA"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
-    num_k_or_v = 2
 
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
-    if (len(kvcache_shape) <= 3 or (kvcache_shape[0] != num_k_or_v and kvcache_shape[1] != num_k_or_v
-    ) or kvcache_shape[2] != block_size):
-        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+    is_mla = attention_type == "MLA"
+    num_k_or_v = 1 if is_mla else 2
 
-    # FlashAttn (num_k_or_v, num_blocks, block_size, head_num, head_dim)
-    if kvcache_shape[0] == num_k_or_v:
-        blocks_dim_idx = 1
-        permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
-    # FlashInfer (num_blocks, num_k_or_v, block_size, head_num, head_dim)
-    elif kvcache_shape[1] == num_k_or_v:
+    # --- Validate shape and determine layout indices ---
+    if is_mla:
+        # MLA shape: (num_blocks, block_size, head_size)
+        if len(kvcache_shape) <= 2:
+            raise ValueError(f"Unsupported MLA kv cache shape: {kvcache_shape}")
+        if kvcache_shape[1] != block_size:
+            raise ValueError(
+                f"block_size mismatch: kvcache_shape[1]={kvcache_shape[1]} != block_size={block_size}"
+            )
         blocks_dim_idx = 0
-        permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+        permute_order = list(range(len(kvcache_shape)))
+        block_mem_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize
     else:
-        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+        # MHA/GQA shape with K/V dimension
+        if (len(kvcache_shape) <= 3
+                or (kvcache_shape[0] != num_k_or_v and kvcache_shape[1] != num_k_or_v)
+                or kvcache_shape[2] != block_size):
+            raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+        # FlashAttn (num_k_or_v, num_blocks, block_size, head_num, head_dim)
+        if kvcache_shape[0] == num_k_or_v:
+            blocks_dim_idx = 1
+            permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
+        # FlashInfer (num_blocks, num_k_or_v, block_size, head_num, head_dim)
+        elif kvcache_shape[1] == num_k_or_v:
+            blocks_dim_idx = 0
+            permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+        else:
+            raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+        block_mem_bytes = math.prod(kvcache_shape[2:]) * dtype.itemsize
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
     assert torch.cuda.is_available(), "CUDA is not available."
 
+    # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # round down to page size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
-    block_mem_bytes = math.prod(kvcache_shape[2:]) * dtype.itemsize
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
     if requested_num_blocks > num_blocks_per_layer:
         logger.warning(
@@ -118,19 +150,22 @@ def alloc_kv_cache(
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
+
+    # --- Reshape raw tensors into per-layer KV cache views ---
     if not _contiguous_layout:
         num_eles = math.prod(actual_kvcache_shape)
-        kv_tensors = [
-            t.view(dtype=dtype)[:num_eles].view(tuple(actual_kvcache_shape)) for t in raw_kv_tensors
+        kv_tensors: List[torch.Tensor] = [
+            t.view(dtype=dtype)[:num_eles].view(actual_kvcache_shape) for t in raw_kv_tensors
         ]
     else:
-        contiguous_shape = (num_blocks_per_layer, num_layers, num_k_or_v, *actual_kvcache_shape[2:])
+        layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+        contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         kv_tensors = [
-            contiguous_tensor[:, i, :, :, :].permute(*permute_order)
-            for i in range(num_layers)
+            contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
+
     return kv_tensors
 
 
@@ -150,7 +185,8 @@ def get_kv_cache_manager(
         block_size,
         cell_size,
         num_layers,
-        _tp_size,
+        _world_size,
+        pp_rank=_pp_rank,
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,

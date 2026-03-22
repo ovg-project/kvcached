@@ -135,7 +135,8 @@ class PageAllocator:
                  num_layers: int,
                  mem_size_per_layer: int,
                  page_size: int,
-                 tp_size: int = 1,
+                 world_size: int = 1,
+                 pp_rank: int = 0,
                  async_sched: bool = False,
                  contiguous_layout: bool = CONTIGUOUS_LAYOUT,
                  enable_page_prealloc: bool = PAGE_PREALLOC_ENABLED,
@@ -146,7 +147,8 @@ class PageAllocator:
             num_layers: Number of layers (for physical memory calculation).
             mem_size_per_layer: Memory size per layer per K/V tensor in bytes.
             page_size: Page size in bytes.
-            tp_size: Tensor parallel size.
+            world_size: Tensor parallel world size within a pipeline stage.
+            pp_rank: Pipeline parallel rank (for IPC socket namespacing).
             async_sched: Whether asynchronous scheduling is enabled.
             contiguous_layout: Whether to use contiguous layout.
             enable_page_prealloc: Whether to enable page preallocation.
@@ -161,7 +163,7 @@ class PageAllocator:
             f"mem_size_per_layer={mem_size_per_layer//(1024*1024)}MB, "
             f"total_mem_size={num_kv_buffers * num_layers * mem_size_per_layer//(1024*1024)}MB, "
             f"page_size={page_size//(1024*1024)}MB, "
-            f"tp_size={tp_size}, "
+            f"world_size={world_size}, "
             f"async_sched={async_sched}, "
             f"contiguous_layout={contiguous_layout}, "
             f"enable_prealloc={enable_page_prealloc}")
@@ -171,7 +173,8 @@ class PageAllocator:
         self.num_layers = num_layers
         self.mem_size_per_layer = mem_size_per_layer
         self.page_size = page_size
-        self.tp_size = tp_size
+        self.world_size = world_size
+        self.pp_rank = pp_rank
         self.async_sched = async_sched
         self.contiguous_layout = contiguous_layout
         self.num_kv_buffers = num_kv_buffers
@@ -543,8 +546,8 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:  # map pages across all tensor parallel workers.
-            broadcast_map_to_kv_tensors(self.tp_size, offsets,
+        if self.world_size > 1:  # map pages across all tensor parallel workers.
+            broadcast_map_to_kv_tensors(self.world_size, offsets, self.pp_rank,
                                         group_id=self.group_id)
         else:
             map_to_kv_tensors(offsets, group_id=self.group_id)
@@ -557,8 +560,9 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.tp_size > 1:  # unmap pages across all tensor parallel workers.
-            broadcast_unmap_from_kv_tensors(self.tp_size, offsets,
+        if self.world_size > 1:  # unmap pages across all tensor parallel workers.
+            broadcast_unmap_from_kv_tensors(self.world_size, offsets,
+                                            self.pp_rank,
                                             group_id=self.group_id)
         else:
             if self.async_sched:
