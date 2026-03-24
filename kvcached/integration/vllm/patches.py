@@ -8,6 +8,7 @@ vLLM-specific patches using unified patch infrastructure.
 from __future__ import annotations
 
 import types
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -161,6 +162,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self._cached_blocks: dict[Any, "KVCacheBlock"] = {}
                 # Reverse index: block_id -> hash for O(1) eviction
                 self._block_id_to_hash: dict[int, Any] = {}
+                # LRU evictable pool: blocks with ref_cnt==0 retained for
+                # cross-request prefix reuse. Insertion order = LRU order.
+                self._evictable_blocks: OrderedDict[int, "KVCacheBlock"] = OrderedDict()
                 self._warned_multi_group = False
 
             def get_cached_block(
@@ -219,12 +223,33 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self._cached_blocks[block_hash] = block
                     self._block_id_to_hash[block.block_id] = block_hash
 
+            def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
+                """Evict oldest blocks from evictable pool, free to kvcached.
+
+                Returns the number of blocks actually evicted.
+                """
+                ids_to_free: list[int] = []
+                for _ in range(min(num_to_evict, len(self._evictable_blocks))):
+                    bid, _block = self._evictable_blocks.popitem(last=False)
+                    h = self._block_id_to_hash.pop(bid, None)
+                    if h is not None:
+                        self._cached_blocks.pop(h, None)
+                    ids_to_free.append(bid)
+                if ids_to_free:
+                    self.kv_cache_manager.free(ids_to_free)
+                return len(ids_to_free)
+
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list["KVCacheBlock"]:
                 if num_blocks > self.get_num_free_blocks():
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
+
+                # Evict cached blocks if kvcached doesn't have enough free space
+                kvcached_free = self.kv_cache_manager.available_size()
+                if kvcached_free < num_blocks and self._evictable_blocks:
+                    self._evict_blocks_from_pool(num_blocks - kvcached_free)
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
@@ -240,9 +265,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     for block_list in blocks:
                         for block in block_list:
                             block.ref_cnt += 1
+                            # Reactivate: remove from evictable pool
+                            self._evictable_blocks.pop(block.block_id, None)
                 else:
                     for block in blocks:
                         block.ref_cnt += 1
+                        self._evictable_blocks.pop(block.block_id, None)
 
             def free_blocks(
                 self,
@@ -258,34 +286,38 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         self.kv_cache_manager.free(block_ids)
                     return
 
-                blocks_to_free = []
+                uncached_to_free: list[int] = []
                 for block in ordered_blocks:
                     if block is None:
                         continue
                     block.ref_cnt -= 1
                     if block.ref_cnt == 0:
-                        block_id = block.block_id
-                        blocks_to_free.append(block_id)
-                if blocks_to_free:
-                    # Remove freed blocks from cache via reverse index (O(1) per block)
-                    for bid in blocks_to_free:
-                        h = self._block_id_to_hash.pop(bid, None)
-                        if h is not None:
-                            self._cached_blocks.pop(h, None)
-                    self.kv_cache_manager.free(blocks_to_free)
+                        if block.block_id in self._block_id_to_hash:
+                            # Cached block: retain for cross-request reuse
+                            self._evictable_blocks[block.block_id] = block
+                        else:
+                            # Uncached block (e.g. partial): free immediately
+                            uncached_to_free.append(block.block_id)
+                if uncached_to_free:
+                    self.kv_cache_manager.free(uncached_to_free)
 
             def evict_blocks(self, block_ids: set[int]) -> None:
                 if not self.enable_prefix_cache:
                     return
 
-                # Remove from cache via reverse index (O(1) per block)
                 removed = 0
+                ids_to_free: list[int] = []
                 for bid in block_ids:
                     h = self._block_id_to_hash.pop(bid, None)
                     if h is not None:
                         self._cached_blocks.pop(h, None)
                         removed += 1
+                    if bid in self._evictable_blocks:
+                        self._evictable_blocks.pop(bid)
+                        ids_to_free.append(bid)
 
+                if ids_to_free:
+                    self.kv_cache_manager.free(ids_to_free)
                 if removed:
                     logger.debug(f"Evicted {removed} blocks from prefix cache")
 
@@ -293,13 +325,19 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if not self.enable_prefix_cache:
                     return True
 
+                # Free all evictable blocks back to kvcached
+                if self._evictable_blocks:
+                    ids_to_free = list(self._evictable_blocks.keys())
+                    self._evictable_blocks.clear()
+                    self.kv_cache_manager.free(ids_to_free)
+
                 self._cached_blocks.clear()
                 self._block_id_to_hash.clear()
                 logger.info("Prefix cache reset")
                 return True
 
             def get_num_free_blocks(self) -> int:
-                return self.kv_cache_manager.available_size()
+                return self.kv_cache_manager.available_size() + len(self._evictable_blocks)
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
