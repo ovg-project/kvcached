@@ -525,6 +525,6 @@ class TestEdgeCases:
         pool, mgr = pool_factory(100)
         assert pool.get_usage() == 0.0
 
-        # blocks = pool.get_new_blocks(50)
+        blocks = pool.get_new_blocks(50)
         # 50 allocated from kvcached, 0 evictable -> 50 free from kvcached + 0 evictable
         assert pool.get_usage() == pytest.approx(0.5)
