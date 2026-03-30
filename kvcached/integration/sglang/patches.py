@@ -8,7 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import inspect
 import math
 import types
-from typing import Any, Union
+from typing import Any, List, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
@@ -451,20 +451,24 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     if "cuda" not in self.device:
                         raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
-                    self.k_buffer, self.v_buffer = kvi.alloc_kv_cache(
-                        kvcache_shape=(
-                            self.size + self.page_size,
-                            self.head_num,
-                            self.head_dim,
+                    _kv_mha: Tuple[List[Any], List[Any]] = cast(
+                        Tuple[List[Any], List[Any]],
+                        kvi.alloc_kv_cache(
+                            kvcache_shape=(
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.head_dim,
+                            ),
+                            dtype=self.dtype,
+                            device=self.device,
+                            num_layers=self.layer_num,
+                            page_size=self.page_size,
+                            attention_type="MHA",
+                            kv_layout="NHD",
+                            group_id=self._group_id,
                         ),
-                        dtype=self.dtype,
-                        device=self.device,
-                        num_layers=self.layer_num,
-                        page_size=self.page_size,
-                        attention_type="MHA",
-                        kv_layout="NHD",
-                        group_id=self._group_id,
                     )
+                    self.k_buffer, self.v_buffer = _kv_mha
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.
@@ -610,16 +614,20 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     if "cuda" not in device:
                         raise ValueError("ElasticMLATokenToKVPool only supports cuda device")
-                    self.kv_buffer = kvi.alloc_mla_kv_cache(
-                        kvcache_shape=(
-                            size + page_size,
-                            1,
-                            self.kv_cache_dim,
+                    self.kv_buffer = cast(
+                        List[torch.Tensor],
+                        kvi.alloc_kv_cache(
+                            kvcache_shape=(
+                                size + page_size,
+                                1,
+                                self.kv_cache_dim,
+                            ),
+                            dtype=dtype,
+                            device=device,
+                            num_layers=layer_num,
+                            page_size=page_size,
+                            attention_type="MLA",
                         ),
-                        dtype=dtype,
-                        device=device,
-                        num_layers=layer_num,
-                        page_size=page_size,
                     )
 
                     self.data_ptrs = torch.tensor(

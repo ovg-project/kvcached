@@ -35,6 +35,12 @@ def init_kvcached(
 ) -> None:
     global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank, _is_worker
     if _kvcached_initialized:
+        # EngineCore call init_kvcached(is_worker=False) first. When TP=1 GPUModelRunner
+        # then calls init_kvcached(is_worker=True) in the same process; without this branch
+        # the early return would leave _is_worker False, so KVCacheManager would try Unix IPC
+        # (broadcast_kv_tensors_created) and fail with ENOENT on the socket path.
+        if is_worker and not _is_worker:
+            _is_worker = True
         return
 
     if device is None:
