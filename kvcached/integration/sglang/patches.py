@@ -12,7 +12,7 @@ from typing import Any, List, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
-from kvcached.utils import get_kvcached_logger
+from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
 
@@ -741,4 +741,72 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_wrapped)
         setattr(Scheduler, target_method_name, _wrapped)
+        return True
+
+
+class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
+    """Enforce KVCACHED_MAX_CACHED_TOKENS limit on SGLang's RadixCache.
+
+    After each finished request is inserted into the radix cache, if the
+    evictable (cached) size exceeds the configured limit, immediately evict
+    down to that limit.  This prevents the cache from consuming all KV pool
+    capacity and leaves headroom for running requests.
+
+    Set KVCACHED_MAX_CACHED_TOKENS to a positive integer to enable.
+    0 (default) means unlimited — this patch is a no-op in that case.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.radix_cache"
+    target_class = "RadixCache"
+    patch_name = "radix_cache_limit"
+
+    def apply(self, radix_cache_mod: types.ModuleType) -> bool:
+        if MAX_CACHED_TOKENS <= 0:
+            logger.debug(
+                "KVCACHED_MAX_CACHED_TOKENS not set — RadixCacheLimitPatch skipped"
+            )
+            return True  # Not an error; just not needed.
+
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_radix_cache_limit(radix_cache_mod)
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_radix_cache_limit(self, radix_cache_mod: types.ModuleType) -> bool:
+        RadixCache = self._get_target_class(radix_cache_mod)
+        if RadixCache is None:
+            return False
+
+        original_cache_finished = getattr(RadixCache, "cache_finished_req", None)
+        if original_cache_finished is None:
+            self.logger.warning("RadixCache.cache_finished_req not found")
+            return False
+
+        if self._is_already_patched(original_cache_finished):
+            self.logger.debug("RadixCache.cache_finished_req already patched")
+            return True
+
+        max_cached = MAX_CACHED_TOKENS
+
+        try:
+            from sglang.srt.mem_cache.radix_cache import EvictParams
+        except ImportError:
+            self.logger.warning("Could not import EvictParams from sglang")
+            return False
+
+        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+            original_cache_finished(self_rc, *args, **kwargs)
+            excess = self_rc.evictable_size_ - max_cached
+            if excess > 0:
+                self_rc.evict(EvictParams(num_tokens=excess))
+
+        self._mark_as_patched(_wrapped)
+        RadixCache.cache_finished_req = _wrapped  # type: ignore
+
+        logger.info(
+            f"[kvcached] RadixCache evictable size capped at "
+            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+        )
         return True
