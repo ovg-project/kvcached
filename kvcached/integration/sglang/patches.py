@@ -8,6 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import inspect
 import math
 import types
+from collections import OrderedDict
 from typing import Any, Union
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -74,23 +75,27 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if "cuda" not in device:
                         raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
                     self.kvcached_allocator = kvcache.kvcached_allocator
+                    # Prefix cache state (lazy eviction for cross-request reuse)
+                    self.enable_prefix_cache = getattr(kvcache, 'enable_prefix_cache', False)
+                    self._cached_blocks: dict = {}
+                    self._block_id_to_hash: dict = {}
+                    self._evictable_blocks: OrderedDict = OrderedDict()
                     logger.info(
                         f"[kvcached] ElasticTokenToKVPoolAllocator in use: size={size} "
-                        "(page_size=1 path)"
+                        f"(page_size=1, prefix_cache={'on' if self.enable_prefix_cache else 'off'})"
                     )
 
                 def available_size(self):
-                    # Cap at the pool's token capacity.  KVCacheManager
-                    # internally manages size+1 blocks (the extra slot is
-                    # the null/padding block) and considers physical GPU
-                    # memory availability, so its reported available_size
-                    # can slightly exceed the pool's declared size.
-                    # SGLang's SWATokenToKVPoolAllocator asserts
-                    # available <= size.
-                    return min(self.kvcached_allocator.available_size(),
-                               self.size)
+                    base = self.kvcached_allocator.available_size()
+                    if self.enable_prefix_cache:
+                        base += len(self._evictable_blocks)
+                    return min(base, self.size)
 
                 def alloc(self, need_size: int):
+                    if self.enable_prefix_cache:
+                        kvcached_free = self.kvcached_allocator.available_size()
+                        if kvcached_free < need_size and self._evictable_blocks:
+                            self._evict_blocks_from_pool(need_size - kvcached_free)
                     indices: list[int] = self.kvcached_allocator.alloc(need_size)
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
@@ -100,13 +105,92 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices: list[int] = free_index.cpu().numpy().tolist()
                         except Exception:
                             indices = list(free_index)
-                        return self.kvcached_allocator.free(indices)
+                        if not self.enable_prefix_cache:
+                            return self.kvcached_allocator.free(indices)
+                        uncached_to_free: list[int] = []
+                        for bid in indices:
+                            if bid in self._block_id_to_hash:
+                                self._evictable_blocks[bid] = bid
+                            else:
+                                uncached_to_free.append(bid)
+                        if uncached_to_free:
+                            self.kvcached_allocator.free(uncached_to_free)
                     else:
                         self.free_group.append(free_index)
 
                 def clear(self):
+                    self._cached_blocks.clear()
+                    self._block_id_to_hash.clear()
+                    self._evictable_blocks.clear()
                     if hasattr(self, "kvcached_allocator"):
                         self.kvcached_allocator.clear()
+
+                # -- Prefix cache API --
+
+                def get_cached_block(self, block_hash):
+                    """Return cached block ID for the given hash, or None."""
+                    if not self.enable_prefix_cache:
+                        return None
+                    return self._cached_blocks.get(block_hash)
+
+                def cache_full_blocks(self, block_ids, block_hashes):
+                    """Mark blocks as cached with their content hashes."""
+                    if not self.enable_prefix_cache:
+                        return
+                    for bid, bh in zip(block_ids, block_hashes):
+                        if bh in self._cached_blocks:
+                            continue
+                        self._cached_blocks[bh] = bid
+                        self._block_id_to_hash[bid] = bh
+
+                def touch(self, block_ids):
+                    """Reactivate cached blocks (remove from evictable pool)."""
+                    if not self.enable_prefix_cache:
+                        return
+                    for bid in block_ids:
+                        self._evictable_blocks.pop(bid, None)
+
+                def _evict_blocks_from_pool(self, num_to_evict):
+                    """Evict oldest blocks from evictable pool, free to kvcached."""
+                    ids_to_free: list[int] = []
+                    for _ in range(min(num_to_evict, len(self._evictable_blocks))):
+                        bid, _ = self._evictable_blocks.popitem(last=False)
+                        h = self._block_id_to_hash.pop(bid, None)
+                        if h is not None:
+                            self._cached_blocks.pop(h, None)
+                        ids_to_free.append(bid)
+                    if ids_to_free:
+                        self.kvcached_allocator.free(ids_to_free)
+                    return len(ids_to_free)
+
+                def evict_blocks(self, block_ids):
+                    """Explicitly evict specific blocks from cache."""
+                    if not self.enable_prefix_cache:
+                        return
+                    ids_to_free: list[int] = []
+                    for bid in block_ids:
+                        h = self._block_id_to_hash.pop(bid, None)
+                        if h is not None:
+                            self._cached_blocks.pop(h, None)
+                        if bid in self._evictable_blocks:
+                            self._evictable_blocks.pop(bid)
+                            ids_to_free.append(bid)
+                    if ids_to_free:
+                        self.kvcached_allocator.free(ids_to_free)
+
+                def reset_prefix_cache(self):
+                    """Clear all prefix cache state."""
+                    if self._evictable_blocks:
+                        ids_to_free = list(self._evictable_blocks.keys())
+                        self._evictable_blocks.clear()
+                        self.kvcached_allocator.free(ids_to_free)
+                    self._cached_blocks.clear()
+                    self._block_id_to_hash.clear()
+                    return True
+
+                def get_num_free_blocks(self):
+                    """Total free blocks including evictable pool."""
+                    return self.kvcached_allocator.available_size() + len(self._evictable_blocks)
 
             setattr(alloc_mod, "ElasticTokenToKVPoolAllocator", ElasticTokenToKVPoolAllocator)
             return True
@@ -165,19 +249,31 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    # Prefix cache state (lazy eviction at page level)
+                    self.enable_prefix_cache = getattr(kvcache, 'enable_prefix_cache', False)
+                    self._cached_blocks: dict = {}
+                    self._block_id_to_hash: dict = {}
+                    self._evictable_blocks: OrderedDict = OrderedDict()
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
-                        f"page_size={page_size}"
+                        f"page_size={page_size}, prefix_cache={'on' if self.enable_prefix_cache else 'off'}"
                     )
                     # Base class expects these tensors for backup_state / free_group_end
                     self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
                 def available_size(self):
-                    return self.kvcached_allocator.available_size() * self.page_size
+                    base = self.kvcached_allocator.available_size()
+                    if self.enable_prefix_cache:
+                        base += len(self._evictable_blocks)
+                    return base * self.page_size
 
                 def alloc(self, need_size: int):
                     num_pages = need_size // self.page_size
+                    if self.enable_prefix_cache:
+                        kvcached_free = self.kvcached_allocator.available_size()
+                        if kvcached_free < num_pages and self._evictable_blocks:
+                            self._evict_blocks_from_pool(num_pages - kvcached_free)
                     block_ids = self.kvcached_allocator.alloc(num_pages)
                     if block_ids is None:
                         return None
@@ -210,6 +306,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
 
                     if num_new_pages > 0:
+                        if self.enable_prefix_cache:
+                            kvcached_free = self.kvcached_allocator.available_size()
+                            if kvcached_free < num_new_pages and self._evictable_blocks:
+                                self._evict_blocks_from_pool(num_new_pages - kvcached_free)
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
                         if block_ids is None:
                             return None
@@ -249,6 +349,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
 
                     if num_new_pages > 0:
+                        if self.enable_prefix_cache:
+                            kvcached_free = self.kvcached_allocator.available_size()
+                            if kvcached_free < num_new_pages and self._evictable_blocks:
+                                self._evict_blocks_from_pool(num_new_pages - kvcached_free)
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
                         if block_ids is None:
                             return None
@@ -279,11 +383,23 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices: list[int] = page_ids.cpu().numpy().tolist()
                         except Exception:
                             indices = list(page_ids)
-                        return self.kvcached_allocator.free(indices)
+                        if not self.enable_prefix_cache:
+                            return self.kvcached_allocator.free(indices)
+                        uncached_to_free: list[int] = []
+                        for pid in indices:
+                            if pid in self._block_id_to_hash:
+                                self._evictable_blocks[pid] = pid
+                            else:
+                                uncached_to_free.append(pid)
+                        if uncached_to_free:
+                            self.kvcached_allocator.free(uncached_to_free)
                     else:
                         self.free_group.append(free_index)
 
                 def clear(self):
+                    self._cached_blocks.clear()
+                    self._block_id_to_hash.clear()
+                    self._evictable_blocks.clear()
                     if hasattr(self, "kvcached_allocator"):
                         self.kvcached_allocator.clear()
                     self.free_pages = torch.empty(
@@ -297,6 +413,73 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
 
                 def merge_and_sort_free(self):
                     pass  # No-op: kvcached manages the free list
+
+                # -- Prefix cache API --
+
+                def get_cached_block(self, block_hash):
+                    """Return cached page ID for the given hash, or None."""
+                    if not self.enable_prefix_cache:
+                        return None
+                    return self._cached_blocks.get(block_hash)
+
+                def cache_full_blocks(self, page_ids, block_hashes):
+                    """Mark pages as cached with their content hashes."""
+                    if not self.enable_prefix_cache:
+                        return
+                    for pid, bh in zip(page_ids, block_hashes):
+                        if bh in self._cached_blocks:
+                            continue
+                        self._cached_blocks[bh] = pid
+                        self._block_id_to_hash[pid] = bh
+
+                def touch(self, page_ids):
+                    """Reactivate cached pages (remove from evictable pool)."""
+                    if not self.enable_prefix_cache:
+                        return
+                    for pid in page_ids:
+                        self._evictable_blocks.pop(pid, None)
+
+                def _evict_blocks_from_pool(self, num_to_evict):
+                    """Evict oldest pages from evictable pool, free to kvcached."""
+                    ids_to_free: list[int] = []
+                    for _ in range(min(num_to_evict, len(self._evictable_blocks))):
+                        pid, _ = self._evictable_blocks.popitem(last=False)
+                        h = self._block_id_to_hash.pop(pid, None)
+                        if h is not None:
+                            self._cached_blocks.pop(h, None)
+                        ids_to_free.append(pid)
+                    if ids_to_free:
+                        self.kvcached_allocator.free(ids_to_free)
+                    return len(ids_to_free)
+
+                def evict_blocks(self, page_ids):
+                    """Explicitly evict specific pages from cache."""
+                    if not self.enable_prefix_cache:
+                        return
+                    ids_to_free: list[int] = []
+                    for pid in page_ids:
+                        h = self._block_id_to_hash.pop(pid, None)
+                        if h is not None:
+                            self._cached_blocks.pop(h, None)
+                        if pid in self._evictable_blocks:
+                            self._evictable_blocks.pop(pid)
+                            ids_to_free.append(pid)
+                    if ids_to_free:
+                        self.kvcached_allocator.free(ids_to_free)
+
+                def reset_prefix_cache(self):
+                    """Clear all prefix cache state."""
+                    if self._evictable_blocks:
+                        ids_to_free = list(self._evictable_blocks.keys())
+                        self._evictable_blocks.clear()
+                        self.kvcached_allocator.free(ids_to_free)
+                    self._cached_blocks.clear()
+                    self._block_id_to_hash.clear()
+                    return True
+
+                def get_num_free_blocks(self):
+                    """Total free pages including evictable pool."""
+                    return self.kvcached_allocator.available_size() + len(self._evictable_blocks)
 
             setattr(
                 alloc_mod,

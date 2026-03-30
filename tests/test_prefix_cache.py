@@ -28,10 +28,12 @@ sys.modules.setdefault("posix_ipc", mock.MagicMock())
 # Mock the C extension module and heavy submodules
 sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 
-# Pre-mock the interfaces module so mock.patch can resolve its attributes.
+# Pre-mock the interfaces modules so mock.patch can resolve their attributes.
 # This avoids importing torch / C extensions transitively via interfaces.py.
 _interfaces_mock = mock.MagicMock()
 sys.modules.setdefault("kvcached.integration.vllm.interfaces", _interfaces_mock)
+_sglang_interfaces_mock = mock.MagicMock()
+sys.modules.setdefault("kvcached.integration.sglang.interfaces", _sglang_interfaces_mock)
 
 import pytest  # noqa: E402
 
@@ -88,6 +90,26 @@ class MockRequest:
         self.block_hashes = block_hashes
 
 
+class MockBaseAllocator:
+    """Minimal stand-in for SGLang's BaseTokenToKVPoolAllocator."""
+
+    def __init__(self, size, page_size, dtype, device, kvcache, *args, **kwargs):
+        self.size = size
+        self.page_size = page_size
+        self.dtype = dtype
+        self.device = device
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+
+class MockKVPool:
+    """Minimal stand-in for SGLang's MHA/MLA memory pool (kvcache arg)."""
+
+    def __init__(self, kvcached_allocator, enable_prefix_cache=False):
+        self.kvcached_allocator = kvcached_allocator
+        self.enable_prefix_cache = enable_prefix_cache
+
+
 # ---------------------------------------------------------------------------
 # Fixture: create an ElasticBlockPool via the real patch injection
 # ---------------------------------------------------------------------------
@@ -141,6 +163,48 @@ def pool_factory():
 def pool_and_manager(pool_factory):
     """Convenience fixture: 100-block pool with caching enabled."""
     return pool_factory(100, True)
+
+
+# ---------------------------------------------------------------------------
+# SGLang fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sglang_alloc_factory():
+    """Factory that builds an SGLang ElasticTokenToKVPoolAllocator.
+
+    Returns (allocator, manager) so tests can inspect both.
+    """
+
+    def _make(num_blocks: int = 100, enable_prefix_cache: bool = True):
+        manager = MockKVCacheManager(num_blocks)
+
+        # Build a mock module that looks like sglang.srt.mem_cache.allocator
+        mock_mod = types.ModuleType("mock_allocator")
+        mock_mod.BaseTokenToKVPoolAllocator = MockBaseAllocator  # type: ignore[attr-defined]
+
+        from kvcached.integration.sglang.patches import ElasticAllocatorPatch
+
+        patch = ElasticAllocatorPatch()
+        # Call the injection method directly, bypassing version detection.
+        patch.inject_elastic_allocator(mock_mod)
+
+        ElasticAllocator = mock_mod.ElasticTokenToKVPoolAllocator  # type: ignore[attr-defined]
+
+        kvcache = MockKVPool(manager, enable_prefix_cache)
+        allocator = ElasticAllocator(
+            size=num_blocks, dtype=None, device="cuda", kvcache=kvcache
+        )
+
+        return allocator, manager
+
+    return _make
+
+
+@pytest.fixture
+def sglang_alloc_and_manager(sglang_alloc_factory):
+    """Convenience fixture: 100-block SGLang allocator with prefix cache enabled."""
+    return sglang_alloc_factory(100, True)
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +589,278 @@ class TestEdgeCases:
         pool, mgr = pool_factory(100)
         assert pool.get_usage() == 0.0
 
-        blocks = pool.get_new_blocks(50)
+        pool.get_new_blocks(50)
         # 50 allocated from kvcached, 0 evictable -> 50 free from kvcached + 0 evictable
         assert pool.get_usage() == pytest.approx(0.5)
+
+
+# ===========================================================================
+# SGLang prefix cache tests
+# ===========================================================================
+
+def _sglang_simulate_request(alloc, mgr, hashes):
+    """Allocate blocks via the manager, cache them in the allocator."""
+    block_ids = mgr.alloc(len(hashes))
+    alloc.cache_full_blocks(block_ids, hashes)
+    return block_ids
+
+
+def _sglang_finish_request(alloc, block_ids):
+    """Free blocks through the allocator (lazy eviction path)."""
+    alloc.free(block_ids)
+
+
+class TestSGLangLazyEviction:
+    """SGLang allocator: cached blocks stay in evictable pool for reuse."""
+
+    def test_cross_request_cache_hit(self, sglang_alloc_and_manager):
+        """After freeing cached blocks, they are still retrievable."""
+        alloc, mgr = sglang_alloc_and_manager
+        hashes = ["h0", "h1", "h2", "h3"]
+
+        block_ids = _sglang_simulate_request(alloc, mgr, hashes)
+        _sglang_finish_request(alloc, block_ids)
+
+        assert len(alloc._evictable_blocks) == 4
+        assert len(alloc._cached_blocks) == 4
+
+        for h in hashes:
+            assert alloc.get_cached_block(h) is not None
+
+    def test_evictable_blocks_not_freed_to_kvcached(self, sglang_alloc_and_manager):
+        """Evictable blocks hold their kvcached allocation (pages stay mapped)."""
+        alloc, mgr = sglang_alloc_and_manager
+        initial_free = mgr.available_size()
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1"])
+        alloc_free = mgr.available_size()
+        assert alloc_free == initial_free - 2
+
+        _sglang_finish_request(alloc, block_ids)
+        # Blocks in evictable pool: kvcached free should NOT increase
+        assert mgr.available_size() == alloc_free
+
+    def test_uncached_blocks_freed_immediately(self, sglang_alloc_and_manager):
+        """Blocks that were never cached are freed to kvcached on free()."""
+        alloc, mgr = sglang_alloc_and_manager
+        initial_free = mgr.available_size()
+
+        # Allocate but do NOT cache
+        block_ids = mgr.alloc(3)
+        assert mgr.available_size() == initial_free - 3
+
+        alloc.free(block_ids)
+        # Not cached -> freed immediately
+        assert len(alloc._evictable_blocks) == 0
+        assert mgr.available_size() == initial_free
+
+    def test_touch_removes_from_evictable_pool(self, sglang_alloc_and_manager):
+        """Touching an evictable block reactivates it."""
+        alloc, mgr = sglang_alloc_and_manager
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1"])
+        _sglang_finish_request(alloc, block_ids)
+        assert len(alloc._evictable_blocks) == 2
+
+        # Simulate cache hit -> touch the first block
+        alloc.touch([block_ids[0]])
+        assert block_ids[0] not in alloc._evictable_blocks
+        assert len(alloc._evictable_blocks) == 1
+
+
+class TestSGLangEvictOnDemand:
+    """SGLang allocator: eviction from the evictable pool under pressure."""
+
+    def test_evict_on_alloc_pressure(self, sglang_alloc_factory):
+        """Evicting from pool frees blocks back to kvcached."""
+        alloc, mgr = sglang_alloc_factory(10)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, [f"h{i}" for i in range(10)])
+        _sglang_finish_request(alloc, block_ids)
+        assert mgr.available_size() == 0
+        assert len(alloc._evictable_blocks) == 10
+        assert alloc.get_num_free_blocks() == 10
+
+        # Evict 4 -> kvcached gets 4 free blocks back
+        alloc._evict_blocks_from_pool(4)
+        assert len(alloc._evictable_blocks) == 6
+        assert mgr.available_size() == 4
+
+    def test_evict_lru_order(self, sglang_alloc_factory):
+        """Oldest blocks (first inserted) are evicted first."""
+        alloc, mgr = sglang_alloc_factory(10)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, [f"h{i}" for i in range(10)])
+        _sglang_finish_request(alloc, block_ids)
+
+        # Evict 3 -> should evict h0, h1, h2 (oldest)
+        alloc._evict_blocks_from_pool(3)
+
+        assert alloc.get_cached_block("h0") is None
+        assert alloc.get_cached_block("h1") is None
+        assert alloc.get_cached_block("h2") is None
+        assert alloc.get_cached_block("h3") is not None
+
+    def test_evict_all_then_realloc(self, sglang_alloc_factory):
+        """Can evict entire pool and reallocate fresh blocks."""
+        alloc, mgr = sglang_alloc_factory(5)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["a", "b", "c", "d", "e"])
+        _sglang_finish_request(alloc, block_ids)
+        assert mgr.available_size() == 0
+
+        alloc._evict_blocks_from_pool(5)
+        assert len(alloc._evictable_blocks) == 0
+        assert len(alloc._cached_blocks) == 0
+        assert mgr.available_size() == 5
+
+    def test_no_eviction_when_kvcached_has_space(self, sglang_alloc_factory):
+        """Don't evict if kvcached already has enough free blocks."""
+        alloc, mgr = sglang_alloc_factory(20)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, [f"h{i}" for i in range(5)])
+        _sglang_finish_request(alloc, block_ids)
+        assert len(alloc._evictable_blocks) == 5
+        assert mgr.available_size() == 15
+
+        # Allocate 3 directly -- kvcached has 15 free, no eviction needed
+        new_ids = mgr.alloc(3)
+        assert len(alloc._evictable_blocks) == 5  # unchanged
+        assert new_ids is not None
+
+    def test_get_num_free_blocks_includes_evictable(self, sglang_alloc_factory):
+        """get_num_free_blocks = kvcached free + evictable pool size."""
+        alloc, mgr = sglang_alloc_factory(20)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, [f"h{i}" for i in range(8)])
+        _sglang_finish_request(alloc, block_ids)
+
+        kvcached_free = mgr.available_size()  # 20 - 8 = 12
+        evictable = len(alloc._evictable_blocks)  # 8
+        assert alloc.get_num_free_blocks() == kvcached_free + evictable  # 20
+
+
+class TestSGLangResetAndExplicitEviction:
+    """SGLang allocator: reset_prefix_cache and evict_blocks."""
+
+    def test_reset_frees_evictable_blocks(self, sglang_alloc_factory):
+        """reset_prefix_cache frees all evictable blocks to kvcached."""
+        alloc, mgr = sglang_alloc_factory(20)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1", "h2"])
+        _sglang_finish_request(alloc, block_ids)
+        assert mgr.available_size() == 17
+
+        alloc.reset_prefix_cache()
+        assert len(alloc._evictable_blocks) == 0
+        assert len(alloc._cached_blocks) == 0
+        assert len(alloc._block_id_to_hash) == 0
+        assert mgr.available_size() == 20
+
+    def test_reset_with_no_evictable(self, sglang_alloc_and_manager):
+        """reset_prefix_cache works even when pool is empty."""
+        alloc, mgr = sglang_alloc_and_manager
+        result = alloc.reset_prefix_cache()
+        assert result is True
+
+    def test_evict_blocks_explicit(self, sglang_alloc_factory):
+        """evict_blocks(set) removes specified blocks from cache and pool."""
+        alloc, mgr = sglang_alloc_factory(20)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1", "h2", "h3"])
+        _sglang_finish_request(alloc, block_ids)
+        evict_ids = set(block_ids[:2])
+
+        freed_before = mgr.available_size()
+        alloc.evict_blocks(evict_ids)
+
+        assert mgr.available_size() == freed_before + 2
+        assert len(alloc._evictable_blocks) == 2
+        assert alloc.get_cached_block("h0") is None
+        assert alloc.get_cached_block("h1") is None
+        assert alloc.get_cached_block("h2") is not None
+
+
+class TestSGLangCacheDisabled:
+    """SGLang allocator: when enable_prefix_cache=False."""
+
+    def test_no_cache_free_immediately(self, sglang_alloc_factory):
+        """With caching disabled, blocks are freed immediately."""
+        alloc, mgr = sglang_alloc_factory(20, enable_prefix_cache=False)
+        initial_free = mgr.available_size()
+
+        block_ids = mgr.alloc(5)
+        assert mgr.available_size() == initial_free - 5
+
+        alloc.free(block_ids)
+        assert mgr.available_size() == initial_free
+        assert len(alloc._evictable_blocks) == 0
+
+    def test_no_cache_hit(self, sglang_alloc_factory):
+        """With caching disabled, get_cached_block always returns None."""
+        alloc, mgr = sglang_alloc_factory(20, enable_prefix_cache=False)
+        result = alloc.get_cached_block("h0")
+        assert result is None
+
+    def test_get_num_free_blocks_no_cache(self, sglang_alloc_factory):
+        """With caching disabled, get_num_free_blocks = kvcached only."""
+        alloc, mgr = sglang_alloc_factory(20, enable_prefix_cache=False)
+        assert alloc.get_num_free_blocks() == mgr.available_size()
+
+
+class TestSGLangEdgeCases:
+    """SGLang allocator: edge cases and robustness."""
+
+    def test_evict_more_than_pool_size(self, sglang_alloc_factory):
+        """Requesting eviction of more blocks than in the pool is safe."""
+        alloc, mgr = sglang_alloc_factory(5)
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1"])
+        _sglang_finish_request(alloc, block_ids)
+
+        evicted = alloc._evict_blocks_from_pool(100)
+        assert evicted == 2
+        assert len(alloc._evictable_blocks) == 0
+
+    def test_evict_empty_pool(self, sglang_alloc_and_manager):
+        """Evicting from empty pool is a no-op."""
+        alloc, mgr = sglang_alloc_and_manager
+        evicted = alloc._evict_blocks_from_pool(5)
+        assert evicted == 0
+
+    def test_cache_full_blocks_idempotent(self, sglang_alloc_and_manager):
+        """Calling cache_full_blocks twice with same hashes is safe."""
+        alloc, mgr = sglang_alloc_and_manager
+        block_ids = mgr.alloc(2)
+        alloc.cache_full_blocks(block_ids, ["h0", "h1"])
+        alloc.cache_full_blocks(block_ids, ["h0", "h1"])
+        assert len(alloc._cached_blocks) == 2
+
+    def test_reuse_after_eviction_and_realloc(self, sglang_alloc_factory):
+        """After eviction, block IDs can be reallocated and recached."""
+        alloc, mgr = sglang_alloc_factory(4)
+
+        block_ids = _sglang_simulate_request(alloc, mgr, ["h0", "h1", "h2", "h3"])
+        _sglang_finish_request(alloc, block_ids)
+
+        alloc._evict_blocks_from_pool(4)
+        assert len(alloc._cached_blocks) == 0
+
+        new_ids = mgr.alloc(4)
+        alloc.cache_full_blocks(new_ids, ["x0", "x1", "x2", "x3"])
+        assert len(alloc._cached_blocks) == 4
+        for h in ["x0", "x1", "x2", "x3"]:
+            assert alloc.get_cached_block(h) is not None
+
+    def test_mixed_cached_and_uncached_free(self, sglang_alloc_and_manager):
+        """free() with a mix of cached and uncached blocks."""
+        alloc, mgr = sglang_alloc_and_manager
+        initial_free = mgr.available_size()
+
+        block_ids = mgr.alloc(4)
+        # Cache only first 2
+        alloc.cache_full_blocks(block_ids[:2], ["h0", "h1"])
+
+        alloc.free(block_ids)
+        # First 2: cached -> evictable pool. Last 2: uncached -> freed.
+        assert len(alloc._evictable_blocks) == 2
+        assert mgr.available_size() == initial_free - 2
