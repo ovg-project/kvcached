@@ -97,6 +97,12 @@ def _get_kv_cache_params(kv_cache_spec: Any, block_size: int) -> tuple:
     return cell_size, num_kv_buffers
 
 
+def _get_max_cached_blocks() -> int:
+    """Return the max_cached_blocks limit from env config."""
+    from kvcached.utils import MAX_CACHED_BLOCKS
+    return MAX_CACHED_BLOCKS
+
+
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
@@ -137,9 +143,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 enable_caching: bool,
                 enable_kv_cache_events: bool = False,
                 num_kv_buffers: int = 2,
+                max_cached_blocks: int = 1000
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
+                # 0 means unlimited
+                self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
 
@@ -246,10 +255,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
 
-                # Evict cached blocks if kvcached doesn't have enough free space
-                kvcached_free = self.kv_cache_manager.available_size()
-                if kvcached_free < num_blocks and self._evictable_blocks:
-                    self._evict_blocks_from_pool(num_blocks - kvcached_free)
+                if self.enable_prefix_cache:
+                    # Evict cached blocks if kvcached doesn't have enough free space
+                    kvcached_free = self.kv_cache_manager.available_size()
+                    if kvcached_free < num_blocks and self._evictable_blocks:
+                        self._evict_blocks_from_pool(num_blocks - kvcached_free)
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
@@ -301,6 +311,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
 
+                if (self.max_cached_blocks > 0
+                        and len(self._evictable_blocks) > self.max_cached_blocks):
+                    excess = len(self._evictable_blocks) - self.max_cached_blocks
+                    self._evict_blocks_from_pool(excess)
+
             def evict_blocks(self, block_ids: set[int]) -> None:
                 if not self.enable_prefix_cache:
                     return
@@ -337,7 +352,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return True
 
             def get_num_free_blocks(self) -> int:
-                return self.kv_cache_manager.available_size() + len(self._evictable_blocks)
+                return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
@@ -490,6 +505,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=getattr(self, "enable_caching", False),
                 num_kv_buffers=num_kv_buffers,
+                max_cached_blocks=_get_max_cached_blocks()
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -608,6 +624,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
+                max_cached_blocks=_get_max_cached_blocks()
             )
             if hasattr(self, "specialized_manager"):
                 self.specialized_manager.block_pool = self.block_pool
