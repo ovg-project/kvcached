@@ -41,6 +41,8 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 ## 📢 Updates
 
+- **[2026-04]** kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
+
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
 GPT-OSS support in SGLang updated to **v0.5.9**.
@@ -253,14 +255,7 @@ pre-commit run --all-files
 
 ## Contacts
 
-kvcached is developed by many contributors from the community. Feel free to contact us for contributions and collaborations.
-
-```
-Jiarong Xing (jxing@rice.edu)
-Yifan Qiao (yifanqiao@berkeley.edu)
-Xingqi Cui (xc66@rice.edu)
-Shan Yu (shanyu1@g.ucla.edu)
-```
+kvcached is developed by many contributors from the community. The best way to contact us for questions, issues, and contributions, is through our [Slack channel](https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw) or [GitHub Issues](https://github.com/ovg-project/kvcached/issues).
 
 ## Citation
 
@@ -277,7 +272,7 @@ If you find kvcached useful, please cite our paper:
 @article{yu2025prism,
   title={Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving},
   author={Yu, Shan and Xing, Jiarong and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Wang, Yang and Yang, Shuo and Xie, Zhiqiang and Cao, Shiyi and Bao, Ke and others},
-  journal={arXiv preprint arXiv:2505.04021},
-  year={2025}
+  journal={OSDI},
+  year={2026}
 }
 ```
