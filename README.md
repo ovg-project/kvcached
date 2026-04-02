@@ -43,6 +43,12 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 - **[2026-04]** kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
 
+  <div align="center">
+    <a href="https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link">
+      <img src="https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv/thumbnail?ref=share-link" alt="Sardeenz Demo" width="700">
+    </a>
+  </div>
+
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
 GPT-OSS support in SGLang updated to **v0.5.9**.
