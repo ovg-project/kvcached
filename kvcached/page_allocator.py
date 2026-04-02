@@ -26,6 +26,14 @@ logger = get_kvcached_logger()
 PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
+def _should_use_worker_ipc() -> bool:
+    try:
+        from kvcached.integration.vllm.interfaces import should_use_worker_ipc
+        return should_use_worker_ipc()
+    except ImportError:
+        return False
+
+
 class Page:
 
     def __init__(self, page_id: int, page_size: int):
@@ -546,7 +554,7 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.world_size > 1:  # map pages across all tensor parallel workers.
+        if self.world_size > 1 or _should_use_worker_ipc():
             broadcast_map_to_kv_tensors(self.world_size, offsets, self.pp_rank,
                                         group_id=self.group_id)
         else:
@@ -560,7 +568,7 @@ class PageAllocator:
             ]
         else:
             offsets = [pid * self.page_size for pid in page_ids]
-        if self.world_size > 1:  # unmap pages across all tensor parallel workers.
+        if self.world_size > 1 or _should_use_worker_ipc():
             broadcast_unmap_from_kv_tensors(self.world_size, offsets,
                                             self.pp_rank,
                                             group_id=self.group_id)

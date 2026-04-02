@@ -119,16 +119,11 @@ class KVCacheManager:
             return
 
         def _check_kv_tensors_created():
-            vllm_remote = False
             try:
-                from kvcached.integration.vllm.interfaces import (
-                    _is_worker,
-                    _kvcached_initialized as vllm_inited,
-                )
-                if vllm_inited and not _is_worker:
-                    vllm_remote = True
+                from kvcached.integration.vllm.interfaces import should_use_worker_ipc
+                vllm_remote = should_use_worker_ipc()
             except ImportError:
-                pass
+                vllm_remote = False
 
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(

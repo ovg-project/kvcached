@@ -68,6 +68,14 @@ def _count_kv_cache_layers(kv_cache_config: Any) -> int:
     return sum(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
 
 
+def _should_enable_async_sched(vllm_config: Any) -> bool:
+    """Enable kvcached async scheduling whenever vLLM async scheduling is on."""
+    if vllm_config is None:
+        return False
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    return bool(getattr(scheduler_config, "async_scheduling", False))
+
+
 # Version ranges for vLLM support
 VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
@@ -394,6 +402,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                         tp_rank=0,
                         world_size=vllm_config.parallel_config.tensor_parallel_size,
                         is_worker=False,
+                        async_sched=_should_enable_async_sched(vllm_config),
                     )
                 except Exception:
                     pass
@@ -474,7 +483,12 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets
             # are registered per TP rank within each stage (w0.sock … w(tp_size-1).sock).
-            kvi.init_kvcached(tp_rank=0, world_size=tp_size, is_worker=False)
+            kvi.init_kvcached(
+                tp_rank=0,
+                world_size=tp_size,
+                is_worker=False,
+                async_sched=_should_enable_async_sched(getattr(self, "vllm_config", None)),
+            )
 
             # Import ElasticBlockPool from the patched module
             import importlib
@@ -708,8 +722,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             # Register this worker's IPC socket using tp_rank so all TP workers
             # within this PP stage listen on w0.sock … w(tp_size-1).sock.
-            kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank,
-                              is_worker=True, device=device_str)
+            kvi.init_kvcached(
+                tp_rank=tp_rank,
+                world_size=tp_size,
+                pp_rank=pp_rank,
+                is_worker=True,
+                device=device_str,
+                async_sched=_should_enable_async_sched(self.vllm_config),
+            )
 
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached
