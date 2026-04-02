@@ -102,7 +102,6 @@ def _get_max_cached_blocks() -> int:
     from kvcached.utils import MAX_CACHED_BLOCKS
     return MAX_CACHED_BLOCKS
 
-
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
@@ -167,14 +166,26 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 self.null_block = None  # type: ignore
 
-                # Prefix cache: hash -> KVCacheBlock object (direct lookup)
+                # Prefix cache: (block_hash, group_id) -> KVCacheBlock
+                # The key embeds group_id to support hybrid attention
+                # (multiple KV cache groups with different attention types).
                 self._cached_blocks: dict[Any, "KVCacheBlock"] = {}
-                # Reverse index: block_id -> hash for O(1) eviction
-                self._block_id_to_hash: dict[int, Any] = {}
+                # Reverse index: block_id -> cache key for O(1) eviction.
+                # Each block_id belongs to exactly one group.
+                self._block_id_to_key: dict[int, Any] = {}
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, "KVCacheBlock"] = OrderedDict()
-                self._warned_multi_group = False
+
+            @staticmethod
+            def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
+                """Pack block_hash + group_id into a composite cache key.
+
+                Mirrors vLLM's make_block_hash_with_group_id: appends 4-byte
+                big-endian group_id so the same content hash is distinct across
+                KV cache groups (e.g. full attention vs sliding window).
+                """
+                return bytes(block_hash) + group_id.to_bytes(4, "big", signed=False)
 
             def get_cached_block(
                 self,
@@ -184,18 +195,15 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if not self.enable_prefix_cache:
                     return None
 
-                if len(kv_cache_group_ids) > 1:
-                    if not self._warned_multi_group:
-                        logger.warning("ElasticBlockPool only supports single KV cache group, "
-                                      f"got {len(kv_cache_group_ids)} groups")
-                        self._warned_multi_group = True
-                    return None
-
-                block = self._cached_blocks.get(block_hash)
-                if block is None:
-                    return None
-
-                return [block]
+                cached_blocks: list["KVCacheBlock"] = []
+                for group_id in kv_cache_group_ids:
+                    key = self._make_cache_key(block_hash, group_id)
+                    block = self._cached_blocks.get(key)
+                    if block is None:
+                        # Atomic: all groups must hit or return None
+                        return None
+                    cached_blocks.append(block)
+                return cached_blocks
 
             def cache_full_blocks(
                 self,
@@ -224,13 +232,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                     block_idx = num_cached_blocks + i
                     block_hash = request.block_hashes[block_idx]
+                    key = self._make_cache_key(block_hash, kv_cache_group_id)
 
                     # Already cached, idempotent
-                    if block_hash in self._cached_blocks:
+                    if key in self._cached_blocks:
                         continue
 
-                    self._cached_blocks[block_hash] = block
-                    self._block_id_to_hash[block.block_id] = block_hash
+                    self._cached_blocks[key] = block
+                    self._block_id_to_key[block.block_id] = key
 
             def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
                 """Evict oldest blocks from evictable pool, free to kvcached.
@@ -240,9 +249,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 ids_to_free: list[int] = []
                 for _ in range(min(num_to_evict, len(self._evictable_blocks))):
                     bid, _block = self._evictable_blocks.popitem(last=False)
-                    h = self._block_id_to_hash.pop(bid, None)
-                    if h is not None:
-                        self._cached_blocks.pop(h, None)
+                    key = self._block_id_to_key.pop(bid, None)
+                    if key is not None:
+                        self._cached_blocks.pop(key, None)
                     ids_to_free.append(bid)
                 if ids_to_free:
                     self.kv_cache_manager.free(ids_to_free)
@@ -302,7 +311,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         continue
                     block.ref_cnt -= 1
                     if block.ref_cnt == 0:
-                        if block.block_id in self._block_id_to_hash:
+                        if block.block_id in self._block_id_to_key:
                             # Cached block: retain for cross-request reuse
                             self._evictable_blocks[block.block_id] = block
                         else:
@@ -316,6 +325,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
 
+
             def evict_blocks(self, block_ids: set[int]) -> None:
                 if not self.enable_prefix_cache:
                     return
@@ -323,9 +333,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 removed = 0
                 ids_to_free: list[int] = []
                 for bid in block_ids:
-                    h = self._block_id_to_hash.pop(bid, None)
-                    if h is not None:
-                        self._cached_blocks.pop(h, None)
+                    key = self._block_id_to_key.pop(bid, None)
+                    if key is not None:
+                        self._cached_blocks.pop(key, None)
                         removed += 1
                     if bid in self._evictable_blocks:
                         self._evictable_blocks.pop(bid)
@@ -347,7 +357,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager.free(ids_to_free)
 
                 self._cached_blocks.clear()
-                self._block_id_to_hash.clear()
+                self._block_id_to_key.clear()
                 logger.info("Prefix cache reset")
                 return True
 
