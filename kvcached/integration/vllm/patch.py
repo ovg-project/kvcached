@@ -925,9 +925,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             import torch
 
             kv_caches: dict[str, torch.Tensor] = {}
-            kv_cache_group = kv_cache_config.kv_cache_groups[0]
-            for idx, layer_name in enumerate(kv_cache_group.layer_names):
-                kv_caches[layer_name] = kv_cache_raw_tensors[idx]
+            layer_id = 0
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                for layer_name in kv_cache_group.layer_names:
+                    kv_caches[layer_name] = kv_cache_raw_tensors[layer_id]
+                    layer_id += 1
             return kv_caches
 
         setattr(
