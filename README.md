@@ -45,10 +45,9 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **[2026-04]** <img src="https://img.shields.io/badge/Featured%20by-Red%20Hat-EE0000?logo=redhat&logoColor=white" alt="Featured by Red Hat" /> kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
   [[▶ View Demo]](https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link)
 
-- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management.
-  - **vLLM**: Cached blocks are retained in an evictable pool and freed on demand when memory pressure occurs (lazy eviction).
-  - **SGLang**: After each request finishes, RadixCache proactively evicts entries that exceed the token budget.
-  - The cached token budget is controlled via `KVCACHED_MAX_CACHED_TOKENS` for both engines (default: `16000`).
+- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management. The cached token budget can be controlled via `KVCACHED_MAX_CACHED_TOKENS` (default: `16000`).
+  - **vLLM**: Cached blocks are retained in an evictable pool and freed on demand when memory pressure occurs (lazy eviction). The token limit is converted to blocks internally (`KVCACHED_MAX_CACHED_TOKENS // block_size`).
+  - **SGLang**: After each request finishes, RadixCache proactively evicts entries that exceed the token budget. Works with both `page_size=1` and `page_size>1`.
 
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
