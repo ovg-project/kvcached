@@ -128,6 +128,10 @@ MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
 MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 MAX_CACHED_BLOCKS = int(os.getenv("KVCACHED_MAX_CACHED_BLOCKS", "1000"))
 SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
+# Maximum number of tokens the radix cache may hold as evictable (cached) entries.
+# 0 means unlimited. When set, the cache is proactively evicted after each
+# finished request to stay within the limit.
+MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "0"))
 CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
                               "true").lower() == "true"
 

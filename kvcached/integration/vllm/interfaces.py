@@ -25,6 +25,10 @@ _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
 
+
+def should_use_worker_ipc() -> bool:
+    return _kvcached_initialized and not _is_worker
+
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,
@@ -41,6 +45,12 @@ def init_kvcached(
         # (broadcast_kv_tensors_created) and fail with ENOENT on the socket path.
         if is_worker and not _is_worker:
             _is_worker = True
+            start_worker_listener_thread(tp_rank, pp_rank)
+        if async_sched and not _async_sched:
+            _async_sched = True
+            logger.info("kvcached async scheduler enabled")
+        _pp_rank = pp_rank
+        _world_size = world_size
         return
 
     if device is None:
@@ -53,6 +63,9 @@ def init_kvcached(
     _pp_rank = pp_rank
     _async_sched = async_sched
     _is_worker = is_worker
+
+    if _async_sched:
+        logger.info("kvcached async scheduler enabled")
 
     if is_worker:
         # start the listener thread for kv cache management regardless of TP size
