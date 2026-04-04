@@ -37,7 +37,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
 - **Memory control CLI**: enforce memory limits with kvcached CLI.
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
-- **Prefix caching**: support automatic prefix caching (APC) for vLLM and RadixCache for SGLang, with configurable memory bounds.
+- **Prefix caching**: support automatic prefix caching (APC) for vLLM (including hybrid attention models) and RadixCache for SGLang, with configurable memory bounds.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
 
 ## 📢 Updates
@@ -45,7 +45,9 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **[2026-04]** <img src="https://img.shields.io/badge/Featured%20by-Red%20Hat-EE0000?logo=redhat&logoColor=white" alt="Featured by Red Hat" /> kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
   [[▶ View Demo]](https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link)
 
-- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang. In vLLM, evictable blocks are retained for cross-request prefix reuse and evicted on demand when memory is needed. In SGLang, the cached token budget can be controlled via `KVCACHED_MAX_CACHED_TOKENS` (default: 0, unlimited).
+- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management.
+  - **vLLM**: Cached blocks are retained in an evictable pool and freed on demand when memory pressure occurs (lazy eviction). Supports hybrid attention models (e.g., `openai/gpt-oss-20b`). Set `KVCACHED_MAX_CACHED_BLOCKS` to control the cached block budget (default: `1000`).
+  - **SGLang**: After each request finishes, RadixCache proactively evicts entries that exceed the token budget. Set `KVCACHED_MAX_CACHED_TOKENS` to control the cached token budget (default: `0`, unlimited).
 
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
@@ -199,7 +201,7 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 ```
 
 > [!NOTE]
-> kvcached now supports **prefix caching** for both vLLM (APC) and SGLang (RadixCache). You can enable prefix caching as usual (the engines' defaults apply). In vLLM, cached blocks are retained and evicted on demand when new allocations need memory. In SGLang, you can set `KVCACHED_MAX_CACHED_TOKENS` to limit the cached token budget (default: `0`, unlimited). If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+> kvcached now supports **prefix caching** for both vLLM (APC) and SGLang (RadixCache). You can enable prefix caching as usual (the engines' defaults apply). In vLLM, cached blocks are retained in an evictable pool and freed on demand when memory pressure occurs; set `KVCACHED_MAX_CACHED_BLOCKS` to control the cached block budget (default: `1000`). In SGLang, RadixCache proactively evicts entries exceeding the token budget; set `KVCACHED_MAX_CACHED_TOKENS` to control the limit (default: `0`, unlimited). If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
