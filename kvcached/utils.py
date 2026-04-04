@@ -126,6 +126,7 @@ PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
                                   "true").lower() == "true"
 MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
 MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
+MAX_CACHED_BLOCKS = int(os.getenv("KVCACHED_MAX_CACHED_BLOCKS", "1000"))
 SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 # Maximum number of tokens the radix cache may hold as evictable (cached) entries.
 # 0 means unlimited. When set, the cache is proactively evicted after each
