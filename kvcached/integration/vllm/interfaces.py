@@ -45,9 +45,12 @@ def init_kvcached(
         # (broadcast_kv_tensors_created) and fail with ENOENT on the socket path.
         if is_worker and not _is_worker:
             _is_worker = True
+            start_worker_listener_thread(tp_rank, pp_rank)
         if async_sched and not _async_sched:
             _async_sched = True
             logger.info("kvcached async scheduler enabled")
+        _pp_rank = pp_rank
+        _world_size = world_size
         return
 
     if device is None:
