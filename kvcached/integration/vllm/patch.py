@@ -105,10 +105,15 @@ def _get_kv_cache_params(kv_cache_spec: Any, block_size: int) -> tuple:
     return cell_size, num_kv_buffers
 
 
-def _get_max_cached_blocks() -> int:
-    """Return the max_cached_blocks limit from env config."""
-    from kvcached.utils import MAX_CACHED_BLOCKS
-    return MAX_CACHED_BLOCKS
+def _get_max_cached_blocks(block_size: int) -> int:
+    """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
+
+    Returns 0 (unlimited) when MAX_CACHED_TOKENS is 0.
+    """
+    from kvcached.utils import MAX_CACHED_TOKENS
+    if MAX_CACHED_TOKENS <= 0:
+        return 0
+    return MAX_CACHED_TOKENS // block_size
 
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
@@ -529,7 +534,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=getattr(self, "enable_caching", False),
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks()
+                max_cached_blocks=_get_max_cached_blocks(block_size)
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -648,7 +653,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks()
+                max_cached_blocks=_get_max_cached_blocks(block_size)
             )
             if hasattr(self, "specialized_manager"):
                 self.specialized_manager.block_pool = self.block_pool
