@@ -131,10 +131,6 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 # 0 means unlimited. When set, the cache is proactively evicted after each
 # finished request to stay within the limit.
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "0"))
-# When enabled, the elastic allocator keeps freed blocks in a local evictable
-# pool instead of returning them to the shared kvcached pool immediately.
-# This prevents cross-instance thrashing and preserves APC effectiveness.
-PREFIX_CACHE_ENABLED = os.getenv("KVCACHED_PREFIX_CACHE", "true").lower() == "true"
 CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
                               "true").lower() == "true"
 
