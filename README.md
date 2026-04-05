@@ -37,25 +37,19 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
 - **Memory control CLI**: enforce memory limits with kvcached CLI.
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
-- **Prefix caching**: support automatic prefix caching (APC) for vLLM (including hybrid attention models) and RadixCache for SGLang, with configurable memory bounds.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
+- **Prefix caching**: support automatic prefix caching (APC) with a configurable memory bound.
 
 ## 📢 Updates
 
-- **[2026-04]** <img src="https://img.shields.io/badge/Featured%20by-Red%20Hat-EE0000?logo=redhat&logoColor=white" alt="Featured by Red Hat" /> kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
+- **[2026-04]** kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
   [[▶ View Demo]](https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link)
 
 - **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management. The cached token budget can be controlled via `KVCACHED_MAX_CACHED_TOKENS` (default: `16000`).
-  - **vLLM**: Cached blocks are retained in an evictable pool and freed on demand when memory pressure occurs (lazy eviction). The token limit is converted to blocks internally (`KVCACHED_MAX_CACHED_TOKENS // block_size`).
-  - **SGLang**: After each request finishes, RadixCache proactively evicts entries that exceed the token budget. Works with both `page_size=1` and `page_size>1`.
 
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
 GPT-OSS support in SGLang updated to **v0.5.9**.
-
-- **[2026-02]** kvcached now supports **vLLM v0.16.0** and **SGLang v0.5.9**.
-MLA models (DeepSeek-V3, DeepSeek-V2 etc.) are supported in SGLang with both `page_size=1` and `page_size>1`.
-GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are supported in SGLang.
 
 ### Supported engines and models
 
@@ -192,16 +186,16 @@ If you are using the engine-specific dockers, you can test kvcached by running t
 
 ```bash
 # for sglang
-python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --disable-radix-cache --port 30000
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --port 30000
 python -m sglang.bench_serving --backend sglang-oai --model meta-llama/Llama-3.2-1B-Instruct --dataset-name sharegpt --request-rate 10 --num-prompts 1000 --port 30000
 
 # for vllm
-vllm serve meta-llama/Llama-3.2-1B-Instruct --no-enable-prefix-caching --port=12346
+vllm serve meta-llama/Llama-3.2-1B-Instruct --port=12346
 vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --num-prompts 1000 --port 12346
 ```
 
 > [!NOTE]
-> kvcached now supports **prefix caching** for both vLLM (APC) and SGLang (RadixCache). You can enable prefix caching as usual (the engines' defaults apply). Cached blocks are retained for cross-request prefix reuse and evicted on demand when memory is needed. Set `KVCACHED_MAX_CACHED_TOKENS` to control the cached token budget for both engines (default: `16000`; `0` means unlimited). If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+> kvcached now supports **prefix caching**. You can set `KVCACHED_MAX_CACHED_TOKENS` to control the cached token budget for both engines (default: `16000`; `0` means unlimited). If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
@@ -216,31 +210,8 @@ cd benchmarks/simple_bench
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
 
-> [!TIP]
-> Starting from transformers >= 4.44, there is no fallback “default” chat template. If the tokenizer does not define a chat_template, `apply_chat_template` cannot be used without explicitly providing one. If you encounter chat template errors during its chat warmup at startup, use an Instruct model (e.g., `meta-llama/Llama-3.2-1B-Instruct`) instead of the base model.
-
 > [!NOTE]
 > We haven’t fully tested kvcached with every version of SGLang and vLLM (there are too many!). If you run into issues with a specific version, please open an issue---we'll look into it and fix it within a few hours.
-
-## Roadmap
-
-The latest roadmap is also tracked in [issue #125](https://github.com/ovg-project/kvcached/issues/125).
-
-- **Engine integration**
-  - [x] SGLang and vLLM
-  - [ ] Ollama (in progress)
-  - [ ] llama.cpp and LMStudio
-- **Features**
-  - [x] Tensor parallelism
-  - [x] Prefix caching
-  - [ ] KV cache offloading to host memory
-  - [ ] More attention types (sliding window attention, linear attention, vision encoder, etc.)
-- **Performance optimizations**
-  - [x] Contiguous KV tensor layout
-  - [x] Physical memory management
-- **Hardware**
-  - [x] NVIDIA GPUs
-  - [ ] AMD GPUs
 
 ## Contributing
 
