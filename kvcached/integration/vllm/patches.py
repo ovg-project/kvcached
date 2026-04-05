@@ -177,7 +177,16 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     num_gpu_blocks, block_size, cell_size, num_layers,
                     num_kv_buffers=num_kv_buffers)
 
-                self.null_block = None  # type: ignore
+                # Allocate a dedicated null block – a placeholder for skipped
+                # positions (e.g. sliding-window / chunked-local attention).
+                # The original vLLM BlockPool pops block 0 from its free queue;
+                # we mirror that by allocating one real block from kvcached so
+                # the block_id is valid on the GPU (the attention kernel may
+                # read from it, but results are masked out).
+                _null_ids = self.kv_cache_manager.alloc(1)
+                assert _null_ids is not None and len(_null_ids) == 1
+                self.null_block = KVCacheBlockClass(_null_ids[0])
+                self.null_block.is_null = True
 
                 # Prefix cache: (block_hash, group_id) -> KVCacheBlock
                 # The key embeds group_id to support hybrid attention
@@ -312,7 +321,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     block_ids = [
                         block.block_id
                         for block in ordered_blocks
-                        if block is not None
+                        if block is not None and not block.is_null
                     ]
                     if block_ids:
                         self.kv_cache_manager.free(block_ids)
@@ -320,7 +329,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 uncached_to_free: list[int] = []
                 for block in ordered_blocks:
-                    if block is None:
+                    if block is None or block.is_null:
                         continue
                     block.ref_cnt -= 1
                     if block.ref_cnt == 0:
