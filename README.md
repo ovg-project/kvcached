@@ -55,8 +55,8 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
-| SGLang | ≥ v0.4.9 (tested up to v0.5.9) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b, etc. |
-| vLLM | ≥ v0.8.4 (tested up to v0.16.0) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b |
+| SGLang | ≥ v0.4.9 (tested up to v0.5.10) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b, etc. |
+| vLLM | ≥ v0.8.4 (tested up to v0.19.0) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b |
 
 ## Example use cases
 
@@ -125,7 +125,7 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 ### Prerequisites
 
 - Python (tested with 3.9 - 3.13)
-- SGLang (tested with v0.5.9) or vLLM (tested with v0.16.0)
+- SGLang (tested with v0.5.10) or vLLM (tested with v0.19.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
@@ -149,8 +149,8 @@ python tools/dev_copy_pth.py
 kvcached installed with original engine dockers.
 
 ```bash
-docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.4-sglang-v0.5.9
-docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.4-vllm-v0.16.0
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.5-sglang-v0.5.10
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.5-vllm-v0.19.0
 ```
 
 We prepare an all-in-one docker for developers:
