@@ -45,7 +45,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **[2026-04]** kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
   [[▶ View Demo]](https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link)
 
-- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management. The cached token budget can be controlled via `KVCACHED_MAX_CACHED_TOKENS` (default: `16000`).
+- **[2026-04]** Added **prefix caching** support. kvcached now supports **automatic prefix caching (APC)** for vLLM and **RadixCache** for SGLang, enabling cross-request prefix reuse while maintaining elastic memory management. See [Elastic memory with prefix caching](#elastic-memory-with-prefix-caching) for details.
 
 - **[2026-03]** Added **pipeline parallelism** support.
 MLA models (DeepSeek-V3, DeepSeek-V2 etc.) and GPT-OSS hybrid attention models (`openai/gpt-oss-20b`) are now also supported in **vLLM**.
@@ -57,6 +57,25 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 |--------|----------|-----------------|----------------|
 | SGLang | ≥ v0.4.9 (tested up to v0.5.10) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b, etc. |
 | vLLM | ≥ v0.8.4 (tested up to v0.19.0) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b |
+
+### Elastic memory with prefix caching
+
+Without prefix caching, kvcached's memory is purely elastic, as physical memory is allocated on demand for active requests and freed immediately after. However, prefix caching is important for many workloads as it avoids redundant computation by reusing KV caches from shared prefixes (e.g., system prompts) across requests. kvcached supports prefix caching while keeping memory elastic by bounding the cached prefix region:
+
+```
+GPU Memory (per model)
+┌─────────────────────────────────────┐
+│  Model Weights          (fixed)     │
+├─────────────────────────────────────┤
+│  Active KV Cache      (elastic)     │ ← grows/shrinks with live requests
+├─────────────────────────────────────┤
+│  Cached Prefixes      (bounded)     │ ← reusable across requests, up to bound
+├─────────────────────────────────────┤
+│  Free                               │ ← available to other models/workloads
+└─────────────────────────────────────┘
+```
+
+The **memory bound** (`KVCACHED_MAX_CACHED_TOKENS`, default `16000`; `0` means unlimited) caps how many tokens of cached prefixes a model may keep. When the cache exceeds this bound, older prefixes are evicted. This prevents prefix caching from consuming all free memory, which would undermine the elastic sharing between co-located models that kvcached is designed for.
 
 ## Example use cases
 
@@ -195,7 +214,7 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 ```
 
 > [!NOTE]
-> kvcached now supports **prefix caching**. You can set `KVCACHED_MAX_CACHED_TOKENS` to control the cached token budget for both engines (default: `16000`; `0` means unlimited). If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
+> If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
