@@ -790,17 +790,20 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
 
         max_cached = MAX_CACHED_TOKENS
 
+        # SGLang >= ~0.5.9 uses EvictParams; older releases pass token count as int.
         try:
-            from sglang.srt.mem_cache.radix_cache import EvictParams
+            from sglang.srt.mem_cache.radix_cache import EvictParams as _EvictParams
         except ImportError:
-            self.logger.warning("Could not import EvictParams from sglang")
-            return False
+            _EvictParams = None  # type: ignore[misc, assignment]
 
         def _wrapped(self_rc, *args: Any, **kwargs: Any):
             original_cache_finished(self_rc, *args, **kwargs)
             excess = self_rc.evictable_size_ - max_cached
             if excess > 0:
-                self_rc.evict(EvictParams(num_tokens=excess))
+                if _EvictParams is not None:
+                    self_rc.evict(_EvictParams(num_tokens=excess))
+                else:
+                    self_rc.evict(excess)
 
         self._mark_as_patched(_wrapped)
         RadixCache.cache_finished_req = _wrapped  # type: ignore
