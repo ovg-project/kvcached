@@ -38,7 +38,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **Memory control CLI**: enforce memory limits with kvcached CLI.
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
-- **Prefix caching**: support automatic prefix caching (APC) with a configurable memory bound. See [examples/09_prefix_caching](https://github.com/ovg-project/kvcached/tree/main/examples/09_prefix_caching) for details.
+- **Prefix caching**: support automatic prefix caching (APC) with a configurable memory bound. See [examples/09_prefix_caching](examples/09_prefix_caching) for details.
 
 ## 📢 Updates
 
