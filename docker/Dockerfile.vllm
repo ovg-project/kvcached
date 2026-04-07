@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.16.0
+FROM vllm/vllm-openai:v0.19.0
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
 
 ENV ENABLE_KVCACHED=true

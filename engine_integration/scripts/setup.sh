@@ -161,7 +161,7 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _default_ver="0.16.0"
+    local _default_ver="0.19.0"
     local _version=${version:-"$_default_ver"}
 
     if [[ "$method" == "source" ]]; then
@@ -172,7 +172,7 @@ setup_vllm() {
 }
 
 setup_sglang() {
-    local _version=${version:-"0.5.9"}
+    local _version=${version:-"0.5.10"}
 
     if [[ "$method" == "source" ]]; then
         setup_sglang_from_source "$_version"

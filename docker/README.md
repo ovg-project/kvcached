@@ -10,18 +10,18 @@ We also provide a development image that has both vLLM and SGLang.
 
 | Engine | Public image | Default tag |
 | ------ | ------------ | ----------- |
-| vLLM   | `ghcr.io/ovg-project/vllm-v0.10.2-kvcached`     | `latest` |
-| SGLang | `ghcr.io/ovg-project/sglang-v0.5.2-kvcached`   | `latest` |
+| vLLM   | `ghcr.io/ovg-project/vllm-v0.19.0-kvcached`     | `latest` |
+| SGLang | `ghcr.io/ovg-project/sglang-v0.5.10-kvcached`   | `latest` |
 | vLLM+SGLang | `ghcr.io/ovg-project/kvcached-dev`   | `latest` |
 
 ## 2. Pulling a pre-built image
 
 ```bash
 # vLLM engine
-docker pull ghcr.io/ovg-project/vllm-v0.10.2-kvcached:latest
+docker pull ghcr.io/ovg-project/vllm-v0.19.0-kvcached:latest
 
 # SGLang engine
-docker pull ghcr.io/ovg-project/sglang-v0.5.2-kvcached:latest
+docker pull ghcr.io/ovg-project/sglang-v0.5.10-kvcached:latest
 
 # vLLM+SGLang kvcached development
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
@@ -41,7 +41,7 @@ docker run -itd \
   --network=host \
   --privileged \
   --name kvcached-vllm \
-  ghcr.io/ovg-project/vllm-v0.10.2-kvcached \
+  ghcr.io/ovg-project/vllm-v0.19.0-kvcached \
   bash
 ```
 
@@ -69,16 +69,16 @@ vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts
 NOTE: If installed correctly, you should see that kvcached patches the vLLM:
 
 ```
-[kvcached][INFO][2025-10-15 23:01:33][patch_base.py:98] Applying 6 patches for vllm
-INFO 10-15 23:01:35 [__init__.py:216] Automatically detected platform cuda.
-[kvcached][INFO][2025-10-15 23:01:37][version_utils.py:189] Detected vllm version: 0.10.2
-[kvcached][INFO][2025-10-15 23:01:37][version_utils.py:189] Detected vllm version: 0.10.2
-W1015 23:01:39.249000 598 torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
-W1015 23:01:39.249000 598 torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
-[kvcached][INFO][2025-10-15 23:01:39][version_utils.py:189] Detected vllm version: 0.10.2
-[kvcached][INFO][2025-10-15 23:01:39][version_utils.py:189] Detected vllm version: 0.10.2
-[kvcached][INFO][2025-10-15 23:01:39][version_utils.py:189] Detected vllm version: 0.10.2
-[kvcached][INFO][2025-10-15 23:01:39][patch_base.py:178] Successfully patched vllm: elastic_block_pool, engine_core, gpu_model_runner, gpu_worker, kv_cache_coordinator
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:98] Applying 6 patches for vllm
+INFO xx-xx xx:xx:xx [__init__.py:216] Automatically detected platform cuda.
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
+Wxxxx xx:xx:xx.xxxxxx xxx torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
+Wxxxx xx:xx:xx.xxxxxx xxx torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:178] Successfully patched vllm: elastic_block_pool, engine_core, gpu_model_runner, gpu_worker, kv_cache_coordinator
 ```
 
 Another way to verify is to check the memory consumption using `nvidia-smi`. With kvcached, you should see that the memory usage is closer to model weight size when there are no requests.
