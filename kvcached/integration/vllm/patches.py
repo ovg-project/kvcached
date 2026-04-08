@@ -293,7 +293,24 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         self._evict_blocks_from_pool(num_blocks - kvcached_free)
 
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
-                assert block_ids is not None and len(block_ids) == num_blocks
+                if block_ids is None:
+                    if self.enable_prefix_cache and self._evictable_blocks:
+                        kvcached_free = self.kv_cache_manager.available_size()
+                        if kvcached_free < num_blocks:
+                            self._evict_blocks_from_pool(num_blocks - kvcached_free)
+                        block_ids = self.kv_cache_manager.alloc(num_blocks)
+
+                    if block_ids is None:
+                        raise ValueError(
+                            "Unable to allocate KV cache blocks from physical pool; "
+                            f"requested={num_blocks}, available={self.kv_cache_manager.available_size()}"
+                        )
+
+                if len(block_ids) != num_blocks:
+                    raise ValueError(
+                        "KV cache manager returned an unexpected number of blocks; "
+                        f"requested={num_blocks}, got={len(block_ids)}"
+                    )
 
                 return [KVCacheBlockClass(bid, ref_cnt=1) for bid in block_ids]
 
