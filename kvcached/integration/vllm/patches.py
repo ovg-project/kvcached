@@ -207,7 +207,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 big-endian group_id so the same content hash is distinct across
                 KV cache groups (e.g. full attention vs sliding window).
                 """
-                return bytes(block_hash) + group_id.to_bytes(4, "big", signed=False)
+                block_hash_bytes = (
+                    block_hash.encode("utf-8")
+                    if isinstance(block_hash, str)
+                    else bytes(block_hash)
+                )
+                return block_hash_bytes + group_id.to_bytes(4, "big", signed=False)
 
             def get_cached_block(
                 self,
@@ -286,27 +291,25 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
 
-                if self.enable_prefix_cache:
-                    # Evict cached blocks if kvcached doesn't have enough free space
-                    kvcached_free = self.kv_cache_manager.available_size()
-                    if kvcached_free < num_blocks and self._evictable_blocks:
-                        self._evict_blocks_from_pool(num_blocks - kvcached_free)
-
-                block_ids = self.kv_cache_manager.alloc(num_blocks)
-                if block_ids is None:
-                    if self.enable_prefix_cache and self._evictable_blocks:
+                block_ids: Optional[list[int]] = None
+                for _ in range(2):
+                    if self.enable_prefix_cache:
                         kvcached_free = self.kv_cache_manager.available_size()
-                        if kvcached_free < num_blocks:
+                        if kvcached_free < num_blocks and self._evictable_blocks:
                             self._evict_blocks_from_pool(num_blocks - kvcached_free)
-                        block_ids = self.kv_cache_manager.alloc(num_blocks)
+                    block_ids = self.kv_cache_manager.alloc(num_blocks)
+                    if block_ids is not None:
+                        break
 
-                    if block_ids is None:
-                        raise ValueError(
-                            "Unable to allocate KV cache blocks from physical pool; "
-                            f"requested={num_blocks}, available={self.kv_cache_manager.available_size()}"
-                        )
+                if block_ids is None:
+                    raise ValueError(
+                        "Unable to allocate KV cache blocks from physical pool; "
+                        f"requested={num_blocks}, available={self.kv_cache_manager.available_size()}"
+                    )
 
                 if len(block_ids) != num_blocks:
+                    if block_ids:
+                        self.kv_cache_manager.free(block_ids)
                     raise ValueError(
                         "KV cache manager returned an unexpected number of blocks; "
                         f"requested={num_blocks}, got={len(block_ids)}"
