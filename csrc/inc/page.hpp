@@ -6,7 +6,6 @@
 #include <memory>
 
 #include <cuda.h>
-#include <torch/extension.h>
 
 #include "constants.hpp"
 

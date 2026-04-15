@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
-#include <pybind11/pybind11.h>
+#include <Python.h>
+
 #include <string>
-#include <torch/extension.h>
 #include <vector>
+
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -12,66 +15,71 @@
 
 namespace kvcached {
 
-void init_kvcached(const std::string &dev_str, size_t page_size = 0,
-                   bool contiguous_layout = false) {
-  py::gil_scoped_release release;
-  FTensorAllocator::init(dev_str, page_size, contiguous_layout);
+void init_kvcached(std::string dev_str, int64_t page_size,
+                   bool contiguous_layout) {
+  FTensorAllocator::init(dev_str, static_cast<size_t>(page_size),
+                         contiguous_layout);
 }
 
-void shutdown_kvcached() {
-  py::gil_scoped_release release;
-  FTensorAllocator::shutdown();
-}
+void shutdown_kvcached() { FTensorAllocator::shutdown(); }
 
-std::vector<torch::Tensor> create_kv_tensors(size_t size, size_t dtype_size,
-                                             const std::string &dev_str,
-                                             int64_t num_layers,
-                                             int64_t num_kv_buffers = 2,
-                                             int64_t group_id = 0) {
-  py::gil_scoped_release release;
+std::vector<torch::stable::Tensor>
+create_kv_tensors(int64_t size, int64_t dtype_size, std::string dev_str,
+                  int64_t num_layers, int64_t num_kv_buffers,
+                  int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
-  auto dtype_ = torch_dtype_from_size(dtype_size);
-  return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers,
-                                      num_kv_buffers);
+  auto dtype_ = torch_dtype_from_size(static_cast<size_t>(dtype_size));
+  return allocator->create_kv_tensors(static_cast<size_t>(size), dtype_,
+                                      dev_str, num_layers, num_kv_buffers);
 }
 
-bool kv_tensors_created(int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool kv_tensors_created(int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->kv_tensors_created();
 }
 
-bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
-                       int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool map_to_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors(offsets);
 }
 
-bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
-                           int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool unmap_from_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->unmap_from_kv_tensors(offsets);
 }
 
 } // namespace kvcached
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "kvcached VMM plugin";
+STABLE_TORCH_LIBRARY(kvcached, m) {
+  m.def("init_kvcached(str dev_str, int page_size=0, bool "
+        "contiguous_layout=False) -> ()");
+  m.def("shutdown_kvcached() -> ()");
+  m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
+        "num_layers, int num_kv_buffers=2, int group_id=0) -> Tensor[]");
+  m.def("kv_tensors_created(int group_id=0) -> bool");
+  m.def("map_to_kv_tensors(int[] offsets, int group_id=0) -> bool");
+  m.def("unmap_from_kv_tensors(int[] offsets, int group_id=0) -> bool");
+}
 
-  m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
-        py::arg("dev_str"), py::arg("page_size") = 0,
-        py::arg("contiguous_layout") = true);
-  m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
-  m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
-        py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
-        py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
-        py::arg("group_id") = 0);
-  m.def("kv_tensors_created", &kvcached::kv_tensors_created,
-        "kv_tensors_created", py::arg("group_id") = 0);
-  m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
-        py::arg("offsets"), py::arg("group_id") = 0);
-  m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
-        "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
+  m.impl("init_kvcached", TORCH_BOX(&kvcached::init_kvcached));
+  m.impl("shutdown_kvcached", TORCH_BOX(&kvcached::shutdown_kvcached));
+  m.impl("create_kv_tensors", TORCH_BOX(&kvcached::create_kv_tensors));
+  m.impl("kv_tensors_created", TORCH_BOX(&kvcached::kv_tensors_created));
+  m.impl("map_to_kv_tensors", TORCH_BOX(&kvcached::map_to_kv_tensors));
+  m.impl("unmap_from_kv_tensors", TORCH_BOX(&kvcached::unmap_from_kv_tensors));
+}
+
+// Minimal Python module init.
+// Importing this module triggers the STABLE_TORCH_LIBRARY static constructors
+// above, which register the ops in PyTorch's dispatcher.
+static PyModuleDef _vmm_ops_lib_module = {
+    PyModuleDef_HEAD_INIT,
+    "_vmm_ops_lib",
+    "kvcached VMM operations (stable ABI)",
+    -1,
+};
+
+extern "C" PyMODINIT_FUNC PyInit__vmm_ops_lib(void) {
+  return PyModule_Create(&_vmm_ops_lib_module);
 }

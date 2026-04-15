@@ -21,7 +21,7 @@ try:
         library_paths,
     )
 except ImportError:
-    raise ImportError("Torch not found, please install torch>=2.6.0 first.")
+    raise ImportError("Torch not found, please install torch>=2.10.0 first.")
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH
@@ -44,15 +44,18 @@ def get_extensions():
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
     extra_compile_args = [
-        "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
+        "-std=c++17",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
+        # Torch 2.10.0 stable ABI
+        "-DTORCH_TARGET_VERSION=0x0210000000000000",
     ]
 
     vmm_ops_module = CUDAExtension(
-        "kvcached.vmm_ops",
+        "kvcached._vmm_ops_lib",
         csrc_files,
         include_dirs=include_paths() + [os.path.join(CSRC_PATH, "inc")],
         library_dirs=library_paths(),
-        libraries=["torch", "torch_cpu", "torch_python", "cuda"],
+        libraries=["torch", "torch_cpu", "cuda"],
         extra_compile_args={
             "cxx": extra_compile_args,
             "nvcc": extra_compile_args
