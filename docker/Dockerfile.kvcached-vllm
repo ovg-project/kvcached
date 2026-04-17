@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+#
+# Engine image: vLLM + kvcached (with our ftensor.cpp patch).
+#
+# Built from the kvcached fork's source tree.  Inherits vLLM 0.19.x so we
+# get the working sleep level=2 weight offload.  The ENABLE_KVCACHED env
+# var defaults to true so subprocess-launched engines speak kvcached
+# without needing extra wiring.
+#
+# Build:
+#   docker build -f docker/Dockerfile.kvcached-vllm -t kvcached-vllm:<tag> .
+#
+# Run inside a pod started by the parasail Helm chart with kvcached.enabled=true.
+
+ARG VLLM_BASE_TAG=v0.19.0
+FROM vllm/vllm-openai:${VLLM_BASE_TAG}
+
+# ---------------------------------------------------------------------------
+# Build-time args
+# ---------------------------------------------------------------------------
+ARG max_jobs=8
+ARG sccache_gha_enabled=off
+ARG actions_results_url=
+ARG actions_runtime_token=
+
+ENV MAX_JOBS=${max_jobs}
+ENV SCCACHE_GHA_ENABLED=${sccache_gha_enabled}
+ENV ACTIONS_RESULTS_URL=${actions_results_url}
+ENV ACTIONS_RUNTIME_TOKEN=${actions_runtime_token}
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+
+# ---------------------------------------------------------------------------
+# Build kvcached from this repo's source (includes the ftensor.cpp patch)
+# ---------------------------------------------------------------------------
+COPY . /tmp/kvcached
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-build-isolation /tmp/kvcached \
+ && rm -rf /tmp/kvcached
+
+# ---------------------------------------------------------------------------
+# Default kvcached env — engines pick up the autopatch automatically
+# ---------------------------------------------------------------------------
+ENV ENABLE_KVCACHED=true \
+    KVCACHED_AUTOPATCH=1 \
+    KVCACHED_IPC_NAME=VLLM \
+    VLLM_USE_V1=1 \
+    VLLM_ATTENTION_BACKEND=FLASH_ATTN \
+    VLLM_SERVER_DEV_MODE=1
+
+# Engine ports the Helm chart usually uses.  Pod-local; informational only.
+EXPOSE 8000 12346 30000 40000
+
+# Inherit the vllm-openai entrypoint from the base image so plain `docker
+# run kvcached-vllm:<tag>` still works as a drop-in replacement when not
+# orchestrated by the sidecar.

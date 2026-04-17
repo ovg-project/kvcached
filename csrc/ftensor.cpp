@@ -57,8 +57,26 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
   auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
   auto options =
       torch::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
-  tensor_ =
-      torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+
+  // Build a proper Storage pointing to our reserved virtual address range.
+  // Compared to torch::from_blob, this yields a tensor whose TensorImpl has
+  // allow_tensor_metadata_change_ = true, which is required by PyTorch 2.10+
+  // (vLLM >= 0.19 calls as_strided_ / set_stride on the returned tensors).
+  auto data_ptr = c10::DataPtr(
+      reinterpret_cast<void *>(vaddr_),
+      /*ctx=*/reinterpret_cast<void *>(vaddr_),
+      /*ctx_deleter=*/[](void *) {},
+      dev_);
+  auto storage = c10::Storage(
+      c10::Storage::use_byte_size_t{},
+      /*size_bytes=*/size_,
+      std::move(data_ptr),
+      /*allocator=*/nullptr,
+      /*resizable=*/false);
+
+  tensor_ = at::empty({0}, options);
+  tensor_.set_(std::move(storage), /*storage_offset=*/0,
+               /*sizes=*/{num_elems}, /*strides=*/{1});
 }
 
 FTensor::~FTensor() {

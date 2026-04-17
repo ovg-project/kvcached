@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+#
+# Sidecar image: mainline kvcached controller + frontend_uds.py + the ability
+# to subprocess-launch vLLM engines for runtime model adds.
+#
+# Inherits FROM the engine image so that:
+#   - `vllm` CLI is on PATH (needed for the admin `/admin/engines` POST that
+#     spawns a new engine inside the pod for zero-downtime model add)
+#   - kvcached is installed (the controller's startup checks pass)
+#   - CUDA libs are present (the subprocess will need them)
+#
+# Build:
+#   docker build -f docker/Dockerfile.kvcached-sidecar \
+#       --build-arg ENGINE_IMAGE=...kvcached-vllm \
+#       --build-arg ENGINE_TAG=<tag> \
+#       -t kvcached-sidecar:<tag> .
+
+ARG ENGINE_IMAGE=us-central1-docker.pkg.dev/axial-trail-412423/parasail/kvcached-vllm
+ARG ENGINE_TAG=latest
+FROM ${ENGINE_IMAGE}:${ENGINE_TAG}
+
+# ---------------------------------------------------------------------------
+# Sidecar code (mainline controller is already in the image because the
+# kvcached pip install pulls it in; copy frontend_uds.py from the fork tree).
+# ---------------------------------------------------------------------------
+WORKDIR /opt/kvcached-sidecar
+
+# Mainline controller modules — shipped in the kvcached package; we re-export
+# them here so PYTHONPATH stays simple.
+COPY controller /opt/kvcached-sidecar/controller
+
+# Our subclass that adds UDS transport, LRU eviction, admin endpoints
+COPY frontend_uds.py /opt/kvcached-sidecar/frontend_uds.py
+
+# ---------------------------------------------------------------------------
+# Sidecar runtime configuration
+# ---------------------------------------------------------------------------
+# The sidecar process itself needs no GPU.  Subprocesses it spawns will
+# inherit access to the pod's GPU via the engine container's nvidia.com/gpu
+# request.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/kvcached-sidecar:${PYTHONPATH:-}
+
+# Override the engine image's vLLM-openai ENTRYPOINT
+ENTRYPOINT ["python3", "-u", "/opt/kvcached-sidecar/frontend_uds.py"]
+
+# Default args — operator overrides these in the Helm chart values
+CMD ["--config_path", "/etc/kvcached/controller-config.yaml", "--port", "8080"]
+
+EXPOSE 8080
