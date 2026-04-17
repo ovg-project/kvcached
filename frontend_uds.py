@@ -30,9 +30,17 @@ import sys
 import aiohttp
 import yaml
 
-# Make main-branch controller/ importable
-KVCACHED_ROOT = Path("/root/kvcached")
+# Make main-branch controller/ importable.  Resolved relative to this file
+# so the same code works from a local checkout (/root/kvcached) AND inside
+# the sidecar container (/opt/kvcached-sidecar).  KVCACHED_ROOT env var
+# overrides if you have kvcached installed somewhere else.
+import os
+HERE = Path(__file__).resolve().parent
+KVCACHED_ROOT = Path(os.environ.get("KVCACHED_ROOT", str(HERE)))
 CONTROLLER_DIR = KVCACHED_ROOT / "controller"
+if not CONTROLLER_DIR.is_dir():
+    # Fallback for container layouts where controller/ sits next to this file
+    CONTROLLER_DIR = HERE / "controller"
 sys.path.insert(0, str(KVCACHED_ROOT))
 sys.path.insert(0, str(CONTROLLER_DIR))
 
