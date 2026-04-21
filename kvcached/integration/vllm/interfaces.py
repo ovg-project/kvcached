@@ -24,6 +24,7 @@ _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
+_num_blocks_per_layer: int = 0
 
 
 def should_use_worker_ipc() -> bool:
@@ -203,7 +204,9 @@ def alloc_kv_cache(
     # round down to page size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
+    global _num_blocks_per_layer
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
+    _num_blocks_per_layer = num_blocks_per_layer
     if requested_num_blocks > num_blocks_per_layer:
         logger.warning(
             f"Requested {requested_num_blocks} blocks, but only {num_blocks_per_layer} blocks are available."
@@ -293,6 +296,22 @@ def alloc_kv_cache(
         kv_tensors = [
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
+
+    from kvcached.integration.vllm.debug_layout import dump_kv_layout
+    dump_kv_layout(
+        tag="alloc",
+        kv_tensors=kv_tensors,
+        blocks_dim_idx=blocks_dim_idx,
+        extra={
+            "_num_blocks_per_layer": _num_blocks_per_layer,
+            "requested_num_blocks": requested_num_blocks,
+            "block_mem_bytes": block_mem_bytes,
+            "attention_type": attention_type,
+            "kv_layout": kv_layout,
+            "group_id": group_id,
+            "contiguous_layout": _contiguous_layout,
+        },
+    )
 
     if not unified_pool:
         return kv_tensors
