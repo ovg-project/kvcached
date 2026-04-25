@@ -101,7 +101,7 @@ def _patch_nixl_connector() -> None:
             return _original_register(self, kv_caches, *args, **kwargs)
 
         from kvcached.integration.vllm.interfaces import _num_blocks_per_layer
-        if _num_blocks_per_layer > self.num_blocks:
+        if _num_blocks_per_layer > 0 and _num_blocks_per_layer != self.num_blocks:
             logger.info(
                 "kvcached: NixlConnector num_blocks %d -> %d",
                 self.num_blocks, _num_blocks_per_layer,
