@@ -24,6 +24,10 @@ _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
+# Physical blocks per layer kvcached allocates for the GPU's KV region.
+# Read by the NixlConnector patch in autopatch.py to satisfy the connector's
+# shape[blocks_dim] == self.num_blocks assertion when kvcached over-allocates.
+_num_blocks_per_layer: int = 0
 
 
 def should_use_worker_ipc() -> bool:
@@ -202,6 +206,8 @@ def alloc_kv_cache(
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
+    global _num_blocks_per_layer
+    _num_blocks_per_layer = num_blocks_per_layer
     if requested_num_blocks > num_blocks_per_layer:
         logger.warning(
             f"Requested {requested_num_blocks} blocks, but only {num_blocks_per_layer} blocks are available."
