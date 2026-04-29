@@ -199,6 +199,7 @@ VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.pos
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
+VLLM_V12_RANGE = ">=0.12.0"  # use_uniform_kv_cache/prefer_cross_layer_blocks (PR #27743)
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
 
 
@@ -1297,6 +1298,58 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         else:
             raise ValueError(f"Unsupported vLLM version: {self.detected_version}")
 
+
+class KVConnectorMixinPatch(VersionAwarePatch, BasePatch):
+    """Patch use_uniform_kv_cache to return False when kvcached is active.
+
+    When OffloadingConnector is configured as a kv_connector, its
+    prefer_cross_layer_blocks=True causes use_uniform_kv_cache() to return True,
+    routing GPU allocation through allocate_uniform_kv_caches() with a single
+    torch.zeros cross-layer tensor — completely bypassing kvcached's
+    _allocate_kv_cache_tensors patch (and thus the VMM elastic pool).
+
+    We patch use_uniform_kv_cache to return False when kvcached is active so
+    that _allocate_kv_cache_tensors is always called. The CPU offloading
+    connector then receives per-layer VMM-backed tensors via register_kv_caches()
+    instead of register_cross_layers_kv_cache(), which CpuGpuOffloadingHandlers
+    handles correctly via its has_layers_dim=False code path.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.worker.kv_connector_model_runner_mixin"
+    target_class = "KVConnectorModelRunnerMixin"
+    patch_name = "kv_connector_mixin"
+
+    def apply(self, mixin_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_use_uniform_kv_cache(mixin_mod)
+
+    @version_range(VLLM_V12_RANGE)
+    def patch_use_uniform_kv_cache(self, mixin_mod: types.ModuleType) -> bool:
+        """Patch use_uniform_kv_cache to return False when kvcached is active."""
+        KVConnectorModelRunnerMixin = self._get_target_class(mixin_mod)
+        if KVConnectorModelRunnerMixin is None:
+            return False
+
+        original_method = KVConnectorModelRunnerMixin.use_uniform_kv_cache
+        if self._is_already_patched(original_method, "use_uniform_kv_cache"):
+            self.logger.debug("use_uniform_kv_cache already patched")
+            return True
+
+        def _patched_use_uniform_kv_cache(attn_groups, cache_dtype):
+            if enable_kvcached():
+                # Force the _allocate_kv_cache_tensors path so kvcached's VMM
+                # patch intercepts GPU allocation instead of the cross-layer
+                # torch.zeros path used by allocate_uniform_kv_caches().
+                return False
+            return original_method(attn_groups, cache_dtype)
+
+        self._mark_as_patched(_patched_use_uniform_kv_cache, "use_uniform_kv_cache")
+        KVConnectorModelRunnerMixin.use_uniform_kv_cache = staticmethod(
+            _patched_use_uniform_kv_cache
+        )
+        return True
 
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     """Patch Worker.init_device to ignore GPU free-memory check when kvcached is enabled"""
