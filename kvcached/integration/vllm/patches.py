@@ -308,6 +308,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self.num_gpu_blocks = num_gpu_blocks
                 self.enable_kv_cache_events = enable_kv_cache_events
                 self.kv_event_queue = []  # type: ignore[var-annotated]
+                self.kv_block_pool = [KVCacheBlockClass(i) for i in range(num_gpu_blocks)]
 
                 from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
@@ -481,7 +482,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
                 assert block_ids is not None and len(block_ids) == num_blocks
 
-                return [KVCacheBlockClass(bid, ref_cnt=1) for bid in block_ids]
+                blocks = []
+                for bid in block_ids:
+                    block = self.kv_block_pool[bid]
+                    block.ref_cnt = 1
+                    blocks.append(block)
+                return blocks
 
             def touch(
                 self, blocks: list["KVCacheBlock"] | tuple[list["KVCacheBlock"], ...]
@@ -1208,7 +1214,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
             import torch
-            from vllm.utils.torch_utils import get_dtype_size
+            try:
+                from vllm.utils.torch_utils import get_dtype_size
+            except ImportError:
+                from vllm.utils import get_dtype_size  # type: ignore[attr-defined]
 
             kv_caches: dict[str, torch.Tensor] = {}
 
