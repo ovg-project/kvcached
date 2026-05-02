@@ -366,7 +366,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # read from it, but results are masked out).
                 _null_ids = self.kv_cache_manager.alloc(1)
                 assert _null_ids is not None and len(_null_ids) == 1
-                self.null_block = KVCacheBlockClass(_null_ids[0])
+                self.null_block = self.kv_block_pool[_null_ids[0]]
                 self.null_block.is_null = True
 
                 # Prefix cache: (block_hash, group_id) -> KVCacheBlock
