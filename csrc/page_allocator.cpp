@@ -438,6 +438,15 @@ page_id_t PageAllocator::get_page_id(int64_t block_id,
   return block_id * block_mem_size / page_size_;
 }
 
+int64_t
+PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
+  if (!mem_info_tracker_) {
+    return -1;
+  }
+  return mem_info_tracker_->check_and_get_resize_target(
+      current_mem_size, num_layers_, num_kv_buffers_);
+}
+
 std::unordered_map<page_id_t, std::vector<int64_t>>
 PageAllocator::group_indices_by_page(const std::vector<int64_t> &indices,
                                      int64_t block_mem_size) const {

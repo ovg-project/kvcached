@@ -136,6 +136,11 @@ int64_t page_allocator_get_avail_physical_pages(
   return allocator->get_avail_physical_pages();
 }
 
+int64_t page_allocator_check_and_get_resize_target(
+    std::shared_ptr<PageAllocator> allocator, int64_t current_mem_size) {
+  return allocator->check_and_get_resize_target(current_mem_size);
+}
+
 void page_allocator_set_broadcast_map_callback(
     std::shared_ptr<PageAllocator> allocator, BroadcastMapCallback callback) {
   allocator->set_broadcast_map_callback(callback);
@@ -212,6 +217,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("check_and_get_resize_target",
+           &kvcached::page_allocator_check_and_get_resize_target)
       .def("get_page_id", &kvcached::page_allocator_get_page_id)
       .def("group_indices_by_page",
            &kvcached::page_allocator_group_indices_by_page)

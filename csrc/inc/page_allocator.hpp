@@ -81,6 +81,11 @@ public:
   int64_t get_num_reserved_pages() const;
   int64_t get_avail_physical_pages() const;
 
+  // Poll the shared-memory MemInfoStruct to see if an external controller
+  // (e.g. `kvctl limit`) has written a new total_size. Returns the new
+  // per-layer mem_size if it differs from current_mem_size, otherwise -1.
+  int64_t check_and_get_resize_target(int64_t current_mem_size) const;
+
   // Utility functions
   page_id_t get_page_id(int64_t block_id, int64_t block_mem_size) const;
 
