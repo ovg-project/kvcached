@@ -12,21 +12,20 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
-from kvcached.utils import (DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK,
-                            get_kvcached_logger)
+from kvcached.utils import DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
 from kvcached.vmm_ops import kv_tensors_created
 
 # The C++ MemInfoTracker derives its shm name from KVCACHED_IPC_NAME or
 # falls back to "kvcached_engine_<pgid>", which does NOT match Python's
 # "kvcached_<engine_tag>_<pgid>". Pin the env var so both sides agree.
-import os as _os
-_os.environ.setdefault("KVCACHED_IPC_NAME", DEFAULT_IPC_NAME)
+os.environ.setdefault("KVCACHED_IPC_NAME", DEFAULT_IPC_NAME)
 
 try:
     import kvcached.vmm_ops as kvcached_cpp
