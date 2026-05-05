@@ -6,8 +6,7 @@ import types
 
 from wrapt.importer import when_imported
 
-from kvcached.integration.patch_base import PatchManager, log_patch_results
-from kvcached.integration.patch_base import enable_kvcached
+from kvcached.integration.patch_base import PatchManager, enable_kvcached, log_patch_results
 from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
     VLLM_V8_RANGE,
