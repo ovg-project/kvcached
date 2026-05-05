@@ -65,7 +65,7 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
                             bool contiguous_layout) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (!g_allocators_.empty()) {
-    LOGE("FTensorAllocator has been initialized. Re-initializing...")
+    LOGGER(ERROR, "FTensorAllocator has been initialized. Re-initializing...");
     g_allocators_.clear();
   }
 
@@ -74,8 +74,10 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
     // Validate that page_size is a multiple of 2MB
     size_t base_size = 2 * 1024 * 1024; // 2MB
     if (page_size % base_size != 0) {
-      LOGE("Invalid page size: %zu, must be a multiple of 2MB (2097152 bytes)",
-           page_size);
+      LOGGER(
+          ERROR,
+          "Invalid page size: %zu, must be a multiple of 2MB (2097152 bytes)",
+          page_size);
       abort();
     }
     kPageSize = page_size;
@@ -120,8 +122,8 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
   size_t aligned_size = size;
   if (size % kPageSize != 0) {
     aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
-    LOGW("Size %zu is not aligned to page size %zu, aligning to %zu", size,
-         kPageSize, aligned_size);
+    LOGGER(WARNING, "Size %zu is not aligned to page size %zu, aligning to %zu",
+           size, kPageSize, aligned_size);
   }
   kv_tensor_size_per_layer_ = aligned_size;
 
@@ -151,7 +153,7 @@ bool FTensorAllocator::kv_tensors_created() {
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
   if (num_layers_ == 0) {
-    LOGE("try to map to KV tensors when KV tensors are not created");
+    LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
     return false;
   }
 
@@ -202,7 +204,8 @@ bool FTensorAllocator::unmap_from_kv_tensors(
     const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
   if (num_layers_ == 0) {
-    LOGE("try to unmap from KV tensors when KV tensors are not created");
+    LOGGER(ERROR,
+           "try to unmap from KV tensors when KV tensors are not created");
     return false;
   }
 

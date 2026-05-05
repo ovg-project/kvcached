@@ -9,17 +9,36 @@ This module implements a hierarchical memory management system for KV cache:
 - Blocks: Smaller units within pages that are allocated to store KV cache data
 """
 
+from __future__ import annotations
+
 import functools
+import os
 import threading
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
-from kvcached.page_allocator import Page, PageAllocator
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
-from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    DEFAULT_IPC_NAME,
+    PAGE_SIZE,
+    SANITY_CHECK,
+    get_kvcached_logger,
+)
 from kvcached.vmm_ops import kv_tensors_created
+
+# The C++ MemInfoTracker derives its shm name from KVCACHED_IPC_NAME or
+# falls back to "kvcached_engine_<pgid>", which does NOT match Python's
+# "kvcached_<engine_tag>_<pgid>". Pin the env var so both sides agree.
+os.environ.setdefault("KVCACHED_IPC_NAME", DEFAULT_IPC_NAME)
+
+try:
+    import kvcached.vmm_ops as kvcached_cpp
+    PageAllocator = kvcached_cpp.PageAllocator
+    InternalPage: Any = kvcached_cpp.InternalPage
+except ImportError as e:
+    raise ImportError(f"Failed to import kvcached.vmm_ops. Please ensure the C++ extension is built properly. err: {e}")
 
 logger = get_kvcached_logger()
 
@@ -91,13 +110,51 @@ class KVCacheManager:
             self.world_size,
             pp_rank=self.pp_rank,
             async_sched=async_sched,
+            contiguous_layout=CONTIGUOUS_LAYOUT,
+            enable_page_prealloc=True,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
         )
+        # Register should_use_worker_ipc callback so C++ PageAllocator
+        # knows when to use broadcast IPC even with world_size == 1
+        # (e.g. vLLM V1 EngineCore + worker in separate processes).
+        try:
+            from kvcached.integration.vllm.interfaces import should_use_worker_ipc
+            self.page_allocator.set_should_use_worker_ipc_callback(should_use_worker_ipc)
+            use_worker_ipc = should_use_worker_ipc()
+        except ImportError:
+            use_worker_ipc = False
+
+        if self.world_size > 1 or use_worker_ipc:
+            try:
+                from kvcached.tp_ipc_util import (
+                    broadcast_map_to_kv_tensors,
+                    broadcast_unmap_from_kv_tensors,
+                )
+
+                # Wrap Python functions to match C++ callback signature
+                def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                    """Wrapper for Python broadcast function"""
+                    broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+
+                def unmap_callback(world_size: int, offsets: List[int]) -> None:
+                    """Wrapper for Python broadcast function"""
+                    broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+
+                # Set the callbacks in the PageAllocator
+                self.page_allocator.set_broadcast_map_callback(map_callback)
+                self.page_allocator.set_broadcast_unmap_callback(unmap_callback)
+
+                logger.info("Set up broadcast callbacks for multi-process (world_size=%d, use_worker_ipc=%s)",
+                            self.world_size, use_worker_ipc)
+            except ImportError as e:
+                logger.warning("Failed to import tp_ipc_util module: %s. Broadcast callbacks will not be available.", e)
+            except Exception as e:
+                logger.warning("Failed to set up broadcast callbacks: %s. Falling back to single-process mode.", e)
 
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
-        self.avail_pages: Dict[int, Page] = {}
-        self.full_pages: Dict[int, Page] = {}
+        self.avail_pages: Dict[int, InternalPage] = {}
+        self.full_pages: Dict[int, InternalPage] = {}
 
         self.reserved_blocks: List[int] = []
         self.null_block: Optional[list[int]] = None
@@ -182,9 +239,9 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-            self.mem_size, self.num_layers, self.num_kv_buffers)
-        if new_mem_size is not None:
+        new_mem_size = self.page_allocator.check_and_get_resize_target(
+            self.mem_size)
+        if new_mem_size > 0:
             self.resize(new_mem_size)
 
         if self.available_size() < need_size:
@@ -193,7 +250,7 @@ class KVCacheManager:
             return None
 
         ret_index = []
-        page: Optional[Page] = None
+        page: Optional[InternalPage] = None
 
         remaining_need = need_size
 
@@ -244,11 +301,7 @@ class KVCacheManager:
                     raise ValueError(f"Freed index {idx} is in "
                                      " reserved_blocks, which is not allowed.")
 
-        # Group indices by page_id
-        idx_dict = defaultdict(list)
-        for idx in indices:
-            page_id = self.page_allocator.get_page_id(idx, self.block_mem_size)
-            idx_dict[page_id].append(idx)
+        idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
 
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():
@@ -346,11 +399,8 @@ class KVCacheManager:
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            virtual_free_pages = self.page_allocator.get_num_free_pages()
-            physical_free_pages = self.page_allocator.get_avail_physical_pages(
-            ) + self.page_allocator.get_num_reserved_pages()
-            free_pages = min(virtual_free_pages, physical_free_pages)
-            blocks_from_free_pages = free_pages * Page.get_num_blocks(
+            free_pages = self.page_allocator.get_num_free_pages()
+            blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
 
@@ -424,13 +474,13 @@ class KVCacheManager:
     @synchronized
     def _get_num_alloced_blocks(self) -> int:
         # Blocks from fully allocated pages
-        blocks_from_full_pages = len(self.full_pages) * Page.get_num_blocks(
+        blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size)
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
-        blocks_from_avail_pages = len(self.avail_pages) * Page.get_num_blocks(
+        blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size) - self.num_avail_blocks
         # Blocks from reserved blocks
         blocks_from_reserved_blocks = len(self.reserved_blocks)
