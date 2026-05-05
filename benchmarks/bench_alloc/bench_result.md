@@ -141,3 +141,65 @@ Microbench wins are real and broad. At e2e level they amortise to ~5% on this se
 A separate, larger overhead remains: **kvcached as a whole adds ~30-50% e2e overhead vs vanilla vLLM** (pre-existing, on all kvcached branches), which the PR partially closes (~5%) but does not eliminate.
 
 The kvctl resize poll on the fix branch costs ~7 μs/alloc in microbench (~30% in multi-thread alloc), but is invisible at e2e (<1%).
+
+---
+
+## G. Investigating the 30–50% e2e gap — the layout flag is the entire story
+
+Three hypotheses for the pre-existing kvcached overhead (Section E), tested on the fix branch with the same setup as Section E (Qwen3-0.6B, gpu-mem-util 0.5, max-model-len 2048, random 512in/128out, 500 prompts, 3 seeds, 100-prompt warmup discarded; all medians).
+
+### G.1 Burst alloc is **not** the cause
+
+`KVCACHED_MIN_RESERVED_PAGES=50` + `KVCACHED_MAX_RESERVED_PAGES=200` (vs default 5/10) — supposed to absorb burst alloc demand at request-rate=inf:
+
+| | tput | mean TTFT | mean TPOT |
+|---|--:|--:|--:|
+| kvcached default (5/10) | 9.87 | 16555 ms | 177.51 ms |
+| kvcached RESERVED=50/200 | 9.77 | 16548 ms | 179.38 ms |
+
+Statistically identical. The reserved-pool size has **no e2e effect** at this workload — the slow-path `cuMemMap` cost (4 ms/page from Section C) amortises out across the run.
+
+### G.2 KV layout is the **entire** cause
+
+`KVCACHED_CONTIGUOUS_LAYOUT=false` switches from one big shared buffer with cross-layer interleaving to **per-layer separate VMM pools**, matching vanilla vLLM's allocation pattern. Per-layer block stride drops from `num_layers × per_block_bytes` (28 × 64 KB = 1.79 MB on Qwen3-0.6B) back to `per_block_bytes` (64 KB).
+
+| rate=inf | tput (req/s) | mean TTFT | mean TPOT | P99 TPOT |
+|---|--:|--:|--:|--:|
+| **vanilla vLLM** | 14.25 | 11565 ms | 118.42 ms | 142.33 ms |
+| kvcached default (LAYOUT=true) | 9.87 (-31%) | 16555 (+43%) | 177.51 (+50%) | 230.84 (+62%) |
+| **kvcached LAYOUT=false** | **14.17 (-1%)** | **11642 (+1%)** | **119.03 (+0.5%)** | **142.72 (+0.3%)** |
+
+| rate=16 | tput (req/s) | mean TTFT | mean TPOT | P99 TPOT |
+|---|--:|--:|--:|--:|
+| **vanilla vLLM** | 13.20 | 240 ms | 73.62 ms | 117.27 ms |
+| kvcached default (LAYOUT=true) | 9.88 (-25%) | 1574 (6.6×) | 141.93 (+93%) | 226.60 (+93%) |
+| **kvcached LAYOUT=false + RESERVED=200** | **13.17 (-0.2%)** | **246 (+2%)** | **73.67 (+0%)** | **117.01 (-0.2%)** |
+
+`KVCACHED_CONTIGUOUS_LAYOUT=false` **eliminates the e2e gap entirely** — kvcached is statistically indistinguishable from vanilla vLLM on every metric, at both burst (rate=inf) and sustained (rate=16) load. **There is no residual "VMM mapping cost"; the entire 30-50% e2e overhead was the layer-interleaved layout.**
+
+### G.3 Mechanism
+
+`CONTIGUOUS_LAYOUT=true` (default) packs all layers' KV into one shared VM range with shape `[num_blocks, num_layers, 2, block_size, head_num, head_dim]`, and exposes per-layer tensors as strided views. Within one layer, block n+1 is `num_layers × per_block_bytes` bytes after block n — for Qwen3-0.6B that's 1.79 MB.
+
+During decode, FlashAttention reads **all blocks of one layer** for each request before moving to the next layer. With layer-interleaved layout, each block read crosses a different 2 MB VMM page → TLB pressure goes up roughly `num_layers`× vs vanilla. With per-layer pools (`LAYOUT=false`), consecutive blocks of one layer are tightly packed in one buffer, just like vanilla.
+
+This is consistent with the gap scaling with `num_layers` — small for shallow models (which is why Section E only saw +30-50% on a 28-layer model), and presumably much worse on the 32-layer Llama2-7B in PR #299's reported setup.
+
+### G.4 Required fix to make `LAYOUT=false` actually work
+
+`kvcached/kv_cache_manager.py:107` hardcoded `contiguous_layout=True` when constructing the C++ `PageAllocator`, regardless of the env var. With `KVCACHED_CONTIGUOUS_LAYOUT=false`, the FTensor side switched to per-layer buffers but the PageAllocator continued computing offsets as if layers were striped, leading to `cuMemUnmap (...) failed in CUDA driver (1): invalid argument` on the first eviction. Patched to read `CONTIGUOUS_LAYOUT` from `kvcached.utils`. Diff:
+
+```python
+-from kvcached.utils import DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
++from kvcached.utils import (CONTIGUOUS_LAYOUT, DEFAULT_IPC_NAME, PAGE_SIZE,
++                             SANITY_CHECK, get_kvcached_logger)
+@@
+-            contiguous_layout=True,
++            contiguous_layout=CONTIGUOUS_LAYOUT,
+```
+
+### G.5 Implication
+
+The kvcached "pre-existing overhead" framed in Section E is not pre-existing at all — it's a default setting. **Changing one env var (`KVCACHED_CONTIGUOUS_LAYOUT=false`) closes 100% of the gap**, and the previously-reported "~5% PR speedup" becomes the marginal piece of a feature whose primary cost was elsewhere.
+
+Open question: is there any reason `CONTIGUOUS_LAYOUT=true` is the default? The only place it's required is for hybrid-linear (mamba) models, which already check and bail out (`interfaces.py:138`). For all standard MHA/GQA/MLA workloads, `LAYOUT=false` should be the default.
