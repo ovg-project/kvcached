@@ -175,11 +175,18 @@ The documentation covers:
 
 ## Testing
 
-kvcached can be enabled by setting the following environmental variables:
+kvcached can be enabled by setting `ENABLE_KVCACHED` either in the shell:
 
 ```bash
 export ENABLE_KVCACHED=true
-export KVCACHED_AUTOPATCH=1
+```
+
+or from Python script (before `import vllm` / `import sglang`):
+
+```python
+import os
+os.environ["ENABLE_KVCACHED"] = "true"
+from kvcached import autopatch  # required when setting from Python;
 ```
 
 If you are using the engine-specific dockers, you can test kvcached by running the original engines' benchmark scripts. For example:
