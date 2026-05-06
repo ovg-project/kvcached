@@ -50,17 +50,39 @@ def _install_cleanup_handlers():
 class MemInfoTracker:
     """Tracks memory usage information through shared memory."""
 
-    def __init__(self, total_mem_size: int, group_id: int = 0):
+    # Minimum number of physical pages per layer to keep the model functional.
+    # 2 pages × page_size(2MB) = 4MB per layer per KV buffer — enough for
+    # a few short requests so the model doesn't become completely unusable.
+    # Configurable via KVCACHED_MIN_SAFE_PAGES_PER_LAYER env var.
+    MIN_SAFE_PAGES_PER_LAYER = int(
+        os.getenv("KVCACHED_MIN_SAFE_PAGES_PER_LAYER", "2"))
+
+    def __init__(self, total_mem_size: int, group_id: int = 0,
+                 num_layers: int = 1, num_kv_buffers: int = 2,
+                 page_size: int = 0):
         """
         Args:
             total_mem_size: Total memory size to initialize shared memory with
             group_id: KV cache group id.  group_id=0 uses DEFAULT_IPC_NAME
                 unchanged; non-zero groups get a "_g<id>" suffix so multiple
                 pools in one process don't share a segment.
+            num_layers: Number of model layers (for min_safe_limit calculation)
+            num_kv_buffers: Number of KV buffers per layer (2 for MHA K+V, 1 for MLA)
+            page_size: Physical page size in bytes (0 = use default PAGE_SIZE)
         """
+        from kvcached.utils import PAGE_SIZE as _default_page_size
+        if page_size <= 0:
+            page_size = _default_page_size
+
         base = DEFAULT_IPC_NAME if group_id == 0 else f"{DEFAULT_IPC_NAME}_g{group_id}"
         self.ipc_name = get_ipc_name(base)
-        init_kv_cache_limit(self.ipc_name, total_mem_size)
+
+        # Auto-calculate minimum safe limit from model parameters
+        min_safe_limit = (num_layers * num_kv_buffers * page_size
+                          * self.MIN_SAFE_PAGES_PER_LAYER)
+
+        init_kv_cache_limit(self.ipc_name, total_mem_size,
+                            min_safe_limit=min_safe_limit)
         _active_trackers.append(self)
         _install_cleanup_handlers()
 

@@ -204,7 +204,10 @@ class PageAllocator:
         # Initialize memory info tracker
         self.mem_info_tracker = MemInfoTracker(
             self.mem_size_per_layer * num_layers * num_kv_buffers,
-            group_id=group_id)
+            group_id=group_id,
+            num_layers=num_layers,
+            num_kv_buffers=num_kv_buffers,
+            page_size=page_size)
 
         # Preallocation thread management
         self.enable_page_prealloc: bool = enable_page_prealloc

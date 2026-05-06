@@ -30,9 +30,10 @@ class MemInfoStruct:
     total_size: int
     used_size: int
     prealloc_size: int
+    min_safe_limit: int = 0  # Minimum safe KV cache limit (auto-calculated from model params)
 
     DTYPE = np.int64
-    N_FIELDS = 3
+    N_FIELDS = 4
     SHM_SIZE = np.dtype(DTYPE).itemsize * N_FIELDS
 
     @classmethod
@@ -43,12 +44,15 @@ class MemInfoStruct:
     @classmethod
     def from_buffer(cls, buf: mmap.mmap) -> "MemInfoStruct":
         arr = cls._view(buf)
+        # Backward compatible: old segments with 3 fields will have min_safe_limit=0
+        min_safe = int(arr[3]) if len(arr) > 3 else 0
         return cls(int(arr[0]), int(arr[1]),
-                   int(arr[2]))  # total, used, prealloc
+                   int(arr[2]), min_safe)  # total, used, prealloc, min_safe_limit
 
     def write_to_buffer(self, buf: mmap.mmap) -> None:
         arr = self._view(buf)
-        arr[:] = (self.total_size, self.used_size, self.prealloc_size)
+        arr[:] = (self.total_size, self.used_size, self.prealloc_size,
+                  self.min_safe_limit)
 
 
 class RwLockedShm:
@@ -96,7 +100,8 @@ class RwLockedShm:
         self.file.close()
 
 
-def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
+def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int,
+                       min_safe_limit: int = 0):
     """
     Set the kv cache limit for the current process.
     Creates a persistent shared memory file that remains even after the script exits.
@@ -110,7 +115,7 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     # Now we can safely memory map and write the values
     with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
                      RwLockedShm.WLOCK) as mm:
-        mem_info = MemInfoStruct(kv_cache_limit, 0, 0)
+        mem_info = MemInfoStruct(kv_cache_limit, 0, 0, min_safe_limit)
         mem_info.write_to_buffer(mm)
         return mem_info
 

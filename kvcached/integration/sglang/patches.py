@@ -1162,3 +1162,64 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
         )
         return True
+
+
+class HttpServerPatch(VersionAwarePatch, BasePatch):
+    """Patch SGLang's HTTP server to inject kvcached KV cache management endpoints.
+
+    SGLang creates a module-level ``app = FastAPI(...)`` in
+    ``sglang.srt.entrypoints.http_server``.  We wrap
+    ``_setup_and_run_http_server`` so that the kvcache router is attached
+    to ``app`` before uvicorn starts listening.
+
+    This adds ``/kvcache/status``, ``/kvcache/limit``, and
+    ``/kvcache/limit_percent`` to every SGLang instance.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.entrypoints.http_server"
+    target_class = None  # Module-level function, not a class
+    patch_name = "http_server_kvcache"
+
+    def can_apply(self, target_module: types.ModuleType) -> bool:
+        return hasattr(target_module, "_setup_and_run_http_server")
+
+    def apply(self, http_server_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_setup_and_run(http_server_mod)
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_setup_and_run(self, http_server_mod: types.ModuleType) -> bool:
+        """Wrap _setup_and_run_http_server to attach kvcache routes."""
+        original_fn = getattr(http_server_mod, "_setup_and_run_http_server", None)
+        if original_fn is None:
+            self.logger.warning(
+                "_setup_and_run_http_server not found in http_server module")
+            return False
+
+        if self._is_already_patched(original_fn, "_setup_and_run"):
+            self.logger.debug("_setup_and_run_http_server already patched")
+            return True
+
+        _logger = self.logger
+
+        def _patched_setup_and_run(*args: Any, **kwargs: Any):
+            if enable_kvcached():
+                try:
+                    # The module-level ``app`` is the FastAPI instance.
+                    fastapi_app = getattr(http_server_mod, "app", None)
+                    if fastapi_app is not None:
+                        from kvcached.integration.vllm.api_router import (
+                            attach_to_app,
+                        )
+                        attach_to_app(fastapi_app)
+                except Exception as exc:
+                    _logger.warning(
+                        "Failed to attach kvcache router to SGLang: %s", exc)
+
+            return original_fn(*args, **kwargs)
+
+        self._mark_as_patched(_patched_setup_and_run, "_setup_and_run")
+        http_server_mod._setup_and_run_http_server = _patched_setup_and_run
+        return True

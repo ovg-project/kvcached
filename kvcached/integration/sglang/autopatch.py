@@ -14,6 +14,7 @@ from kvcached.integration.sglang.patches import (
     ElasticMambaPoolPatch,
     ElasticMemoryPoolPatch,
     ElasticMLAMemoryPoolPatch,
+    HttpServerPatch,
     RadixCacheLimitPatch,
     SchedulerMemoryLeakPatch,
 )
@@ -44,6 +45,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
+            (HttpServerPatch(), SGLANG_ALL_RANGE),
         ]
     )
 
