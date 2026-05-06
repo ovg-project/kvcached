@@ -11,6 +11,7 @@ from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
     VLLM_V8_RANGE,
     VLLM_V9_PLUS_RANGE,
+    ApiServerPatch,
     ElasticBlockPoolPatch,
     EngineCorePatch,
     GPUModelRunnerPatch,
@@ -44,6 +45,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
+            (ApiServerPatch(), VLLM_ALL_RANGE),
         ]
     )
 

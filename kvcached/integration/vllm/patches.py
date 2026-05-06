@@ -471,19 +471,35 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def get_new_blocks(
                 self, num_blocks: int
-            ) -> list[KVCacheBlock]:
+            ) -> list["KVCacheBlock"]:
+                if self.enable_prefix_cache and self._evictable_blocks:
+                    # When kvcached is in shrink mode, available_size() returns 0
+                    # and the capacity check below would always fail, creating a
+                    # deadlock. Break it by evicting cached blocks first so that
+                    # free() can trigger shrink recovery.
+                    if self.kv_cache_manager.in_shrink:
+                        self._evict_blocks_from_pool(len(self._evictable_blocks))
+                    else:
+                        # Normal mode: evict only if kvcached doesn't have enough
+                        kvcached_free = self.kv_cache_manager.available_size()
+                        if kvcached_free < num_blocks:
+                            self._evict_blocks_from_pool(num_blocks - kvcached_free)
+
                 if num_blocks > self.get_num_free_blocks():
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
 
-                if self.enable_prefix_cache:
-                    # Evict cached blocks if kvcached doesn't have enough free space
-                    kvcached_free = self.kv_cache_manager.available_size()
-                    if kvcached_free < num_blocks and self._evictable_blocks:
-                        self._evict_blocks_from_pool(num_blocks - kvcached_free)
-
                 block_ids = self.kv_cache_manager.alloc(num_blocks)
-                assert block_ids is not None and len(block_ids) == num_blocks
+                if block_ids is None or len(block_ids) != num_blocks:
+                    # Shrink mode may leave insufficient blocks after eviction.
+                    # Return what we got back to kvcached and signal failure
+                    # so the scheduler can retry on the next cycle.
+                    if block_ids:
+                        self.kv_cache_manager.free(block_ids)
+                    raise ValueError(
+                        f"kvcached alloc returned {len(block_ids) if block_ids else 0} "
+                        f"blocks, needed {num_blocks} (shrink mode active, "
+                        f"memory will be reclaimed gradually)")
 
                 blocks = []
                 for bid in block_ids:
@@ -1393,4 +1409,59 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class ApiServerPatch(VersionAwarePatch, BasePatch):
+    """Patch vLLM's build_app to inject kvcached KV cache management endpoints.
+
+    This adds ``/kvcache/status``, ``/kvcache/limit``, and
+    ``/kvcache/limit_percent`` to every vLLM instance's HTTP server so that
+    each instance can manage its own KV cache memory independently — no
+    external controller or shared /dev/shm access required.
+    """
+
+    library = "vllm"
+    target_module = "vllm.entrypoints.openai.api_server"
+    target_class = None  # We patch a module-level function, not a class
+    patch_name = "api_server_kvcache"
+
+    def can_apply(self, target_module: types.ModuleType) -> bool:
+        return hasattr(target_module, "build_app")
+
+    def apply(self, api_server_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_build_app(api_server_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_build_app(self, api_server_mod: types.ModuleType) -> bool:
+        """Wrap build_app so the returned FastAPI app includes kvcache routes."""
+        original_build_app = getattr(api_server_mod, "build_app", None)
+        if original_build_app is None:
+            self.logger.warning("build_app not found in api_server module")
+            return False
+
+        if self._is_already_patched(original_build_app, "build_app"):
+            self.logger.debug("build_app already patched")
+            return True
+
+        logger = self.logger
+
+        def _patched_build_app(*args: Any, **kwargs: Any):
+            app = original_build_app(*args, **kwargs)
+
+            if not enable_kvcached():
+                return app
+
+            try:
+                from kvcached.integration.vllm.api_router import attach_to_app
+                attach_to_app(app)
+            except Exception as exc:
+                logger.warning("Failed to attach kvcache router: %s", exc)
+
+            return app
+
+        self._mark_as_patched(_patched_build_app, "build_app")
+        api_server_mod.build_app = _patched_build_app
         return True
