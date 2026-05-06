@@ -733,6 +733,69 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
         try:
             import torch
 
+            State = getattr(MambaPool, "State")
+
+            class _PerLayerMambaState:
+                """Mamba state holder for kvcached non-contiguous layout.
+
+                In non-contiguous layout each mamba layer has its own VM
+                reservation, so a single ``(num_mamba_layers, num_slots,
+                *shape)`` tensor that spans all layers is impossible.  We
+                therefore keep per-layer 2D state tensors and expose the
+                same ``at_layer_idx`` API the rest of SGLang uses — every
+                hot-path consumer (e.g. ``Mamba2AttnBackend.forward``) goes
+                through ``mamba2_layer_cache(layer_id)`` which calls
+                ``at_layer_idx`` and only ever sees per-layer slices.
+
+                Multi-layer code paths that index the state directly as a
+                3D tensor — currently only
+                ``HybridLinearAttnBackend.update_mamba_state_after_mtp_verify``
+                in the speculative-decode flow — are not supported in
+                non-contiguous layout (caught at __init__ time).
+                """
+
+                def __init__(
+                    self,
+                    conv_per_layer: List[List["torch.Tensor"]],
+                    temporal_per_layer: List["torch.Tensor"],
+                ) -> None:
+                    # conv_per_layer[shape_idx][layer_idx] -> (slots, *shape)
+                    self.conv_per_layer = conv_per_layer
+                    # temporal_per_layer[layer_idx] -> (slots, *temporal_shape)
+                    self.temporal_per_layer = temporal_per_layer
+
+                # GDNAttnBackend (and similar) introspect
+                # ``mamba_cache.conv[0].shape`` / ``.temporal`` at attention-
+                # backend init time to learn the per-slot state shape.  We
+                # expose layer-0's per-layer tensor as a stand-in: trailing
+                # dims (slots, *shape) are identical across layers, and
+                # consumers only read .shape[-1] / .shape from it.  Any
+                # multi-layer 3D indexing would silently mis-target layer 0
+                # — but in this codebase those paths only run during
+                # speculative decode, which we already block at __init__.
+                @property
+                def conv(self) -> List["torch.Tensor"]:
+                    return [c[0] for c in self.conv_per_layer]
+
+                @property
+                def temporal(self) -> "torch.Tensor":
+                    return self.temporal_per_layer[0]
+
+                def at_layer_idx(self, layer: int) -> Any:
+                    return State(
+                        conv=[c[layer] for c in self.conv_per_layer],
+                        temporal=self.temporal_per_layer[layer],
+                    )
+
+                def mem_usage_bytes(self) -> int:
+                    total = 0
+                    for shape_list in self.conv_per_layer:
+                        for t in shape_list:
+                            total += t.numel() * t.element_size()
+                    for t in self.temporal_per_layer:
+                        total += t.numel() * t.element_size()
+                    return total
+
             class ElasticMambaPool(MambaPool):  # type: ignore[misc, valid-type]
                 """MambaPool variant whose conv + temporal state tensors are
                 backed by kvcached virtual memory.
@@ -741,6 +804,18 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 allocated block corresponds to one mamba slot; block_size=1,
                 num_kv_buffers=1, cell_size = sum of per-slot bytes across
                 all state kinds.
+
+                Two layouts are supported:
+
+                * Contiguous: a single VM reservation backs all layers, so
+                  ``mamba_cache.conv[i]`` and ``mamba_cache.temporal`` are
+                  ``(num_mamba_layers, slots, *)`` tensors — identical in
+                  shape to the native MambaPool buffers.
+                * Non-contiguous: each layer has its own VM reservation,
+                  so ``mamba_cache`` is a ``_PerLayerMambaState`` that
+                  satisfies the ``at_layer_idx`` contract used by the
+                  hybrid linear attention backend.  Speculative decoding
+                  is not supported in this layout.
                 """
 
                 # Kept separate from attention-pool group IDs to make logs
@@ -821,45 +896,67 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         group_id=self._group_id,
                     )
                     self._kvcached_layout = layout
+                    self._is_contiguous = bool(layout.get("is_contiguous", True))
 
-                    if speculative_num_draft_tokens is not None:
-                        conv_state_shape = cache_params.shape.conv
-                        temporal_state_shape = cache_params.shape.temporal
-                        intermediate_ssm_state_cache = torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                speculative_num_draft_tokens,
-                                temporal_state_shape[0],
-                                temporal_state_shape[1],
-                                temporal_state_shape[2],
-                            ),
-                            dtype=cache_params.dtype.temporal,
-                            device="cuda",
+                    if not self._is_contiguous and speculative_num_draft_tokens is not None:
+                        # Spec-decode's `update_mamba_state_after_mtp_verify`
+                        # uses fused_mamba_state_scatter_with_mask, which
+                        # needs a single contiguous (num_layers, slots, *)
+                        # tensor.  Per-layer tensors can't satisfy that.
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support speculative "
+                            "decoding with non-contiguous kvcached layout. "
+                            "Re-launch with KVCACHED_CONTIGUOUS_LAYOUT=true "
+                            "if you need spec decode for hybrid linear models."
                         )
-                        intermediate_conv_window_cache = [
-                            torch.zeros(
+
+                    if self._is_contiguous:
+                        if speculative_num_draft_tokens is not None:
+                            conv_state_shape = cache_params.shape.conv
+                            temporal_state_shape = cache_params.shape.temporal
+                            intermediate_ssm_state_cache = torch.zeros(
                                 size=(
                                     num_mamba_layers,
                                     spec_state_size + 1,
                                     speculative_num_draft_tokens,
-                                    conv_shape[0],
-                                    conv_shape[1],
+                                    temporal_state_shape[0],
+                                    temporal_state_shape[1],
+                                    temporal_state_shape[2],
                                 ),
-                                dtype=cache_params.dtype.conv,
+                                dtype=cache_params.dtype.temporal,
                                 device="cuda",
                             )
-                            for conv_shape in conv_state_shape
-                        ]
-                        self.mamba_cache = self.SpeculativeState(
-                            conv=conv_state,
-                            temporal=temporal_state,
-                            intermediate_ssm=intermediate_ssm_state_cache,
-                            intermediate_conv_window=intermediate_conv_window_cache,
-                        )
+                            intermediate_conv_window_cache = [
+                                torch.zeros(
+                                    size=(
+                                        num_mamba_layers,
+                                        spec_state_size + 1,
+                                        speculative_num_draft_tokens,
+                                        conv_shape[0],
+                                        conv_shape[1],
+                                    ),
+                                    dtype=cache_params.dtype.conv,
+                                    device="cuda",
+                                )
+                                for conv_shape in conv_state_shape
+                            ]
+                            self.mamba_cache = self.SpeculativeState(
+                                conv=conv_state,
+                                temporal=temporal_state,
+                                intermediate_ssm=intermediate_ssm_state_cache,
+                                intermediate_conv_window=intermediate_conv_window_cache,
+                            )
+                        else:
+                            self.mamba_cache = self.State(
+                                conv=conv_state, temporal=temporal_state,
+                            )
                     else:
-                        self.mamba_cache = self.State(
-                            conv=conv_state, temporal=temporal_state,
+                        # Non-contiguous: conv_state is List[List[Tensor]]
+                        # (outer=conv shape, inner=layer); temporal_state is
+                        # List[Tensor] (one per layer).
+                        self.mamba_cache = _PerLayerMambaState(
+                            conv_per_layer=conv_state,
+                            temporal_per_layer=temporal_state,
                         )
 
                     # block_size=1 → one block == one mamba slot.
@@ -888,6 +985,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         f"#slots={num_slots}, "
                         f"#mamba_layers={num_mamba_layers}, "
                         f"super_cell_bytes={layout['cell_size']}, "
+                        f"layout={'contig' if self._is_contiguous else 'non-contig'}, "
                         f"virtual_mem={self.mem_usage:.2f} GB"
                     )
 
@@ -903,9 +1001,19 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     select_index = torch.tensor(
                         block_ids, dtype=torch.int64, device=self.device,
                     )
-                    for i in range(len(self.mamba_cache.conv)):
-                        self.mamba_cache.conv[i][:, select_index] = 0
-                    self.mamba_cache.temporal[:, select_index] = 0
+                    if self._is_contiguous:
+                        for i in range(len(self.mamba_cache.conv)):
+                            self.mamba_cache.conv[i][:, select_index] = 0
+                        self.mamba_cache.temporal[:, select_index] = 0
+                    else:
+                        # Per-layer zeroing: each layer's state tensor is
+                        # (slots, *), so [select_index] slices on the slot
+                        # dim directly.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[select_index] = 0
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[select_index] = 0
                     return select_index
 
                 def free(self, free_index: Any) -> None:
@@ -915,6 +1023,55 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                 def clear(self) -> None:
                     self.kvcached_allocator.clear()
+
+                def copy_from(
+                    self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
+                ) -> None:
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "copy_from"):
+                            super().copy_from(src_index, dst_index)
+                    else:
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[dst_index] = t[src_index]
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[dst_index] = t[src_index]
+
+                def get_contiguous_buf_infos(self):
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "get_contiguous_buf_infos"):
+                            return super().get_contiguous_buf_infos()
+                    else:
+                        # Non-contiguous: per-layer pointer/length triples
+                        # in (state_kind_outer, layer_inner) order.
+                        data_ptrs: List[int] = []
+                        data_lens: List[int] = []
+                        item_lens: List[int] = []
+                        state_lists: List[List["torch.Tensor"]] = list(
+                            self.mamba_cache.conv_per_layer
+                        ) + [list(self.mamba_cache.temporal_per_layer)]
+                        for state_list in state_lists:
+                            for layer_t in state_list:
+                                data_ptrs.append(layer_t.data_ptr())
+                                data_lens.append(layer_t.nbytes)
+                                item_lens.append(layer_t[0].nbytes)
+                        return data_ptrs, data_lens, item_lens
+
+                def get_state_dim_per_tensor(self):
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "get_state_dim_per_tensor"):
+                            return super().get_state_dim_per_tensor()
+                    else:
+                        # Per-layer state shape is (slots, sliceable_dim, ...);
+                        # the sliceable dimension is at index 1 (post-slot).
+                        dim_per_tensor: List[int] = []
+                        state_lists: List[List["torch.Tensor"]] = list(
+                            self.mamba_cache.conv_per_layer
+                        ) + [list(self.mamba_cache.temporal_per_layer)]
+                        for state_list in state_lists:
+                            sliceable_dim = state_list[0].shape[1]
+                            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                        return dim_per_tensor
 
             setattr(mem_pool_mod, "ElasticMambaPool", ElasticMambaPool)
             return True

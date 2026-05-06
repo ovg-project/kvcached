@@ -173,13 +173,9 @@ def alloc_mamba_states(
     cache_params: Any,
     device: str,
     group_id: int = 0,
-) -> Tuple[List[torch.Tensor], torch.Tensor, Dict[str, Any]]:
+) -> Tuple[Any, Any, Dict[str, Any]]:
     """Allocate kvcached-backed mamba conv + temporal state tensors with a
     super-cell layout.
-
-    Requires contiguous kvcached layout so all mamba layers live in a single
-    VM reservation, which lets us hand back ``(num_mamba_layers, num_slots,
-    *shape)`` tensors identical in shape to the native ``MambaPool`` buffers.
 
     Per-slot byte layout within each (slot, layer) super-cell:
 
@@ -188,17 +184,34 @@ def alloc_mamba_states(
     One mamba slot == one kvcached block; a single ``map_to_kv_tensors`` call
     backs every state kind for that slot across all layers simultaneously.
 
+    Two layouts are supported:
+
+    * Contiguous (``KVCACHED_CONTIGUOUS_LAYOUT=true``): all mamba layers
+      share a single VM reservation, so the returned ``conv_state``
+      entries and ``temporal_state`` are single ``(num_mamba_layers,
+      num_slots, *shape)`` tensors — identical in shape to the native
+      ``MambaPool`` buffers.
+
+    * Non-contiguous (``KVCACHED_CONTIGUOUS_LAYOUT=false``): each layer
+      has its own VM reservation, so a single tensor that spans all
+      layers is impossible.  ``conv_state`` is a ``List[List[Tensor]]``
+      (outer = conv shape, inner = layer; each inner tensor has shape
+      ``(num_slots, *shape)``) and ``temporal_state`` is a
+      ``List[Tensor]`` (one per layer, shape ``(num_slots,
+      *temporal_shape)``).  The caller is responsible for adapting the
+      ``MambaPool.State`` API; SGLang's ``at_layer_idx`` path works
+      naturally because it only requests per-layer slices, but
+      multi-layer code paths (e.g. ``update_mamba_state_after_mtp_verify``
+      in the speculative-decode backend) require contiguous layout.
+
     Returns:
-        (conv_state_list, temporal_state, layout_info)
+        (conv_state, temporal_state, layout_info) where layout_info
+        carries an ``is_contiguous`` flag so callers can branch on the
+        returned shapes.
     """
     if not _kvcached_initialized:
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
-
-    if not _contiguous_layout:
-        raise RuntimeError(
-            "ElasticMambaPool requires contiguous kvcached layout. "
-            "Set KVCACHED_CONTIGUOUS_LAYOUT=true before starting the server.")
 
     assert torch.cuda.is_available(), "CUDA is not available."
 
@@ -273,16 +286,72 @@ def alloc_mamba_states(
     per_layer_bytes = num_slots * cell_size
     per_layer_bytes_aligned = _align_up(per_layer_bytes, PAGE_SIZE)
 
+    # Non-contiguous layout requires unified_pool=True so the per-layer
+    # FTensor map path skips the K/V split (which assumes a 2-buffer layout
+    # via get_v_base_offset and asserts num_eles % (2*kPageSize) == 0).
+    # Each FTensor here is a single-buffer mamba state, so unified_pool=True
+    # makes map_to_kv_tensors map exactly one VMM page per offset per
+    # layer.  In contiguous mode, the C++ ignores unified_pool and uses
+    # the compound-page path instead, so the flag is harmless there.
     raw_tensors = create_kv_tensors(
         per_layer_bytes_aligned, torch.int8.itemsize, device,
         num_mamba_layers, num_kv_buffers=1, group_id=group_id,
+        unified_pool=not _contiguous_layout,
     )
-    # Contiguous layout hands back a single flat int8 FTensor covering all
-    # mamba layers: bytes laid out as [slot][layer][cell].
-    flat_int8 = raw_tensors[0]
 
-    def _view_state(shape: Tuple[int, ...], dtype: torch.dtype,
-                    offset_bytes: int) -> torch.Tensor:
+    layout_info: Dict[str, Any] = {
+        "cell_size": cell_size,
+        "num_slots": num_slots,
+        "num_mamba_layers": num_mamba_layers,
+        "conv_offsets": conv_offsets,
+        "temporal_offset": temporal_offset,
+        "is_contiguous": _contiguous_layout,
+    }
+
+    if _contiguous_layout:
+        # Contiguous layout hands back a single flat int8 FTensor covering
+        # all mamba layers: bytes laid out as [slot][layer][cell].
+        flat_int8 = raw_tensors[0]
+
+        def _view_state_contig(shape: Tuple[int, ...], dtype: torch.dtype,
+                               offset_bytes: int) -> torch.Tensor:
+            dtype_size = dtype.itemsize
+            assert offset_bytes % dtype_size == 0
+            assert cell_size % dtype_size == 0
+
+            inner_stride: List[int] = []
+            running = 1
+            for d in reversed(shape):
+                inner_stride.insert(0, running)
+                running *= d
+
+            size = (num_mamba_layers, num_slots, *shape)
+            strides = [
+                cell_size // dtype_size,
+                (num_mamba_layers * cell_size) // dtype_size,
+                *inner_stride,
+            ]
+            return torch.as_strided(
+                flat_int8.view(dtype=dtype),
+                size=size,
+                stride=strides,
+                storage_offset=offset_bytes // dtype_size,
+            )
+
+        conv_state: Any = [
+            _view_state_contig(shape, conv_dtype, conv_offsets[i])
+            for i, shape in enumerate(conv_shapes)
+        ]
+        temporal_state: Any = _view_state_contig(temporal_shape, ssm_dtype,
+                                                 temporal_offset)
+        return conv_state, temporal_state, layout_info
+
+    # Non-contiguous layout: one int8 FTensor per layer, each laid out as
+    # [slot][cell].  We build per-layer (num_slots, *shape) views — no single
+    # tensor can span layers because each layer has its own VM reservation.
+    def _view_state_per_layer(layer_ftensor: torch.Tensor,
+                              shape: Tuple[int, ...], dtype: torch.dtype,
+                              offset_bytes: int) -> torch.Tensor:
         dtype_size = dtype.itemsize
         assert offset_bytes % dtype_size == 0
         assert cell_size % dtype_size == 0
@@ -293,33 +362,33 @@ def alloc_mamba_states(
             inner_stride.insert(0, running)
             running *= d
 
-        size = (num_mamba_layers, num_slots, *shape)
+        size = (num_slots, *shape)
         strides = [
             cell_size // dtype_size,
-            (num_mamba_layers * cell_size) // dtype_size,
             *inner_stride,
         ]
         return torch.as_strided(
-            flat_int8.view(dtype=dtype),
+            layer_ftensor.view(dtype=dtype),
             size=size,
             stride=strides,
             storage_offset=offset_bytes // dtype_size,
         )
 
-    conv_state = [
-        _view_state(shape, conv_dtype, conv_offsets[i])
-        for i, shape in enumerate(conv_shapes)
+    # conv_state_per_layer[shape_idx][layer_idx] -> (num_slots, *shape)
+    conv_state_per_layer: List[List[torch.Tensor]] = [
+        [
+            _view_state_per_layer(raw_tensors[layer_idx], shape, conv_dtype,
+                                  conv_offsets[shape_idx])
+            for layer_idx in range(num_mamba_layers)
+        ] for shape_idx, shape in enumerate(conv_shapes)
     ]
-    temporal_state = _view_state(temporal_shape, ssm_dtype, temporal_offset)
-
-    layout_info: Dict[str, Any] = {
-        "cell_size": cell_size,
-        "num_slots": num_slots,
-        "num_mamba_layers": num_mamba_layers,
-        "conv_offsets": conv_offsets,
-        "temporal_offset": temporal_offset,
-    }
-    return conv_state, temporal_state, layout_info
+    # temporal_state_per_layer[layer_idx] -> (num_slots, *temporal_shape)
+    temporal_state_per_layer: List[torch.Tensor] = [
+        _view_state_per_layer(raw_tensors[layer_idx], temporal_shape,
+                              ssm_dtype, temporal_offset)
+        for layer_idx in range(num_mamba_layers)
+    ]
+    return conv_state_per_layer, temporal_state_per_layer, layout_info
 
 
 def get_kv_cache_manager(
