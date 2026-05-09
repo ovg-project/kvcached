@@ -138,7 +138,8 @@ TIMEOUT_REQUEST=300 \
 ```
 
 That wrapper uses the upstream vLLM proxy from the cloned vLLM repo and direct
-`vllm serve` producer/decode processes. It does not use the kvcached debug proxy.
+`vllm serve` producer/decode processes. It does not use the kvcached debug proxy,
+and it sends one small request instead of running the upstream benchmark.
 
 Manual equivalent:
 

@@ -278,13 +278,20 @@ phase0_setup() {
     log_pass "vLLM $(python3 -c 'import vllm; print(vllm.__version__)')"
 
     if [ "$INSTALL_DEPS" = "1" ]; then
-        python3 - <<'PY' || pip install -q quart aiohttp msgpack pyzmq pandas datasets transformers huggingface_hub
+        if ! python3 - <<'PY'
 import aiohttp  # noqa: F401
+import huggingface_hub  # noqa: F401
 import msgpack  # noqa: F401
-import pandas  # noqa: F401
 import quart  # noqa: F401
+import transformers  # noqa: F401
 import zmq  # noqa: F401
 PY
+        then
+            log_info "Installing direct vLLM example dependencies..."
+            python3 -m pip install -q --ignore-installed blinker
+            python3 -m pip install -q \
+                quart aiohttp msgpack pyzmq transformers huggingface_hub
+        fi
     fi
 
     if [ "$SKIP_MODEL_DOWNLOAD" != "1" ]; then
