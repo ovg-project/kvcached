@@ -272,14 +272,17 @@ PY
     fi
 
     if [ "$INSTALL_KVCACHED" = "1" ]; then
-        log_info "Installing kvcached from this checkout..."
+        log_info "Installing kvcached from this checkout with the normal install path..."
+        pip uninstall -y kvcached >/dev/null 2>&1 || true
         CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" \
-            pip install -q -e "$REPO_DIR" --no-build-isolation
+            pip install -q "$REPO_DIR" --no-build-isolation
         log_pass "kvcached installed from $REPO_DIR"
     fi
 
     python3 - <<'PY'
 import inspect
+from pathlib import Path
+import site
 
 import kvcached.integration.vllm.autopatch as autopatch
 
@@ -287,8 +290,20 @@ source = inspect.getsource(autopatch._patch_p2p_nccl_debug)
 assert "P2pNcclConnector" in source
 assert "P2pNcclEngine" in source
 print(f"kvcached autopatch source: {autopatch.__file__}")
+
+site_dirs = site.getsitepackages()
+user_site = site.getusersitepackages()
+if user_site:
+    site_dirs.append(user_site)
+pth_files = [
+    Path(site_dir) / "kvcached_autopatch.pth"
+    for site_dir in site_dirs
+    if (Path(site_dir) / "kvcached_autopatch.pth").exists()
+]
+assert pth_files, "kvcached_autopatch.pth was not installed into site-packages"
+print(f"kvcached autopatch pth: {pth_files[0]}")
 PY
-    log_pass "P2P debug autopatch source is present"
+    log_pass "P2P debug autopatch source and .pth hook are present"
 }
 
 write_proxy() {
@@ -487,29 +502,6 @@ if __name__ == "__main__":
 PY
 }
 
-write_vllm_wrapper() {
-    cat > "$RUN_DIR/vllm_with_kvcached_autopatch.py" <<'PY'
-import os
-import sys
-
-os.environ.setdefault("ENABLE_KVCACHED", "true")
-os.environ.setdefault("KVCACHED_AUTOPATCH", "1")
-os.environ.setdefault("KVCACHED_LOG_LEVEL", "INFO")
-
-import kvcached.autopatch  # noqa: F401
-
-print(
-    "[kvcached p2p debug wrapper] imported kvcached.autopatch before vLLM CLI",
-    file=sys.stderr,
-    flush=True,
-)
-
-from vllm.entrypoints.cli.main import main
-
-main()
-PY
-}
-
 make_kv_config() {
     local role=$1
     local kv_port=$2
@@ -571,7 +563,7 @@ start_vllm_instance() {
         export KVCACHED_LOG_LEVEL
         export KVCACHED_P2P_WAIT_LOG_INTERVAL_S
         export KVCACHED_P2P_TRACE_TENSORS
-        exec python3 "$RUN_DIR/vllm_with_kvcached_autopatch.py" serve "$MODEL" \
+        exec vllm serve "$MODEL" \
             --host 0.0.0.0 \
             --port "$http_port" \
             --tensor-parallel-size 1 \
@@ -659,7 +651,6 @@ run_harness() {
     start_proxy
 
     log_info "========== PHASE 2: Start P2P vLLM instances =========="
-    write_vllm_wrapper
     start_vllm_instance \
         "prefill" "$PREFILL_GPU" "$PREFILL_PORT" "$PREFILL_KV_PORT" \
         "kv_producer" "$PREFILL_KV_BUFFER_SIZE" "$PREFILL_GPU_MEM_UTIL"
