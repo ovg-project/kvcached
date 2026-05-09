@@ -399,7 +399,10 @@ class KVCacheManager:
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            free_pages = self.page_allocator.get_num_free_pages()
+            virtual_free_pages = self.page_allocator.get_num_free_pages()
+            physical_free_pages = self.page_allocator.get_avail_physical_pages(
+            ) + self.page_allocator.get_num_reserved_pages()
+            free_pages = min(virtual_free_pages, physical_free_pages)
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
