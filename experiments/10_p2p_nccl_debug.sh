@@ -70,6 +70,7 @@ ln -sfn "$RUN_DIR" "$LATEST_LINK"
 
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
+export KVCACHED_LOG_LEVEL="${KVCACHED_LOG_LEVEL:-INFO}"
 export KVCACHED_P2P_WAIT_LOG_INTERVAL_S="${KVCACHED_P2P_WAIT_LOG_INTERVAL_S:-5}"
 export KVCACHED_P2P_TRACE_TENSORS="${KVCACHED_P2P_TRACE_TENSORS:-true}"
 export PYTHONUNBUFFERED=1
@@ -276,6 +277,18 @@ PY
             pip install -q -e "$REPO_DIR" --no-build-isolation
         log_pass "kvcached installed from $REPO_DIR"
     fi
+
+    python3 - <<'PY'
+import inspect
+
+import kvcached.integration.vllm.autopatch as autopatch
+
+source = inspect.getsource(autopatch._patch_p2p_nccl_debug)
+assert "P2pNcclConnector" in source
+assert "P2pNcclEngine" in source
+print(f"kvcached autopatch source: {autopatch.__file__}")
+PY
+    log_pass "P2P debug autopatch source is present"
 }
 
 write_proxy() {
@@ -474,6 +487,29 @@ if __name__ == "__main__":
 PY
 }
 
+write_vllm_wrapper() {
+    cat > "$RUN_DIR/vllm_with_kvcached_autopatch.py" <<'PY'
+import os
+import sys
+
+os.environ.setdefault("ENABLE_KVCACHED", "true")
+os.environ.setdefault("KVCACHED_AUTOPATCH", "1")
+os.environ.setdefault("KVCACHED_LOG_LEVEL", "INFO")
+
+import kvcached.autopatch  # noqa: F401
+
+print(
+    "[kvcached p2p debug wrapper] imported kvcached.autopatch before vLLM CLI",
+    file=sys.stderr,
+    flush=True,
+)
+
+from vllm.entrypoints.cli.main import main
+
+main()
+PY
+}
+
 make_kv_config() {
     local role=$1
     local kv_port=$2
@@ -532,9 +568,10 @@ start_vllm_instance() {
         export CUDA_VISIBLE_DEVICES="$gpu"
         export ENABLE_KVCACHED=true
         export KVCACHED_AUTOPATCH=1
+        export KVCACHED_LOG_LEVEL
         export KVCACHED_P2P_WAIT_LOG_INTERVAL_S
         export KVCACHED_P2P_TRACE_TENSORS
-        exec vllm serve "$MODEL" \
+        exec python3 "$RUN_DIR/vllm_with_kvcached_autopatch.py" serve "$MODEL" \
             --host 0.0.0.0 \
             --port "$http_port" \
             --tensor-parallel-size 1 \
@@ -622,6 +659,7 @@ run_harness() {
     start_proxy
 
     log_info "========== PHASE 2: Start P2P vLLM instances =========="
+    write_vllm_wrapper
     start_vllm_instance \
         "prefill" "$PREFILL_GPU" "$PREFILL_PORT" "$PREFILL_KV_PORT" \
         "kv_producer" "$PREFILL_KV_BUFFER_SIZE" "$PREFILL_GPU_MEM_UTIL"
