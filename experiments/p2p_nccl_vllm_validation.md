@@ -115,7 +115,7 @@ The official example is documented here:
 
 The example source lives here:
 
-<https://github.com/vllm-project/vllm/tree/main/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd>
+<https://github.com/vllm-project/vllm/tree/main/examples/disaggregated/p2p_nccl_xpyd>
 
 Automated local wrapper:
 
@@ -163,7 +163,7 @@ export HF_TOKEN=hf_...
 Run a 1P1D A100 baseline:
 
 ```bash
-cd /root/vllm-upstream/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+cd /root/vllm-upstream/examples/disaggregated/p2p_nccl_xpyd
 
 MODEL=Qwen/Qwen2.5-1.5B-Instruct \
 PREFILL_GPUS=0 \
@@ -191,7 +191,7 @@ curl --max-time 300 -sS http://localhost:10001/v1/completions \
 Then repeat with request ID randomization disabled:
 
 ```bash
-cd /root/vllm-upstream/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd
+cd /root/vllm-upstream/examples/disaggregated/p2p_nccl_xpyd
 
 VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1 \
 MODEL=Qwen/Qwen2.5-1.5B-Instruct \

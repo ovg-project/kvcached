@@ -329,15 +329,30 @@ sync_upstream_vllm() {
         log_info "Using existing upstream vLLM checkout at $VLLM_REPO_DIR"
     fi
 
-    EXAMPLE_DIR="$VLLM_REPO_DIR/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd"
-    PROXY_SCRIPT="$EXAMPLE_DIR/disagg_proxy_p2p_nccl_xpyd.py"
-    if [ ! -f "$PROXY_SCRIPT" ]; then
-        log_fail "Upstream proxy script not found: $PROXY_SCRIPT"
+    local candidate_dir
+    for candidate_dir in \
+        "$VLLM_REPO_DIR/examples/disaggregated/p2p_nccl_xpyd" \
+        "$VLLM_REPO_DIR/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd"; do
+        if [ -f "$candidate_dir/disagg_proxy_p2p_nccl_xpyd.py" ]; then
+            EXAMPLE_DIR="$candidate_dir"
+            PROXY_SCRIPT="$EXAMPLE_DIR/disagg_proxy_p2p_nccl_xpyd.py"
+            break
+        fi
+    done
+
+    if [ -z "${PROXY_SCRIPT:-}" ]; then
+        log_fail "Upstream proxy script not found in known vLLM example paths."
+        log_info "Nearby files:"
+        find "$VLLM_REPO_DIR/examples" -maxdepth 4 -type f \
+            | grep -E "p2p|nccl|disagg_proxy" \
+            | sort \
+            | tail -50 || true
         return 1
     fi
 
     git -C "$VLLM_REPO_DIR" rev-parse --short HEAD > "$RUN_DIR/vllm_example_commit.txt"
     log_pass "Using upstream vLLM example commit $(cat "$RUN_DIR/vllm_example_commit.txt")"
+    log_info "Upstream example directory: $EXAMPLE_DIR"
 }
 
 make_kv_config() {
