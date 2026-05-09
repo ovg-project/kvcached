@@ -14,6 +14,7 @@
 # Useful overrides:
 #   MODEL=Qwen/Qwen2.5-1.5B-Instruct ./experiments/10_p2p_nccl_debug.sh
 #   TIMEOUT_REQUEST=300 KVCACHED_P2P_WAIT_LOG_INTERVAL_S=5 ./experiments/10_p2p_nccl_debug.sh
+#   RUN_WITH_KVCACHED=0 ./experiments/10_p2p_nccl_debug.sh
 #   KEEP_ALIVE_ON_FAIL=1 ./experiments/10_p2p_nccl_debug.sh
 #
 # Logs are saved to experiments/logs_p2p_debug/<timestamp>/.
@@ -51,6 +52,7 @@ P2P_MEM_POOL_SIZE_GB="${P2P_MEM_POOL_SIZE_GB:-32}"
 
 TIMEOUT_STARTUP="${TIMEOUT_STARTUP:-240}"
 TIMEOUT_REQUEST="${TIMEOUT_REQUEST:-90}"
+RUN_WITH_KVCACHED="${RUN_WITH_KVCACHED:-1}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
 INSTALL_KVCACHED="${INSTALL_KVCACHED:-1}"
 SKIP_MODEL_DOWNLOAD="${SKIP_MODEL_DOWNLOAD:-0}"
@@ -68,8 +70,13 @@ LATEST_LINK="$REPO_DIR/$LOG_ROOT/latest"
 mkdir -p "$RUN_DIR"
 ln -sfn "$RUN_DIR" "$LATEST_LINK"
 
-export ENABLE_KVCACHED=true
-export KVCACHED_AUTOPATCH=1
+if [ "$RUN_WITH_KVCACHED" = "1" ]; then
+    export ENABLE_KVCACHED=true
+    export KVCACHED_AUTOPATCH=1
+else
+    export ENABLE_KVCACHED=false
+    export KVCACHED_AUTOPATCH=0
+fi
 export KVCACHED_LOG_LEVEL="${KVCACHED_LOG_LEVEL:-INFO}"
 export KVCACHED_P2P_WAIT_LOG_INTERVAL_S="${KVCACHED_P2P_WAIT_LOG_INTERVAL_S:-5}"
 export KVCACHED_P2P_TRACE_TENSORS="${KVCACHED_P2P_TRACE_TENSORS:-true}"
@@ -271,7 +278,7 @@ PY
         log_pass "Model available"
     fi
 
-    if [ "$INSTALL_KVCACHED" = "1" ]; then
+    if [ "$RUN_WITH_KVCACHED" = "1" ] && [ "$INSTALL_KVCACHED" = "1" ]; then
         log_info "Installing kvcached from this checkout with the normal install path..."
         pip uninstall -y kvcached >/dev/null 2>&1 || true
         CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" \
@@ -279,7 +286,8 @@ PY
         log_pass "kvcached installed from $REPO_DIR"
     fi
 
-    python3 - <<'PY'
+    if [ "$RUN_WITH_KVCACHED" = "1" ]; then
+        python3 - <<'PY'
 import inspect
 from pathlib import Path
 import site
@@ -303,7 +311,11 @@ pth_files = [
 assert pth_files, "kvcached_autopatch.pth was not installed into site-packages"
 print(f"kvcached autopatch pth: {pth_files[0]}")
 PY
-    log_pass "P2P debug autopatch source and .pth hook are present"
+        log_pass "P2P debug autopatch source and .pth hook are present"
+    else
+        log_info "RUN_WITH_KVCACHED=0: running plain vLLM P2P with kvcached disabled."
+        log_info "Existing kvcached installs are ignored because ENABLE_KVCACHED=false."
+    fi
 }
 
 write_proxy() {
@@ -558,8 +570,8 @@ start_vllm_instance() {
     echo "$kv_config" > "$RUN_DIR/$name.kv_transfer_config.json"
     (
         export CUDA_VISIBLE_DEVICES="$gpu"
-        export ENABLE_KVCACHED=true
-        export KVCACHED_AUTOPATCH=1
+        export ENABLE_KVCACHED
+        export KVCACHED_AUTOPATCH
         export KVCACHED_LOG_LEVEL
         export KVCACHED_P2P_WAIT_LOG_INTERVAL_S
         export KVCACHED_P2P_TRACE_TENSORS
@@ -647,6 +659,11 @@ PY
 
 run_harness() {
     log_info "Logs: $RUN_DIR"
+    if [ "$RUN_WITH_KVCACHED" = "1" ]; then
+        log_info "Mode: vLLM P2P with kvcached enabled and debug instrumentation"
+    else
+        log_info "Mode: plain vLLM P2P baseline, kvcached disabled"
+    fi
     log_info "========== PHASE 1: Start proxy =========="
     start_proxy
 
