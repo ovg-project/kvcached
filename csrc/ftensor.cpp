@@ -75,7 +75,7 @@ bool FTensor::map(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) != mapping_.end()) {
-    LOGE("Page %ld is already mapped.", page_id);
+    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
     return false;
   }
 
@@ -93,7 +93,7 @@ bool FTensor::unmap(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) == mapping_.end()) {
-    LOGE("Page %ld is not mapped.", page_id);
+    LOGGER(ERROR, "Page %ld is not mapped.", page_id);
     return false;
   }
 

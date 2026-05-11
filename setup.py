@@ -31,8 +31,10 @@ CSRC_PATH = os.path.join(ROOT_PATH, "csrc")
 def get_csrc_files(path) -> List[str]:
     src_dir = Path(path)
     # setuptools requires relative paths
+    # Filter out macOS AppleDouble metadata files (._* prefix)
     cpp_files = [
         str(f.relative_to(SCRIPT_PATH)) for f in src_dir.rglob("*.cpp")
+        if not f.name.startswith("._")
     ]
     return cpp_files
 

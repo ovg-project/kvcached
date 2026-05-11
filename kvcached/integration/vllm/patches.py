@@ -1217,7 +1217,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
             import torch
-            from vllm.utils.torch_utils import get_dtype_size
+            try:
+                from vllm.utils.torch_utils import get_dtype_size
+            except ImportError:
+                from vllm.utils import get_dtype_size  # type: ignore[attr-defined]
 
             kv_caches: dict[str, torch.Tensor] = {}
 
