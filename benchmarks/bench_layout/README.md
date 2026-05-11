@@ -72,10 +72,85 @@ Per-call attention slowdown grows with concurrent working-set size — consisten
 
 `LAYOUT=false` is flat with workload because ~32 blocks share each page. Deeper models (32-layer Llama2-7B, 48+ layer Llama3-70B) cross the 2 MB page boundary even more sharply.
 
-## 3. Patch needed for `LAYOUT=false`
+## 3. When does `LAYOUT=true` win?
+
+The previous sections show non-contiguous wins big on attention. The contiguous layout still pays off on three things:
+
+### 3.1 Hybrid linear / mamba models — required
+
+Mamba layers share the same flat KV buffer as attention layers and index into it per virtual block across layers. `interfaces.py:138` detects hybrid-linear configs and refuses to run with `CONTIGUOUS_LAYOUT=false`. So for `HYBRID_LINEAR` model types there is no choice — contiguous is mandatory.
+
+### 3.2 Init time — `LAYOUT=true` is ~3× faster
+
+Contiguous reserves one big VM range; non-contiguous reserves `num_layers` separate ranges + a shared zero-page handle. Measured `alloc_kv_cache` time (ms) at varying `num_layers`, 1 GB per layer:
+
+| `num_layers` | `LAYOUT=true` | `LAYOUT=false` | Δ |
+|--:|--:|--:|--:|
+| 8 | 658 | 2,058 | +1,400 |
+| 16 | 640 | 1,899 | +1,259 |
+| 28 | 568 | 2,058 | +1,490 |
+| 32 | 632 | 1,936 | +1,304 |
+| 80 | 613 | 1,890 | +1,277 |
+
+The extra cost is a roughly flat **~1.4 s**, not linear in `num_layers` — looks like fixed-cost driver / metadata overhead per VM range plus a small per-layer term, with the per-layer term cheap enough that it stays in the noise up to 80 layers. One-shot at server startup; doesn't recur per request.
+
+### 3.3 Alloc/free hot path — `LAYOUT=true` is ~2× faster
+
+Each PageAllocator "page" maps to 1 cuMemMap call under contiguous, vs `num_layers × (K+V)` FTensor `map()` calls under non-contiguous. Measured with the same `bench_alloc.py` harness (16 layers):
+
+Cold path — `KVCACHED_MIN/MAX_RESERVED_PAGES=0` forces a fresh mapping every alloc:
+
+| k | `LAYOUT=true` μs | `LAYOUT=false` μs | ratio |
+|--:|--:|--:|--:|
+| 1 | 4527 | 9512 | 2.1× |
+| 16 | 4554 | 9567 | 2.1× |
+| 64 | 4526 | 9638 | 2.1× |
+| 256 | 9240 | 19261 | 2.1× |
+
+Steady state — default `RESERVED=5/10`, mappings cached:
+
+| k | `LAYOUT=true` μs | `LAYOUT=false` μs | ratio |
+|--:|--:|--:|--:|
+| 1 | 43 | 87 | 2.0× |
+| 16 | 37 | 94 | 2.5× |
+| 64 | 38 | 64 | 1.7× |
+| 256 | 52 | 59 | 1.1× |
+
+Holds ~2× at small k; collapses to ~1× at larger k as bookkeeping amortises.
+
+### 3.4 Net effect: startup vs steady-state
+
+Per-request attention overhead hits every decode step. Startup overhead hits once. So which layout wins on **total wall-clock including server boot** depends on how many requests you serve before tearing down.
+
+For the Section 1 workload:
+- `LAYOUT=true` startup advantage: ~1.4 s (Section 3.2)
+- `LAYOUT=false` throughput advantage: 14.17 vs 9.83 req/s, i.e. 31 ms saved per request on average
+
+Break-even:
+
+```
+t_true(N)  =       N / 9.83
+t_false(N) = 1.4 + N / 14.17
+N* ≈ 45 requests
+```
+
+For **>45 requests** total, `LAYOUT=false` is faster wall-clock even counting startup. For **<45**, `LAYOUT=true`'s faster boot wins on total time. The 45 figure depends on the model — deeper layers shift the attention gap upward (Section 2 "Scaling") and would lower the break-even further.
+
+So the trade-off is genuine but heavily favours `LAYOUT=false` for any real serving workload. Where `LAYOUT=true` actually pays off:
+
+- **Very short-lived runs** — smoke tests, debugging, single-shot inference with <50 requests
+- **Frequent server restarts** — request-level autoscaling, model reloading
+- **Boot-time SLA** — when every second to first-ready matters
+- **Hybrid linear / mamba** — forced regardless
+
+For all other cases (long-running serving, throughput-bound deployments, latency-bound deployments under sustained load), the 1.4 s of extra startup is paid off within tens of requests and `LAYOUT=false` is strictly better thereafter.
+
+## 4. Patch needed for `LAYOUT=false`
 
 `kvcached/kv_cache_manager.py:107` previously hardcoded `contiguous_layout=True`. With `LAYOUT=false`, FTensor used per-layer buffers but `PageAllocator` still computed striped offsets → `cuMemUnmap (1): invalid argument` on first eviction. Fix: wire `CONTIGUOUS_LAYOUT` env var into the `KVCacheManager` constructor.
 
 ## Recommendation
 
-`CONTIGUOUS_LAYOUT=true` is the kvcached default but is only needed for hybrid-linear/mamba models (`interfaces.py:138` already detects those and bails out of the non-contiguous path). On standard MHA/GQA/MLA, flipping the default to `false` eliminates the entire kvcached-vs-vanilla e2e overhead measured here.
+For standard MHA/GQA/MLA, `CONTIGUOUS_LAYOUT=false` is the right default — it eliminates the entire kvcached-vs-vanilla e2e overhead at the cost of a few seconds of extra startup and microseconds of extra alloc-path latency, neither of which shows up in steady-state throughput.
+
+`CONTIGUOUS_LAYOUT=true` should remain the default only for hybrid-linear/mamba, which `interfaces.py:138` already detects.
