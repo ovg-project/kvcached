@@ -1,4 +1,10 @@
+# `bench_alloc` — KVCacheManager alloc/free microbench
+
 NVIDIA GB10 (aarch64), clean rebuild between runs. `main` = `ovg-project/kvcached` main, `PR` = `lianghao_c++` + must-fix `98d9bb3`, `fix` = `fix/pr319-restore-resize`.
+
+Driver: `bench_alloc.py` — times `KVCacheManager.alloc(k) + free(handles)` cycles after 100 warmup iterations.
+
+For e2e vLLM serving numbers and the layout-overhead investigation, see [`../bench_layout/bench_result.md`](../bench_layout/bench_result.md).
 
 ## A. `available_size()`
 
@@ -10,7 +16,7 @@ PR drops `cudaMemGetInfo` from the hot path.
 | PR | 0.52 |
 | fix | 0.52 |
 
-12.5×. Side effect: `available_size()` no longer caps by physical memory.
+12.5×. Side effect: `available_size()` no longer caps by physical memory (later restored on PR-319 head — see commit `7e3fdb7`).
 
 ## B. `group_indices_by_page`
 
@@ -85,74 +91,7 @@ PR-only — main has no pool. Pre-allocated pool vs `new()` per call.
 
 (μs)
 
-## E. End-to-end vLLM serving
-
-`vllm bench serve` against a local server, `ENABLE_KVCACHED=true`. Qwen3-0.6B, gpu-mem-util 0.5, max-model-len 2048, random 512in/128out, 500 prompts, `request-rate=inf`. 100-prompt warmup discarded; 3 seeds (42, 99, 7), median.
-
-| | tput | TTFT mean | TTFT P99 | TPOT mean | TPOT P99 |
-|---|--:|--:|--:|--:|--:|
-| vanilla | 14.21 | 11575 | 26377 | 119.3 | 143.2 |
-| main | 9.42 (-34%) | 17284 (+49%) | 40464 | 185.1 | 239.6 |
-| PR | 9.86 (-31%) | 16472 | 38756 | 177.5 | 230.2 |
-| fix | 9.83 (-31%) | 16602 | 38746 | 178.2 | 231.7 |
-
-(req/s, ms.) PR closes ~5% of the kvcached overhead; fix retains it. The remaining ~30% gap to vanilla is the layout default — see G.
-
-## G. Where the 30-50% e2e gap actually comes from
-
-Three hypotheses, tested on fix with the Section E setup.
-
-### G.1 Reserved-pool size — no e2e effect
-
-| | tput | TTFT mean | TPOT mean |
-|---|--:|--:|--:|
-| RESERVED=5/10 (default) | 9.87 | 16555 | 177.51 |
-| RESERVED=50/200 | 9.77 | 16548 | 179.38 |
-
-`cuMemMap` cost (4 ms/page from C) amortises across the run.
-
-### G.2 KV layout — the entire cause
-
-`KVCACHED_CONTIGUOUS_LAYOUT=false` switches from one shared buffer with cross-layer interleaving to per-layer VMM pools, matching vanilla's allocation pattern.
-
-rate=inf:
-| | tput | TTFT mean | TPOT mean | TPOT P99 |
-|---|--:|--:|--:|--:|
-| vanilla | 14.25 | 11565 | 118.42 | 142.33 |
-| LAYOUT=true (default) | 9.87 (-31%) | 16555 | 177.51 | 230.84 |
-| LAYOUT=false | 14.17 (-1%) | 11642 | 119.03 | 142.72 |
-
-rate=16:
-| | tput | TTFT mean | TPOT mean | TPOT P99 |
-|---|--:|--:|--:|--:|
-| vanilla | 13.20 | 240 | 73.62 | 117.27 |
-| LAYOUT=true | 9.88 (-25%) | 1574 | 141.93 | 226.60 |
-| LAYOUT=false + RESERVED=200 | 13.17 (-0.2%) | 246 | 73.67 | 117.01 |
-
-`LAYOUT=false` is indistinguishable from vanilla on every metric, at burst (inf) and sustained (16) load. The whole 30-50% overhead is the layout default — there's no residual VMM mapping cost.
-
-### G.3 Mechanism
-
-`CONTIGUOUS_LAYOUT=true` packs all layers into one VM range with shape `[num_blocks, num_layers, 2, block_size, head_num, head_dim]`. Within a layer, block n+1 sits `num_layers × per_block_bytes` after block n — 1.79 MB on Qwen3-0.6B (28 layers × 64 KB).
-
-FlashAttention reads all blocks of one layer before moving to the next. With this layout, each block read crosses a fresh 2 MB VMM page → ~`num_layers`× TLB pressure. Per-layer pools pack same-layer blocks contiguously.
-
-Effect scales with `num_layers`: 28 layers gave +30-50%; deeper models (32-layer Llama2-7B in #299) should be worse.
-
-### G.4 Patch
-
-`kvcached/kv_cache_manager.py:107` hardcoded `contiguous_layout=True`. With `LAYOUT=false`, FTensor used per-layer buffers but `PageAllocator` still computed striped offsets → `cuMemUnmap (1): invalid argument` on first eviction.
-
-```python
--from kvcached.utils import DEFAULT_IPC_NAME, PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
-+from kvcached.utils import (CONTIGUOUS_LAYOUT, DEFAULT_IPC_NAME, PAGE_SIZE,
-+                             SANITY_CHECK, get_kvcached_logger)
-@@
--            contiguous_layout=True,
-+            contiguous_layout=CONTIGUOUS_LAYOUT,
-```
-
-## Summary
+## Summary (microbench only)
 
 | | speedup vs main | fix retains |
 |---|---|---|
@@ -161,8 +100,5 @@ Effect scales with `num_layers`: 28 layers gave +30-50%; deeper models (32-layer
 | C. slow-path alloc | 1× (driver-bound) | full |
 | D. multi-thread | 2-5× | ~70% of PR |
 | F. block-object pool | ~7× (PR-only) | full |
-| E. e2e (LAYOUT=true) | ~5% | full |
 
-Microbench wins amortise to 5% e2e because per-token model forward dominates.
-
-The bigger lever is unrelated to the C++ migration: `KVCACHED_CONTIGUOUS_LAYOUT=false` closes the entire kvcached-vs-vanilla gap on standard MHA/GQA/MLA. Open question — why is `true` the default? Hybrid-linear/mamba models need it, but they already check and bail at `interfaces.py:138`.
+These microbench wins are real but amortise to ~5% on e2e vLLM serving because per-token model forward dominates the hot path — see [`../bench_layout/bench_result.md`](../bench_layout/bench_result.md) for the e2e picture and the much larger layout-related lever.
