@@ -145,10 +145,6 @@ So the trade-off is genuine but heavily favours `LAYOUT=false` for any real serv
 
 For all other cases (long-running serving, throughput-bound deployments, latency-bound deployments under sustained load), the 1.4 s of extra startup is paid off within tens of requests and `LAYOUT=false` is strictly better thereafter.
 
-## 4. Patch needed for `LAYOUT=false`
-
-`kvcached/kv_cache_manager.py:107` previously hardcoded `contiguous_layout=True`. With `LAYOUT=false`, FTensor used per-layer buffers but `PageAllocator` still computed striped offsets → `cuMemUnmap (1): invalid argument` on first eviction. Fix: wire `CONTIGUOUS_LAYOUT` env var into the `KVCacheManager` constructor.
-
 ## Recommendation
 
 For standard MHA/GQA/MLA, `CONTIGUOUS_LAYOUT=false` is the right default — it eliminates the entire kvcached-vs-vanilla e2e overhead at the cost of a few seconds of extra startup and microseconds of extra alloc-path latency, neither of which shows up in steady-state throughput.
