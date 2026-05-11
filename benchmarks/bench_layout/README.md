@@ -1,152 +1,96 @@
 # vLLM e2e + `KVCACHED_CONTIGUOUS_LAYOUT` overhead
 
-Where the 30-50% kvcached-vs-vanilla e2e overhead comes from, and why `KVCACHED_CONTIGUOUS_LAYOUT=false` closes it.
+Why kvcached is 30-50% slower than vanilla vLLM by default, and why `KVCACHED_CONTIGUOUS_LAYOUT=false` fixes it.
 
 For the alloc/free microbench, see [`../bench_alloc/README.md`](../bench_alloc/README.md).
 
 ## Setup
 
-NVIDIA GB10 (aarch64). `Qwen/Qwen3-0.6B` (28 layers, 8 KV heads, head_dim 128, bf16). `vllm serve --gpu-memory-utilization 0.5 --max-model-len 2048`. Bench: `vllm bench serve` random 512in/128out, 500 prompts, 3 seeds, median.
-
-Variants compared: **vanilla** vs **kvcached** (Python allocator / C++ allocator / C++ + restored resize — all three behave identically at e2e).
+GB10 (aarch64). `Qwen/Qwen3-0.6B` (28 layers, 8 KV heads, head_dim 128, bf16). `vllm serve --gpu-memory-utilization 0.5 --max-model-len 2048`. Bench: `vllm bench serve` random 512in/128out, 500 prompts, 3 seeds.
 
 ## Run
 
 ```bash
 # E2E sweep (vanilla vs kvcached × LAYOUT × reserved pool)
-bash run_sweep.sh
-python parse_results.py sweep_results/
+bash run_sweep.sh && python parse_results.py sweep_results/
 
 # Kernel-level profile under both layouts
 bash run_nsys_layout.sh
 python diff_nsys_kernels.py nsys_runs/layout_false.nsys-rep nsys_runs/layout_true.nsys-rep
 ```
 
-Intermediate outputs (`sweep_results/`, `nsys_runs/`, ...) are reproducible from the scripts and not tracked in git.
+Intermediate outputs aren't tracked in git — reproducible from the scripts.
 
 ## 1. The gap
 
-`rate=inf`, 500 prompts:
+500 prompts at `rate=inf`:
 
 | | tput (req/s) | TTFT mean (ms) | TPOT mean (ms) |
 |---|--:|--:|--:|
 | vanilla | 14.21 | 11575 | 119.3 |
-| kvcached default (`LAYOUT=true`) | 9.87 (-31%) | 16555 | 177.5 |
+| kvcached (`LAYOUT=true`, default) | 9.87 (-31%) | 16555 | 177.5 |
 | kvcached + `LAYOUT=false` | 14.17 (-1%) | 11642 | 119.0 |
 
-`LAYOUT=false` matches vanilla on every metric, also at `rate=16` (sustained load). The C++ allocator from PR #319 only closes ~5% of the kvcached overhead; reserved-pool size has no measurable effect. **The entire 30% gap is the layout default.**
+`LAYOUT=false` matches vanilla on every metric, also at `rate=16` (sustained load). The C++ allocator from PR #319 only buys back ~5%; reserve-pool size doesn't help either. **It's all the layout.**
 
-## 2. Mechanism
+## 2. Where the gap actually is
 
-### Stride math (from `interfaces.py:282-289`)
+### Stride math
 
-Under `CONTIGUOUS_LAYOUT=true`, the raw KV tensor has shape `[num_blocks, num_layers, k/v, token, head, dim]`. When sliced to layer `i`, block n→n+1 stride is `num_layers × per_block_bytes`. For Qwen3-0.6B:
+`CONTIGUOUS_LAYOUT=true` lays out KV as `[num_blocks, num_layers, k/v, token, head, dim]` (`interfaces.py:282-289`). When you slice down to one layer, block n→n+1 stride is `num_layers × per_block_bytes`. For Qwen3-0.6B:
 
-- per-block K+V, one layer = 16 × 8 × 128 × 2 = **64 KB**
-- stride **`LAYOUT=true`** = 28 × 64 KB = **1.75 MB** (≈ VMM page size = 2 MB)
-- stride **`LAYOUT=false`** = **64 KB** (~32 blocks share one 2 MB page)
+- per-block K+V, one layer = 16·8·128·2 = **64 KB**
+- stride under `LAYOUT=true` = 28 × 64 KB = **1.75 MB** (≈ VMM page = 2 MB)
+- stride under `LAYOUT=false` = **64 KB** (~32 blocks share a page)
 
-So every FlashAttention block read crosses a fresh 2 MB VMM page under `LAYOUT=true`; non-contiguous packs them densely.
+So under contiguous, every FlashAttention block read lands on its own fresh 2 MB page. Non-contiguous packs 32 blocks per page. The attention kernel can't hide that.
 
-### nsys per-kernel attribution
+### nsys per-kernel breakdown
 
-Same workload as section 1. Total GPU kernel time grows by **+8,043 ms (+34.8%)** going from `LAYOUT=false → true`:
+Same workload as Section 1. Going from `LAYOUT=false → true` adds **+8,043 ms (+34.8%)** total GPU kernel time, all in one kernel:
 
-| kernel | calls | `LAYOUT=false` ms | `LAYOUT=true` ms | Δms | Δ% |
-|---|--:|--:|--:|--:|--:|
-| `flash::flash_fwd_splitkv_kernel` (KV-read) | 3948 | 14,666 | **22,879** | **+8,213** | **+56.0%** |
-| `cutlass_80_..._gemm_relu` | 7756 | 2,277 | 2,214 | -63 | -2.8% |
-| `vllm::reshape_and_cache_flash_kernel` (KV-write) | 3948 | 302 | 271 | -32 | -10.5% |
-| (everything else) | — | ~6,000 | ~6,000 | ~0 | flat |
+| kernel | calls | LAYOUT=false ms | LAYOUT=true ms | Δ |
+|---|--:|--:|--:|--:|
+| `flash::flash_fwd_splitkv_kernel` (KV-read) | 3948 | 14,666 | 22,879 | **+8,213 (+56%)** |
+| `vllm::reshape_and_cache_flash_kernel` (KV-write) | 3948 | 302 | 271 | -32 (-11%) |
+| everything else | — | ~8,000 | ~8,000 | ~0 |
 
-**One kernel — FlashAttention's split-KV read — accounts for more than the entire e2e gap.** Every other kernel is unchanged or noise. The KV-*write* kernel is even slightly faster under contiguous (writes one position per request, no stride pattern).
+That one kernel exceeds the entire gap. Worth noting: the KV-*write* kernel isn't affected — only the multi-block read path is. Writes are sequential per-position so they never hit the cross-page stride.
 
-### Scaling
+### Scales with working set
 
-Per-call attention slowdown grows with concurrent working-set size — consistent with TLB/L2 pressure:
+Per-call attention time:
 
-| workload | `LAYOUT=false` μs/call | `LAYOUT=true` μs/call | Δ |
-|---|--:|--:|--:|
-| 100 prompts | 851 | 1163 | +37% |
-| 500 prompts | 3,715 | 5,795 | **+56%** |
+- 100 prompts: 1163 vs 851 μs (**+37%**)
+- 500 prompts: 5795 vs 3715 μs (**+56%**)
 
-`LAYOUT=false` is flat with workload because ~32 blocks share each page. Deeper models (32-layer Llama2-7B, 48+ layer Llama3-70B) cross the 2 MB page boundary even more sharply.
+More concurrent requests → larger working set → more distinct 2 MB pages touched → worse TLB/L2 hit rate. `LAYOUT=false` stays flat because 32 blocks share one page. Deeper models (Llama2-7B at 32 layers, Llama3-70B at 80) cross the page boundary even harder.
 
-## 3. When does `LAYOUT=true` win?
+## 3. Where `LAYOUT=true` still wins
 
-The previous sections show non-contiguous wins big on attention. The contiguous layout still pays off on three things:
+Three things to put on the other side of the scale.
 
-### 3.1 Hybrid linear / mamba models — required
+**Hybrid linear / mamba: required.** Mamba state shares the KV buffer and indexes by virtual block across layers. `interfaces.py:138` outright refuses non-contiguous for hybrid-linear configs.
 
-Mamba layers share the same flat KV buffer as attention layers and index into it per virtual block across layers. `interfaces.py:138` detects hybrid-linear configs and refuses to run with `CONTIGUOUS_LAYOUT=false`. So for `HYBRID_LINEAR` model types there is no choice — contiguous is mandatory.
+**Init time: ~1.4 s faster at server boot.** Contiguous reserves one big VM range; non-contiguous reserves `num_layers` separate ones. Measured `alloc_kv_cache` (16 layers, 1 GB/layer): 635 ms vs 2055 ms. ~99% of that 1.4 s is `FTensor::init_with_zero_()` mapping the zero-page over the entire VM range — contiguous uses a 64 MB compound page so it makes 1947 `cuMemMap` calls (~325 μs each); non-contiguous uses 2 MB pages and makes 62,304 calls (~33 μs each). CUDA driver per-call overhead is the dominant cost, and bigger pages amortise it better.
 
-### 3.2 Init time — `LAYOUT=true` is ~3× faster
+The gap stays roughly flat across `num_layers ∈ {8..80}` (1.3–1.5 s), one-shot at startup.
 
-Contiguous reserves one big VM range; non-contiguous reserves `num_layers` separate ranges + a shared zero-page handle. Measured `alloc_kv_cache` time (ms) at varying `num_layers`, 1 GB per layer:
+**Alloc/free hot path: ~2× faster.** Each page mapping under contiguous = 1 `cuMemMap`; under non-contiguous = `num_layers × (K+V)` FTensor `map()` calls. Cold path (`RESERVED=0`) shows a consistent 2.1× ratio; steady-state at small `k` is similar, collapsing to ~1× at `k=256`.
 
-| `num_layers` | `LAYOUT=true` | `LAYOUT=false` | Δ |
-|--:|--:|--:|--:|
-| 8 | 658 | 2,058 | +1,400 |
-| 16 | 640 | 1,899 | +1,259 |
-| 28 | 568 | 2,058 | +1,490 |
-| 32 | 632 | 1,936 | +1,304 |
-| 80 | 613 | 1,890 | +1,277 |
+### When does the trade-off flip?
 
-The extra cost is a roughly flat **~1.4 s**, not linear in `num_layers` — looks like fixed-cost driver / metadata overhead per VM range plus a small per-layer term, with the per-layer term cheap enough that it stays in the noise up to 80 layers. One-shot at server startup; doesn't recur per request.
+Attention overhead hits every decode step. Startup hits once. For the Section 1 workload:
 
-### 3.3 Alloc/free hot path — `LAYOUT=true` is ~2× faster
+- `LAYOUT=true` startup advantage: ~1.4 s
+- `LAYOUT=false` throughput advantage: 14.17 vs 9.83 req/s, ≈ 31 ms/req
 
-Each PageAllocator "page" maps to 1 cuMemMap call under contiguous, vs `num_layers × (K+V)` FTensor `map()` calls under non-contiguous. Measured with the same `bench_alloc.py` harness (16 layers):
+Break-even at **~45 requests**. Above that, non-contiguous wins on total wall-clock; below, contiguous's faster boot wins. Deeper models shift the break-even down further.
 
-Cold path — `KVCACHED_MIN/MAX_RESERVED_PAGES=0` forces a fresh mapping every alloc:
+So contiguous still wins for: smoke tests, single-shot inference, request-level autoscaling, boot-SLA workloads, hybrid linear/mamba (forced). Everything else: non-contiguous.
 
-| k | `LAYOUT=true` μs | `LAYOUT=false` μs | ratio |
-|--:|--:|--:|--:|
-| 1 | 4527 | 9512 | 2.1× |
-| 16 | 4554 | 9567 | 2.1× |
-| 64 | 4526 | 9638 | 2.1× |
-| 256 | 9240 | 19261 | 2.1× |
+## Summary
 
-Steady state — default `RESERVED=5/10`, mappings cached:
+The kvcached default `CONTIGUOUS_LAYOUT=true` costs ~30% e2e throughput on standard MHA/GQA/MLA because every FlashAttention block read crosses a fresh 2 MB VMM page. Flipping to `LAYOUT=false` closes the gap entirely, at the price of ~1.4 s extra startup that's paid off in tens of requests.
 
-| k | `LAYOUT=true` μs | `LAYOUT=false` μs | ratio |
-|--:|--:|--:|--:|
-| 1 | 43 | 87 | 2.0× |
-| 16 | 37 | 94 | 2.5× |
-| 64 | 38 | 64 | 1.7× |
-| 256 | 52 | 59 | 1.1× |
-
-Holds ~2× at small k; collapses to ~1× at larger k as bookkeeping amortises.
-
-### 3.4 Net effect: startup vs steady-state
-
-Per-request attention overhead hits every decode step. Startup overhead hits once. So which layout wins on **total wall-clock including server boot** depends on how many requests you serve before tearing down.
-
-For the Section 1 workload:
-- `LAYOUT=true` startup advantage: ~1.4 s (Section 3.2)
-- `LAYOUT=false` throughput advantage: 14.17 vs 9.83 req/s, i.e. 31 ms saved per request on average
-
-Break-even:
-
-```
-t_true(N)  =       N / 9.83
-t_false(N) = 1.4 + N / 14.17
-N* ≈ 45 requests
-```
-
-For **>45 requests** total, `LAYOUT=false` is faster wall-clock even counting startup. For **<45**, `LAYOUT=true`'s faster boot wins on total time. The 45 figure depends on the model — deeper layers shift the attention gap upward (Section 2 "Scaling") and would lower the break-even further.
-
-So the trade-off is genuine but heavily favours `LAYOUT=false` for any real serving workload. Where `LAYOUT=true` actually pays off:
-
-- **Very short-lived runs** — smoke tests, debugging, single-shot inference with <50 requests
-- **Frequent server restarts** — request-level autoscaling, model reloading
-- **Boot-time SLA** — when every second to first-ready matters
-- **Hybrid linear / mamba** — forced regardless
-
-For all other cases (long-running serving, throughput-bound deployments, latency-bound deployments under sustained load), the 1.4 s of extra startup is paid off within tens of requests and `LAYOUT=false` is strictly better thereafter.
-
-## Recommendation
-
-For standard MHA/GQA/MLA, `CONTIGUOUS_LAYOUT=false` is the right default — it eliminates the entire kvcached-vs-vanilla e2e overhead at the cost of a few seconds of extra startup and microseconds of extra alloc-path latency, neither of which shows up in steady-state throughput.
-
-`CONTIGUOUS_LAYOUT=true` should remain the default only for hybrid-linear/mamba, which `interfaces.py:138` already detects.
+The default should flip to `false` for non-hybrid models; `interfaces.py:138` already handles the hybrid-linear case where contiguous is mandatory.
