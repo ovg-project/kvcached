@@ -142,6 +142,9 @@ summarize_logs() {
             "LMCache|lmcache|NIXL|nixl|Reqid|request_id|Storing KV|Retrieved|prefill_done|decode_done" \
             "$logfile" 2>/dev/null | tail -120 || true
         grep -E \
+            "disagg_spec|kv_transfer_params|receiver_init_port|receiver_alloc_port" \
+            "$logfile" 2>/dev/null | tail -40 || true
+        grep -E \
             "Traceback|ERROR|WARNING|RuntimeError|AssertionError" \
             "$logfile" 2>/dev/null | tail -80 || true
     done
@@ -441,6 +444,24 @@ def _request_id():
     return f"lmcache-disagg-{uuid.uuid4().hex}"
 
 
+def _port_list(env_name, default):
+    raw = os.environ.get(env_name, str(default))
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def _attach_prefill_kv_transfer_params(payload, request_id):
+    kv_transfer_params = dict(payload.get("kv_transfer_params") or {})
+    kv_transfer_params["ret_first_tok"] = True
+    kv_transfer_params["disagg_spec"] = {
+        "req_id": request_id,
+        "receiver_host": os.environ.get("LMCACHE_PD_PEER_HOST", "localhost"),
+        "receiver_init_port": _port_list("LMCACHE_PD_PEER_INIT_PORT", 7300),
+        "receiver_alloc_port": _port_list("LMCACHE_PD_PEER_ALLOC_PORT", 7400),
+    }
+    payload["kv_transfer_params"] = kv_transfer_params
+    return kv_transfer_params["disagg_spec"]
+
+
 async def _forward(session, url, payload, request_id):
     headers = {}
     if os.environ.get("FORWARD_X_REQUEST_ID", "1") == "1":
@@ -463,11 +484,13 @@ async def handle_request(request):
     prefill["stream"] = False
 
     request_id = _request_id()
+    disagg_spec = _attach_prefill_kv_transfer_params(prefill, request_id)
     prefill_url = f"http://{os.environ['PREFILL_HTTP']}{request.path}"
     decode_url = f"http://{os.environ['DECODE_HTTP']}{request.path}"
     print(
         f"handle_request request_id={request_id} "
-        f"prefill_url={prefill_url} decode_url={decode_url}",
+        f"prefill_url={prefill_url} decode_url={decode_url} "
+        f"disagg_spec={disagg_spec}",
         flush=True,
     )
 
@@ -551,6 +574,9 @@ start_proxy() {
     PROXY_PORT="$PROXY_PORT" \
     PREFILL_HTTP="127.0.0.1:$PREFILL_PORT" \
     DECODE_HTTP="127.0.0.1:$DECODE_PORT" \
+    LMCACHE_PD_PEER_HOST="$LMCACHE_PD_PEER_HOST" \
+    LMCACHE_PD_PEER_INIT_PORT="$LMCACHE_PD_PEER_INIT_PORT" \
+    LMCACHE_PD_PEER_ALLOC_PORT="$LMCACHE_PD_PEER_ALLOC_PORT" \
     FORWARD_X_REQUEST_ID="$FORWARD_X_REQUEST_ID" \
         python3 "$RUN_DIR/lmcache_disagg_proxy.py" \
         > "$RUN_DIR/proxy.log" 2>&1 &

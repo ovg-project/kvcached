@@ -7,6 +7,10 @@ The harness launches one prefiller, one decoder, and a local proxy. The proxy
 sends the same client request to prefiller first with `max_tokens=1`, then to
 decoder for the full completion. It forwards a shared `X-Request-Id` to both
 servers by default so the experiment is comparable to the P2P NCCL run.
+For LMCache PD, the proxy also attaches prefiller-side
+`kv_transfer_params.disagg_spec` with the decoder receiver host/init/alloc
+ports; without that per-request metadata, the prefiller reaches
+`lmcache_engine.store(...)` with a null transfer spec.
 
 ## Files
 
@@ -27,6 +31,7 @@ Plain vLLM LMCacheConnectorV1, request ID randomization enabled:
 
 ```bash
 RUN_WITH_KVCACHED=0 \
+GPU_MEM_UTIL=0.45 \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -36,6 +41,7 @@ Plain vLLM LMCacheConnectorV1, request ID randomization disabled:
 ```bash
 RUN_WITH_KVCACHED=0 \
 DISABLE_REQUEST_ID_RANDOMIZATION=1 \
+GPU_MEM_UTIL=0.45 \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -44,6 +50,7 @@ kvcached-enabled LMCacheConnectorV1, request ID randomization enabled:
 
 ```bash
 RUN_WITH_KVCACHED=1 \
+GPU_MEM_UTIL=0.45 \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -53,6 +60,7 @@ kvcached-enabled LMCacheConnectorV1, request ID randomization disabled:
 ```bash
 RUN_WITH_KVCACHED=1 \
 DISABLE_REQUEST_ID_RANDOMIZATION=1 \
+GPU_MEM_UTIL=0.45 \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
