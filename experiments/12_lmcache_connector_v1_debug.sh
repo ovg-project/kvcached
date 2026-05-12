@@ -207,6 +207,13 @@ wait_for_server() {
             tail -60 "$logfile"
             return 1
         fi
+        if [ -f "$logfile" ] \
+            && grep -Eq "error: unrecognized arguments|usage: vllm" \
+                "$logfile" 2>/dev/null; then
+            log_fail "$name rejected its CLI arguments. See $logfile"
+            tail -60 "$logfile"
+            return 1
+        fi
         if [ $((elapsed % 30)) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
             local last_line
             last_line=$(tail -1 "$logfile" 2>/dev/null | cut -c1-120)
@@ -593,7 +600,6 @@ start_vllm_instance() {
             --gpu-memory-utilization "$gpu_mem_util" \
             --enforce-eager \
             --no-enable-prefix-caching \
-            --disable-log-requests \
             --kv-transfer-config "$kv_config" \
             $EXTRA_VLLM_ARGS
     ) > "$logfile" 2>&1 &
