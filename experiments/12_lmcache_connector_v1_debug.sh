@@ -30,6 +30,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$MAX_MODEL_LEN}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 MAX_TOKENS="${MAX_TOKENS:-20}"
+PROMPT_MODE="${PROMPT_MODE:-long}"
+LONG_PROMPT_REPEAT="${LONG_PROMPT_REPEAT:-24}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
 PREFILL_GPU_MEM_UTIL="${PREFILL_GPU_MEM_UTIL:-$GPU_MEM_UTIL}"
 DECODE_GPU_MEM_UTIL="${DECODE_GPU_MEM_UTIL:-$GPU_MEM_UTIL}"
@@ -154,6 +156,12 @@ summarize_logs() {
     fi
     if grep -q "Retrieved" "$RUN_DIR/decode.log" 2>/dev/null; then
         log_info "Classifier: decoder reached LMCache retrieve path."
+    fi
+    if grep -Eq "LMCache hit tokens: [1-9][0-9]*" \
+        "$RUN_DIR/decode.log" 2>/dev/null; then
+        log_info "Classifier: decoder reported non-zero LMCache hit tokens."
+    elif grep -q "LMCache hit tokens: 0" "$RUN_DIR/decode.log" 2>/dev/null; then
+        log_info "Classifier: decoder reported zero LMCache hit tokens."
     fi
     if grep -q "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION is set" \
         "$RUN_DIR/decode.log" "$RUN_DIR/prefill.log" 2>/dev/null; then
@@ -634,11 +642,37 @@ start_vllm_instance() {
 
 make_payload() {
     local prompt=$1
-    python3 - "$SERVED_MODEL_NAME" "$prompt" "$MAX_TOKENS" <<'PY'
+    python3 - \
+        "$SERVED_MODEL_NAME" \
+        "$prompt" \
+        "$MAX_TOKENS" \
+        "$PROMPT_MODE" \
+        "$LONG_PROMPT_REPEAT" <<'PY'
 import json
 import sys
 
-model, prompt, max_tokens = sys.argv[1], sys.argv[2], int(sys.argv[3])
+model = sys.argv[1]
+prompt = sys.argv[2]
+max_tokens = int(sys.argv[3])
+prompt_mode = sys.argv[4]
+long_prompt_repeat = int(sys.argv[5])
+
+if prompt_mode == "long":
+    context_lines = [
+        "Reference line "
+        f"{idx:02d}: alpha beta gamma delta epsilon zeta eta theta "
+        "remains unchanged for cache transfer validation."
+        for idx in range(long_prompt_repeat)
+    ]
+    prompt = (
+        "\n".join(context_lines)
+        + "\nUse the reference lines only as context. "
+        + "Complete this sentence directly: "
+        + prompt
+    )
+elif prompt_mode != "short":
+    raise SystemExit(f"unknown PROMPT_MODE={prompt_mode!r}")
+
 print(json.dumps({
     "model": model,
     "prompt": prompt,
@@ -657,7 +691,7 @@ send_request() {
     local status_file="$RUN_DIR/${label}_curl_status.txt"
 
     make_payload "$prompt" > "$payload_file"
-    log_info "Sending $label through proxy: $prompt"
+    log_info "Sending $label through proxy (${PROMPT_MODE} prompt): $prompt"
 
     set +e
     local http_code
@@ -703,6 +737,7 @@ run_harness() {
     else
         log_info "Mode: plain vLLM LMCacheConnectorV1 baseline, kvcached disabled"
     fi
+    log_info "Prompt mode: $PROMPT_MODE (LONG_PROMPT_REPEAT=$LONG_PROMPT_REPEAT)"
 
     write_lmcache_configs
 

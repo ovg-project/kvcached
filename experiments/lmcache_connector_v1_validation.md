@@ -12,6 +12,11 @@ For LMCache PD, the proxy also attaches prefiller-side
 ports; without that per-request metadata, the prefiller reaches
 `lmcache_engine.store(...)` with a null transfer spec.
 
+The default `PROMPT_MODE=long` uses deterministic synthetic context long enough
+to cross the LMCache chunk boundary. Use `PROMPT_MODE=short` only for fast
+startup checks; short prompts can complete successfully while still reporting
+`LMCache hit tokens: 0`.
+
 ## Files
 
 - `experiments/12_lmcache_connector_v1_debug.sh`
@@ -32,6 +37,7 @@ Plain vLLM LMCacheConnectorV1, request ID randomization enabled:
 ```bash
 RUN_WITH_KVCACHED=0 \
 GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -42,6 +48,7 @@ Plain vLLM LMCacheConnectorV1, request ID randomization disabled:
 RUN_WITH_KVCACHED=0 \
 DISABLE_REQUEST_ID_RANDOMIZATION=1 \
 GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -51,6 +58,7 @@ kvcached-enabled LMCacheConnectorV1, request ID randomization enabled:
 ```bash
 RUN_WITH_KVCACHED=1 \
 GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
@@ -61,6 +69,7 @@ kvcached-enabled LMCacheConnectorV1, request ID randomization disabled:
 RUN_WITH_KVCACHED=1 \
 DISABLE_REQUEST_ID_RANDOMIZATION=1 \
 GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
 TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
