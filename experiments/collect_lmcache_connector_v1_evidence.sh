@@ -58,8 +58,8 @@ cp -a "$RUN_DIR_ABS" "$EVIDENCE_DIR/run"
     echo
     echo "## Key Classifiers"
     grep -R -E \
-        "Classifier:|LMCache hit tokens: [1-9][0-9]*|Retrieved [1-9][0-9]* out of|Stored [1-9][0-9]* out of|EngineCore encountered|Traceback|HTTP 500" \
-        "$RUN_DIR_ABS"/*.log 2>/dev/null || true
+        "Classifier:|LMCache hit tokens: [1-9][0-9]*|Retrieved [1-9][0-9]* out of|Stored [1-9][0-9]* out of|EngineCore encountered|Traceback|HTTP 500|kv-layout-diag|stride=|storage_offset=" \
+        "$RUN_DIR_ABS"/*.log "$RUN_DIR_ABS"/*.layout_diag.log 2>/dev/null || true
     echo
     echo "## Request/Response Files"
     ls -la "$RUN_DIR_ABS"/*_request.json "$RUN_DIR_ABS"/*_response.json 2>/dev/null || true

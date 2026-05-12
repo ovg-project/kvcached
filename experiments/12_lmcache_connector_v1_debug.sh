@@ -67,6 +67,7 @@ KEEP_ALIVE_ON_FAIL="${KEEP_ALIVE_ON_FAIL:-0}"
 FORWARD_X_REQUEST_ID="${FORWARD_X_REQUEST_ID:-1}"
 DISABLE_REQUEST_ID_RANDOMIZATION="${DISABLE_REQUEST_ID_RANDOMIZATION:-0}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
+KV_LAYOUT_DIAG="${KV_LAYOUT_DIAG:-0}"
 LOG_ROOT="${LOG_ROOT:-experiments/logs_lmcache_v1_debug}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
@@ -75,6 +76,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$REPO_DIR/$LOG_ROOT/$RUN_ID"
 LATEST_LINK="$REPO_DIR/$LOG_ROOT/latest"
 CONFIG_DIR="$RUN_DIR/configs"
+DIAG_DIR="$RUN_DIR/diagnostics"
 
 mkdir -p "$RUN_DIR" "$CONFIG_DIR"
 ln -sfn "$RUN_DIR" "$LATEST_LINK"
@@ -147,6 +149,12 @@ summarize_logs() {
         grep -E \
             "Traceback|ERROR|WARNING|RuntimeError|AssertionError" \
             "$logfile" 2>/dev/null | tail -80 || true
+    done
+
+    for logfile in "$RUN_DIR"/*.layout_diag.log; do
+        [ -f "$logfile" ] || continue
+        echo "--- layout_diag: $logfile ---"
+        tail -160 "$logfile" || true
     done
 
     if grep -q "Storing KV cache" "$RUN_DIR/prefill.log" 2>/dev/null; then
@@ -357,6 +365,172 @@ PY
     if [ "$DISABLE_REQUEST_ID_RANDOMIZATION" = "1" ]; then
         log_info "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1"
     fi
+}
+
+write_layout_diag() {
+    mkdir -p "$DIAG_DIR"
+    cat > "$DIAG_DIR/sitecustomize.py" <<'PY'
+"""Diagnostic-only tensor layout logging for the LMCacheConnectorV1 harness."""
+
+import os
+import threading
+import traceback
+
+
+ENABLED = os.getenv("KV_LAYOUT_DIAG", "0") == "1"
+LOG_PATH = os.getenv("KV_LAYOUT_DIAG_LOG", "/tmp/kv_layout_diag.log")
+_LOCK = threading.Lock()
+
+
+def _log(message: str) -> None:
+    if not ENABLED:
+        return
+    try:
+        with _LOCK:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(message.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def _safe_call(fn, default="<error>"):
+    try:
+        return fn()
+    except Exception as exc:
+        return f"{default}:{type(exc).__name__}:{exc}"
+
+
+def _tensor_summary(tensor) -> str:
+    return (
+        f"type={type(tensor).__name__} "
+        f"shape={_safe_call(lambda: tuple(tensor.shape))} "
+        f"stride={_safe_call(lambda: tuple(tensor.stride()))} "
+        f"storage_offset={_safe_call(tensor.storage_offset)} "
+        f"is_contiguous={_safe_call(tensor.is_contiguous)} "
+        f"dtype={_safe_call(lambda: tensor.dtype)} "
+        f"device={_safe_call(lambda: tensor.device)} "
+        f"data_ptr={_safe_call(tensor.data_ptr)} "
+        f"storage_data_ptr={_safe_call(lambda: tensor.untyped_storage().data_ptr())} "
+        f"storage_nbytes={_safe_call(lambda: tensor.untyped_storage().nbytes())}"
+    )
+
+
+def _describe_tensor(label: str, tensor, include_base: bool = False) -> None:
+    _log(f"[kv-layout-diag] {label}: {_tensor_summary(tensor)}")
+    if include_base:
+        base = getattr(tensor, "_base", None)
+        depth = 0
+        while base is not None and depth < 4:
+            _log(f"[kv-layout-diag] {label}._base[{depth}]: {_tensor_summary(base)}")
+            base = getattr(base, "_base", None)
+            depth += 1
+
+
+def _describe_sequence(label: str, tensors) -> None:
+    try:
+        count = len(tensors)
+    except Exception:
+        count = "unknown"
+    _log(f"[kv-layout-diag] {label}: count={count}")
+    try:
+        sample_indices = list(range(min(3, len(tensors))))
+        if len(tensors) > 3:
+            sample_indices.append(len(tensors) - 1)
+        for idx in sample_indices:
+            _describe_tensor(f"{label}[{idx}]", tensors[idx], include_base=True)
+    except Exception:
+        _log(f"[kv-layout-diag] failed to describe {label}\n{traceback.format_exc()}")
+
+
+def _patch_kvcached_alloc() -> None:
+    try:
+        from kvcached.integration.vllm import interfaces as kvi
+    except Exception:
+        _log("[kv-layout-diag] kvcached interfaces import failed\n" + traceback.format_exc())
+        return
+
+    if getattr(kvi.alloc_kv_cache, "_kv_layout_diag_wrapped", False):
+        return
+
+    original = kvi.alloc_kv_cache
+
+    def wrapped_alloc_kv_cache(*args, **kwargs):
+        _log(
+            "[kv-layout-diag] kvcached.alloc_kv_cache call "
+            f"kvcache_shape={args[0] if len(args) > 0 else kwargs.get('kvcache_shape')} "
+            f"block_size={args[1] if len(args) > 1 else kwargs.get('block_size')} "
+            f"dtype={args[2] if len(args) > 2 else kwargs.get('dtype')} "
+            f"device={args[3] if len(args) > 3 else kwargs.get('device')} "
+            f"num_layers={args[4] if len(args) > 4 else kwargs.get('num_layers')} "
+            f"attention_type={kwargs.get('attention_type', 'MHA')} "
+            f"kernel_block_size={kwargs.get('kernel_block_size')} "
+            f"contiguous_layout={getattr(kvi, '_contiguous_layout', '<unknown>')}"
+        )
+        result = original(*args, **kwargs)
+        tensors = result[0] if isinstance(result, tuple) else result
+        _describe_sequence("kvcached.alloc_kv_cache result", tensors)
+        return result
+
+    wrapped_alloc_kv_cache._kv_layout_diag_wrapped = True
+    kvi.alloc_kv_cache = wrapped_alloc_kv_cache
+    _log("[kv-layout-diag] patched kvcached.integration.vllm.interfaces.alloc_kv_cache")
+
+
+def _patch_lmcache_gpu_utils() -> None:
+    try:
+        from lmcache.v1.gpu_connector import utils as lm_utils
+    except Exception:
+        _log("[kv-layout-diag] LMCache gpu_connector utils import failed\n" + traceback.format_exc())
+        return
+
+    if not getattr(lm_utils.permute_to_contiguous, "_kv_layout_diag_wrapped", False):
+        original_permute = lm_utils.permute_to_contiguous
+
+        def wrapped_permute_to_contiguous(tensor):
+            _describe_tensor("lmcache.permute_to_contiguous input", tensor, include_base=True)
+            try:
+                result = original_permute(tensor)
+            except Exception as exc:
+                _log(
+                    "[kv-layout-diag] lmcache.permute_to_contiguous raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+            _describe_tensor("lmcache.permute_to_contiguous output", result, include_base=True)
+            return result
+
+        wrapped_permute_to_contiguous._kv_layout_diag_wrapped = True
+        lm_utils.permute_to_contiguous = wrapped_permute_to_contiguous
+        _log("[kv-layout-diag] patched lmcache.v1.gpu_connector.utils.permute_to_contiguous")
+
+    if not getattr(lm_utils.permute_kv_caches_to_contiguous, "_kv_layout_diag_wrapped", False):
+        original_permute_list = lm_utils.permute_kv_caches_to_contiguous
+
+        def wrapped_permute_kv_caches_to_contiguous(kv_caches):
+            _describe_sequence("lmcache.permute_kv_caches_to_contiguous input", kv_caches)
+            return original_permute_list(kv_caches)
+
+        wrapped_permute_kv_caches_to_contiguous._kv_layout_diag_wrapped = True
+        lm_utils.permute_kv_caches_to_contiguous = wrapped_permute_kv_caches_to_contiguous
+        _log(
+            "[kv-layout-diag] patched "
+            "lmcache.v1.gpu_connector.utils.permute_kv_caches_to_contiguous"
+        )
+
+    try:
+        import lmcache.v1.gpu_connector.gpu_connectors as lm_gc
+
+        lm_gc.permute_kv_caches_to_contiguous = lm_utils.permute_kv_caches_to_contiguous
+        _log("[kv-layout-diag] patched gpu_connectors.permute_kv_caches_to_contiguous binding")
+    except Exception:
+        _log("[kv-layout-diag] LMCache gpu_connectors binding patch failed\n" + traceback.format_exc())
+
+
+if ENABLED:
+    _log("[kv-layout-diag] sitecustomize loaded")
+    _patch_kvcached_alloc()
+    _patch_lmcache_gpu_utils()
+PY
 }
 
 write_lmcache_configs() {
@@ -607,12 +781,17 @@ start_vllm_instance() {
         export ENABLE_KVCACHED
         export KVCACHED_AUTOPATCH
         export KVCACHED_LOG_LEVEL
+        export KV_LAYOUT_DIAG
         export LMCACHE_CONFIG_FILE="$lmcache_config"
         export LMCACHE_USE_EXPERIMENTAL=True
         export VLLM_ENABLE_V1_MULTIPROCESSING=1
         export VLLM_WORKER_MULTIPROC_METHOD=spawn
         export UCX_TLS="${UCX_TLS:-cuda_ipc,cuda_copy,tcp}"
         export PYTHONHASHSEED="$LMCACHE_PYTHONHASHSEED"
+        if [ "$KV_LAYOUT_DIAG" = "1" ]; then
+            export KV_LAYOUT_DIAG_LOG="$RUN_DIR/${name}.layout_diag.log"
+            export PYTHONPATH="$DIAG_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        fi
         if [ "$DISABLE_REQUEST_ID_RANDOMIZATION" = "1" ]; then
             export VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1
         fi
@@ -734,6 +913,11 @@ run_harness() {
         log_info "Mode: plain vLLM LMCacheConnectorV1 baseline, kvcached disabled"
     fi
     log_info "Prompt mode: $PROMPT_MODE (LONG_PROMPT_REPEAT=$LONG_PROMPT_REPEAT)"
+
+    if [ "$KV_LAYOUT_DIAG" = "1" ]; then
+        write_layout_diag
+        log_info "KV tensor layout diagnostics enabled"
+    fi
 
     write_lmcache_configs
 

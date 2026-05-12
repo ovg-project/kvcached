@@ -59,6 +59,25 @@ TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
 
+To collect tensor layout metadata at the kvcached/LMCache handoff, enable the
+diagnostic shim:
+
+```bash
+KV_LAYOUT_DIAG=1 \
+RUN_WITH_KVCACHED=1 \
+GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
+TIMEOUT_REQUEST=300 \
+./experiments/12_lmcache_connector_v1_debug.sh
+```
+
+This writes `prefill.layout_diag.log` and `decode.layout_diag.log` into the run
+directory. The shim logs tensor `shape`, `stride`, `storage_offset`,
+`is_contiguous`, data pointers, and base tensor metadata around:
+
+- `kvcached.integration.vllm.interfaces.alloc_kv_cache`
+- `lmcache.v1.gpu_connector.utils.permute_to_contiguous`
+
 ## Interpretation
 
 If the plain run reports zero LMCache hits, debug LMCache PD/cache lookup before
