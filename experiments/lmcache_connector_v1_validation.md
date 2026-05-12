@@ -1,12 +1,12 @@
 # LMCacheConnectorV1 PD Debug Validation
 
-This branch repeats the P2P NCCL request-ID experiment with vLLM
-`LMCacheConnectorV1`.
+This branch validates whether plain vLLM `LMCacheConnectorV1` can run a minimal
+1-prefill / 1-decode disaggregated-prefill setup and produce real LMCache KV
+hits. The first goal is simply "does LMCache PD work at all?"
 
 The harness launches one prefiller, one decoder, and a local proxy. The proxy
 sends the same client request to prefiller first with `max_tokens=1`, then to
-decoder for the full completion. It forwards a shared `X-Request-Id` to both
-servers by default so the experiment is comparable to the P2P NCCL run.
+decoder for the full completion.
 For LMCache PD, the proxy also attaches prefiller-side
 `kv_transfer_params.disagg_spec` with the decoder receiver host/init/alloc
 ports; without that per-request metadata, the prefiller reaches
@@ -22,7 +22,7 @@ startup checks; short prompts can complete successfully while still reporting
 - `experiments/12_lmcache_connector_v1_debug.sh`
 - `experiments/lmcache_connector_v1_validation.md`
 
-## Baseline Matrix
+## Bring-Up
 
 Run on a 2-GPU node:
 
@@ -32,7 +32,7 @@ git checkout pd-disagg-LMCacheConnectorV1-1
 git pull
 ```
 
-Plain vLLM LMCacheConnectorV1, request ID randomization enabled:
+Plain vLLM LMCacheConnectorV1. Leave vLLM request-id settings alone:
 
 ```bash
 RUN_WITH_KVCACHED=0 \
@@ -42,32 +42,16 @@ TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
 
-Plain vLLM LMCacheConnectorV1, request ID randomization disabled:
+This run is good only if the summary includes:
 
-```bash
-RUN_WITH_KVCACHED=0 \
-DISABLE_REQUEST_ID_RANDOMIZATION=1 \
-GPU_MEM_UTIL=0.45 \
-PROMPT_MODE=long \
-TIMEOUT_REQUEST=300 \
-./experiments/12_lmcache_connector_v1_debug.sh
+```text
+Classifier: decoder reported non-zero LMCache hit tokens.
 ```
 
-kvcached-enabled LMCacheConnectorV1, request ID randomization enabled:
+After plain LMCache shows non-zero hits, test kvcached:
 
 ```bash
 RUN_WITH_KVCACHED=1 \
-GPU_MEM_UTIL=0.45 \
-PROMPT_MODE=long \
-TIMEOUT_REQUEST=300 \
-./experiments/12_lmcache_connector_v1_debug.sh
-```
-
-kvcached-enabled LMCacheConnectorV1, request ID randomization disabled:
-
-```bash
-RUN_WITH_KVCACHED=1 \
-DISABLE_REQUEST_ID_RANDOMIZATION=1 \
 GPU_MEM_UTIL=0.45 \
 PROMPT_MODE=long \
 TIMEOUT_REQUEST=300 \
@@ -76,14 +60,9 @@ TIMEOUT_REQUEST=300 \
 
 ## Interpretation
 
-For `P2pNcclConnector`, randomization broke tensor matching because the tensor key
-was `request_id#layer_name`, and prefill/decode got different internal vLLM
-suffixes.
-
-`LMCacheConnectorV1` should be tested separately because it transfers via
-LMCache/NIXL and keying is not the same as P2P NCCL. If the randomization-on and
-randomization-off LMCache runs behave the same, request ID randomization is likely
-not the relevant failure mode for this connector.
+If the plain run reports zero LMCache hits, debug LMCache PD/cache lookup before
+testing kvcached. If the plain run reports non-zero hits and the kvcached run
+does not, the regression is in the kvcached path.
 
 ## Notes
 

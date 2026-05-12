@@ -5,8 +5,7 @@
 # Purpose:
 #   Start a minimal 1-prefill / 1-decode vLLM PD-disagg setup with
 #   LMCacheConnectorV1 over LMCache/NIXL, route requests through a tiny local
-#   proxy, and capture logs for the same request-ID-randomization matrix used
-#   for the P2pNcclConnector investigation.
+#   proxy, and capture logs proving whether LMCache transfers KV at all.
 #
 # Usage:
 #   chmod +x experiments/12_lmcache_connector_v1_debug.sh
@@ -14,7 +13,6 @@
 #
 # Useful overrides:
 #   RUN_WITH_KVCACHED=0 ./experiments/12_lmcache_connector_v1_debug.sh
-#   DISABLE_REQUEST_ID_RANDOMIZATION=1 ./experiments/12_lmcache_connector_v1_debug.sh
 #   TIMEOUT_REQUEST=300 KEEP_ALIVE_ON_FAIL=1 ./experiments/12_lmcache_connector_v1_debug.sh
 #
 # Logs are saved to experiments/logs_lmcache_v1_debug/<timestamp>/.
@@ -358,8 +356,6 @@ PY
 
     if [ "$DISABLE_REQUEST_ID_RANDOMIZATION" = "1" ]; then
         log_info "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1"
-    else
-        log_info "VLLM request ID randomization is enabled"
     fi
 }
 
