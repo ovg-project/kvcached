@@ -22,6 +22,7 @@ startup checks; short prompts can complete successfully while still reporting
 - `experiments/12_lmcache_connector_v1_debug.sh`
 - `experiments/collect_lmcache_connector_v1_evidence.sh`
 - `experiments/lmcache_connector_v1_validation.md`
+- `experiments/evidence/lmcache_connector_v1/`
 
 ## Bring-Up
 
@@ -59,6 +60,19 @@ TIMEOUT_REQUEST=300 \
 ./experiments/12_lmcache_connector_v1_debug.sh
 ```
 
+For the validated LMCacheConnectorV1 compatibility mode, run kvcached with the
+non-compound layout:
+
+```bash
+KVCACHED_CONTIGUOUS_LAYOUT=false \
+KV_LAYOUT_DIAG=1 \
+RUN_WITH_KVCACHED=1 \
+GPU_MEM_UTIL=0.45 \
+PROMPT_MODE=long \
+TIMEOUT_REQUEST=300 \
+./experiments/12_lmcache_connector_v1_debug.sh
+```
+
 To collect tensor layout metadata at the kvcached/LMCache handoff, enable the
 diagnostic shim:
 
@@ -84,7 +98,7 @@ If the plain run reports zero LMCache hits, debug LMCache PD/cache lookup before
 testing kvcached. If the plain run reports non-zero hits and the kvcached run
 does not, the regression is in the kvcached path.
 
-## Observed Results So Far
+## Observed Results
 
 Test environment:
 
@@ -163,6 +177,35 @@ non-contiguous KV tensor can be recovered by a metadata-only permutation. The
 kvcached view still has hidden layer spacing in its block stride, so LMCache
 rejects it as slicing/as_strided-style non-contiguity.
 
+The validated compatibility fix is to run LMCacheConnectorV1 with kvcached's
+non-compound layout:
+
+```bash
+KVCACHED_CONTIGUOUS_LAYOUT=false
+```
+
+With this setting, LMCache receives contiguous per-layer KV tensors:
+
+```text
+run_id: kvcached_noncontig_lmcache_1
+shape=(2, 51456, 16, 2, 128)
+stride=(210763776, 4096, 256, 128, 1)
+storage_offset=0
+is_contiguous=True
+```
+
+The passing run reports successful prefiller/decoder requests and non-zero
+LMCache hits:
+
+```text
+Classifier: decoder reached LMCache retrieve path.
+Classifier: decoder reported non-zero LMCache hit tokens.
+PASS: LMCacheConnectorV1 debug harness completed
+prefill request 2: LMCache hit tokens: 512
+decode request 1: LMCache hit tokens: 512
+decode request 2: LMCache hit tokens: 512
+```
+
 Evidence bundles from these runs were collected with:
 
 ```bash
@@ -171,10 +214,29 @@ Evidence bundles from these runs were collected with:
 
 ./experiments/collect_lmcache_connector_v1_evidence.sh \
   experiments/logs_lmcache_v1_debug/kvcached_lmcache_hits_1
+
+./experiments/collect_lmcache_connector_v1_evidence.sh \
+  experiments/logs_lmcache_v1_debug/kvcached_layout_diag_1
+
+./experiments/collect_lmcache_connector_v1_evidence.sh \
+  experiments/logs_lmcache_v1_debug/plain_layout_diag_1
+
+./experiments/collect_lmcache_connector_v1_evidence.sh \
+  experiments/logs_lmcache_v1_debug/kvcached_noncontig_lmcache_1
 ```
 
 The resulting tarballs contain `summary.md`, package versions, system info,
 configs, request/response JSON, and prefill/decode/proxy logs.
+
+Committed evidence bundles:
+
+```text
+experiments/evidence/lmcache_connector_v1/lmcache_connector_v1_plain_hits.tar.gz
+experiments/evidence/lmcache_connector_v1/lmcache_connector_v1_kvcached_default_failure.tar.gz
+experiments/evidence/lmcache_connector_v1/lmcache_connector_v1_plain_layout_diag.tar.gz
+experiments/evidence/lmcache_connector_v1/lmcache_connector_v1_kvcached_compound_layout_failure_diag.tar.gz
+experiments/evidence/lmcache_connector_v1/lmcache_connector_v1_kvcached_noncompound_layout_fix_pass.tar.gz
+```
 
 ## Notes
 
