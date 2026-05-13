@@ -1061,6 +1061,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         # Capture patch instance for version-aware access
         patch_instance = self
+        logger = self.logger  # Capture logger in closure
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
@@ -1161,6 +1162,71 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 if kernel_block_sizes is not None
                 and first_attn_group_id < len(kernel_block_sizes)
                 else None)
+
+            if kernel_block_size is None:
+                logger.warning("kernel_block_size is None, try to compute from the attention backend's supported block sizes")
+                try:
+                    # Try to compute kernel_block_size from the attention backend's
+                    # supported block sizes, mirroring vLLM's
+                    # prepare_kernel_block_sizes / select_common_block_size logic.
+                    kv_manager_block_size = kv_cache_spec.block_size
+                    supported_sizes = None
+                    if hasattr(attn_backend_cls, 'get_supported_kernel_block_sizes'):
+                        supported_sizes = attn_backend_cls.get_supported_kernel_block_sizes()
+                    elif hasattr(attn_backend_cls, 'get_supported_block_sizes'):
+                        supported_sizes = attn_backend_cls.get_supported_block_sizes()
+
+                    if supported_sizes:
+                        # Import MultipleOf for isinstance checks
+                        try:
+                            from vllm.v1.attention.backend import MultipleOf as _MultipleOf
+                        except ImportError:
+                            _MultipleOf = None  # type: ignore[misc]
+
+                        # Check if the kv_manager_block_size is directly supported
+                        directly_supported = False
+                        for s in supported_sizes:
+                            if isinstance(s, int) and s == kv_manager_block_size:
+                                directly_supported = True
+                                break
+                            elif isinstance(s, range) and kv_manager_block_size in s:
+                                directly_supported = True
+                                break
+                            elif (_MultipleOf is not None
+                                and isinstance(s, _MultipleOf)
+                                and kv_manager_block_size % s.base == 0):
+                                directly_supported = True
+                                break
+                        if not directly_supported:
+                            # Pick the largest supported size that divides kv_manager_block_size
+                            candidates = []
+                            for s in supported_sizes:
+                                if isinstance(s, int):
+                                    if kv_manager_block_size % s == 0:
+                                        candidates.append(s)
+                                elif isinstance(s, range):
+                                    for v in s:
+                                        if kv_manager_block_size % v == 0:
+                                            candidates.append(v)
+                                elif (_MultipleOf is not None
+                                    and isinstance(s, _MultipleOf)):
+                                    if kv_manager_block_size % s.base == 0:
+                                        candidates.append(kv_manager_block_size)
+                            if candidates:
+                                kernel_block_size = max(candidates)
+                except Exception:
+                    pass
+            # Fallback: try prepare_kernel_block_sizes if available
+            if kernel_block_size is None:
+                try:
+                    from vllm.v1.worker.utils import prepare_kernel_block_sizes as _prep_kbs
+                    _attn_groups = getattr(self, "attn_groups", None)
+                    if _attn_groups is not None:
+                        _kbs_list = _prep_kbs(kv_cache_config, _attn_groups)
+                        if first_attn_group_id < len(_kbs_list):
+                            kernel_block_size = _kbs_list[first_attn_group_id]
+                except Exception:
+                    pass
 
             alloc_result = kvi.alloc_kv_cache(
                 kv_cache_shape,
