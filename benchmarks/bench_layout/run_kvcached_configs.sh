@@ -8,7 +8,7 @@ RESULTS_DIR="$SCRIPT_DIR/sweep_results"
 LOG_DIR="$SCRIPT_DIR/sweep_logs"
 mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
-VLLM="/home/xingqi/miniforge3/envs/kvcached/bin/vllm"
+VLLM="/home/qa4/kvcached/engine_integration/vllm-pip-venv/bin/vllm"
 MODEL="Qwen/Qwen3-0.6B"
 PORT=12347
 SEEDS=(42 99 7)
