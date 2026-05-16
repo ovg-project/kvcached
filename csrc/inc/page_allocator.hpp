@@ -87,8 +87,8 @@ public:
   // per-layer mem_size if it differs from current_mem_size, otherwise -1.
   int64_t check_and_get_resize_target(int64_t current_mem_size) const;
 
-  // Fast atomic read of the resize target (updated by background watcher thread).
-  // Returns new per-layer mem_size if changed, otherwise -1.
+  // Fast atomic read of the resize target (updated by background watcher
+  // thread). Returns new per-layer mem_size if changed, otherwise -1.
   int64_t get_resize_target() const;
 
   // Utility functions
