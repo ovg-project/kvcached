@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -61,7 +62,8 @@ public:
                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
                 bool async_sched = false, bool contiguous_layout = true,
                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
-                int64_t group_id = 0);
+                int64_t group_id = 0,
+                const std::string &ipc_name = "");
 
   ~PageAllocator();
 

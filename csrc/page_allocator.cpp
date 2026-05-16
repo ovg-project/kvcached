@@ -105,7 +105,8 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              int64_t page_size, int64_t world_size,
                              int64_t pp_rank, bool async_sched,
                              bool contiguous_layout, bool enable_page_prealloc,
-                             int64_t num_kv_buffers, int64_t group_id)
+                             int64_t num_kv_buffers, int64_t group_id,
+                             const std::string &ipc_name)
     : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
@@ -126,7 +127,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
 
   // Initialize memory info tracker
   mem_info_tracker_ =
-      std::make_unique<MemInfoTracker>(total_memory_size_, group_id_);
+      std::make_unique<MemInfoTracker>(total_memory_size_, group_id_, ipc_name);
 
   std::cout << "Init C++ PageAllocator: "
             << "num_layers=" << num_layers << ", "
