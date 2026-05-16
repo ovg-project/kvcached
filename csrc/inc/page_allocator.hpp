@@ -87,6 +87,10 @@ public:
   // per-layer mem_size if it differs from current_mem_size, otherwise -1.
   int64_t check_and_get_resize_target(int64_t current_mem_size) const;
 
+  // Fast atomic read of the resize target (updated by background watcher thread).
+  // Returns new per-layer mem_size if changed, otherwise -1.
+  int64_t get_resize_target() const;
+
   // Utility functions
   page_id_t get_page_id(int64_t block_id, int64_t block_mem_size) const;
 
@@ -110,6 +114,9 @@ public:
 private:
   // Preallocation thread worker
   void prealloc_worker();
+
+  // Resize watcher thread worker
+  void resize_watcher();
 
   // Internal methods
   void map_pages(const std::vector<page_id_t> &page_ids);
@@ -152,6 +159,11 @@ private:
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
   std::unique_ptr<std::thread> prealloc_thread_;
+
+  // Resize watcher thread
+  std::atomic<int64_t> resize_target_{-1};
+  std::atomic<bool> resize_watcher_running_{false};
+  std::unique_ptr<std::thread> resize_watcher_thread_;
 
   // Memory info tracker
   int64_t total_memory_size_;

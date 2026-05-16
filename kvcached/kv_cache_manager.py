@@ -234,8 +234,7 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        new_mem_size = self.page_allocator.check_and_get_resize_target(
-            self.mem_size)
+        new_mem_size = self.page_allocator.get_resize_target()
         if new_mem_size > 0:
             self.resize(new_mem_size)
 

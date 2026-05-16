@@ -724,6 +724,13 @@ void PageAllocator::start_prealloc_thread_internal() {
     // Initial preallocation trigger
     trigger_preallocation();
   }
+
+  // Start resize watcher thread alongside prealloc thread
+  if (!resize_watcher_thread_) {
+    resize_watcher_running_ = true;
+    resize_watcher_thread_ =
+        std::make_unique<std::thread>(&PageAllocator::resize_watcher, this);
+  }
 }
 
 void PageAllocator::stop_prealloc_thread_internal() {
@@ -738,6 +745,14 @@ void PageAllocator::stop_prealloc_thread_internal() {
     prealloc_thread_.reset();
     LOGGER(DEBUG, "Stopped page preallocation thread");
   }
+
+  // Stop resize watcher thread
+  if (resize_watcher_thread_) {
+    resize_watcher_running_ = false;
+    resize_watcher_thread_->join();
+    resize_watcher_thread_.reset();
+    LOGGER(DEBUG, "Stopped resize watcher thread");
+  }
 }
 
 bool PageAllocator::should_use_worker_ipc() const {
@@ -745,6 +760,26 @@ bool PageAllocator::should_use_worker_ipc() const {
     return should_use_worker_ipc_callback_();
   }
   return false;
+}
+
+void PageAllocator::resize_watcher() {
+  LOGGER(INFO, "Resize watcher thread started (poll interval: 100ms)");
+  while (resize_watcher_running_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!resize_watcher_running_) {
+      break;
+    }
+    if (mem_info_tracker_) {
+      int64_t target = mem_info_tracker_->check_and_get_resize_target(
+          mem_size_per_layer_, num_layers_, num_kv_buffers_);
+      resize_target_.store(target, std::memory_order_relaxed);
+    }
+  }
+  LOGGER(INFO, "Resize watcher thread stopped");
+}
+
+int64_t PageAllocator::get_resize_target() const {
+  return resize_target_.load(std::memory_order_relaxed);
 }
 
 } // namespace kvcached
