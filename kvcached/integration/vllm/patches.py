@@ -349,6 +349,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 big-endian group_id so the same content hash is distinct across
                 KV cache groups (e.g. full attention vs sliding window).
                 """
+                if isinstance(block_hash, str):
+                    block_hash = block_hash.encode()
                 return bytes(block_hash) + group_id.to_bytes(4, "big", signed=False)
 
             def get_cached_block(
