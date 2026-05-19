@@ -9,13 +9,18 @@ RESULTS_DIR="$SCRIPT_DIR/sweep_results"
 LOG_DIR="$SCRIPT_DIR/sweep_logs"
 mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
-VENV_PY="/home/xingqi/miniforge3/envs/kvcached/bin/python"
-VLLM="/home/xingqi/miniforge3/envs/kvcached/bin/vllm"
+VENV_PY="/home/qa4/kvcached/engine_integration/vllm-pip-venv/bin/python"
+VLLM="/home/qa4/kvcached/engine_integration/vllm-pip-venv/bin/vllm"
 
 MODEL="Qwen/Qwen3-0.6B"
 PORT=12347
 GPU_MEM_UTIL=0.5
 MAX_MODEL_LEN=2048
+
+# Use system GCC so Triton can find Ubuntu's multiarch Python headers
+# (conda's cross-compiler doesn't know about /usr/include/x86_64-linux-gnu/)
+export CC=/usr/bin/gcc
+export CUDA_VISIBLE_DEVICES=1
 
 WARMUP_PROMPTS=100
 NUM_PROMPTS=500

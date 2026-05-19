@@ -13,7 +13,10 @@ OUT_DIR="$SCRIPT_DIR/nsys_runs"
 LOG_DIR="$SCRIPT_DIR/nsys_logs"
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
-VLLM="/home/xingqi/miniforge3/envs/kvcached/bin/vllm"
+export CC=/usr/bin/gcc
+export CUDA_VISIBLE_DEVICES=1
+
+VLLM="/home/qa4/kvcached/engine_integration/vllm-pip-venv/bin/vllm"
 MODEL="Qwen/Qwen3-0.6B"
 PORT=12348
 NUM_PROMPTS=${NUM_PROMPTS:-100}
