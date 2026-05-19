@@ -7,6 +7,7 @@
 #include "constants.hpp"
 #include "cuda_utils.hpp"
 #include "ftensor.hpp"
+#include "gpu_vmm.hpp"
 #include "page.hpp"
 
 namespace kvcached {
@@ -23,7 +24,9 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::Device &dev,
   size_t offset = g_vaddr_allocated_offset.fetch_add(size);
   if (dev.is_cuda()) {
     CHECK_DRV(cuMemAddressReserve(reinterpret_cast<CUdeviceptr *>(&vaddr), size,
-                                  alignment_2mb, kStartAddr + offset, 0ULL));
+                                  alignment_2mb,
+                                  kvcached_vmm_addr(kStartAddr + offset),
+                                  0ULL));
   } else {
     vaddr = mmap(reinterpret_cast<void *>(kStartAddr + offset), size,
                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

@@ -10,6 +10,7 @@
 #include "constants.hpp"
 #include "cuda_utils.hpp"
 #include "ftensor.hpp"
+#include "gpu_vmm.hpp"
 #include "page.hpp"
 #include "torch_utils.hpp"
 
@@ -320,9 +321,8 @@ void FTensorAllocator::init_cuda_() {
   CHECK_DRV(cuCtxGetDevice(&dev));
 
   int supportsVMM = 0;
-  CHECK_DRV(cuDeviceGetAttribute(
-      &supportsVMM, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
-      dev));
+  CHECK_DRV(cuDeviceGetAttribute(&supportsVMM,
+                                 KVCACHED_GPU_ATTR_VMM_SUPPORTED, dev));
   // LOGE("Supports VMM: %d", supportsVMM);
 
   CUcontext context;

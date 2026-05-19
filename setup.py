@@ -27,14 +27,20 @@ SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH
 CSRC_PATH = os.path.join(ROOT_PATH, "csrc")
 
+# torch-ROCm sets torch.version.hip and leaves torch.version.cuda None.
+IS_ROCM = torch.version.hip is not None
+ROCM_PATH = os.environ.get("ROCM_PATH", "/opt/rocm")
+
 
 def get_csrc_files(path) -> List[str]:
     src_dir = Path(path)
-    # setuptools requires relative paths
-    # Filter out macOS AppleDouble metadata files (._* prefix)
+    # setuptools requires relative paths.
+    # Exclusions:
+    #  - "._*": macOS AppleDouble metadata files.
+    #  - "*_hip.cpp": hipify-generated artifacts.
     cpp_files = [
         str(f.relative_to(SCRIPT_PATH)) for f in src_dir.rglob("*.cpp")
-        if not f.name.startswith("._")
+        if not f.name.startswith("._") and not f.name.endswith("_hip.cpp")
     ]
     return cpp_files
 
@@ -49,12 +55,19 @@ def get_extensions():
         "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
     ]
 
+    gpu_lib = "amdhip64" if IS_ROCM else "cuda"
+    inc_dirs = include_paths() + [os.path.join(CSRC_PATH, "inc")]
+    lib_dirs = library_paths()
+    if IS_ROCM:
+        inc_dirs.append(os.path.join(ROCM_PATH, "include"))
+        lib_dirs.append(os.path.join(ROCM_PATH, "lib"))
+
     vmm_ops_module = CUDAExtension(
         "kvcached.vmm_ops",
         csrc_files,
-        include_dirs=include_paths() + [os.path.join(CSRC_PATH, "inc")],
-        library_dirs=library_paths(),
-        libraries=["torch", "torch_cpu", "torch_python", "cuda"],
+        include_dirs=inc_dirs,
+        library_dirs=lib_dirs,
+        libraries=["torch", "torch_cpu", "torch_python", gpu_lib],
         extra_compile_args={
             "cxx": extra_compile_args,
             "nvcc": extra_compile_args

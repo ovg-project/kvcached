@@ -187,3 +187,12 @@ tools/.addlicense.lock
 # macOS metadata files
 .DS_Store
 ._*
+
+# hipify (ROCm) build artifacts: generated in-tree by torch's BuildExtension
+# from the csrc/ originals. Kept on disk for reference but never committed —
+# they are derived, not source. See docs/rocm_phase2_report.md.
+csrc/*_hip.cpp
+csrc/inc/*_hip.hpp
+# hipify renames cuda_utils.hpp -> hip_utils.hpp (substring swap, not a _hip
+# suffix), so it needs an explicit entry. Still generated, not source.
+csrc/inc/hip_utils.hpp
