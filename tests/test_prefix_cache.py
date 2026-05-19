@@ -279,7 +279,7 @@ class TestEvictOnDemand:
 
     def test_evict_on_alloc_pressure(self, pool_factory):
         """When kvcached is full, get_new_blocks evicts from the pool."""
-        pool, mgr = pool_factory(10)
+        pool, mgr = pool_factory(11)  # +1 for null_block
 
         # Fill all 10 blocks and cache them
         blocks = _simulate_request(pool, [f"h{i}" for i in range(10)])
@@ -298,7 +298,7 @@ class TestEvictOnDemand:
 
     def test_evict_lru_order(self, pool_factory):
         """Oldest blocks (first inserted) are evicted first."""
-        pool, mgr = pool_factory(10)
+        pool, mgr = pool_factory(11)  # +1 for null_block
 
         # Cache blocks h0..h9 in order
         blocks = _simulate_request(pool, [f"h{i}" for i in range(10)])
@@ -314,7 +314,7 @@ class TestEvictOnDemand:
 
     def test_evict_all_then_alloc(self, pool_factory):
         """Can evict entire pool and allocate fresh blocks."""
-        pool, mgr = pool_factory(5)
+        pool, mgr = pool_factory(6)  # +1 for null_block
 
         blocks = _simulate_request(pool, ["a", "b", "c", "d", "e"])
         _finish_request(pool, blocks)
@@ -328,7 +328,7 @@ class TestEvictOnDemand:
 
     def test_partial_eviction(self, pool_factory):
         """Evict only as many as needed, keep the rest."""
-        pool, mgr = pool_factory(10)
+        pool, mgr = pool_factory(11)  # +1 for null_block
 
         blocks = _simulate_request(pool, [f"h{i}" for i in range(10)])
         _finish_request(pool, blocks)
@@ -340,13 +340,13 @@ class TestEvictOnDemand:
 
     def test_no_eviction_when_kvcached_has_space(self, pool_factory):
         """Don't evict if kvcached already has enough free blocks."""
-        pool, mgr = pool_factory(20)
+        pool, mgr = pool_factory(21)  # +1 for null_block
 
         # Use 5 blocks, cache them, free them
         blocks = _simulate_request(pool, [f"h{i}" for i in range(5)])
         _finish_request(pool, blocks)
         assert len(pool._evictable_blocks) == 5
-        assert mgr.available_size() == 15  # 20 - 5 held by evictable
+        assert mgr.available_size() == 15  # 21-1(null)-5 = 15
 
         # Allocate 3 -- kvcached has 15 free, no eviction needed
         new_blocks = pool.get_new_blocks(3)
@@ -370,17 +370,17 @@ class TestResetAndExplicitEviction:
 
     def test_reset_frees_evictable_blocks(self, pool_factory):
         """reset_prefix_cache frees all evictable blocks to kvcached."""
-        pool, mgr = pool_factory(20)
+        pool, mgr = pool_factory(21)  # +1 for null_block
 
         blocks = _simulate_request(pool, ["h0", "h1", "h2"])
         _finish_request(pool, blocks)
-        assert mgr.available_size() == 17  # 20 - 3 held by pool
+        assert mgr.available_size() == 17  # 21-1(null)-3 = 17
 
         pool.reset_prefix_cache()
         assert len(pool._evictable_blocks) == 0
         assert len(pool._cached_blocks) == 0
-        assert len(pool._block_id_to_hash) == 0
-        assert mgr.available_size() == 20  # all freed
+        assert len(pool._block_id_to_key) == 0
+        assert mgr.available_size() == 20  # all freed (null_block still allocated)
 
     def test_reset_with_no_evictable(self, pool_and_manager):
         """reset_prefix_cache works even when evictable pool is empty."""
@@ -487,7 +487,7 @@ class TestEdgeCases:
 
     def test_reuse_after_eviction_and_realloc(self, pool_factory):
         """After eviction, block IDs can be reallocated and recached."""
-        pool, mgr = pool_factory(4)
+        pool, mgr = pool_factory(5)  # +1 for null_block
 
         # Fill cache
         blocks = _simulate_request(pool, ["h0", "h1", "h2", "h3"])
@@ -523,8 +523,9 @@ class TestEdgeCases:
     def test_get_usage(self, pool_factory):
         """get_usage reflects the fraction of blocks in use."""
         pool, mgr = pool_factory(100)
-        assert pool.get_usage() == 0.0
+        # null_block occupies 1/100, so usage is ~0.01
+        assert pool.get_usage() == pytest.approx(0.01, abs=0.001)
 
         pool.get_new_blocks(50)
-        # 50 allocated from kvcached, 0 evictable -> 50 free from kvcached + 0 evictable
-        assert pool.get_usage() == pytest.approx(0.5)
+        # 50+1(null) allocated, 0 evictable -> 49 free from kvcached
+        assert pool.get_usage() == pytest.approx(0.51)
