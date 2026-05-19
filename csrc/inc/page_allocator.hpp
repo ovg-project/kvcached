@@ -155,6 +155,7 @@ private:
   BroadcastMapCallback broadcast_map_callback_;
   BroadcastUnmapCallback broadcast_unmap_callback_;
   ShouldUseWorkerIpcCallback should_use_worker_ipc_callback_;
+  mutable std::atomic<bool> should_use_worker_ipc_cached_{false};
 };
 
 } // namespace kvcached
