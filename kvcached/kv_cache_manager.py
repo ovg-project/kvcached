@@ -446,6 +446,7 @@ class KVCacheManager:
         # causing the null-block reservation to get a non-zero block.
         self.page_allocator._stop_prealloc_thread(
             timeout=PREALLOC_THREAD_TIMEOUT)
+        self._prealloc_started = False
 
         # Clear reserved blocks
         self.free_reserved()
