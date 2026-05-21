@@ -140,6 +140,16 @@ class KVCacheManager:
             except Exception as e:
                 logger.warning("Failed to set up broadcast callbacks: %s. Falling back to single-process mode.", e)
 
+        # In multi-process mode, vLLM reserves its null block from the first
+        # post-init alloc() call rather than via reserve_null_block=True.
+        # Starting the background prealloc thread before that first alloc can
+        # race the same multi-process map path and stall TP startup.
+        self._defer_prealloc_until_first_alloc = (
+            not self.reserve_null_block
+            and (self.world_size > 1 or use_worker_ipc)
+        )
+        self._prealloc_started = False
+
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, InternalPage] = {}
         self.full_pages: Dict[int, InternalPage] = {}
@@ -158,6 +168,12 @@ class KVCacheManager:
         # exist, then complete the remaining setup (reserve null block, start
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
+
+    def _start_prealloc_thread(self) -> None:
+        if self._prealloc_started:
+            return
+        self.page_allocator.start_prealloc_thread()
+        self._prealloc_started = True
 
     def _post_init(self):
         if self.null_block is not None:
@@ -188,8 +204,8 @@ class KVCacheManager:
             # KV tensors created now
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
-
-            self.page_allocator.start_prealloc_thread()
+            if not self._defer_prealloc_until_first_alloc:
+                self._start_prealloc_thread()
         except Exception as e:
             logger.error(
                 f"Error during KVCacheManager post-initialization: {e}")
@@ -274,6 +290,9 @@ class KVCacheManager:
 
             self.num_avail_blocks -= num_from_page
             remaining_need -= num_from_page
+
+        if self._defer_prealloc_until_first_alloc:
+            self._start_prealloc_thread()
 
         return ret_index
 
@@ -460,7 +479,7 @@ class KVCacheManager:
         self._reserve_null_block()
 
         # Restart the prealloc thread now that null block is safely reserved.
-        self.page_allocator.start_prealloc_thread()
+        self._start_prealloc_thread()
 
     # Private methods
     @synchronized
