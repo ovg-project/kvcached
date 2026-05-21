@@ -713,14 +713,13 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             cell_size, num_kv_buffers = _get_kv_cache_params(
                 kv_cache_spec, block_size, attention_type=attention_type)
 
-            try:
-                from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-
-                tp_size = int(get_tensor_model_parallel_world_size())
-            except Exception:
-                tp_size = 1
-
             from kvcached.integration.vllm import interfaces as kvi
+
+            # Reuse the TP world size recorded during EngineCore init.
+            # At coordinator construction time, vLLM's parallel_state helpers
+            # can still observe world_size=1 even though TP workers will be
+            # launched with the correct tensor_parallel_size later in startup.
+            tp_size = kvi.get_world_size()
 
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets
