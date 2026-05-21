@@ -1,40 +1,60 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import sys
 import types
 from importlib.machinery import ModuleSpec
 from unittest import mock
 
-
-_torch_mock = mock.MagicMock()
-_torch_mock.__version__ = "2.6.0"
-sys.modules.setdefault("torch", _torch_mock)
-sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
-sys.modules.setdefault("torch.utils", _torch_mock.utils)
-sys.modules.setdefault("torch.utils.cpp_extension", _torch_mock.utils.cpp_extension)
-sys.modules.setdefault("posix_ipc", mock.MagicMock())
-sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
-
-_interfaces_mod = types.ModuleType("kvcached.integration.vllm.interfaces")
-_interfaces_mod._world_size = 2
-_interfaces_mod.init_kvcached = mock.Mock()
-sys.modules["kvcached.integration.vllm.interfaces"] = _interfaces_mod
-
-_parallel_state_mod = types.ModuleType("vllm.distributed.parallel_state")
-_parallel_state_mod.get_tensor_model_parallel_world_size = lambda: 1
-_vllm_mod = sys.modules.setdefault("vllm", types.ModuleType("vllm"))
-_vllm_mod.__spec__ = ModuleSpec("vllm", loader=None)
-_vllm_distributed_mod = sys.modules.setdefault(
-    "vllm.distributed", types.ModuleType("vllm.distributed")
-)
-_vllm_distributed_mod.__spec__ = ModuleSpec("vllm.distributed", loader=None)
-_parallel_state_mod.__spec__ = ModuleSpec("vllm.distributed.parallel_state", loader=None)
-sys.modules["vllm.distributed.parallel_state"] = _parallel_state_mod
-
 import pytest
 
-from kvcached.integration.vllm import patches
+
+def _load_patches(monkeypatch):
+    torch_mock = mock.MagicMock()
+    torch_mock.__version__ = "2.6.0"
+    monkeypatch.setitem(sys.modules, "torch", torch_mock)
+    monkeypatch.setitem(sys.modules, "torch.cuda", torch_mock.cuda)
+    monkeypatch.setitem(sys.modules, "torch.utils", torch_mock.utils)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.utils.cpp_extension",
+        torch_mock.utils.cpp_extension,
+    )
+    monkeypatch.setitem(sys.modules, "posix_ipc", mock.MagicMock())
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
+
+    interfaces_mod = types.ModuleType("kvcached.integration.vllm.interfaces")
+    interfaces_mod.get_world_size = mock.Mock(return_value=2)
+    interfaces_mod.init_kvcached = mock.Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "kvcached.integration.vllm.interfaces",
+        interfaces_mod,
+    )
+
+    parallel_state_mod = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state_mod.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state_mod.__spec__ = ModuleSpec(
+        "vllm.distributed.parallel_state",
+        loader=None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.parallel_state",
+        parallel_state_mod,
+    )
+
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.__spec__ = ModuleSpec("vllm", loader=None)
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+
+    vllm_distributed_mod = types.ModuleType("vllm.distributed")
+    vllm_distributed_mod.__spec__ = ModuleSpec("vllm.distributed", loader=None)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", vllm_distributed_mod)
+
+    patches = importlib.import_module("kvcached.integration.vllm.patches")
+    return importlib.reload(patches), interfaces_mod
 
 
 class FakeElasticBlockPool:
@@ -43,6 +63,8 @@ class FakeElasticBlockPool:
 
 
 def test_kv_cache_coordinator_reuses_enginecore_world_size(monkeypatch):
+    patches, interfaces_mod = _load_patches(monkeypatch)
+
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
     monkeypatch.setattr(
@@ -58,7 +80,7 @@ def test_kv_cache_coordinator_reuses_enginecore_world_size(monkeypatch):
 
     fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
     fake_block_pool_mod.ElasticBlockPool = FakeElasticBlockPool
-    sys.modules["vllm.v1.core.block_pool"] = fake_block_pool_mod
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod)
 
     kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
 
@@ -75,6 +97,7 @@ def test_kv_cache_coordinator_reuses_enginecore_world_size(monkeypatch):
 
     coordinator = kvcoord_mod.KVCacheCoordinator()
 
-    _interfaces_mod.init_kvcached.assert_called_once()
-    assert _interfaces_mod.init_kvcached.call_args.kwargs["world_size"] == 2
+    interfaces_mod.get_world_size.assert_called_once_with()
+    interfaces_mod.init_kvcached.assert_called_once()
+    assert interfaces_mod.init_kvcached.call_args.kwargs["world_size"] == 2
     assert isinstance(coordinator.block_pool, FakeElasticBlockPool)

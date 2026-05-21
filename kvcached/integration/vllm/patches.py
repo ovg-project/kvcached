@@ -719,7 +719,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             # At coordinator construction time, vLLM's parallel_state helpers
             # can still observe world_size=1 even though TP workers will be
             # launched with the correct tensor_parallel_size later in startup.
-            tp_size = int(getattr(kvi, "_world_size", 1))
+            tp_size = kvi.get_world_size()
 
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets

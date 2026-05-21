@@ -29,6 +29,18 @@ _is_worker: bool = False
 def should_use_worker_ipc() -> bool:
     return _kvcached_initialized and not _is_worker
 
+
+def get_world_size(default: int = 1) -> int:
+    try:
+        return int(_world_size)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid recorded TP world size %r; falling back to %d",
+            _world_size,
+            default,
+        )
+        return default
+
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,
