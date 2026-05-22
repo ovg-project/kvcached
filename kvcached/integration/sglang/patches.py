@@ -1258,8 +1258,10 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     down to that limit.  This prevents the cache from consuming all KV pool
     capacity and leaves headroom for running requests.
 
-    Set KVCACHED_MAX_CACHED_TOKENS to a positive integer to enable.
-    0 (default) means unlimited — this patch is a no-op in that case.
+    KVCACHED_MAX_CACHED_TOKENS semantics:
+      < 0  → unlimited; this patch is a no-op.
+      == 0 → disabled; every cached entry is evicted immediately on insert.
+      > 0  → cap evictable size at this many tokens.
     """
 
     library = "sglang"
@@ -1268,9 +1270,10 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     patch_name = "radix_cache_limit"
 
     def apply(self, radix_cache_mod: types.ModuleType) -> bool:
-        if MAX_CACHED_TOKENS <= 0:
+        if MAX_CACHED_TOKENS < 0:
             logger.debug(
-                "KVCACHED_MAX_CACHED_TOKENS not set — RadixCacheLimitPatch skipped"
+                "KVCACHED_MAX_CACHED_TOKENS < 0 (unlimited) — "
+                "RadixCacheLimitPatch skipped"
             )
             return True  # Not an error; just not needed.
 
