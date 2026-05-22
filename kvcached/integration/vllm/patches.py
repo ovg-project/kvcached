@@ -246,11 +246,13 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
 def _get_max_cached_blocks(block_size: int) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
-    Returns 0 (unlimited) when MAX_CACHED_TOKENS is 0.
+    Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
+    Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
+    Otherwise returns MAX_CACHED_TOKENS // block_size.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
-    if MAX_CACHED_TOKENS <= 0:
-        return 0
+    if MAX_CACHED_TOKENS < 0:
+        return -1
     return MAX_CACHED_TOKENS // block_size
 
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
@@ -300,7 +302,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
-                # 0 means unlimited
+                # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
@@ -537,7 +539,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
 
-                if (self.max_cached_blocks > 0
+                if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
