@@ -246,11 +246,13 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
 def _get_max_cached_blocks(block_size: int) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
-    Returns 0 (unlimited) when MAX_CACHED_TOKENS is 0.
+    Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
+    Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
+    Otherwise returns MAX_CACHED_TOKENS // block_size.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
-    if MAX_CACHED_TOKENS <= 0:
-        return 0
+    if MAX_CACHED_TOKENS < 0:
+        return -1
     return MAX_CACHED_TOKENS // block_size
 
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
@@ -277,6 +279,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             return True
 
         BlockPool = getattr(block_pool_mod, "BlockPool")
+        # NOTE: use a different local name than ``KVCacheBlock`` so the stub
+        # class declared in the TYPE_CHECKING block above stays visible for
+        # type annotations inside the nested ``ElasticBlockPool`` class.
         KVCacheBlockClass = getattr(block_pool_mod, "KVCacheBlock")
 
         logger = self.logger  # Capture logger in closure
@@ -297,7 +302,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
-                # 0 means unlimited
+                # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
@@ -324,19 +329,19 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # read from it, but results are masked out).
                 _null_ids = self.kv_cache_manager.alloc(1)
                 assert _null_ids is not None and len(_null_ids) == 1
-                self.null_block = KVCacheBlockClass(_null_ids[0])
+                self.null_block = self.kv_block_pool[_null_ids[0]]
                 self.null_block.is_null = True
 
                 # Prefix cache: (block_hash, group_id) -> KVCacheBlock
                 # The key embeds group_id to support hybrid attention
                 # (multiple KV cache groups with different attention types).
-                self._cached_blocks: dict[Any, "KVCacheBlock"] = {}
+                self._cached_blocks: dict[Any, KVCacheBlock] = {}
                 # Reverse index: block_id -> cache key for O(1) eviction.
                 # Each block_id belongs to exactly one group.
                 self._block_id_to_key: dict[int, Any] = {}
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
-                self._evictable_blocks: OrderedDict[int, "KVCacheBlock"] = OrderedDict()
+                self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
 
             @staticmethod
             def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
@@ -367,7 +372,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if isinstance(kv_cache_group_ids, int):
                     kv_cache_group_ids = [int(kv_cache_group_ids)]
 
-                cached_blocks: list["KVCacheBlock"] = []
+                cached_blocks: list[KVCacheBlock] = []
                 for group_id in kv_cache_group_ids:
                     key = self._make_cache_key(block_hash, int(group_id))
                     block = self._cached_blocks.get(key)
@@ -382,7 +387,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def cache_full_blocks(
                 self,
                 request: "Request",
-                blocks: list["KVCacheBlock"],
+                blocks: list[KVCacheBlock],
                 *args: Any,
                 **kwargs: Any,
             ) -> None:
@@ -468,7 +473,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def get_new_blocks(
                 self, num_blocks: int
-            ) -> list["KVCacheBlock"]:
+            ) -> list[KVCacheBlock]:
                 if num_blocks > self.get_num_free_blocks():
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
@@ -490,7 +495,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return blocks
 
             def touch(
-                self, blocks: list["KVCacheBlock"] | tuple[list["KVCacheBlock"], ...]
+                self, blocks: list[KVCacheBlock] | tuple[list[KVCacheBlock], ...]
             ) -> None:
                 if not self.enable_prefix_cache:
                     return
@@ -507,7 +512,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def free_blocks(
                 self,
-                ordered_blocks: Iterable["KVCacheBlock"],
+                ordered_blocks: Iterable[KVCacheBlock],
             ) -> None:
                 if not self.enable_prefix_cache:
                     block_ids = [
@@ -534,7 +539,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
 
-                if (self.max_cached_blocks > 0
+                if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
