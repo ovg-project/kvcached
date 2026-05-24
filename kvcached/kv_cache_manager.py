@@ -21,6 +21,7 @@ from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
+    PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
     get_kvcached_logger,
@@ -105,7 +106,7 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
-            enable_page_prealloc=True,
+            enable_page_prealloc=PAGE_PREALLOC_ENABLED,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
