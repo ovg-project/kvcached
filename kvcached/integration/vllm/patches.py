@@ -687,8 +687,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             try:
                 self._setup_kvcached_coordinator()
-            except Exception:
-                logger.warning("Failed to patch kv_cache_coordinator")
+            except Exception as e:
+                logger.warning("Failed to patch kv_cache_coordinator: %s", e, exc_info=True)
                 return
 
         def _setup_kvcached_coordinator(self) -> None:

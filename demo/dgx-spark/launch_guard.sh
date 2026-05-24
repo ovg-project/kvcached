@@ -1,0 +1,84 @@
+#!/bin/bash
+# Launch the guardrail model (Llama-Guard-3-8B).
+#
+# Usage:
+#   ./launch_guard.sh                      # kvcached mode (default)
+#   ./launch_guard.sh --mode baseline      # baseline with static memory split
+#   ./launch_guard.sh --mode baseline --gpu-util 0.85
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+
+MODE=kvcached
+GPU_UTIL=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --mode) MODE="$2"; shift 2 ;;
+    --gpu-util) GPU_UTIL="$2"; shift 2 ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+LOG="${LOG_DIR}/serve_guard.log"
+rm -f "$LOG"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+if ! command -v vllm >/dev/null 2>&1; then
+  echo "ERROR: vllm not found; activate the ${CONDA_ENV} environment or set CONDA_ENV" >&2
+  exit 1
+fi
+
+if [[ "$MODE" == "kvcached" ]]; then
+  GPU_UTIL="${GPU_UTIL:-$KVCACHED_GUARD_GPU_UTIL}"
+  export ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1 KVCACHED_IPC_NAME=kvcached_guard
+  export KVCACHED_CONTIGUOUS_LAYOUT=false
+  export KVCACHED_PAGE_PREALLOC_ENABLED="${KVCACHED_PAGE_PREALLOC_ENABLED:-false}"
+  export KVCACHED_PAGE_SIZE_MB
+  export VLLM_USE_V1=1
+  export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+  nohup vllm serve "$GUARD_MODEL_PATH" \
+    --enforce-eager --no-enable-prefix-caching \
+    --served-model-name "$GUARD_MODEL" \
+    --max-model-len "$GUARD_MAX_MODEL_LEN" --port "$GUARD_PORT" \
+    --gpu-memory-utilization "$KVCACHED_GUARD_GPU_UTIL" > "$LOG" 2>&1 &
+elif [[ "$MODE" == "baseline" ]]; then
+  GPU_UTIL="${GPU_UTIL:-$BASELINE_GUARD_GPU_UTIL}"
+  unset ENABLE_KVCACHED KVCACHED_AUTOPATCH KVCACHED_IPC_NAME 2>/dev/null || true
+  export VLLM_USE_V1=1
+  export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+  nohup vllm serve "$GUARD_MODEL_PATH" \
+    --enforce-eager --no-enable-prefix-caching \
+    --served-model-name "$GUARD_MODEL" \
+    --max-model-len "$BASELINE_GUARD_MAX_MODEL_LEN" --port "$GUARD_PORT" \
+    --gpu-memory-utilization "$GPU_UTIL" > "$LOG" 2>&1 &
+else
+  echo "invalid mode: $MODE (use kvcached or baseline)" >&2; exit 1
+fi
+
+PID=$!
+disown
+echo "guard ($MODE) launched - pid=$PID log=$LOG"
+
+echo "waiting for guard to become ready..."
+for i in $(seq 1 "$WAIT_HEALTH_ATTEMPTS"); do
+  curl -sf "http://localhost:${GUARD_PORT}/health" >/dev/null 2>&1 && break
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "ERROR: guard process exited early - check $LOG" >&2
+    tail -80 "$LOG" >&2 || true
+    exit 1
+  fi
+  sleep "$WAIT_HEALTH_INTERVAL"
+done
+
+if curl -sf "http://localhost:${GUARD_PORT}/health" >/dev/null 2>&1; then
+  echo "guard ready"
+  curl -s "http://localhost:${GUARD_PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${GUARD_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":20,\"temperature\":0}" \
+    | python3 -c 'import sys,json; print("sanity:", repr(json.load(sys.stdin)["choices"][0]["message"]["content"]))'
+else
+  echo "ERROR: guard failed to start - check $LOG" >&2
+  tail -80 "$LOG" >&2 || true
+  exit 1
+fi
