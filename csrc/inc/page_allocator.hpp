@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -61,7 +62,7 @@ public:
                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
                 bool async_sched = false, bool contiguous_layout = true,
                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
-                int64_t group_id = 0);
+                int64_t group_id = 0, const std::string &ipc_name = "");
 
   ~PageAllocator();
 
@@ -80,6 +81,15 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   int64_t get_avail_physical_pages() const;
+
+  // Poll the shared-memory MemInfoStruct to see if an external controller
+  // (e.g. `kvctl limit`) has written a new total_size. Returns the new
+  // per-layer mem_size if it differs from current_mem_size, otherwise -1.
+  int64_t check_and_get_resize_target(int64_t current_mem_size) const;
+
+  // Fast atomic read of the resize target (updated by background watcher
+  // thread). Returns new per-layer mem_size if changed, otherwise -1.
+  int64_t get_resize_target() const;
 
   // Utility functions
   page_id_t get_page_id(int64_t block_id, int64_t block_mem_size) const;
@@ -104,6 +114,9 @@ public:
 private:
   // Preallocation thread worker
   void prealloc_worker();
+
+  // Resize watcher thread worker
+  void resize_watcher();
 
   // Internal methods
   void map_pages(const std::vector<page_id_t> &page_ids);
@@ -146,6 +159,11 @@ private:
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
   std::unique_ptr<std::thread> prealloc_thread_;
+
+  // Resize watcher thread
+  std::atomic<int64_t> resize_target_{-1};
+  std::atomic<bool> resize_watcher_running_{false};
+  std::unique_ptr<std::thread> resize_watcher_thread_;
 
   // Memory info tracker
   int64_t total_memory_size_;

@@ -63,12 +63,13 @@ std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t num_layers, int64_t mem_size_per_layer, int64_t page_size,
     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
     bool contiguous_layout = true, bool enable_page_prealloc = true,
-    int64_t num_kv_buffers = 2, int64_t group_id = 0) {
+    int64_t num_kv_buffers = 2, int64_t group_id = 0,
+    const std::string &ipc_name = "") {
 
   return std::make_shared<PageAllocator>(
       num_layers, mem_size_per_layer, page_size, world_size, pp_rank,
       async_sched, contiguous_layout, enable_page_prealloc, num_kv_buffers,
-      group_id);
+      group_id, ipc_name);
 }
 
 // PageAllocator method bindings
@@ -136,6 +137,16 @@ int64_t page_allocator_get_avail_physical_pages(
   return allocator->get_avail_physical_pages();
 }
 
+int64_t page_allocator_check_and_get_resize_target(
+    std::shared_ptr<PageAllocator> allocator, int64_t current_mem_size) {
+  return allocator->check_and_get_resize_target(current_mem_size);
+}
+
+int64_t
+page_allocator_get_resize_target(std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_resize_target();
+}
+
 void page_allocator_set_broadcast_map_callback(
     std::shared_ptr<PageAllocator> allocator, BroadcastMapCallback callback) {
   allocator->set_broadcast_map_callback(callback);
@@ -193,7 +204,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("world_size") = 1, py::arg("pp_rank") = 0,
            py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
            py::arg("enable_page_prealloc") = true,
-           py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0)
+           py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
+           py::arg("ipc_name") = "")
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
       .def("stop_prealloc_thread",
@@ -212,6 +224,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("check_and_get_resize_target",
+           &kvcached::page_allocator_check_and_get_resize_target)
+      .def("get_resize_target", &kvcached::page_allocator_get_resize_target)
       .def("get_page_id", &kvcached::page_allocator_get_page_id)
       .def("group_indices_by_page",
            &kvcached::page_allocator_group_indices_by_page)

@@ -19,7 +19,13 @@ GPU Memory (per model)
 └─────────────────────────────────────┘
 ```
 
-The **memory bound** (`KVCACHED_MAX_CACHED_TOKENS`, default `16000`; `0` means unlimited) caps how many tokens of cached prefixes a model may keep. When the cache exceeds this bound, older prefixes are evicted. This prevents prefix caching from consuming all free memory, which would undermine the elastic sharing between co-located models that kvcached is designed for.
+The **memory bound** (`KVCACHED_MAX_CACHED_TOKENS`, default `16000`) caps how many tokens of cached prefixes a model may keep. When the cache exceeds this bound, older prefixes are evicted. This prevents prefix caching from consuming all free memory, which would undermine the elastic sharing between co-located models that kvcached is designed for.
+
+Sentinel values:
+
+- `KVCACHED_MAX_CACHED_TOKENS=-1` — **unlimited**: closest to vanilla vLLM/SGLang prefix-cache behavior, at the cost of memory elasticity.
+- `KVCACHED_MAX_CACHED_TOKENS=0` — **disabled at the kvcached layer**: the framework's prefix-cache module still runs, but every cached prefix is evicted as soon as it becomes evictable, so there is no cross-request reuse. To fully turn off prefix caching (skip the caching path entirely), use the framework flags below instead.
+- `KVCACHED_MAX_CACHED_TOKENS=N` (`N>0`) — cap cached prefixes at `N` tokens.
 
 ## Usage
 
@@ -28,7 +34,7 @@ Prefix caching is enabled by default when kvcached is active. No additional flag
 To control the cached token budget:
 
 ```bash
-export KVCACHED_MAX_CACHED_TOKENS=16000   # default; set to 0 for unlimited
+export KVCACHED_MAX_CACHED_TOKENS=16000   # default; -1 = unlimited, 0 = disabled
 ```
 
 To disable prefix caching:

@@ -18,7 +18,13 @@ from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
-from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    DEFAULT_IPC_NAME,
+    PAGE_SIZE,
+    SANITY_CHECK,
+    get_kvcached_logger,
+)
 from kvcached.vmm_ops import kv_tensors_created
 
 try:
@@ -98,10 +104,11 @@ class KVCacheManager:
             self.world_size,
             pp_rank=self.pp_rank,
             async_sched=async_sched,
-            contiguous_layout=True,
+            contiguous_layout=CONTIGUOUS_LAYOUT,
             enable_page_prealloc=True,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
+            ipc_name=DEFAULT_IPC_NAME,
         )
         # Register should_use_worker_ipc callback so C++ PageAllocator
         # knows when to use broadcast IPC even with world_size == 1
@@ -227,11 +234,9 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        # todo: check if we need to resize
-        #new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-        #    self.mem_size, self.num_layers, self.num_kv_buffers)
-        #if new_mem_size is not None:
-        #    self.resize(new_mem_size)
+        new_mem_size = self.page_allocator.get_resize_target()
+        if new_mem_size > 0:
+            self.resize(new_mem_size)
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
