@@ -1,4 +1,4 @@
-# DGX Spark Demo: Enterprise Workstation, Multiple Users
+# DGX Spark Demo
 
 ## Overview
 
@@ -138,7 +138,7 @@ conda activate kvcached
 ## File Inventory
 
 ```
-demo/dgx-spark/
+benchmarks/bench_dgx_spark
 ├── README.md                 # this file
 ├── config.sh                 # shared configuration (models, ports, tuning knobs)
 ├── launch_main.sh            # start main LLM (--mode kvcached|baseline)
