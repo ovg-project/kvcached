@@ -1158,23 +1158,27 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             kernel_block_sizes = getattr(self, "_kernel_block_sizes", None)
             has_kernel_block_size_source = kernel_block_sizes is not None
             if kernel_block_sizes is None:
-                prepare_kernel_block_sizes = getattr(
+                prepare_kernel_block_sizes_method = getattr(
                     self, "_prepare_kernel_block_sizes", None
                 )
-                if prepare_kernel_block_sizes is not None:
+                if prepare_kernel_block_sizes_method is not None:
                     has_kernel_block_size_source = True
-                    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config)
+                    kernel_block_sizes = prepare_kernel_block_sizes_method(
+                        kv_cache_config
+                    )
 
             if kernel_block_sizes is None:
                 try:
-                    from vllm.v1.worker.utils import prepare_kernel_block_sizes
+                    from vllm.v1.worker.utils import (
+                        prepare_kernel_block_sizes as prepare_kernel_block_sizes_fn,
+                    )
                 except ImportError:
                     pass
                 else:
                     attn_groups = getattr(self, "attn_groups", None)
                     if attn_groups is not None:
                         has_kernel_block_size_source = True
-                        kernel_block_sizes = prepare_kernel_block_sizes(
+                        kernel_block_sizes = prepare_kernel_block_sizes_fn(
                             kv_cache_config, attn_groups
                         )
 
