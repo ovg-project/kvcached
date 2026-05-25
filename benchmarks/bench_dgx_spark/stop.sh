@@ -3,6 +3,8 @@
 set -euo pipefail
 
 echo "stopping vllm serve processes..."
+MAIN_IPC_NAME="${KVCACHED_MAIN_IPC_NAME:-kvcached_main}"
+GUARD_IPC_NAME="${KVCACHED_GUARD_IPC_NAME:-kvcached_guard}"
 mapfile -t PIDS < <(pgrep -f "[v]llm serve" || true)
 if [[ "${#PIDS[@]}" -gt 0 ]]; then
   for pid in "${PIDS[@]}"; do
@@ -28,5 +30,5 @@ else
   echo "no vllm serve processes found"
 fi
 
-rm -rf /tmp/kvcached-tp-kvcached_main-* /tmp/kvcached-tp-kvcached_guard-* 2>/dev/null || true
-rm -f /dev/shm/kvcached_main /dev/shm/kvcached_guard 2>/dev/null || true
+rm -rf "/tmp/kvcached-tp-${MAIN_IPC_NAME}-"* "/tmp/kvcached-tp-${GUARD_IPC_NAME}-"* 2>/dev/null || true
+rm -f "/dev/shm/${MAIN_IPC_NAME}" "/dev/shm/${GUARD_IPC_NAME}" 2>/dev/null || true

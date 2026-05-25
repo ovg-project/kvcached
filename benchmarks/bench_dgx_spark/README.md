@@ -11,9 +11,9 @@ pipeline that a real deployment would use:
 User request  -->  Guardrail (input check)  -->  LLM  -->  Guardrail (output check)  -->  Response
 ```
 
-**Key message:** Under the same memory constraint, kvcached serves concurrent
-requests at lower tail latency than a baseline that must statically partition
-GPU memory between the two models.
+**Key message:** Under the same memory constraint, kvcached lowers TTFT tail
+latency across the tested concurrency sweep while supporting a much larger
+context window than the static-memory-split baseline.
 
 ## Hardware
 
@@ -83,8 +83,8 @@ the KV-cache budget available to each.
 | Dataset used for reported results | Synthetic random prompts (`DATASET_NAME=random`) |
 | Input length | `random-input-len=256` word target (~400 prompt tokens with the current tokenizers) |
 | Main output cap | 2,048 tokens |
-| Concurrency levels | 4, 8, 16, 32 |
-| Prompts per level in reported results | 16, 16, 32, 64 |
+| Concurrency levels | 1, 2, 4, 8, 16 |
+| Prompts per level in reported results | 16, 16, 16, 16, 32 |
 | Timeout per level | 1,800 s |
 
 The checked-in result files under `results/` were produced with synthetic
@@ -103,14 +103,16 @@ results are regenerated and the prompt token distribution is recorded.
 
 | Mode | Concurrency | Completed | Mean TTFT (ms) | P99 TTFT (ms) | Mean E2E (ms) | P99 E2E (ms) |
 |------|:-----------:|:---------:|:--------------:|:-------------:|:-------------:|:------------:|
-| kvcached | 4 | 16 | 2,331 | 5,461 | 9,538 | 12,578 |
-| kvcached | 8 | 16 | 2,303 | 2,623 | 11,994 | 12,453 |
-| kvcached | 16 | 32 | 4,082 | 5,205 | 18,470 | 19,931 |
-| kvcached | 32 | 64 | 6,799 | 9,570 | 29,143 | 32,856 |
-| baseline | 4 | 16 | 3,020 | **7,791** | 10,246 | **14,607** |
-| baseline | 8 | 16 | 2,741 | 2,965 | 12,544 | 12,742 |
-| baseline | 16 | 32 | 4,614 | **8,626** | 20,377 | **22,803** |
-| baseline | 32 | 64 | 6,353 | 9,343 | 29,087 | 33,274 |
+| kvcached | 1 | 16 | 817 | 2,953 | 10,349 | 18,311 |
+| kvcached | 2 | 16 | 1,157 | 1,465 | 14,102 | 25,317 |
+| kvcached | 4 | 16 | 1,211 | 1,374 | 20,260 | 41,128 |
+| kvcached | 8 | 16 | 1,789 | 2,339 | 28,363 | 60,923 |
+| kvcached | 16 | 32 | 2,581 | 4,524 | 47,163 | 96,843 |
+| baseline | 1 | 16 | 904 | 4,029 | 10,503 | 18,301 |
+| baseline | 2 | 16 | 1,278 | 2,064 | 14,614 | 25,763 |
+| baseline | 4 | 16 | 1,219 | 1,445 | 19,957 | 34,770 |
+| baseline | 8 | 16 | 2,010 | 3,076 | 30,441 | 63,146 |
+| baseline | 16 | 32 | 2,757 | 4,687 | 45,526 | 89,155 |
 
 ### Figures
 
@@ -120,11 +122,13 @@ results are regenerated and the prompt token distribution is recorded.
 
 ### Key Observations
 
-- **P99 TTFT** is consistently lower with kvcached, most notably at C=4
-  (5.5 s vs 7.8 s, **30% reduction**) and C=16 (5.2 s vs 8.6 s, **40% reduction**).
-- **P99 E2E latency** shows the same pattern: kvcached reduces tail latency by
-  14-16% at C=4 and C=16.
-- Both modes complete all requests without failures through C=32, but kvcached
+- **P99 TTFT** is lower with kvcached at every tested concurrency.  The largest
+  reductions are at C=1 (4.0 s -> 3.0 s, **27%**), C=2 (2.1 s -> 1.5 s,
+  **29%**), and C=8 (3.1 s -> 2.3 s, **24%**).
+- **P99 E2E latency** is mixed because the 2,048-token output cap makes decode
+  time dominate total workflow latency.  kvcached is roughly tied at C=1,
+  lower at C=2 and C=8, and higher at C=4 and C=16 in this run.
+- Both modes complete all requests without failures through C=16, but kvcached
   achieves this with a much larger context window (65K vs 8K) thanks to dynamic
   memory sharing.
 
@@ -135,9 +139,13 @@ conda activate kvcached
 
 # Reproduce the reported synthetic-prompt sweep.
 export DATASET_NAME=random
-export CONCURRENCIES="4 8 16 32"
+export CONCURRENCIES="1 2 4 8 16"
 export MIN_NUM_PROMPTS=16
 export NUM_PROMPTS_MULTIPLIER=2
+
+# Optional on shared machines with stale kvcached IPC files.
+export KVCACHED_MAIN_IPC_NAME="kvcached_main_${USER}"
+export KVCACHED_GUARD_IPC_NAME="kvcached_guard_${USER}"
 
 # Run kvcached benchmark (launch both models + sweep).
 ./run_benchmark.sh kvcached

@@ -29,7 +29,8 @@ if ! command -v vllm >/dev/null 2>&1; then
 fi
 
 if [[ "$MODE" == "kvcached" ]]; then
-  export ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1 KVCACHED_IPC_NAME=kvcached_main
+  export ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1
+  export KVCACHED_IPC_NAME="${KVCACHED_MAIN_IPC_NAME:-kvcached_main}"
   export KVCACHED_CONTIGUOUS_LAYOUT=false
   export KVCACHED_PAGE_PREALLOC_ENABLED="${KVCACHED_PAGE_PREALLOC_ENABLED:-false}"
   export KVCACHED_PAGE_SIZE_MB
