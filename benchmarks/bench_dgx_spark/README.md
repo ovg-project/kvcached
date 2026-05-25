@@ -80,10 +80,22 @@ the KV-cache budget available to each.
 | Parameter | Value |
 |-----------|-------|
 | Harness | `workflow_benchmark.py` (Guard -> LLM -> Guard pipeline) |
-| Dataset | Random (input 256 tokens, main output 2,048 tokens) |
+| Dataset used for reported results | Synthetic random prompts (`DATASET_NAME=random`) |
+| Input length | `random-input-len=256` word target (~400 prompt tokens with the current tokenizers) |
+| Main output cap | 2,048 tokens |
 | Concurrency levels | 4, 8, 16, 32 |
-| Prompts per level | max(32, concurrency x 2) |
+| Prompts per level in reported results | 16, 16, 32, 64 |
 | Timeout per level | 1,800 s |
+
+The checked-in result files under `results/` were produced with synthetic
+random prompts, not ShareGPT.  The random prompt generator repeats a fixed
+enterprise-workflow instruction around a sampled topic; `random-input-len=256`
+is a word-count target rather than a tokenizer-level sequence-length filter.
+
+The scripts also support ShareGPT by setting `DATASET_NAME=sharegpt`.  ShareGPT
+prompts are filtered by character length (`16 <= prompt chars <= 12000`), so
+ShareGPT runs are not directly comparable to the reported table unless the
+results are regenerated and the prompt token distribution is recorded.
 
 ## Results
 
@@ -121,10 +133,16 @@ the KV-cache budget available to each.
 ```bash
 conda activate kvcached
 
-# Run kvcached benchmark (launch both models + sweep)
+# Reproduce the reported synthetic-prompt sweep.
+export DATASET_NAME=random
+export CONCURRENCIES="4 8 16 32"
+export MIN_NUM_PROMPTS=16
+export NUM_PROMPTS_MULTIPLIER=2
+
+# Run kvcached benchmark (launch both models + sweep).
 ./run_benchmark.sh kvcached
 
-# Run baseline benchmark
+# Run baseline benchmark.
 ./run_benchmark.sh baseline
 
 # Or step-by-step:
