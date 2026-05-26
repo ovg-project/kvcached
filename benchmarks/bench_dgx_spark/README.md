@@ -19,11 +19,11 @@
 
 ## Models
 
-| Role | Model | Params | Weights (BF16) |
-|------|-------|--------|----------------|
-| Main LLM, Experiment 1 | `Qwen/Qwen3.6-35B-A3B` | 35B total / 3B active (MoE) | ~67 GB |
-| Main LLM, Experiment 2 | `Qwen/Qwen3-30B-A3B` | 30B total / 3B active (MoE) | ~57 GB |
-| Guardrail | `meta-llama/Llama-Guard-3-8B` | 8B | ~15 GB |
+| Role | Model | Params | Weights (BF16) | KV/token |
+|------|-------|--------|----------------|----------|
+| Main LLM, Experiment 1 | `Qwen/Qwen3.6-35B-A3B` | 35B total / 3B active (MoE) | ~67 GB | 20 KiB |
+| Main LLM, Experiment 2 | `Qwen/Qwen3-30B-A3B` | 30B total / 3B active (MoE) | ~57 GB | 96 KiB |
+| Guardrail | `meta-llama/Llama-Guard-3-8B` | 8B | ~15 GB | 128 KiB |
 
 ## Results
 
@@ -56,21 +56,6 @@ Configuration:
 |------|-------------------------------|--------------------------------|
 | kvcached | 0.75 | 0.30 |
 | baseline | 0.59 | 0.15 |
-
-Short reproduce command from `benchmarks/bench_dgx_spark/`:
-
-```bash
-RESULTS_DIR="$PWD/results_gain_12k_c8_tuned" \
-LOG_DIR="$PWD/logs_gain_12k_c8_tuned" \
-DATASET_NAME=random CONCURRENCIES="1 2 4 8" \
-MIN_NUM_PROMPTS=64 NUM_PROMPTS_MULTIPLIER=8 \
-BENCH_INPUT_LEN=8192 BENCH_OUTPUT_LEN=10 BENCH_TIMEOUT_SECONDS=2400 \
-MAIN_MAX_MODEL_LEN=16384 GUARD_MAX_MODEL_LEN=16384 \
-BASELINE_MAIN_MAX_MODEL_LEN=16384 BASELINE_GUARD_MAX_MODEL_LEN=16384 \
-KVCACHED_MAIN_GPU_UTIL=0.75 KVCACHED_GUARD_GPU_UTIL=0.30 \
-BASELINE_MAIN_GPU_UTIL=0.59 BASELINE_GUARD_GPU_UTIL=0.15 \
-./run_benchmark.sh both
-```
 
 Observed KV capacity at startup:
 
@@ -131,15 +116,6 @@ Memory split:
 |------|-------------------------------|--------------------------------|
 | kvcached | 0.70 | 0.25 |
 | baseline | 0.65 | 0.16 |
-
-Short reproduce command from `benchmarks/bench_dgx_spark/`:
-
-```bash
-DATASET_NAME=random CONCURRENCIES="1 2 4 8 16" \
-MIN_NUM_PROMPTS=16 NUM_PROMPTS_MULTIPLIER=2 \
-BENCH_INPUT_LEN=256 BENCH_OUTPUT_LEN=2048 \
-./run_benchmark.sh both
-```
 
 #### Summary Table
 
