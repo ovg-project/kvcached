@@ -136,12 +136,14 @@ small-sample tail variance rather than a stable latency trend.
 ### Gain Analysis
 
 The table below uses the largest reported workload:
-`C=16`, `input prompt=400`, and `output=2k`
+`C=16`, `input prompt=400`, and `output=2k`.
+For kvcached, the denominator is the configured virtual/on-demand KV cap, not
+memory physically allocated at startup.
 
 | Model | KV per token | kvcached: actual / theoretical allocation | baseline: actual / theoretical allocation |
 |-------|--------------|---------------------------|----------------------------|
-| Qwen/Qwen3.6-35B-A3B main<br>weights: 65.53 GiB | 20 KiB/token<br>`2 KV heads * 256 dim * K/V * BF16 * 10 full-attn layers` | ~0.75 GiB / shared on-demand KV<br>`max-model-len=65,536` | ~0.75 GiB / 10.95 GiB fixed KV budget<br>`max-model-len=8,192` |
-| Llama-Guard-3-8B guard<br>weights: 14.99 GiB | 128 KiB/token<br>`8 KV heads * 128 dim * K/V * BF16 * 32 layers` | <=4.1 GiB / shared on-demand KV<br>`max-model-len=8,192` | <=4.1 GiB / 7.33 GiB fixed KV budget<br>`max-model-len=8,192` |
+| Qwen/Qwen3.6-35B-A3B main<br>weights: 65.53 GiB | 20 KiB/token<br>`2 KV heads * 256 dim * K/V * BF16 * 10 full-attn layers` | ~0.75 GiB / ~16.6 GiB virtual KV cap<br>`gpu-memory-utilization=0.70` | ~0.75 GiB / 10.95 GiB fixed KV budget<br>`gpu-memory-utilization=0.65` |
+| Llama-Guard-3-8B guard<br>weights: 14.99 GiB | 128 KiB/token<br>`8 KV heads * 128 dim * K/V * BF16 * 32 layers` | <=4.1 GiB / ~18.3 GiB virtual KV cap<br>`gpu-memory-utilization=0.25` | <=4.1 GiB / 7.33 GiB fixed KV budget<br>`gpu-memory-utilization=0.16` |
 
 So the current measured run does **not** fill the baseline KV cache; the
 observed TTFT gain should be treated mainly as runtime noise rather than a
