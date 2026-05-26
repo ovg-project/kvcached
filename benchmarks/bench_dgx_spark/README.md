@@ -120,6 +120,19 @@ results are regenerated and the prompt token distribution is recorded.
 |:---:|:---:|
 | ![TTFT](results/ttft_vs_concurrency.png) | ![E2E](results/e2e_vs_concurrency.png) |
 
+Labels on the kvcached mean and P99 points show the percentage delta relative
+to the matching baseline point at the same concurrency; negative values mean
+lower latency with kvcached.
+
+#### 64-prompt TTFT check
+
+![TTFT comparison with 16 and 64 prompts](results_np64/ttft_np16_vs_np64.png)
+
+This check reruns C=1, 2, and 4 with 64 prompts per level.  The higher-sample
+run removes the apparent low-concurrency P99 TTFT dip seen in the 16-prompt
+run, which indicates that the earlier C=1 to C=4 tail shape was dominated by
+small-sample tail variance rather than a stable latency trend.
+
 ### Key Observations
 
 - **P99 TTFT** is lower with kvcached at every tested concurrency.  The largest
@@ -174,10 +187,13 @@ benchmarks/bench_dgx_spark
 ├── plot_results.py           # generate comparison plots from results/
 ├── run_benchmark.sh          # end-to-end: launch + bench + stop
 ├── stop.sh                   # kill all vllm serve processes
-└── results/
-    ├── kvcached/             # per-concurrency JSON results
-    ├── baseline/             # per-concurrency JSON results
-    ├── summary.csv           # combined metrics table
-    ├── ttft_vs_concurrency.png
-    └── e2e_vs_concurrency.png
+├── results/
+│   ├── kvcached/             # per-concurrency JSON results
+│   ├── baseline/             # per-concurrency JSON results
+│   ├── summary.csv           # combined metrics table
+│   ├── ttft_vs_concurrency.png
+│   └── e2e_vs_concurrency.png
+└── results_np64/
+    ├── summary.csv           # 64-prompt C=1/2/4 check
+    └── ttft_np16_vs_np64.png # TTFT comparison for 16 vs 64 prompts
 ```

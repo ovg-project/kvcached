@@ -51,13 +51,53 @@ def _valid(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _annotate_delta(
+    phase_rows: dict[str, list[dict[str, Any]]],
+    metric: str,
+    stat: str,
+    yoffset: int,
+) -> None:
+    """Annotate kvcached percentage delta relative to baseline."""
+    if "kvcached" not in phase_rows or "baseline" not in phase_rows:
+        return
+
+    value_key = f"{stat}_{metric}_ms"
+    baseline_by_c = {
+        int(row["concurrency"]): float(row[value_key])
+        for row in phase_rows["baseline"]
+        if value_key in row and float(row[value_key]) > 0
+    }
+    kvcached_by_c = {
+        int(row["concurrency"]): float(row[value_key])
+        for row in phase_rows["kvcached"]
+        if value_key in row
+    }
+
+    for concurrency in sorted(set(baseline_by_c) & set(kvcached_by_c)):
+        baseline = baseline_by_c[concurrency]
+        kvcached = kvcached_by_c[concurrency]
+        delta = (kvcached - baseline) / baseline * 100.0
+        color = "#188038" if delta <= 0 else "#b3261e"
+        plt.annotate(
+            f"{delta:+.0f}%",
+            xy=(concurrency, kvcached),
+            xytext=(0, yoffset),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+            color=color,
+        )
+
+
 def _plot_metric(results_dir: Path, phases: list[str], metric: str, ylabel: str, output: Path) -> None:
     plt.figure(figsize=(8, 5))
     plotted = False
+    phase_rows: dict[str, list[dict[str, Any]]] = {}
     for phase in phases:
         rows = _valid(_load_phase(results_dir, phase))
         if not rows:
             continue
+        phase_rows[phase] = rows
         xs = [row["concurrency"] for row in rows]
         mean_key = f"mean_{metric}_ms"
         p99_key = f"p99_{metric}_ms"
@@ -70,6 +110,8 @@ def _plot_metric(results_dir: Path, phases: list[str], metric: str, ylabel: str,
     if not plotted:
         raise SystemExit(f"no valid rows found for {metric}")
 
+    _annotate_delta(phase_rows, metric, "mean", -14)
+    _annotate_delta(phase_rows, metric, "p99", 10)
     plt.xlabel("Concurrent workflow requests")
     plt.ylabel(ylabel)
     plt.grid(True, alpha=0.3)
