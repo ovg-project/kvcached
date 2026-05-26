@@ -133,6 +133,55 @@ run removes the apparent low-concurrency P99 TTFT dip seen in the 16-prompt
 run, which indicates that the earlier C=1 to C=4 tail shape was dominated by
 small-sample tail variance rather than a stable latency trend.
 
+### Gain Analysis
+
+The reported workload is not a KV-cache-capacity saturation test.  The random
+prompts are short, and the main model generates up to 2,048 tokens.  For
+Qwen3.6-35B-A3B, only 10 of the 40 layers use full attention, and each
+full-attention token needs about 20 KiB of KV cache:
+
+```
+2 KV heads * 256 head dim * 2 (K,V) * 2 bytes * 10 layers = 20 KiB/token
+```
+
+At C=16, a rough upper bound for the main model is therefore around
+`16 * (400 + 2048) * 20 KiB ~= 0.75 GiB` of sequence-dependent full-attention
+KV cache.  The baseline main model log for this run reported 10.95 GiB of
+available KV-cache memory and a maximum concurrency of 49.36x for 8,192 tokens
+per request.  Even accounting for hybrid linear-attention state and vLLM cache
+group overheads, this workload is well below the baseline main KV-cache
+capacity.
+
+The observed TTFT improvement should therefore not be interpreted as "baseline
+ran out of KV cache."  It is a co-location result under different memory
+management policies: the baseline must use a conservative static split
+(`0.65` main, `0.16` guard), while kvcached can run with larger declared
+budgets (`0.70` main, `0.25` guard) because KV pages are backed on demand.
+This can change vLLM's profiled cache layout, allocator headroom, temporary
+buffer pressure, and multi-process tail behavior.  Low-concurrency P99 numbers
+are also sensitive to outliers; with 16 prompts, P99 is effectively the slowest
+request.
+
+In an ideal no-jitter, warmed-up, below-capacity setting with identical prompt
+tokens, output tokens, kernels, and no allocator pressure, kvcached should not
+produce a large latency gain purely from memory management.  The model still
+performs the same prefill and decode computation.  A control experiment for
+that case should use many prompts, discard warmup requests, save per-request
+breakdowns, and compare input-guard latency, main TTFT, and output-guard
+latency separately.  It is also useful to repeat the run with both modes capped
+at the same 8K context to isolate latency from long-context capability.
+
+The strongest kvcached gain is expected when static partitioning wastes memory:
+one model needs more live KV cache than its fixed baseline slice can provide,
+while another co-located model has idle or low KV-cache usage.  In that regime,
+the baseline must queue, fail, reduce max context, or use a lower-concurrency
+configuration, whereas kvcached can back the active model's KV pages from the
+shared pool.  A targeted experiment should use long prompts and short outputs,
+for example near-8K, 16K, or 32K inputs with 32-64 output tokens, then sweep
+concurrency until the static split reaches its KV-cache boundary.  The primary
+metrics should be maximum successful concurrency, failures or queueing, and
+P99 TTFT/E2E latency near that boundary.
+
 ### Key Observations
 
 - **P99 TTFT** is lower with kvcached at every tested concurrency.  The largest
