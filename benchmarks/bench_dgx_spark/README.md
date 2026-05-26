@@ -31,6 +31,62 @@
 |------------|------------|----------|------------|----------------|-------------|
 | Experiment 1 | `results/` | Guard -> Main -> Guard | `Qwen/Qwen3.6-35B-A3B` | ~400 prompt tokens / 2,048 output tokens | 1, 2, 4, 8, 16 |
 | Experiment 2 | `results_gain_12k_c8_tuned/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 1, 2, 4, 8 |
+| Experiment 3 | `results_gain_12k_c16_sweep/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
+| Experiment 4 | `results_gain_12k_c16_guard031_boundary/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
+
+### Experiment 3: Qwen3-30B-A3B C=16 Baseline Split Sweep
+
+```
+User request  -->  Guardrail (input check)  -->  LLM  -->  Response
+```
+
+| Parameter | Value |
+|-----------|-------|
+| Main model | `Qwen/Qwen3-30B-A3B` |
+| Guard model | `meta-llama/Llama-Guard-3-8B` |
+| Dataset | Synthetic random prompts (`DATASET_NAME=random`) |
+| `BENCH_INPUT_LEN` | 8,192 word target, about 11.6K tokens with the Qwen3-30B tokenizer |
+| Main output cap | 10 tokens |
+| `max-model-len` | 16,384 for both models and both modes |
+| Concurrency level | 16 |
+| Prompts | 128 |
+| Baseline util sum | 0.81 |
+
+Common kvcached reference:
+
+| Mode | Main util | Guard util | Completed | Failed | Mean TTFT (s) | P99 TTFT (s) | Mean E2E (s) | P99 E2E (s) |
+|------|----------:|-----------:|----------:|-------:|--------------:|-------------:|-------------:|------------:|
+| kvcached | 0.75 | 0.30 | 128 | 0 | 85.61 | 99.35 | 94.39 | 108.34 |
+
+Baseline sweep:
+
+| Main util | Guard util | Main 16K capacity | Guard 16K capacity | Outcome | Mean TTFT (s) | TTFT speedup | Mean E2E (s) | E2E speedup |
+|----------:|-----------:|------------------:|-------------------:|---------|--------------:|-------------:|-------------:|------------:|
+| 0.50 | 0.31 | 2.26x | - | guard startup CUDA OOM | - | - | - | - |
+| 0.53 | 0.28 | 4.58x | - | guard startup CUDA OOM | - | - | - | - |
+| 0.55 | 0.26 | 5.25x | - | guard startup CUDA OOM | - | - | - | - |
+| 0.57 | 0.24 | 7.18x | 6.66x | completed | 89.54 | 1.05x | 93.79 | 0.99x |
+| 0.60 | 0.21 | 10.35x | - | guard startup CUDA OOM | - | - | - | - |
+
+The best completed baseline split in this sweep is `main=0.57, guard=0.24`.
+It gives `1.05x` mean TTFT speedup for kvcached vs. baseline at C=16.
+
+### Experiment 4: Qwen3-30B-A3B C=16 Guard-First Boundary
+
+Same workload and kvcached reference as Experiment 3.  Baseline launches the
+guard model first, fixes `guard=0.31`, and sweeps runnable main util values.
+Speedup is `baseline / kvcached`; values above 1.0 mean kvcached is faster.
+
+| Main util | Guard util | Completed | Failed | Main 16K capacity | Guard 16K capacity | Mean TTFT (s) | TTFT speedup | Mean E2E (s) | E2E speedup |
+|----------:|-----------:|----------:|-------:|------------------:|-------------------:|--------------:|-------------:|-------------:|------------:|
+| 0.47 | 0.31 | 128 | 0 | 1.44x | 10.68x | 88.52 | 1.034x | 93.57 | 0.991x |
+| 0.48 | 0.31 | 128 | 0 | 1.95x | 10.66x | 88.23 | 1.031x | 93.47 | 0.990x |
+| 0.50 | 0.31 | 128 | 0 | 3.72x | 10.65x | 87.89 | 1.027x | 92.92 | 0.984x |
+
+The lower tested boundary is between `main=0.46` and `main=0.47`: `0.45` and
+`0.46` load the main model but fail vLLM's 16K KV-capacity check.  Under the
+fixed util sum of `0.81`, `main=0.50, guard=0.31` is the highest tested split
+and completed on rerun.
 
 ### Experiment 2: Qwen3-30B-A3B 12K Guard -> Main
 
@@ -164,10 +220,18 @@ benchmarks/bench_dgx_spark
 ├── results_np64/
 │   ├── summary.csv           # 64-prompt C=1/2/4 check
 │   └── ttft_np16_vs_np64.png # TTFT comparison for 16 vs 64 prompts
-└── results_gain_12k_c8_tuned/
-    ├── summary.csv           # Qwen3-30B-A3B 12K guard->main run
-    ├── kvcached/             # C=1/2/4/8 JSON results
-    ├── baseline/             # C=1/2/4/8 JSON results
-    ├── ttft_vs_concurrency.png
-    └── e2e_vs_concurrency.png
+├── results_gain_12k_c8_tuned/
+│   ├── summary.csv           # Qwen3-30B-A3B 12K guard->main run
+│   ├── kvcached/             # C=1/2/4/8 JSON results
+│   ├── baseline/             # C=1/2/4/8 JSON results
+│   ├── ttft_vs_concurrency.png
+│   └── e2e_vs_concurrency.png
+└── results_gain_12k_c16_sweep/
+    ├── summary_c16_sweep.csv # baseline split sweep summary
+    ├── kvcached/             # C=16 reference JSON result
+    ├── m050_g031/            # failed baseline split: guard startup OOM
+    ├── m053_g028/            # failed baseline split: guard startup OOM
+    ├── m055_g026/            # failed baseline split: guard startup OOM
+    ├── m057_g024/            # completed baseline split result
+    └── m060_g021/            # failed baseline split: guard startup OOM
 ```

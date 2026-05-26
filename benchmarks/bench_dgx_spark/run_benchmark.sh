@@ -5,6 +5,7 @@
 #   ./run_benchmark.sh                  # run kvcached mode
 #   ./run_benchmark.sh baseline         # run baseline mode
 #   ./run_benchmark.sh baseline 0.65    # baseline with custom gpu-util for main
+#   BASELINE_LAUNCH_ORDER=guard-first ./run_benchmark.sh baseline
 #   ./run_benchmark.sh both             # run kvcached, then baseline, then plot
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +13,7 @@ source "$SCRIPT_DIR/config.sh"
 
 MODE=${1:-kvcached}
 GPU_UTIL=${2:-$BASELINE_MAIN_GPU_UTIL}
+BASELINE_LAUNCH_ORDER="${BASELINE_LAUNCH_ORDER:-main-first}"
 
 cleanup() {
   if [[ "${KEEP_SERVERS:-0}" != "1" ]]; then
@@ -33,8 +35,16 @@ run_one() {
     "$SCRIPT_DIR/launch_guard.sh" --mode kvcached
     "$SCRIPT_DIR/launch_main.sh" --mode kvcached
   elif [[ "$mode" == "baseline" ]]; then
-    "$SCRIPT_DIR/launch_main.sh" --mode baseline --gpu-util "$gpu_util"
-    "$SCRIPT_DIR/launch_guard.sh" --mode baseline --gpu-util "$BASELINE_GUARD_GPU_UTIL"
+    if [[ "$BASELINE_LAUNCH_ORDER" == "guard-first" ]]; then
+      "$SCRIPT_DIR/launch_guard.sh" --mode baseline --gpu-util "$BASELINE_GUARD_GPU_UTIL"
+      "$SCRIPT_DIR/launch_main.sh" --mode baseline --gpu-util "$gpu_util"
+    elif [[ "$BASELINE_LAUNCH_ORDER" == "main-first" ]]; then
+      "$SCRIPT_DIR/launch_main.sh" --mode baseline --gpu-util "$gpu_util"
+      "$SCRIPT_DIR/launch_guard.sh" --mode baseline --gpu-util "$BASELINE_GUARD_GPU_UTIL"
+    else
+      echo "invalid BASELINE_LAUNCH_ORDER=$BASELINE_LAUNCH_ORDER (use main-first or guard-first)" >&2
+      exit 1
+    fi
   else
     echo "invalid mode: $mode (use kvcached, baseline, or both)" >&2
     exit 1
