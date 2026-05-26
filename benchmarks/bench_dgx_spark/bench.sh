@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run a concurrency sweep for Guardrail -> LLM -> Guardrail.
+# Run a concurrency sweep for Guardrail -> LLM.
 #
 # Usage:
 #   ./bench.sh                # results saved to results/kvcached/

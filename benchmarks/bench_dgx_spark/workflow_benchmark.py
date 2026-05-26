@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load generator for the DGX Spark Guardrail -> LLM -> Guardrail workflow."""
+"""Load generator for the DGX Spark Guardrail -> LLM workflow."""
 
 from __future__ import annotations
 
@@ -250,15 +250,6 @@ async def _run_one(
                 args.request_timeout,
             )
             first_token_at = main_start + main_ttft_s
-            _, output_guard_s = await _post_chat(
-                session,
-                args.guard_base_url,
-                args.guard_model,
-                [{"role": "user", "content": output[: args.output_guard_max_chars]}],
-                args.guard_max_tokens,
-                False,
-                args.request_timeout,
-            )
             end = time.perf_counter()
             return {
                 "index": idx,
@@ -269,7 +260,7 @@ async def _run_one(
                 "e2e_ms": (end - start) * 1000,
                 "input_guard_ms": input_guard_s * 1000,
                 "main_e2e_ms": main_e2e_s * 1000,
-                "output_guard_ms": output_guard_s * 1000,
+                "output_guard_ms": 0.0,
                 "output_chars": len(output),
             }
         except Exception as exc:  # noqa: BLE001 - benchmark records request-level failures
@@ -301,7 +292,7 @@ def _build_result(args: argparse.Namespace, duration_s: float, rows: list[dict[s
         "date": _now_tag(),
         "phase": args.phase,
         "backend": "openai-chat-workflow",
-        "endpoint_type": "guard-main-guard",
+        "endpoint_type": "guard-main",
         "model_id": args.main_model,
         "guard_model_id": args.guard_model,
         "dataset_name": args.dataset_name,

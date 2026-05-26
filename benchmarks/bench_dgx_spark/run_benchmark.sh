@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end benchmark: launch servers, run concurrency sweep, stop servers.
+# End-to-end benchmark: launch servers, run Guardrail -> LLM sweep, stop servers.
 #
 # Usage:
 #   ./run_benchmark.sh                  # run kvcached mode

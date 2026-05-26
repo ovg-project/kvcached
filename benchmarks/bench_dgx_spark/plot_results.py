@@ -43,7 +43,7 @@ def _valid(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         row
         for row in rows
-        if row.get("endpoint_type") == "guard-main-guard"
+        if row.get("endpoint_type") in {"guard-main", "guard-main-guard"}
         and "mean_e2e_ms" in row
         and "p99_e2e_ms" in row
         and int(row.get("completed", 0)) > 0

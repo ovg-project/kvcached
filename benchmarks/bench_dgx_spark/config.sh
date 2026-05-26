@@ -23,7 +23,7 @@ elif [[ -d "${HOME}/miniforge3/envs/${CONDA_ENV}/bin" ]]; then
   export PATH="${HOME}/miniforge3/envs/${CONDA_ENV}/bin:${PATH}"
 fi
 
-MAIN_MODEL="${MAIN_MODEL:-Qwen/Qwen3.6-35B-A3B}"
+MAIN_MODEL="${MAIN_MODEL:-Qwen/Qwen3-30B-A3B}"
 GUARD_MODEL="${GUARD_MODEL:-meta-llama/Llama-Guard-3-8B}"
 MAIN_PORT="${MAIN_PORT:-12346}"
 GUARD_PORT="${GUARD_PORT:-12347}"
