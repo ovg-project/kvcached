@@ -27,6 +27,46 @@
 
 ## Results
 
+### Rixin: Qwen3-30B-A3B Output=500 C=1-16 Sweep
+
+Source: `rixin.md`.  Same Guard -> Main workflow with ~12K input, 500 output
+tokens, and 64 prompts per concurrency level.  kvcached uses
+`main=0.75, guard=0.30`; baseline launches guard first with
+`main=0.49, guard=0.31`.
+
+Latency speedup is `baseline / kvcached`.  Throughput speedup is
+`kvcached / baseline`.
+
+| C | Mean TTFT speedup | P99 TTFT speedup | Mean E2E speedup | P99 E2E speedup | Throughput speedup |
+|--:|------------------:|-----------------:|-----------------:|----------------:|-------------------:|
+| 1 | 0.98x | 1.10x | 0.92x | 0.99x | 0.93x |
+| 2 | 0.97x | 1.03x | 1.04x | 1.27x | 1.04x |
+| 4 | 0.66x | 0.92x | 1.09x | 1.29x | 1.09x |
+| 8 | 2.05x | 1.89x | 1.24x | 1.47x | 1.27x |
+| 16 | 3.52x | 2.21x | 1.21x | 1.06x | 1.30x |
+
+| Latency vs Concurrency | Throughput vs Concurrency |
+|:---:|:---:|
+| ![Rixin latency](results_rixin_exp5_full/latency_vs_concurrency.png) | ![Rixin throughput](results_rixin_exp5_full/throughput_vs_concurrency.png) |
+
+The turning point is C=8: baseline main KV cache starts waiting, while
+kvcached continues to admit the full batch.  By C=16, mean TTFT speedup reaches
+3.52x and throughput speedup reaches 1.30x.
+
+### Rixin: Qwen3.6-35B-A3B ShareGPT C=32 Early Result
+
+Source: `rixin.md`.  This older run uses a different main model and ShareGPT
+inputs, so it is useful as a reference point rather than a direct comparison
+with the Qwen3-30B output=500 sweep.
+
+| Metric | kvcached | baseline | Speedup |
+|--------|---------:|---------:|--------:|
+| workflow TTFT mean | 3.28s | 6.80s | 2.07x |
+| workflow TTFT p99 | 5.83s | 12.50s | 2.14x |
+| E2E mean | 191.69s | 199.58s | 1.04x |
+
+![Rixin C=32 ShareGPT](results_rixin_c32_sharegpt/c32_sharegpt_summary.png)
+
 ### Experiment 5: Qwen3-30B-A3B C=8 Decode-Length Sweep
 
 Same Guard -> Main workload as Experiment 2, with `BENCH_INPUT_LEN=8192`,
