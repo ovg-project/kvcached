@@ -33,6 +33,37 @@
 | Experiment 2 | `results_gain_12k_c8_tuned/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 1, 2, 4, 8 |
 | Experiment 3 | `results_gain_12k_c16_sweep/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
 | Experiment 4 | `results_gain_12k_c16_guard031_boundary/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
+| Experiment 5 | `results_gain_12k_c8_out*_*/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 500-2,000 output tokens | 8 |
+
+### Experiment 5: Qwen3-30B-A3B C=8 Decode-Length Sweep
+
+Same Guard -> Main workload as Experiment 2, with `BENCH_INPUT_LEN=8192`,
+`NUM_PROMPTS=64`, and C=8.  The main comparison uses kvcached
+`main=0.75, guard=0.30` and baseline guard-first `main=0.49, guard=0.31`.
+Speedup is `baseline / kvcached`; values above 1.0 mean kvcached is faster.
+
+| Output cap | kvcached result | baseline result | Mean TTFT speedup | Mean E2E speedup | Baseline main waiting | Note |
+|-----------:|-----------------|-----------------|------------------:|-----------------:|-----------------------|------|
+| 500 | `results_gain_12k_c8_out500_m049_g031/` | same dir | 2.04x | 1.24x | yes, max 4 | TTFT and E2E improve |
+| 1,000 | `results_gain_12k_c8_out1k_m065_g019/` | `results_gain_12k_c8_out1k_m049_g031/` | 1.86x | 0.91x | yes, max 4 | TTFT improves; E2E slightly worse |
+| 2,000 | `results_gain_12k_c8_out2k_m049_g031/` | same dir | 2.11x | 0.51x | yes, max 4 | TTFT improves; E2E worse |
+
+Raw latency:
+
+| Output cap | kvcached mean TTFT (s) | baseline mean TTFT (s) | kvcached mean E2E (s) | baseline mean E2E (s) |
+|-----------:|-----------------------:|-----------------------:|----------------------:|----------------------:|
+| 500 | 31.84 | 64.93 | 95.14 | 118.02 |
+| 1,000 | 31.65 | 58.93 | 141.16 | 128.14 |
+| 2,000 | 31.76 | 66.86 | 239.59 | 121.54 |
+
+Baseline split checks for output=1,000:
+
+| Baseline main util | Baseline guard util | Outcome | Mean TTFT speedup | Mean E2E speedup | Main waiting |
+|-------------------:|--------------------:|---------|------------------:|-----------------:|--------------|
+| 0.65 | 0.19 | cannot launch both models | - | - | - |
+| 0.62 | 0.19 | completes, not memory-bound | 0.49x | 0.77x | no |
+| 0.50 | 0.31 | startup free-memory check failed | - | - | - |
+| 0.49 | 0.31 | completes, memory-bound | 1.86x | 0.91x | yes, max 4 |
 
 ### Experiment 3: Qwen3-30B-A3B C=16 Baseline Split Sweep
 
