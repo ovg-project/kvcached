@@ -27,14 +27,6 @@
 
 ## Results
 
-| Experiment | Result dir | Workflow | Main model | Input / output | Concurrency |
-|------------|------------|----------|------------|----------------|-------------|
-| Experiment 1 | `results/` | Guard -> Main -> Guard | `Qwen/Qwen3.6-35B-A3B` | ~400 prompt tokens / 2,048 output tokens | 1, 2, 4, 8, 16 |
-| Experiment 2 | `results_gain_12k_c8_tuned/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 1, 2, 4, 8 |
-| Experiment 3 | `results_gain_12k_c16_sweep/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
-| Experiment 4 | `results_gain_12k_c16_guard031_boundary/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 10 output tokens | 16 |
-| Experiment 5 | `results_gain_12k_c8_out*_*/` | Guard -> Main | `Qwen/Qwen3-30B-A3B` | ~11.6K prompt tokens / 500-2,000 output tokens | 8 |
-
 ### Experiment 5: Qwen3-30B-A3B C=8 Decode-Length Sweep
 
 Same Guard -> Main workload as Experiment 2, with `BENCH_INPUT_LEN=8192`,
@@ -42,19 +34,19 @@ Same Guard -> Main workload as Experiment 2, with `BENCH_INPUT_LEN=8192`,
 `main=0.75, guard=0.30` and baseline guard-first `main=0.49, guard=0.31`.
 Speedup is `baseline / kvcached`; values above 1.0 mean kvcached is faster.
 
-| Output cap | kvcached result | baseline result | Mean TTFT speedup | Mean E2E speedup | Baseline main waiting | Note |
-|-----------:|-----------------|-----------------|------------------:|-----------------:|-----------------------|------|
-| 500 | `results_gain_12k_c8_out500_m049_g031/` | same dir | 2.04x | 1.24x | yes, max 4 | TTFT and E2E improve |
-| 1,000 | `results_gain_12k_c8_out1k_m065_g019/` | `results_gain_12k_c8_out1k_m049_g031/` | 1.86x | 0.91x | yes, max 4 | TTFT improves; E2E slightly worse |
-| 2,000 | `results_gain_12k_c8_out2k_m049_g031/` | same dir | 2.11x | 0.51x | yes, max 4 | TTFT improves; E2E worse |
+| Output cap | kvcached result | baseline result | Mean TTFT speedup | P99 TTFT speedup | Mean E2E speedup | P99 E2E speedup | Baseline main waiting | Note |
+|-----------:|-----------------|-----------------|------------------:|-----------------:|-----------------:|----------------:|-----------------------|------|
+| 500 | `results_gain_12k_c8_out500_m049_g031/` | same dir | 2.04x | 1.83x | 1.24x | 1.43x | yes, max 4 | TTFT and E2E improve |
+| 1,000 | `results_gain_12k_c8_out1k_m065_g019/` | `results_gain_12k_c8_out1k_m049_g031/` | 1.86x | 1.98x | 0.91x | 1.18x | yes, max 4 | TTFT improves; E2E mixed |
+| 2,000 | `results_gain_12k_c8_out2k_m049_g031/` | same dir | 2.11x | 1.87x | 0.51x | 0.63x | yes, max 4 | TTFT improves; E2E worse |
 
 Raw latency:
 
-| Output cap | kvcached mean TTFT (s) | baseline mean TTFT (s) | kvcached mean E2E (s) | baseline mean E2E (s) |
-|-----------:|-----------------------:|-----------------------:|----------------------:|----------------------:|
-| 500 | 31.84 | 64.93 | 95.14 | 118.02 |
-| 1,000 | 31.65 | 58.93 | 141.16 | 128.14 |
-| 2,000 | 31.76 | 66.86 | 239.59 | 121.54 |
+| Output cap | kvcached mean TTFT (s) | baseline mean TTFT (s) | kvcached P99 TTFT (s) | baseline P99 TTFT (s) | kvcached mean E2E (s) | baseline mean E2E (s) | kvcached P99 E2E (s) | baseline P99 E2E (s) |
+|-----------:|-----------------------:|-----------------------:|----------------------:|----------------------:|----------------------:|----------------------:|---------------------:|---------------------:|
+| 500 | 31.84 | 64.93 | 51.46 | 94.15 | 95.14 | 118.02 | 101.84 | 146.06 |
+| 1,000 | 31.65 | 58.93 | 49.84 | 98.65 | 141.16 | 128.14 | 145.94 | 171.51 |
+| 2,000 | 31.76 | 66.86 | 52.25 | 97.56 | 239.59 | 121.54 | 245.88 | 156.09 |
 
 Baseline split checks for output=1,000:
 
