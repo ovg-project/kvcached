@@ -47,7 +47,7 @@ Latency speedup is `baseline / kvcached`.  Throughput speedup is
 
 | Latency vs Concurrency | Throughput vs Concurrency |
 |:---:|:---:|
-| ![Rixin latency](results_rixin_exp5_full/latency_vs_concurrency.png) | ![Rixin throughput](results_rixin_exp5_full/throughput_vs_concurrency.png) |
+| ![Latency](results_rixin_exp5_full/latency_vs_concurrency.png) | ![Throughput](results_rixin_exp5_full/throughput_vs_concurrency.png) |
 
 The turning point is C=8: baseline main KV cache starts waiting, while
 kvcached continues to admit the full batch.  By C=16, mean TTFT speedup reaches
@@ -65,7 +65,7 @@ with the Qwen3-30B output=500 sweep.
 | workflow TTFT p99 | 5.83s | 12.50s | 2.14x |
 | E2E mean | 191.69s | 199.58s | 1.04x |
 
-![Rixin C=32 ShareGPT](results_rixin_c32_sharegpt/c32_sharegpt_summary.png)
+![C=32 ShareGPT](results_rixin_c32_sharegpt/c32_sharegpt_summary.png)
 
 ### Experiment 5: Qwen3-30B-A3B C=8 Decode-Length Sweep
 
