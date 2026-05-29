@@ -259,7 +259,7 @@ If you find kvcached useful, please cite our paper:
 
 @article{yu2026prism,
   title={Prism: Cost-Efficient Multi-LLM Serving via GPU Memory Ballooning},
-  author={Yu, Shan and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Yang, Shuo and Tong, Xinyuan and Wang, Yang and Xie, Zhiqiang and An, Yuwei and Cao, Shiyi and others},
+  author={Yu, Shan and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Yang, Shuo and Tong, Xinyuan and Wang, Yang and Xie, Zhiqiang and An, Yuwei and Cao, Shiyi and Bao, Ke and Vij, Deepak and Ding, Xiaoning and Wang, Yichen and Lu, Qingda and Wang, Zhong and Gao, Gao and Xu, Harry and Shu, Junyi and Xing, Jiarong and Sheng, Ying},
   journal={OSDI},
   year={2026}
 }
