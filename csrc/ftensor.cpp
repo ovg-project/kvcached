@@ -62,12 +62,24 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
 }
 
 FTensor::~FTensor() {
-  mapping_.clear(); // Free all physical pages directly.
-  zero_page_.reset();
   if (vaddr_) {
-    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
-    CHECK_DRV(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
+    CUresult res = cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
+    if (res != CUDA_SUCCESS) {
+      const char *err = nullptr;
+      (void)cuGetErrorString(res, &err);
+      LOGGER(ERROR, "cuMemUnmap during FTensor cleanup failed: %s",
+             err ? err : "unknown");
+    }
+    res = cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
+    if (res != CUDA_SUCCESS) {
+      const char *err = nullptr;
+      (void)cuGetErrorString(res, &err);
+      LOGGER(ERROR, "cuMemAddressFree during FTensor cleanup failed: %s",
+             err ? err : "unknown");
+    }
   }
+  mapping_.clear(); // Free physical page handles after their mappings are gone.
+  zero_page_.reset();
 }
 
 bool FTensor::map(offset_t offset) {
@@ -75,7 +87,7 @@ bool FTensor::map(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) != mapping_.end()) {
-    LOGE("Page %ld is already mapped.", page_id);
+    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
     return false;
   }
 
@@ -93,7 +105,7 @@ bool FTensor::unmap(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) == mapping_.end()) {
-    LOGE("Page %ld is not mapped.", page_id);
+    LOGGER(ERROR, "Page %ld is not mapped.", page_id);
     return false;
   }
 

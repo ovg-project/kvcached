@@ -28,7 +28,8 @@ public:
   std::vector<torch::Tensor> create_kv_tensors(size_t size, torch::Dtype dtype,
                                                const std::string &dev_str,
                                                int64_t num_layers,
-                                               int64_t num_kv_buffers = 2);
+                                               int64_t num_kv_buffers = 2,
+                                               bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
@@ -74,6 +75,7 @@ private:
 
   int64_t num_layers_;
   bool contiguous_layout_;
+  bool unified_pool_;
   size_t kv_tensor_size_per_layer_;
 
   mutable std::mutex mtx_;

@@ -90,9 +90,10 @@ def alloc_kv_cache(
     dtype: torch.dtype,
     device: str,
     num_layers: int,
-    attention_type: str = "MHA",  # MHA, GQA, or MLA.
+    attention_type: str = "MHA",  # MHA, GQA, MLA, or HYBRID_LINEAR.
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
     group_id: int = 0,
+    kernel_block_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """Allocate KV cache tensors for all supported attention types.
 
@@ -101,18 +102,62 @@ def alloc_kv_cache(
       - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
     For MLA, kvcache_shape is expected to be:
       - (num_blocks, block_size, head_size)
+
+    ``attention_type="HYBRID_LINEAR"`` selects the layout for hybrid
+    models that mix full attention with linear attention (mamba/SSM).
+    It collapses K and V into a single FTensor per pool so VM page
+    mappings use page_size_bytes granularity (K+V combined), matching
+    the ``as_strided_`` access pattern that vLLM's
+    ``_update_hybrid_attention_mamba_layout`` applies. Callers should
+    set ``num_layers`` to the group_size in this mode.
+
+    Returns:
+        List[torch.Tensor] for MHA/GQA/MLA.
+        For HYBRID_LINEAR, returns (kv_tensors, raw_info) where
+        raw_info is a dict with:
+          buffers            - flat int8 tensors, one per pool
+          num_blocks         - number of blocks per pool
+          page_size_bytes    - uniform page size (bytes) shared by all groups
+          block_stride_bytes - byte stride between consecutive blocks of the
+                               same pool
+          num_pools          - number of pools (== num_layers)
     """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA"]:
+    if attention_type not in ["MHA", "GQA", "MLA", "HYBRID_LINEAR"]:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
     if kv_layout != "NHD":
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     is_mla = attention_type == "MLA"
+    is_hybrid_linear = attention_type == "HYBRID_LINEAR"
+    unified_pool = is_hybrid_linear
+
+    if is_hybrid_linear and _contiguous_layout:
+        raise ValueError(
+            "kvcached detected a hybrid linear-attention model "
+            "(e.g. Jamba/Bamba/NemotronH/Zamba2/Plamo2), which requires the "
+            "non-contiguous KV layout. Re-launch with "
+            "KVCACHED_CONTIGUOUS_LAYOUT=false. Also do NOT pass "
+            "--disable-hybrid-kv-cache-manager to vLLM for these models — "
+            "it only applies to attention-only hybrids like sliding-window "
+            "models (e.g. GPT-OSS).")
+
     num_k_or_v = 1 if is_mla else 2
+
+    # Kernel-block granularity. vLLM may split a virtual block (``block_size``
+    # tokens) into ``ratio`` kernel-sized blocks. The attention zero kernel
+    # assumes the per-layer tensor is strided at kernel-block granularity, so
+    # the as_strided view we hand back must match.
+    if kernel_block_size is None:
+        kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"block_size ({block_size}) must be a multiple of "
+            f"kernel_block_size ({kernel_block_size})")
+    ratio = block_size // kernel_block_size
 
     # --- Validate shape and determine layout indices ---
     if is_mla:
@@ -153,8 +198,15 @@ def alloc_kv_cache(
     # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
-    # round down to page size
-    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // PAGE_SIZE) * PAGE_SIZE
+    # Round down to 2 * PAGE_SIZE for MLA backend.
+    # The get_v_base_offset() requires the ftensor size (which equals
+    # gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) to be a multiple of
+    # 2 * PAGE_SIZE. When num_k_or_v == 1 (MLA), we must align this value
+    # to 2 * PAGE_SIZE directly. For MHA/GQA (num_k_or_v == 2), aligning
+    # to PAGE_SIZE suffices because ftensor_bytes = 2 * aligned_value is
+    # automatically 2*PAGE_SIZE-aligned.
+    alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
+    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
     if requested_num_blocks > num_blocks_per_layer:
@@ -162,20 +214,78 @@ def alloc_kv_cache(
             f"Requested {requested_num_blocks} blocks, but only {num_blocks_per_layer} blocks are available."
         )
 
+    ftensor_bytes_per_layer = gpu_mem_bytes_per_layer_k_or_v * num_k_or_v
+
     raw_kv_tensors = create_kv_tensors(
-        gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,
+        ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
         num_kv_buffers=num_k_or_v, group_id=group_id,
+        unified_pool=unified_pool,
     )
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
 
+    page_size_bytes = math.prod(
+        actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+    ) * dtype.itemsize
+
+    # Build a second shape expressed at kernel-block granularity. vLLM's zero
+    # kernel and attention kernels index the KV tensor using ``kernel_bs``-
+    # token blocks; each virtual block is ``ratio`` contiguous kernel blocks.
+    # When ratio == 1, kernel_kvcache_shape == actual_kvcache_shape.
+    kernel_kvcache_shape: List[int] = list(actual_kvcache_shape)
+    if ratio > 1:
+        kernel_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer * ratio
+        # Token dim index: for MHA it's 2, for MLA it's 1 (right after block dim).
+        token_dim_idx = 2 if not is_mla else 1
+        kernel_kvcache_shape[token_dim_idx] = kernel_block_size
+
     # --- Reshape raw tensors into per-layer KV cache views ---
     if not _contiguous_layout:
-        num_eles = math.prod(actual_kvcache_shape)
-        kv_tensors: List[torch.Tensor] = [
-            t.view(dtype=dtype)[:num_eles].view(actual_kvcache_shape) for t in raw_kv_tensors
-        ]
+        kv_tensors: List[torch.Tensor] = []
+        if is_mla:
+            num_eles = math.prod(kernel_kvcache_shape)
+            kv_tensors = [
+                t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
+                for t in raw_kv_tensors
+            ]
+        else:
+            # Build attention view with as_strided. Two modes:
+            #   split-half (default): K occupies [0, v_offset), V occupies
+            #     [v_offset, 2*v_offset). K/V dim stride = v_offset_eles.
+            #   unified_pool (HYBRID_LINEAR): K and V interleaved per kernel
+            #     block. This mirrors native vLLM's
+            #     _update_hybrid_attention_mamba_layout and lets an attached
+            #     linear-attention / mamba layer read the same flat buffer
+            #     (mamba still indexes by virtual block; each virtual block
+            #     spans ``ratio`` kernel blocks).
+            shape = list(kernel_kvcache_shape)
+            strides = [0] * len(shape)
+            strides[-1] = 1
+            for i in range(len(shape) - 2, 1, -1):
+                strides[i] = strides[i + 1] * shape[i + 1]
+            # hidden_size_eles uses kernel_block_size (shape[2]), not block_size.
+            hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * h * d
+            if unified_pool:
+                # Block-interleaved at kernel granularity: inter-(kernel-)block
+                # stride = 2*hidden_size; K/V dim stride = hidden_size.
+                if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
+                    strides[1] = 2 * hidden_size_eles
+                    strides[0] = hidden_size_eles
+                else:                             # FlashInfer (N*ratio, 2, ...)
+                    strides[0] = 2 * hidden_size_eles
+                    strides[1] = hidden_size_eles
+            else:
+                v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
+                if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
+                    strides[1] = hidden_size_eles
+                    strides[0] = v_offset_eles
+                else:                             # FlashInfer (N*ratio, 2, ...)
+                    strides[0] = hidden_size_eles
+                    strides[1] = v_offset_eles
+            for t in raw_kv_tensors:
+                kv_tensors.append(
+                    torch.as_strided(t.view(dtype=dtype), shape, strides))
     else:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
@@ -185,7 +295,21 @@ def alloc_kv_cache(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
-    return kv_tensors
+    if not unified_pool:
+        return kv_tensors
+
+    # --- Build raw int8 buffers for hybrid model (mamba) support ---
+    pool_bytes = num_blocks_per_layer * page_size_bytes
+    raw_int8 = [t.view(torch.int8)[:pool_bytes] for t in raw_kv_tensors]
+
+    raw_info = {
+        "buffers": raw_int8,
+        "num_blocks": num_blocks_per_layer,
+        "page_size_bytes": page_size_bytes,
+        "block_stride_bytes": page_size_bytes,
+        "num_pools": num_layers,
+    }
+    return kv_tensors, raw_info  # type: ignore[return-value]
 
 
 def get_kv_cache_manager(

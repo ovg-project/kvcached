@@ -2,7 +2,16 @@
 
 This example shows the minimal, end-to-end setup to colocate two models on the same GPU using kvcached. Both models are served by vLLM engines and share GPU memory elastically through kvcached.
 
-The key configuration to enable this is passing `--disable-hybrid-kv-cache-manager` to vLLM.
+## Two flavors of hybrid models
+
+vLLM uses the term "hybrid" for two very different things, and kvcached needs different settings for each:
+
+| Flavor | Examples | vLLM flag | kvcached env |
+|---|---|---|---|
+| **Attention-only hybrid** (full attention + sliding window, all groups unify to `FullAttentionSpec`) | GPT-OSS | `--disable-hybrid-kv-cache-manager` | (default; `KVCACHED_CONTIGUOUS_LAYOUT=true`) |
+| **Linear-attention hybrid** (full attention + Mamba/SSM, groups have different specs and cannot be unified) | Jamba, Bamba, NemotronH, Zamba2, Plamo2 | **do NOT pass** `--disable-hybrid-kv-cache-manager` | `KVCACHED_CONTIGUOUS_LAYOUT=false` |
+
+The `start_two_models.sh` script defaults to GPT-OSS (attention-only). For Jamba/Bamba and other Mamba-hybrid models, drop `--disable-hybrid-kv-cache-manager` from the `vllm serve` command and export `KVCACHED_CONTIGUOUS_LAYOUT=false` before launching.
 
 ## Prerequisites
 - A working vLLM installation with kvcached.

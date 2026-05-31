@@ -234,6 +234,17 @@ pre-commit run --all-files
 
 kvcached is developed by many contributors from the community. The best way to contact us for questions, issues, and contributions, is through our [Slack channel](https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw) or [GitHub Issues](https://github.com/ovg-project/kvcached/issues).
 
+## Trusted and deployed by
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Intel_Logo.png" alt="Intel" height="44" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/AMD_Logo.png" alt="AMD" height="32" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Red_Hat_Logo.png" alt="Red Hat" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/ByteDance_Logo.svg" alt="ByteDance" height="30" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Alibaba_Cloud_Logo.png" alt="Alibaba Cloud" height="25" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Tencent_Logo.png" alt="Tencent" height="30" />
+</p>
+
 ## Citation
 
 If you find kvcached useful, please cite our paper:
@@ -246,9 +257,9 @@ If you find kvcached useful, please cite our paper:
   year={2025}
 }
 
-@article{yu2025prism,
-  title={Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving},
-  author={Yu, Shan and Xing, Jiarong and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Wang, Yang and Yang, Shuo and Xie, Zhiqiang and Cao, Shiyi and Bao, Ke and others},
+@article{yu2026prism,
+  title={Prism: Cost-Efficient Multi-LLM Serving via GPU Memory Ballooning},
+  author={Yu, Shan and Qiao, Yifan and Ma, Mingyuan and Li, Yangmin and Yang, Shuo and Tong, Xinyuan and Wang, Yang and Xie, Zhiqiang and An, Yuwei and Cao, Shiyi and Bao, Ke and Vij, Deepak and Ding, Xiaoning and Wang, Yichen and Lu, Qingda and Wang, Zhong and Gao, Gao and Xu, Harry and Shu, Junyi and Xing, Jiarong and Sheng, Ying},
   journal={OSDI},
   year={2026}
 }

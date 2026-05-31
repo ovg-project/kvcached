@@ -8,7 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import inspect
 import math
 import types
-from typing import Any, List, Tuple, Union, cast
+from typing import Any, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
@@ -689,6 +689,512 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
+    """Inject ElasticMambaPool with kvcached-backed conv+temporal state.
+
+    Packs each slot's conv[i] and temporal state into a single super-cell and
+    uses one kvcached group (contiguous layout) so one ``map_to_kv_tensors``
+    call backs every state kind for that slot across all mamba layers.  Slot
+    0 is reserved as the padded dummy slot via kvcached's null-block
+    mechanism.
+
+    Speculative-decoding intermediate buffers (``intermediate_ssm`` /
+    ``intermediate_conv_window``) have a different slot count and remain
+    eager torch allocations in this first cut.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.memory_pool"
+    patch_name = "elastic_mamba_pool"
+
+    def apply(self, mem_pool_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+
+        success = self.inject_elastic_mamba_pool(mem_pool_mod)
+        if success:
+            success &= self.alias_mamba_pool_to_elastic(mem_pool_mod)
+        return success
+
+    @version_range(SGLANG_ALL_RANGE)
+    def inject_elastic_mamba_pool(self, mem_pool_mod: types.ModuleType) -> bool:
+        if hasattr(mem_pool_mod, "ElasticMambaPool"):
+            self.logger.debug("ElasticMambaPool already exists")
+            return True
+
+        MambaPool = getattr(mem_pool_mod, "MambaPool", None)
+        if MambaPool is None:
+            # Older SGLang versions don't ship MambaPool.
+            self.logger.debug(
+                "MambaPool not found in memory_pool module; "
+                "skipping ElasticMambaPool injection")
+            return True
+
+        try:
+            import torch
+
+            State = getattr(MambaPool, "State")
+
+            class _PerLayerMambaState:
+                """Mamba state holder for kvcached non-contiguous layout.
+
+                In non-contiguous layout each mamba layer has its own VM
+                reservation, so a single ``(num_mamba_layers, num_slots,
+                *shape)`` tensor that spans all layers is impossible.  We
+                therefore keep per-layer 2D state tensors and expose the
+                same ``at_layer_idx`` API the rest of SGLang uses — every
+                hot-path consumer (e.g. ``Mamba2AttnBackend.forward``) goes
+                through ``mamba2_layer_cache(layer_id)`` which calls
+                ``at_layer_idx`` and only ever sees per-layer slices.
+
+                Multi-layer code paths that index the state directly as a
+                3D tensor — currently only
+                ``HybridLinearAttnBackend.update_mamba_state_after_mtp_verify``
+                in the speculative-decode flow — are not supported in
+                non-contiguous layout (caught at __init__ time).
+                """
+
+                def __init__(
+                    self,
+                    conv_per_layer: List[List["torch.Tensor"]],
+                    temporal_per_layer: List["torch.Tensor"],
+                ) -> None:
+                    # conv_per_layer[shape_idx][layer_idx] -> (slots, *shape)
+                    self.conv_per_layer = conv_per_layer
+                    # temporal_per_layer[layer_idx] -> (slots, *temporal_shape)
+                    self.temporal_per_layer = temporal_per_layer
+
+                # GDNAttnBackend (and similar) introspect
+                # ``mamba_cache.conv[0].shape`` / ``.temporal`` at attention-
+                # backend init time to learn the per-slot state shape.  We
+                # expose layer-0's per-layer tensor as a stand-in: trailing
+                # dims (slots, *shape) are identical across layers, and
+                # consumers only read .shape[-1] / .shape from it.  Any
+                # multi-layer 3D indexing would silently mis-target layer 0
+                # — but in this codebase those paths only run during
+                # speculative decode, which we already block at __init__.
+                @property
+                def conv(self) -> List["torch.Tensor"]:
+                    return [c[0] for c in self.conv_per_layer]
+
+                @property
+                def temporal(self) -> "torch.Tensor":
+                    return self.temporal_per_layer[0]
+
+                def at_layer_idx(self, layer: int) -> Any:
+                    return State(
+                        conv=[c[layer] for c in self.conv_per_layer],
+                        temporal=self.temporal_per_layer[layer],
+                    )
+
+                def mem_usage_bytes(self) -> int:
+                    total = 0
+                    for shape_list in self.conv_per_layer:
+                        for t in shape_list:
+                            total += t.numel() * t.element_size()
+                    for t in self.temporal_per_layer:
+                        total += t.numel() * t.element_size()
+                    return total
+
+            class ElasticMambaPool(MambaPool):  # type: ignore[misc, valid-type]
+                """MambaPool variant whose conv + temporal state tensors are
+                backed by kvcached virtual memory.
+
+                One group_id per instance (independent VM reservation).  Each
+                allocated block corresponds to one mamba slot; block_size=1,
+                num_kv_buffers=1, cell_size = sum of per-slot bytes across
+                all state kinds.
+
+                Two layouts are supported:
+
+                * Contiguous: a single VM reservation backs all layers, so
+                  ``mamba_cache.conv[i]`` and ``mamba_cache.temporal`` are
+                  ``(num_mamba_layers, slots, *)`` tensors — identical in
+                  shape to the native MambaPool buffers.
+                * Non-contiguous: each layer has its own VM reservation,
+                  so ``mamba_cache`` is a ``_PerLayerMambaState`` that
+                  satisfies the ``at_layer_idx`` contract used by the
+                  hybrid linear attention backend.  Speculative decoding
+                  is not supported in this layout.
+                """
+
+                # Kept separate from attention-pool group IDs to make logs
+                # easier to read; the C++ allocator lazily constructs a
+                # fresh FTensorAllocator per group_id on first access.
+                _next_group_id = 1000
+
+                def __init__(
+                    self,
+                    *,
+                    size: int,
+                    spec_state_size: int,
+                    cache_params: Any,
+                    device: str,
+                    mamba_layer_ids: Optional[List[int]] = None,
+                    enable_memory_saver: bool = False,
+                    speculative_num_draft_tokens: Optional[int] = None,
+                ) -> None:
+                    import kvcached.integration.sglang.interfaces as kvi
+
+                    # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
+                    # does so the IPC socket naming matches.
+                    try:
+                        from sglang.srt.distributed import (
+                            get_pipeline_model_parallel_rank,
+                            get_tensor_model_parallel_rank,
+                            get_tensor_model_parallel_world_size,
+                        )
+                        tp_rank = int(get_tensor_model_parallel_rank())
+                        tp_size = int(get_tensor_model_parallel_world_size())
+                        pp_rank = int(get_pipeline_model_parallel_rank())
+                    except (ImportError, AttributeError):
+                        try:
+                            import torch.distributed as dist
+                            tp_rank = dist.get_rank() if dist.is_initialized() else 0
+                            tp_size = dist.get_world_size() if dist.is_initialized() else 1
+                            pp_rank = 0
+                        except (ImportError, AttributeError, RuntimeError, ValueError, TypeError):
+                            tp_rank, tp_size, pp_rank = 0, 1, 0
+
+                    kvi.init_kvcached(
+                        tp_rank=tp_rank, world_size=tp_size,
+                        pp_rank=pp_rank, async_sched=True,
+                    )
+
+                    if "cuda" not in device:
+                        raise ValueError(
+                            "ElasticMambaPool only supports cuda device")
+
+                    self._group_id = ElasticMambaPool._next_group_id
+                    ElasticMambaPool._next_group_id += 1
+
+                    self.size = size
+                    self.device = device
+                    # SGLang passes the layer list as either a mamba_layer_ids
+                    # kwarg or cache_params.layers, depending on version.
+                    if mamba_layer_ids is not None:
+                        layer_ids = list(mamba_layer_ids)
+                    else:
+                        layer_ids = list(getattr(cache_params, "layers", []))
+                    num_mamba_layers = len(layer_ids)
+                    if num_mamba_layers == 0:
+                        raise ValueError(
+                            "ElasticMambaPool could not determine mamba layer "
+                            "count: pass mamba_layer_ids or ensure "
+                            "cache_params.layers is set.")
+                    self.num_mamba_layers = num_mamba_layers
+
+                    # Slot 0 is the padded dummy slot; kvcached reserves it
+                    # via reserve_null_block.
+                    num_slots = size + 1
+
+                    conv_state, temporal_state, layout = kvi.alloc_mamba_states(
+                        num_slots=num_slots,
+                        num_mamba_layers=num_mamba_layers,
+                        cache_params=cache_params,
+                        device=device,
+                        group_id=self._group_id,
+                    )
+                    self._kvcached_layout = layout
+                    self._is_contiguous = bool(layout.get("is_contiguous", True))
+
+                    if not self._is_contiguous and speculative_num_draft_tokens is not None:
+                        # Spec-decode's `update_mamba_state_after_mtp_verify`
+                        # uses fused_mamba_state_scatter_with_mask, which
+                        # needs a single contiguous (num_layers, slots, *)
+                        # tensor.  Per-layer tensors can't satisfy that.
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support speculative "
+                            "decoding with non-contiguous kvcached layout. "
+                            "Re-launch with KVCACHED_CONTIGUOUS_LAYOUT=true "
+                            "if you need spec decode for hybrid linear models."
+                        )
+
+                    if self._is_contiguous:
+                        if speculative_num_draft_tokens is not None:
+                            conv_state_shape = cache_params.shape.conv
+                            temporal_state_shape = cache_params.shape.temporal
+                            intermediate_ssm_state_cache = torch.zeros(
+                                size=(
+                                    num_mamba_layers,
+                                    spec_state_size + 1,
+                                    speculative_num_draft_tokens,
+                                    temporal_state_shape[0],
+                                    temporal_state_shape[1],
+                                    temporal_state_shape[2],
+                                ),
+                                dtype=cache_params.dtype.temporal,
+                                device="cuda",
+                            )
+                            intermediate_conv_window_cache = [
+                                torch.zeros(
+                                    size=(
+                                        num_mamba_layers,
+                                        spec_state_size + 1,
+                                        speculative_num_draft_tokens,
+                                        conv_shape[0],
+                                        conv_shape[1],
+                                    ),
+                                    dtype=cache_params.dtype.conv,
+                                    device="cuda",
+                                )
+                                for conv_shape in conv_state_shape
+                            ]
+                            self.mamba_cache = self.SpeculativeState(
+                                conv=conv_state,
+                                temporal=temporal_state,
+                                intermediate_ssm=intermediate_ssm_state_cache,
+                                intermediate_conv_window=intermediate_conv_window_cache,
+                            )
+                        else:
+                            self.mamba_cache = self.State(
+                                conv=conv_state, temporal=temporal_state,
+                            )
+                    else:
+                        # Non-contiguous: conv_state is List[List[Tensor]]
+                        # (outer=conv shape, inner=layer); temporal_state is
+                        # List[Tensor] (one per layer).
+                        self.mamba_cache = _PerLayerMambaState(
+                            conv_per_layer=conv_state,
+                            temporal_per_layer=temporal_state,
+                        )
+
+                    # block_size=1 → one block == one mamba slot.
+                    # num_kv_buffers=1 → single super-cell per slot per layer.
+                    self.kvcached_allocator = kvi.get_kv_cache_manager(
+                        num_blocks=num_slots,
+                        block_size=1,
+                        cell_size=layout["cell_size"],
+                        num_layers=num_mamba_layers,
+                        reserve_null_block=True,
+                        num_kv_buffers=1,
+                        group_id=self._group_id,
+                    )
+
+                    # Placeholder so code that touches self.free_slots in
+                    # error paths (e.g. suppressed leak checks) doesn't
+                    # AttributeError.  Never used for allocation.
+                    self.free_slots = torch.empty(
+                        0, dtype=torch.int64, device=self.device)
+
+                    self.mem_usage = (
+                        self.mamba_cache.mem_usage_bytes() / BYTES_PER_GB
+                    )
+                    logger.info(
+                        f"Elastic MambaPool (group_id={self._group_id}) "
+                        f"#slots={num_slots}, "
+                        f"#mamba_layers={num_mamba_layers}, "
+                        f"super_cell_bytes={layout['cell_size']}, "
+                        f"layout={'contig' if self._is_contiguous else 'non-contig'}, "
+                        f"virtual_mem={self.mem_usage:.2f} GB"
+                    )
+
+                def available_size(self) -> int:
+                    return self.kvcached_allocator.available_size()
+
+                def alloc(
+                    self, need_size: int,
+                ):
+                    block_ids = self.kvcached_allocator.alloc(need_size)
+                    if block_ids is None:
+                        return None
+                    select_index = torch.tensor(
+                        block_ids, dtype=torch.int64, device=self.device,
+                    )
+                    if self._is_contiguous:
+                        for i in range(len(self.mamba_cache.conv)):
+                            self.mamba_cache.conv[i][:, select_index] = 0
+                        self.mamba_cache.temporal[:, select_index] = 0
+                    else:
+                        # Per-layer zeroing: each layer's state tensor is
+                        # (slots, *), so [select_index] slices on the slot
+                        # dim directly.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[select_index] = 0
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[select_index] = 0
+                    return select_index
+
+                def free(self, free_index: Any) -> None:
+                    if free_index.numel() == 0:
+                        return
+                    self.kvcached_allocator.free(free_index.tolist())
+
+                def clear(self) -> None:
+                    self.kvcached_allocator.clear()
+
+                def copy_from(
+                    self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
+                ) -> None:
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "copy_from"):
+                            super().copy_from(src_index, dst_index)
+                    else:
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[dst_index] = t[src_index]
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[dst_index] = t[src_index]
+
+                def get_contiguous_buf_infos(self):
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "get_contiguous_buf_infos"):
+                            return super().get_contiguous_buf_infos()
+                    else:
+                        # Non-contiguous: per-layer pointer/length triples
+                        # in (state_kind_outer, layer_inner) order.
+                        data_ptrs: List[int] = []
+                        data_lens: List[int] = []
+                        item_lens: List[int] = []
+                        state_lists: List[List["torch.Tensor"]] = list(
+                            self.mamba_cache.conv_per_layer
+                        ) + [list(self.mamba_cache.temporal_per_layer)]
+                        for state_list in state_lists:
+                            for layer_t in state_list:
+                                data_ptrs.append(layer_t.data_ptr())
+                                data_lens.append(layer_t.nbytes)
+                                item_lens.append(layer_t[0].nbytes)
+                        return data_ptrs, data_lens, item_lens
+
+                def get_state_dim_per_tensor(self):
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "get_state_dim_per_tensor"):
+                            return super().get_state_dim_per_tensor()
+                    else:
+                        # Per-layer state shape is (slots, sliceable_dim, ...);
+                        # the sliceable dimension is at index 1 (post-slot).
+                        dim_per_tensor: List[int] = []
+                        state_lists: List[List["torch.Tensor"]] = list(
+                            self.mamba_cache.conv_per_layer
+                        ) + [list(self.mamba_cache.temporal_per_layer)]
+                        for state_list in state_lists:
+                            sliceable_dim = state_list[0].shape[1]
+                            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                        return dim_per_tensor
+
+            setattr(mem_pool_mod, "ElasticMambaPool", ElasticMambaPool)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to inject ElasticMambaPool: {e}")
+            return False
+
+    @version_range(SGLANG_ALL_RANGE)
+    def alias_mamba_pool_to_elastic(self, mem_pool_mod: types.ModuleType) -> bool:
+        if self._is_already_patched(mem_pool_mod, "__kvcached_mamba_pool_aliased__"):
+            return True
+
+        ElasticMambaPool = getattr(mem_pool_mod, "ElasticMambaPool", None)
+        if ElasticMambaPool is None:
+            return True
+
+        try:
+            mem_pool_mod.MambaPool = ElasticMambaPool  # type: ignore
+            self._mark_as_patched(mem_pool_mod, "__kvcached_mamba_pool_aliased__")
+            return True
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to alias MambaPool to elastic one: {e}")
+            return False
+
+
+class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
+    """Inject ElasticHybridLinearKVPool into SGLang's memory pool module.
+
+    Hybrid linear-attention models (e.g. Qwen3-Next, Nemotron-H, Bamba, LFM2,
+    Jamba) wrap a full-attention ``MHATokenToKVPool`` / ``MLATokenToKVPool``
+    and a separate ``MambaPool`` inside ``HybridLinearKVPool``.  SGLang keeps
+    the two pools in distinct memory — unlike vLLM, there is no shared
+    buffer — so kvcached needs to manage the full-attention pool and mamba
+    pool separately.
+
+    The outer ``PagedTokenToKVPoolAllocator`` (already aliased to
+    ``ElasticPagedTokenToKVPoolAllocator``) requires the kvcache object to
+    expose ``kvcached_allocator``.  The inner ``full_kv_pool`` has it (since
+    ``MHATokenToKVPool``/``MLATokenToKVPool`` are aliased to their elastic
+    variants), so we expose a delegating property on the hybrid pool.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.memory_pool"
+    patch_name = "elastic_hybrid_linear_memory_pool"
+
+    def apply(self, mem_pool_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+
+        success = self.inject_elastic_hybrid_linear_pool(mem_pool_mod)
+        if success:
+            success &= self.alias_hybrid_linear_pool_to_elastic(mem_pool_mod)
+        return success
+
+    @version_range(SGLANG_ALL_RANGE)
+    def inject_elastic_hybrid_linear_pool(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Inject ElasticHybridLinearKVPool."""
+        if hasattr(mem_pool_mod, "ElasticHybridLinearKVPool"):
+            self.logger.debug("ElasticHybridLinearKVPool already exists")
+            return True
+
+        HybridLinearKVPool = getattr(mem_pool_mod, "HybridLinearKVPool", None)
+        if HybridLinearKVPool is None:
+            # Older SGLang versions don't ship hybrid linear-attention support.
+            self.logger.debug(
+                "HybridLinearKVPool not found in memory_pool module; "
+                "skipping ElasticHybridLinearKVPool injection"
+            )
+            return True
+
+        try:
+            class ElasticHybridLinearKVPool(HybridLinearKVPool):  # type: ignore[misc, valid-type]
+                """Hybrid linear-attention KV pool backed by kvcached for
+                the full-attention layers.
+
+                Both sub-pools are kvcached-backed via class aliasing done
+                earlier in this patch module: ``MHATokenToKVPool`` /
+                ``MLATokenToKVPool`` are aliased to their elastic variants, so
+                the inner ``full_kv_pool`` constructed by
+                ``HybridLinearKVPool.__init__`` is an elastic attention pool;
+                ``MambaPool`` is aliased to ``ElasticMambaPool`` (see
+                ``ElasticMambaPoolPatch``), so the inner mamba pool allocates
+                conv + temporal state through kvcached as well. Each sub-pool
+                gets its own ``group_id`` so their IPC mem-info segments don't
+                collide.
+                """
+
+                @property
+                def kvcached_allocator(self):
+                    # Delegate to the attention pool's kvcached allocator so
+                    # the outer ElasticPagedTokenToKVPoolAllocator can reach it
+                    # through kvcache.kvcached_allocator.
+                    return self.full_kv_pool.kvcached_allocator
+
+            setattr(mem_pool_mod, "ElasticHybridLinearKVPool", ElasticHybridLinearKVPool)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to inject ElasticHybridLinearKVPool: {e}")
+            return False
+
+    @version_range(SGLANG_ALL_RANGE)
+    def alias_hybrid_linear_pool_to_elastic(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Alias HybridLinearKVPool to ElasticHybridLinearKVPool."""
+        if self._is_already_patched(mem_pool_mod, "__kvcached_hybrid_linear_mempool_aliased__"):
+            return True
+
+        ElasticHybridLinearKVPool = getattr(mem_pool_mod, "ElasticHybridLinearKVPool", None)
+        if ElasticHybridLinearKVPool is None:
+            # Injection skipped (older SGLang without HybridLinearKVPool).
+            return True
+
+        try:
+            mem_pool_mod.HybridLinearKVPool = ElasticHybridLinearKVPool  # type: ignore
+            self._mark_as_patched(mem_pool_mod, "__kvcached_hybrid_linear_mempool_aliased__")
+            return True
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to alias HybridLinearKVPool to elastic one: {e}")
+            return False
+
+
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
     """Patch SGLang scheduler to suppress memory leak check when kvcached is enabled"""
 
@@ -752,8 +1258,10 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     down to that limit.  This prevents the cache from consuming all KV pool
     capacity and leaves headroom for running requests.
 
-    Set KVCACHED_MAX_CACHED_TOKENS to a positive integer to enable.
-    0 (default) means unlimited — this patch is a no-op in that case.
+    KVCACHED_MAX_CACHED_TOKENS semantics:
+      < 0  → unlimited; this patch is a no-op.
+      == 0 → disabled; every cached entry is evicted immediately on insert.
+      > 0  → cap evictable size at this many tokens.
     """
 
     library = "sglang"
@@ -762,9 +1270,10 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     patch_name = "radix_cache_limit"
 
     def apply(self, radix_cache_mod: types.ModuleType) -> bool:
-        if MAX_CACHED_TOKENS <= 0:
+        if MAX_CACHED_TOKENS < 0:
             logger.debug(
-                "KVCACHED_MAX_CACHED_TOKENS not set — RadixCacheLimitPatch skipped"
+                "KVCACHED_MAX_CACHED_TOKENS < 0 (unlimited) — "
+                "RadixCacheLimitPatch skipped"
             )
             return True  # Not an error; just not needed.
 
