@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <fcntl.h>
-#include <iostream>
 #include <sys/mman.h>
 
 #include "constants.hpp"
@@ -68,17 +67,15 @@ FTensor::~FTensor() {
     if (res != CUDA_SUCCESS) {
       const char *err = nullptr;
       (void)cuGetErrorString(res, &err);
-      std::cerr << __FILE__ << ':' << __LINE__
-                << " cuMemUnmap during FTensor cleanup failed: "
-                << (err ? err : "unknown") << std::endl;
+      LOGGER(ERROR, "cuMemUnmap during FTensor cleanup failed: %s",
+             err ? err : "unknown");
     }
     res = cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_);
     if (res != CUDA_SUCCESS) {
       const char *err = nullptr;
       (void)cuGetErrorString(res, &err);
-      std::cerr << __FILE__ << ':' << __LINE__
-                << " cuMemAddressFree during FTensor cleanup failed: "
-                << (err ? err : "unknown") << std::endl;
+      LOGGER(ERROR, "cuMemAddressFree during FTensor cleanup failed: %s",
+             err ? err : "unknown");
     }
   }
   mapping_.clear(); // Free physical page handles after their mappings are gone.
