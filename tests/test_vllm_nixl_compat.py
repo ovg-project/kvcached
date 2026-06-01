@@ -42,10 +42,12 @@ def _install_fake_nixl_module(monkeypatch, module_style="legacy"):
             return "HND"
 
     class NixlConnectorWorker:
-        def __init__(self, num_blocks=0, use_flashinfer=False, use_mla=False):
+        def __init__(self, num_blocks=0, backend_name="", use_mla=False):
             self.num_blocks = num_blocks
             self.calls = 0
-            self._use_flashinfer = use_flashinfer
+            # Mirror real vLLM: the backend is reported via backend_name
+            # (= attn_backends[0].get_name()), not a `_use_flashinfer` attr.
+            self.backend_name = backend_name
             self.use_mla = use_mla
 
         def register_kv_caches(self, kv_caches, *args, **kwargs):
@@ -212,8 +214,50 @@ def test_nixl_connector_patch_supports_split_vllm_modules(monkeypatch):
 
     assert NixlConnector.get_required_kvcache_layout("config") is None
 
-    worker = NixlConnectorWorker(num_blocks=17, use_flashinfer=True)
+    # FlashInfer layout keeps blocks in dim 0; detected via backend_name.
+    worker = NixlConnectorWorker(num_blocks=17, backend_name="FLASHINFER")
     assert worker.register_kv_caches({"layer": FakeTensor((55, 2, 4, 5, 6))}) == 55
+
+
+def test_nixl_connector_patch_uses_dim0_for_mla(monkeypatch):
+    """MLA tensors expose blocks in dim 0; detected via worker.use_mla."""
+    _install_fake_torch(monkeypatch)
+    _, NixlConnectorWorker = _install_fake_nixl_module(monkeypatch)
+
+    from kvcached.integration.vllm import nixl_compat
+
+    _enable_kvcached_nixl(monkeypatch, nixl_compat)
+
+    assert nixl_compat.patch_nixl_connector() is True
+
+    worker = NixlConnectorWorker(num_blocks=17, use_mla=True)
+    # MLA shape (num_blocks, block_size, head_size); blocks are in dim 0.
+    assert worker.register_kv_caches({"layer": FakeTensor((48, 16, 576))}) == 48
+    assert worker.num_blocks == 48
+
+
+def test_nixl_connector_patch_handles_missing_layout_method(monkeypatch):
+    """Older vLLM where NixlConnector has no get_required_kvcache_layout.
+
+    The patch must not AttributeError; it skips the layout override and still
+    patches register_kv_caches.
+    """
+    _install_fake_torch(monkeypatch)
+    NixlConnector, NixlConnectorWorker = _install_fake_nixl_module(monkeypatch)
+    delattr(NixlConnector, "get_required_kvcache_layout")
+
+    from kvcached.integration.vllm import nixl_compat
+
+    _enable_kvcached_nixl(monkeypatch, nixl_compat)
+
+    # Must not raise despite the missing layout classmethod.
+    assert nixl_compat.patch_nixl_connector() is True
+    assert not hasattr(NixlConnector, "get_required_kvcache_layout")
+
+    # register_kv_caches is still patched and rewrites num_blocks.
+    worker = NixlConnectorWorker(num_blocks=17)
+    assert worker.register_kv_caches({"layer": FakeTensor((2, 33, 4, 5, 6))}) == 33
+    assert worker.num_blocks == 33
 
 
 def test_nixl_connector_patch_rejects_contiguous_kvcached_layout(monkeypatch):

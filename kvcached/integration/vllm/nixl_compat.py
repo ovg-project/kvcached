@@ -80,11 +80,21 @@ class NixlConnectorPatch(BasePatch):
             patch.logger.info("kvcached: NixlConnector layout overridden to NHD")
             return None
 
-        if not hasattr(NixlConnector, "_original_get_layout"):
-            NixlConnector._original_get_layout = (
-                NixlConnector.get_required_kvcache_layout
+        # get_required_kvcache_layout only exists on newer vLLM (added to the
+        # connector base ~v0.10.1). On older versions NixlConnector does not
+        # force a layout, so NHD is already used and there is nothing to
+        # override; guard with hasattr so the patch does not AttributeError.
+        if hasattr(NixlConnector, "get_required_kvcache_layout"):
+            if not hasattr(NixlConnector, "_original_get_layout"):
+                NixlConnector._original_get_layout = (
+                    NixlConnector.get_required_kvcache_layout
+                )
+            NixlConnector.get_required_kvcache_layout = _kvcached_layout
+        else:
+            self.logger.debug(
+                "NixlConnector has no get_required_kvcache_layout on this vLLM "
+                "version; skipping layout override (NHD already in use)"
             )
-        NixlConnector.get_required_kvcache_layout = _kvcached_layout
 
         if not hasattr(NixlConnectorWorker, "_kvcached_original_register_kv_caches"):
             NixlConnectorWorker._kvcached_original_register_kv_caches = (
@@ -153,14 +163,17 @@ class NixlConnectorPatch(BasePatch):
         if not shape:
             return None
 
+        # MLA and FlashInfer expose the block count in dim 0. NixlConnectorWorker
+        # reports the attention backend via ``backend_name`` (set from
+        # ``attn_backends[0].get_name()``); there is no ``_use_flashinfer`` attr.
         use_mla = bool(getattr(worker, "use_mla", False))
-        use_flashinfer = bool(getattr(worker, "_use_flashinfer", False))
+        backend_name = (getattr(worker, "backend_name", "") or "").upper()
+        use_flashinfer = "FLASHINFER" in backend_name
         if use_mla or use_flashinfer:
             return int(shape[0])
 
-        # vLLM's non-FlashInfer attention layout keeps K/V in dim 0 and blocks
-        # in dim 1. MLA, FlashInfer, split K/V tensors, and Mamba state tensors
-        # all expose blocks in dim 0.
+        # FlashAttn family stacks K/V in dim 0 and keeps blocks in dim 1, e.g.
+        # (2, num_blocks, block_size, num_kv_heads, head_size).
         if len(shape) >= 5 and shape[0] == 2:
             return int(shape[1])
 
