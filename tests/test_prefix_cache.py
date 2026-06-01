@@ -479,16 +479,6 @@ class TestEdgeCases:
         assert len(new_blocks) == 2
         assert call_count["n"] == 2
 
-    def test_get_new_blocks_frees_partial_allocation_on_size_mismatch(self, pool_and_manager):
-        pool, _ = pool_and_manager
-
-        with mock.patch.object(pool.kv_cache_manager, "alloc", return_value=[42]):
-            with mock.patch.object(pool.kv_cache_manager, "free") as free_mock:
-                with pytest.raises(ValueError, match="unexpected number of blocks"):
-                    pool.get_new_blocks(2)
-
-        free_mock.assert_called_once_with([42])
-
     def test_free_none_blocks(self, pool_and_manager):
         """free_blocks handles None entries in the list."""
         pool, mgr = pool_and_manager

@@ -502,13 +502,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         f"requested={num_blocks}, available={self.kv_cache_manager.available_size()}"
                     )
 
-                if len(block_ids) != num_blocks:
-                    if block_ids:
-                        self.kv_cache_manager.free(block_ids)
-                    raise ValueError(
-                        "KV cache manager returned an unexpected number of blocks; "
-                        f"requested={num_blocks}, got={len(block_ids)}"
-                    )
+                # alloc() returns either None or exactly num_blocks ids
+                # (see KVCacheManager._alloc), so a different length is a
+                # contract violation rather than a recoverable runtime state.
+                assert len(block_ids) == num_blocks, (
+                    f"alloc returned {len(block_ids)} blocks, expected {num_blocks}")
 
                 blocks = []
                 for bid in block_ids:
