@@ -1446,6 +1446,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
 
 
 class OffloadingConnectorPatch(VersionAwarePatch, BasePatch):
@@ -1527,27 +1528,34 @@ class OffloadingConnectorPatch(VersionAwarePatch, BasePatch):
 
         from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 
-        class _HMACompatibleOffloadingConnector(
-            OffloadingConnector, SupportsHMA
-        ):  # type: ignore[misc,valid-type]
-            """OffloadingConnector + SupportsHMA (kvcached backport of upstream vLLM 0.21+)."""
+        def request_finished_all_groups(
+            self: Any,
+            request: "Request",
+            block_ids: tuple,
+        ) -> tuple:
+            # Single-group case (Qwen, Llama, MLA, etc.): exactly the
+            # same call vLLM's non-HMA scheduler path makes.
+            if len(block_ids) != 1:
+                raise NotImplementedError(
+                    "OffloadingConnector does not yet support models with "
+                    "multiple KV cache groups (hybrid attention). For now, "
+                    "pass --disable-hybrid-kv-cache-manager when using "
+                    "--kv-offloading-size with such models."
+                )
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.request_finished(request, block_ids[0])
 
-            def request_finished_all_groups(
-                self,
-                request: "Request",
-                block_ids: tuple,
-            ) -> tuple:
-                # Single-group case (Qwen, Llama, MLA, etc.): exactly the
-                # same call vLLM's non-HMA scheduler path makes.
-                if len(block_ids) != 1:
-                    raise NotImplementedError(
-                        "OffloadingConnector does not yet support models with "
-                        "multiple KV cache groups (hybrid attention). For now, "
-                        "pass --disable-hybrid-kv-cache-manager when using "
-                        "--kv-offloading-size with such models."
-                    )
-                assert self.connector_scheduler is not None
-                return self.connector_scheduler.request_finished(request, block_ids[0])
+        _HMACompatibleOffloadingConnector = type(
+            OffloadingConnector.__name__,
+            (OffloadingConnector, SupportsHMA),
+            {
+                "__doc__": (
+                    "OffloadingConnector + SupportsHMA "
+                    "(kvcached backport of upstream vLLM 0.21+)."
+                ),
+                "request_finished_all_groups": request_finished_all_groups,
+            },
+        )
 
         # Preserve identity so factory logs ("Creating v1 connector with name:
         # %s") and introspection look like the upstream-fixed class rather
