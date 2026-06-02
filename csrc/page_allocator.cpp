@@ -12,9 +12,8 @@
 #include <stdexcept>
 
 #include "allocator.hpp"
-#include "cuda_utils.hpp"
+#include "gpu_utils.hpp"
 #include "mem_info_tracker.hpp"
-#include "torch_utils.hpp"
 
 namespace kvcached {
 
@@ -442,7 +441,7 @@ int64_t PageAllocator::get_num_reserved_pages() const {
 
 int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size, total_phy_mem_size;
-  cudaMemGetInfo(&avail_phy_mem_size, &total_phy_mem_size);
+  (void)gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size);
 
   size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
   avail_phy_mem_size =
@@ -668,9 +667,9 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     // callback
     broadcast_unmap_callback_(world_size_, offsets);
   } else {
-    // Need to synchronize CUDA first in async scheduling mode
+    // Need to synchronize first in async scheduling mode
     if (async_sched_) {
-      CHECK_RT(cudaDeviceSynchronize());
+      CHECK_GPU(gpu_vmm::device_synchronize());
     }
     auto allocator = FTensorAllocator::global_allocator(group_id_);
     bool success = allocator->unmap_from_kv_tensors(offsets);

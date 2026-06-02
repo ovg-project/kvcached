@@ -1,46 +1,26 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
-#include <cuda_runtime.h>
-
-#include "constants.hpp"
-#include "cuda_utils.hpp"
 #include "page.hpp"
+#include "constants.hpp"
+#include "gpu_utils.hpp"
 
 namespace kvcached {
 
 GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
-    : page_id_(page_id), dev_(dev_idx),
-      page_size_(page_size > 0 ? page_size : kPageSize), handle_(0) {
-  // CHECK_DRV(cuCtxGetDevice(&dev_));
-
-  CUmemAllocationProp prop = {
-      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev_,
-          },
-  };
-  CHECK_DRV(cuMemCreate(&handle_, page_size_, &prop, 0));
+    : page_id_(page_id), dev_idx_(dev_idx),
+      page_size_(page_size > 0 ? page_size : kPageSize), handle_() {
+  auto prop = gpu_vmm::make_pinned_device_allocation_prop(dev_idx_);
+  CHECK_GPU(gpu_vmm::mem_create(&handle_, page_size_, &prop));
 }
 
-GPUPage::~GPUPage() { CHECK_DRV(cuMemRelease(handle_)); }
+GPUPage::~GPUPage() { CHECK_GPU(gpu_vmm::mem_release(handle_)); }
 
 bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
-  CUmemAccessDesc accessDesc_{
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev_,
-          },
-      .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-  };
-  CHECK_DRV(cuMemMap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_, 0,
-                     handle_, 0));
+  auto access_desc = gpu_vmm::make_device_rw_access_desc(dev_idx_);
+  CHECK_GPU(gpu_vmm::mem_map(vaddr, page_size_, 0, handle_));
   if (set_access)
-    CHECK_DRV(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(vaddr), page_size_,
-                             &accessDesc_, 1));
+    CHECK_GPU(gpu_vmm::set_access(vaddr, page_size_, &access_desc, 1));
   return true;
 }
 

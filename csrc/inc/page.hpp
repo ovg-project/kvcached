@@ -5,10 +5,8 @@
 
 #include <memory>
 
-#include <cuda.h>
-#include <torch/extension.h>
-
 #include "constants.hpp"
+#include "gpu_vmm.hpp"
 
 namespace kvcached {
 
@@ -28,9 +26,9 @@ public:
 
 private:
   page_id_t page_id_;
-  CUdevice dev_;
+  int dev_idx_;
   size_t page_size_;
-  CUmemGenericAllocationHandle handle_;
+  gpu_vmm::allocation_handle_t handle_;
 };
 
 class CPUPage : public Page {

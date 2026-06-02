@@ -6,8 +6,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
-#include <torch/extension.h>
 #include <vector>
+
+#include <torch/csrc/utils/pybind.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -27,7 +28,7 @@ void shutdown_kvcached() {
   FTensorAllocator::shutdown();
 }
 
-std::vector<torch::Tensor>
+std::vector<at::Tensor>
 create_kv_tensors(size_t size, size_t dtype_size, const std::string &dev_str,
                   int64_t num_layers, int64_t num_kv_buffers = 2,
                   int64_t group_id = 0, bool unified_pool = false) {

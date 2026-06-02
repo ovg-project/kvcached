@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -14,9 +15,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-#include <cuda_runtime.h>
-#include <torch/extension.h>
 
 #include "constants.hpp"
 #include "mem_info_tracker.hpp"

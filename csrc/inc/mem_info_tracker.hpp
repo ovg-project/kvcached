@@ -13,7 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "cuda_utils.hpp"
+#include "gpu_utils.hpp"
 
 namespace kvcached {
 
