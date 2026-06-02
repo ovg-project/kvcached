@@ -193,7 +193,7 @@ def alloc_kv_cache(
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
 
     # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory

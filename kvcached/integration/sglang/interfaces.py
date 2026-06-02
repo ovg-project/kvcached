@@ -93,7 +93,7 @@ def alloc_kv_cache(
     if len(kvcache_shape) <= 2:
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
@@ -220,7 +220,7 @@ def alloc_mamba_states(
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
 
     conv_shapes = [tuple(s) for s in cache_params.shape.conv]
     temporal_shape = tuple(cache_params.shape.temporal)
