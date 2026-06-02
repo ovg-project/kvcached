@@ -248,7 +248,8 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Alibaba_Cloud_Logo.png" alt="Alibaba Cloud" height="25" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Tencent_Logo.png" alt="Tencent" height="30" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Moreh_Logo.png" alt="Moreh" height="30" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="30" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="30" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/LinkedIn_Logo.svg" alt="LinkedIn" height="30" />
 </p>
 
 ## Citation
