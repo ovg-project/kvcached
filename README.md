@@ -239,6 +239,7 @@ kvcached is developed by many contributors from the community. The best way to c
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Google_Logo.webp" alt="Google" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/LinkedIn_Logo.svg" alt="LinkedIn" height="30" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Intel_Logo.png" alt="Intel" height="44" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/AMD_Logo.png" alt="AMD" height="32" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Red_Hat_Logo.png" alt="Red Hat" height="34" />&nbsp;&nbsp;&nbsp;
@@ -248,8 +249,7 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Alibaba_Cloud_Logo.png" alt="Alibaba Cloud" height="25" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Tencent_Logo.png" alt="Tencent" height="30" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Moreh_Logo.png" alt="Moreh" height="30" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="30" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/LinkedIn_Logo.svg" alt="LinkedIn" height="30" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="30" />
 </p>
 
 ## Citation
