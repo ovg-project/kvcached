@@ -154,6 +154,16 @@ class VersionManager:
         except Exception as e:
             self.logger.warning(f"Error detecting version for {library_name}: {e}")
 
+        # Fallback to installed-package metadata. Some builds (e.g. source
+        # builds of SGLang) don't expose a module-level __version__, but the
+        # distribution metadata still carries the version.
+        if detected_version is None:
+            try:
+                import importlib.metadata as _md
+                detected_version = _md.version(library_name)
+            except Exception:
+                pass
+
         self._version_cache[library_name] = detected_version
         return detected_version
 
