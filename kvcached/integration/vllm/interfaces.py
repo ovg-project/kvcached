@@ -8,7 +8,7 @@ import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -55,6 +55,7 @@ def init_kvcached(
 
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
+    device = normalize_gpu_device(device)
 
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
@@ -194,6 +195,7 @@ def alloc_kv_cache(
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
+    device = normalize_gpu_device(device)
 
     # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory

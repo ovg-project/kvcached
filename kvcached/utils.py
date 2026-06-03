@@ -180,6 +180,19 @@ _LEVEL_TO_COLOR = {
 _COLOR_RESET = "\033[0m"
 
 
+def normalize_gpu_device(device: str) -> str:
+    """Map a ``hip[:N]`` device string to ``cuda[:N]``.
+
+    PyTorch-ROCm and the C++ extension (``c10::Device``) address AMD GPUs as
+    ``cuda``; kvcached's integration accepts ``hip`` strings, so normalize them
+    before handing the device to any ``torch.cuda`` API or ``create_kv_tensors``.
+    """
+    dev = str(device)
+    if dev.lower().startswith("hip"):
+        return "cuda" + dev[3:]
+    return dev
+
+
 def align_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 

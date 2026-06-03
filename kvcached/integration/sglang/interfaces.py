@@ -8,7 +8,7 @@ import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.tp_ipc_util import start_worker_listener_thread
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -38,6 +38,7 @@ def init_kvcached(
 
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
+    device = normalize_gpu_device(device)
 
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
@@ -94,6 +95,7 @@ def alloc_kv_cache(
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
+    device = normalize_gpu_device(device)
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
@@ -221,6 +223,7 @@ def alloc_mamba_states(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
+    device = normalize_gpu_device(device)
 
     conv_shapes = [tuple(s) for s in cache_params.shape.conv]
     temporal_shape = tuple(cache_params.shape.temporal)
