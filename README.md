@@ -199,6 +199,9 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
+> [!NOTE]
+> **AMD / ROCm:** on ROCm (HIP) builds, kvcached automatically defaults to the **non-contiguous** KV-cache layout. The contiguous layout (the default on NVIDIA) hands vLLM's ROCm attention backend strided per-layer KV tensors it cannot read correctly, whereas non-contiguous matches the layout the backend expects. You can override with `KVCACHED_CONTIGUOUS_LAYOUT=true|false`, but contiguous is not recommended on ROCm.
+
 If you installed kvcached using its source code, you can also do the following:
 
 ```bash
