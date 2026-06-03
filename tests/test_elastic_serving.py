@@ -32,6 +32,7 @@ import hashlib
 import os
 import threading
 import time
+from typing import Optional
 
 from kvcached.cli.utils import get_kv_cache_limit, update_kv_cache_limit
 
@@ -52,8 +53,8 @@ def fmt(v):
     return f"{v / MB:8.1f} MB" if v is not None else "   n/a"
 
 
-samples = []          # (t, total, used, prealloc)
-seg_name = [None]     # this run's segment, detected after engine init
+samples: list[tuple[float, int, int, int]] = []  # (t, total, used, prealloc)
+seg_name: list[Optional[str]] = [None]            # this run's segment, set after init
 stop = threading.Event()
 
 
