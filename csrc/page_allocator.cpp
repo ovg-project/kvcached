@@ -440,8 +440,8 @@ int64_t PageAllocator::get_num_reserved_pages() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
-  size_t avail_phy_mem_size, total_phy_mem_size;
-  (void)gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size);
+  size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
+  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
   size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
   avail_phy_mem_size =

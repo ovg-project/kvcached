@@ -4,6 +4,7 @@
 #pragma once
 
 #include <c10/core/ScalarType.h>
+#include <pybind11/pybind11.h>
 #include <string>
 
 namespace kvcached {
