@@ -1223,10 +1223,16 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
         source mentions ``token_to_kv_pool_allocator``.  Newer SGLang
         (>=0.5.11) moved it into ``SchedulerRuntimeCheckerMixin`` and split it
         across several small methods (e.g. ``_check_req_pool`` raises directly,
-        ``_report_leak`` is the choke point for pool leaks).  To stay robust
-        across both layouts we wrap every Scheduler method whose source raises
-        a ``"memory leak detected"`` error -- and only those, leaving the
-        stats/logging methods untouched.
+        ``_report_leak`` is the generic choke point for *token/KV* pool leaks).
+
+        We suppress only the leak checks for pools kvcached actually manages
+        (the KV / token pools).  A check that is specific to
+        ``req_to_token_pool`` is deliberately left intact -- kvcached does not
+        manage the request pool, its invariant still holds, and silencing it
+        would hide a genuine request-pool leak.  The old single-method layout
+        (which names ``token_to_kv_pool_allocator``) and the new generic
+        reporter (which names no pool, and is only ever called for the token
+        pools) are both kept; only the req-pool-specific check is skipped.
         """
         Scheduler = self._get_target_class(sched_mod)
         if Scheduler is None:
@@ -1238,8 +1244,14 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
                 src = inspect.getsource(fn)
             except Exception:
                 continue
-            if "memory leak detected" in src:
-                target_method_names.append(name)
+            if "memory leak detected" not in src:
+                continue
+            # Skip a check that is specific to the request pool, which kvcached
+            # does not manage.  The generic reporter names no pool (so it is not
+            # excluded) and the legacy combined check names the KV allocator.
+            if "req_to_token_pool" in src and "token_to_kv_pool" not in src:
+                continue
+            target_method_names.append(name)
 
         if not target_method_names:
             self.logger.debug("No memory leak detection method found in Scheduler")
