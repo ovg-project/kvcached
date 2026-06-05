@@ -52,3 +52,24 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
 
     # Log results
     log_patch_results("sglang", results)
+
+    # Optional: layer TriAttention KV compression on top of kvcached's SGLang
+    # patches. Gated by ENABLE_TRIATTENTION=1. Must run AFTER kvcached patches
+    # so TriAttention's scheduler/worker hooks see the kvcached-aware runtime.
+    if os.getenv("ENABLE_TRIATTENTION", "0").lower() in ("true", "1"):
+        try:
+            from kvcached.integration.triattention_external import (
+                get_external_sglang_installer,
+            )
+
+            install_sglang_integration = get_external_sglang_installer()
+            install_sglang_integration()
+            logger.info(
+                "[TriAttention] SGLang integration activated on top of "
+                "kvcached (ENABLE_TRIATTENTION=1)."
+            )
+        except Exception as exc:
+            logger.error(
+                "[TriAttention] SGLang activation failed: %s: %s",
+                type(exc).__name__, exc,
+            )

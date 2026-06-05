@@ -54,3 +54,38 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
 
     # Log results
     log_patch_results("vllm", results)
+
+    # Optional: layer TriAttention KV compression on top of kvcached's vLLM
+    # patches. Gated by ENABLE_TRIATTENTION=1 so existing kvcached users are
+    # unaffected. Must run AFTER kvcached patches so TriAttention's scheduler/
+    # worker monkeypatches wrap the kvcached-aware scheduler & runner.
+    #
+    # Block reclaim routing: TriAttention's reclaim path ultimately calls
+    # ``block_pool.free_blocks(...)``. After ElasticBlockPoolPatch above,
+    # ``block_pool`` is kvcached's ElasticBlockPool, which routes free_blocks
+    # to ``self.kv_cache_manager.free(...)`` — i.e. through kvcached's
+    # allocator. No extra glue is needed. The only hard requirement is that
+    # vLLM automatic prefix caching be disabled; TriAttention's scheduler
+    # hook asserts this at startup.
+    if os.getenv("ENABLE_TRIATTENTION", "0").lower() in ("true", "1"):
+        try:
+            from kvcached.integration.triattention_external import (
+                install_external_vllm_triattention,
+            )
+
+            install_external_vllm_triattention()
+            logger.info(
+                "[TriAttention] Runtime plugin activated on top of kvcached "
+                "(ENABLE_TRIATTENTION=1)."
+            )
+        except Exception as exc:
+            logger.error(
+                "[TriAttention] Activation failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+            raise RuntimeError(
+                "ENABLE_TRIATTENTION=1 was requested, but TriAttention "
+                "activation failed. Check the external triattention package, "
+                "PYTHONPATH/--triattention-root, and the kvcached compatibility "
+                "patch."
+            ) from exc
