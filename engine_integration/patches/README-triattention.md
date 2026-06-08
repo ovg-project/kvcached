@@ -62,20 +62,23 @@ on SGLang. The script starts SGLang with `--disable-radix-cache` and
 `--disable-overlap-schedule`, which are required for TriAttention's SGLang
 compression path.
 
-SGLang TriAttention compression is decode-time driven, so a long prompt alone
-is not enough to trigger it. Use `--min-tokens` with a value larger than the KV
-budget and `--ignore-eos` when validating compression/reclaim events.
+SGLang TriAttention compression is decode-time driven, so the recommended
+benchmark uses a short prompt and a long forced decode. This lets compression
+and reclaim happen while decode memory is still growing, making the effect more
+visible in GPU peak memory.
 
 ```bash
 python tools/compare_sglang_triattention.py \
+  --workload-profile decode-stress \
   --concurrencies 4 \
   --budgets 1024 \
   --triattention-root /root/triattention-main \
   --stats-path /root/triattention-main/triattention/calibration/for_aime25_experiment/qwen3_8b.pt \
   --model /root/data/models/Qwen/Qwen3-8B \
   --max-model-len 32768 \
-  --max-tokens 2048 \
-  --min-tokens 1536 \
+  --prompt-repeat 64 \
+  --max-tokens 8192 \
+  --min-tokens 8192 \
   --ignore-eos \
   --trust-remote-code
 ```

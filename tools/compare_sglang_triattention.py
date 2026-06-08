@@ -34,6 +34,8 @@ CSV_FIELDS = [
     "kv_budget",
     "divide_length",
     "max_tokens",
+    "min_tokens",
+    "ignore_eos",
     "concurrency",
     "requests",
     "successes",
@@ -75,6 +77,21 @@ PROMPT_UNIT = (
 DEFAULT_STATS_RELATIVE_PATH = (
     "triattention/calibration/for_aime25_experiment/qwen3_8b.pt"
 )
+
+WORKLOAD_PROFILES: dict[str, dict[str, Any]] = {
+    "long-prompt": {
+        "prompt_repeat": 1200,
+        "max_tokens": 2048,
+        "min_tokens": 0,
+        "ignore_eos": False,
+    },
+    "decode-stress": {
+        "prompt_repeat": 64,
+        "max_tokens": 8192,
+        "min_tokens": 8192,
+        "ignore_eos": True,
+    },
+}
 
 
 def default_triattention_root() -> str:
@@ -679,12 +696,14 @@ def build_row(
     )
     return {
         "label": label,
-        "workload": "concurrency",
+        "workload": args.workload_profile,
         "model": args.model,
         "prompt_repeat": actual_prompt_repeat,
         "kv_budget": "" if budget is None else budget,
         "divide_length": "" if budget is None else args.divide_length,
         "max_tokens": args.max_tokens,
+        "min_tokens": args.min_tokens,
+        "ignore_eos": str(args.ignore_eos).lower(),
         "concurrency": concurrency,
         "requests": len(request_metrics),
         "successes": len(successes),
@@ -728,12 +747,38 @@ def parse_int_list(raw: str) -> list[int]:
     return values
 
 
+def apply_workload_profile(args: argparse.Namespace) -> None:
+    profile = WORKLOAD_PROFILES[args.workload_profile]
+    if args.prompt_repeat is None:
+        args.prompt_repeat = int(profile["prompt_repeat"])
+    if args.max_tokens is None:
+        args.max_tokens = int(profile["max_tokens"])
+    if args.min_tokens is None:
+        args.min_tokens = (
+            args.max_tokens
+            if args.workload_profile == "decode-stress"
+            else int(profile["min_tokens"])
+        )
+    if profile["ignore_eos"]:
+        args.ignore_eos = True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare kvcached-only and kvcached+TriAttention on a "
             "long-context SGLang workload."
         )
+    )
+    parser.add_argument(
+        "--workload-profile",
+        choices=sorted(WORKLOAD_PROFILES),
+        default="decode-stress",
+        help=(
+            "decode-stress uses a short prompt and long forced decode so "
+            "SGLang TriAttention reclaim can affect GPU peak memory. "
+            "long-prompt keeps the original prompt-heavy workload."
+        ),
     )
     parser.add_argument("--model", default="/root/data/models/Qwen/Qwen3-8B")
     parser.add_argument(
@@ -768,7 +813,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(tempfile.gettempdir()) / "triattn-sglang-compare",
     )
-    parser.add_argument("--prompt-repeat", type=int, default=1200)
+    parser.add_argument("--prompt-repeat", type=int, default=None)
     parser.add_argument(
         "--prompt-token-margin",
         type=int,
@@ -778,11 +823,11 @@ def parse_args() -> argparse.Namespace:
             "the long prompt."
         ),
     )
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument(
         "--min-tokens",
         type=int,
-        default=0,
+        default=None,
         help=(
             "Forward min_tokens to SGLang's OpenAI-compatible endpoint. "
             "Use a value larger than the KV budget to exercise decode-time "
@@ -827,7 +872,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run only kvcached baseline rows.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    apply_workload_profile(args)
+    return args
 
 
 def resolve_triattention_paths(args: argparse.Namespace) -> None:
@@ -887,7 +934,8 @@ def main() -> int:
     print(f"TriAttention root: {args.triattention_root}")
     print(f"TriAttention stats: {args.stats_path}")
     print(
-        f"Workload: prompt_repeat={args.prompt_repeat}, max_tokens={args.max_tokens}, "
+        f"Workload: profile={args.workload_profile}, "
+        f"prompt_repeat={args.prompt_repeat}, max_tokens={args.max_tokens}, "
         f"min_tokens={args.min_tokens}, ignore_eos={args.ignore_eos}, "
         f"concurrencies={args.concurrencies}, budgets={args.budgets}"
     )
@@ -895,7 +943,7 @@ def main() -> int:
     for idx, (label, budget, pair_budget, concurrency) in enumerate(plan, start=1):
         budget_tag = f"budget{pair_budget}"
         log_name = (
-            f"concurrency-{label}-{budget_tag}-tok{args.max_tokens}-"
+            f"concurrency-{args.workload_profile}-{label}-{budget_tag}-tok{args.max_tokens}-"
             f"conc{concurrency}-{int(time.time())}.log"
         )
         log_path = args.log_dir / log_name
