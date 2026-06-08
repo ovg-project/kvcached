@@ -57,7 +57,6 @@ FTensor::FTensor(const std::string &name, size_t size, torch::Dtype dtype,
   auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
   auto options =
       torch::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
-  torch::NoGradGuard no_grad;
   tensor_ =
       torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
 }

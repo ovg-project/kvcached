@@ -64,7 +64,7 @@ index 6871474..7bc4651 100644
 
  from . import input_patch_state as _patch_state
 
-@@ -27,6 +28,109 @@ def _debug_preserve_rope_positions() -> bool:
+@@ -27,6 +28,106 @@ def _debug_preserve_rope_positions() -> bool:
      return os.environ.get("TRIATTN_DEBUG_V1_PRESERVE_ROPE_POSITIONS", "0") == "1"
 
 
@@ -142,8 +142,7 @@ index 6871474..7bc4651 100644
 +            return True
 +        except TypeError:
 +            try:
-+                # Some vLLM builds expose the function without binding it as an
-+                # instance method; pass the table explicitly in that case.
++                # Handle unbound compatibility shims.
 +                method(block_table_obj, req_indices, positions)
 +                return True
 +            except TypeError:
@@ -166,8 +165,6 @@ index 6871474..7bc4651 100644
 +        if committed:
 +            return True
 +
-+    # Some vLLM variants write directly into the active slot-mapping buffer
-+    # during compute_slot_mapping and expose no explicit commit hook.
 +    return _get_buffer_np(block_table_obj, "slot_mapping") is not None
 +
 +
@@ -237,21 +234,12 @@ diff --git a/triattention/vllm/runtime/integration_monkeypatch.py b/triattention
 index 6fb2df8..9ecefa1 100644
 --- a/triattention/vllm/runtime/integration_monkeypatch.py
 +++ b/triattention/vllm/runtime/integration_monkeypatch.py
-@@ -87,9 +87,33 @@ def _refresh_scheduler_stats_kv_usage(outputs: Any, kv_usage: float) -> None:
+@@ -87,9 +87,24 @@ def _refresh_scheduler_stats_kv_usage(outputs: Any, kv_usage: float) -> None:
              scheduler_stats.kv_cache_usage = usage
 
 
 +def _assert_apc_disabled(scheduler_self: Any) -> None:
-+    """Hard-fail when vLLM automatic prefix caching is enabled.
-+
-+    TriAttention's block reclaim path calls ``block_pool.free_blocks(...)``.
-+    Under kvcached that resolves to ``ElasticBlockPool.free_blocks``, which —
-+    when prefix caching is enabled — decrements ref counts and stashes the
-+    blocks in ``_evictable_blocks`` instead of returning them to the kvcached
-+    allocator. Because TriAttention has already truncated the request's
-+    block list, those stashed blocks become orphans and the freed KV slots
-+    are never reused. To avoid silent corruption we refuse to start.
-+    """
++    """Fail fast because APC can orphan TriAttention-reclaimed blocks."""
 +    vllm_cfg = getattr(scheduler_self, "vllm_config", None)
 +    cache_cfg = getattr(vllm_cfg, "cache_config", None)
 +    if cache_cfg is None:
@@ -284,7 +272,7 @@ index de07981..706e34a 100644
      backend = getattr(group, "backend", None)
      if backend is None:
          return None
-@@ -65,6 +67,63 @@ def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
+@@ -65,6 +67,57 @@ def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
      return None
 
 
@@ -309,10 +297,6 @@ index de07981..706e34a 100644
 +    if isinstance(kv_caches, dict):
 +        return _first_tensor(kv_caches.get(layer_name))
 +    if isinstance(kv_caches, (list, tuple)):
-+        # vLLM variants differ here:
-+        # - some expose a flat list of layer tensors;
-+        # - some expose per-group containers;
-+        # - some expose dict-like layer mappings inside the list.
 +        if gid < len(kv_caches):
 +            group_entry = kv_caches[gid]
 +            if isinstance(group_entry, dict):
@@ -340,8 +324,6 @@ index de07981..706e34a 100644
 +        try:
 +            register_kv_layout_axis_hint(tensor, kv_axis_hint)
 +        except ValueError:
-+            # Best effort registration only; compaction path will fail-fast if
-+            # an ambiguous layout cannot be safely disambiguated.
 +            pass
 +
 +
@@ -573,26 +555,14 @@ index 0631b30..8572771 100644
              )
              continue
 
-@@ -140,7 +163,21 @@ def execute_runner_compression_actions(
+@@ -140,7 +163,9 @@ def execute_runner_compression_actions(
              )
              # Resolve scheduler_nct for this request so state can record
              # the num_computed_tokens at compression time (used by
 -            # build_effective_sparse_overrides for stable delta).
 +            # compression_anchored_effective_len for stable post-compression
-+            # decode tracking — without this the regression guard fires on
-+            # the next step because anchored fallback can't compute a delta).
-+            #
-+            # Order matters:
-+            # 1. ``scheduled_cached_reqs`` — authoritative for subsequent
-+            #    compressions on requests that are mid-decode.
-+            # 2. ``before_len`` (effective_tokens_before) — for the FIRST
-+            #    compression. The request still lives in
-+            #    ``scheduled_new_reqs`` whose ``num_computed_tokens`` reflects
-+            #    the pre-prefill state (0 or a small chunk offset), NOT the
-+            #    post-prefill KV position where compression actually happens.
-+            #    ``before_len`` is the worker-side measured KV length at the
-+            #    moment of compression, which is exactly what anchored decode
-+            #    tracking needs.
++            # decode tracking. For the first compression, scheduled_new_reqs
++            # can still carry the pre-prefill count, so fall back to before_len.
              _sched_nct = None
              _cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
              if _cached_reqs is not None:
@@ -646,14 +616,11 @@ diff --git a/triattention/vllm/runtime/scheduler.py b/triattention/vllm/runtime/
 index dd4151a..06ad4fc 100644
 --- a/triattention/vllm/runtime/scheduler.py
 +++ b/triattention/vllm/runtime/scheduler.py
-@@ -103,6 +103,18 @@ class TriAttentionScheduler(Scheduler):
+@@ -103,6 +103,15 @@ class TriAttentionScheduler(Scheduler):
              include_finished_set=include_finished_set,
              log_stats=log_stats,
          )
-+        # Refuse to run when vLLM automatic prefix caching is enabled.
-+        # See _assert_apc_disabled in integration_monkeypatch.py for why
-+        # ElasticBlockPool.free_blocks under APC silently orphans freed
-+        # blocks after TriAttention reclaim.
++        # Keep subclass and monkeypatch paths equally fail-fast.
 +        cache_cfg = getattr(vllm_config, "cache_config", None)
 +        if cache_cfg is not None and bool(
 +            getattr(cache_cfg, "enable_prefix_caching", False)

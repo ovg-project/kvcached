@@ -2,18 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare long-context vLLM serving with and without TriAttention.
-
-This script starts two kinds of vLLM servers repeatedly:
-
-* kvcached-only baseline: ENABLE_KVCACHED=true, ENABLE_TRIATTENTION=0
-* kvcached + TriAttention: ENABLE_KVCACHED=true, ENABLE_TRIATTENTION=1
-
-For each run it sends a concurrent long-context streaming workload, samples GPU
-memory, parses the server log for TriAttention activity, and writes a CSV row.
-It intentionally uses only the Python standard library so it can run in the same
-venv as vLLM without extra client dependencies.
-"""
+"""Compare kvcached-only and kvcached+TriAttention vLLM serving."""
 
 from __future__ import annotations
 
@@ -132,6 +121,14 @@ def percentile(values: list[float], q: float) -> float:
 
 def mean(values: list[float]) -> float:
     return statistics.fmean(values) if values else 0.0
+
+
+def count_regex(pattern: str, text: str) -> int:
+    return len(re.findall(pattern, text))
+
+
+def sum_first_group(pattern: str, text: str) -> int:
+    return sum(int(match.group(1)) for match in re.finditer(pattern, text))
 
 
 def read_gpu_mib(gpu_index: int) -> int | None:
@@ -350,8 +347,12 @@ def make_env(
     event_sink_path: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
-    env["ENABLE_KVCACHED"] = "true"
-    env["ENABLE_TRIATTENTION"] = "1" if enable_triattention else "0"
+    env.update(
+        {
+            "ENABLE_KVCACHED": "true",
+            "ENABLE_TRIATTENTION": "1" if enable_triattention else "0",
+        }
+    )
     env.setdefault("KVCACHED_LOG_LEVEL", args.kvcached_log_level)
     env.setdefault("VLLM_USE_DEEP_GEMM", "0")
     if args.offline:
@@ -366,19 +367,23 @@ def make_env(
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
 
     if enable_triattention:
+        env.update(
+            {
+                "TRIATTN_RUNTIME_MODEL_PATH": args.model,
+                "TRIATTN_RUNTIME_DIVIDE_LENGTH": str(args.divide_length),
+                "TRIATTN_RUNTIME_WINDOW_SIZE": str(args.window_size),
+                "TRIATTN_RUNTIME_LOG_DECISIONS": "true",
+                "TRIATTN_RUNTIME_REQUIRE_TRITON_SCORING": "true",
+                "TRIATTN_RUNTIME_REQUIRE_PHYSICAL_RECLAIM": "true",
+                "TRIATTN_RUNTIME_DISABLE_COMPRESSION": "false",
+                "TRIATTN_RUNTIME_ENABLE_EXPERIMENTAL_KV_COMPACTION": "true",
+                "TRIATTN_RUNTIME_ENABLE_EXPERIMENTAL_BLOCK_RECLAIM": "true",
+            }
+        )
         if args.stats_path:
             env["TRIATTN_RUNTIME_SPARSE_STATS_PATH"] = args.stats_path
-        env["TRIATTN_RUNTIME_MODEL_PATH"] = args.model
         if budget is not None:
             env["TRIATTN_RUNTIME_KV_BUDGET"] = str(budget)
-        env["TRIATTN_RUNTIME_DIVIDE_LENGTH"] = str(args.divide_length)
-        env["TRIATTN_RUNTIME_WINDOW_SIZE"] = str(args.window_size)
-        env["TRIATTN_RUNTIME_LOG_DECISIONS"] = "true"
-        env["TRIATTN_RUNTIME_REQUIRE_TRITON_SCORING"] = "true"
-        env["TRIATTN_RUNTIME_REQUIRE_PHYSICAL_RECLAIM"] = "true"
-        env["TRIATTN_RUNTIME_DISABLE_COMPRESSION"] = "false"
-        env["TRIATTN_RUNTIME_ENABLE_EXPERIMENTAL_KV_COMPACTION"] = "true"
-        env["TRIATTN_RUNTIME_ENABLE_EXPERIMENTAL_BLOCK_RECLAIM"] = "true"
         if event_sink_path is not None:
             env["TRIATTN_RUNTIME_EVENT_SINK_PATH"] = str(event_sink_path)
     return env
@@ -528,36 +533,29 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         text = ""
-    reclaimed = 0
-    for match in re.finditer(r"reclaimed_blocks=([0-9]+)", text):
-        reclaimed += int(match.group(1))
-    scheduler_freed = 0
-    for match in re.finditer(r"TriAttention scheduler FREE_BLOCKS:[^\n]*freed=([0-9]+)", text):
-        scheduler_freed += int(match.group(1))
-    applied_from_runner_log = len(re.findall(r"TriAttention compression applied", text))
-    applied_from_scheduler_events = 0
-    for match in re.finditer(
+    reclaimed = sum_first_group(r"reclaimed_blocks=([0-9]+)", text)
+    scheduler_freed = sum_first_group(
+        r"TriAttention scheduler FREE_BLOCKS:[^\n]*freed=([0-9]+)", text
+    )
+    applied_from_runner_log = count_regex(r"TriAttention compression applied", text)
+    applied_from_scheduler_events = sum_first_group(
         r"TriAttention update_from_output: received [0-9]+ events \(([0-9]+) applied\)",
         text,
-    ):
-        applied_from_scheduler_events += int(match.group(1))
+    )
     event_sink = parse_event_sink(event_sink_path)
-    skip_reasons: Counter[str] = Counter()
-    for match in re.finditer(
-        r"TriAttention compression skipped[^\n]*reason=([^\s,]+)", text
-    ):
-        skip_reasons[match.group(1)] += 1
-    for match in re.finditer(
-        r"TriAttention compression skipped \(([^)]+)\)", text
-    ):
-        skip_reasons[match.group(1).replace(" ", "_")] += 1
-    skip_reasons.update(event_sink["skip_reasons"])
-    activation_failures = len(
-        re.findall(
-            r"\[TriAttention\].*Activation failed|"
-            r"\[TriAttention\].*Runtime plugin activation failed",
-            text,
+    skip_reasons: Counter[str] = Counter(
+        reason.replace(" ", "_")
+        for pattern in (
+            r"TriAttention compression skipped[^\n]*reason=([^\s,]+)",
+            r"TriAttention compression skipped \(([^)]+)\)",
         )
+        for reason in re.findall(pattern, text)
+    )
+    skip_reasons.update(event_sink["skip_reasons"])
+    activation_failures = count_regex(
+        r"\[TriAttention\].*Activation failed|"
+        r"\[TriAttention\].*Runtime plugin activation failed",
+        text,
     )
     return {
         "compression_events": max(
@@ -566,15 +564,15 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
             int(event_sink["applied"]),
         ),
         "compression_skipped_events": max(
-            len(re.findall(r"TriAttention compression skipped", text)),
+            count_regex(r"TriAttention compression skipped", text),
             int(event_sink["skipped"]),
         ),
         "compression_skip_reasons": ";".join(
             f"{reason}:{count}" for reason, count in skip_reasons.most_common()
         ),
         "free_blocks_events": (
-            len(re.findall(r"TriAttention block reclaim", text))
-            + len(re.findall(r"TriAttention scheduler FREE_BLOCKS", text))
+            count_regex(r"TriAttention block reclaim", text)
+            + count_regex(r"TriAttention scheduler FREE_BLOCKS", text)
         ),
         "freed_blocks": max(reclaimed, scheduler_freed, int(event_sink["freed_blocks"])),
         "triattention_activation_seen": bool(
@@ -587,7 +585,7 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
             )
         ),
         "triattention_activation_failures": activation_failures,
-        "error_count": len(re.findall(r"\bERROR\b|\[ERROR\]", text)),
+        "error_count": count_regex(r"\bERROR\b|\[ERROR\]", text),
     }
 
 
@@ -691,11 +689,7 @@ def write_row(output_csv: Path, row: dict[str, Any]) -> None:
 
 
 def parse_int_list(raw: str) -> list[int]:
-    values = []
-    for part in raw.split(","):
-        stripped = part.strip()
-        if stripped:
-            values.append(int(stripped))
+    values = [int(part.strip()) for part in raw.split(",") if part.strip()]
     if not values:
         raise argparse.ArgumentTypeError("expected at least one integer")
     return values
