@@ -31,11 +31,7 @@ int init_gpu() {
   int dev_idx = vmm::current_device();
 
   size_t free_mem = 0, total_mem = 0;
-#if defined(KVCACHED_USE_HIP)
-  CHECK_GPU(hipMemGetInfo(&free_mem, &total_mem));
-#elif defined(KVCACHED_USE_CUDA)
-  CHECK_GPU(cudaMemGetInfo(&free_mem, &total_mem));
-#endif
+  CHECK_GPU(vmm::mem_get_info(&free_mem, &total_mem));
 
   std::cout << "Backend: " << vmm::backend_name() << std::endl;
   std::cout << "Total Free Memory: " << (float)free_mem / std::giga::num << "GB"
