@@ -12,6 +12,7 @@
     <a href="https://arxiv.org/abs/2505.04021"><img alt="arXiv: Multi LLM Serving" src="https://img.shields.io/badge/arXiv-Multi%20LLM%20Serving-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
     <a href="https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw"><img alt="Slack Join" src="https://img.shields.io/badge/Slack-Join-4A154B?logo=slack&logoColor=white&labelColor=555555"></a>
     <a href="https://deepwiki.com/ovg-project/kvcached"><img alt="DeepWiki" src="https://img.shields.io/badge/DeepWiki-Docs-6B46C1?logo=book&logoColor=white&labelColor=555555"></a>
+    <a href="https://kvcached.org/"><img alt="Homepage" src="https://img.shields.io/badge/Homepage-kvcached.org-0A66C2?logo=internetexplorer&logoColor=white&labelColor=555555"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   </p>
 
@@ -240,12 +241,18 @@ kvcached is developed by many contributors from the community. The best way to c
 ## Trusted and deployed by
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Intel_Logo.png" alt="Intel" height="44" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/AMD_Logo.png" alt="AMD" height="32" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Google_Logo.webp" alt="Google" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/LinkedIn_Logo.svg" alt="LinkedIn" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Intel_Logo.png" alt="Intel" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/AMD_Logo.png" alt="AMD" height="34" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Red_Hat_Logo.png" alt="Red Hat" height="34" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/ByteDance_Logo.svg" alt="ByteDance" height="30" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Alibaba_Cloud_Logo.png" alt="Alibaba Cloud" height="25" />&nbsp;&nbsp;&nbsp;
-  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Tencent_Logo.png" alt="Tencent" height="30" />
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Adobe_Logo.png" alt="Adobe" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Sony_Logo.png" alt="Sony" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/ByteDance_Logo.svg" alt="ByteDance" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Alibaba_Cloud_Logo.png" alt="Alibaba Cloud" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Tencent_Logo.png" alt="Tencent" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Moreh_Logo.png" alt="Moreh" height="34" />&nbsp;&nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="34" />
 </p>
 
 ## Citation
