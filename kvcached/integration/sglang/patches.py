@@ -1258,11 +1258,14 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
             return False
 
         def _make_wrapped(original: Callable[..., Any]) -> Callable[..., Any]:
-            def _wrapped(self, *args: Any, **kwargs: Any):
+            import functools
+
+            @functools.wraps(original)
+            def _wrapped(sched_self, *args: Any, **kwargs: Any):
                 # Disable memory leak detection when ENABLE_KVCACHED is set
                 if enable_kvcached():
                     return
-                return original(self, *args, **kwargs)
+                return original(sched_self, *args, **kwargs)
 
             return _wrapped
 
