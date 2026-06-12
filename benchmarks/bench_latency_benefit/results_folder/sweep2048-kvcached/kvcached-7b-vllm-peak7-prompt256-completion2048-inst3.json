@@ -1,0 +1,665 @@
+{
+  "date": "20260302-200426",
+  "backend": "vllm",
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "tokenizer_id": "Qwen/Qwen2.5-7B-Instruct",
+  "num_prompts": 49,
+  "peak_rps": "7,tag",
+  "request_rate": "inf",
+  "burstiness": 1.0,
+  "max_concurrency": null,
+  "ramp_up_strategy": "ramp-up-down",
+  "ramp_start_rps": 0,
+  "ramp_peak_rps": 7,
+  "ramp_end_rps": 1,
+  "ramp_increment": 1,
+  "duration": 97.8396449459251,
+  "completed": 49,
+  "total_input_tokens": 12544,
+  "total_output_tokens": 86156,
+  "request_throughput": 0.5008194789247422,
+  "request_goodput": null,
+  "output_throughput": 880.5837352293896,
+  "total_token_throughput": 1008.7935218341237,
+  "request_timestamps": [
+    {
+      "time": 2.825702540576458e-05,
+      "wall_time": 1772481768.3267524,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 1.000965948915109,
+      "wall_time": 1772481769.3276908,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 1.501024846918881,
+      "wall_time": 1772481769.8277495,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 2.002069259993732,
+      "wall_time": 1772481770.3287938,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 2.3353848170954734,
+      "wall_time": 1772481770.6621094,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 2.6669620890170336,
+      "wall_time": 1772481770.9936864,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 3.000243595102802,
+      "wall_time": 1772481771.326968,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 3.2507985080592334,
+      "wall_time": 1772481771.577523,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 3.5020064141135663,
+      "wall_time": 1772481771.8287315,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 3.750971837900579,
+      "wall_time": 1772481772.0776963,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 4.000551925972104,
+      "wall_time": 1772481772.3272765,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 4.200161922024563,
+      "wall_time": 1772481772.5268865,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 4.401359071955085,
+      "wall_time": 1772481772.7280848,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 4.600137076107785,
+      "wall_time": 1772481772.9268622,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 4.8004386480897665,
+      "wall_time": 1772481773.1271632,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.000926489010453,
+      "wall_time": 1772481773.327651,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.167183687910438,
+      "wall_time": 1772481773.4939082,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.333672090899199,
+      "wall_time": 1772481773.6603966,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.500557790044695,
+      "wall_time": 1772481773.8272824,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.667411606991664,
+      "wall_time": 1772481773.994136,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 5.833997790003195,
+      "wall_time": 1772481774.1607234,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.001035575987771,
+      "wall_time": 1772481774.327761,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.143789489055052,
+      "wall_time": 1772481774.4705138,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.286654283059761,
+      "wall_time": 1772481774.6133792,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.428765676915646,
+      "wall_time": 1772481774.7554903,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.572282620007172,
+      "wall_time": 1772481774.8990073,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.714530634926632,
+      "wall_time": 1772481775.0412557,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 6.857349925907329,
+      "wall_time": 1772481775.1840744,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.000370081979781,
+      "wall_time": 1772481775.3270946,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.167311872122809,
+      "wall_time": 1772481775.494037,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.333501416957006,
+      "wall_time": 1772481775.6602266,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.5007776820566505,
+      "wall_time": 1772481775.8275023,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.667408348992467,
+      "wall_time": 1772481775.9941328,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 7.834518359974027,
+      "wall_time": 1772481776.161243,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 8.001082844100893,
+      "wall_time": 1772481776.3278074,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 8.20040324400179,
+      "wall_time": 1772481776.5271285,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 8.400444929022342,
+      "wall_time": 1772481776.7271695,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 8.600236889906228,
+      "wall_time": 1772481776.9269614,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 8.800531036918983,
+      "wall_time": 1772481777.1272562,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 9.00020755105652,
+      "wall_time": 1772481777.326932,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 9.251799975056201,
+      "wall_time": 1772481777.5785244,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 9.500470045022666,
+      "wall_time": 1772481777.8271947,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 9.750458942959085,
+      "wall_time": 1772481778.0771835,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 10.000363687984645,
+      "wall_time": 1772481778.3270888,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 10.33374289306812,
+      "wall_time": 1772481778.6604674,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 10.666878710035235,
+      "wall_time": 1772481778.9936032,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 11.000356781994924,
+      "wall_time": 1772481779.3270812,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 11.500352303963155,
+      "wall_time": 1772481779.827077,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 12.000473824096844,
+      "wall_time": 1772481780.3271985,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "send"
+    },
+    {
+      "time": 87.44453003210947,
+      "wall_time": 1772481855.7712543,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 88.4995857370086,
+      "wall_time": 1772481856.8263106,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 89.03011073591188,
+      "wall_time": 1772481857.3568354,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 89.5637071300298,
+      "wall_time": 1772481857.8904316,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 89.88924925611354,
+      "wall_time": 1772481858.2159739,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 90.21618023794144,
+      "wall_time": 1772481858.5429046,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 90.54201243608259,
+      "wall_time": 1772481858.8687367,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 90.78928379691206,
+      "wall_time": 1772481859.1160083,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 18.373424523044378,
+      "wall_time": 1772481786.7001495,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 91.32265122281387,
+      "wall_time": 1772481859.6493757,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 91.54487947397865,
+      "wall_time": 1772481859.871604,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 91.73354413197376,
+      "wall_time": 1772481860.0602686,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 91.88089892407879,
+      "wall_time": 1772481860.2076247,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.06489472999237,
+      "wall_time": 1772481860.39162,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.24997480306774,
+      "wall_time": 1772481860.5766993,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.43166050314903,
+      "wall_time": 1772481860.758385,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.58071604999714,
+      "wall_time": 1772481860.9074404,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.72927241097204,
+      "wall_time": 1772481861.055997,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 92.8800455329474,
+      "wall_time": 1772481861.2067702,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 93.02785463491455,
+      "wall_time": 1772481861.3545792,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 93.17873485013843,
+      "wall_time": 1772481861.5054605,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 10.925044744974002,
+      "wall_time": 1772481779.25177,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 11.21393139497377,
+      "wall_time": 1772481779.5406556,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 93.54695458803326,
+      "wall_time": 1772481861.8736796,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 93.69343916978687,
+      "wall_time": 1772481862.0201638,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 93.80356386303902,
+      "wall_time": 1772481862.1302886,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 7.94662244990468,
+      "wall_time": 1772481776.2733476,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 94.05613197293133,
+      "wall_time": 1772481862.3828564,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 94.16263720812276,
+      "wall_time": 1772481862.4893618,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 94.30805091722868,
+      "wall_time": 1772481862.6347759,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 94.44890396483243,
+      "wall_time": 1772481862.775629,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 26.214146498125046,
+      "wall_time": 1772481794.5408711,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 22.41670221881941,
+      "wall_time": 1772481790.7434266,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 94.86914584506303,
+      "wall_time": 1772481863.1958704,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.00916857412085,
+      "wall_time": 1772481863.3358932,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.18621124490164,
+      "wall_time": 1772481863.5129364,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.36292854696512,
+      "wall_time": 1772481863.6896532,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.5020497199148,
+      "wall_time": 1772481863.8287742,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.67960007186048,
+      "wall_time": 1772481864.0063252,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 95.85293398308568,
+      "wall_time": 1772481864.1796584,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 96.05628602020442,
+      "wall_time": 1772481864.3830104,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 96.26159631693736,
+      "wall_time": 1772481864.588321,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 96.46604510792531,
+      "wall_time": 1772481864.7927697,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 96.67069699987769,
+      "wall_time": 1772481864.9974222,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 96.94158946699463,
+      "wall_time": 1772481865.268314,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 23.566099903080612,
+      "wall_time": 1772481791.8928244,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 97.47555828420445,
+      "wall_time": 1772481865.8022828,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 97.83939856593497,
+      "wall_time": 1772481866.1661232,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    },
+    {
+      "time": 29.588783234125003,
+      "wall_time": 1772481797.915508,
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "type": "complete"
+    }
+  ],
+  "global_start_timestamp": 1772481768.3267245,
+  "rps_change_events": [
+    {
+      "rps": 0,
+      "timestamp": "2026-03-02T20:02:48.326744"
+    },
+    {
+      "rps": 1,
+      "timestamp": "2026-03-02T20:02:48.326744"
+    },
+    {
+      "rps": 2,
+      "timestamp": "2026-03-02T20:02:49.327679"
+    },
+    {
+      "rps": 3,
+      "timestamp": "2026-03-02T20:02:50.328782"
+    },
+    {
+      "rps": 4,
+      "timestamp": "2026-03-02T20:02:51.326958"
+    },
+    {
+      "rps": 5,
+      "timestamp": "2026-03-02T20:02:52.327268"
+    },
+    {
+      "rps": 6,
+      "timestamp": "2026-03-02T20:02:53.327642"
+    },
+    {
+      "rps": 7,
+      "timestamp": "2026-03-02T20:02:54.327750"
+    }
+  ],
+  "mean_ttft_ms": 114.29190709806826,
+  "median_ttft_ms": 112.89113317616284,
+  "std_ttft_ms": 13.362067442906714,
+  "p99_ttft_ms": 133.54294627904892,
+  "mean_tpot_ms": 42.31257537796849,
+  "median_tpot_ms": 42.52791474505069,
+  "std_tpot_ms": 0.5758244668210367,
+  "p99_tpot_ms": 42.7183608492608,
+  "mean_itl_ms": 42.498335587741295,
+  "median_itl_ms": 41.76591895520687,
+  "std_itl_ms": 3.292165181726347,
+  "p99_itl_ms": 50.420626434497535,
+  "mean_e2el_ms": 74796.00976997682,
+  "median_e2el_ms": 87162.26712614298,
+  "std_e2el_ms": 28178.73945163766,
+  "p99_e2el_ms": 87566.85945777223
+}
