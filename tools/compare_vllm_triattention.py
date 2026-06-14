@@ -440,15 +440,19 @@ def start_server(
     log_file = log_path.open("w", encoding="utf-8")
     log_file.write("$ " + " ".join(cmd) + "\n")
     log_file.flush()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-        preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception:
+        log_file.close()
+        raise
 
     def pump_log() -> None:
         assert proc.stdout is not None
