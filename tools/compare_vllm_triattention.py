@@ -332,11 +332,15 @@ def stream_chat_request(
 
     end = time.perf_counter()
     ttft = (first_chunk or end) - start
+    # A stream that opens and closes but yields no content tokens is a failure,
+    # not a success: e.g. the engine crashed mid-decode. Counting it as a
+    # success would report a (misleadingly low) GPU peak for a dead run.
     return RequestMetrics(
-        ok=True,
+        ok=chunks > 0,
         ttft_ms=ttft * 1000.0,
         e2e_ms=(end - start) * 1000.0,
         output_chunks=chunks,
+        error="" if chunks > 0 else "stream completed but produced 0 output tokens",
     )
 
 
