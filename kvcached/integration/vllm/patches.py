@@ -274,6 +274,31 @@ def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
     return bytes(block_hash) + group_id.to_bytes(4, "big", signed=False)
 
 
+def _reset_block_hash(block: Any) -> None:
+    """Clear vLLM's cached block hash before returning a block to kvcached."""
+    reset_hash = getattr(block, "reset_hash", None)
+    if callable(reset_hash):
+        reset_hash()
+        return
+    if hasattr(block, "_block_hash"):
+        block._block_hash = None
+    if hasattr(block, "_block_hash_num_tokens"):
+        block._block_hash_num_tokens = None
+
+
+def _set_block_hash(block: Any, key: Any) -> None:
+    """Set vLLM's cached block hash across API versions.
+
+    vLLM 0.24 and later expose a read-only property plus set_block_hash().
+    Older supported versions expose a writable block_hash property instead.
+    """
+    set_block_hash = getattr(block, "set_block_hash", None)
+    if callable(set_block_hash):
+        set_block_hash(key)
+    else:
+        block.block_hash = key
+
+
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
@@ -461,6 +486,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if key in self._cached_blocks:
                         continue
 
+                    # ElasticBlockPool tracks cached blocks through its own maps,
+                    # but vLLM manager code may still read KVCacheBlock.block_hash
+                    # after cache_full_blocks. Preserve that metadata contract and
+                    # clear it before the block is evicted or reused.
+                    if getattr(block, "block_hash", None) is None:
+                        _set_block_hash(block, key)
                     self._cached_blocks[key] = block
                     self._block_id_to_key[block.block_id] = key
 
@@ -471,10 +502,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 """
                 ids_to_free: list[int] = []
                 for _ in range(min(num_to_evict, len(self._evictable_blocks))):
-                    bid, _block = self._evictable_blocks.popitem(last=False)
+                    bid, block = self._evictable_blocks.popitem(last=False)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._cached_blocks.pop(key, None)
+                    _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
                     self.kv_cache_manager.free(ids_to_free)
@@ -557,6 +589,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             self._evictable_blocks[block.block_id] = block
                         else:
                             # Uncached block (e.g. partial): free immediately
+                            _reset_block_hash(block)
                             uncached_to_free.append(block.block_id)
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
@@ -576,10 +609,13 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 for bid in block_ids:
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        self._cached_blocks.pop(key, None)
+                        block = self._cached_blocks.pop(key, None)
+                        if block is not None:
+                            _reset_block_hash(block)
                         removed += 1
                     if bid in self._evictable_blocks:
-                        self._evictable_blocks.pop(bid)
+                        block = self._evictable_blocks.pop(bid)
+                        _reset_block_hash(block)
                         ids_to_free.append(bid)
 
                 if ids_to_free:
@@ -593,6 +629,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 # Free all evictable blocks back to kvcached
                 if self._evictable_blocks:
+                    for block in self._evictable_blocks.values():
+                        _reset_block_hash(block)
                     ids_to_free = list(self._evictable_blocks.keys())
                     self._evictable_blocks.clear()
                     self.kv_cache_manager.free(ids_to_free)
