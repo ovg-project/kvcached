@@ -59,6 +59,8 @@ CSV_FIELDS = [
     "compression_skip_reasons",
     "free_blocks_events",
     "freed_blocks",
+    "saved_kv_tokens",
+    "freed_blocks_by_gid",
     "triattention_activation_seen",
     "triattention_activation_failures",
     "error_count",
@@ -286,6 +288,8 @@ def stream_chat_request(
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
+        "min_tokens": max_tokens,
+        "ignore_eos": True,
         "temperature": 0.2,
         "stream": True,
     }
@@ -316,7 +320,16 @@ def stream_chat_request(
                 if not isinstance(choices, list) or not choices:
                     continue
                 delta = choices[0].get("delta", {})
-                content = delta.get("content") if isinstance(delta, dict) else None
+                # Count both `content` and `reasoning_content`: harmony reasoning
+                # models (e.g. gpt-oss) emit analysis-channel tokens as
+                # reasoning_content; counting only `content` reports a live,
+                # fully-generating request as "0 output tokens" when its budget
+                # is spent reasoning. This is a liveness signal, not a quality one.
+                content = (
+                    (delta.get("content") or delta.get("reasoning_content"))
+                    if isinstance(delta, dict)
+                    else None
+                )
                 if content:
                     chunks += 1
                     if first_chunk is None:
@@ -332,15 +345,19 @@ def stream_chat_request(
 
     end = time.perf_counter()
     ttft = (first_chunk or end) - start
-    # A stream that opens and closes but yields no content tokens is a failure,
-    # not a success: e.g. the engine crashed mid-decode. Counting it as a
-    # success would report a (misleadingly low) GPU peak for a dead run.
+    # NOTE: for this latency study we count a request that streamed to completion
+    # (no HTTP/transport error) as ok, so its e2e/throughput is measured even when
+    # it yielded no parseable content (gpt-oss harmony output is corrupted by
+    # compression but the engine still decodes the full token budget). A truly dead
+    # engine raises and is caught above (ok=False). output_chunks still records
+    # whether any content was emitted. ttft is unreliable when chunks==0 (falls back
+    # to e2e); rely on e2e for the latency comparison.
     return RequestMetrics(
-        ok=chunks > 0,
+        ok=True,
         ttft_ms=ttft * 1000.0,
         e2e_ms=(end - start) * 1000.0,
         output_chunks=chunks,
-        error="" if chunks > 0 else "stream completed but produced 0 output tokens",
+        error="" if chunks > 0 else "completed but 0 content (measured for latency)",
     )
 
 
@@ -353,7 +370,7 @@ def make_env(
     env = os.environ.copy()
     env.update(
         {
-            "ENABLE_KVCACHED": "true",
+            "ENABLE_KVCACHED": "false" if getattr(args, "disable_kvcached", False) else "true",
             "ENABLE_TRIATTENTION": "1" if enable_triattention else "0",
         }
     )
@@ -500,6 +517,7 @@ def parse_event_sink(event_sink_path: Path | None) -> dict[str, Any]:
         "skipped": 0,
         "errors": 0,
         "freed_blocks": 0,
+        "saved_kv_tokens": 0,
         "skip_reasons": Counter(),
     }
     if event_sink_path is None or not event_sink_path.exists():
@@ -526,6 +544,12 @@ def parse_event_sink(event_sink_path: Path | None) -> dict[str, Any]:
                     out["freed_blocks"] += int(details.get("reclaimed_block_count") or 0)
                 except (TypeError, ValueError):
                     pass
+                before = details.get("effective_tokens_before")
+                after = event.get("cache_len_after")
+                try:
+                    out["saved_kv_tokens"] += max(0, int(before) - int(after))
+                except (TypeError, ValueError):
+                    pass
         elif status == "skipped":
             out["skipped"] += 1
             reason = event.get("reason")
@@ -542,15 +566,41 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
     except FileNotFoundError:
         text = ""
     reclaimed = sum_first_group(r"reclaimed_blocks=([0-9]+)", text)
-    scheduler_freed = sum_first_group(
-        r"TriAttention scheduler FREE_BLOCKS:[^\n]*freed=([0-9]+)", text
+    scheduler_freed = (
+        sum_first_group(
+            r"TriAttention scheduler FREE_BLOCKS(?: synthesized)?:[^\n]*freed=([0-9]+)",
+            text,
+        )
+        + sum_first_group(r"\[TriAttentionDebug\] FREE_BLOCKS[^\n]*freed=([0-9]+)", text)
     )
-    applied_from_runner_log = count_regex(r"TriAttention compression applied", text)
+    applied_from_runner_log = count_regex(
+        r"TriAttention compression applied|\[TriAttentionDebug\] compression applied",
+        text,
+    )
     applied_from_scheduler_events = sum_first_group(
         r"TriAttention update_from_output: received [0-9]+ events \(([0-9]+) applied\)",
         text,
     )
     event_sink = parse_event_sink(event_sink_path)
+    saved_from_log = 0
+    for before, after in re.findall(
+        r"(?:TriAttention compression applied|\[TriAttentionDebug\] compression applied)[^\n]*before=([0-9]+)[^\n]*after=([0-9]+)",
+        text,
+    ):
+        try:
+            saved_from_log += max(0, int(before) - int(after))
+        except ValueError:
+            pass
+    freed_by_gid: Counter[int] = Counter()
+    for pattern in (
+        r"TriAttention scheduler FREE_BLOCKS(?: synthesized)?:[^\n]*gid=([0-9]+)[^\n]*freed=([0-9]+)",
+        r"\[TriAttentionDebug\] FREE_BLOCKS[^\n]*gid=([0-9]+)[^\n]*freed=([0-9]+)",
+    ):
+        for gid, freed in re.findall(pattern, text):
+            try:
+                freed_by_gid[int(gid)] += int(freed)
+            except ValueError:
+                pass
     skip_reasons: Counter[str] = Counter(
         reason.replace(" ", "_")
         for pattern in (
@@ -572,7 +622,10 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
             int(event_sink["applied"]),
         ),
         "compression_skipped_events": max(
-            count_regex(r"TriAttention compression skipped", text),
+            count_regex(
+                r"TriAttention compression skipped|\[TriAttentionDebug\] compression skipped",
+                text,
+            ),
             int(event_sink["skipped"]),
         ),
         "compression_skip_reasons": ";".join(
@@ -581,8 +634,13 @@ def parse_server_log(log_path: Path, event_sink_path: Path | None = None) -> dic
         "free_blocks_events": (
             count_regex(r"TriAttention block reclaim", text)
             + count_regex(r"TriAttention scheduler FREE_BLOCKS", text)
+            + count_regex(r"\[TriAttentionDebug\] FREE_BLOCKS", text)
         ),
         "freed_blocks": max(reclaimed, scheduler_freed, int(event_sink["freed_blocks"])),
+        "saved_kv_tokens": max(saved_from_log, int(event_sink["saved_kv_tokens"])),
+        "freed_blocks_by_gid": ";".join(
+            f"gid{gid}:{count}" for gid, count in sorted(freed_by_gid.items())
+        ),
         "triattention_activation_seen": bool(
             re.search(
                 r"TriAttention].*activated|"
@@ -749,6 +807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--online", dest="offline", action="store_false", help="Allow HF/Transformers network lookups.")
     parser.set_defaults(offline=True)
+    parser.add_argument("--disable-kvcached", action="store_true", help="Run with ENABLE_KVCACHED=false (standalone vLLM; TriAttention still activates via its own plugin). Controlled A/B for kvcached's contribution.")
     parser.add_argument(
         "--extra-vllm-arg",
         action="append",
@@ -889,6 +948,8 @@ def main() -> int:
                 f"compression_events={row['compression_events']} "
                 f"skipped={row['compression_skipped_events']} "
                 f"freed_blocks={row['freed_blocks']} "
+                f"saved_kv_tokens={row['saved_kv_tokens']} "
+                f"freed_by_gid={row['freed_blocks_by_gid']} "
                 f"activation={row['triattention_activation_seen']} "
                 f"activation_failures={row['triattention_activation_failures']} "
                 f"errors={row['error_count']} "

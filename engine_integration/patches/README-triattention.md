@@ -53,7 +53,10 @@ python tools/compare_vllm_triattention.py \
 Use `--skip-baseline` to run only the TriAttention row, or
 `--skip-triattention` to run only the kvcached baseline. Results are written to
 `results/results_vllm_tri_compare.csv` by default, and server logs are written
-under `/tmp/triattn-compare`.
+under `/tmp/triattn-compare`. The CSV includes `saved_kv_tokens`,
+`freed_blocks`, and `freed_blocks_by_gid`; for hybrid-attention models such as
+gpt-oss, TriAttention should reclaim only the plain full-attention gid and leave
+sliding-window groups untouched.
 
 ### SGLang
 
