@@ -1,0 +1,108 @@
+site_name: kvcached Documentation
+site_url: https://ovg-project.github.io/kvcached
+site_description: Comprehensive documentation for kvcached - GPU virtual memory management for LLM KV cache
+site_author: The kvcached team
+
+repo_url: https://github.com/ovg-project/kvcached
+repo_name: ovg-project/kvcached
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.tabs.link
+    - content.code.copy
+    - content.action.edit
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search:
+      separator: '[\s\-\.]+'
+  - i18n:
+      docs_structure: folder
+      default_language: en
+      languages:
+        - locale: en
+          name: English
+          build: true
+          default: true
+        - locale: zh
+          name: 中文
+          build: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_mermaid
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quick-start.md
+      - Docker Deployment: getting-started/docker.md
+  - Core Concepts:
+      - Architecture: core-concepts/architecture.md
+      - GPU Virtual Memory: core-concepts/virtual-memory.md
+      - Autopatch System: core-concepts/autopatch.md
+      - Prefix Caching: core-concepts/prefix-caching.md
+  - User Guide:
+      - Multi-Model Serving: user-guide/multi-model.md
+      - Memory Control CLI: user-guide/memory-control.md
+      - Router & Sleep Management: user-guide/router-sleep.md
+      - Inference & Fine-tuning: user-guide/inference-finetune.md
+      - Serverless LLM: user-guide/serverless.md
+      - Workload Colocation: user-guide/workload-colocation.md
+  - Configuration:
+      - Environment Variables: configuration/environment.md
+      - Controller Configuration: configuration/controller.md
+      - Engine Options: configuration/engine-options.md
+  - Performance:
+      - Benchmarks: performance/benchmarks.md
+      - Tuning Guide: performance/tuning.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Build System: development/build-system.md
+      - Testing: development/testing.md
+  - FAQ: faq.md
