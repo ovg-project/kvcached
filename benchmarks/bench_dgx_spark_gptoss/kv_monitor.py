@@ -115,6 +115,9 @@ def main() -> int:
     peak_gpu = 0
     seg_names: set[str] = set()
     samples = 0
+    # running means over samples where a segment was active (for "avg committed")
+    sum_used = sum_prealloc = sum_phys = 0.0
+    active_samples = 0
     t0 = time.time()
 
     while not stop["v"]:
@@ -131,6 +134,11 @@ def main() -> int:
         peak_prealloc = max(peak_prealloc, prealloc)
         peak_phys = max(peak_phys, used + prealloc)
         peak_total = max(peak_total, total)
+        if total > 0:  # a segment was active this sample
+            sum_used += used
+            sum_prealloc += prealloc
+            sum_phys += used + prealloc
+            active_samples += 1
 
         m = scrape_metrics(args.metrics_url)
         for k, v in m.items():
@@ -155,6 +163,8 @@ def main() -> int:
         "kvcached_peak_used_gib": round(peak_used / gib, 3),       # live working set
         "kvcached_peak_prealloc_gib": round(peak_prealloc / gib, 3),
         "kvcached_peak_physical_gib": round(peak_phys / gib, 3),   # used+prealloc = true GPU footprint
+        "kvcached_avg_used_gib": round(sum_used / active_samples / gib, 3) if active_samples else 0.0,
+        "kvcached_avg_physical_gib": round(sum_phys / active_samples / gib, 3) if active_samples else 0.0,
         "peak_gpu_used_gib": round(peak_gpu / gib, 3) if peak_gpu else None,
         "peak_metrics": peak_metrics,                              # incl. num_preemptions_total, num_requests_waiting
     }

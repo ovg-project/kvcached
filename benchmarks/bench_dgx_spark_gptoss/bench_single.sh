@@ -51,7 +51,7 @@ for C in "${CONCS[@]}"; do
     --max-concurrency "$C" \
     --seed "$SEED" \
     --percentile-metrics ttft,tpot,itl,e2el \
-    --metric-percentiles 50,99 \
+    --metric-percentiles 50,90 \
     --ignore-eos \
     --save-result \
     --result-dir "$OUT_DIR" \
