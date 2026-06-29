@@ -25,13 +25,16 @@ logger = get_kvcached_logger()
 
 
 def _env_enabled() -> bool:
-    return os.getenv("KVCACHED_AUTOPATCH", "false").lower() in ("true", "1")
+    return (
+        os.getenv("ENABLE_KVCACHED", "false").lower() in ("true", "1")
+        or os.getenv("KVCACHED_AUTOPATCH", "false").lower() in ("true", "1")
+    )
 
 
 @when_imported("vllm")
 def _patch_vllm(_vllm: types.ModuleType) -> None:
     if not _env_enabled():
-        logger.debug("Disabled by KVCACHED_AUTOPATCH")
+        logger.debug("Disabled by ENABLE_KVCACHED/KVCACHED_AUTOPATCH")
         return
 
     # Create patch manager and register version-specific vLLM patches
