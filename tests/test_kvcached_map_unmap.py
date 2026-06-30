@@ -50,6 +50,11 @@ except ImportError:  # CLI usage does not require pytest
 DEFAULT_MODEL = os.getenv("KVCACHED_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 _GB = 1024 ** 3
 
+# Quick correctness probe: a factual question with an unambiguous answer, so a
+# garbled KV cache (e.g. a wrong layout / broken patch) shows up immediately.
+CORRECTNESS_PROMPT = "What is the capital of France? Answer in one word."
+CORRECTNESS_EXPECT = "paris"
+
 
 def _free_bytes() -> int:
     return torch.cuda.mem_get_info()[0]
@@ -159,6 +164,15 @@ def measure_map_unmap(
     log(f"[settle] free after free       = {settled / _GB:6.2f} GB")
     log(f"        UNMAP recovery         = {recovered / _GB:6.2f} GB")
 
+    # Quick correctness check: greedy answer to a factual question (run last so
+    # it doesn't perturb the map/unmap measurement above).
+    answer = llm.generate(
+        [CORRECTNESS_PROMPT], SamplingParams(max_tokens=16, temperature=0.0)
+    )[0].outputs[0].text.strip()
+    correct = CORRECTNESS_EXPECT in answer.lower()
+    log(f"[check] Q: {CORRECTNESS_PROMPT}")
+    log(f"        A: {answer!r}  -> {'OK' if correct else 'UNEXPECTED'}")
+
     return {
         "model": model,
         "kvcached": kvcached,
@@ -167,6 +181,8 @@ def measure_map_unmap(
         "settled": settled,
         "mapped_gb": mapped / _GB,
         "recovered_gb": recovered / _GB,
+        "answer": answer,
+        "correct": correct,
     }
 
 
@@ -188,6 +204,9 @@ if _HAS_PYTEST:
     assert m["recovered_gb"] > 0.5 * m["mapped_gb"], (
         f"expected UNMAP to recover >50% of {m['mapped_gb']:.2f} GB, "
         f"got {m['recovered_gb']:.2f} GB")
+    # Correctness: kvcached must not corrupt output.
+    assert m["correct"], (
+        f"expected an answer containing {CORRECTNESS_EXPECT!r}, got {m['answer']!r}")
 
 
 def _cli(argv=None) -> int:
@@ -211,6 +230,8 @@ def _cli(argv=None) -> int:
     )
 
     print("\n=== VERDICT ===")
+    print(f"  correctness     : {'PASS' if m['correct'] else 'FAIL'} "
+          f"(Q: capital of France -> A: {m['answer']!r})")
     if args.baseline:
         print(f"  baseline static pool: MAP delta={m['mapped_gb']:.2f} GB (expected ~0 / flat)")
         return 0
@@ -220,8 +241,8 @@ def _cli(argv=None) -> int:
           f"(free dropped {m['mapped_gb']:.2f} GB under load)")
     print(f"  on-demand UNMAP : {'PASS' if unmap_ok else 'FAIL'} "
           f"(free recovered {m['recovered_gb']:.2f} GB after free)")
-    ok = map_ok and unmap_ok
-    print(f"  RESULT: {'PASS - MAP + UNMAP confirmed' if ok else 'FAIL - see above'}")
+    ok = map_ok and unmap_ok and m["correct"]
+    print(f"  RESULT: {'PASS - correctness + MAP + UNMAP confirmed' if ok else 'FAIL - see above'}")
     return 0 if ok else 1
 
 
