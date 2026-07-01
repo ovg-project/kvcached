@@ -9,6 +9,7 @@ from wrapt.importer import when_imported
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
+    DeepSeekV4KVPoolBridgePatch,
     DeepSeekV4RuntimeReservationPatch,
     ElasticAllocatorPatch,
     ElasticHybridLinearKVPoolPatch,
@@ -43,6 +44,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4KVPoolBridgePatch(), SGLANG_ALL_RANGE),
             (DeepSeekV4RuntimeReservationPatch(), SGLANG_ALL_RANGE),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
