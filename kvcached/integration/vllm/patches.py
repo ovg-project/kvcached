@@ -1290,8 +1290,22 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 for gid, grp in enumerate(kv_cache_config.kv_cache_groups)
                 if _is_attention_spec(grp.kv_cache_spec)
             ]
+            distinct_attn_geoms = {_attn_geom(grp) for _, grp in attn_group_list}
+            # The relaxed validate gate admits attention groups with differing
+            # geometry as long as block_mem_size matches. Per-group views are only
+            # built for the pure-attention path; HYBRID_LINEAR (full attn + mamba)
+            # reshape still binds all attention layers to the first group's
+            # geometry, so heterogeneous attention geometry there would be wrong.
+            # No known hybrid-linear model has that, but fail loud rather than
+            # silently mis-stride.
+            if attention_type == "HYBRID_LINEAR" and len(distinct_attn_geoms) > 1:
+                raise NotImplementedError(
+                    "kvcached does not support hybrid-linear (attention + mamba) "
+                    "models with heterogeneous attention-group geometry "
+                    f"({sorted(distinct_attn_geoms)})."
+                )
             is_hetero = (attention_type != "HYBRID_LINEAR"
-                         and len({_attn_geom(grp) for _, grp in attn_group_list}) > 1)
+                         and len(distinct_attn_geoms) > 1)
             self._kvcached_attn_layer_views = None
 
             alloc_result = kvi.alloc_kv_cache(
