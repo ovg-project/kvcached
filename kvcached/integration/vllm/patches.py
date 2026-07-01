@@ -99,20 +99,33 @@ def _validate_kv_cache_groups(kv_cache_config: Any) -> None:
 
     first_spec = first_attn_group.kv_cache_spec
     block_size = first_spec.block_size
-    cell_size, _ = _get_kv_cache_params(first_spec, block_size)
+    cell_size, num_kv_buffers = _get_kv_cache_params(first_spec, block_size)
+    block_mem_size = block_size * cell_size
 
     for idx, grp in enumerate(kv_groups):
         grp_spec = grp.kv_cache_spec
         if not _is_attention_spec(grp_spec):
             continue
         grp_block_size = grp_spec.block_size
-        grp_cell_size, _ = _get_kv_cache_params(grp_spec, grp_block_size)
-        if grp_block_size != block_size or grp_cell_size != cell_size:
+        grp_cell_size, grp_num_kv_buffers = _get_kv_cache_params(grp_spec, grp_block_size)
+        grp_block_mem_size = grp_block_size * grp_cell_size
+        # kvcached needs one uniform physical block stride (block_mem_size =
+        # bytes/block per K-or-V) and one K/V buffer count. It does NOT require
+        # identical block_size/cell_size individually: attention groups that split
+        # a block into different token counts (e.g. Gemma's sliding-window
+        # block_size=64/cell=1024 vs full-attention block_size=16/cell=4096, both
+        # block_mem_size=65536) share one physical pool and get a per-group
+        # as_strided view. Reject only when the physical block stride or the K/V
+        # buffer count actually differ (a genuine single-pool violation, e.g.
+        # mixing MLA num_kv_buffers=1 with MHA num_kv_buffers=2).
+        if grp_block_mem_size != block_mem_size or grp_num_kv_buffers != num_kv_buffers:
             raise ValueError(
-                "kvcached requires all attention KV cache groups to have the "
-                f"same block geometry. First attention group: block_size={block_size},"
-                f" cell_size={cell_size}; group {idx}: "
-                f"block_size={grp_block_size}, cell_size={grp_cell_size}"
+                "kvcached requires all attention KV cache groups to share one "
+                "physical block geometry (block_mem_size and num_kv_buffers). "
+                f"First attention group: block_mem_size={block_mem_size}, "
+                f"num_kv_buffers={num_kv_buffers}; group {idx}: "
+                f"block_mem_size={grp_block_mem_size}, "
+                f"num_kv_buffers={grp_num_kv_buffers}"
             )
 
 
@@ -1262,6 +1275,25 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     "produce invalid KV cache strides."
                 )
 
+            # Detect heterogeneous attention groups (Gemma-style: sliding-window
+            # + full-attention groups with different (block_size, num_kv_heads,
+            # head_size) but identical block_mem_size, validated above). For
+            # those we allocate ONE uniform physical pool set and build a
+            # per-group as_strided view; homogeneous / single-group models keep
+            # the original fast path byte-for-byte.
+            def _attn_geom(grp):
+                s = grp.kv_cache_spec
+                return (s.block_size, s.num_kv_heads, s.head_size)
+
+            attn_group_list = [
+                (gid, grp)
+                for gid, grp in enumerate(kv_cache_config.kv_cache_groups)
+                if _is_attention_spec(grp.kv_cache_spec)
+            ]
+            is_hetero = (attention_type != "HYBRID_LINEAR"
+                         and len({_attn_geom(grp) for _, grp in attn_group_list}) > 1)
+            self._kvcached_attn_layer_views = None
+
             alloc_result = kvi.alloc_kv_cache(
                 kv_cache_shape,
                 kv_cache_spec.block_size,
@@ -1271,11 +1303,45 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 attention_type=attention_type,
                 kv_layout="NHD",
                 kernel_block_size=kernel_block_size,
+                return_meta=is_hetero,
             )
 
             if attention_type == "HYBRID_LINEAR":
                 kv_cache_raw_tensors, raw_info = alloc_result
                 self._kvcached_mamba_raw_info = raw_info
+            elif is_hetero:
+                kv_cache_raw_tensors, meta = alloc_result
+                if getattr(kvi, "_contiguous_layout", False):
+                    raise RuntimeError(
+                        "kvcached: heterogeneous attention KV groups (e.g. Gemma "
+                        "sliding-window + full-attention) currently require the "
+                        "non-contiguous layout. Re-launch with "
+                        "KVCACHED_CONTIGUOUS_LAYOUT=false."
+                    )
+                # Build a per-group view over the shared physical pools using each
+                # group's own (block_size, num_kv_heads, head_size).
+                layer_views: dict = {}
+                for gid, grp in attn_group_list:
+                    gspec = grp.kv_cache_spec
+                    gbackend = patch_instance._get_version_specific_attention_backend(
+                        self, kv_cache_group_id=gid
+                    )
+                    gshape = gbackend.get_kv_cache_shape(
+                        num_blocks, gspec.block_size, gspec.num_kv_heads,
+                        gspec.head_size,
+                    )
+                    gkbs = (kernel_block_sizes[gid]
+                            if kernel_block_sizes is not None
+                            and gid < len(kernel_block_sizes) else None)
+                    gviews, _ = kvi.build_kv_views(
+                        meta["raw_kv_tensors"], gshape, gspec.block_size, dtype,
+                        attention_type, meta["num_blocks_per_layer"],
+                        meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
+                        kernel_block_size=gkbs,
+                    )
+                    for pool_idx, layer_name in enumerate(grp.layer_names):
+                        layer_views[layer_name] = gviews[pool_idx]
+                self._kvcached_attn_layer_views = layer_views
             else:
                 kv_cache_raw_tensors = alloc_result
 
@@ -1325,6 +1391,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             kv_caches: dict[str, torch.Tensor] = {}
 
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
+            # Per-group attention views for heterogeneous hybrids (Gemma). None
+            # for homogeneous / single-group models, which use the raw-tensor
+            # index mapping below unchanged.
+            attn_layer_views = getattr(self, "_kvcached_attn_layer_views", None)
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -1343,7 +1413,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
-                        kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+                        if attn_layer_views is not None and layer_name in attn_layer_views:
+                            kv_caches[layer_name] = attn_layer_views[layer_name]
+                        else:
+                            kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
 
             return kv_caches
 
