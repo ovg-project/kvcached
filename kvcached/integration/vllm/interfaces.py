@@ -112,6 +112,10 @@ def build_kv_views(
     num_k_or_v = 1 if is_mla else 2
     if kernel_block_size is None:
         kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"block_size ({block_size}) must be a multiple of "
+            f"kernel_block_size ({kernel_block_size})")
     ratio = block_size // kernel_block_size
 
     if is_mla:
