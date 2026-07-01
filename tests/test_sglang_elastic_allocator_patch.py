@@ -5,12 +5,32 @@ import importlib
 import importlib.machinery
 import sys
 import types
+from typing import Any, cast
 from unittest import mock
 
 
 class FakeTensor(list):
+    def __getitem__(self, index):
+        value = super().__getitem__(index)
+        if isinstance(index, slice):
+            return FakeTensor(value)
+        return value
+
     def numel(self):
         return len(self)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return list(self)
+
+    def split(self, size):
+        assert size == 1
+        return [FakeTensor([value]) for value in self]
 
 
 class FakeKVCachedAllocator:
@@ -32,10 +52,16 @@ def _load_sglang_patches(monkeypatch):
     torch_mock.empty.side_effect = lambda shape, **_kwargs: FakeTensor(
         [0] * (shape if isinstance(shape, int) else shape[0])
     )
+    torch_mock.arange.side_effect = lambda start, end=None, **_kwargs: FakeTensor(
+        range(start if end is not None else 0, end if end is not None else start)
+    )
     torch_mock.tensor.side_effect = lambda values, **_kwargs: FakeTensor(values)
+    torch_mock.cat.side_effect = lambda tensors, **_kwargs: FakeTensor(
+        [value for tensor in tensors for value in tensor]
+    )
     monkeypatch.setitem(sys.modules, "torch", torch_mock)
 
-    utils_mod = types.ModuleType("sglang.srt.utils")
+    utils_mod: Any = types.ModuleType("sglang.srt.utils")
     utils_mod.next_power_of_2 = lambda value: 1 << (int(value) - 1).bit_length()
 
     def get_num_new_pages(**_kwargs):
@@ -53,6 +79,15 @@ def _load_sglang_patches(monkeypatch):
 
     importlib.reload(patches)
     return patches
+
+
+def _install_sglang_interfaces(monkeypatch, interfaces):
+    import kvcached.integration.sglang as sglang_integration
+
+    monkeypatch.setitem(
+        sys.modules, "kvcached.integration.sglang.interfaces", interfaces
+    )
+    monkeypatch.setattr(sglang_integration, "interfaces", interfaces)
 
 
 def test_elastic_paged_alloc_extend_accepts_precomputed_num_new_pages(monkeypatch):
@@ -77,7 +112,7 @@ def test_elastic_paged_alloc_extend_accepts_precomputed_num_new_pages(monkeypatc
             return run
 
     alloc_extend_kernel = Kernel()
-    alloc_mod = types.SimpleNamespace(
+    alloc_mod: Any = types.SimpleNamespace(
         BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator,
         alloc_extend_kernel=alloc_extend_kernel,
         alloc_decode_kernel=Kernel(),
@@ -146,16 +181,18 @@ def test_elastic_paged_allocator_supports_split_sglang_allocator_module(monkeypa
             return run
 
     alloc_extend_kernel = Kernel()
-    paged_mod = types.ModuleType("sglang.srt.mem_cache.allocator.paged")
+    paged_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator.paged")
     paged_mod.alloc_extend_kernel = alloc_extend_kernel
     paged_mod.alloc_decode_kernel = Kernel()
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache", types.ModuleType("sglang.srt.mem_cache"))
-    allocator_pkg = types.ModuleType("sglang.srt.mem_cache.allocator")
+    allocator_pkg: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
     allocator_pkg.paged = paged_mod
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.allocator", allocator_pkg)
     monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.allocator.paged", paged_mod)
 
-    alloc_mod = types.SimpleNamespace(BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator)
+    alloc_mod: Any = types.SimpleNamespace(
+        BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator
+    )
 
     patch = patches.ElasticAllocatorPatch()
     assert patch.inject_elastic_paged_allocator(alloc_mod)
@@ -207,7 +244,7 @@ def test_elastic_paged_allocator_falls_back_for_native_pools(monkeypatch):
 
             return run
 
-    alloc_mod = types.SimpleNamespace(
+    alloc_mod: Any = types.SimpleNamespace(
         BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator,
         PagedTokenToKVPoolAllocator=NativePagedTokenToKVPoolAllocator,
         alloc_extend_kernel=Kernel(),
@@ -242,7 +279,7 @@ def test_elastic_allocator_falls_back_for_native_pools(monkeypatch):
         def __init__(self, size, _dtype, device, _kvcache):
             super().__init__(size, 1, _dtype, device, _kvcache)
 
-    alloc_mod = types.SimpleNamespace(
+    alloc_mod: Any = types.SimpleNamespace(
         BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator,
         TokenToKVPoolAllocator=NativeTokenToKVPoolAllocator,
     )
@@ -266,7 +303,7 @@ def test_elastic_mha_pool_uses_storage_dtype(monkeypatch):
 
     logical_dtype = types.SimpleNamespace(itemsize=1, name="float8_e4m3fn")
     storage_dtype = types.SimpleNamespace(itemsize=1, name="uint8")
-    calls = {}
+    calls: dict[str, Any] = {}
 
     class MHATokenToKVPool:
         def __init__(
@@ -298,19 +335,22 @@ def test_elastic_mha_pool_uses_storage_dtype(monkeypatch):
         def get_kv_size_bytes(self):
             return (self.layer_num * self.size, self.layer_num * self.size)
 
+        def _create_buffers(self):
+            return None
+
     def fake_alloc_kv_cache(**kwargs):
         calls["alloc_kv_cache"] = kwargs
         return ([object()], [object()])
 
-    interfaces = types.ModuleType("kvcached.integration.sglang.interfaces")
+    interfaces: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
     interfaces.init_kvcached = lambda **kwargs: calls.setdefault("init_kvcached", kwargs)
     interfaces.get_kv_cache_manager = (
         lambda *args, **kwargs: types.SimpleNamespace(args=args, kwargs=kwargs)
     )
     interfaces.alloc_kv_cache = fake_alloc_kv_cache
-    monkeypatch.setitem(sys.modules, "kvcached.integration.sglang.interfaces", interfaces)
+    _install_sglang_interfaces(monkeypatch, interfaces)
 
-    mem_pool_mod = types.SimpleNamespace(MHATokenToKVPool=MHATokenToKVPool)
+    mem_pool_mod: Any = types.SimpleNamespace(MHATokenToKVPool=MHATokenToKVPool)
     patch = patches.ElasticMemoryPoolPatch()
     assert patch.inject_elastic_mem_pool(mem_pool_mod)
 
@@ -335,13 +375,13 @@ def test_elastic_mha_pool_uses_storage_dtype(monkeypatch):
 def test_elastic_mha_nonzero_tp_rank_uses_logical_allocator(monkeypatch):
     patches = _load_sglang_patches(monkeypatch)
 
-    dist_mod = types.ModuleType("sglang.srt.distributed")
+    dist_mod: Any = types.ModuleType("sglang.srt.distributed")
     dist_mod.get_tensor_model_parallel_rank = lambda: 2
     dist_mod.get_tensor_model_parallel_world_size = lambda: 4
     dist_mod.get_pipeline_model_parallel_rank = lambda: 0
     monkeypatch.setitem(sys.modules, "sglang.srt.distributed", dist_mod)
 
-    calls = {}
+    calls: dict[str, Any] = {}
 
     class MHATokenToKVPool:
         def __init__(
@@ -373,7 +413,10 @@ def test_elastic_mha_nonzero_tp_rank_uses_logical_allocator(monkeypatch):
         def get_kv_size_bytes(self):
             return (self.layer_num * self.size, self.layer_num * self.size)
 
-    interfaces = types.ModuleType("kvcached.integration.sglang.interfaces")
+        def _create_buffers(self):
+            return None
+
+    interfaces: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
     interfaces.init_kvcached = lambda **kwargs: calls.setdefault("init_kvcached", kwargs)
 
     def fake_alloc_kv_cache(**kwargs):
@@ -386,9 +429,9 @@ def test_elastic_mha_nonzero_tp_rank_uses_logical_allocator(monkeypatch):
         raise AssertionError("nonzero TP rank should not drive physical KV manager")
 
     interfaces.get_kv_cache_manager = fail_get_manager
-    monkeypatch.setitem(sys.modules, "kvcached.integration.sglang.interfaces", interfaces)
+    _install_sglang_interfaces(monkeypatch, interfaces)
 
-    mem_pool_mod = types.SimpleNamespace(MHATokenToKVPool=MHATokenToKVPool)
+    mem_pool_mod: Any = types.SimpleNamespace(MHATokenToKVPool=MHATokenToKVPool)
     patch = patches.ElasticMemoryPoolPatch()
     assert patch.inject_elastic_mem_pool(mem_pool_mod)
 
@@ -447,17 +490,54 @@ def test_capped_allocator_reports_logical_available_but_checks_physical(monkeypa
     assert allocator.available_size() == 2
 
 
+def test_capped_allocator_only_frees_allocated_ids(monkeypatch):
+    patches = _load_sglang_patches(monkeypatch)
+
+    class Manager:
+        def __init__(self):
+            self.freed = []
+
+        def available_size(self):
+            return 8
+
+        def alloc(self, need_size):
+            return list(range(1, need_size + 1))
+
+        def free(self, block_ids):
+            self.freed.append(list(block_ids))
+
+    manager = Manager()
+    allocator = patches._CappedKVCachedAllocator(manager, capacity_blocks=4)
+
+    assert allocator.alloc(2) == [1, 2]
+    allocator.free([0, 1, 99])
+
+    assert manager.freed == [[1]]
+    assert allocator.available_size() == 3
+
+
+def test_logical_allocator_only_frees_allocated_ids(monkeypatch):
+    patches = _load_sglang_patches(monkeypatch)
+
+    allocator = patches._LogicalKVCachedAllocator(capacity_blocks=4)
+
+    assert allocator.alloc(2) == [1, 2]
+    allocator.free([0, 1, 99])
+
+    assert sorted(allocator.alloc(2)) == [1, 3]
+
+
 def test_elastic_mamba_pool_uses_rank_local_device_for_spec_buffers(monkeypatch):
     patches = _load_sglang_patches(monkeypatch)
 
-    torch_mod = sys.modules["torch"]
+    torch_mod = cast(Any, sys.modules["torch"])
     torch_mod.zeros.side_effect = lambda size, **kwargs: types.SimpleNamespace(
         size=size,
         kwargs=kwargs,
         mem_usage_bytes=lambda: 0,
     )
 
-    calls = {"zeros": []}
+    calls: dict[str, Any] = {"zeros": []}
 
     def fake_zeros(*args, **kwargs):
         calls["zeros"].append(kwargs)
@@ -469,13 +549,13 @@ def test_elastic_mamba_pool_uses_rank_local_device_for_spec_buffers(monkeypatch)
 
     torch_mod.zeros.side_effect = fake_zeros
 
-    dist_mod = types.ModuleType("sglang.srt.distributed")
+    dist_mod: Any = types.ModuleType("sglang.srt.distributed")
     dist_mod.get_tensor_model_parallel_rank = lambda: 2
     dist_mod.get_tensor_model_parallel_world_size = lambda: 4
     dist_mod.get_pipeline_model_parallel_rank = lambda: 0
     monkeypatch.setitem(sys.modules, "sglang.srt.distributed", dist_mod)
 
-    interfaces = types.ModuleType("kvcached.integration.sglang.interfaces")
+    interfaces: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
     interfaces.init_kvcached = lambda **kwargs: calls.setdefault("init_kvcached", kwargs)
     interfaces.alloc_mamba_states = lambda **kwargs: (
         [types.SimpleNamespace(mem_usage_bytes=lambda: 0)],
@@ -487,7 +567,7 @@ def test_elastic_mamba_pool_uses_rank_local_device_for_spec_buffers(monkeypatch)
         kwargs=kwargs,
         available_size=lambda: 8,
     )
-    monkeypatch.setitem(sys.modules, "kvcached.integration.sglang.interfaces", interfaces)
+    _install_sglang_interfaces(monkeypatch, interfaces)
 
     class CacheParams:
         layers = [0]
@@ -509,7 +589,7 @@ def test_elastic_mamba_pool_uses_rank_local_device_for_spec_buffers(monkeypatch)
                 self.intermediate_ssm = intermediate_ssm
                 self.intermediate_conv_window = intermediate_conv_window
 
-    mem_pool_mod = types.SimpleNamespace(MambaPool=MambaPool)
+    mem_pool_mod: Any = types.SimpleNamespace(MambaPool=MambaPool)
     patch = patches.ElasticMambaPoolPatch()
     assert patch.inject_elastic_mamba_pool(mem_pool_mod)
 

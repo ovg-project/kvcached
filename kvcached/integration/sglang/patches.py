@@ -7,6 +7,7 @@ SGLang-specific patches using unified patch infrastructure.
 
 import inspect
 import math
+import os
 import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
@@ -32,6 +33,10 @@ def _resolve_tp_device(device: Any, tp_rank: int) -> str:
     if device_str in {"cuda", "hip"}:
         return f"{device_str}:{tp_rank}"
     return str(device)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class _LogicalKVCachedAllocator:
@@ -60,11 +65,14 @@ class _LogicalKVCachedAllocator:
         return block_ids
 
     def free(self, block_ids: Any) -> None:
-        ids = [int(block_id) for block_id in block_ids]
+        ids = [
+            int(block_id)
+            for block_id in block_ids
+            if int(block_id) in self._allocated
+        ]
         for block_id in ids:
-            if block_id in self._allocated:
-                self._allocated.remove(block_id)
-                self._free.append(block_id)
+            self._allocated.remove(block_id)
+            self._free.append(block_id)
 
     def clear(self) -> None:
         self._allocated.clear()
@@ -101,7 +109,11 @@ class _CappedKVCachedAllocator:
         return block_ids
 
     def free(self, block_ids: Any) -> None:
-        ids = [int(block_id) for block_id in block_ids]
+        ids = [
+            int(block_id)
+            for block_id in block_ids
+            if int(block_id) in self._allocated
+        ]
         if not ids:
             return
         self._manager.free(ids)
@@ -280,7 +292,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             paged_mod = alloc_mod
             if not hasattr(paged_mod, "alloc_extend_kernel"):
                 try:
-                    from sglang.srt.mem_cache.allocator import paged as paged_mod
+                    from sglang.srt.mem_cache.allocator import paged as imported_paged_mod
+
+                    paged_mod = imported_paged_mod
                 except Exception:
                     paged_mod = alloc_mod
 
@@ -644,7 +658,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             tp_rank, tp_size, pp_rank = 0, 1, 0
 
                     # Initialize kvcached with overlap scheduling to be conservative
-                    target_device = _resolve_tp_device(self.device, tp_rank)
+                    target_device = _resolve_tp_device(getattr(self, "device"), tp_rank)
                     self.device = target_device
                     self._kvcached_tp_rank = tp_rank
                     self._kvcached_tp_size = tp_size
@@ -657,7 +671,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         async_sched=True,
                     )
 
-                    if not _is_supported_gpu_device(self.device):
+                    if not _is_supported_gpu_device(target_device):
                         raise ValueError(
                             "ElasticMHATokenToKVPool only supports GPU devices "
                             "(cuda/hip)")
@@ -792,11 +806,14 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         self.use_nsa and dtype == torch.float8_e4m3fn
                     )
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
-                    self.kv_cache_dim = (
+                    kv_cache_dim = (
                         override_kv_cache_dim
                         if self.use_nsa and self.nsa_kv_cache_store_fp8
                         else (kv_lora_rank + qk_rope_head_dim)
                     )
+                    if kv_cache_dim is None:
+                        kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+                    self.kv_cache_dim = int(kv_cache_dim)
                     # Attributes from parent that we skip but inherited methods may need
                     self.custom_mem_pool = None
 
@@ -833,7 +850,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         async_sched=True,
                     )
 
-                    if not _is_supported_gpu_device(device):
+                    if not _is_supported_gpu_device(target_device):
                         raise ValueError(
                             "ElasticMLATokenToKVPool only supports GPU devices "
                             "(cuda/hip)")
@@ -1428,6 +1445,147 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias HybridLinearKVPool to elastic one: {e}")
             return False
+
+
+class DeepSeekV4RuntimeReservationPatch(VersionAwarePatch, BasePatch):
+    """Account SGLang DeepSeek-V4 runtime-owned pools without taking ownership.
+
+    DeepSeek-V4 keeps model-specific side pools for SWA KV, compressed KV,
+    indexer KV, and compressor state.  kvcached should not bind allocators to
+    those fast-moving implementation details yet, but it must subtract their
+    physical footprint before budgeting elastic KV for colocated models.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
+    patch_name = "deepseek_v4_runtime_reservation"
+
+    def apply(self, dsv4_pool_mod: types.ModuleType) -> bool:
+        if not _env_truthy("KVCACHED_SGLANG_DSV4_RUNTIME_RESERVATION"):
+            self.logger.debug(
+                "DeepSeek-V4 runtime reservation accounting disabled by env"
+            )
+            return True
+
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_dsv4_pool_init(dsv4_pool_mod)
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_dsv4_pool_init(self, dsv4_pool_mod: types.ModuleType) -> bool:
+        DeepSeekV4TokenToKVPool = getattr(dsv4_pool_mod, "DeepSeekV4TokenToKVPool", None)
+        if DeepSeekV4TokenToKVPool is None:
+            self.logger.debug("DeepSeekV4TokenToKVPool not found; skipping reservation patch")
+            return True
+
+        original_init = getattr(DeepSeekV4TokenToKVPool, "__init__", None)
+        if original_init is None:
+            self.logger.warning("DeepSeekV4TokenToKVPool.__init__ not found")
+            return False
+        if self._is_already_patched(original_init):
+            self.logger.debug("DeepSeek-V4 runtime reservation patch already applied")
+            return True
+
+        def _wrapped_init(pool_self: Any, *args: Any, **kwargs: Any) -> None:
+            original_init(pool_self, *args, **kwargs)
+            try:
+                breakdown = _collect_dsv4_runtime_reservations(pool_self)
+                _register_dsv4_runtime_reservations(pool_self, breakdown)
+            except Exception as exc:
+                if os.getenv("KVCACHED_REQUIRE", "false").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    raise
+                self.logger.warning(
+                    "DeepSeek-V4 runtime reservation accounting unavailable: %s",
+                    exc,
+                )
+
+        self._mark_as_patched(_wrapped_init)
+        DeepSeekV4TokenToKVPool.__init__ = _wrapped_init
+        self.logger.info("Enabled DeepSeek-V4 runtime reservation accounting")
+        return True
+
+
+def _collect_dsv4_runtime_reservations(kvcache: Any) -> dict[str, int]:
+    return {
+        "dsv4.swa_kv_pool": _sum_buffer_nbytes(
+            getattr(getattr(kvcache, "swa_kv_pool", None), "kv_buffer", None)
+        ),
+        "dsv4.c4_kv_pool": _sum_buffer_nbytes(
+            getattr(getattr(kvcache, "c4_kv_pool", None), "kv_buffer", None)
+        ),
+        "dsv4.c128_kv_pool": _sum_buffer_nbytes(
+            getattr(getattr(kvcache, "c128_kv_pool", None), "kv_buffer", None)
+        ),
+        "dsv4.c4_indexer_kv_pool": _sum_buffer_nbytes(
+            getattr(
+                getattr(kvcache, "c4_indexer_kv_pool", None),
+                "index_k_with_scale_buffer",
+                None,
+            )
+        ),
+        "dsv4.compress_state_pools": _sum_dsv4_state_pool_nbytes(
+            getattr(kvcache, "compress_state_pools", None)
+        ),
+        "dsv4.indexer_compress_state_pools": _sum_dsv4_state_pool_nbytes(
+            getattr(kvcache, "indexer_compress_state_pools", None)
+        ),
+    }
+
+
+def _register_dsv4_runtime_reservations(kvcache: Any, breakdown: dict[str, int]) -> None:
+    import kvcached.integration.sglang.interfaces as kvi
+
+    device = getattr(kvcache, "device", None)
+    if device is None:
+        raise ValueError("DeepSeek-V4 pool does not expose device")
+
+    total_bytes = 0
+    for pool_name, num_bytes in breakdown.items():
+        if num_bytes <= 0:
+            continue
+        kvi.register_runtime_owned_reservation(str(device), pool_name, num_bytes)
+        total_bytes += num_bytes
+
+    setattr(kvcache, "_kvcached_runtime_reservation_breakdown", dict(breakdown))
+    logger.info(
+        "Registered DeepSeek-V4 runtime-owned reservations on %s: total=%.2f GB, "
+        "breakdown=%s",
+        device,
+        total_bytes / BYTES_PER_GB,
+        {
+            key: round(value / BYTES_PER_GB, 3)
+            for key, value in breakdown.items()
+            if value > 0
+        },
+    )
+
+
+def _sum_buffer_nbytes(buffers: Any) -> int:
+    if buffers is None:
+        return 0
+    if hasattr(buffers, "nbytes"):
+        return int(buffers.nbytes)
+    return sum(int(getattr(buffer, "nbytes", 0)) for buffer in buffers if buffer is not None)
+
+
+def _sum_dsv4_state_pool_nbytes(pools: Any) -> int:
+    if pools is None:
+        return 0
+
+    total = 0
+    for pool in pools:
+        if pool is None:
+            continue
+        kv_score_buffer = getattr(pool, "kv_score_buffer", None)
+        kv_score = getattr(kv_score_buffer, "kv_score", None)
+        total += int(getattr(kv_score, "nbytes", 0))
+    return total
 
 
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
