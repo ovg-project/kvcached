@@ -27,6 +27,121 @@ def _is_supported_gpu_device(device: str) -> bool:
     return device_str.startswith("cuda") or device_str.startswith("hip")
 
 
+def _resolve_tp_device(device: Any, tp_rank: int) -> str:
+    device_str = str(device).lower()
+    if device_str in {"cuda", "hip"}:
+        return f"{device_str}:{tp_rank}"
+    return str(device)
+
+
+class _LogicalKVCachedAllocator:
+    def __init__(self, capacity_blocks: int) -> None:
+        self._capacity_blocks = capacity_blocks
+        self._allocated: set[int] = set()
+        self._free: list[int] = []
+        self._next = 1
+
+    def available_size(self) -> int:
+        return max(0, self._capacity_blocks - len(self._allocated))
+
+    def alloc(self, need_size: int):
+        if need_size <= 0:
+            return []
+        if need_size > self.available_size():
+            return None
+
+        block_ids: list[int] = []
+        while self._free and len(block_ids) < need_size:
+            block_ids.append(self._free.pop())
+        while len(block_ids) < need_size:
+            block_ids.append(self._next)
+            self._next += 1
+        self._allocated.update(block_ids)
+        return block_ids
+
+    def free(self, block_ids: Any) -> None:
+        ids = [int(block_id) for block_id in block_ids]
+        for block_id in ids:
+            if block_id in self._allocated:
+                self._allocated.remove(block_id)
+                self._free.append(block_id)
+
+    def clear(self) -> None:
+        self._allocated.clear()
+        self._free.clear()
+        self._next = 1
+
+
+class _CappedKVCachedAllocator:
+    def __init__(self, manager: Any, capacity_blocks: int) -> None:
+        self._manager = manager
+        self._capacity_blocks = capacity_blocks
+        self._allocated: set[int] = set()
+
+    def available_size(self) -> int:
+        return max(0, self._capacity_blocks - len(self._allocated))
+
+    def _physical_available_size(self) -> int:
+        try:
+            return int(self._manager.available_size())
+        except Exception:
+            return self.available_size()
+
+    def alloc(self, need_size: int):
+        if need_size <= 0:
+            return []
+        if need_size > self.available_size():
+            return None
+        if need_size > self._physical_available_size():
+            return None
+        block_ids = self._manager.alloc(need_size)
+        if block_ids is None:
+            return None
+        self._allocated.update(int(block_id) for block_id in block_ids)
+        return block_ids
+
+    def free(self, block_ids: Any) -> None:
+        ids = [int(block_id) for block_id in block_ids]
+        if not ids:
+            return
+        self._manager.free(ids)
+        for block_id in ids:
+            self._allocated.discard(block_id)
+
+    def clear(self) -> None:
+        if not self._allocated:
+            return
+        self.free(list(self._allocated))
+
+
+def _new_tp_scoped_kvcached_allocator(
+    kvi: Any,
+    *,
+    tp_rank: int,
+    tp_size: int,
+    num_blocks: int,
+    block_size: int,
+    cell_size: int,
+    num_layers: int,
+    reserve_null_block: bool = True,
+    num_kv_buffers: int = 2,
+    group_id: int = 0,
+) -> Any:
+    logical_capacity = max(0, num_blocks - (1 if reserve_null_block else 0))
+    if tp_rank != 0 and tp_size > 1:
+        return _LogicalKVCachedAllocator(logical_capacity)
+    manager = kvi.get_kv_cache_manager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        cell_size=cell_size,
+        num_layers=num_layers,
+        reserve_null_block=reserve_null_block,
+        num_kv_buffers=num_kv_buffers,
+        group_id=group_id,
+    )
+    return _CappedKVCachedAllocator(manager, logical_capacity)
+
+
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticTokenToKVPoolAllocator into SGLang's allocator module"""
 
@@ -68,10 +183,23 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            NativeTokenToKVPoolAllocator = getattr(
+                alloc_mod, "TokenToKVPoolAllocator", None
+            )
 
             class ElasticTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
             ):
+                def __new__(
+                    cls, size: int, dtype, device: str, kvcache, *args, **kwargs
+                ):
+                    if not hasattr(kvcache, "kvcached_allocator"):
+                        if NativeTokenToKVPoolAllocator is not None:
+                            return NativeTokenToKVPoolAllocator(
+                                size, dtype, device, kvcache, *args, **kwargs
+                            )
+                    return super().__new__(cls)
+
                 def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
                     super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
@@ -149,15 +277,42 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
         try:
             import torch
 
+            paged_mod = alloc_mod
+            if not hasattr(paged_mod, "alloc_extend_kernel"):
+                try:
+                    from sglang.srt.mem_cache.allocator import paged as paged_mod
+                except Exception:
+                    paged_mod = alloc_mod
+
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
-            alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
-            alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+            NativePagedTokenToKVPoolAllocator = getattr(
+                alloc_mod, "PagedTokenToKVPoolAllocator", None
+            )
+            alloc_extend_kernel = getattr(paged_mod, "alloc_extend_kernel")
+            alloc_decode_kernel = getattr(paged_mod, "alloc_decode_kernel")
+            extend_kernel_fn = getattr(alloc_extend_kernel, "fn", alloc_extend_kernel)
+            try:
+                extend_kernel_param_count = len(
+                    inspect.signature(extend_kernel_fn).parameters
+                )
+            except (TypeError, ValueError):
+                extend_kernel_param_count = 8
 
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
             class ElasticPagedTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
             ):
+                def __new__(
+                    cls, size: int, page_size: int, dtype, device: str, kvcache, *args, **kwargs
+                ):
+                    if not hasattr(kvcache, "kvcached_allocator"):
+                        if NativePagedTokenToKVPoolAllocator is not None:
+                            return NativePagedTokenToKVPoolAllocator(
+                                size, page_size, dtype, device, kvcache, *args, **kwargs
+                            )
+                    return super().__new__(cls)
+
                 def __init__(
                     self, size: int, page_size: int, dtype, device: str, kvcache, *args, **kwargs
                 ) -> None:
@@ -205,6 +360,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     seq_lens_cpu: torch.Tensor,
                     last_loc: torch.Tensor,
                     extend_num_tokens: int,
+                    num_new_pages: Optional[int] = None,
                 ):
                     self.seen_max_num_extend_tokens_next_power_of_2 = max(
                         self.seen_max_num_extend_tokens_next_power_of_2,
@@ -212,11 +368,12 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
                     bs = len(prefix_lens)
 
-                    num_new_pages = get_num_new_pages(
-                        seq_lens=seq_lens_cpu,
-                        page_size=self.page_size,
-                        prefix_lens=prefix_lens_cpu,
-                    )
+                    if num_new_pages is None:
+                        num_new_pages = get_num_new_pages(
+                            seq_lens=seq_lens_cpu,
+                            page_size=self.page_size,
+                            prefix_lens=prefix_lens_cpu,
+                        )
 
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
@@ -231,16 +388,27 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     out_indices = torch.empty(
                         (extend_num_tokens,), dtype=torch.int64, device=self.device
                     )
-                    alloc_extend_kernel[(bs,)](
-                        prefix_lens,
-                        seq_lens,
-                        last_loc,
-                        free_pages,
-                        out_indices,
-                        next_power_of_2(bs),
-                        self.page_size,
-                        self.seen_max_num_extend_tokens_next_power_of_2,
-                    )
+                    if extend_kernel_param_count >= 8:
+                        alloc_extend_kernel[(bs,)](
+                            prefix_lens,
+                            seq_lens,
+                            last_loc,
+                            free_pages,
+                            out_indices,
+                            next_power_of_2(bs),
+                            self.page_size,
+                            self.seen_max_num_extend_tokens_next_power_of_2,
+                        )
+                    else:
+                        alloc_extend_kernel[(bs,)](
+                            prefix_lens,
+                            seq_lens,
+                            last_loc,
+                            free_pages,
+                            out_indices,
+                            next_power_of_2(bs),
+                            self.page_size,
+                        )
                     return out_indices
 
                 def alloc_decode(
@@ -312,6 +480,12 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                 "ElasticPagedTokenToKVPoolAllocator",
                 ElasticPagedTokenToKVPoolAllocator,
             )
+            if paged_mod is not alloc_mod:
+                setattr(
+                    paged_mod,
+                    "ElasticPagedTokenToKVPoolAllocator",
+                    ElasticPagedTokenToKVPoolAllocator,
+                )
             return True
         except Exception as e:
             self.logger.error(f"Failed to inject ElasticPagedTokenToKVPoolAllocator: {e}")
@@ -330,6 +504,12 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             if ElasticPagedTokenToKVPoolAllocator is None:
                 return False
             alloc_mod.PagedTokenToKVPoolAllocator = ElasticPagedTokenToKVPoolAllocator  # type: ignore
+            try:
+                from sglang.srt.mem_cache.allocator import paged as paged_mod
+
+                paged_mod.PagedTokenToKVPoolAllocator = ElasticPagedTokenToKVPoolAllocator  # type: ignore[attr-defined]
+            except Exception:
+                pass
             self._mark_as_patched(alloc_mod, "__kvcached_paged_allocator_aliased__")
             return True
         except Exception as e:
@@ -408,9 +588,17 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    self.cell_size = self.head_num * self.head_dim * dtype.itemsize
-                    self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
+                    self.cell_size = (
+                        self.head_num * self.head_dim * self._storage_dtype().itemsize
+                    )
+                    self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
+                        kvi,
+                        tp_rank=getattr(self, "_kvcached_tp_rank", 0),
+                        tp_size=getattr(self, "_kvcached_tp_size", 1),
+                        num_blocks=math.ceil(size / page_size) + 1,
+                        block_size=page_size,
+                        cell_size=self.cell_size,
+                        num_layers=layer_num,
                         group_id=self._group_id,
                     )
 
@@ -456,7 +644,18 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             tp_rank, tp_size, pp_rank = 0, 1, 0
 
                     # Initialize kvcached with overlap scheduling to be conservative
-                    kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
+                    target_device = _resolve_tp_device(self.device, tp_rank)
+                    self.device = target_device
+                    self._kvcached_tp_rank = tp_rank
+                    self._kvcached_tp_size = tp_size
+                    self._kvcached_pp_rank = pp_rank
+                    kvi.init_kvcached(
+                        tp_rank=tp_rank,
+                        world_size=tp_size,
+                        pp_rank=pp_rank,
+                        device=target_device,
+                        async_sched=True,
+                    )
 
                     if not _is_supported_gpu_device(self.device):
                         raise ValueError(
@@ -470,8 +669,8 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 self.head_num,
                                 self.head_dim,
                             ),
-                            dtype=self.dtype,
-                            device=self.device,
+                            dtype=self._storage_dtype(),
+                            device=target_device,
                             num_layers=self.layer_num,
                             page_size=self.page_size,
                             attention_type="MHA",
@@ -488,12 +687,15 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.head_num * self.head_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self._storage_dtype().itemsize
 
                     k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
                     v_size_bytes = k_size_bytes
 
                     return k_size_bytes, v_size_bytes
+
+                def _storage_dtype(self):
+                    return getattr(self, "store_dtype", self.dtype)
 
             setattr(mem_pool_mod, "ElasticMHATokenToKVPool", ElasticMHATokenToKVPool)
             return True
@@ -621,7 +823,15 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         except Exception:
                             tp_rank, tp_size, pp_rank = 0, 1, 0
 
-                    kvi.init_kvcached(tp_rank=tp_rank, world_size=tp_size, pp_rank=pp_rank, async_sched=True)
+                    target_device = _resolve_tp_device(device, tp_rank)
+                    self.device = target_device
+                    kvi.init_kvcached(
+                        tp_rank=tp_rank,
+                        world_size=tp_size,
+                        pp_rank=pp_rank,
+                        device=target_device,
+                        async_sched=True,
+                    )
 
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
@@ -636,7 +846,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 self.kv_cache_dim,
                             ),
                             dtype=dtype,
-                            device=device,
+                            device=target_device,
                             num_layers=layer_num,
                             page_size=page_size,
                             attention_type="MLA",
@@ -650,8 +860,14 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
 
                     self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
-                    self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num,
+                    self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
+                        kvi,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        num_blocks=size + page_size,
+                        block_size=page_size,
+                        cell_size=self.cell_size,
+                        num_layers=layer_num,
                         num_kv_buffers=1,
                     )
 
@@ -871,18 +1087,21 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     kvi.init_kvcached(
                         tp_rank=tp_rank, world_size=tp_size,
-                        pp_rank=pp_rank, async_sched=True,
+                        pp_rank=pp_rank,
+                        device=_resolve_tp_device(device, tp_rank),
+                        async_sched=True,
                     )
 
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticMambaPool only supports GPU devices (cuda/hip)")
+                    target_device = _resolve_tp_device(device, tp_rank)
 
                     self._group_id = ElasticMambaPool._next_group_id
                     ElasticMambaPool._next_group_id += 1
 
                     self.size = size
-                    self.device = device
+                    self.device = target_device
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
@@ -905,7 +1124,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         num_slots=num_slots,
                         num_mamba_layers=num_mamba_layers,
                         cache_params=cache_params,
-                        device=device,
+                        device=target_device,
                         group_id=self._group_id,
                     )
                     self._kvcached_layout = layout
@@ -937,7 +1156,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                     temporal_state_shape[2],
                                 ),
                                 dtype=cache_params.dtype.temporal,
-                                device="cuda",
+                                device=target_device,
                             )
                             intermediate_conv_window_cache = [
                                 torch.zeros(
@@ -949,7 +1168,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                         conv_shape[1],
                                     ),
                                     dtype=cache_params.dtype.conv,
-                                    device="cuda",
+                                    device=target_device,
                                 )
                                 for conv_shape in conv_state_shape
                             ]
@@ -974,7 +1193,10 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     # block_size=1 → one block == one mamba slot.
                     # num_kv_buffers=1 → single super-cell per slot per layer.
-                    self.kvcached_allocator = kvi.get_kv_cache_manager(
+                    self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
+                        kvi,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
                         num_blocks=num_slots,
                         block_size=1,
                         cell_size=layout["cell_size"],
