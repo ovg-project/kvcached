@@ -218,6 +218,65 @@ def alloc_kv_cache(
     return k_tensors, v_tensors
 
 
+def alloc_dsv4_swa_cache(
+    *,
+    num_pages: int,
+    bytes_per_page: int,
+    num_layers: int,
+    device: str,
+    group_id: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Create per-layer VMM buffers for DeepSeek-V4's uncompressed SWA KV.
+
+    DSV4's store kernels require each ``(num_pages, bytes_per_page)`` layer
+    tensor to be contiguous. kvcached's compound-page layout interleaves
+    layers and cannot provide that contract, so this adapter deliberately
+    supports only the per-layer layout.
+    """
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first."
+        )
+    if _contiguous_layout:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling requires "
+            "KVCACHED_CONTIGUOUS_LAYOUT=false because SGLang's DSV4 kernels "
+            "require a contiguous buffer for each layer."
+        )
+    if num_pages <= 0 or bytes_per_page <= 0 or num_layers <= 0:
+        raise ValueError(
+            "DeepSeek-V4 SWA dimensions must be positive: "
+            f"num_pages={num_pages}, bytes_per_page={bytes_per_page}, "
+            f"num_layers={num_layers}"
+        )
+
+    device = normalize_gpu_device(device)
+    visible_bytes = num_pages * bytes_per_page
+    per_layer_bytes = ((visible_bytes + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    raw_tensors = create_kv_tensors(
+        per_layer_bytes,
+        torch.uint8.itemsize,
+        device,
+        num_layers,
+        num_kv_buffers=1,
+        group_id=group_id,
+        unified_pool=True,
+    )
+    if len(raw_tensors) != num_layers:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling expected one VMM tensor per layer, "
+            f"got {len(raw_tensors)} for {num_layers} layers"
+        )
+
+    buffers = [
+        tensor[:visible_bytes].view(num_pages, bytes_per_page)
+        for tensor in raw_tensors
+    ]
+    if not all(buffer.is_contiguous() for buffer in buffers):
+        raise RuntimeError("DeepSeek-V4 SWA VMM buffers are not contiguous")
+    return buffers, raw_tensors
+
+
 def alloc_mamba_states(
     *,
     num_slots: int,

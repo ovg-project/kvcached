@@ -7,6 +7,17 @@ import types
 from typing import Any
 from unittest import mock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _remove_cached_sglang_submodules():
+    yield
+    package = sys.modules.get("kvcached.integration.sglang")
+    if package is not None:
+        package.__dict__.pop("interfaces", None)
+        package.__dict__.pop("patches", None)
+
 
 class FakeTensor:
     def __init__(self, nbytes=0):
