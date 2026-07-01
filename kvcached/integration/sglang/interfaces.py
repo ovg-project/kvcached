@@ -23,6 +23,7 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
+_runtime_owned_reservations: Dict[str, Dict[str, int]] = {}
 
 
 def init_kvcached(
@@ -55,12 +56,44 @@ def init_kvcached(
 def shutdown_kvcached() -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
+        _runtime_owned_reservations.clear()
         return
 
     _shutdown_kvcached_impl()
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _runtime_owned_reservations.clear()
+
+
+def register_runtime_owned_reservation(
+    device: str,
+    pool_name: str,
+    num_bytes: int,
+) -> None:
+    """Record memory owned by the serving runtime outside kvcached.
+
+    Some runtimes allocate model-specific side pools that kvcached should not
+    manage directly.  The reservation is still consumed by the same GPU, so
+    kvcached's later virtual KV budgets must subtract it to avoid overbooking
+    colocated pools.
+    """
+    device = normalize_gpu_device(device)
+    if num_bytes < 0:
+        raise ValueError(f"runtime reservation for {pool_name} is negative: {num_bytes}")
+    if num_bytes == 0:
+        return
+    _runtime_owned_reservations.setdefault(device, {})[pool_name] = int(num_bytes)
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    device = normalize_gpu_device(device)
+    return sum(_runtime_owned_reservations.get(device, {}).values())
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    device = normalize_gpu_device(device)
+    return dict(_runtime_owned_reservations.get(device, {}))
 
 
 def alloc_kv_cache(
@@ -102,7 +135,17 @@ def alloc_kv_cache(
     block_size = page_size
     block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
 
+    runtime_reserved_bytes = get_runtime_owned_reservation_bytes(device)
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    if runtime_reserved_bytes:
+        gpu_mem_bytes = max(0, gpu_mem_bytes - runtime_reserved_bytes)
+        logger.info(
+            "Reserved %.2f GB for runtime-owned SGLang pools on %s; "
+            "remaining kvcached budget is %.2f GB",
+            runtime_reserved_bytes / (1024**3),
+            device,
+            gpu_mem_bytes / (1024**3),
+        )
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * PAGE_SIZE for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
