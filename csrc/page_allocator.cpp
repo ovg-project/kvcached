@@ -443,12 +443,14 @@ int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
-  size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
-  avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+  const size_t headroom =
+      static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
+  const size_t usable_phy_mem_size =
+      avail_phy_mem_size > headroom ? avail_phy_mem_size - headroom
+                                    : static_cast<size_t>(0);
 
   // Calculate available pages considering layers and KV buffers
-  int64_t avail_phy_pages = avail_phy_mem_size / page_size_;
+  int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
   return avail_pages_per_layer;
