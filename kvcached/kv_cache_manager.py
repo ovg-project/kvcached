@@ -158,11 +158,21 @@ class KVCacheManager:
                 )
 
                 # Wrap Python functions to match C++ callback signature
-                def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                def map_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
 
-                def unmap_callback(world_size: int, offsets: List[int]) -> None:
+                def unmap_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
 
