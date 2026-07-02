@@ -10,7 +10,7 @@ vLLM uses the term "hybrid" for two very different things, and kvcached needs di
 |---|---|---|---|
 | **Attention-only hybrid, uniform geometry** (full + sliding window, all attention groups share the same block geometry) | GPT-OSS | `--disable-hybrid-kv-cache-manager` **optional** (see note) | (default; `KVCACHED_CONTIGUOUS_LAYOUT=true`) |
 | **Attention-only hybrid, heterogeneous geometry** (sliding vs full layers have different KV dims / block_size, same block_mem_size) | Gemma 3 / Gemma 4 | **do NOT pass** `--disable-hybrid-kv-cache-manager` | `KVCACHED_CONTIGUOUS_LAYOUT=false` |
-| **Linear-attention hybrid** (full attention + Mamba/SSM, groups have different specs and cannot be unified) | Jamba, Bamba, NemotronH, Zamba2, Plamo2 | **do NOT pass** `--disable-hybrid-kv-cache-manager` | `KVCACHED_CONTIGUOUS_LAYOUT=false` |
+| **Linear-attention hybrid** (full attention + Mamba/SSM, groups have different specs and cannot be unified) | Qwen3-Next / Qwen3.5-3.6 GDN, Jamba, Bamba, NemotronH, Zamba2, Plamo2 | **do NOT pass** `--disable-hybrid-kv-cache-manager` | `KVCACHED_CONTIGUOUS_LAYOUT=false`² |
 
 > **Note on GPT-OSS / `--disable-hybrid-kv-cache-manager`:** kvcached now supports
 > multiple attention KV-cache groups directly, so GPT-OSS runs correctly **with the
@@ -23,6 +23,8 @@ vLLM uses the term "hybrid" for two very different things, and kvcached needs di
 > `start_two_models.sh` still passes it for GPT-OSS for backward compatibility.
 
 The `start_two_models.sh` script defaults to GPT-OSS (attention-only). For Jamba/Bamba and other Mamba-hybrid models, drop `--disable-hybrid-kv-cache-manager` from the `vllm serve` command and export `KVCACHED_CONTIGUOUS_LAYOUT=false` before launching. For Gemma 3/4 (heterogeneous attention geometry), likewise do not disable the hybrid manager and export `KVCACHED_CONTIGUOUS_LAYOUT=false`.
+
+> ² **Contiguous layout for linear-attention hybrids is newly supported** (code + CPU unit tests landed; see [`docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md`](../../docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md)). It is **not yet GPU token-parity validated**, so keep `KVCACHED_CONTIGUOUS_LAYOUT=false` for these models until you've confirmed token-for-token parity on your hardware. The one combination that is explicitly unsupported and fails loud is `contiguous + kernel_block_size != block_size`.
 
 ## Prerequisites
 - A working vLLM installation with kvcached.
