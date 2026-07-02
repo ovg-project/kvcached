@@ -226,12 +226,16 @@ def alloc_kv_cache(
         List[torch.Tensor] for MHA/GQA/MLA.
         For HYBRID_LINEAR, returns (kv_tensors, raw_info) where
         raw_info is a dict with:
-          buffers            - flat int8 tensors, one per pool
+          buffers            - flat int8 tensors: one per pool in the
+                               non-contiguous layout, or a single shared base
+                               buffer ([base]) in the contiguous layout
           num_blocks         - number of blocks per pool
           page_size_bytes    - uniform page size (bytes) shared by all groups
           block_stride_bytes - byte stride between consecutive blocks of the
-                               same pool
+                               same pool (page_size_bytes when non-contiguous,
+                               num_layers*page_size_bytes when contiguous)
           num_pools          - number of pools (== num_layers)
+          is_contiguous      - whether the contiguous layout is in use
     """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -246,15 +250,13 @@ def alloc_kv_cache(
     is_hybrid_linear = attention_type == "HYBRID_LINEAR"
     unified_pool = is_hybrid_linear
 
-    if is_hybrid_linear and _contiguous_layout:
-        raise ValueError(
-            "kvcached detected a hybrid linear-attention model "
-            "(e.g. Jamba/Bamba/NemotronH/Zamba2/Plamo2), which requires the "
-            "non-contiguous KV layout. Re-launch with "
-            "KVCACHED_CONTIGUOUS_LAYOUT=false. Also do NOT pass "
-            "--disable-hybrid-kv-cache-manager to vLLM for these models — "
-            "it only applies to attention-only hybrids like sliding-window "
-            "models (e.g. GPT-OSS).")
+    # Hybrid linear-attention (HYBRID_LINEAR) supports BOTH the contiguous and
+    # non-contiguous KV layouts. In contiguous layout the attention view
+    # (contiguous_tensor[:, i].permute, below) is already K/V-interleaved per
+    # block, and the mamba state view is rebuilt with a num_layers-scaled block
+    # stride (see _reshape_mamba_contiguous in patches.py). The one combination
+    # we cannot express is contiguous + ratio>1 (kernel_block_size !=
+    # block_size), which is rejected right after ratio is computed below.
 
     num_k_or_v = 1 if is_mla else 2
 
@@ -269,6 +271,20 @@ def alloc_kv_cache(
             f"block_size ({block_size}) must be a multiple of "
             f"kernel_block_size ({kernel_block_size})")
     ratio = block_size // kernel_block_size
+
+    # The contiguous layout builds per-layer attention views at *virtual* block
+    # granularity (actual_kvcache_shape), so it cannot express a view split into
+    # kernel-sized blocks. For hybrid linear-attention this is the one
+    # contiguous combination we cannot support: fail loud rather than hand back
+    # a mis-strided attention tensor. (MHA/MLA reach the same contiguous branch;
+    # their ratio>1 behavior predates this change and is intentionally left
+    # untouched here to avoid regressing already-working dense configs.)
+    if is_hybrid_linear and _contiguous_layout and ratio > 1:
+        raise NotImplementedError(
+            "kvcached does not support the contiguous KV layout for hybrid "
+            "linear-attention models when kernel_block_size != block_size "
+            f"(block_size={block_size}, kernel_block_size={kernel_block_size}, "
+            f"ratio={ratio}). Re-launch with KVCACHED_CONTIGUOUS_LAYOUT=false.")
 
     # --- Validate shape and determine layout indices ---
     if is_mla:
@@ -328,9 +344,22 @@ def alloc_kv_cache(
 
     ftensor_bytes_per_layer = gpu_mem_bytes_per_layer_k_or_v * num_k_or_v
 
+    # For the unified (hybrid) pool, K and V are interleaved into a single
+    # buffer per layer, so the KVCacheManager / PageAllocator use
+    # num_kv_buffers=1 (see _get_kv_cache_params in patches.py). The C++
+    # contiguous layout sizes its compound page as
+    # kPageSize*num_layers*num_kv_buffers, so it MUST see the same 1 here --
+    # otherwise the compound page is 2x too large and FTensor::map's
+    # offset-alignment assert fails on every odd page id (and the compound-page
+    # count no longer matches the manager's block count). In non-contiguous
+    # layout create_kv_tensors ignores num_kv_buffers, so this is a no-op there.
+    # The FTensor byte size is unaffected: it comes from ftensor_bytes_per_layer
+    # (= gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) above, which already
+    # accounts for both K and V.
+    compound_num_kv_buffers = 1 if unified_pool else num_k_or_v
     raw_kv_tensors = create_kv_tensors(
         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
-        num_kv_buffers=num_k_or_v, group_id=group_id,
+        num_kv_buffers=compound_num_kv_buffers, group_id=group_id,
         unified_pool=unified_pool,
     )
 
@@ -421,15 +450,26 @@ def alloc_kv_cache(
         return kv_tensors
 
     # --- Build raw int8 buffers for hybrid model (mamba) support ---
-    pool_bytes = num_blocks_per_layer * page_size_bytes
-    raw_int8 = [t.view(torch.int8)[:pool_bytes] for t in raw_kv_tensors]
+    # Non-contiguous: one compact flat buffer per pool; consecutive blocks of a
+    # pool are page_size_bytes apart. Contiguous: a single interleaved base
+    # buffer shared by all pools; block N of pool L sits at
+    # (N*num_pools + L)*page_size_bytes, so the per-pool block stride is
+    # num_layers*page_size_bytes. _reshape_mamba_{non_,}contiguous consume these.
+    if not _contiguous_layout:
+        pool_bytes = num_blocks_per_layer * page_size_bytes
+        raw_int8 = [t.view(torch.int8)[:pool_bytes] for t in raw_kv_tensors]
+        block_stride_bytes = page_size_bytes
+    else:
+        raw_int8 = [raw_kv_tensors[0].view(torch.int8)]
+        block_stride_bytes = num_layers * page_size_bytes
 
     raw_info = {
         "buffers": raw_int8,
         "num_blocks": num_blocks_per_layer,
         "page_size_bytes": page_size_bytes,
-        "block_stride_bytes": page_size_bytes,
+        "block_stride_bytes": block_stride_bytes,
         "num_pools": num_layers,
+        "is_contiguous": _contiguous_layout,
     }
     if return_meta:
         return kv_tensors, raw_info, meta  # type: ignore[return-value]
