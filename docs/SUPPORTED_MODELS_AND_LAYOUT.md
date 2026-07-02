@@ -100,10 +100,12 @@ return True                              # CUDA → 连续
 
 | 场景 | 要求 | 原因 |
 |---|---|---|
-| **vLLM hybrid-linear / Mamba** | **必须非连续** | `is_hybrid_linear and contiguous` 直接 `ValueError`,提示设 `KVCACHED_CONTIGUOUS_LAYOUT=false`;并强制 `unified_pool` |
+| **vLLM hybrid-linear / Mamba** | 两者皆可¹(连续支持本分支新加入) | 连续下 attention 视图按 block 交织、mamba 视图按 `num_layers×page` 步幅重塑;唯一不支持 `contiguous + ratio>1`(`kernel_block_size≠block_size`)。详见 [HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN](./HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md) |
 | **AMD ROCm / HIP**(任何模型) | **必须非连续**(自动默认) | 连续的交错布局喂给 ROCm 的 `PagedAttention.split_kv_cache` + paged kernel 会读错;CUDA 的 FlashAttention/FlashInfer 能容忍跨步视图 |
 | **vLLM NIXL PD 分离** | **必须非连续** | `NixlConnector` 按 block-contiguous 注册每层 K/V,连续布局的跨层交错与之冲突 |
 | **SGLang hybrid-linear / Mamba 投机解码** | **必须连续** | `fused_mamba_state_scatter` / MTP-verify 需要单个 `(num_layers, slots, *)` tensor |
+
+> ¹ vLLM hybrid-linear 的**连续布局支持是本分支新加入的**(代码 + CPU 单测 `tests/test_hybrid_contiguous_layout.py`)。**GPU token 对齐验证已在 Mamba2 hybrid 上通过**:Zamba2-1.2B / vLLM 0.13.0 / A100,连续 vs 非连续 vs 原生 vLLM **逐 token 一致**(`contiguous_layout=1, num_kv_buffers=1`,无 `FTensor::map` 崩溃)。**GDN 也已通过**:Qwen3-Next(tiny)/ vLLM 0.13 / A100,连续 vs 非连续 vs 原生 **逐 token 一致** —— Mamba2 与 GDN 两种内核家族均验证过。仅本机 27B `Qwen3.6-27B-AWQ` 的 `Qwen3_5` 架构此 vLLM 未注册、未在该具体 checkpoint 上验(内核同 GDN,已覆盖)。验证细节/recipe 见 [方案文档](./HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md)。
 | **NVIDIA 稠密 MHA/GQA/MLA** | **两者皆可** | FlashAttention/FlashInfer 读取路径对布局不敏感;CUDA 默认连续 |
 
 ### 3.4 正确性 / 性能权衡
@@ -114,10 +116,10 @@ return True                              # CUDA → 连续
 | 每层 KV tensor | 跨步视图(大 stride) | 紧凑标准 contiguous |
 | ROCm paged kernel 正确 | ❌ | ✅ |
 | NIXL PD | ❌ | ✅ |
-| vLLM hybrid-linear/Mamba | ❌ | ✅(必需) |
+| vLLM hybrid-linear/Mamba | ⚠️ 本分支新加入,待 GPU 验证(不支持 `ratio>1`) | ✅(当前安全默认) |
 | SGLang hybrid-linear 投机解码 | ✅(必需) | ❌ |
 
-**净取舍**:连续 = 用「跨步的每层视图」换「更少的 VMM 操作」,CUDA 稠密/MLA 首选;非连续 = 紧凑每层 tensor,ROCm / NIXL / vLLM-hybrid-linear 必需,代价是更多 map 调用。
+**净取舍**:连续 = 用「跨步的每层视图」换「更少的 VMM 操作」,CUDA 稠密/MLA 首选;非连续 = 紧凑每层 tensor,ROCm / NIXL 必需(vLLM hybrid-linear 连续支持已加入但待 GPU 验证,验证前仍以非连续为安全默认),代价是更多 map 调用。
 
 > 另:每个 block(或 Mamba 每槽 super-cell)必须放进一个 `PAGE_SIZE`(默认 2MB),否则 `kv_cache_manager.py` 抛 `KVCachedConfigError`(对 GDN/Mamba 这类 recurrent state 较大的模型,需调大 `KVCACHED_PAGE_SIZE_MB`)。
 

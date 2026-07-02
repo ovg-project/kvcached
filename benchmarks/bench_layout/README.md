@@ -70,7 +70,7 @@ More concurrent requests → larger working set → more distinct 2 MB pages tou
 
 Three things to put on the other side of the scale.
 
-**Hybrid linear / mamba: required.** Mamba state shares the KV buffer and indexes by virtual block across layers. `interfaces.py:138` outright refuses non-contiguous for hybrid-linear configs.
+**Hybrid linear / mamba.** Mamba state shares the KV buffer and indexes by virtual block across layers. Historically kvcached's vLLM integration *required non-contiguous* for hybrid-linear configs (`alloc_kv_cache` raised on `is_hybrid_linear and contiguous`). Contiguous support for these models has since been added (see `docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md`), pending GPU token-parity validation; until then non-contiguous remains the safe default here. (Earlier revisions of this note had the polarity backwards.)
 
 **Init time: ~1.4 s faster at server boot.** Contiguous reserves one big VM range; non-contiguous reserves `num_layers` separate ones. Measured `alloc_kv_cache` (16 layers, 1 GB/layer): 635 ms vs 2055 ms. ~99% of that 1.4 s is `FTensor::init_with_zero_()` mapping the zero-page over the entire VM range — contiguous uses a 64 MB compound page so it makes 1947 `cuMemMap` calls (~325 μs each); non-contiguous uses 2 MB pages and makes 62,304 calls (~33 μs each). CUDA driver per-call overhead is the dominant cost, and bigger pages amortise it better.
 
@@ -93,4 +93,4 @@ So contiguous still wins for: smoke tests, single-shot inference, request-level 
 
 The kvcached default `CONTIGUOUS_LAYOUT=true` costs ~30% e2e throughput on standard MHA/GQA/MLA because every FlashAttention block read crosses a fresh 2 MB VMM page. Flipping to `LAYOUT=false` closes the gap entirely, at the price of ~1.4 s extra startup that's paid off in tens of requests.
 
-The default should flip to `false` for non-hybrid models; `interfaces.py:138` already handles the hybrid-linear case where contiguous is mandatory.
+The default should flip to `false` for non-hybrid models. For hybrid-linear models, non-contiguous is currently the safe default (contiguous support is newly added but pending GPU validation — see `docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md`).
