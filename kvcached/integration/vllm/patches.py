@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
-from kvcached.utils import KVCachedConfigError
+from kvcached.utils import KVCachedConfigError, get_kvcached_logger
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -27,6 +27,9 @@ if TYPE_CHECKING:
         KVCacheBlock = Any  # type: ignore[misc,assignment]
         KVCacheEvent = Any  # type: ignore[misc,assignment]
         Request = Any  # type: ignore[misc,assignment]
+
+
+logger = get_kvcached_logger()
 
 
 def _is_attention_spec(spec: Any) -> bool:
@@ -249,12 +252,32 @@ def _get_max_cached_blocks(block_size: int) -> int:
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns MAX_CACHED_TOKENS // block_size.
+    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)``.
+
+    The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
+    ``block_size`` (e.g. 8 tokens with a 16-token block) integer-divides to
+    ``0``, which is indistinguishable from the ``== 0`` "disabled" sentinel and
+    would silently turn prefix caching off. Flooring at one block keeps caching
+    enabled for the smallest non-zero budget, matching the user's intent; a
+    warning is logged so the effective granularity is not silent.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
     if MAX_CACHED_TOKENS < 0:
         return -1
-    return MAX_CACHED_TOKENS // block_size
+    if MAX_CACHED_TOKENS == 0:
+        return 0
+    max_cached_blocks = MAX_CACHED_TOKENS // block_size
+    if max_cached_blocks == 0:
+        logger.warning(
+            "KVCACHED_MAX_CACHED_TOKENS=%d is smaller than the KV block size "
+            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
+            "stays enabled. Set KVCACHED_MAX_CACHED_TOKENS=0 to disable "
+            "caching explicitly.",
+            MAX_CACHED_TOKENS,
+            block_size,
+        )
+        return 1
+    return max_cached_blocks
 
 
 def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
