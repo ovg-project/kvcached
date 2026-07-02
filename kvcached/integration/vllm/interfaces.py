@@ -252,15 +252,10 @@ def alloc_kv_cache(
                 for t in raw_kv_tensors
             ]
         else:
-            # Build attention view with as_strided. Two modes:
-            #   split-half (default): K occupies [0, v_offset), V occupies
-            #     [v_offset, 2*v_offset). K/V dim stride = v_offset_eles.
-            #   unified_pool (HYBRID_LINEAR): K and V interleaved per kernel
-            #     block. This mirrors native vLLM's
-            #     _update_hybrid_attention_mamba_layout and lets an attached
-            #     linear-attention / mamba layer read the same flat buffer
-            #     (mamba still indexes by virtual block; each virtual block
-            #     spans ``ratio`` kernel blocks).
+            # Build the attention view with vLLM's native split-half layout:
+            # K occupies [0, v_offset), V occupies [v_offset, 2*v_offset).
+            # HYBRID_LINEAR mamba reshaping is handled later by vLLM's
+            # _update_hybrid_attention_mamba_layout using the raw pool buffers.
             shape = list(kernel_kvcache_shape)
             strides = [0] * len(shape)
             strides[-1] = 1
@@ -268,23 +263,13 @@ def alloc_kv_cache(
                 strides[i] = strides[i + 1] * shape[i + 1]
             # hidden_size_eles uses kernel_block_size (shape[2]), not block_size.
             hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * h * d
-            if unified_pool:
-                # Block-interleaved at kernel granularity: inter-(kernel-)block
-                # stride = 2*hidden_size; K/V dim stride = hidden_size.
-                if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
-                    strides[1] = 2 * hidden_size_eles
-                    strides[0] = hidden_size_eles
-                else:                             # FlashInfer (N*ratio, 2, ...)
-                    strides[0] = 2 * hidden_size_eles
-                    strides[1] = hidden_size_eles
-            else:
-                v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
-                if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
-                    strides[1] = hidden_size_eles
-                    strides[0] = v_offset_eles
-                else:                             # FlashInfer (N*ratio, 2, ...)
-                    strides[0] = hidden_size_eles
-                    strides[1] = v_offset_eles
+            v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
+            if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
+                strides[1] = hidden_size_eles
+                strides[0] = v_offset_eles
+            else:                             # FlashInfer (N*ratio, 2, ...)
+                strides[0] = hidden_size_eles
+                strides[1] = v_offset_eles
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))

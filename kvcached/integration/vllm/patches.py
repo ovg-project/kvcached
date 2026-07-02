@@ -1287,25 +1287,52 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             kv_caches: dict[str, torch.Tensor] = {}
 
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
+            runner_only_attn_layers = set(
+                getattr(kv_cache_config, "runner_only_attn_layers", set())
+            )
+            layer_to_pool_idx = {}
+            for pool_idx, tensor_cfg in enumerate(
+                getattr(kv_cache_config, "kv_cache_tensors", [])
+            ):
+                for layer_name in getattr(tensor_cfg, "shared_by", []):
+                    layer_to_pool_idx[layer_name] = pool_idx
+
+            has_attn = False
+            has_mamba = False
+            kernel_block_sizes: list[int] = []
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
+                kernel_block_sizes.append(
+                    int(getattr(kv_cache_spec, "block_size", 0))
+                )
 
                 if _is_mamba_spec(kv_cache_spec):
+                    has_mamba = True
                     if mamba_info is None:
                         raise RuntimeError(
                             "Mamba layers found but no raw buffer info "
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                        pool_idx = layer_to_pool_idx.get(layer_name, pool_idx)
                         state_tensors = _reshape_mamba_non_contiguous(
                             mamba_info["buffers"][pool_idx],
                             kv_cache_spec, get_dtype_size,
                         )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
+                    has_attn = True
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                        if layer_name in runner_only_attn_layers:
+                            continue
+                        pool_idx = layer_to_pool_idx.get(layer_name, pool_idx)
                         kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+
+            if has_attn and has_mamba:
+                self._update_hybrid_attention_mamba_layout(
+                    kv_caches, kernel_block_sizes
+                )
 
             return kv_caches
 
