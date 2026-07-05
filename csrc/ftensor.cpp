@@ -102,8 +102,7 @@ bool FTensor::map(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) != mapping_.end()) {
-    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
-    return false;
+    return true;
   }
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
@@ -122,8 +121,7 @@ bool FTensor::unmap(offset_t offset) {
 
   page_id_t page_id = offset / page_size_;
   if (mapping_.find(page_id) == mapping_.end()) {
-    LOGGER(ERROR, "Page %ld is not mapped.", page_id);
-    return false;
+    return true;
   }
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
