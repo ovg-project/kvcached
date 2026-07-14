@@ -11,6 +11,18 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.utils import CONTIGUOUS_LAYOUT
 
 
+def _import_vllm_module(module_name: str):
+    """Import vLLM module from v1 or fallback to v2 layout."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        if module_name.startswith("vllm.v1."):
+            return importlib.import_module(module_name.replace("vllm.v1.", "vllm.v2."))
+        if module_name.startswith("vllm.v2."):
+            return importlib.import_module(module_name.replace("vllm.v2.", "vllm.v1."))
+        raise
+
+
 class NixlConnectorPatch(BasePatch):
     """Eager NixlConnector compatibility patch.
 
@@ -127,8 +139,8 @@ class NixlConnectorPatch(BasePatch):
     def _import_nixl_connector_classes(self) -> Optional[Tuple[Any, Any]]:
         for connector_module_name, worker_module_name in self._CONNECTOR_MODULES:
             try:
-                connector_module = importlib.import_module(connector_module_name)
-                worker_module = importlib.import_module(worker_module_name)
+                connector_module = _import_vllm_module(connector_module_name)
+                worker_module = _import_vllm_module(worker_module_name)
             except ImportError:
                 continue
 

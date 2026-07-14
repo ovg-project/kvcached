@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import importlib
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -14,6 +15,18 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 from kvcached.utils import KVCachedConfigError
+
+
+def _import_vllm_module(module_name: str):
+    """Import vLLM module from v1 or fallback to v2 layout."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        if module_name.startswith("vllm.v1."):
+            return importlib.import_module(module_name.replace("vllm.v1.", "vllm.v2."))
+        if module_name.startswith("vllm.v2."):
+            return importlib.import_module(module_name.replace("vllm.v2.", "vllm.v1."))
+        raise
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -23,10 +36,15 @@ if TYPE_CHECKING:
         from vllm.v1.core.block_pool import KVCacheEvent  # type: ignore[import-untyped]
         from vllm.v1.core.scheduler import Request  # type: ignore[import-untyped]
     except ImportError:
-        # Fallback if vLLM is not available during type checking
-        KVCacheBlock = Any  # type: ignore[misc,assignment]
-        KVCacheEvent = Any  # type: ignore[misc,assignment]
-        Request = Any  # type: ignore[misc,assignment]
+        try:
+            from vllm.v2.core.block_pool import KVCacheBlock  # type: ignore[import-untyped]
+            from vllm.v2.core.block_pool import KVCacheEvent  # type: ignore[import-untyped]
+            from vllm.v2.core.scheduler import Request  # type: ignore[import-untyped]
+        except ImportError:
+            # Fallback if vLLM is not available during type checking
+            KVCacheBlock = Any  # type: ignore[misc,assignment]
+            KVCacheEvent = Any  # type: ignore[misc,assignment]
+            Request = Any  # type: ignore[misc,assignment]
 
 
 def _is_attention_spec(spec: Any) -> bool:
@@ -36,7 +54,7 @@ def _is_attention_spec(spec: Any) -> bool:
     as FullAttentionSpec(use_mla=True), which still matches FullAttentionSpec
     here, so resolving MLAAttentionSpec dynamically is sufficient.
     """
-    from vllm.v1 import kv_cache_interface
+    kv_cache_interface = _import_vllm_module("vllm.v1.kv_cache_interface")
 
     candidates = tuple(
         cls for cls in (
@@ -50,12 +68,9 @@ def _is_attention_spec(spec: Any) -> bool:
 
 def _is_mamba_spec(spec: Any) -> bool:
     """Check if a KV cache spec is a MambaSpec."""
-    try:
-        from vllm.v1.kv_cache_interface import MambaSpec
-
-        return isinstance(spec, MambaSpec)
-    except ImportError:
-        return False
+    kv_cache_interface = _import_vllm_module("vllm.v1.kv_cache_interface")
+    MambaSpec = getattr(kv_cache_interface, "MambaSpec", None)
+    return isinstance(spec, MambaSpec) if MambaSpec is not None else False
 
 
 def _get_first_attention_group(kv_cache_config: Any) -> Any:
@@ -133,7 +148,8 @@ def _infer_attention_type(kv_cache_config: Any) -> str:
     (pre-0.11.0) as well as via the dedicated MLAAttentionSpec class
     (0.11.0+).
     """
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    kv_cache_interface = _import_vllm_module("vllm.v1.kv_cache_interface")
+    FullAttentionSpec = getattr(kv_cache_interface, "FullAttentionSpec", None)
 
     has_full_attn = False
     has_mla = False
@@ -142,7 +158,7 @@ def _infer_attention_type(kv_cache_config: Any) -> str:
         spec = grp.kv_cache_spec
         if _is_mla_kv_cache_spec(spec):
             has_mla = True
-        elif isinstance(spec, FullAttentionSpec):
+        elif FullAttentionSpec is not None and isinstance(spec, FullAttentionSpec):
             has_full_attn = True
         elif _is_mamba_spec(spec):
             has_mamba = True
@@ -237,11 +253,9 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     """
     if getattr(kv_cache_spec, "use_mla", False):
         return True
-    try:
-        from vllm.v1.kv_cache_interface import MLAAttentionSpec
-    except ImportError:
-        return False
-    return isinstance(kv_cache_spec, MLAAttentionSpec)
+    kv_cache_interface = _import_vllm_module("vllm.v1.kv_cache_interface")
+    MLAAttentionSpec = getattr(kv_cache_interface, "MLAAttentionSpec", None)
+    return isinstance(kv_cache_spec, MLAAttentionSpec) if MLAAttentionSpec is not None else False
 
 
 def _get_max_cached_blocks(block_size: int) -> int:
@@ -278,7 +292,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
     library = "vllm"
-    target_module = "vllm.v1.core.block_pool"
+    target_module = ["vllm.v1.core.block_pool", "vllm.v2.core.block_pool"]
     patch_name = "elastic_block_pool"
 
     def apply(self, block_pool_mod: types.ModuleType) -> bool:
@@ -621,7 +635,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
     """Patch EngineCore.__init__ to initialize kvcached"""
 
     library = "vllm"
-    target_module = "vllm.v1.engine.core"
+    target_module = ["vllm.v1.engine.core", "vllm.v2.engine.core"]
     target_class = "EngineCore"
     patch_name = "engine_core"
 
@@ -675,7 +689,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
     """Patch KVCacheCoordinator to use ElasticBlockPool"""
 
     library = "vllm"
-    target_module = "vllm.v1.core.kv_cache_coordinator"
+    target_module = ["vllm.v1.core.kv_cache_coordinator", "vllm.v2.core.kv_cache_coordinator"]
     target_class = "KVCacheCoordinator"
     patch_name = "kv_cache_coordinator"
 
@@ -798,7 +812,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
     """
 
     library = "vllm"
-    target_module = "vllm.v1.core.kv_cache_manager"
+    target_module = ["vllm.v1.core.kv_cache_manager", "vllm.v2.core.kv_cache_manager"]
     target_class = "KVCacheManager"
     patch_name = "kv_cache_manager"
 
@@ -913,7 +927,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
     """Patch GPUModelRunner for kvcached integration"""
 
     library = "vllm"
-    target_module = "vllm.v1.worker.gpu_model_runner"
+    target_module = ["vllm.v1.worker.gpu_model_runner", "vllm.v2.worker.gpu_model_runner"]
     target_class = "GPUModelRunner"
     patch_name = "gpu_model_runner"
 
@@ -1021,7 +1035,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _patched_initialize_kv_cache(self, kv_cache_config: Any) -> None:
             import torch
-            from vllm.v1.utils import bind_kv_cache
+            bind_kv_cache = getattr(
+                _import_vllm_module("vllm.v1.utils"),
+                "bind_kv_cache",
+            )
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1093,7 +1110,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
-            from vllm.v1.kv_cache_interface import KVCacheTensor
+            KVCacheTensor = getattr(
+                _import_vllm_module("vllm.v1.kv_cache_interface"),
+                "KVCacheTensor",
+            )
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1161,7 +1181,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         f"{backend_name} requires {selected_layout}."
                     )
 
-                from vllm.v1.attention.backends.utils import set_kv_cache_layout
+                set_kv_cache_layout = getattr(
+                    _import_vllm_module("vllm.v1.attention.backends.utils"),
+                    "set_kv_cache_layout",
+                )
 
                 set_kv_cache_layout(selected_layout)
 
@@ -1198,10 +1221,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             if kernel_block_sizes is None:
                 try:
-                    from vllm.v1.worker.utils import (
-                        prepare_kernel_block_sizes as prepare_kernel_block_sizes_fn,
+                    prepare_kernel_block_sizes_fn = getattr(
+                        _import_vllm_module("vllm.v1.worker.utils"),
+                        "prepare_kernel_block_sizes",
                     )
-                except ImportError:
+                except (ImportError, AttributeError):
                     pass
                 else:
                     attn_groups = getattr(self, "attn_groups", None)
@@ -1376,7 +1400,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     """Patch Worker.init_device to ignore GPU free-memory check when kvcached is enabled"""
 
     library = "vllm"
-    target_module = "vllm.v1.worker.gpu_worker"
+    target_module = ["vllm.v1.worker.gpu_worker", "vllm.v2.worker.gpu_worker"]
     target_class = "Worker"
     patch_name = "gpu_worker"
 
@@ -1418,12 +1442,22 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 try:
                     from vllm.utils.mem_utils import MemorySnapshot
                     from vllm.utils.torch_utils import set_random_seed  # type: ignore
-                    from vllm.v1.utils import report_usage_stats  # type: ignore
-                    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-                    from vllm.v1.worker.gpu_worker import (
-                        init_worker_distributed_environment as _init_dist_env,
+                    report_usage_stats = getattr(
+                        _import_vllm_module("vllm.v1.utils"),
+                        "report_usage_stats",
                     )
-                    from vllm.v1.worker.workspace import init_workspace_manager
+                    GPUModelRunner = getattr(
+                        _import_vllm_module("vllm.v1.worker.gpu_model_runner"),
+                        "GPUModelRunner",
+                    )
+                    _init_dist_env = getattr(
+                        _import_vllm_module("vllm.v1.worker.gpu_worker"),
+                        "init_worker_distributed_environment",
+                    )
+                    init_workspace_manager = getattr(
+                        _import_vllm_module("vllm.v1.worker.workspace"),
+                        "init_workspace_manager",
+                    )
                 except Exception:
                     logger.warning("Unable to import vLLM helpers; re-raising OOM")
                     raise
