@@ -1,4 +1,3 @@
-import os
 import sys
 import types
 from pathlib import Path
@@ -19,8 +18,11 @@ def _prepare_kvcached_package(monkeypatch):
 
 
 def _make_vllm_package(monkeypatch):
+    import importlib.util
+
     pkg = types.ModuleType("vllm")
     pkg.__path__ = []
+    pkg.__spec__ = importlib.util.spec_from_loader("vllm", loader=None, origin="vllm")
     v2_pkg = types.ModuleType("vllm.v2")
     v2_pkg.__path__ = []
     mod = types.ModuleType("vllm.v2.foo")

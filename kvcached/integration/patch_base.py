@@ -125,7 +125,6 @@ class PatchManager:
 
         return results
 
-
     def _is_patch_compatible(self, patch: BasePatch, version_range: str) -> bool:
         """Check if patch is compatible with the current library version"""
         library_version = self.version_manager.detect_version(self.library_name)

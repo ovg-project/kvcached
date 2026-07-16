@@ -28,6 +28,7 @@ def _import_vllm_module(module_name: str):
             return importlib.import_module(module_name.replace("vllm.v2.", "vllm.v1."))
         raise
 
+
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
     # Import them here for type checking only
@@ -57,7 +58,8 @@ def _is_attention_spec(spec: Any) -> bool:
     kv_cache_interface = _import_vllm_module("vllm.v1.kv_cache_interface")
 
     candidates = tuple(
-        cls for cls in (
+        cls
+        for cls in (
             getattr(kv_cache_interface, name, None)
             for name in ("FullAttentionSpec", "SlidingWindowSpec", "MLAAttentionSpec")
         )
@@ -179,7 +181,9 @@ def _should_enable_async_sched(vllm_config: Any) -> bool:
 
 
 def _reshape_mamba_non_contiguous(
-    raw_int8: Any, kv_cache_spec: Any, get_dtype_size: Any,
+    raw_int8: Any,
+    kv_cache_spec: Any,
+    get_dtype_size: Any,
 ) -> list:
     """Create strided mamba state views from a per-pool flat int8 buffer.
 
@@ -266,6 +270,7 @@ def _get_max_cached_blocks(block_size: int) -> int:
     Otherwise returns MAX_CACHED_TOKENS // block_size.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
+
     if MAX_CACHED_TOKENS < 0:
         return -1
     return MAX_CACHED_TOKENS // block_size
@@ -304,8 +309,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         return self.inject_elastic_block_pool(block_pool_mod)
 
     @version_range(VLLM_ALL_RANGE)
-    def inject_elastic_block_pool(self,
-                                  block_pool_mod: types.ModuleType) -> bool:
+    def inject_elastic_block_pool(self, block_pool_mod: types.ModuleType) -> bool:
         """Inject ElasticBlockPool"""
         if hasattr(block_pool_mod, "ElasticBlockPool"):
             self.logger.debug("ElasticBlockPool already exists")
@@ -331,7 +335,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 enable_caching: bool,
                 enable_kv_cache_events: bool = False,
                 num_kv_buffers: int = 2,
-                max_cached_blocks: int = 1000
+                max_cached_blocks: int = 1000,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
@@ -341,7 +345,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     logger.info("Prefix caching enabled for ElasticBlockPool")
 
                 assert not enable_kv_cache_events, (
-                    "KV cache events are not supported in ElasticBlockPool")
+                    "KV cache events are not supported in ElasticBlockPool"
+                )
 
                 self.num_gpu_blocks = num_gpu_blocks
                 self.enable_kv_cache_events = enable_kv_cache_events
@@ -351,8 +356,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
                 self.kv_cache_manager = get_kv_cache_manager(
-                    num_gpu_blocks, block_size, cell_size, num_layers,
-                    num_kv_buffers=num_kv_buffers)
+                    num_gpu_blocks, block_size, cell_size, num_layers, num_kv_buffers=num_kv_buffers
+                )
 
                 # Allocate a dedicated null block – a placeholder for skipped
                 # positions (e.g. sliding-window / chunked-local attention).
@@ -429,7 +434,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 _hash_fn = kwargs.pop("hash_fn", None)
 
                 remaining_args = list(args)
-                if block_hashes is None and remaining_args and isinstance(remaining_args[0], (list, tuple)):
+                if (
+                    block_hashes is None
+                    and remaining_args
+                    and isinstance(remaining_args[0], (list, tuple))
+                ):
                     block_hashes = remaining_args.pop(0)
 
                 if num_cached_blocks is None and remaining_args:
@@ -458,10 +467,13 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
 
                 if block_hashes is None:
-                    assert hasattr(request, "block_hashes"), "Request missing block_hashes attribute"
+                    assert hasattr(request, "block_hashes"), (
+                        "Request missing block_hashes attribute"
+                    )
                     block_hashes = request.block_hashes
-                assert len(block_hashes) >= num_full_blocks, \
+                assert len(block_hashes) >= num_full_blocks, (
                     f"Request has {len(block_hashes)} hashes but need {num_full_blocks}"
+                )
 
                 for i, block in enumerate(new_full_blocks):
                     if getattr(block, "is_null", False):
@@ -494,12 +506,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager.free(ids_to_free)
                 return len(ids_to_free)
 
-            def get_new_blocks(
-                self, num_blocks: int
-            ) -> list[KVCacheBlock]:
+            def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
                 if num_blocks > self.get_num_free_blocks():
-                    raise ValueError(
-                        f"Cannot get {num_blocks} free blocks from the pool")
+                    raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
                 block_ids: Optional[list[int]] = None
                 for _ in range(2):
@@ -521,7 +530,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # (see KVCacheManager._alloc), so a different length is a
                 # contract violation rather than a recoverable runtime state.
                 assert len(block_ids) == num_blocks, (
-                    f"alloc returned {len(block_ids)} blocks, expected {num_blocks}")
+                    f"alloc returned {len(block_ids)} blocks, expected {num_blocks}"
+                )
 
                 blocks = []
                 for bid in block_ids:
@@ -530,9 +540,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     blocks.append(block)
                 return blocks
 
-            def touch(
-                self, blocks: list[KVCacheBlock] | tuple[list[KVCacheBlock], ...]
-            ) -> None:
+            def touch(self, blocks: list[KVCacheBlock] | tuple[list[KVCacheBlock], ...]) -> None:
                 if not self.enable_prefix_cache:
                     return
                 if isinstance(blocks, tuple):
@@ -575,11 +583,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
 
-                if (self.max_cached_blocks >= 0
-                        and len(self._evictable_blocks) > self.max_cached_blocks):
+                if (
+                    self.max_cached_blocks >= 0
+                    and len(self._evictable_blocks) > self.max_cached_blocks
+                ):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
-
 
             def evict_blocks(self, block_ids: set[int]) -> None:
                 if not self.enable_prefix_cache:
@@ -617,7 +626,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return True
 
             def get_num_free_blocks(self) -> int:
-                return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
+                return (
+                    (self.kv_cache_manager.available_size() + len(self._evictable_blocks))
+                    if self.enable_prefix_cache
+                    else self.kv_cache_manager.available_size()
+                )
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
@@ -754,7 +767,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             attention_type = _infer_attention_type(kv_cache_config)
 
             cell_size, num_kv_buffers = _get_kv_cache_params(
-                kv_cache_spec, block_size, attention_type=attention_type)
+                kv_cache_spec, block_size, attention_type=attention_type
+            )
 
             try:
                 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
@@ -789,7 +803,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=group_size,
                 enable_caching=getattr(self, "enable_caching", False),
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size)
+                max_cached_blocks=_get_max_cached_blocks(block_size),
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -865,7 +879,8 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 # v0.8 scheduler may not wire cache_full_blocks / block_hashes
                 # the same way as v0.9+; disable until verified.
                 logger.warning(
-                    "Prefix caching not yet supported for kvcached on vLLM v0.8.x, disabling")
+                    "Prefix caching not yet supported for kvcached on vLLM v0.8.x, disabling"
+                )
                 enable_caching = False
 
             # Import ElasticBlockPool from the patched module
@@ -908,7 +923,7 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
                 num_layers=num_layers,
                 enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size)
+                max_cached_blocks=_get_max_cached_blocks(block_size),
             )
             if hasattr(self, "specialized_manager"):
                 self.specialized_manager.block_pool = self.block_pool
@@ -985,6 +1000,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     get_tensor_model_parallel_rank,
                     get_tensor_model_parallel_world_size,
                 )
+
                 tp_rank = int(get_tensor_model_parallel_rank())
                 tp_size = int(get_tensor_model_parallel_world_size())
             except (ImportError, AttributeError):
@@ -996,6 +1012,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 from vllm.distributed.parallel_state import (
                     get_pp_group,
                 )
+
                 pp_rank = int(get_pp_group().rank_in_group)
             except Exception:
                 pp_rank = 0
@@ -1035,6 +1052,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _patched_initialize_kv_cache(self, kv_cache_config: Any) -> None:
             import torch
+
             bind_kv_cache = getattr(
                 _import_vllm_module("vllm.v1.utils"),
                 "bind_kv_cache",
@@ -1110,6 +1128,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         def _allocate_kv_cache_from_kvcached(self, kv_cache_config):
             import torch
+
             KVCacheTensor = getattr(
                 _import_vllm_module("vllm.v1.kv_cache_interface"),
                 "KVCacheTensor",
@@ -1119,7 +1138,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             _validate_kv_cache_groups(kv_cache_config)
 
-            layer_to_tensor_cfg: dict[str, KVCacheTensor] = {}
+            layer_to_tensor_cfg: dict[str, KVCacheTensor] = {}  # type: ignore[valid-type]
             for tensor_cfg in kv_cache_config.kv_cache_tensors:
                 for ln in tensor_cfg.shared_by:
                     layer_to_tensor_cfg[ln] = tensor_cfg
@@ -1128,12 +1147,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 layer_spec = grp.kv_cache_spec
                 for layer_name in grp.layer_names:
                     tensor_cfg = layer_to_tensor_cfg[layer_name]
-                    assert tensor_cfg.size % layer_spec.page_size_bytes == 0, (
-                        f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "
+                    assert tensor_cfg.size % layer_spec.page_size_bytes == 0, (  # type: ignore[attr-defined]
+                        f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "  # type: ignore[attr-defined]
                         "is not a multiple of page size "
                         f"{layer_spec.page_size_bytes}."
                     )
-                    num_blocks = tensor_cfg.size // layer_spec.page_size_bytes
+                    num_blocks = tensor_cfg.size // layer_spec.page_size_bytes  # type: ignore[attr-defined]
                     assert num_blocks >= kv_cache_config.num_blocks, (
                         "Number of blocks derived from tensor size is smaller than "
                         "kv_cache_config.num_blocks"
@@ -1158,7 +1177,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             first_layer_name = first_attn_group.layer_names[0]
             rep_tensor_cfg = layer_to_tensor_cfg[first_layer_name]
-            num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes
+            num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes  # type: ignore[attr-defined]
 
             # Use version-aware attention backend access
             attn_backend_cls = patch_instance._get_version_specific_attention_backend(
@@ -1166,7 +1185,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             )
 
             backend_name = (
-                attn_backend_cls.get_name() if hasattr(attn_backend_cls, "get_name")
+                attn_backend_cls.get_name()
+                if hasattr(attn_backend_cls, "get_name")
                 else str(attn_backend_cls)
             ).upper()
             if backend_name == "FLASHINFER":
@@ -1215,9 +1235,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 )
                 if prepare_kernel_block_sizes_method is not None:
                     has_kernel_block_size_source = True
-                    kernel_block_sizes = prepare_kernel_block_sizes_method(
-                        kv_cache_config
-                    )
+                    kernel_block_sizes = prepare_kernel_block_sizes_method(kv_cache_config)
 
             if kernel_block_sizes is None:
                 try:
@@ -1237,9 +1255,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             kernel_block_size = (
                 kernel_block_sizes[first_attn_group_id]
-                if kernel_block_sizes is not None
-                and first_attn_group_id < len(kernel_block_sizes)
-                else None)
+                if kernel_block_sizes is not None and first_attn_group_id < len(kernel_block_sizes)
+                else None
+            )
             if kernel_block_size is None and has_kernel_block_size_source:
                 raise RuntimeError(
                     "kvcached could not determine the vLLM kernel block size. "
@@ -1303,6 +1321,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
             import torch
+
             try:
                 from vllm.utils.torch_utils import get_dtype_size
             except ImportError:
@@ -1318,13 +1337,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 if _is_mamba_spec(kv_cache_spec):
                     if mamba_info is None:
                         raise RuntimeError(
-                            "Mamba layers found but no raw buffer info "
-                            "available from kvcached"
+                            "Mamba layers found but no raw buffer info available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
                         state_tensors = _reshape_mamba_non_contiguous(
                             mamba_info["buffers"][pool_idx],
-                            kv_cache_spec, get_dtype_size,
+                            kv_cache_spec,
+                            get_dtype_size,
                         )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
@@ -1350,7 +1369,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
             return True
 
-        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
+        def _patched_reshape_kv(
+            self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
+        ):
             if enable_kvcached():
                 return self._reshape_kv_cache_tensors_from_kvcached(
                     kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
@@ -1374,9 +1395,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         """Get attention backend for vLLM 0.10.x+ versions"""
         return model_runner_instance.attn_groups[kv_cache_group_id][0].backend
 
-    def _get_version_specific_attention_backend(
-        self, model_runner_instance, kv_cache_group_id=0
-    ):
+    def _get_version_specific_attention_backend(self, model_runner_instance, kv_cache_group_id=0):
         """Get the appropriate attention backend based on detected version"""
         if not self.detected_version:
             raise ValueError("vLLM version not detected")
@@ -1442,6 +1461,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 try:
                     from vllm.utils.mem_utils import MemorySnapshot
                     from vllm.utils.torch_utils import set_random_seed  # type: ignore
+
                     report_usage_stats = getattr(
                         _import_vllm_module("vllm.v1.utils"),
                         "report_usage_stats",
@@ -1477,8 +1497,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
                 # Initialize workspace manager
                 try:
-                    enable_dbo = getattr(
-                        self.vllm_config.parallel_config, "enable_dbo", False)
+                    enable_dbo = getattr(self.vllm_config.parallel_config, "enable_dbo", False)
                     num_ubatches = 2 if enable_dbo else 1
                     init_workspace_manager(self.device, num_ubatches)
                 except Exception:
