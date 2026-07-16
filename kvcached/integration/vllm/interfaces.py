@@ -29,6 +29,16 @@ _is_worker: bool = False
 def should_use_worker_ipc() -> bool:
     return _kvcached_initialized and not _is_worker
 
+
+def get_world_size() -> int:
+    """Return the TP world size recorded by the latest initialization."""
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first."
+        )
+    return _world_size
+
+
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,
