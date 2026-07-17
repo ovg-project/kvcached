@@ -35,3 +35,27 @@ above it show what scattering costs.
 This drives `KVCacheManager` directly, so it measures the allocator's behaviour
 rather than any engine's eviction policy. It reproduces the conditions #359
 describes; it does not by itself exercise `ElasticBlockPool`'s block selection.
+
+# bench_evict
+
+Measures how much memory prefix-cache eviction actually returns. Caches 4096
+blocks, touches every stride-th block so an age-only policy spares it, then
+evicts down to 512 and reports the memory released.
+
+```bash
+python bench_evict.py
+```
+
+Measured on an RTX PRO 4000 Blackwell (24GB), 8 layers, 16 KiB blocks, 2 MB
+pages (128 blocks per page). Both columns evict the same 3584 blocks:
+
+| stride | freed before (LRU) | freed after (page-aware) |
+|---|---|---|
+| 1 | 0.84 GB | 0.88 GB |
+| 2 | 0.75 GB | 0.88 GB |
+| 4 | 0.50 GB | 0.88 GB |
+| 8 | 0.03 GB | 0.88 GB |
+
+Age-only eviction degrades as the retained blocks scatter: at stride 8 it evicts
+3584 blocks and frees almost nothing, because each surviving block pins a page.
+Page-aware selection holds flat, evicting the same count.
