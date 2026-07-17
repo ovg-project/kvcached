@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import inspect
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -56,6 +57,29 @@ def _is_mamba_spec(spec: Any) -> bool:
         return isinstance(spec, MambaSpec)
     except ImportError:
         return False
+
+
+def _call_hybrid_layout_update(
+    update_hybrid_layout: Any,
+    kv_caches: dict[str, Any],
+    kernel_block_sizes: Any,
+) -> None:
+    """Call the native vLLM hybrid-layout helper across signature changes."""
+    parameters = inspect.signature(update_hybrid_layout).parameters.values()
+    positional = tuple(
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    accepts_varargs = any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL
+        for parameter in parameters
+    )
+    if accepts_varargs or len(positional) >= 2:
+        update_hybrid_layout(kv_caches, kernel_block_sizes)
+    else:
+        update_hybrid_layout(kv_caches)
 
 
 def _get_first_attention_group(kv_cache_config: Any) -> Any:
@@ -1409,12 +1433,26 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 from vllm.utils import get_dtype_size  # type: ignore[attr-defined]
 
             kv_caches: dict[str, torch.Tensor] = {}
+            has_attn, has_mamba = False, False
 
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
             # Per-group attention views for heterogeneous hybrids (Gemma). None
             # for homogeneous / single-group models, which use the raw-tensor
             # index mapping below unchanged.
             attn_layer_views = getattr(self, "_kvcached_attn_layer_views", None)
+            layer_to_pool_idx: dict[str, int] = {}
+            for pool_idx, tensor_cfg in enumerate(kv_cache_config.kv_cache_tensors):
+                for layer_name in tensor_cfg.shared_by:
+                    layer_to_pool_idx[layer_name] = pool_idx
+
+            def _pool_index_for_layer(layer_name: str) -> int:
+                try:
+                    return layer_to_pool_idx[layer_name]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "kvcached reshape: KV cache layer "
+                        f"{layer_name!r} is not owned by any physical pool."
+                    ) from exc
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -1425,7 +1463,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "Mamba layers found but no raw buffer info "
                             "available from kvcached"
                         )
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for layer_name in kv_cache_group.layer_names:
+                        if layer_name in getattr(self, "runner_only_attn_layers", ()):
+                            continue
+                        has_mamba = True
+                        pool_idx = _pool_index_for_layer(layer_name)
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
@@ -1438,11 +1480,29 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for layer_name in kv_cache_group.layer_names:
+                        if layer_name in getattr(self, "runner_only_attn_layers", ()):
+                            continue
+                        has_attn = True
+                        pool_idx = _pool_index_for_layer(layer_name)
                         if attn_layer_views is not None and layer_name in attn_layer_views:
                             kv_caches[layer_name] = attn_layer_views[layer_name]
                         else:
                             kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+
+            update_hybrid_layout = getattr(
+                self, "_update_hybrid_attention_mamba_layout", None
+            )
+            if has_attn and has_mamba and update_hybrid_layout is not None:
+                kernel_block_sizes = args[0] if args else kwargs.get("kernel_block_sizes")
+                if kernel_block_sizes is None:
+                    raise RuntimeError(
+                        "kvcached reshape: hybrid attention+mamba layout requires "
+                        "kernel_block_sizes from vLLM."
+                    )
+                _call_hybrid_layout_update(
+                    update_hybrid_layout, kv_caches, kernel_block_sizes
+                )
 
             return kv_caches
 
@@ -1468,13 +1528,35 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 # vLLM <0.20:  _reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors, ...)
                 # vLLM >=0.20: _reshape_kv_cache_tensors(self, kv_cache_raw_tensors, kernel_block_sizes)
                 #   -> the kv_cache_config arg was dropped; pull it from self.kv_cache_config.
-                if args and hasattr(args[0], "kv_cache_groups"):
-                    kv_cache_config, kv_cache_raw_tensors = args[0], args[1]
+                call_kwargs = dict(kwargs)
+                first = args[0] if args else call_kwargs.get("kv_cache_config")
+                if hasattr(first, "kv_cache_groups"):
+                    kv_cache_config = first
+                    call_kwargs.pop("kv_cache_config", None)
+                    kv_cache_raw_tensors = (
+                        args[1]
+                        if len(args) > 1
+                        else call_kwargs.pop("kv_cache_raw_tensors")
+                    )
+                    rest = args[2:]
                 else:
                     kv_cache_config = getattr(self, "kv_cache_config", None)
-                    kv_cache_raw_tensors = args[0]
+                    if not hasattr(kv_cache_config, "kv_cache_groups"):
+                        raise RuntimeError(
+                            "kvcached reshape: cannot resolve KVCacheConfig. The "
+                            "vLLM _reshape_kv_cache_tensors signature dropped "
+                            "kv_cache_config and self.kv_cache_config is unavailable."
+                        )
+                    kv_cache_raw_tensors = (
+                        args[0]
+                        if args
+                        else call_kwargs.pop("kv_cache_raw_tensors")
+                    )
+                    rest = args[1:]
+                call_kwargs.pop("kv_cache_raw_tensors", None)
                 return self._reshape_kv_cache_tensors_from_kvcached(
-                    kv_cache_config, kv_cache_raw_tensors
+                    kv_cache_config, kv_cache_raw_tensors,
+                    *rest, **call_kwargs
                 )
             return original_method(self, *args, **kwargs)
 
