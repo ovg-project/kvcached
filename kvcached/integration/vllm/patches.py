@@ -490,7 +490,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
                          for page_id, ids in by_page.items()
                          if len(ids) >= occupancy.get(page_id, 0)]
-                pages.sort()
+                # Cheapest page first; break ties on the page whose most
+                # recently used block is oldest, so hot pages are kept.
+                pages.sort(key=lambda page: (page[0], page[1]))
 
                 victims: list[int] = []
                 for cost, _rank, ids in pages:
@@ -512,8 +514,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     return 0
 
                 ordered = self._page_aligned_victims(num_to_evict)
+                chosen = set(ordered)
+                # Top up in LRU order: page alignment is best-effort, but the
+                # caller still needs the count it asked for.
                 ordered.extend(bid for bid in self._evictable_blocks
-                               if bid not in set(ordered))
+                               if bid not in chosen)
 
                 ids_to_free: list[int] = []
                 for bid in ordered[:num_to_evict]:

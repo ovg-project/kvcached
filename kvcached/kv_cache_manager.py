@@ -430,8 +430,6 @@ class KVCacheManager:
         callers choosing which blocks to evict need to know how many blocks a
         page still holds. Page ids the manager does not track report 0.
         """
-        blocks_per_page = InternalPage.get_num_blocks(self.page_size,
-                                                      self.block_mem_size)
         occupancy: Dict[int, int] = {}
         for page_id in page_ids:
             if page_id in self.full_pages:
@@ -441,7 +439,12 @@ class KVCacheManager:
             else:
                 occupancy[page_id] = 0
                 continue
-            occupancy[page_id] = blocks_per_page - page.num_free_blocks()
+            # Blocks straddling a page boundary belong to neither page, so a
+            # page's capacity comes from its own block range rather than from
+            # page_size // block_mem_size.
+            start, end = InternalPage.get_block_range(page_id, self.page_size,
+                                                      self.block_mem_size)
+            occupancy[page_id] = (end - start) - page.num_free_blocks()
         return occupancy
 
     @synchronized
