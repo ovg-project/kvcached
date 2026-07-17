@@ -423,6 +423,28 @@ class KVCacheManager:
         return avail_blocks + blocks_from_free_pages
 
     @synchronized
+    def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
+        """Return the number of allocated blocks on each of `page_ids`.
+
+        A page only returns physical memory once every block on it is freed, so
+        callers choosing which blocks to evict need to know how many blocks a
+        page still holds. Page ids the manager does not track report 0.
+        """
+        blocks_per_page = InternalPage.get_num_blocks(self.page_size,
+                                                      self.block_mem_size)
+        occupancy: Dict[int, int] = {}
+        for page_id in page_ids:
+            if page_id in self.full_pages:
+                page = self.full_pages[page_id]
+            elif page_id in self.avail_pages:
+                page = self.avail_pages[page_id]
+            else:
+                occupancy[page_id] = 0
+                continue
+            occupancy[page_id] = blocks_per_page - page.num_free_blocks()
+        return occupancy
+
+    @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = (self.page_allocator.get_num_inuse_pages() *

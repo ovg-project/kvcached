@@ -464,14 +464,60 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self._cached_blocks[key] = block
                     self._block_id_to_key[block.block_id] = key
 
+            def _page_aligned_victims(self, num_to_evict: int) -> list[int]:
+                """Order evictable blocks so whole pages come free.
+
+                kvcached only returns physical memory once every block on a page
+                is freed, so evicting in LRU order can free no memory at all when
+                the survivors stay scattered across pages. Prefer pages this pool
+                can empty outright, cheapest first; draining a page only part of
+                the way costs hit rate and frees nothing.
+                """
+                mgr = self.kv_cache_manager
+                allocator = getattr(mgr, "page_allocator", None)
+                if allocator is None:
+                    return []
+
+                bids = list(self._evictable_blocks)
+                by_page = allocator.group_indices_by_page(
+                    bids, mgr.block_mem_size)
+                # Blocks held by running requests are absent from
+                # _evictable_blocks, so a page whose occupancy exceeds its
+                # evictable count cannot be emptied here -- skip it.
+                occupancy = mgr.get_page_occupancy(list(by_page))
+                lru_rank = {bid: i for i, bid in enumerate(bids)}
+
+                pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
+                         for page_id, ids in by_page.items()
+                         if len(ids) >= occupancy.get(page_id, 0)]
+                pages.sort()
+
+                victims: list[int] = []
+                for cost, _rank, ids in pages:
+                    if len(victims) + cost > num_to_evict:
+                        break
+                    victims.extend(ids)
+                return victims
+
             def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
-                """Evict oldest blocks from evictable pool, free to kvcached.
+                """Evict blocks from evictable pool, free to kvcached.
+
+                Prefers victims that empty whole pages so freeing them returns
+                physical memory, then falls back to LRU order for the remainder.
 
                 Returns the number of blocks actually evicted.
                 """
+                num_to_evict = min(num_to_evict, len(self._evictable_blocks))
+                if num_to_evict <= 0:
+                    return 0
+
+                ordered = self._page_aligned_victims(num_to_evict)
+                ordered.extend(bid for bid in self._evictable_blocks
+                               if bid not in set(ordered))
+
                 ids_to_free: list[int] = []
-                for _ in range(min(num_to_evict, len(self._evictable_blocks))):
-                    bid, _block = self._evictable_blocks.popitem(last=False)
+                for bid in ordered[:num_to_evict]:
+                    self._evictable_blocks.pop(bid, None)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._cached_blocks.pop(key, None)
