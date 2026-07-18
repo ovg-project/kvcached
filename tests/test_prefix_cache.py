@@ -10,6 +10,7 @@ to test the prefix cache logic in isolation without GPU or vLLM dependency.
 
 import sys
 import types
+from typing import Optional
 from unittest import mock
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,21 @@ class MockKVCacheBlock:
         self.block_id = block_id
         self.ref_cnt = ref_cnt
         self.is_null = False
+        self._block_hash: Optional[object] = None
+        self._block_hash_num_tokens: Optional[int] = None
+
+    @property
+    def block_hash(self):
+        return self._block_hash
+
+    def set_block_hash(self, value, num_tokens=None):
+        assert self._block_hash is None
+        self._block_hash = value
+        self._block_hash_num_tokens = num_tokens
+
+    def reset_hash(self):
+        self._block_hash = None
+        self._block_hash_num_tokens = None
 
 
 class MockKVCacheManager:
@@ -86,6 +102,18 @@ class MockRequest:
 
     def __init__(self, block_hashes: list):
         self.block_hashes = block_hashes
+
+
+def test_set_block_hash_supports_legacy_writable_property():
+    """vLLM before 0.24 uses a writable block_hash property."""
+    from kvcached.integration.vllm.patches import _set_block_hash
+
+    block = types.SimpleNamespace(block_hash=None)
+    key = b"legacy-key"
+
+    _set_block_hash(block, key)
+
+    assert block.block_hash == key
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +206,7 @@ class TestLazyEviction:
 
         # Request A
         blocks_a = _simulate_request(pool, hashes)
+        assert all(block.block_hash is not None for block in blocks_a)
         _finish_request(pool, blocks_a)
 
         # All blocks should be in evictable pool, NOT freed to kvcached
@@ -215,6 +244,7 @@ class TestLazyEviction:
         # Not cached -> freed immediately
         assert len(pool._evictable_blocks) == 0
         assert mgr.available_size() == initial_free
+        assert all(block.block_hash is None for block in blocks)
 
     def test_touch_removes_from_evictable_pool(self, pool_and_manager):
         """Touching an evictable block reactivates it (removes from pool)."""
@@ -305,12 +335,14 @@ class TestEvictOnDemand:
         _finish_request(pool, blocks)
 
         # Evict 3 -> should evict h0, h1, h2 (oldest)
+        evicted_blocks = blocks[:3]
         pool._evict_blocks_from_pool(3)
 
         assert pool.get_cached_block("h0", [0]) is None
         assert pool.get_cached_block("h1", [0]) is None
         assert pool.get_cached_block("h2", [0]) is None
         assert pool.get_cached_block("h3", [0]) is not None  # still cached
+        assert all(block.block_hash is None for block in evicted_blocks)
 
     def test_evict_all_then_alloc(self, pool_factory):
         """Can evict entire pool and allocate fresh blocks."""
@@ -381,6 +413,7 @@ class TestResetAndExplicitEviction:
         assert len(pool._cached_blocks) == 0
         assert len(pool._block_id_to_key) == 0
         assert mgr.available_size() == 20  # all freed (null_block still allocated)
+        assert all(block.block_hash is None for block in blocks)
 
     def test_reset_with_no_evictable(self, pool_and_manager):
         """reset_prefix_cache works even when evictable pool is empty."""
@@ -404,6 +437,8 @@ class TestResetAndExplicitEviction:
         assert pool.get_cached_block("h0", [0]) is None
         assert pool.get_cached_block("h1", [0]) is None
         assert pool.get_cached_block("h2", [0]) is not None
+        assert all(block.block_hash is None for block in blocks[:2])
+        assert all(block.block_hash is not None for block in blocks[2:])
 
     def test_evict_blocks_active_not_freed(self, pool_factory):
         """evict_blocks on active (ref_cnt>0) blocks removes cache entry
@@ -523,6 +558,7 @@ class TestEdgeCases:
         # Evict all
         pool._evict_blocks_from_pool(4)
         assert len(pool._cached_blocks) == 0
+        assert all(block.block_hash is None for block in blocks)
 
         # Reallocate -- may get same block IDs
         new_blocks = pool.get_new_blocks(4)
