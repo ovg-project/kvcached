@@ -1,0 +1,1473 @@
+diff --git a/triattention/vllm/runtime/config.py b/triattention/vllm/runtime/config.py
+index 63e4089..d43e644 100644
+--- a/triattention/vllm/runtime/config.py
++++ b/triattention/vllm/runtime/config.py
+@@ -50,6 +50,22 @@ class TriAttentionRuntimeConfig:
+     sparse_score_aggregation: str = "mean"
+     sparse_normalize_scores: bool = True
+     window_size: int = 128
++    # Always keep the first K tokens (attention-sink / format-anchor preservation,
++    # StreamingLLM-style). For structured/reasoning models (e.g. gpt-oss harmony),
++    # the channel/format scaffolding lives at the start of the prompt; protecting it
++    # lets the bulk prompt be compressed without corrupting generation. 0 = disabled.
++    protect_prefix_tokens: int = 0
++    # Token-aware ("content") protection: force-keep KV slots whose decoded token id
++    # is structurally critical, regardless of score/position. For gpt-oss harmony,
++    # the generated control tokens (<|start|>=200006, <|channel|>, <|message|>,
++    # <|end|>, <|return|>, all >= 200000) must survive compression or the model's
++    # channel structure breaks. protect_token_ids = explicit id set;
++    # protect_token_ids_min = keep all ids >= this (0 = off, e.g. 200000 for harmony);
++    # protect_token_ids_lookahead = also keep N slots after each protected slot
++    # (captures the channel-name run after <|channel|>). All default off (no-op).
++    protect_token_ids: tuple[int, ...] = ()
++    protect_token_ids_min: int = 0
++    protect_token_ids_lookahead: int = 0
+     include_prefill_in_budget: bool = True
+     per_head_selection_semantics: str = "hf_aligned_global_per_head"
+     layer_perhead_aggregation: str = "max"
+@@ -85,6 +101,12 @@ class TriAttentionRuntimeConfig:
+             raw = raw.strip()
+             return raw if raw else default
+
++        def maybe_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
++            raw = _get_raw(name)
++            if raw is None:
++                return default
++            return tuple(int(p.strip()) for p in raw.split(",") if p.strip())
++
+         sparse_stats_path_raw = maybe_str("SPARSE_STATS_PATH", None)
+         model_path_raw = maybe_str("MODEL_PATH", None)
+
+@@ -144,6 +166,18 @@ class TriAttentionRuntimeConfig:
+                 "SPARSE_NORMALIZE_SCORES", cls.sparse_normalize_scores
+             ),
+             window_size=maybe_int("WINDOW_SIZE", cls.window_size),
++            protect_prefix_tokens=maybe_int(
++                "PROTECT_PREFIX_TOKENS", cls.protect_prefix_tokens
++            ),
++            protect_token_ids=maybe_int_tuple(
++                "PROTECT_TOKEN_IDS", cls.protect_token_ids
++            ),
++            protect_token_ids_min=maybe_int(
++                "PROTECT_TOKEN_IDS_MIN", cls.protect_token_ids_min
++            ),
++            protect_token_ids_lookahead=maybe_int(
++                "PROTECT_TOKEN_IDS_LOOKAHEAD", cls.protect_token_ids_lookahead
++            ),
+             include_prefill_in_budget=maybe_bool(
+                 "INCLUDE_PREFILL_IN_BUDGET", cls.include_prefill_in_budget
+             ),
+@@ -239,6 +273,10 @@ class TriAttentionRuntimeConfig:
+             )
+         if self.window_size < 0:
+             raise ValueError(f"window_size must be >= 0, got {self.window_size}")
++        if self.protect_prefix_tokens < 0:
++            raise ValueError(
++                f"protect_prefix_tokens must be >= 0, got {self.protect_prefix_tokens}"
++            )
+         if self.disable_top_n_high_freq < 0:
+             raise ValueError(
+                 "disable_top_n_high_freq must be >= 0, "
+diff --git a/triattention/vllm/runtime/hook_runtime_context.py b/triattention/vllm/runtime/hook_runtime_context.py
+index 301dfe1..f1fcb72 100644
+--- a/triattention/vllm/runtime/hook_runtime_context.py
++++ b/triattention/vllm/runtime/hook_runtime_context.py
+@@ -40,6 +40,30 @@ def _resolve_estimated_effective_tokens(
+     return max(0, int(getattr(signal, "estimated_cache_len", 0)))
+
+
++def compression_anchored_effective_len(
++    req_runtime_state: Any,
++    *,
++    logical_num_computed_tokens: int,
++) -> int | None:
++    if req_runtime_state is None:
++        return None
++    compression_count = getattr(req_runtime_state, "compression_count", None)
++    nct_at_compression = getattr(req_runtime_state, "nct_at_last_compression", None)
++    cache_len_after = getattr(req_runtime_state, "cache_len_after_last_compression", None)
++    if not (
++        isinstance(compression_count, int)
++        and compression_count > 0
++        and isinstance(nct_at_compression, int)
++        and isinstance(cache_len_after, int)
++    ):
++        return None
++    decoded_since_compression = max(
++        0,
++        int(logical_num_computed_tokens) - int(nct_at_compression),
++    )
++    return max(0, int(cache_len_after) + decoded_since_compression)
++
++
+ def effective_len_guard_upper(
+     config: TriAttentionRuntimeConfig,
+     signal: CompressionSignal,
+@@ -130,6 +154,18 @@ def build_hook_runtime_context(
+         signal=signal,
+         req_runtime_state=req_runtime_state,
+     )
++    anchored_effective_pre_step = compression_anchored_effective_len(
++        req_runtime_state,
++        logical_num_computed_tokens=num_computed_tokens,
++    )
++    if anchored_effective_pre_step is not None:
++        estimated_upper = anchored_effective_pre_step
++        if not getattr(signal, "_post_forward", False):
++            estimated_upper += max(0, scheduled_tokens)
++        estimated_effective_tokens = min(
++            estimated_effective_tokens,
++            max(0, int(estimated_upper)),
++        )
+
+     _post_forward = getattr(signal, '_post_forward', False)
+     if _post_forward:
+diff --git a/triattention/vllm/runtime/input_patch_vllm_v1_backend.py b/triattention/vllm/runtime/input_patch_vllm_v1_backend.py
+index 6871474..b061894 100644
+--- a/triattention/vllm/runtime/input_patch_vllm_v1_backend.py
++++ b/triattention/vllm/runtime/input_patch_vllm_v1_backend.py
+@@ -11,6 +11,7 @@ import os
+ from typing import Any, Callable
+
+ import numpy as np
++import torch
+
+ from . import input_patch_state as _patch_state
+
+@@ -27,6 +28,115 @@ def _debug_preserve_rope_positions() -> bool:
+     return os.environ.get("TRIATTN_DEBUG_V1_PRESERVE_ROPE_POSITIONS", "0") == "1"
+
+
++def _debug_enable_slot_shift() -> bool:
++    return os.environ.get("TRIATTN_DEBUG_ENABLE_SLOT_SHIFT", "0").strip().lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++def _to_numpy(value: Any, *, dtype: np.dtype | type | None = None) -> np.ndarray | None:
++    if isinstance(value, np.ndarray):
++        return value.astype(dtype, copy=False) if dtype is not None else value
++    if isinstance(value, torch.Tensor):
++        arr = value.detach().to("cpu").numpy()
++        return arr.astype(dtype, copy=False) if dtype is not None else arr
++    return None
++
++
++def _buffer_numpy(value: Any) -> np.ndarray | None:
++    if hasattr(value, "np"):
++        arr = getattr(value, "np")
++        return arr if isinstance(arr, np.ndarray) else None
++    return _to_numpy(value)
++
++
++def _copy_numpy_back(value: Any, arr: np.ndarray, *, length: int | None = None) -> None:
++    if hasattr(value, "np"):
++        copy_to_gpu = getattr(value, "copy_to_gpu", None)
++        if callable(copy_to_gpu):
++            copy_to_gpu()
++        return
++    if isinstance(value, torch.Tensor):
++        target = value if length is None else value[:length]
++        src_arr = arr if length is None else arr[:length]
++        src = torch.as_tensor(src_arr, device=value.device, dtype=value.dtype)
++        target.copy_(src)
++
++
++def _get_buffer_np(obj: Any, attr: str) -> np.ndarray | None:
++    value = getattr(obj, attr, None)
++    if isinstance(value, np.ndarray):
++        return value
++    if hasattr(value, "np"):
++        arr = getattr(value, "np")
++        return arr if isinstance(arr, np.ndarray) else None
++    legacy = getattr(obj, f"{attr}_np", None)
++    return legacy if isinstance(legacy, np.ndarray) else None
++
++
++def _manual_compute_slot_mapping(block_table_obj: Any, req_indices: np.ndarray, positions: np.ndarray) -> bool:
++    block_tables = getattr(block_table_obj, "block_tables", None)
++    if isinstance(block_tables, (list, tuple)) and block_tables:
++        ok = False
++        for table in block_tables:
++            ok = _manual_compute_slot_mapping(table, req_indices, positions) or ok
++        return ok
++
++    block_table_np = _get_buffer_np(block_table_obj, "block_table")
++    slot_mapping_np = _get_buffer_np(block_table_obj, "slot_mapping")
++    block_size = int(getattr(block_table_obj, "block_size", 0) or 0)
++    max_blocks = int(getattr(block_table_obj, "max_num_blocks_per_req", 0) or 0)
++    if block_table_np is None or slot_mapping_np is None or block_size <= 0 or max_blocks <= 0:
++        return False
++
++    block_table_indices = req_indices * max_blocks + positions // block_size
++    block_numbers = block_table_np.ravel()[block_table_indices]
++    block_offsets = positions % block_size
++    np.add(
++        block_numbers * block_size,
++        block_offsets,
++        out=slot_mapping_np[: req_indices.shape[0]],
++    )
++    return True
++
++
++def _compute_slot_mapping(block_table_obj: Any, req_indices: np.ndarray, positions: np.ndarray) -> bool:
++    method = getattr(block_table_obj, "compute_slot_mapping", None)
++    if callable(method):
++        try:
++            method(req_indices, positions)
++            return True
++        except TypeError:
++            try:
++                # Handle unbound compatibility shims.
++                method(block_table_obj, req_indices, positions)
++                return True
++            except TypeError:
++                pass
++
++    return _manual_compute_slot_mapping(block_table_obj, req_indices, positions)
++
++
++def _commit_slot_mapping(block_table_obj: Any, total_num_scheduled_tokens: int) -> bool:
++    method = getattr(block_table_obj, "commit_slot_mapping", None)
++    if callable(method):
++        method(total_num_scheduled_tokens)
++        return True
++
++    block_tables = getattr(block_table_obj, "block_tables", None)
++    if isinstance(block_tables, (list, tuple)) and block_tables:
++        committed = False
++        for table in block_tables:
++            committed = _commit_slot_mapping(table, total_num_scheduled_tokens) or committed
++        if committed:
++            return True
++
++    return _get_buffer_np(block_table_obj, "slot_mapping") is not None
++
++
+ def _build_effective_slot_positions(
+     *,
+     positions_np: np.ndarray,
+@@ -60,34 +170,118 @@ def _build_effective_slot_positions(
+     return out
+
+
+-def _apply_sparse_seq_len_overrides_in_place(
++def _planned_seq_len_overrides(
+     *,
+-    seq_lens_np: np.ndarray,
+-    num_computed_tokens_cpu: np.ndarray,
+     num_scheduled_tokens: np.ndarray,
+     num_reqs: int,
+-) -> bool:
++) -> dict[int, int] | None:
+     if _debug_drop_seq_base():
+-        return False
++        return None
+     if num_reqs <= 0:
+-        return False
++        return None
+
+-    applied = False
+     if num_reqs == 1 and _patch_state.ACTIVE_SINGLE_EFFECTIVE_SEQ_BASE is not None:
+-        seq_lens_np[0] = int(_patch_state.ACTIVE_SINGLE_EFFECTIVE_SEQ_BASE) + int(num_scheduled_tokens[0])
+-        return True
++        return {
++            0: int(_patch_state.ACTIVE_SINGLE_EFFECTIVE_SEQ_BASE)
++            + int(num_scheduled_tokens[0])
++        }
+
+     sparse_bases = _patch_state.ACTIVE_EFFECTIVE_BASE_BY_REQ_IDX
+     if not sparse_bases:
+-        return False
++        return None
+
+-    seq_lens_np[:num_reqs] = num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens[:num_reqs]
++    overrides: dict[int, int] = {}
+     for req_idx, effective_base in sparse_bases.items():
+         idx = int(req_idx)
+         if 0 <= idx < num_reqs:
+-            seq_lens_np[idx] = int(effective_base) + int(num_scheduled_tokens[idx])
+-            applied = True
+-    return applied
++            overrides[idx] = int(effective_base) + int(num_scheduled_tokens[idx])
++    return overrides or None
++
++
++def _apply_seq_len_overrides_to_buffer(
++    seq_lens: Any,
++    *,
++    overrides: dict[int, int],
++    num_reqs: int,
++) -> bool:
++    if not overrides:
++        return False
++    if hasattr(seq_lens, "np"):
++        seq_lens_np = seq_lens.np
++        for idx, value in overrides.items():
++            seq_lens_np[int(idx)] = int(value)
++        seq_lens_np[num_reqs:].fill(0)
++        copy_to_gpu = getattr(seq_lens, "copy_to_gpu", None)
++        if callable(copy_to_gpu):
++            copy_to_gpu()
++        return True
++
++    if isinstance(seq_lens, np.ndarray):
++        for idx, value in overrides.items():
++            seq_lens[int(idx)] = int(value)
++        seq_lens[num_reqs:].fill(0)
++        return True
++
++    if isinstance(seq_lens, torch.Tensor):
++        indices = torch.as_tensor(
++            list(overrides.keys()),
++            device=seq_lens.device,
++            dtype=torch.long,
++        )
++        values = torch.as_tensor(
++            list(overrides.values()),
++            device=seq_lens.device,
++            dtype=seq_lens.dtype,
++        )
++        seq_lens.index_copy_(0, indices, values)
++        seq_lens[num_reqs:].fill_(0)
++        return True
++
++    return False
++
++
++def _positions_numpy_view(positions: Any, total_num_scheduled_tokens: int) -> np.ndarray | None:
++    if hasattr(positions, "np"):
++        return positions.np[:total_num_scheduled_tokens]
++    if isinstance(positions, torch.Tensor):
++        return positions[:total_num_scheduled_tokens].detach().to("cpu").numpy()
++    return None
++
++
++def _recompute_slot_mapping(
++    *,
++    runner: Any,
++    num_reqs: int,
++    total_num_scheduled_tokens: int,
++    slot_positions_np: np.ndarray,
++    req_indices: np.ndarray,
++) -> None:
++    block_table = getattr(getattr(runner, "input_batch", None), "block_table", None)
++    compute_slot_mapping = getattr(block_table, "compute_slot_mapping", None)
++    if not callable(compute_slot_mapping):
++        return
++
++    positions = getattr(runner, "positions", None)
++    query_start_loc = getattr(runner, "query_start_loc", None)
++    query_start_loc_gpu = getattr(query_start_loc, "gpu", None)
++    if isinstance(positions, torch.Tensor) and isinstance(query_start_loc_gpu, torch.Tensor):
++        slot_positions = torch.as_tensor(
++            slot_positions_np,
++            device=positions.device,
++            dtype=positions.dtype,
++        )
++        try:
++            compute_slot_mapping(
++                num_reqs,
++                query_start_loc_gpu[: num_reqs + 1],
++                slot_positions[:total_num_scheduled_tokens],
++            )
++            return
++        except TypeError:
++            pass
++
++    if _compute_slot_mapping(block_table, req_indices, slot_positions_np):
++        _commit_slot_mapping(block_table, total_num_scheduled_tokens)
+
+
+ def make_patched_v1_prepare_inputs(
+@@ -106,26 +300,51 @@ def make_patched_v1_prepare_inputs(
+         if total_num_scheduled_tokens <= 0 or num_reqs <= 0:
+             return out
+
+-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+-        positions_np = self.positions.np[:total_num_scheduled_tokens]
+-        original_positions_np = positions_np.copy()
++        num_scheduled_tokens_np = _to_numpy(num_scheduled_tokens, dtype=np.int64)
++        if num_scheduled_tokens_np is None:
++            return out
++        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
+
+-        slot_positions_np = _build_effective_slot_positions(
+-            positions_np=positions_np,
+-            req_indices=req_indices,
+-        )
+-        if slot_positions_np is not None:
+-            self.input_batch.block_table.compute_slot_mapping(req_indices, slot_positions_np)
+-            self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+-        seq_applied = _apply_sparse_seq_len_overrides_in_place(
+-            seq_lens_np=self.seq_lens.np,
+-            num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu,
+-            num_scheduled_tokens=num_scheduled_tokens,
++        # Slot-position shifting is unsafe for current vLLM V1 gpt-oss decode:
++        # RoPE/logical positions must stay in original sequence space, while
++        # the scheduler block table has already been reclaimed separately.
++        # Keep the old path debug-gated for targeted layout experiments.
++        if _debug_enable_slot_shift():
++            positions_np = _positions_numpy_view(
++                getattr(self, "positions", None),
++                total_num_scheduled_tokens,
++            )
++            if positions_np is not None:
++                slot_positions_np = _build_effective_slot_positions(
++                    positions_np=positions_np,
++                    req_indices=req_indices,
++                )
++                if slot_positions_np is not None:
++                    _recompute_slot_mapping(
++                        runner=self,
++                        num_reqs=num_reqs,
++                        total_num_scheduled_tokens=total_num_scheduled_tokens,
++                        slot_positions_np=slot_positions_np,
++                        req_indices=req_indices,
++                    )
++
++        seq_overrides = _planned_seq_len_overrides(
++            num_scheduled_tokens=num_scheduled_tokens_np,
+             num_reqs=num_reqs,
+         )
+-        if seq_applied:
+-            self.seq_lens.np[num_reqs:].fill(0)
+-            self.seq_lens.copy_to_gpu()
++        if seq_overrides:
++            optimistic_seq_lens_cpu = getattr(self, "optimistic_seq_lens_cpu", None)
++            if optimistic_seq_lens_cpu is not None:
++                _apply_seq_len_overrides_to_buffer(
++                    optimistic_seq_lens_cpu,
++                    overrides=seq_overrides,
++                    num_reqs=num_reqs,
++                )
++            _apply_seq_len_overrides_to_buffer(
++                getattr(self, "seq_lens", None),
++                overrides=seq_overrides,
++                num_reqs=num_reqs,
++            )
+
+         return out
+
+diff --git a/triattention/vllm/runtime/integration_monkeypatch.py b/triattention/vllm/runtime/integration_monkeypatch.py
+index 6fb2df8..1bcc6cf 100644
+--- a/triattention/vllm/runtime/integration_monkeypatch.py
++++ b/triattention/vllm/runtime/integration_monkeypatch.py
+@@ -7,6 +7,7 @@ injecting the minimum TriAttention hooks needed for current runtime behavior.
+ from __future__ import annotations
+
+ import os
++import sys
+ from concurrent.futures import Future
+ from typing import Any, Callable, cast
+
+@@ -37,6 +38,68 @@ _ORIG_WORKER_INIT_DEVICE: Callable[..., Any] | None = None
+ _ORIG_WORKER_EXECUTE_MODEL: Callable[..., Any] | None = None
+ _ORIG_KVCACHE_ALLOCATE_SLOTS: Callable[..., Any] | None = None
+ _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE: Callable[..., Any] | None = None
++_ORIG_GET_KV_CACHE_GROUPS: Callable[..., Any] | None = None
++
++
++def _debug_stderr(message: str) -> None:
++    if os.environ.get("TRIATTN_DEBUG_STDERR", "0") == "1":
++        print(message, file=sys.stderr, flush=True)
++
++
++def _triattention_should_split_full_attention_window_specs(
++    kv_cache_spec: dict[str, Any],
++) -> bool:
++    """Detect gpt-oss-style FullAttentionSpec groups with local-window layers."""
++    if not kv_cache_spec:
++        return False
++    try:
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++    except Exception:
++        return False
++
++    values = list(kv_cache_spec.values())
++    if not all(isinstance(spec, FullAttentionSpec) for spec in values):
++        return False
++    profiles = {
++        (
++            getattr(spec, "sliding_window", None),
++            getattr(spec, "attention_chunk_size", None),
++        )
++        for spec in values
++    }
++    return (None, None) in profiles and len(profiles) > 1
++
++
++def _patched_get_kv_cache_groups(vllm_config, kv_cache_spec, *args, **kwargs):
++    """Split plain full attention away from full-storage local-window layers."""
++    assert _ORIG_GET_KV_CACHE_GROUPS is not None
++    if not _triattention_should_split_full_attention_window_specs(kv_cache_spec):
++        return _ORIG_GET_KV_CACHE_GROUPS(vllm_config, kv_cache_spec, *args, **kwargs)
++
++    try:
++        import vllm.v1.core.kv_cache_utils as _kv_utils
++
++        grouped_specs = _kv_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
++        groups = _kv_utils._get_kv_cache_groups_uniform_page_size(grouped_specs)
++        logger.info(
++            "[TriAttention] Split mixed FullAttentionSpec KV cache into %d "
++            "groups for full-attention-only reclaim",
++            len(groups),
++        )
++        _debug_stderr(
++            "[TriAttentionDebug] split mixed FullAttentionSpec groups="
++            f"{len(groups)} sizes={[len(g.layer_names) for g in groups]} "
++            "local_flags="
++            f"{[(getattr(g.kv_cache_spec, 'sliding_window', None), getattr(g.kv_cache_spec, 'attention_chunk_size', None)) for g in groups]}"
++        )
++        return groups
++    except Exception:
++        logger.warning(
++            "[TriAttention] Failed to split mixed FullAttentionSpec KV cache; "
++            "falling back to vLLM grouping",
++            exc_info=True,
++        )
++        return _ORIG_GET_KV_CACHE_GROUPS(vllm_config, kv_cache_spec, *args, **kwargs)
+
+
+ def _maybe_rewrite_v2_output_req_map(scheduler_output: Any, model_runner_output: Any) -> None:
+@@ -87,9 +150,24 @@ def _refresh_scheduler_stats_kv_usage(outputs: Any, kv_usage: float) -> None:
+             scheduler_stats.kv_cache_usage = usage
+
+
++def _assert_apc_disabled(scheduler_self: Any) -> None:
++    """Fail fast because APC can orphan TriAttention-reclaimed blocks."""
++    vllm_cfg = getattr(scheduler_self, "vllm_config", None)
++    cache_cfg = getattr(vllm_cfg, "cache_config", None)
++    if cache_cfg is None:
++        return
++    if bool(getattr(cache_cfg, "enable_prefix_caching", False)):
++        raise RuntimeError(
++            "TriAttention is incompatible with vLLM automatic prefix caching. "
++            "Relaunch with --no-enable-prefix-caching (or "
++            "--enable-prefix-caching false), or unset ENABLE_TRIATTENTION."
++        )
++
++
+ def _patched_scheduler_init(self, *args, **kwargs):
+     assert _ORIG_SCHED_INIT is not None
+     _ORIG_SCHED_INIT(self, *args, **kwargs)
++    _assert_apc_disabled(self)
+     cfg = TriAttentionRuntimeConfig.from_env()
+     # Always attach config/state once patched to keep behavior deterministic.
+     self.triattention_config = cfg
+@@ -407,6 +485,7 @@ def install_vllm_integration_monkeypatches(
+     global _PATCHED, _ORIG_SCHED_INIT, _ORIG_SCHED_SCHEDULE, _ORIG_SCHED_UPDATE_FROM_OUTPUT
+     global _ORIG_WORKER_INIT_DEVICE, _ORIG_WORKER_EXECUTE_MODEL
+     global _ORIG_KVCACHE_ALLOCATE_SLOTS, _ORIG_ENGINE_CORE_STEP_WITH_BATCH_QUEUE
++    global _ORIG_GET_KV_CACHE_GROUPS
+     global _PATCHED_SCHEDULER_ACTIVE, _PATCHED_WORKER_ACTIVE
+     if _PATCHED:
+         _PATCHED_SCHEDULER_ACTIVE = _PATCHED_SCHEDULER_ACTIVE or bool(patch_scheduler)
+@@ -415,6 +494,7 @@ def install_vllm_integration_monkeypatches(
+
+     import vllm.v1.core.sched.scheduler as sched_mod
+     import vllm.v1.core.kv_cache_manager as kv_cache_manager_mod
++    import vllm.v1.core.kv_cache_utils as kv_cache_utils_mod
+     import vllm.v1.engine.core as engine_core_mod
+     import vllm.v1.worker.gpu_worker as worker_mod
+
+@@ -423,6 +503,9 @@ def install_vllm_integration_monkeypatches(
+     KVCacheManager = kv_cache_manager_mod.KVCacheManager
+     Worker = worker_mod.Worker
+
++    _ORIG_GET_KV_CACHE_GROUPS = kv_cache_utils_mod.get_kv_cache_groups
++    kv_cache_utils_mod.get_kv_cache_groups = _patched_get_kv_cache_groups
++
+     if patch_scheduler:
+         _ORIG_SCHED_INIT = Scheduler.__init__
+         _ORIG_SCHED_SCHEDULE = Scheduler.schedule
+diff --git a/triattention/vllm/runtime/kv_group_resolver.py b/triattention/vllm/runtime/kv_group_resolver.py
+index de07981..5e517e1 100644
+--- a/triattention/vllm/runtime/kv_group_resolver.py
++++ b/triattention/vllm/runtime/kv_group_resolver.py
+@@ -2,7 +2,9 @@
+
+ from __future__ import annotations
+
++import os
+ import re
++import sys
+ from typing import Any
+
+ import torch
+@@ -10,6 +12,14 @@ import torch
+ from .kv_compaction import register_kv_layout_axis_hint
+
+
++_DEBUG_REPORTED_RUNNERS: set[int] = set()
++
++
++def _debug_stderr(message: str) -> None:
++    if os.environ.get("TRIATTN_DEBUG_STDERR", "0") == "1":
++        print(message, file=sys.stderr, flush=True)
++
++
+ def infer_layer_idx(layer_name: str, layer_obj: Any, fallback_idx: int) -> int:
+     for attr in ("layer_idx", "layer_id", "idx"):
+         value = getattr(layer_obj, attr, None)
+@@ -28,6 +38,8 @@ def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
+     if gid < 0 or gid >= len(attn_groups):
+         return None
+     group = attn_groups[gid]
++    if isinstance(group, (list, tuple)) and group:
++        group = group[0]
+     backend = getattr(group, "backend", None)
+     if backend is None:
+         return None
+@@ -65,6 +77,110 @@ def _infer_kv_axis_from_group_backend(base_runner: Any, gid: int) -> int | None:
+     return None
+
+
++def _is_attention_kv_cache_tensor(tensor: torch.Tensor) -> bool:
++    if tensor.ndim != 5:
++        return False
++    return int(tensor.shape[0]) == 2 or int(tensor.shape[1]) == 2
++
++
++def _first_tensor(value: Any) -> torch.Tensor | None:
++    if isinstance(value, torch.Tensor):
++        return value if _is_attention_kv_cache_tensor(value) else None
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            tensor = _first_tensor(item)
++            if tensor is not None:
++                return tensor
++    return None
++
++
++def _extract_attention_kv_cache_tensor(kv_cache: Any) -> torch.Tensor | None:
++    return _first_tensor(kv_cache)
++
++
++def _resolve_tensor_from_kv_caches(
++    kv_caches: Any,
++    *,
++    layer_name: str,
++    gid: int,
++    local_idx: int,
++) -> torch.Tensor | None:
++    if isinstance(kv_caches, dict):
++        return _first_tensor(kv_caches.get(layer_name))
++    if isinstance(kv_caches, (list, tuple)):
++        if gid < len(kv_caches):
++            group_entry = kv_caches[gid]
++            if isinstance(group_entry, dict):
++                tensor = _first_tensor(group_entry.get(layer_name))
++                if tensor is not None:
++                    return tensor
++            elif isinstance(group_entry, (list, tuple)) and local_idx < len(group_entry):
++                tensor = _first_tensor(group_entry[local_idx])
++                if tensor is not None:
++                    return tensor
++        if local_idx < len(kv_caches):
++            return _first_tensor(kv_caches[local_idx])
++    return None
++
++
++def _register_group_axis_hints(
++    base_runner: Any,
++    gid: int,
++    tensors: list[tuple[int, torch.Tensor]],
++) -> None:
++    kv_axis_hint = _infer_kv_axis_from_group_backend(base_runner=base_runner, gid=gid)
++    if kv_axis_hint is None:
++        return
++    for _layer_idx, tensor in tensors:
++        try:
++            register_kv_layout_axis_hint(tensor, kv_axis_hint)
++        except ValueError:
++            pass
++
++
++def _is_plain_full_attention_spec(spec: Any) -> bool:
++    try:
++        from vllm.v1.kv_cache_interface import FullAttentionSpec
++    except Exception:
++        return True
++    if not isinstance(spec, FullAttentionSpec):
++        return False
++    if getattr(spec, "sliding_window", None) is not None:
++        return False
++    if getattr(spec, "attention_chunk_size", None) is not None:
++        return False
++    return True
++
++
++def _is_reclaimable_full_attention_group(group: Any) -> bool:
++    """True only for plain full-attention KV-cache groups whose scheduler block
++    table is a 1:1 tail-truncatable mirror of the worker block_ids.
++
++    Sliding-window / chunked-local / mamba / cross-attention groups null-pad or
++    window their scheduler-side block table (out-of-window slots overwritten with
++    the null block id 0) while the worker keeps real append-only ids, so they are
++    NOT tail-truncatable and must be excluded from TriAttention compaction/reclaim.
++    Permissive (True) when spec info is unavailable so single-group full-attention
++    models and fake-spec tests are unaffected.
++    """
++    spec = getattr(group, "kv_cache_spec", None)
++    if spec is None:
++        return True
++    try:
++        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
++    except Exception:
++        return True
++    if isinstance(spec, UniformTypeKVCacheSpecs):
++        layer_specs = getattr(spec, "kv_cache_specs", None)
++        if not isinstance(layer_specs, dict) or not layer_specs:
++            return False
++        # A mixed uniform group shares one block table across plain full and
++        # SWA-as-full-storage layers. Reclaiming it after moving only the plain
++        # full tensors would free blocks that SWA layers still reference.
++        return all(_is_plain_full_attention_spec(s) for s in layer_specs.values())
++    return _is_plain_full_attention_spec(spec)
++
++
+ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.Tensor]]]:
+     """Resolve kv cache tensors for each kv cache group.
+
+@@ -81,8 +197,9 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
+         else None
+     )
+
++    fallback = getattr(base_runner, "kv_caches", None)
++
+     if kv_cache_config is None or not isinstance(static_forward_context, dict):
+-        fallback = getattr(base_runner, "kv_caches", None)
+         if isinstance(fallback, list):
+             tensors = [
+                 (idx, t)
+@@ -91,13 +208,61 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
+             ]
+             if tensors:
+                 group_tensors[0] = tensors
++                _register_group_axis_hints(base_runner, 0, tensors)
++        elif isinstance(fallback, dict):
++            tensors = [
++                (idx, t)
++                for idx, t in enumerate(fallback.values())
++                if isinstance(t, torch.Tensor)
++            ]
++            if tensors:
++                group_tensors[0] = tensors
++                _register_group_axis_hints(base_runner, 0, tensors)
+         return group_tensors
+
+     kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+     if not isinstance(kv_cache_groups, (list, tuple)):
+         return group_tensors
+
++    debug_runner_id = id(base_runner)
++    debug_report = (
++        os.environ.get("TRIATTN_DEBUG_STDERR", "0") == "1"
++        and debug_runner_id not in _DEBUG_REPORTED_RUNNERS
++    )
++    if debug_report:
++        _DEBUG_REPORTED_RUNNERS.add(debug_runner_id)
++
+     for gid, group in enumerate(kv_cache_groups):
++        if debug_report:
++            spec = getattr(group, "kv_cache_spec", None)
++            layer_names_dbg = getattr(group, "layer_names", None)
++            inner = getattr(spec, "kv_cache_specs", None)
++            if isinstance(inner, dict):
++                profiles: dict[str, int] = {}
++                for inner_spec in inner.values():
++                    key = (
++                        f"{type(inner_spec).__name__}:"
++                        f"sw={getattr(inner_spec, 'sliding_window', None)}:"
++                        f"chunk={getattr(inner_spec, 'attention_chunk_size', None)}"
++                    )
++                    profiles[key] = profiles.get(key, 0) + 1
++                inner_desc = profiles
++            else:
++                inner_desc = None
++            _debug_stderr(
++                "[TriAttentionDebug] resolver group "
++                f"gid={gid} spec={type(spec).__name__ if spec is not None else None} "
++                f"layers={len(layer_names_dbg) if isinstance(layer_names_dbg, (list, tuple)) else None} "
++                f"sw={getattr(spec, 'sliding_window', None)} "
++                f"chunk={getattr(spec, 'attention_chunk_size', None)} "
++                f"reclaimable={_is_reclaimable_full_attention_group(group)} "
++                f"inner={inner_desc}"
++            )
++        if not _is_reclaimable_full_attention_group(group):
++            # Sliding-window / chunked-local / mamba groups are not
++            # tail-truncatable; skip so the pipeline never compacts or emits a
++            # ReclaimGroup for them (hook_group_pipeline skips empty group_tensors).
++            continue
+         layer_names = getattr(group, "layer_names", None)
+         if not isinstance(layer_names, (list, tuple)):
+             continue
+@@ -105,13 +270,19 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
+         seen_ptrs: set[int] = set()
+         for local_idx, layer_name in enumerate(layer_names):
+             layer = static_forward_context.get(layer_name)
+-            if layer is None:
+-                continue
+-            kv_cache_list = getattr(layer, "kv_cache", None)
+-            if not isinstance(kv_cache_list, list) or not kv_cache_list:
+-                continue
+-            tensor = kv_cache_list[0]
+-            if not isinstance(tensor, torch.Tensor):
++            tensor = (
++                _extract_attention_kv_cache_tensor(getattr(layer, "kv_cache", None))
++                if layer is not None
++                else None
++            )
++            if tensor is None:
++                tensor = _resolve_tensor_from_kv_caches(
++                    fallback,
++                    layer_name=str(layer_name),
++                    gid=gid,
++                    local_idx=local_idx,
++                )
++            if tensor is None:
+                 continue
+             ptr = tensor.data_ptr()
+             if ptr in seen_ptrs:
+@@ -128,14 +299,17 @@ def resolve_group_tensors(base_runner: Any) -> dict[int, list[tuple[int, torch.T
+                 )
+             )
+         if tensors:
+-            kv_axis_hint = _infer_kv_axis_from_group_backend(base_runner=base_runner, gid=gid)
+-            if kv_axis_hint is not None:
+-                for _layer_idx, tensor in tensors:
+-                    try:
+-                        register_kv_layout_axis_hint(tensor, kv_axis_hint)
+-                    except ValueError:
+-                        # Best effort registration only; compaction path will fail-fast if
+-                        # an ambiguous layout cannot be safely disambiguated.
+-                        pass
++            _register_group_axis_hints(base_runner, gid, tensors)
+             group_tensors[gid] = tensors
++            if debug_report:
++                sample_shape = tuple(int(x) for x in tensors[0][1].shape)
++                _debug_stderr(
++                    "[TriAttentionDebug] resolver resolved "
++                    f"gid={gid} tensors={len(tensors)} sample_shape={sample_shape}"
++                )
++        elif debug_report:
++            _debug_stderr(
++                "[TriAttentionDebug] resolver resolved "
++                f"gid={gid} tensors=0"
++            )
+     return group_tensors
+diff --git a/triattention/vllm/runtime/runner.py b/triattention/vllm/runtime/runner.py
+index 72ecfca..7038c3b 100644
+--- a/triattention/vllm/runtime/runner.py
++++ b/triattention/vllm/runtime/runner.py
+@@ -9,6 +9,7 @@ from typing import Any
+
+ from .config import TriAttentionRuntimeConfig
+ from .executor import CompressionExecutor, RunnerHookCompressionExecutor
++from .hook_runtime_context import compression_anchored_effective_len
+ from .input_patch_backend import install_runtime_input_patch
+ from .request_key_compat import get_scheduled_token_items
+ from .runner_compression_actions import execute_runner_compression_actions
+@@ -124,6 +125,27 @@ class TriAttentionModelRunner:
+             return None
+         return int(num_blocks_per_row[req_index]) * blk_size
+
++    def _get_scheduler_num_computed(self, scheduler_output: Any, req_id: str) -> int | None:
++        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
++        if cached is not None:
++            req_ids = getattr(cached, "req_ids", None)
++            num_computed = getattr(cached, "num_computed_tokens", None)
++            if isinstance(req_ids, list) and isinstance(num_computed, list):
++                try:
++                    idx = req_ids.index(req_id)
++                    return int(num_computed[idx])
++                except (ValueError, IndexError, TypeError):
++                    pass
++        requests = getattr(self._base_runner, "requests", None)
++        if isinstance(requests, dict):
++            req_state = requests.get(req_id)
++            if req_state is not None:
++                try:
++                    return int(getattr(req_state, "num_computed_tokens", 0))
++                except (TypeError, ValueError):
++                    return None
++        return None
++
+     def _supplement_worker_self_triggers(
+         self,
+         scheduler_output: Any,
+@@ -153,12 +175,23 @@ class TriAttentionModelRunner:
+             if state is None:
+                 continue
+             prefill_len = state.prefill_len
++            scheduler_nct = self._get_scheduler_num_computed(scheduler_output, req_id)
++            anchored_kv = (
++                compression_anchored_effective_len(
++                    state,
++                    logical_num_computed_tokens=scheduler_nct,
++                )
++                if scheduler_nct is not None
++                else None
++            )
+             # Compute actual KV length on the Worker side.
+             # kv_from_blocks: block table already includes current step's
+             # allocated blocks (update_states runs before execute_model),
+             # so scheduled_tokens must NOT be added again.
+             kv_from_blocks = False
+-            if state.compression_count > 0 and state.current_cache_len > 0:
++            if anchored_kv is not None:
++                actual_kv = anchored_kv
++            elif state.compression_count > 0 and state.current_cache_len > 0:
+                 actual_kv = state.current_cache_len
+             else:
+                 # First-time compression: use block table for ground truth.
+@@ -193,9 +226,9 @@ class TriAttentionModelRunner:
+             self._logger.info(
+                 "TriAttention worker self-trigger: req=%s actual_kv=%d "
+                 "effective_kv=%d scheduled=%d threshold=%d "
+-                "from_blocks=%s (scheduler had no signal)",
++                "from_blocks=%s anchored=%s (scheduler had no signal)",
+                 req_id, actual_kv, effective_kv, scheduled_tokens,
+-                threshold, kv_from_blocks,
++                threshold, kv_from_blocks, anchored_kv is not None,
+             )
+             signals[req_id] = CompressionSignal(
+                 req_id=req_id,
+diff --git a/triattention/vllm/runtime/runner_compression_actions.py b/triattention/vllm/runtime/runner_compression_actions.py
+index 0631b30..7b929b8 100644
+--- a/triattention/vllm/runtime/runner_compression_actions.py
++++ b/triattention/vllm/runtime/runner_compression_actions.py
+@@ -1,13 +1,34 @@
+ """Compression action execution for TriAttentionModelRunner."""
+ from __future__ import annotations
+
++import json
+ import logging
++import os
++import time
+ from typing import Any
+
+ from .constants import TRITON_SCORING_REQUIRED_MARKER
+ from .signals import CompressionSignal
+
+
++def _write_event_sink(event: dict[str, Any]) -> None:
++    sink_path = os.environ.get("TRIATTN_RUNTIME_EVENT_SINK_PATH")
++    if not sink_path:
++        return
++    payload = dict(event)
++    payload.setdefault("ts", time.time())
++    try:
++        with open(sink_path, "a", encoding="utf-8") as fp:
++            fp.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
++    except Exception:
++        pass
++
++
++def _append_event(events: list[dict[str, Any]], event: dict[str, Any]) -> None:
++    events.append(event)
++    _write_event_sink(event)
++
++
+ def execute_runner_compression_actions(
+     *,
+     executor: Any,
+@@ -48,7 +69,8 @@ def execute_runner_compression_actions(
+                         reason="batch_queue_dedup",
+                         step=signal.step,
+                     )
+-                events.append(
++                _append_event(
++                    events,
+                     {
+                         "req_id": req_id,
+                         "step": signal.step,
+@@ -58,7 +80,7 @@ def execute_runner_compression_actions(
+                         "scheduled_tokens": int(getattr(signal, "scheduled_tokens", 1)),
+                         "estimated_cache_len": int(getattr(signal, "estimated_cache_len", 0)),
+                         "prefill_len": int(getattr(signal, "prefill_len", 0)),
+-                    }
++                    },
+                 )
+                 continue
+         try:
+@@ -97,7 +119,8 @@ def execute_runner_compression_actions(
+                 req_id,
+                 signal.step,
+             )
+-            events.append(
++            _append_event(
++                events,
+                 {
+                     "req_id": req_id,
+                     "step": signal.step,
+@@ -107,7 +130,7 @@ def execute_runner_compression_actions(
+                     "scheduled_tokens": int(getattr(signal, "scheduled_tokens", 1)),
+                     "estimated_cache_len": int(getattr(signal, "estimated_cache_len", 0)),
+                     "prefill_len": int(getattr(signal, "prefill_len", 0)),
+-                }
++                },
+             )
+             continue
+
+@@ -140,7 +163,9 @@ def execute_runner_compression_actions(
+             )
+             # Resolve scheduler_nct for this request so state can record
+             # the num_computed_tokens at compression time (used by
+-            # build_effective_sparse_overrides for stable delta).
++            # compression_anchored_effective_len for stable post-compression
++            # decode tracking. For the first compression, scheduled_new_reqs
++            # can still carry the pre-prefill count, so fall back to before_len.
+             _sched_nct = None
+             _cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+             if _cached_reqs is not None:
+@@ -152,6 +177,8 @@ def execute_runner_compression_actions(
+                         _sched_nct = int(_cr_nct[_idx])
+                     except (ValueError, IndexError):
+                         pass
++            if _sched_nct is None and isinstance(before_len, int) and before_len > 0:
++                _sched_nct = int(before_len)
+             state_store.mark_compressed(
+                 req_id=req_id,
+                 step=signal.step,
+@@ -182,7 +209,8 @@ def execute_runner_compression_actions(
+                     int(getattr(signal, "estimated_cache_len", 0)),
+                     result.reason,
+                 )
+-            events.append(
++            _append_event(
++                events,
+                 {
+                     "req_id": req_id,
+                     "step": signal.step,
+@@ -198,7 +226,7 @@ def execute_runner_compression_actions(
+                         if isinstance(result.details, dict)
+                         else None
+                     ),
+-                }
++                },
+             )
+             continue
+
+@@ -216,7 +244,8 @@ def execute_runner_compression_actions(
+             result.cache_len_after,
+             result.details,
+         )
+-        events.append(
++        _append_event(
++            events,
+             {
+                 "req_id": req_id,
+                 "step": signal.step,
+@@ -232,6 +261,6 @@ def execute_runner_compression_actions(
+                     if isinstance(result.details, dict)
+                     else None
+                 ),
+-            }
++            },
+         )
+     return events
+diff --git a/triattention/vllm/runtime/scheduler.py b/triattention/vllm/runtime/scheduler.py
+index dd4151a..58a20b8 100644
+--- a/triattention/vllm/runtime/scheduler.py
++++ b/triattention/vllm/runtime/scheduler.py
+@@ -2,6 +2,8 @@
+
+ from __future__ import annotations
+
++import os
++import sys
+ from typing import Any
+
+ from vllm.config import VllmConfig
+@@ -13,6 +15,13 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.structured_output import StructuredOutputManager
+
++try:
++    # Only full-attention groups have a 1:1 tail-truncatable block table.
++    # Sliding-window / chunked-local / mamba managers null-pad in place.
++    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
++except Exception:  # pragma: no cover - version/layout fallback
++    FullAttentionManager = None  # type: ignore[assignment]
++
+ from .config import TriAttentionRuntimeConfig
+ from .effective_len_tracker import EffectiveCacheLenTracker
+ from .kv_allocation_sync import (
+@@ -26,6 +35,12 @@ from .signals import CompressionSignal
+
+ logger = init_logger(__name__)
+
++
++def _debug_stderr(message: str) -> None:
++    if os.environ.get("TRIATTN_DEBUG_STDERR", "0") == "1":
++        print(message, file=sys.stderr, flush=True)
++
++
+ def _evict_reclaimed_block_metadata(block_pool: Any, block: Any) -> None:
+     """Best-effort clear of prefix-cache metadata before reusing a block."""
+     if block_pool is None or block is None:
+@@ -90,6 +105,7 @@ class TriAttentionScheduler(Scheduler):
+         kv_cache_config: KVCacheConfig,
+         structured_output_manager: StructuredOutputManager,
+         block_size: int,
++        hash_block_size: int | None = None,
+         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+         include_finished_set: bool = False,
+         log_stats: bool = False,
+@@ -99,10 +115,20 @@ class TriAttentionScheduler(Scheduler):
+             kv_cache_config=kv_cache_config,
+             structured_output_manager=structured_output_manager,
+             block_size=block_size,
++            hash_block_size=hash_block_size,
+             mm_registry=mm_registry,
+             include_finished_set=include_finished_set,
+             log_stats=log_stats,
+         )
++        # Keep subclass and monkeypatch paths equally fail-fast.
++        cache_cfg = getattr(vllm_config, "cache_config", None)
++        if cache_cfg is not None and bool(
++            getattr(cache_cfg, "enable_prefix_caching", False)
++        ):
++            raise RuntimeError(
++                "TriAttention is incompatible with vLLM automatic prefix "
++                "caching. Relaunch with --no-enable-prefix-caching."
++            )
+         self.triattention_config = TriAttentionRuntimeConfig.from_env()
+         self._planner = CompressionPlanner(self.triattention_config)
+         self._effective_len_tracker = EffectiveCacheLenTracker()
+@@ -119,6 +145,12 @@ class TriAttentionScheduler(Scheduler):
+             self.triattention_config.enable_kv_usage_trigger,
+             self.triattention_config.enable_experimental_block_reclaim,
+         )
++        _debug_stderr(
++            "[TriAttentionDebug] scheduler init "
++            f"budget={self.triattention_config.kv_budget} "
++            f"divide={self.triattention_config.divide_length} "
++            f"reclaim={self.triattention_config.enable_experimental_block_reclaim}"
++        )
+
+     def _resolve_prefill_len(self, req_id: str) -> int:
+         if req_id in self._prefill_lens:
+@@ -260,6 +292,11 @@ class TriAttentionScheduler(Scheduler):
+                         req_id, self._triattention_step,
+                         estimated_cache_len, signal.reason,
+                     )
++                    _debug_stderr(
++                        "[TriAttentionDebug] signal "
++                        f"req={req_id} step={self._triattention_step} "
++                        f"estimated={estimated_cache_len} reason={signal.reason}"
++                    )
+                 signals[req_id] = signal
+         return signals
+
+@@ -385,12 +422,64 @@ class TriAttentionScheduler(Scheduler):
+             req_groups_seen = 0
+             if isinstance(managers, (list, tuple)):
+                 for gid, manager in enumerate(managers):
++                    if FullAttentionManager is not None and not isinstance(
++                        manager, FullAttentionManager
++                    ):
++                        # sliding-window/chunked/mamba: null-padded block table,
++                        # not tail-truncatable -> never synthesize a reclaim for it.
++                        continue
+                     req_blocks = manager.req_to_blocks.get(req_id)
+                     if req_blocks and required_blocks < len(req_blocks):
+                         expected_shrink_gids.add(gid)
+                     if req_blocks:
+                         req_groups_seen += 1
+
++            def _can_synthesize_reclaim(gids: set[int]) -> bool:
++                if not gids or not isinstance(managers, (list, tuple)):
++                    return False
++                if len(managers) == 1:
++                    return True
++                if FullAttentionManager is None:
++                    return False
++                return all(
++                    0 <= gid < len(managers)
++                    and isinstance(managers[gid], FullAttentionManager)
++                    for gid in gids
++                )
++
++            def _synthesize_reclaim(gids: set[int], reason: str) -> bool:
++                applied = False
++                if not isinstance(managers, (list, tuple)):
++                    return False
++                for gid in sorted(gids):
++                    if gid < 0 or gid >= len(managers):
++                        continue
++                    manager = managers[gid]
++                    req_blocks = manager.req_to_blocks.get(req_id)
++                    if not req_blocks or required_blocks >= len(req_blocks):
++                        continue
++                    kept_blocks = req_blocks[:required_blocks]
++                    removed_blocks = req_blocks[required_blocks:]
++                    manager.req_to_blocks[req_id] = kept_blocks
++                    if req_id in manager.num_cached_block:
++                        manager.num_cached_block[req_id] = min(
++                            manager.num_cached_block[req_id],
++                            len(kept_blocks),
++                        )
++                    logger.info(
++                        "TriAttention scheduler FREE_BLOCKS synthesized: "
++                        "req=%s gid=%d freed=%d kept=%d reason=%s",
++                        req_id, gid, len(removed_blocks), len(kept_blocks), reason,
++                    )
++                    _debug_stderr(
++                        "[TriAttentionDebug] FREE_BLOCKS "
++                        f"req={req_id} gid={gid} freed={len(removed_blocks)} "
++                        f"kept={len(kept_blocks)} synthesized={reason}"
++                    )
++                    if _free_reclaimed_blocks(manager, removed_blocks):
++                        applied = True
++                return applied
++
+             block_reclaim = event.get("block_reclaim")
+             groups = (
+                 block_reclaim.get("groups")
+@@ -423,22 +512,23 @@ class TriAttentionScheduler(Scheduler):
+                         "scheduled_tokens=%d) req=%s",
+                         _evt_scheduled, req_id,
+                     )
+-                elif expected_shrink_gids and isinstance(managers, (list, tuple)):
+-                    for gid in sorted(expected_shrink_gids):
+-                        manager = managers[gid]
+-                        req_blocks = manager.req_to_blocks.get(req_id)
+-                        if not req_blocks or required_blocks >= len(req_blocks):
+-                            continue
+-                        kept_blocks = req_blocks[:required_blocks]
+-                        removed_blocks = req_blocks[required_blocks:]
+-                        manager.req_to_blocks[req_id] = kept_blocks
+-                        if req_id in manager.num_cached_block:
+-                            manager.num_cached_block[req_id] = min(
+-                                manager.num_cached_block[req_id],
+-                                len(kept_blocks),
+-                            )
+-                        if _free_reclaimed_blocks(manager, removed_blocks):
+-                            reclaim_applied_any = True
++                elif expected_shrink_gids and _can_synthesize_reclaim(expected_shrink_gids):
++                    if _synthesize_reclaim(expected_shrink_gids, "no_groups_payload"):
++                        reclaim_applied_any = True
++                elif (
++                    expected_shrink_gids
++                    and isinstance(managers, (list, tuple))
++                    and len(managers) > 1
++                ):
++                    # Hybrid model where we cannot prove all missing gids are
++                    # plain full-attention managers. Skip rather than risking
++                    # SWA/chunked-local block-table corruption.
++                    logger.warning(
++                        "TriAttention block reclaim: skipping synthesized "
++                        "reclaim on hybrid model (no groups payload, "
++                        "unverified group layout) expected_shrink_gids=%s req=%s",
++                        sorted(expected_shrink_gids), req_id,
++                    )
+                 if reclaim_applied_any:
+                     update_request_effective_kv_offset(
+                         request=req,
+@@ -470,23 +560,31 @@ class TriAttentionScheduler(Scheduler):
+                 curr_ids = [block.block_id for block in req_blocks]
+                 kept_len = len(block_ids_after)
+                 if kept_len > len(curr_ids):
+-                    raise RuntimeError(
+-                        "TriAttention block reclaim invalid length: "
+-                        f"req={req_id} gid={gid} kept_len={kept_len} "
+-                        f"curr_len={len(curr_ids)}"
++                    logger.warning(
++                        "TriAttention block reclaim: skipping group "
++                        "(invalid length kept_len > curr_len) "
++                        "req=%s gid=%s kept_len=%s curr_len=%s",
++                        req_id, gid, kept_len, len(curr_ids),
+                     )
++                    continue
+                 if len(set(block_ids_after)) != kept_len:
+-                    raise RuntimeError(
+-                        "TriAttention block reclaim contains duplicate block ids: "
+-                        f"req={req_id} gid={gid} block_ids_after={block_ids_after}"
++                    logger.warning(
++                        "TriAttention block reclaim: skipping group "
++                        "(duplicate block ids / group-identity mismatch) "
++                        "req=%s gid=%s block_ids_after=%s",
++                        req_id, gid, block_ids_after,
+                     )
++                    continue
+                 expected_prefix = curr_ids[:kept_len]
+                 if expected_prefix != block_ids_after:
+-                    raise RuntimeError(
+-                        "TriAttention block reclaim prefix mismatch: "
+-                        f"req={req_id} gid={gid} expected_prefix={expected_prefix} "
+-                        f"actual_after={block_ids_after}"
++                    logger.warning(
++                        "TriAttention block reclaim: skipping group "
++                        "(prefix mismatch / sliding-window null padding or "
++                        "group-identity mismatch) req=%s gid=%s "
++                        "expected_prefix=%s actual_after=%s",
++                        req_id, gid, expected_prefix, block_ids_after,
+                     )
++                    continue
+                 if (
+                     getattr(self.triattention_config, "require_physical_reclaim", False)
+                     and gid in expected_shrink_gids
+@@ -524,6 +622,11 @@ class TriAttentionScheduler(Scheduler):
+                         req_id, gid, len(removed_old_blocks),
+                         len(kept_old_blocks), len(new_blocks_this_step),
+                     )
++                    _debug_stderr(
++                        "[TriAttentionDebug] FREE_BLOCKS "
++                        f"req={req_id} gid={gid} freed={len(removed_old_blocks)} "
++                        f"kept={len(kept_old_blocks)} new={len(new_blocks_this_step)}"
++                    )
+                     if _free_reclaimed_blocks(manager, removed_old_blocks):
+                         reclaim_applied_any = True
+
+@@ -533,22 +636,13 @@ class TriAttentionScheduler(Scheduler):
+             # Same safety as above: skip during chunked prefill without
+             # block_ids_before to avoid freeing new blocks.
+             missing_gids = expected_shrink_gids - seen_gids
+-            if missing_gids and _evt_scheduled <= 1:
+-                for gid in sorted(missing_gids):
+-                    manager = managers[gid]
+-                    req_blocks = manager.req_to_blocks.get(req_id)
+-                    if not req_blocks or required_blocks >= len(req_blocks):
+-                        continue
+-                    kept_blocks = req_blocks[:required_blocks]
+-                    removed_blocks = req_blocks[required_blocks:]
+-                    manager.req_to_blocks[req_id] = kept_blocks
+-                    if req_id in manager.num_cached_block:
+-                        manager.num_cached_block[req_id] = min(
+-                            manager.num_cached_block[req_id],
+-                            len(kept_blocks),
+-                        )
+-                    if _free_reclaimed_blocks(manager, removed_blocks):
+-                        reclaim_applied_any = True
++            if (
++                missing_gids
++                and _evt_scheduled <= 1
++                and _can_synthesize_reclaim(missing_gids)
++            ):
++                if _synthesize_reclaim(missing_gids, "missing_groups_payload"):
++                    reclaim_applied_any = True
+             elif missing_gids and _evt_scheduled > 1:
+                 logger.info(
+                     "TriAttention block reclaim: skipping synthesized "
+@@ -556,6 +650,13 @@ class TriAttentionScheduler(Scheduler):
+                     "(scheduled_tokens=%d) req=%s",
+                     sorted(missing_gids), _evt_scheduled, req_id,
+                 )
++            elif missing_gids and isinstance(managers, (list, tuple)) and len(managers) > 1:
++                logger.warning(
++                    "TriAttention block reclaim: skipping synthesized "
++                    "reclaim on hybrid model (unverified group layout) "
++                    "missing_gids=%s req=%s",
++                    sorted(missing_gids), req_id,
++                )
+
+             if reclaim_applied_any:
+                 update_request_effective_kv_offset(
+diff --git a/triattention/vllm/runtime/selector_hf.py b/triattention/vllm/runtime/selector_hf.py
+index 82abd43..24879d3 100644
+--- a/triattention/vllm/runtime/selector_hf.py
++++ b/triattention/vllm/runtime/selector_hf.py
+@@ -339,9 +339,13 @@ def build_triattention_selector(
+
+         if config.sparse_normalize_scores:
+             scores = normalize_scores(scores)
++        prefix_protect = min(
++            max(0, int(config.protect_prefix_tokens)), int(scores.shape[-1])
++        )
+         mutate_scores = (
+             config.window_size > 0
+             or (protect_prefill and prefill_len > 0)
++            or prefix_protect > 0
+         )
+         if mutate_scores:
+             scores = scores.clone()
+@@ -352,6 +356,11 @@ def build_triattention_selector(
+                 scores[..., total_tokens - recent_count :] = float("inf")
+         if protect_prefill and prefill_len > 0:
+             scores[..., :prefill_len] = float("inf")
++        if prefix_protect > 0:
++            # Attention-sink / format-anchor preservation: always keep the first K
++            # tokens (e.g. gpt-oss harmony channel scaffolding) so compressing the
++            # bulk prompt does not corrupt structured generation.
++            scores[..., :prefix_protect] = float("inf")
+         if use_hf_group_max:
+             scores = _reduce_grouped_head_scores(
+                 scores=scores,
+@@ -423,7 +432,12 @@ def build_triattention_selector(
+         protect_prefill: bool,
+         device: torch.device,
+     ) -> torch.Tensor | None:
+-        if config.window_size <= 0 and not (protect_prefill and prefill_len > 0):
++        prefix_protect = max(0, int(config.protect_prefix_tokens))
++        if (
++            config.window_size <= 0
++            and not (protect_prefill and prefill_len > 0)
++            and prefix_protect <= 0
++        ):
+             return None
+         token_positions = torch.arange(
+             start_token,
+@@ -438,6 +452,9 @@ def build_triattention_selector(
+             guard_mask |= token_positions >= window_start
+         if protect_prefill and prefill_len > 0:
+             guard_mask |= token_positions < prefill_len
++        if prefix_protect > 0:
++            # Attention-sink / format-anchor preservation (first K tokens).
++            guard_mask |= token_positions < prefix_protect
+         return guard_mask
+
+     def _apply_token_guards(
+diff --git a/triattention/vllm/runtime/worker_reclaim_sync.py b/triattention/vllm/runtime/worker_reclaim_sync.py
+index f9964cf..da8109d 100644
+--- a/triattention/vllm/runtime/worker_reclaim_sync.py
++++ b/triattention/vllm/runtime/worker_reclaim_sync.py
+@@ -85,6 +85,22 @@ def apply_worker_block_reclaim_events(
+     if block_size <= 0:
+         block_size = 16
+
++    # Only full-attention groups have tail-truncatable block tables. Sliding-window /
++    # chunked-local / mamba groups null-pad or window their tables, so shrinking them
++    # by the (full-attention-derived) required_blocks would corrupt their live KV.
++    full_attn_gids: set[int] | None = None
++    _kv_cache_config = getattr(base_runner, "kv_cache_config", None)
++    _groups = getattr(_kv_cache_config, "kv_cache_groups", None) if _kv_cache_config else None
++    if isinstance(_groups, (list, tuple)):
++        try:
++            from .kv_group_resolver import _is_reclaimable_full_attention_group
++            full_attn_gids = {
++                gid for gid, g in enumerate(_groups)
++                if _is_reclaimable_full_attention_group(g)
++            }
++        except Exception:
++            full_attn_gids = None
++
+     for event in events:
+         if not isinstance(event, dict) or event.get("status") != "applied":
+             continue
+@@ -100,7 +116,9 @@ def apply_worker_block_reclaim_events(
+
+         required_blocks = (cache_len_after + block_size - 1) // block_size
+
+-        for table in tables:
++        for gid, table in enumerate(tables):
++            if full_attn_gids is not None and gid not in full_attn_gids:
++                continue
+             num_blocks_per_row = getattr(table, "num_blocks_per_row", None)
+             if num_blocks_per_row is None:
+                 continue
+@@ -123,6 +141,8 @@ def apply_worker_block_reclaim_events(
+             if req_state is not None:
+                 block_ids_attr = getattr(req_state, "block_ids", None)
+                 if isinstance(block_ids_attr, (list, tuple)):
+-                    for group_blocks in block_ids_attr:
++                    for gid, group_blocks in enumerate(block_ids_attr):
++                        if full_attn_gids is not None and gid not in full_attn_gids:
++                            continue
+                         if isinstance(group_blocks, list) and len(group_blocks) > required_blocks:
+                             del group_blocks[required_blocks:]

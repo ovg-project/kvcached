@@ -1364,12 +1364,24 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
             return True
 
-        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
+        def _patched_reshape_kv(self, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # vLLM <=0.19: _reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+                # vLLM >=0.20: _reshape_kv_cache_tensors(kv_cache_raw_tensors, kernel_block_sizes)
+                #              and kv_cache_config now lives on self.kv_cache_config.
+                first = args[0] if args else kwargs.get("kv_cache_config")
+                if first is not None and hasattr(first, "kv_cache_groups"):
+                    kv_cache_config = first
+                    kv_cache_raw_tensors = (
+                        args[1] if len(args) > 1 else kwargs.get("kv_cache_raw_tensors")
+                    )
+                else:
+                    kv_cache_config = getattr(self, "kv_cache_config", None)
+                    kv_cache_raw_tensors = first
                 return self._reshape_kv_cache_tensors_from_kvcached(
-                    kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
+                    kv_cache_config, kv_cache_raw_tensors
                 )
-            return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
+            return original_method(self, *args, **kwargs)
 
         self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)

@@ -54,3 +54,28 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
 
     # Log results
     log_patch_results("vllm", results)
+
+    # Optional TriAttention layer. Install after kvcached patches so
+    # TriAttention sees kvcached-backed vLLM scheduler and block pool state.
+    if os.getenv("ENABLE_TRIATTENTION", "0").lower() in ("true", "1"):
+        try:
+            from kvcached.integration.triattention_external import (
+                install_external_vllm_triattention,
+            )
+
+            install_external_vllm_triattention()
+            logger.info(
+                "[TriAttention] Runtime plugin activated on top of kvcached "
+                "(ENABLE_TRIATTENTION=1)."
+            )
+        except Exception as exc:
+            logger.error(
+                "[TriAttention] Activation failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+            raise RuntimeError(
+                "ENABLE_TRIATTENTION=1 was requested, but TriAttention "
+                "vLLM activation failed. Check the external triattention "
+                "package, PYTHONPATH/--triattention-root, and the kvcached "
+                "compatibility patch."
+            ) from exc
