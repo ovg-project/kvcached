@@ -18,6 +18,7 @@ Verified on **NVIDIA GB10 (DGX Spark)**, vLLM **0.24.0**, torch 2.11.0+cu130.
 - Gemma is multimodal; the check runs it text-only (`limit_mm_per_prompt` all 0).
 
 ## How to run
+
 ```bash
 # baseline (no kvcached)
 python correctness_check.py --tag baseline
@@ -27,6 +28,7 @@ ENABLE_KVCACHED=true KVCACHED_AUTOPATCH=1 KVCACHED_CONTIGUOUS_LAYOUT=false \
 # compare token ids
 python correctness_check.py --compare baseline kvcached
 ```
+
 The prompts are long (> the 1024 sliding window) so the sliding-window layers are
 exercised, not just the prefix.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+
 """Byte-exact correctness check for kvcached on a heterogeneous-KV-group model.
 
 Greedy-decode a long-context chat request (prompt > sliding window, so the
