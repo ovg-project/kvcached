@@ -57,7 +57,7 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
 | SGLang | ≥ v0.4.9 (tested up to v0.5.10) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b, etc. |
-| vLLM | ≥ v0.8.4 (tested up to v0.19.0) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b |
+| vLLM | ≥ v0.8.4 (tested up to v0.25.1) | MHA / GQA / MLA | Llama 3.1/3.3, Qwen 2.5, DeepSeek-V3, openai/gpt-oss-20b |
 
 ## Example use cases
 
