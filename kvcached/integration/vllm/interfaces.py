@@ -85,6 +85,109 @@ def shutdown_kvcached() -> None:
     _async_sched = False
 
 
+def build_kv_views(
+    raw_kv_tensors: List[torch.Tensor],
+    kvcache_shape: Tuple[int, ...],
+    block_size: int,
+    dtype: torch.dtype,
+    attention_type: str,
+    num_blocks_per_layer: int,
+    gpu_mem_bytes_per_layer_k_or_v: int,
+    num_layers: int,
+    kernel_block_size: Optional[int] = None,
+) -> Tuple[List[torch.Tensor], int]:
+    """Reinterpret already-allocated raw KV pools as per-layer KV views.
+
+    Mirrors the view-building math inside ``alloc_kv_cache`` but takes
+    already-allocated ``raw_kv_tensors`` plus the (uniform) physical quantities
+    ``num_blocks_per_layer`` / ``gpu_mem_bytes_per_layer_k_or_v``. This lets a
+    heterogeneous hybrid model (e.g. Gemma: sliding-window + full-attention
+    groups with different ``(block_size, num_kv_heads, head_size)`` but identical
+    ``block_mem_size``) build a DIFFERENT view per group over the SAME physical
+    pools. Returns ``(kv_tensors, page_size_bytes)``. Non-contiguous layout only
+    for heterogeneous callers.
+    """
+    is_mla = attention_type == "MLA"
+    unified_pool = attention_type == "HYBRID_LINEAR"
+    num_k_or_v = 1 if is_mla else 2
+    if kernel_block_size is None:
+        kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"block_size ({block_size}) must be a multiple of "
+            f"kernel_block_size ({kernel_block_size})")
+    ratio = block_size // kernel_block_size
+
+    if is_mla:
+        blocks_dim_idx = 0
+        permute_order = list(range(len(kvcache_shape)))
+    elif kvcache_shape[0] == num_k_or_v:
+        blocks_dim_idx = 1
+        permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
+    elif kvcache_shape[1] == num_k_or_v:
+        blocks_dim_idx = 0
+        permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+    else:
+        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+    actual_kvcache_shape: List[int] = list(kvcache_shape)
+    actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
+
+    page_size_bytes = math.prod(
+        actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+    ) * dtype.itemsize
+
+    kernel_kvcache_shape: List[int] = list(actual_kvcache_shape)
+    if ratio > 1:
+        kernel_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer * ratio
+        token_dim_idx = 2 if not is_mla else 1
+        kernel_kvcache_shape[token_dim_idx] = kernel_block_size
+
+    if not _contiguous_layout:
+        kv_tensors: List[torch.Tensor] = []
+        if is_mla:
+            num_eles = math.prod(kernel_kvcache_shape)
+            kv_tensors = [
+                t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
+                for t in raw_kv_tensors
+            ]
+        else:
+            shape = list(kernel_kvcache_shape)
+            strides = [0] * len(shape)
+            strides[-1] = 1
+            for i in range(len(shape) - 2, 1, -1):
+                strides[i] = strides[i + 1] * shape[i + 1]
+            hidden_size_eles = strides[2] * shape[2]
+            if unified_pool:
+                if blocks_dim_idx == 1:
+                    strides[1] = 2 * hidden_size_eles
+                    strides[0] = hidden_size_eles
+                else:
+                    strides[0] = 2 * hidden_size_eles
+                    strides[1] = hidden_size_eles
+            else:
+                v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
+                if blocks_dim_idx == 1:
+                    strides[1] = hidden_size_eles
+                    strides[0] = v_offset_eles
+                else:
+                    strides[0] = hidden_size_eles
+                    strides[1] = v_offset_eles
+            for t in raw_kv_tensors:
+                kv_tensors.append(
+                    torch.as_strided(t.view(dtype=dtype), shape, strides))
+    else:
+        layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+        contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+        kv_tensors = [
+            contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
+        ]
+
+    return kv_tensors, page_size_bytes
+
+
 def alloc_kv_cache(
     kvcache_shape: Tuple[int, ...],
     block_size: int,
@@ -95,8 +198,15 @@ def alloc_kv_cache(
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
     group_id: int = 0,
     kernel_block_size: Optional[int] = None,
+    return_meta: bool = False,
 ) -> List[torch.Tensor]:
     """Allocate KV cache tensors for all supported attention types.
+
+    When ``return_meta`` is True, the physical-allocation metadata needed to
+    rebuild per-group views (for heterogeneous hybrid models like Gemma) is
+    appended to the return value as a final ``meta`` dict with keys:
+    ``raw_kv_tensors``, ``num_blocks_per_layer``, ``gpu_mem_bytes_per_layer_k_or_v``,
+    ``num_layers``, ``dtype``.
 
     For MHA/GQA, kvcache_shape is expected to be:
       - FlashAttn:  (2, num_blocks, block_size, head_num, head_dim)
@@ -297,7 +407,17 @@ def alloc_kv_cache(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
+    meta = {
+        "raw_kv_tensors": raw_kv_tensors,
+        "num_blocks_per_layer": num_blocks_per_layer,
+        "gpu_mem_bytes_per_layer_k_or_v": gpu_mem_bytes_per_layer_k_or_v,
+        "num_layers": num_layers,
+        "dtype": dtype,
+    }
+
     if not unified_pool:
+        if return_meta:
+            return kv_tensors, meta  # type: ignore[return-value]
         return kv_tensors
 
     # --- Build raw int8 buffers for hybrid model (mamba) support ---
@@ -311,6 +431,8 @@ def alloc_kv_cache(
         "block_stride_bytes": page_size_bytes,
         "num_pools": num_layers,
     }
+    if return_meta:
+        return kv_tensors, raw_info, meta  # type: ignore[return-value]
     return kv_tensors, raw_info  # type: ignore[return-value]
 
 
