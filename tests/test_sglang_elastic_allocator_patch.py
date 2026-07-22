@@ -87,7 +87,9 @@ def _install_sglang_interfaces(monkeypatch, interfaces):
     monkeypatch.setitem(
         sys.modules, "kvcached.integration.sglang.interfaces", interfaces
     )
-    monkeypatch.setattr(sglang_integration, "interfaces", interfaces)
+    monkeypatch.setattr(
+        sglang_integration, "interfaces", interfaces, raising=False
+    )
 
 
 def test_elastic_paged_alloc_extend_accepts_precomputed_num_new_pages(monkeypatch):
