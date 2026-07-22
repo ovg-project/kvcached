@@ -24,7 +24,7 @@ vLLM uses the term "hybrid" for two very different things, and kvcached needs di
 
 The `start_two_models.sh` script defaults to GPT-OSS (attention-only). For Jamba/Bamba and other Mamba-hybrid models, drop `--disable-hybrid-kv-cache-manager` from the `vllm serve` command and export `KVCACHED_CONTIGUOUS_LAYOUT=false` before launching. For Gemma 3/4 (heterogeneous attention geometry), likewise do not disable the hybrid manager and export `KVCACHED_CONTIGUOUS_LAYOUT=false`.
 
-> ² **Contiguous layout for linear-attention hybrids is newly supported** (code + CPU unit tests landed; see [`docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md`](../../docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md)). It is **not yet GPU token-parity validated**, so keep `KVCACHED_CONTIGUOUS_LAYOUT=false` for these models until you've confirmed token-for-token parity on your hardware. The one combination that is explicitly unsupported and fails loud is `contiguous + kernel_block_size != block_size`.
+> ² **Contiguous layout for linear-attention hybrids is newly supported** (code + CPU unit tests landed; see [`docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md`](../../docs/HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md)). GPU token-parity validated on vLLM 0.22.1 (tiny GDN hybrids, ratio=5, 1- and 2-slot pools): token-for-token identical to the no-kvcached baseline for both layouts. `contiguous + kernel_block_size != block_size` (ratio>1) is supported via kernel-block-granular per-block views.
 
 ## Prerequisites
 - A working vLLM installation with kvcached.

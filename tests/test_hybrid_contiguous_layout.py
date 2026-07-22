@@ -26,7 +26,8 @@ This test suite pins the two invariants that make the *contiguous* layout work:
    byte ``(N*num_pools + L) * page_size_bytes`` in the single shared base
    buffer.  (test_contiguous_mamba_aliases_attention)
 
-Plus a guard test for the one unsupported combination (contiguous + ratio>1).
+Plus kernel-block-granular view tests for contiguous + ratio>1 (supported
+since the kernel-outermost per-block layout landed).
 
 These run CPU-only: ``create_kv_tensors`` is intercepted and
 ``torch.cuda.get_device_properties`` is stubbed, so no GPU / VMM is exercised.
@@ -126,15 +127,155 @@ def test_hybrid_contiguous_no_longer_raises(ifc):
     assert call.kwargs["unified_pool"] is True
 
 
-def test_hybrid_contiguous_ratio_gt_1_fails_loud(ifc):
-    """contiguous + ratio>1 (kernel_block_size != block_size) is unexpressible
-    for the contiguous attention view and must raise NotImplementedError."""
+def test_hybrid_contiguous_ratio_gt_1_allowed(ifc):
+    """contiguous + ratio>1 is now supported (kernel-block-granular attention
+    views): alloc proceeds all the way to create_kv_tensors instead of raising
+    NotImplementedError."""
     mod, monkeypatch = ifc
     monkeypatch.setattr(mod, "_contiguous_layout", True)
-    with pytest.raises(NotImplementedError, match="contiguous KV layout"):
-        mod.alloc_kv_cache(HYBRID_SHAPE, BLOCK_SIZE, DTYPE, "cuda:0", 24,
-                           attention_type="HYBRID_LINEAR",
-                           kernel_block_size=BLOCK_SIZE // 2)
+    call = _capture_alloc(mod, "HYBRID_LINEAR",
+                          kernel_block_size=BLOCK_SIZE // 2)
+    assert call.kwargs["unified_pool"] is True
+
+
+# --------------------------------------------------------------------------
+# Completing-allocator fixture: create_kv_tensors returns real CPU tensors so
+# alloc_kv_cache finishes and the returned views can be inspected.
+# --------------------------------------------------------------------------
+
+# Small geometry so CPU buffers stay tiny:
+# (2, num_blocks, block_size=16, heads=2, head_dim=8), fp16.
+SMALL_SHAPE = (2, 4, BLOCK_SIZE, 2, 8)
+SMALL_SHAPE_FLASHINFER = (4, 2, BLOCK_SIZE, 2, 8)
+SMALL_LAYERS = 3
+
+
+@pytest.fixture()
+def ifc_real(monkeypatch):
+    mod = importlib.import_module("kvcached.integration.vllm.interfaces")
+    monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
+    monkeypatch.setattr(mod, "_contiguous_layout", True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda dev=None: _FakeProps(64 * (1024 ** 2)))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def _cpu_create(ftensor_bytes_per_layer, itemsize, device, num_layers,
+                    **kwargs):
+        total = ftensor_bytes_per_layer * num_layers
+        return [torch.zeros(total, dtype=torch.uint8)
+                for _ in range(num_layers)]
+
+    monkeypatch.setattr(mod, "create_kv_tensors", _cpu_create)
+    return mod
+
+
+def _alloc_views(mod, shape, kernel_block_size):
+    views, raw_info = mod.alloc_kv_cache(
+        shape, BLOCK_SIZE, DTYPE, "cuda:0", SMALL_LAYERS,
+        attention_type="HYBRID_LINEAR", kernel_block_size=kernel_block_size)
+    return views, raw_info
+
+
+@pytest.mark.parametrize("ratio", [1, 2, 4])
+def test_contiguous_attention_view_strides(ifc_real, ratio):
+    """Attention views must be globally linear in the kernel-block id:
+    kernel-block stride = num_layers*2h, K/V stride = h, slot offset = i*2h."""
+    mod = ifc_real
+    kbs = BLOCK_SIZE // ratio
+    views, _ = _alloc_views(mod, SMALL_SHAPE, kbs)
+    assert len(views) == SMALL_LAYERS
+    h = kbs * SMALL_SHAPE[3] * SMALL_SHAPE[4]  # kernel_bs * H * D elements
+    for i, v in enumerate(views):
+        # FlashAttn kernel-granular shape: (2, N*ratio, kernel_bs, H, D)
+        assert v.shape[0] == 2 and v.shape[2] == kbs
+        assert v.shape[1] % ratio == 0
+        assert v.stride(0) == h                      # K -> V within a cell
+        assert v.stride(1) == SMALL_LAYERS * 2 * h   # kernel-block stride
+        assert v.storage_offset() == i * 2 * h       # slot offset
+        H, D = SMALL_SHAPE[3], SMALL_SHAPE[4]
+        assert v.stride()[2:] == (H * D, D, 1)       # inner (token, head, dim)
+
+
+def test_contiguous_ratio1_matches_legacy_layout(ifc_real):
+    """At ratio==1 the kernel-granular formula must reproduce the historical
+    layout (contiguous_tensor[:, i].permute) byte-for-byte: same storage
+    offsets, same strides."""
+    mod = ifc_real
+    views, raw_info = _alloc_views(mod, SMALL_SHAPE, BLOCK_SIZE)
+    n_blocks = views[0].shape[1]
+    base = raw_info["buffers"][0].view(dtype=DTYPE)
+    # legacy: (N, L, 2, bs, H, D) -> [:, i] -> permute to (2, N, bs, H, D)
+    legacy_shape = [n_blocks, SMALL_LAYERS, 2, BLOCK_SIZE,
+                    SMALL_SHAPE[3], SMALL_SHAPE[4]]
+    num_eles = 1
+    for s in legacy_shape:
+        num_eles *= s
+    legacy_base = base[:num_eles].view(legacy_shape)
+    for i, v in enumerate(views):
+        legacy = legacy_base[:, i].permute(1, 0, 2, 3, 4)
+        assert list(v.shape) == list(legacy.shape)
+        assert v.stride() == legacy.stride()
+        assert v.storage_offset() == legacy.storage_offset()
+
+
+@pytest.mark.parametrize("ratio", [2, 4])
+def test_contiguous_block_span_bijection(ifc_real, ratio):
+    """The strongest invariant: for a given virtual block b, the element set
+    covered by the ATTENTION interpretation (all slots, all its kernel blocks,
+    K and V) and the element set covered by the MAMBA interpretation (all
+    slots' state cells) are BOTH exactly the block's span
+    [b*T, (b+1)*T) -- same bytes, two interpretations, no leakage into any
+    other block."""
+    mod = ifc_real
+    kbs = BLOCK_SIZE // ratio
+    views, raw_info = _alloc_views(mod, SMALL_SHAPE, kbs)
+    h = kbs * SMALL_SHAPE[3] * SMALL_SHAPE[4]
+    L = SMALL_LAYERS
+    p_eles = ratio * 2 * h                       # per-slot bytes per block, in elements
+    t_eles = L * p_eles                          # full span per virtual block
+    assert raw_info["block_stride_bytes"] == t_eles * DTYPE.itemsize
+
+    for b in range(2):
+        attn: set[int] = set()
+        for i, v in enumerate(views):
+            off = v.storage_offset()
+            for kb in range(b * ratio, (b + 1) * ratio):
+                for kv in range(2):
+                    start = off + kv * v.stride(0) + kb * v.stride(1)
+                    attn.update(range(start, start + h))
+        mamba: set[int] = set()
+        for i in range(L):
+            start = b * t_eles + i * p_eles
+            mamba.update(range(start, start + p_eles))
+        span = set(range(b * t_eles, (b + 1) * t_eles))
+        assert attn == span
+        assert mamba == span
+
+
+def test_contiguous_flashinfer_shape_ratio_gt1(ifc_real):
+    """Blocks-first (FlashInfer-style) shapes get the mirrored stride layout."""
+    mod = ifc_real
+    ratio = 2
+    kbs = BLOCK_SIZE // ratio
+    views, _ = _alloc_views(mod, SMALL_SHAPE_FLASHINFER, kbs)
+    h = kbs * SMALL_SHAPE_FLASHINFER[3] * SMALL_SHAPE_FLASHINFER[4]
+    for i, v in enumerate(views):
+        # (N*ratio, 2, kernel_bs, H, D)
+        assert v.shape[1] == 2 and v.shape[2] == kbs
+        assert v.stride(0) == SMALL_LAYERS * 2 * h
+        assert v.stride(1) == h
+        assert v.storage_offset() == i * 2 * h
+
+
+def test_contiguous_mamba_raw_info_unchanged_ratio_gt1(ifc_real):
+    """raw_info consumed by _reshape_mamba_contiguous keeps the slot-sequential
+    contract under ratio>1: single base buffer, block stride = L*P bytes."""
+    mod = ifc_real
+    views, raw_info = _alloc_views(mod, SMALL_SHAPE, BLOCK_SIZE // 4)
+    assert len(raw_info["buffers"]) == 1
+    assert raw_info["block_stride_bytes"] == \
+        SMALL_LAYERS * raw_info["page_size_bytes"]
+    assert raw_info["is_contiguous"] is True
 
 
 def test_hybrid_noncontiguous_ratio_gt_1_ok(ifc):

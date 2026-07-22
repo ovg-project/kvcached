@@ -1267,6 +1267,27 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 kv_cache_spec.head_size,
             )
 
+            if attention_type == "HYBRID_LINEAR":
+                # The unified-pool layout math (both layouts; load-bearing for
+                # contiguous ratio>1 linearity) assumes the spec's page is
+                # EXACTLY the geometric K+V bytes of one block:
+                #   page_size_bytes == 2 * block_size * H * D * itemsize.
+                # Quantized KV modes that inline per-token scales into the
+                # page, or a padded attention page (page_size_padded), break
+                # that identity silently -- fail loud instead of garbling.
+                import math as _math
+                _geom_page = (_math.prod(kv_cache_shape) // num_blocks *
+                              kv_cache_spec.dtype.itemsize)
+                if kv_cache_spec.page_size_bytes != _geom_page:
+                    raise NotImplementedError(
+                        "kvcached hybrid-linear requires the attention page "
+                        "size to equal the geometric K+V block bytes, but "
+                        f"page_size_bytes={kv_cache_spec.page_size_bytes} != "
+                        f"{_geom_page}. This typically means a quantized KV "
+                        "cache dtype with inline scales (e.g. "
+                        "fp8_per_token_head) or a padded attention page, "
+                        "which the unified hybrid pool does not support yet.")
+
             # Allocate group_size shared VM-backed pools, mirroring vLLM's
             # KVCacheTensor sharing: pool i is shared by layer i from each
             # group, and different groups use different block IDs within the

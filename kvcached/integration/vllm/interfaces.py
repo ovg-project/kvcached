@@ -176,6 +176,10 @@ def build_kv_views(
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
+    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views today
+    # (heterogeneous grouping requires the non-contiguous layout and
+    # excludes hybrid-linear); the kernel-block-granular contiguous view
+    # for the unified pool lives in alloc_kv_cache.
     else:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
@@ -254,9 +258,6 @@ def alloc_kv_cache(
     # non-contiguous KV layouts. In contiguous layout the attention view
     # (contiguous_tensor[:, i].permute, below) is already K/V-interleaved per
     # block, and the mamba state view is rebuilt with a num_layers-scaled block
-    # stride (see _reshape_mamba_contiguous in patches.py). The one combination
-    # we cannot express is contiguous + ratio>1 (kernel_block_size !=
-    # block_size), which is rejected right after ratio is computed below.
 
     num_k_or_v = 1 if is_mla else 2
 
@@ -272,19 +273,14 @@ def alloc_kv_cache(
             f"kernel_block_size ({kernel_block_size})")
     ratio = block_size // kernel_block_size
 
-    # The contiguous layout builds per-layer attention views at *virtual* block
-    # granularity (actual_kvcache_shape), so it cannot express a view split into
-    # kernel-sized blocks. For hybrid linear-attention this is the one
-    # contiguous combination we cannot support: fail loud rather than hand back
-    # a mis-strided attention tensor. (MHA/MLA reach the same contiguous branch;
-    # their ratio>1 behavior predates this change and is intentionally left
-    # untouched here to avoid regressing already-working dense configs.)
-    if is_hybrid_linear and _contiguous_layout and ratio > 1:
-        raise NotImplementedError(
-            "kvcached does not support the contiguous KV layout for hybrid "
-            "linear-attention models when kernel_block_size != block_size "
-            f"(block_size={block_size}, kernel_block_size={kernel_block_size}, "
-            f"ratio={ratio}). Re-launch with KVCACHED_CONTIGUOUS_LAYOUT=false.")
+    # Contiguous + hybrid linear-attention supports any ratio (= block_size /
+    # kernel_block_size): attention-owned virtual blocks are viewed with
+    # kernel-block-outermost striding (globally linear in the kernel-block id,
+    # see the unified_pool contiguous branch below), while mamba-owned virtual
+    # blocks keep the slot-sequential layout. Both views alias the same bytes;
+    # a virtual block is owned by exactly one KV-cache group at a time (vLLM's
+    # groups draw disjoint ids from one shared BlockPool), so only one
+    # interpretation is ever live for a given block.
 
     # --- Validate shape and determine layout indices ---
     if is_mla:
@@ -427,6 +423,33 @@ def alloc_kv_cache(
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
+    elif unified_pool:
+        # Contiguous HYBRID_LINEAR: kernel-block-granular attention views (see
+        # the identical branch in build_kv_views for the layout derivation).
+        # Slot i's kernel block kb lives at element kb*(num_layers*2h) + i*2h,
+        # globally linear in kb; at ratio==1 this is byte-for-byte the
+        # historical [slot0: K|V][slot1: K|V]... per-block layout. Mamba-owned
+        # blocks are read slot-sequentially by _reshape_mamba_contiguous over
+        # the same bytes -- valid because a virtual block belongs to exactly
+        # one KV-cache group at a time.
+        shape = list(kernel_kvcache_shape)
+        strides = [0] * len(shape)
+        strides[-1] = 1
+        for i in range(len(shape) - 2, 1, -1):
+            strides[i] = strides[i + 1] * shape[i + 1]
+        hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * H * D
+        if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
+            strides[1] = num_layers * 2 * hidden_size_eles
+            strides[0] = hidden_size_eles
+        else:                             # FlashInfer (N*ratio, 2, ...)
+            strides[0] = num_layers * 2 * hidden_size_eles
+            strides[1] = hidden_size_eles
+        flat = raw_kv_tensors[0].view(dtype=dtype)
+        kv_tensors = [
+            torch.as_strided(flat, shape, strides,
+                             storage_offset=i * 2 * hidden_size_eles)
+            for i in range(num_layers)
+        ]
     else:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape

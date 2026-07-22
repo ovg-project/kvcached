@@ -100,7 +100,7 @@ return True                              # CUDA → 连续
 
 | 场景 | 要求 | 原因 |
 |---|---|---|
-| **vLLM hybrid-linear / Mamba** | 两者皆可¹(连续支持本分支新加入) | 连续下 attention 视图按 block 交织、mamba 视图按 `num_layers×page` 步幅重塑;唯一不支持 `contiguous + ratio>1`(`kernel_block_size≠block_size`)。详见 [HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN](./HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md) |
+| **vLLM hybrid-linear / Mamba** | 两者皆可¹(连续支持本分支新加入) | 连续下 attention 视图按 block 交织、mamba 视图按 `num_layers×page` 步幅重塑;`contiguous + ratio>1`(`kernel_block_size≠block_size`)亦已支持:attention 属主的块在块内按 kernel 粒度跨槽交错(全局线性),mamba 属主的块保持槽位顺序。详见 [HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN](./HYBRID_LINEAR_CONTIGUOUS_LAYOUT_PLAN.md) |
 | **AMD ROCm / HIP**(任何模型) | **必须非连续**(自动默认) | 连续的交错布局喂给 ROCm 的 `PagedAttention.split_kv_cache` + paged kernel 会读错;CUDA 的 FlashAttention/FlashInfer 能容忍跨步视图 |
 | **vLLM NIXL PD 分离** | **必须非连续** | `NixlConnector` 按 block-contiguous 注册每层 K/V,连续布局的跨层交错与之冲突 |
 | **SGLang hybrid-linear / Mamba 投机解码** | **必须连续** | `fused_mamba_state_scatter` / MTP-verify 需要单个 `(num_layers, slots, *)` tensor |
@@ -116,7 +116,7 @@ return True                              # CUDA → 连续
 | 每层 KV tensor | 跨步视图(大 stride) | 紧凑标准 contiguous |
 | ROCm paged kernel 正确 | ❌ | ✅ |
 | NIXL PD | ❌ | ✅ |
-| vLLM hybrid-linear/Mamba | ⚠️ 本分支新加入,待 GPU 验证(不支持 `ratio>1`) | ✅(当前安全默认) |
+| vLLM hybrid-linear/Mamba | ✅ 本分支新加入,已 GPU token-parity 验证(vLLM 0.22.1,ratio=5,L=1/2;含 `ratio>1`) | ✅(当前安全默认) |
 | SGLang hybrid-linear 投机解码 | ✅(必需) | ❌ |
 
 **净取舍**:连续 = 用「跨步的每层视图」换「更少的 VMM 操作」,CUDA 稠密/MLA 首选;非连续 = 紧凑每层 tensor,ROCm / NIXL 必需(vLLM hybrid-linear 连续支持已加入但待 GPU 验证,验证前仍以非连续为安全默认),代价是更多 map 调用。
