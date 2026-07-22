@@ -121,6 +121,30 @@ def test_set_block_hash_supports_legacy_writable_property():
     assert block.block_hash == key
 
 
+@pytest.mark.parametrize(
+    ("max_cached_tokens", "block_size", "expected_blocks"),
+    [
+        (-1, 16, -1),
+        (0, 16, 0),
+        (1, 16, 1),
+        (8, 16, 1),
+        (16, 16, 1),
+        (17, 16, 2),
+        (32, 16, 2),
+    ],
+)
+def test_get_max_cached_blocks_rounds_positive_limits_up(
+    monkeypatch, max_cached_tokens, block_size, expected_blocks
+):
+    """Positive token limits should keep at least one cache block."""
+    import kvcached.utils as utils
+    from kvcached.integration.vllm.patches import _get_max_cached_blocks
+
+    monkeypatch.setattr(utils, "MAX_CACHED_TOKENS", max_cached_tokens)
+
+    assert _get_max_cached_blocks(block_size) == expected_blocks
+
+
 # ---------------------------------------------------------------------------
 # Fixture: create an ElasticBlockPool via the real patch injection
 # ---------------------------------------------------------------------------
