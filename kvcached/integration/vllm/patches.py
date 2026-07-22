@@ -441,16 +441,36 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self.null_block = self.kv_block_pool[0]
                 self.null_block.is_null = True
 
-                # Prefix cache: (block_hash, group_id) -> KVCacheBlock
+                # Prefix cache: (block_hash, group_id) -> {block_id: block}.
+                # Multiple in-flight requests can materialize the same prefix
+                # before either block becomes reusable. vLLM preserves every
+                # such block because request block tables are append-only.
                 # The key embeds group_id to support hybrid attention
                 # (multiple KV cache groups with different attention types).
-                self._cached_blocks: dict[Any, KVCacheBlock] = {}
+                self._cached_blocks: dict[Any, dict[int, KVCacheBlock]] = {}
                 # Reverse index: block_id -> cache key for O(1) eviction.
                 # Each block_id belongs to exactly one group.
                 self._block_id_to_key: dict[int, Any] = {}
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+
+            def _get_one_cached_block(self, key: Any) -> Optional[KVCacheBlock]:
+                blocks = self._cached_blocks.get(key)
+                if not blocks:
+                    return None
+                return next(iter(blocks.values()))
+
+            def _remove_cached_block(
+                self, key: Any, block_id: int
+            ) -> Optional[KVCacheBlock]:
+                blocks = self._cached_blocks.get(key)
+                if not blocks:
+                    return None
+                block = blocks.pop(block_id, None)
+                if not blocks:
+                    self._cached_blocks.pop(key, None)
+                return block
 
             def get_cached_block(
                 self,
@@ -467,14 +487,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 #   expect one block per group.
                 if kv_cache_group_ids is None:
                     key = _make_cache_key(block_hash, 0)
-                    return self._cached_blocks.get(key)
+                    return self._get_one_cached_block(key)
                 if isinstance(kv_cache_group_ids, int):
                     kv_cache_group_ids = [int(kv_cache_group_ids)]
 
                 cached_blocks: list[KVCacheBlock] = []
                 for group_id in kv_cache_group_ids:
                     key = _make_cache_key(block_hash, int(group_id))
-                    block = self._cached_blocks.get(key)
+                    block = self._get_one_cached_block(key)
                     if block is None:
                         # Atomic: all groups must hit or return None
                         return None
@@ -547,17 +567,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     block_hash = block_hashes[block_idx]
                     key = _make_cache_key(block_hash, kv_cache_group_id)
 
-                    # Already cached, idempotent
-                    if key in self._cached_blocks:
-                        continue
-
                     # ElasticBlockPool tracks cached blocks through its own maps,
                     # but vLLM manager code may still read KVCacheBlock.block_hash
                     # after cache_full_blocks. Preserve that metadata contract and
                     # clear it before the block is evicted or reused.
+                    previous_key = self._block_id_to_key.get(block.block_id)
+                    if previous_key is not None and previous_key != key:
+                        self._remove_cached_block(previous_key, block.block_id)
+                        _reset_block_hash(block)
                     if getattr(block, "block_hash", None) is None:
                         _set_block_hash(block, key)
-                    self._cached_blocks[key] = block
+                    self._cached_blocks.setdefault(key, {})[block.block_id] = block
                     self._block_id_to_key[block.block_id] = key
 
             def _page_aligned_victims(self, num_to_evict: int) -> list[int]:
@@ -636,7 +656,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     block = self._evictable_blocks.pop(bid, None)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        self._cached_blocks.pop(key, None)
+                        self._remove_cached_block(key, bid)
                     if block is not None:
                         _reset_block_hash(block)
                     ids_to_free.append(bid)
@@ -746,7 +766,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 for bid in block_ids:
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        block = self._cached_blocks.pop(key, None)
+                        block = self._remove_cached_block(key, bid)
                         if block is not None:
                             _reset_block_hash(block)
                         removed += 1
