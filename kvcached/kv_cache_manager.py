@@ -374,8 +374,12 @@ class KVCacheManager:
     @synchronized
     def free_reserved(self):
         if self.reserved_blocks:
-            self.free(self.reserved_blocks)
-            self.reserved_blocks.clear()
+            # Detach first: once off the ledger the blocks are ordinary
+            # blocks, so free()'s sanity check (which forbids freeing a
+            # block that is still reserved) correctly stays quiet. Freeing
+            # before detaching trips that check under KVCACHED_SANITY_CHECK.
+            blocks, self.reserved_blocks = self.reserved_blocks, []
+            self.free(blocks)
 
     @synchronized
     def resize(self, new_mem_size: int):
@@ -390,14 +394,15 @@ class KVCacheManager:
                 self.in_shrink = False
                 self.target_num_blocks = None
             return True  # Successfully resized.
-        # Failed to resize due to too many in-use blocks.
-        assert (len(self.reserved_blocks) == 0
-                ), "Reserved blocks must be freed before resizing."
+        # Failed to resize due to too many in-use blocks. Free any
+        # outstanding reserved blocks before entering the lazy shrink wait.
         # NOTE: we can support resizing with reserved blocks, but we want to
         # enforce this check for now to ensure correctness.
+        self.free_reserved()
+        assert (len(self.reserved_blocks) == 0
+                ), "Reserved blocks must be freed before resizing."
         self.in_shrink = True
         self.target_num_blocks = new_mem_size // self.block_mem_size
-        self.free_reserved()
         return False
 
     @synchronized
