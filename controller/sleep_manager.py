@@ -202,7 +202,7 @@ class SleepManager:
                     f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
                 )
 
-            del self.sleeping_models[model_name]
+            self.sleeping_models.pop(model_name, None)
             self.manual_sleep_models.discard(model_name)
 
             logger.info(
