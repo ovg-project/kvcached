@@ -520,4 +520,5 @@ def get_kv_cache_manager(
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
+        reserve_null_block=True,
     )
