@@ -428,9 +428,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # we mirror that by allocating one real block from kvcached so
                 # the block_id is valid on the GPU (the attention kernel may
                 # read from it, but results are masked out).
-                _null_ids = self.kv_cache_manager.alloc(1)
-                assert _null_ids is not None and len(_null_ids) == 1
-                self.null_block = self.kv_block_pool[_null_ids[0]]
+                # vLLM hard-codes null == block 0: native BlockPool pops
+                # block 0 as the null block, NULL_BLOCK_ID = 0, block tables
+                # are fill_(0) so padded/unused slots read 0, and mamba/GDN
+                # state kernels skip index 0 on both read and write. If any
+                # real request owns block 0, its GDN state is silently
+                # skipped as "null" and its output garbles. The manager is
+                # created with reserve_null_block=True (see get_kv_cache_manager),
+                # which reserves and maps block 0 synchronously before the
+                # page-prealloc thread starts (and fails loud if it cannot),
+                # so block 0 never enters circulation. Just wrap it here.
+                self.null_block = self.kv_block_pool[0]
                 self.null_block.is_null = True
 
                 # Prefix cache: (block_hash, group_id) -> KVCacheBlock

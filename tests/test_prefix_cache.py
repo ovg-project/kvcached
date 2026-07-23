@@ -77,8 +77,13 @@ class MockKVCacheManager:
     """
 
     def __init__(self, num_blocks: int):
-        self._free: list[int] = list(range(num_blocks))
+        # Mirror KVCacheManager(reserve_null_block=True): block 0 is reserved
+        # as the null block during manager init and never enters circulation,
+        # so the free list starts at 1 (same id sequence the old code produced
+        # by allocating block 0 for the null block).
+        self._free: list[int] = list(range(1, num_blocks))
         self._allocated: set[int] = set()
+        self.null_block = [0]
 
     def alloc(self, n: int):
         if len(self._free) < n:
