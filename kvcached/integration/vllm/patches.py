@@ -99,20 +99,33 @@ def _validate_kv_cache_groups(kv_cache_config: Any) -> None:
 
     first_spec = first_attn_group.kv_cache_spec
     block_size = first_spec.block_size
-    cell_size, _ = _get_kv_cache_params(first_spec, block_size)
+    cell_size, num_kv_buffers = _get_kv_cache_params(first_spec, block_size)
+    block_mem_size = block_size * cell_size
 
     for idx, grp in enumerate(kv_groups):
         grp_spec = grp.kv_cache_spec
         if not _is_attention_spec(grp_spec):
             continue
         grp_block_size = grp_spec.block_size
-        grp_cell_size, _ = _get_kv_cache_params(grp_spec, grp_block_size)
-        if grp_block_size != block_size or grp_cell_size != cell_size:
+        grp_cell_size, grp_num_kv_buffers = _get_kv_cache_params(grp_spec, grp_block_size)
+        grp_block_mem_size = grp_block_size * grp_cell_size
+        # kvcached needs one uniform physical block stride (block_mem_size =
+        # bytes/block per K-or-V) and one K/V buffer count. It does NOT require
+        # identical block_size/cell_size individually: attention groups that split
+        # a block into different token counts (e.g. Gemma's sliding-window
+        # block_size=64/cell=1024 vs full-attention block_size=16/cell=4096, both
+        # block_mem_size=65536) share one physical pool and get a per-group
+        # as_strided view. Reject only when the physical block stride or the K/V
+        # buffer count actually differ (a genuine single-pool violation, e.g.
+        # mixing MLA num_kv_buffers=1 with MHA num_kv_buffers=2).
+        if grp_block_mem_size != block_mem_size or grp_num_kv_buffers != num_kv_buffers:
             raise ValueError(
-                "kvcached requires all attention KV cache groups to have the "
-                f"same block geometry. First attention group: block_size={block_size},"
-                f" cell_size={cell_size}; group {idx}: "
-                f"block_size={grp_block_size}, cell_size={grp_cell_size}"
+                "kvcached requires all attention KV cache groups to share one "
+                "physical block geometry (block_mem_size and num_kv_buffers). "
+                f"First attention group: block_mem_size={block_mem_size}, "
+                f"num_kv_buffers={num_kv_buffers}; group {idx}: "
+                f"block_mem_size={grp_block_mem_size}, "
+                f"num_kv_buffers={grp_num_kv_buffers}"
             )
 
 
@@ -195,6 +208,50 @@ def _reshape_mamba_non_contiguous(
     return state_tensors
 
 
+def _reshape_mamba_contiguous(
+    mamba_info: dict, kv_cache_spec: Any, pool_idx: int, get_dtype_size: Any,
+) -> list:
+    """Create strided mamba state views from a contiguous interleaved buffer.
+
+    In contiguous layout there is a single base buffer shared by all pools.
+    Block N for pool L sits at byte offset
+    ``(N * num_pools + L) * page_size_bytes`` inside that base buffer, so the
+    inter-block stride is ``block_stride_bytes == num_pools * page_size_bytes``
+    (not ``page_size_bytes`` as in the non-contiguous per-pool case), and the
+    per-pool base offset is ``pool_idx * page_size_bytes``. This aliases exactly
+    the same cell the contiguous attention view (contiguous_tensor[:, L]) reads,
+    so a hybrid model's attention and mamba layers share one physical block.
+    """
+    import torch
+
+    base_buffer = mamba_info["buffers"][0]  # flat int8 buffer
+    num_blocks = mamba_info["num_blocks"]
+    page_size_bytes = mamba_info["page_size_bytes"]
+    block_stride_bytes = mamba_info["block_stride_bytes"]
+
+    layer_offset_bytes = pool_idx * page_size_bytes
+
+    state_tensors: list = []
+    inner_offset_bytes = 0
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        dtype_size = get_dtype_size(dtype)
+        block_stride_elems = block_stride_bytes // dtype_size
+        target_shape = (num_blocks, *shape)
+        inner_stride = torch.empty(target_shape).stride()
+        target_stride = (block_stride_elems, *inner_stride[1:])
+        assert (layer_offset_bytes + inner_offset_bytes) % dtype_size == 0
+        storage_offset = (layer_offset_bytes + inner_offset_bytes) // dtype_size
+        tensor = torch.as_strided(
+            base_buffer.view(dtype),
+            size=target_shape,
+            stride=target_stride,
+            storage_offset=storage_offset,
+        )
+        state_tensors.append(tensor)
+        inner_offset_bytes += inner_stride[0] * dtype_size
+    return state_tensors
+
+
 # Version ranges for vLLM support
 VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
@@ -274,6 +331,31 @@ def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
     return bytes(block_hash) + group_id.to_bytes(4, "big", signed=False)
 
 
+def _reset_block_hash(block: Any) -> None:
+    """Clear vLLM's cached block hash before returning a block to kvcached."""
+    reset_hash = getattr(block, "reset_hash", None)
+    if callable(reset_hash):
+        reset_hash()
+        return
+    if hasattr(block, "_block_hash"):
+        block._block_hash = None
+    if hasattr(block, "_block_hash_num_tokens"):
+        block._block_hash_num_tokens = None
+
+
+def _set_block_hash(block: Any, key: Any) -> None:
+    """Set vLLM's cached block hash across API versions.
+
+    vLLM 0.24 and later expose a read-only property plus set_block_hash().
+    Older supported versions expose a writable block_hash property instead.
+    """
+    set_block_hash = getattr(block, "set_block_hash", None)
+    if callable(set_block_hash):
+        set_block_hash(key)
+    else:
+        block.block_hash = key
+
+
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
@@ -346,9 +428,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # we mirror that by allocating one real block from kvcached so
                 # the block_id is valid on the GPU (the attention kernel may
                 # read from it, but results are masked out).
-                _null_ids = self.kv_cache_manager.alloc(1)
-                assert _null_ids is not None and len(_null_ids) == 1
-                self.null_block = self.kv_block_pool[_null_ids[0]]
+                # vLLM hard-codes null == block 0: native BlockPool pops
+                # block 0 as the null block, NULL_BLOCK_ID = 0, block tables
+                # are fill_(0) so padded/unused slots read 0, and mamba/GDN
+                # state kernels skip index 0 on both read and write. If any
+                # real request owns block 0, its GDN state is silently
+                # skipped as "null" and its output garbles. The manager is
+                # created with reserve_null_block=True (see get_kv_cache_manager),
+                # which reserves and maps block 0 synchronously before the
+                # page-prealloc thread starts (and fails loud if it cannot),
+                # so block 0 never enters circulation. Just wrap it here.
+                self.null_block = self.kv_block_pool[0]
                 self.null_block.is_null = True
 
                 # Prefix cache: (block_hash, group_id) -> KVCacheBlock
@@ -461,6 +551,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if key in self._cached_blocks:
                         continue
 
+                    # ElasticBlockPool tracks cached blocks through its own maps,
+                    # but vLLM manager code may still read KVCacheBlock.block_hash
+                    # after cache_full_blocks. Preserve that metadata contract and
+                    # clear it before the block is evicted or reused.
+                    if getattr(block, "block_hash", None) is None:
+                        _set_block_hash(block, key)
                     self._cached_blocks[key] = block
                     self._block_id_to_key[block.block_id] = key
 
@@ -537,10 +633,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 ids_to_free: list[int] = []
                 for bid in ordered[:num_to_evict]:
-                    self._evictable_blocks.pop(bid, None)
+                    block = self._evictable_blocks.pop(bid, None)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._cached_blocks.pop(key, None)
+                    if block is not None:
+                        _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
                     self.kv_cache_manager.free(ids_to_free)
@@ -628,6 +726,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             self._evictable_blocks[block.block_id] = block
                         else:
                             # Uncached block (e.g. partial): free immediately
+                            _reset_block_hash(block)
                             uncached_to_free.append(block.block_id)
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
@@ -647,10 +746,13 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 for bid in block_ids:
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        self._cached_blocks.pop(key, None)
+                        block = self._cached_blocks.pop(key, None)
+                        if block is not None:
+                            _reset_block_hash(block)
                         removed += 1
                     if bid in self._evictable_blocks:
-                        self._evictable_blocks.pop(bid)
+                        block = self._evictable_blocks.pop(bid)
+                        _reset_block_hash(block)
                         ids_to_free.append(bid)
 
                 if ids_to_free:
@@ -664,6 +766,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 # Free all evictable blocks back to kvcached
                 if self._evictable_blocks:
+                    for block in self._evictable_blocks.values():
+                        _reset_block_hash(block)
                     ids_to_free = list(self._evictable_blocks.keys())
                     self._evictable_blocks.clear()
                     self.kv_cache_manager.free(ids_to_free)
@@ -1243,6 +1347,27 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 kv_cache_spec.head_size,
             )
 
+            if attention_type == "HYBRID_LINEAR":
+                # The unified-pool layout math (both layouts; load-bearing for
+                # contiguous ratio>1 linearity) assumes the spec's page is
+                # EXACTLY the geometric K+V bytes of one block:
+                #   page_size_bytes == 2 * block_size * H * D * itemsize.
+                # Quantized KV modes that inline per-token scales into the
+                # page, or a padded attention page (page_size_padded), break
+                # that identity silently -- fail loud instead of garbling.
+                import math as _math
+                _geom_page = (_math.prod(kv_cache_shape) // num_blocks *
+                              kv_cache_spec.dtype.itemsize)
+                if kv_cache_spec.page_size_bytes != _geom_page:
+                    raise NotImplementedError(
+                        "kvcached hybrid-linear requires the attention page "
+                        "size to equal the geometric K+V block bytes, but "
+                        f"page_size_bytes={kv_cache_spec.page_size_bytes} != "
+                        f"{_geom_page}. This typically means a quantized KV "
+                        "cache dtype with inline scales (e.g. "
+                        "fp8_per_token_head) or a padded attention page, "
+                        "which the unified hybrid pool does not support yet.")
+
             # Allocate group_size shared VM-backed pools, mirroring vLLM's
             # KVCacheTensor sharing: pool i is shared by layer i from each
             # group, and different groups use different block IDs within the
@@ -1295,6 +1420,39 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     "produce invalid KV cache strides."
                 )
 
+            # Detect heterogeneous attention groups (Gemma-style: sliding-window
+            # + full-attention groups with different (block_size, num_kv_heads,
+            # head_size) but identical block_mem_size, validated above). For
+            # those we allocate ONE uniform physical pool set and build a
+            # per-group as_strided view; homogeneous / single-group models keep
+            # the original fast path byte-for-byte.
+            def _attn_geom(grp):
+                s = grp.kv_cache_spec
+                return (s.block_size, s.num_kv_heads, s.head_size)
+
+            attn_group_list = [
+                (gid, grp)
+                for gid, grp in enumerate(kv_cache_config.kv_cache_groups)
+                if _is_attention_spec(grp.kv_cache_spec)
+            ]
+            distinct_attn_geoms = {_attn_geom(grp) for _, grp in attn_group_list}
+            # The relaxed validate gate admits attention groups with differing
+            # geometry as long as block_mem_size matches. Per-group views are only
+            # built for the pure-attention path; HYBRID_LINEAR (full attn + mamba)
+            # reshape still binds all attention layers to the first group's
+            # geometry, so heterogeneous attention geometry there would be wrong.
+            # No known hybrid-linear model has that, but fail loud rather than
+            # silently mis-stride.
+            if attention_type == "HYBRID_LINEAR" and len(distinct_attn_geoms) > 1:
+                raise NotImplementedError(
+                    "kvcached does not support hybrid-linear (attention + mamba) "
+                    "models with heterogeneous attention-group geometry "
+                    f"({sorted(distinct_attn_geoms)})."
+                )
+            is_hetero = (attention_type != "HYBRID_LINEAR"
+                         and len(distinct_attn_geoms) > 1)
+            self._kvcached_attn_layer_views = None
+
             alloc_result = kvi.alloc_kv_cache(
                 kv_cache_shape,
                 kv_cache_spec.block_size,
@@ -1304,11 +1462,45 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 attention_type=attention_type,
                 kv_layout="NHD",
                 kernel_block_size=kernel_block_size,
+                return_meta=is_hetero,
             )
 
             if attention_type == "HYBRID_LINEAR":
                 kv_cache_raw_tensors, raw_info = alloc_result
                 self._kvcached_mamba_raw_info = raw_info
+            elif is_hetero:
+                kv_cache_raw_tensors, meta = alloc_result
+                if getattr(kvi, "_contiguous_layout", False):
+                    raise RuntimeError(
+                        "kvcached: heterogeneous attention KV groups (e.g. Gemma "
+                        "sliding-window + full-attention) currently require the "
+                        "non-contiguous layout. Re-launch with "
+                        "KVCACHED_CONTIGUOUS_LAYOUT=false."
+                    )
+                # Build a per-group view over the shared physical pools using each
+                # group's own (block_size, num_kv_heads, head_size).
+                layer_views: dict = {}
+                for gid, grp in attn_group_list:
+                    gspec = grp.kv_cache_spec
+                    gbackend = patch_instance._get_version_specific_attention_backend(
+                        self, kv_cache_group_id=gid
+                    )
+                    gshape = gbackend.get_kv_cache_shape(
+                        num_blocks, gspec.block_size, gspec.num_kv_heads,
+                        gspec.head_size,
+                    )
+                    gkbs = (kernel_block_sizes[gid]
+                            if kernel_block_sizes is not None
+                            and gid < len(kernel_block_sizes) else None)
+                    gviews, _ = kvi.build_kv_views(
+                        meta["raw_kv_tensors"], gshape, gspec.block_size, dtype,
+                        attention_type, meta["num_blocks_per_layer"],
+                        meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
+                        kernel_block_size=gkbs,
+                    )
+                    for pool_idx, layer_name in enumerate(grp.layer_names):
+                        layer_views[layer_name] = gviews[pool_idx]
+                self._kvcached_attn_layer_views = layer_views
             else:
                 kv_cache_raw_tensors = alloc_result
 
@@ -1358,6 +1550,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             kv_caches: dict[str, torch.Tensor] = {}
 
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
+            # Per-group attention views for heterogeneous hybrids (Gemma). None
+            # for homogeneous / single-group models, which use the raw-tensor
+            # index mapping below unchanged.
+            attn_layer_views = getattr(self, "_kvcached_attn_layer_views", None)
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -1369,14 +1565,23 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
-                        state_tensors = _reshape_mamba_non_contiguous(
-                            mamba_info["buffers"][pool_idx],
-                            kv_cache_spec, get_dtype_size,
-                        )
+                        if mamba_info.get("is_contiguous"):
+                            state_tensors = _reshape_mamba_contiguous(
+                                mamba_info, kv_cache_spec, pool_idx,
+                                get_dtype_size,
+                            )
+                        else:
+                            state_tensors = _reshape_mamba_non_contiguous(
+                                mamba_info["buffers"][pool_idx],
+                                kv_cache_spec, get_dtype_size,
+                            )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
-                        kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+                        if attn_layer_views is not None and layer_name in attn_layer_views:
+                            kv_caches[layer_name] = attn_layer_views[layer_name]
+                        else:
+                            kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
 
             return kv_caches
 
@@ -1397,12 +1602,20 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
             return True
 
-        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
+        def _patched_reshape_kv(self, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # vLLM <0.20:  _reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors, ...)
+                # vLLM >=0.20: _reshape_kv_cache_tensors(self, kv_cache_raw_tensors, kernel_block_sizes)
+                #   -> the kv_cache_config arg was dropped; pull it from self.kv_cache_config.
+                if args and hasattr(args[0], "kv_cache_groups"):
+                    kv_cache_config, kv_cache_raw_tensors = args[0], args[1]
+                else:
+                    kv_cache_config = getattr(self, "kv_cache_config", None)
+                    kv_cache_raw_tensors = args[0]
                 return self._reshape_kv_cache_tensors_from_kvcached(
-                    kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
+                    kv_cache_config, kv_cache_raw_tensors
                 )
-            return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
+            return original_method(self, *args, **kwargs)
 
         self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)

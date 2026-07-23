@@ -67,8 +67,10 @@ class MockPagedKVCacheManager:
     """
 
     def __init__(self, num_blocks: int):
-        self._free: list[int] = list(range(num_blocks))
-        self._allocated: set[int] = set()
+        # Block 0 is reserved as the null block (reserve_null_block=True on the
+        # real manager), so it never enters circulation and alloc starts at 1.
+        self._free: list[int] = list(range(1, num_blocks))
+        self._allocated: set[int] = {0}
         self.page_allocator = MockPageAllocator()
         self.block_mem_size = 16 * 1024
         self.page_size = BLOCKS_PER_PAGE * self.block_mem_size

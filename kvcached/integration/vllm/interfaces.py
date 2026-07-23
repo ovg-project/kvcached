@@ -85,6 +85,113 @@ def shutdown_kvcached() -> None:
     _async_sched = False
 
 
+def build_kv_views(
+    raw_kv_tensors: List[torch.Tensor],
+    kvcache_shape: Tuple[int, ...],
+    block_size: int,
+    dtype: torch.dtype,
+    attention_type: str,
+    num_blocks_per_layer: int,
+    gpu_mem_bytes_per_layer_k_or_v: int,
+    num_layers: int,
+    kernel_block_size: Optional[int] = None,
+) -> Tuple[List[torch.Tensor], int]:
+    """Reinterpret already-allocated raw KV pools as per-layer KV views.
+
+    Mirrors the view-building math inside ``alloc_kv_cache`` but takes
+    already-allocated ``raw_kv_tensors`` plus the (uniform) physical quantities
+    ``num_blocks_per_layer`` / ``gpu_mem_bytes_per_layer_k_or_v``. This lets a
+    heterogeneous hybrid model (e.g. Gemma: sliding-window + full-attention
+    groups with different ``(block_size, num_kv_heads, head_size)`` but identical
+    ``block_mem_size``) build a DIFFERENT view per group over the SAME physical
+    pools. Returns ``(kv_tensors, page_size_bytes)``. Non-contiguous layout only
+    for heterogeneous callers.
+    """
+    is_mla = attention_type == "MLA"
+    unified_pool = attention_type == "HYBRID_LINEAR"
+    num_k_or_v = 1 if is_mla else 2
+    if kernel_block_size is None:
+        kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"block_size ({block_size}) must be a multiple of "
+            f"kernel_block_size ({kernel_block_size})")
+    ratio = block_size // kernel_block_size
+
+    if is_mla:
+        blocks_dim_idx = 0
+        permute_order = list(range(len(kvcache_shape)))
+    elif kvcache_shape[0] == num_k_or_v:
+        blocks_dim_idx = 1
+        permute_order = [1, 0] + list(range(2, len(kvcache_shape)))
+    elif kvcache_shape[1] == num_k_or_v:
+        blocks_dim_idx = 0
+        permute_order = [0, 1] + list(range(2, len(kvcache_shape)))
+    else:
+        raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
+
+    actual_kvcache_shape: List[int] = list(kvcache_shape)
+    actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
+
+    page_size_bytes = math.prod(
+        actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+    ) * dtype.itemsize
+
+    kernel_kvcache_shape: List[int] = list(actual_kvcache_shape)
+    if ratio > 1:
+        kernel_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer * ratio
+        token_dim_idx = 2 if not is_mla else 1
+        kernel_kvcache_shape[token_dim_idx] = kernel_block_size
+
+    if not _contiguous_layout:
+        kv_tensors: List[torch.Tensor] = []
+        if is_mla:
+            num_eles = math.prod(kernel_kvcache_shape)
+            kv_tensors = [
+                t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
+                for t in raw_kv_tensors
+            ]
+        else:
+            shape = list(kernel_kvcache_shape)
+            strides = [0] * len(shape)
+            strides[-1] = 1
+            for i in range(len(shape) - 2, 1, -1):
+                strides[i] = strides[i + 1] * shape[i + 1]
+            hidden_size_eles = strides[2] * shape[2]
+            if unified_pool:
+                if blocks_dim_idx == 1:
+                    strides[1] = 2 * hidden_size_eles
+                    strides[0] = hidden_size_eles
+                else:
+                    strides[0] = 2 * hidden_size_eles
+                    strides[1] = hidden_size_eles
+            else:
+                v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
+                if blocks_dim_idx == 1:
+                    strides[1] = hidden_size_eles
+                    strides[0] = v_offset_eles
+                else:
+                    strides[0] = hidden_size_eles
+                    strides[1] = v_offset_eles
+            for t in raw_kv_tensors:
+                kv_tensors.append(
+                    torch.as_strided(t.view(dtype=dtype), shape, strides))
+    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views today
+    # (heterogeneous grouping requires the non-contiguous layout and
+    # excludes hybrid-linear); the kernel-block-granular contiguous view
+    # for the unified pool lives in alloc_kv_cache.
+    else:
+        layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+        contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
+        num_eles = math.prod(contiguous_shape)
+        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+        kv_tensors = [
+            contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
+        ]
+
+    return kv_tensors, page_size_bytes
+
+
 def alloc_kv_cache(
     kvcache_shape: Tuple[int, ...],
     block_size: int,
@@ -95,8 +202,15 @@ def alloc_kv_cache(
     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
     group_id: int = 0,
     kernel_block_size: Optional[int] = None,
+    return_meta: bool = False,
 ) -> List[torch.Tensor]:
     """Allocate KV cache tensors for all supported attention types.
+
+    When ``return_meta`` is True, the physical-allocation metadata needed to
+    rebuild per-group views (for heterogeneous hybrid models like Gemma) is
+    appended to the return value as a final ``meta`` dict with keys:
+    ``raw_kv_tensors``, ``num_blocks_per_layer``, ``gpu_mem_bytes_per_layer_k_or_v``,
+    ``num_layers``, ``dtype``.
 
     For MHA/GQA, kvcache_shape is expected to be:
       - FlashAttn:  (2, num_blocks, block_size, head_num, head_dim)
@@ -116,12 +230,16 @@ def alloc_kv_cache(
         List[torch.Tensor] for MHA/GQA/MLA.
         For HYBRID_LINEAR, returns (kv_tensors, raw_info) where
         raw_info is a dict with:
-          buffers            - flat int8 tensors, one per pool
+          buffers            - flat int8 tensors: one per pool in the
+                               non-contiguous layout, or a single shared base
+                               buffer ([base]) in the contiguous layout
           num_blocks         - number of blocks per pool
           page_size_bytes    - uniform page size (bytes) shared by all groups
           block_stride_bytes - byte stride between consecutive blocks of the
-                               same pool
+                               same pool (page_size_bytes when non-contiguous,
+                               num_layers*page_size_bytes when contiguous)
           num_pools          - number of pools (== num_layers)
+          is_contiguous      - whether the contiguous layout is in use
     """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -136,15 +254,10 @@ def alloc_kv_cache(
     is_hybrid_linear = attention_type == "HYBRID_LINEAR"
     unified_pool = is_hybrid_linear
 
-    if is_hybrid_linear and _contiguous_layout:
-        raise ValueError(
-            "kvcached detected a hybrid linear-attention model "
-            "(e.g. Jamba/Bamba/NemotronH/Zamba2/Plamo2), which requires the "
-            "non-contiguous KV layout. Re-launch with "
-            "KVCACHED_CONTIGUOUS_LAYOUT=false. Also do NOT pass "
-            "--disable-hybrid-kv-cache-manager to vLLM for these models — "
-            "it only applies to attention-only hybrids like sliding-window "
-            "models (e.g. GPT-OSS).")
+    # Hybrid linear-attention (HYBRID_LINEAR) supports BOTH the contiguous and
+    # non-contiguous KV layouts. In contiguous layout the attention view
+    # (contiguous_tensor[:, i].permute, below) is already K/V-interleaved per
+    # block, and the mamba state view is rebuilt with a num_layers-scaled block
 
     num_k_or_v = 1 if is_mla else 2
 
@@ -159,6 +272,15 @@ def alloc_kv_cache(
             f"block_size ({block_size}) must be a multiple of "
             f"kernel_block_size ({kernel_block_size})")
     ratio = block_size // kernel_block_size
+
+    # Contiguous + hybrid linear-attention supports any ratio (= block_size /
+    # kernel_block_size): attention-owned virtual blocks are viewed with
+    # kernel-block-outermost striding (globally linear in the kernel-block id,
+    # see the unified_pool contiguous branch below), while mamba-owned virtual
+    # blocks keep the slot-sequential layout. Both views alias the same bytes;
+    # a virtual block is owned by exactly one KV-cache group at a time (vLLM's
+    # groups draw disjoint ids from one shared BlockPool), so only one
+    # interpretation is ever live for a given block.
 
     # --- Validate shape and determine layout indices ---
     if is_mla:
@@ -218,9 +340,22 @@ def alloc_kv_cache(
 
     ftensor_bytes_per_layer = gpu_mem_bytes_per_layer_k_or_v * num_k_or_v
 
+    # For the unified (hybrid) pool, K and V are interleaved into a single
+    # buffer per layer, so the KVCacheManager / PageAllocator use
+    # num_kv_buffers=1 (see _get_kv_cache_params in patches.py). The C++
+    # contiguous layout sizes its compound page as
+    # kPageSize*num_layers*num_kv_buffers, so it MUST see the same 1 here --
+    # otherwise the compound page is 2x too large and FTensor::map's
+    # offset-alignment assert fails on every odd page id (and the compound-page
+    # count no longer matches the manager's block count). In non-contiguous
+    # layout create_kv_tensors ignores num_kv_buffers, so this is a no-op there.
+    # The FTensor byte size is unaffected: it comes from ftensor_bytes_per_layer
+    # (= gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) above, which already
+    # accounts for both K and V.
+    compound_num_kv_buffers = 1 if unified_pool else num_k_or_v
     raw_kv_tensors = create_kv_tensors(
         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
-        num_kv_buffers=num_k_or_v, group_id=group_id,
+        num_kv_buffers=compound_num_kv_buffers, group_id=group_id,
         unified_pool=unified_pool,
     )
 
@@ -288,6 +423,33 @@ def alloc_kv_cache(
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
+    elif unified_pool:
+        # Contiguous HYBRID_LINEAR: kernel-block-granular attention views (see
+        # the identical branch in build_kv_views for the layout derivation).
+        # Slot i's kernel block kb lives at element kb*(num_layers*2h) + i*2h,
+        # globally linear in kb; at ratio==1 this is byte-for-byte the
+        # historical [slot0: K|V][slot1: K|V]... per-block layout. Mamba-owned
+        # blocks are read slot-sequentially by _reshape_mamba_contiguous over
+        # the same bytes -- valid because a virtual block belongs to exactly
+        # one KV-cache group at a time.
+        shape = list(kernel_kvcache_shape)
+        strides = [0] * len(shape)
+        strides[-1] = 1
+        for i in range(len(shape) - 2, 1, -1):
+            strides[i] = strides[i + 1] * shape[i + 1]
+        hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * H * D
+        if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
+            strides[1] = num_layers * 2 * hidden_size_eles
+            strides[0] = hidden_size_eles
+        else:                             # FlashInfer (N*ratio, 2, ...)
+            strides[0] = num_layers * 2 * hidden_size_eles
+            strides[1] = hidden_size_eles
+        flat = raw_kv_tensors[0].view(dtype=dtype)
+        kv_tensors = [
+            torch.as_strided(flat, shape, strides,
+                             storage_offset=i * 2 * hidden_size_eles)
+            for i in range(num_layers)
+        ]
     else:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
@@ -297,20 +459,43 @@ def alloc_kv_cache(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
+    meta = {
+        "raw_kv_tensors": raw_kv_tensors,
+        "num_blocks_per_layer": num_blocks_per_layer,
+        "gpu_mem_bytes_per_layer_k_or_v": gpu_mem_bytes_per_layer_k_or_v,
+        "num_layers": num_layers,
+        "dtype": dtype,
+    }
+
     if not unified_pool:
+        if return_meta:
+            return kv_tensors, meta  # type: ignore[return-value]
         return kv_tensors
 
     # --- Build raw int8 buffers for hybrid model (mamba) support ---
-    pool_bytes = num_blocks_per_layer * page_size_bytes
-    raw_int8 = [t.view(torch.int8)[:pool_bytes] for t in raw_kv_tensors]
+    # Non-contiguous: one compact flat buffer per pool; consecutive blocks of a
+    # pool are page_size_bytes apart. Contiguous: a single interleaved base
+    # buffer shared by all pools; block N of pool L sits at
+    # (N*num_pools + L)*page_size_bytes, so the per-pool block stride is
+    # num_layers*page_size_bytes. _reshape_mamba_{non_,}contiguous consume these.
+    if not _contiguous_layout:
+        pool_bytes = num_blocks_per_layer * page_size_bytes
+        raw_int8 = [t.view(torch.int8)[:pool_bytes] for t in raw_kv_tensors]
+        block_stride_bytes = page_size_bytes
+    else:
+        raw_int8 = [raw_kv_tensors[0].view(torch.int8)]
+        block_stride_bytes = num_layers * page_size_bytes
 
     raw_info = {
         "buffers": raw_int8,
         "num_blocks": num_blocks_per_layer,
         "page_size_bytes": page_size_bytes,
-        "block_stride_bytes": page_size_bytes,
+        "block_stride_bytes": block_stride_bytes,
         "num_pools": num_layers,
+        "is_contiguous": _contiguous_layout,
     }
+    if return_meta:
+        return kv_tensors, raw_info, meta  # type: ignore[return-value]
     return kv_tensors, raw_info  # type: ignore[return-value]
 
 
@@ -335,4 +520,5 @@ def get_kv_cache_manager(
         async_sched=_async_sched,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
+        reserve_null_block=True,
     )
