@@ -501,11 +501,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     victims.extend(ids)
                 return victims
 
-            def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
+            def _evict_blocks_from_pool(self,
+                                        num_to_evict: int,
+                                        page_aware: bool = True) -> int:
                 """Evict blocks from evictable pool, free to kvcached.
 
-                Prefers victims that empty whole pages so freeing them returns
-                physical memory, then falls back to LRU order for the remainder.
+                With page_aware set, prefers victims that empty whole pages so
+                freeing them returns physical memory, then falls back to LRU
+                order for the remainder. Use it only when the goal is physical
+                release (cap trimming): a page returns memory only once every
+                block on it is free.
+
+                With page_aware clear, evicts in pure LRU order. Callers that
+                reuse the freed logical slot immediately (allocation shortage)
+                get no page benefit -- the page is neither unmapped nor
+                remapped -- so reordering victims by page only trades away a
+                newer prefix for an older one and pays for the full evictable
+                scan and page sort.
 
                 Returns the number of blocks actually evicted.
                 """
@@ -513,12 +525,15 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if num_to_evict <= 0:
                     return 0
 
-                ordered = self._page_aligned_victims(num_to_evict)
-                chosen = set(ordered)
-                # Top up in LRU order: page alignment is best-effort, but the
-                # caller still needs the count it asked for.
-                ordered.extend(bid for bid in self._evictable_blocks
-                               if bid not in chosen)
+                if page_aware:
+                    ordered = self._page_aligned_victims(num_to_evict)
+                    chosen = set(ordered)
+                    # Top up in LRU order: page alignment is best-effort, but
+                    # the caller still needs the count it asked for.
+                    ordered.extend(bid for bid in self._evictable_blocks
+                                   if bid not in chosen)
+                else:
+                    ordered = list(self._evictable_blocks)
 
                 ids_to_free: list[int] = []
                 for bid in ordered[:num_to_evict]:
@@ -543,7 +558,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if self.enable_prefix_cache:
                         kvcached_free = self.kv_cache_manager.available_size()
                         if kvcached_free < num_blocks and self._evictable_blocks:
-                            self._evict_blocks_from_pool(num_blocks - kvcached_free)
+                            # Allocation shortage: the freed slot is reused
+                            # immediately, so page-aware selection buys no
+                            # memory and would evict a newer prefix over the
+                            # LRU victim. Keep pure LRU here.
+                            self._evict_blocks_from_pool(
+                                num_blocks - kvcached_free, page_aware=False)
                     block_ids = self.kv_cache_manager.alloc(num_blocks)
                     if block_ids is not None:
                         break

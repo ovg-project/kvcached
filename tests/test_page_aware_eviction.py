@@ -201,3 +201,27 @@ class TestPageAwareEviction:
         for block in blocks[:3]:
             assert pool.get_cached_block(f"h{block.block_id}", [0]) is None
         assert pool.get_cached_block(f"h{blocks[3].block_id}", [0]) is not None
+
+    def test_lru_eviction_ignores_page_layout(self, pool_factory):
+        """page_aware=False evicts the LRU victim even off a fuller page.
+
+        The allocation-shortage path reuses the freed slot immediately, so no
+        page is unmapped and page-aware selection would only swap a newer
+        prefix for an older one. Lay out the oldest cached block on a full page
+        and the newest alone on a nearly-empty page: page-aware would take the
+        newest to empty its page, so LRU must instead take the oldest.
+        """
+        pool, mgr = pool_factory(64)
+        blocks = _cache_n(pool, 8)
+        oldest, newest = blocks[0], blocks[-1]
+        # The lone newest block sits on a page by itself; the oldest shares a
+        # full page. Page-aware selection would prefer the newest here.
+        assert (sum(1 for b in mgr._allocated
+                    if b // BLOCKS_PER_PAGE
+                    == newest.block_id // BLOCKS_PER_PAGE) == 1)
+
+        pool._evict_blocks_from_pool(1, page_aware=False)
+
+        # LRU dropped the oldest; the newest prefix survives.
+        assert pool.get_cached_block(f"h{oldest.block_id}", [0]) is None
+        assert pool.get_cached_block(f"h{newest.block_id}", [0]) is not None
