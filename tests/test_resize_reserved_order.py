@@ -91,14 +91,13 @@ def _make_manager(resize_return=False):
 
     freed = []
     manager.free = lambda indices: freed.append(list(indices))
-    manager._freed_calls = freed
-    return manager
+    return manager, freed
 
 
 def test_resize_frees_reserved_blocks_before_entering_shrink_wait():
     """When the allocator can't shrink immediately, resize() must free the
     outstanding reserved blocks and enter in_shrink, not crash."""
-    manager = _make_manager(resize_return=False)
+    manager, freed = _make_manager(resize_return=False)
 
     result = manager.resize(4096)
 
@@ -106,12 +105,12 @@ def test_resize_frees_reserved_blocks_before_entering_shrink_wait():
     assert manager.in_shrink is True
     assert manager.target_num_blocks == 4096 // manager.block_mem_size
     assert manager.reserved_blocks == []
-    assert manager._freed_calls == [[1, 2, 3]]
+    assert freed == [[1, 2, 3]]
 
 
 def test_resize_with_no_reserved_blocks_still_works():
     """Sanity check: the common case (nothing reserved) is unaffected."""
-    manager = _make_manager(resize_return=False)
+    manager, _freed = _make_manager(resize_return=False)
     manager.reserved_blocks = []
 
     result = manager.resize(4096)
