@@ -122,3 +122,43 @@ def test_resize_with_no_reserved_blocks_still_works():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_free_reserved_survives_sanity_check():
+    """Regression: free_reserved() must detach blocks from the ledger BEFORE
+    handing them to free(); otherwise free()'s KVCACHED_SANITY_CHECK guard
+    (which forbids freeing a block still listed as reserved) rejects the
+    legitimate release path with ValueError. Uses the REAL free() -- only the
+    page allocator below it is stubbed."""
+    import kvcached.kv_cache_manager as kcm
+
+    manager = object.__new__(KVCacheManager)
+    manager._lock = NoOpLock()
+    manager.block_mem_size = 1024
+    manager.reserved_blocks = [1, 2, 3]
+    manager.in_shrink = False
+    manager.target_num_blocks = None
+    manager._post_init_done = threading.Event()
+    manager._post_init_done.set()
+    manager.num_avail_blocks = 0
+
+    class StubPageAllocator:
+
+        def resize(self, new_mem_size):
+            return False
+
+        def group_indices_by_page(self, indices, block_mem_size):
+            return {}
+
+    manager.page_allocator = StubPageAllocator()
+
+    original = kcm.SANITY_CHECK
+    kcm.SANITY_CHECK = True
+    try:
+        result = manager.resize(4096)
+    finally:
+        kcm.SANITY_CHECK = original
+
+    assert result is False
+    assert manager.reserved_blocks == []
+    assert manager.in_shrink is True

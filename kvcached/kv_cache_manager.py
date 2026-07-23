@@ -374,8 +374,12 @@ class KVCacheManager:
     @synchronized
     def free_reserved(self):
         if self.reserved_blocks:
-            self.free(self.reserved_blocks)
-            self.reserved_blocks.clear()
+            # Detach first: once off the ledger the blocks are ordinary
+            # blocks, so free()'s sanity check (which forbids freeing a
+            # block that is still reserved) correctly stays quiet. Freeing
+            # before detaching trips that check under KVCACHED_SANITY_CHECK.
+            blocks, self.reserved_blocks = self.reserved_blocks, []
+            self.free(blocks)
 
     @synchronized
     def resize(self, new_mem_size: int):
