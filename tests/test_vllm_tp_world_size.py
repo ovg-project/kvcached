@@ -54,6 +54,70 @@ def test_get_world_size_rejects_uninitialized_state(monkeypatch, vllm_modules):
         interfaces.get_world_size()
 
 
+def test_engine_core_records_tp_world_size_before_original_init(
+    monkeypatch, vllm_modules
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: True)
+    init_kvcached = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", init_kvcached)
+
+    def assert_kvcached_initialized_first(*args, **kwargs):
+        init_kvcached.assert_called_once()
+
+    original_init = mock.Mock(side_effect=assert_kvcached_initialized_first)
+    engine_mod = types.ModuleType("mock_engine_mod")
+
+    class FakeEngineCore:
+        __init__ = original_init
+
+    setattr(engine_mod, "EngineCore", FakeEngineCore)
+    assert patches.EngineCorePatch().patch_engine_init(engine_mod)
+
+    config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+    )
+    engine_mod.EngineCore(config)
+
+    init_kvcached.assert_called_once_with(
+        tp_rank=0,
+        world_size=4,
+        is_worker=False,
+        async_sched=True,
+    )
+    original_init.assert_called_once()
+
+
+def test_engine_core_propagates_kvcached_initialization_failure(
+    monkeypatch, vllm_modules
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    init_error = RuntimeError("failed to record TP state")
+    monkeypatch.setattr(
+        interfaces, "init_kvcached", mock.Mock(side_effect=init_error)
+    )
+
+    original_init = mock.Mock(return_value=None)
+    engine_mod = types.ModuleType("mock_engine_mod")
+
+    class FakeEngineCore:
+        __init__ = original_init
+
+    setattr(engine_mod, "EngineCore", FakeEngineCore)
+    assert patches.EngineCorePatch().patch_engine_init(engine_mod)
+
+    config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+    )
+    with pytest.raises(RuntimeError, match="failed to record TP state"):
+        engine_mod.EngineCore(config)
+
+    original_init.assert_not_called()
+
+
 class FakeElasticBlockPool:
     def __init__(self, *args, **kwargs):
         self.null_block = object()

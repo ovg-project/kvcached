@@ -707,22 +707,19 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                try:
-                    from kvcached.integration.vllm.interfaces import init_kvcached
+                from kvcached.integration.vllm.interfaces import init_kvcached
 
-                    # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
-                    # The kvcached IPC mechanism coordinates KV tensor readiness
-                    # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
-                    # Each PP stage manages its own KV memory independently, so
-                    # cross-stage IPC is neither needed nor correct.
-                    init_kvcached(
-                        tp_rank=0,
-                        world_size=vllm_config.parallel_config.tensor_parallel_size,
-                        is_worker=False,
-                        async_sched=_should_enable_async_sched(vllm_config),
-                    )
-                except Exception:
-                    pass
+                # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
+                # The kvcached IPC mechanism coordinates KV tensor readiness
+                # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
+                # Each PP stage manages its own KV memory independently, so
+                # cross-stage IPC is neither needed nor correct.
+                init_kvcached(
+                    tp_rank=0,
+                    world_size=vllm_config.parallel_config.tensor_parallel_size,
+                    is_worker=False,
+                    async_sched=_should_enable_async_sched(vllm_config),
+                )
             return original_init(self, vllm_config, *args, **kwargs)
 
         self._mark_as_patched(_patched_engine_init, "init")
