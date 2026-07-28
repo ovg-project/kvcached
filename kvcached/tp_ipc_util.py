@@ -129,10 +129,16 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 # print(f"Worker {rank} received message: {msg}")
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    map_to_kv_tensors(msg["offsets"], group_id=group_id)
+                    if not map_to_kv_tensors(msg["offsets"], group_id=group_id):
+                        raise RuntimeError(
+                            f"Failed to map KV tensors for group_id={group_id}"
+                        )
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "unmap_from_kv_tensors":
-                    unmap_from_kv_tensors(msg["offsets"], group_id=group_id)
+                    if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
+                        raise RuntimeError(
+                            f"Failed to unmap KV tensors for group_id={group_id}"
+                        )
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
