@@ -226,10 +226,19 @@ class KVCacheManager:
 
         try:
             total_wait = 0.0
-            while not _check_kv_tensors_created():
+            last_error: Exception | None = None
+            while True:
+                try:
+                    if _check_kv_tensors_created():
+                        break
+                except Exception as e:
+                    last_error = e
                 if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
-                    raise TimeoutError("KV tensors not created after "
-                                       f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    message = ("KV tensors not created after "
+                               f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    if last_error is not None:
+                        message = f"{message}; last error: {last_error}"
+                    raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
             # KV tensors created now
