@@ -560,18 +560,85 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self._cached_blocks[key] = block
                     self._block_id_to_key[block.block_id] = key
 
-            def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
-                """Evict oldest blocks from evictable pool, free to kvcached.
+            def _page_aligned_victims(self, num_to_evict: int) -> list[int]:
+                """Order evictable blocks so whole pages come free.
+
+                kvcached only returns physical memory once every block on a page
+                is freed, so evicting in LRU order can free no memory at all when
+                the survivors stay scattered across pages. Prefer pages this pool
+                can empty outright, cheapest first; draining a page only part of
+                the way costs hit rate and frees nothing.
+                """
+                mgr = self.kv_cache_manager
+                allocator = getattr(mgr, "page_allocator", None)
+                if allocator is None:
+                    return []
+
+                bids = list(self._evictable_blocks)
+                by_page = allocator.group_indices_by_page(
+                    bids, mgr.block_mem_size)
+                # Blocks held by running requests are absent from
+                # _evictable_blocks, so a page whose occupancy exceeds its
+                # evictable count cannot be emptied here -- skip it.
+                occupancy = mgr.get_page_occupancy(list(by_page))
+                lru_rank = {bid: i for i, bid in enumerate(bids)}
+
+                pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
+                         for page_id, ids in by_page.items()
+                         if len(ids) >= occupancy.get(page_id, 0)]
+                # Cheapest page first; break ties on the page whose most
+                # recently used block is oldest, so hot pages are kept.
+                pages.sort(key=lambda page: (page[0], page[1]))
+
+                victims: list[int] = []
+                for cost, _rank, ids in pages:
+                    if len(victims) + cost > num_to_evict:
+                        break
+                    victims.extend(ids)
+                return victims
+
+            def _evict_blocks_from_pool(self,
+                                        num_to_evict: int,
+                                        page_aware: bool = True) -> int:
+                """Evict blocks from evictable pool, free to kvcached.
+
+                With page_aware set, prefers victims that empty whole pages so
+                freeing them returns physical memory, then falls back to LRU
+                order for the remainder. Use it only when the goal is physical
+                release (cap trimming): a page returns memory only once every
+                block on it is free.
+
+                With page_aware clear, evicts in pure LRU order. Callers that
+                reuse the freed logical slot immediately (allocation shortage)
+                get no page benefit -- the page is neither unmapped nor
+                remapped -- so reordering victims by page only trades away a
+                newer prefix for an older one and pays for the full evictable
+                scan and page sort.
 
                 Returns the number of blocks actually evicted.
                 """
+                num_to_evict = min(num_to_evict, len(self._evictable_blocks))
+                if num_to_evict <= 0:
+                    return 0
+
+                if page_aware:
+                    ordered = self._page_aligned_victims(num_to_evict)
+                    chosen = set(ordered)
+                    # Top up in LRU order: page alignment is best-effort, but
+                    # the caller still needs the count it asked for.
+                    ordered.extend(bid for bid in self._evictable_blocks
+                                   if bid not in chosen)
+                else:
+                    ordered = list(self._evictable_blocks)
+
                 ids_to_free: list[int] = []
-                for _ in range(min(num_to_evict, len(self._evictable_blocks))):
-                    bid, block = self._evictable_blocks.popitem(last=False)
+                for bid in ordered[:num_to_evict]:
+                    block = self._evictable_blocks.pop(bid, None)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._cached_blocks.pop(key, None)
-                    _reset_block_hash(block)
+                    if block is not None:
+                        _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
                     self.kv_cache_manager.free(ids_to_free)
@@ -589,7 +656,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if self.enable_prefix_cache:
                         kvcached_free = self.kv_cache_manager.available_size()
                         if kvcached_free < num_blocks and self._evictable_blocks:
-                            self._evict_blocks_from_pool(num_blocks - kvcached_free)
+                            # Allocation shortage: the freed slot is reused
+                            # immediately, so page-aware selection buys no
+                            # memory and would evict a newer prefix over the
+                            # LRU victim. Keep pure LRU here.
+                            self._evict_blocks_from_pool(
+                                num_blocks - kvcached_free, page_aware=False)
                     block_ids = self.kv_cache_manager.alloc(num_blocks)
                     if block_ids is not None:
                         break
