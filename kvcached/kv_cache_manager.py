@@ -186,6 +186,8 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._physical_memory_limit_bytes: Optional[int] = None
+        self._physical_memory_limit_revision = -1
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -459,15 +461,120 @@ class KVCacheManager:
         self.page_allocator.trim()
 
     @synchronized
+    def set_physical_memory_limit(
+        self,
+        limit_bytes: int,
+        *,
+        revision: int,
+    ) -> Dict[str, Any]:
+        """Apply a provider-owned physical mapping limit to this KV pool.
+
+        The limit is rounded down to complete page bundles. Lowering it below
+        current mapped usage never revokes active pages: reserved pages are
+        trimmed immediately and further physical growth is blocked until
+        normal frees bring usage below the target.
+        """
+        limit_bytes = int(limit_bytes)
+        revision = int(revision)
+        if limit_bytes < 0:
+            raise ValueError("limit_bytes must be non-negative")
+        if revision < 0:
+            raise ValueError("revision must be non-negative")
+
+        current_revision = self._physical_memory_limit_revision
+        current_limit = self._physical_memory_limit_bytes
+        if revision < current_revision:
+            return self._physical_memory_limit_state(status="stale")
+        if revision == current_revision and current_limit == limit_bytes:
+            return self._physical_memory_limit_state()
+
+        # One instance-level revision may be redistributed when a local KV pool
+        # is added or removed. The provider therefore accepts a changed share
+        # at the current revision while still rejecting older control input.
+
+        page_bundle_bytes = self._physical_page_bundle_bytes()
+        max_pages = limit_bytes // page_bundle_bytes
+        max_pages = min(max_pages, self.page_allocator.get_num_total_pages())
+        self.page_allocator.set_physical_page_limit(max_pages)
+        self._physical_memory_limit_bytes = limit_bytes
+        self._physical_memory_limit_revision = revision
+
+        if self.page_allocator.get_num_mapped_pages() > max_pages:
+            self.page_allocator.trim()
+        return self._physical_memory_limit_state()
+
+    def _physical_page_bundle_bytes(self) -> int:
+        return self.page_size * self.num_layers * self.num_kv_buffers
+
+    def _physical_memory_limit_state(
+        self,
+        *,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        requested = self._physical_memory_limit_bytes
+        revision = self._physical_memory_limit_revision
+        page_limit = self.page_allocator.get_physical_page_limit()
+        mapped_pages = self.page_allocator.get_num_mapped_pages()
+        page_bundle_bytes = self._physical_page_bundle_bytes()
+        effective = None if page_limit < 0 else page_limit * page_bundle_bytes
+        mapped = mapped_pages * page_bundle_bytes
+        if status is None:
+            status = "unlimited" if effective is None else (
+                "deferred" if mapped > effective else "applied"
+            )
+        return {
+            "status": status,
+            "pool_name": str(getattr(self, "pool_name", "") or ""),
+            "group_id": self.group_id,
+            "limit_bytes": requested,
+            "effective_limit_bytes": effective,
+            "revision": revision,
+            "mapped_bytes": mapped,
+            "remaining_bytes": None if effective is None else max(0, effective - mapped),
+            "overage_bytes": 0 if effective is None else max(0, mapped - effective),
+            "reason": "mapped_usage_above_limit" if status == "deferred" else "",
+        }
+
+    @synchronized
+    def physical_memory_limit_state(self) -> Dict[str, Any]:
+        """Return the current provider-owned physical limit state."""
+        return self._physical_memory_limit_state()
+
+    @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
-            physical_free_pages = self.page_allocator.get_avail_physical_pages(
-            ) + self.page_allocator.get_num_reserved_pages()
-            free_pages = min(virtual_free_pages, physical_free_pages)
+            limit_remaining = getattr(
+                self.page_allocator,
+                "get_num_physical_limit_remaining_pages",
+                lambda: virtual_free_pages,
+            )()
+            limit_available = (
+                limit_remaining + self.page_allocator.get_num_reserved_pages()
+            )
+            physical_limit_active = getattr(
+                self.page_allocator,
+                "get_physical_page_limit",
+                lambda: -1,
+            )() >= 0
+            skip_physical_free_check = bool(
+                getattr(self, "skip_physical_free_check", False)
+            )
+            if skip_physical_free_check or physical_limit_active:
+                free_pages = min(virtual_free_pages, limit_available)
+            else:
+                physical_free_pages = (
+                    self.page_allocator.get_avail_physical_pages()
+                    + self.page_allocator.get_num_reserved_pages()
+                )
+                free_pages = min(
+                    virtual_free_pages,
+                    physical_free_pages,
+                    limit_available,
+                )
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
@@ -500,7 +607,12 @@ class KVCacheManager:
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = (self.page_allocator.get_num_inuse_pages() *
+        mapped_pages = getattr(
+            self.page_allocator,
+            "get_num_mapped_pages",
+            self.page_allocator.get_num_inuse_pages,
+        )()
+        memory_bytes = (mapped_pages *
                         self.num_layers * self.page_size *
                         self.num_kv_buffers)
 

@@ -117,6 +117,8 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
+      physical_page_limit_(-1), pending_foreground_pages_(0),
+      pending_prealloc_pages_(0),
       min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
       max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
       prealloc_running_(false), prealloc_needed_(false),
@@ -194,9 +196,13 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
     // Slow path: allocate from free pages
     if (!free_page_list_.empty()) {
+      if (get_num_physical_limit_remaining_pages_unlocked() <= 0) {
+        throw std::runtime_error("Physical KV memory limit reached");
+      }
       page_id = free_page_list_.front();
       free_page_list_.pop_front();
       num_free_pages_--;
+      pending_foreground_pages_++;
       break;
     }
 
@@ -217,8 +223,12 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   try {
     map_pages({page_id});
+    std::lock_guard<std::mutex> guard(lock_);
+    pending_foreground_pages_--;
+    cond_.notify_all();
   } catch (const std::exception &e) {
     std::lock_guard<std::mutex> guard(lock_);
+    pending_foreground_pages_--;
     free_page_list_.push_front(page_id);
     num_free_pages_++;
     cond_.notify_all();
@@ -244,7 +254,11 @@ void PageAllocator::free_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(lock_);
     num_free_pages_++;
 
-    if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
+    const bool retain_mapped_page =
+        physical_page_limit_ < 0 ||
+        get_num_mapped_or_pending_pages_unlocked() < physical_page_limit_;
+    if (retain_mapped_page &&
+        reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
       // Fast path: reserve page
       reserved_page_list_.push_back(page_id);
       update_memory_usage();
@@ -273,6 +287,10 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
     std::lock_guard<std::mutex> lock(lock_);
     num_free_pages_ += page_ids.size();
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
+    if (physical_page_limit_ >= 0) {
+      num_to_reserve = std::min(
+          num_to_reserve, get_num_physical_limit_remaining_pages_unlocked());
+    }
 
     if (num_to_reserve > 0) {
       // Fast path: reserve pages
@@ -429,6 +447,20 @@ void PageAllocator::trim() {
   }
 }
 
+void PageAllocator::set_physical_page_limit(int64_t max_pages) {
+  if (max_pages < -1) {
+    throw std::invalid_argument(
+        "physical page limit must be -1 or non-negative");
+  }
+  std::unique_lock<std::mutex> lock(lock_);
+  while (pending_foreground_pages_ > 0 || pending_prealloc_pages_ > 0) {
+    cond_.wait(lock);
+  }
+  physical_page_limit_ = max_pages;
+  prealloc_needed_ = false;
+  cond_.notify_all();
+}
+
 int64_t PageAllocator::get_num_free_pages() const { return num_free_pages_; }
 
 int64_t PageAllocator::get_num_inuse_pages() const {
@@ -442,7 +474,47 @@ int64_t PageAllocator::get_num_reserved_pages() const {
   return reserved_page_list_.size();
 }
 
+int64_t PageAllocator::get_physical_page_limit() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return physical_page_limit_;
+}
+
+int64_t PageAllocator::get_num_mapped_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_inuse_pages() +
+         static_cast<int64_t>(reserved_page_list_.size());
+}
+
+int64_t PageAllocator::get_num_physical_limit_remaining_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_physical_limit_remaining_pages_unlocked();
+}
+
+int64_t PageAllocator::get_num_mapped_or_pending_pages_unlocked() const {
+  return get_num_inuse_pages() +
+         static_cast<int64_t>(reserved_page_list_.size()) +
+         pending_foreground_pages_ + pending_prealloc_pages_;
+}
+
+int64_t PageAllocator::get_num_physical_limit_remaining_pages_unlocked() const {
+  if (physical_page_limit_ < 0) {
+    return num_total_pages_;
+  }
+  return std::max(0L, physical_page_limit_ -
+                          get_num_mapped_or_pending_pages_unlocked());
+}
+
 int64_t PageAllocator::get_avail_physical_pages() const {
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (physical_page_limit_ >= 0) {
+      return get_num_physical_limit_remaining_pages_unlocked();
+    }
+  }
+  return get_avail_unlimited_physical_pages();
+}
+
+int64_t PageAllocator::get_avail_unlimited_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
@@ -573,9 +645,14 @@ void PageAllocator::prealloc_worker() {
     int64_t current_reserved = reserved_page_list_.size();
     int64_t to_reserve = std::max(0L, min_reserved_pages_ - current_reserved);
     // Only try to reserve up to the available free pages and physical memory
+    const int64_t physical_limit_remaining =
+        get_num_physical_limit_remaining_pages_unlocked();
+    const int64_t available_physical_pages =
+        physical_page_limit_ >= 0 ? physical_limit_remaining
+                                  : get_avail_unlimited_physical_pages();
     to_reserve =
         std::min({to_reserve, static_cast<int64_t>(free_page_list_.size()),
-                  get_avail_physical_pages()});
+                  available_physical_pages, physical_limit_remaining});
 
     LOGGER(INFO,
            "max_reserved_pages: %ld, min_reserved_pages: %ld, "
@@ -601,6 +678,7 @@ void PageAllocator::prealloc_worker() {
       pages_to_reserve.push_back(free_page_list_.front());
       free_page_list_.pop_front();
     }
+    pending_prealloc_pages_ += pages_to_reserve.size();
 
     lock.unlock();
 
@@ -608,6 +686,7 @@ void PageAllocator::prealloc_worker() {
       try {
         map_pages(pages_to_reserve);
         lock.lock();
+        pending_prealloc_pages_ -= pages_to_reserve.size();
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
                                    pages_to_reserve.end());
@@ -617,6 +696,7 @@ void PageAllocator::prealloc_worker() {
                pages_to_reserve.size(), reserved_page_list_.size());
       } catch (const std::exception &e) {
         lock.lock();
+        pending_prealloc_pages_ -= pages_to_reserve.size();
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
