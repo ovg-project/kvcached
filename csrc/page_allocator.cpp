@@ -13,6 +13,7 @@
 
 #include "allocator.hpp"
 #include "gpu_utils.hpp"
+#include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
 
 namespace kvcached {
@@ -445,9 +446,8 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  const size_t usable_phy_mem_size = avail_phy_mem_size > headroom
-                                         ? avail_phy_mem_size - headroom
-                                         : static_cast<size_t>(0);
+  const size_t usable_phy_mem_size =
+      saturating_subtract(avail_phy_mem_size, headroom);
 
   // Calculate available pages considering layers and KV buffers
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
