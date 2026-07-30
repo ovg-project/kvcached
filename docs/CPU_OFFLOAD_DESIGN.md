@@ -67,9 +67,17 @@ Active request pages must never be offloaded.
 Run the complete provider-neutral VMM validation on a CUDA machine:
 
 ```bash
+git clone --branch zixuan/cpu-offload-control-plane \
+  https://github.com/Lanoxia/kvcached.git
+cd kvcached
 bash tools/run_cpu_offload_h20_validation.sh
 ```
 
 The command builds the current checkout, runs repeated real-page round trips,
 checks byte-level correctness and VMM state, runs the transfer benchmark, and
 creates a checksummed artifact archive.
+
+The same validation is available through
+`.github/workflows/cpu-offload-gpu.yml`. It supports manual page/cycle counts,
+runs weekly by default, serializes access to the persistent GPU runner, and
+uploads the checksummed bundle on success or failure.

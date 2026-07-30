@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -39,3 +41,14 @@ def test_offload_unmaps_and_restore_maps_the_same_page_id():
 
     assert "unmap_pages({page_id})" in offload_body
     assert "map_pages({page_id})" in restore_body
+
+
+def test_gpu_workflow_targets_the_persistent_runner():
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "cpu-offload-gpu.yml").read_text()
+    )
+    job = workflow["jobs"]["vmm-roundtrip"]
+
+    assert job["runs-on"] == ["self-hosted", "linux", "x64", "gpu", "kvcached"]
+    run_step = next(step for step in job["steps"] if "run" in step)
+    assert run_step["run"] == "bash tools/run_cpu_offload_h20_validation.sh"
