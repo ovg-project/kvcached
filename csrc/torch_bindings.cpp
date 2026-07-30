@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <torch/csrc/utils/pybind.h>
@@ -52,11 +53,41 @@ bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
   return allocator->map_to_kv_tensors(offsets);
 }
 
+std::pair<bool, std::vector<offset_t>>
+map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
+                              int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->map_to_kv_tensors_with_result(offsets);
+}
+
 bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
                            int64_t group_id = 0) {
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->unmap_from_kv_tensors(offsets);
+}
+
+bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                   const std::string &transaction_id,
+                                   int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->prepare_unmap_from_kv_tensors(offsets, transaction_id);
+}
+
+bool commit_unmap_from_kv_tensors(const std::string &transaction_id,
+                                  int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->commit_unmap_from_kv_tensors(transaction_id);
+}
+
+bool abort_unmap_from_kv_tensors(const std::string &transaction_id,
+                                 int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->abort_unmap_from_kv_tensors(transaction_id);
 }
 
 // PageAllocator bindings
@@ -208,8 +239,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "kv_tensors_created", py::arg("group_id") = 0);
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
         py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("map_to_kv_tensors_with_result",
+        &kvcached::map_to_kv_tensors_with_result,
+        "map_to_kv_tensors_with_result", py::arg("offsets"),
+        py::arg("group_id") = 0);
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("prepare_unmap_from_kv_tensors",
+        &kvcached::prepare_unmap_from_kv_tensors,
+        "prepare_unmap_from_kv_tensors", py::arg("offsets"),
+        py::arg("transaction_id"), py::arg("group_id") = 0);
+  m.def("commit_unmap_from_kv_tensors", &kvcached::commit_unmap_from_kv_tensors,
+        "commit_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("abort_unmap_from_kv_tensors", &kvcached::abort_unmap_from_kv_tensors,
+        "abort_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
