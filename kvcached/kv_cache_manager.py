@@ -69,6 +69,7 @@ class KVCacheManager:
         num_kv_buffers: int = 2,
         group_id: int = 0,
         pool_name: Optional[str] = None,
+        worker_physical_admission: bool = False,
     ):
         """
         Args:
@@ -87,6 +88,9 @@ class KVCacheManager:
                 Different groups have independent FTensors and page spaces.
             pool_name: Stable, low-cardinality name assigned by the engine
                 integration when this pool is created.
+            worker_physical_admission: Report logical capacity to the scheduler
+                and let the CUDA-owning workers perform final physical
+                admission while mapping pages.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -95,6 +99,7 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
+        self.worker_physical_admission = worker_physical_admission
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -129,7 +134,10 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
-            enable_page_prealloc=PAGE_PREALLOC_ENABLED,
+            # A control-only process must not let the C++ preallocation thread
+            # enter Python to reach remote workers.
+            enable_page_prealloc=(PAGE_PREALLOC_ENABLED and
+                                  not self.worker_physical_admission),
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
@@ -657,9 +665,16 @@ class KVCacheManager:
             blocks_from_free_pages = 0
         else:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
-            physical_free_pages = self.page_allocator.get_avail_physical_pages(
-            ) + self.page_allocator.get_num_reserved_pages()
-            free_pages = min(virtual_free_pages, physical_free_pages)
+            if not getattr(self, "worker_physical_admission", False):
+                physical_free_pages = (
+                    self.page_allocator.get_avail_physical_pages() +
+                    self.page_allocator.get_num_reserved_pages())
+                free_pages = min(virtual_free_pages, physical_free_pages)
+            else:
+                # EngineCore owns only logical KV state in control-only mode.
+                # The workers that own the CUDA contexts perform the final
+                # physical admission as part of transactional page mapping.
+                free_pages = virtual_free_pages
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
