@@ -68,6 +68,7 @@ class KVCacheManager:
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
         group_id: int = 0,
+        pool_name: Optional[str] = None,
     ):
         """
         Args:
@@ -84,6 +85,8 @@ class KVCacheManager:
                 1 for MLA combined KV).
             group_id: KV cache group identifier for hybrid attention models.
                 Different groups have independent FTensors and page spaces.
+            pool_name: Stable, low-cardinality name assigned by the engine
+                integration when this pool is created.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -91,6 +94,7 @@ class KVCacheManager:
         self.num_kv_buffers = num_kv_buffers
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
+        self._pool_name = pool_name
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -510,6 +514,27 @@ class KVCacheManager:
             return memory_bytes / (1024**3)
         else:
             raise ValueError(f"Unknown unit: {unit}")
+
+    @property
+    def pool_name(self) -> Optional[str]:
+        """Return the stable name assigned when this pool was created."""
+        return self._pool_name
+
+    @synchronized
+    def observability_snapshot(self, *, integration=None):
+        """Return a read-only snapshot of this KV cache pool."""
+        from kvcached.observability import build_kv_cache_pool_snapshot
+        return build_kv_cache_pool_snapshot(
+            self,
+            integration=integration,
+        )
+
+    @synchronized
+    def observability_snapshot_dict(self, *, integration=None):
+        """Return a JSON-serializable read-only snapshot of this KV cache pool."""
+        return self.observability_snapshot(
+            integration=integration,
+        ).to_dict()
 
     @synchronized
     def clear(self):
