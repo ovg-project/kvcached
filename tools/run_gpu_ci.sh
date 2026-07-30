@@ -19,6 +19,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 PYTHON="${PYTHON:-python}"
+VLLM_PYTHON="${VLLM_PYTHON:-${PYTHON}}"
+SGLANG_PYTHON="${SGLANG_PYTHON:-${PYTHON}}"
 GPU_CI_PROFILE="${GPU_CI_PROFILE:-core}"
 GPU_CI_ARTIFACT_DIR="${GPU_CI_ARTIFACT_DIR:-${ROOT_DIR}/gpu-ci-artifacts}"
 GPU_CI_INSTALL="${GPU_CI_INSTALL:-1}"
@@ -62,6 +64,16 @@ done
 
 if ! command -v "${PYTHON}" >/dev/null 2>&1; then
   echo "Python command not found: ${PYTHON}" >&2
+  exit 2
+fi
+if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+   ! command -v "${VLLM_PYTHON}" >/dev/null 2>&1; then
+  echo "vLLM Python command not found: ${VLLM_PYTHON}" >&2
+  exit 2
+fi
+if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+   ! command -v "${SGLANG_PYTHON}" >/dev/null 2>&1; then
+  echo "SGLang Python command not found: ${SGLANG_PYTHON}" >&2
   exit 2
 fi
 
@@ -140,7 +152,9 @@ fi
   echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo uploaded-worktree)"
   echo "profile=${GPU_CI_PROFILE}"
   echo "repeat=${GPU_CI_REPEAT}"
-  echo "python=${PYTHON}"
+  echo "core_python=${PYTHON}"
+  echo "vllm_python=${VLLM_PYTHON}"
+  echo "sglang_python=${SGLANG_PYTHON}"
   command -v "${CC:-cc}" >/dev/null 2>&1 &&
     "${CC:-cc}" --version 2>/dev/null | head -1 || true
   command -v "${CXX:-c++}" >/dev/null 2>&1 &&
@@ -167,17 +181,36 @@ PY
 "${PYTHON}" -m pip freeze \
   >"${GPU_CI_ARTIFACT_DIR}/python-packages.txt"
 
-if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
-  "${PYTHON}" -m pip install \
+install_project() {
+  local target_python="$1"
+  local artifact_prefix="$2"
+
+  "${target_python}" -m pip install \
     "packaging>=24.2" \
     "pytest>=8,<9" \
     "setuptools>=77" \
     wheel \
-    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/bootstrap.log"
-  "${PYTHON}" -m pip install -e . --no-build-isolation --no-cache-dir \
-    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/install.log"
-  "${PYTHON}" tools/dev_copy_pth.py \
-    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/dev-copy-pth.log"
+    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/${artifact_prefix}-bootstrap.log"
+  "${target_python}" -m pip install . --force-reinstall --no-deps \
+    --no-build-isolation --no-cache-dir \
+    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/${artifact_prefix}-install.log"
+  "${target_python}" tools/dev_copy_pth.py \
+    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/${artifact_prefix}-dev-copy-pth.log"
+  "${target_python}" -m pip check \
+    2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/${artifact_prefix}-pip-check.log"
+}
+
+if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
+  install_project "${PYTHON}" core
+  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+     [[ "${VLLM_PYTHON}" != "${PYTHON}" ]]; then
+    install_project "${VLLM_PYTHON}" vllm
+  fi
+  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+     [[ "${SGLANG_PYTHON}" != "${PYTHON}" ]] &&
+     [[ "${SGLANG_PYTHON}" != "${VLLM_PYTHON}" ]]; then
+    install_project "${SGLANG_PYTHON}" sglang
+  fi
 fi
 
 default_pytest_targets=(
@@ -197,12 +230,17 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   fi
 
   if [[ "${GPU_CI_PROFILE}" == "nixl" ]]; then
-    if [[ "$("${PYTHON}" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ]]; then
+    if [[ "$("${VLLM_PYTHON}" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ]]; then
       echo "The nixl profile requires at least two visible GPUs" >&2
       exit 2
     fi
 
-    GPU_CI_ARTIFACT_DIR="${GPU_CI_ARTIFACT_DIR}" \
+    PATH="$(dirname "$(command -v "${VLLM_PYTHON}")"):${PATH}" \
+    PYTHON="${VLLM_PYTHON}" \
+    INSTALL_DEPS=0 \
+    INSTALL_EDITABLE=0 \
+    INSTALL_VLLM=0 \
+    LOG_DIR="${GPU_CI_ARTIFACT_DIR}/nixl-${iteration}" \
       bash tools/run_vllm_nixl_pd_smoke.sh \
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/nixl-pd-smoke-${iteration}.log"
   fi
@@ -210,6 +248,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   if [[ "${GPU_CI_PROFILE}" == "vllm" ]] ||
      [[ "${GPU_CI_PROFILE}" == "engines" ]]; then
     ENGINE=vllm \
+    PYTHON="${VLLM_PYTHON}" \
     MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/vllm-${iteration}" \
       bash tools/run_engine_smoke.sh
@@ -218,6 +257,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   if [[ "${GPU_CI_PROFILE}" == "sglang" ]] ||
      [[ "${GPU_CI_PROFILE}" == "engines" ]]; then
     ENGINE=sglang \
+    PYTHON="${SGLANG_PYTHON}" \
     MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/sglang-${iteration}" \
       bash tools/run_engine_smoke.sh
