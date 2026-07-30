@@ -58,10 +58,6 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required" >&2
   exit 2
 fi
-if [[ "${ENGINE}" == "vllm" ]] && ! command -v vllm >/dev/null 2>&1; then
-  echo "vllm command is required for the vllm smoke test" >&2
-  exit 2
-fi
 "${PYTHON}" -c "import ${ENGINE}" >/dev/null
 
 SERVER_PID=""
@@ -88,7 +84,8 @@ export no_proxy="localhost,127.0.0.1,::1"
 export NO_PROXY="${no_proxy}"
 
 if [[ "${ENGINE}" == "vllm" ]]; then
-  vllm serve "${MODEL}" \
+  "${PYTHON}" -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --max-model-len "${MAX_MODEL_LEN}" \

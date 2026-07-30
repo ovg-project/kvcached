@@ -58,6 +58,8 @@ jobs:
       - name: Run kvcached GPU test profile
         env:
           PYTHON: ${{ vars.KVCACHED_GPU_PYTHON || 'python' }}
+          VLLM_PYTHON: ${{ vars.KVCACHED_VLLM_PYTHON || vars.KVCACHED_GPU_PYTHON || 'python' }}
+          SGLANG_PYTHON: ${{ vars.KVCACHED_SGLANG_PYTHON || vars.KVCACHED_GPU_PYTHON || 'python' }}
           GPU_CI_PROFILE: >-
             ${{ github.event_name == 'schedule' && 'engines' ||
             inputs.profile || 'core' }}
