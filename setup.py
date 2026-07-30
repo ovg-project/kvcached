@@ -17,6 +17,7 @@ try:
     from torch.utils.cpp_extension import (
         BuildExtension,
         CppExtension,
+        CUDA_HOME,
         CUDAExtension,
         include_paths,
         library_paths,
@@ -90,6 +91,13 @@ def get_extensions():
         )
     else:
         # CUDA driver APIs require libcuda for cuMem* symbols.
+        # NVIDIA container runtimes commonly mount only the runtime driver
+        # library (libcuda.so.1). Link against the CUDA toolkit stub, whose
+        # SONAME still resolves to the real driver library at runtime.
+        if CUDA_HOME:
+            cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
+            if os.path.isfile(os.path.join(cuda_stub_dir, "libcuda.so")):
+                ext_library_dirs.append(cuda_stub_dir)
         ext_libraries = ["cuda"]
         vmm_ops_module = CUDAExtension(
             "kvcached.vmm_ops",
