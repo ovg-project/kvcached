@@ -65,12 +65,12 @@ std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
     bool contiguous_layout = true, bool enable_page_prealloc = true,
     int64_t num_kv_buffers = 2, int64_t group_id = 0,
-    const std::string &ipc_name = "") {
+    const std::string &ipc_name = "", bool cuda_control_plane = true) {
 
   return std::make_shared<PageAllocator>(
       num_layers, mem_size_per_layer, page_size, world_size, pp_rank,
       async_sched, contiguous_layout, enable_page_prealloc, num_kv_buffers,
-      group_id, ipc_name);
+      group_id, ipc_name, cuda_control_plane);
 }
 
 // PageAllocator method bindings
@@ -136,6 +136,11 @@ int64_t page_allocator_get_num_reserved_pages(
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
+}
+
+void page_allocator_set_mem_info(std::shared_ptr<PageAllocator> allocator,
+                                 int64_t free_bytes, int64_t total_bytes) {
+  allocator->set_mem_info(free_bytes, total_bytes);
 }
 
 int64_t page_allocator_check_and_get_resize_target(
@@ -205,7 +210,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
            py::arg("enable_page_prealloc") = true,
            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
-           py::arg("ipc_name") = "")
+           py::arg("ipc_name") = "", py::arg("cuda_control_plane") = true)
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
       // The bindings below can block inside the allocator (alloc_page waits on
@@ -236,6 +241,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("set_mem_info", &kvcached::page_allocator_set_mem_info)
       .def("check_and_get_resize_target",
            &kvcached::page_allocator_check_and_get_resize_target)
       .def("get_resize_target", &kvcached::page_allocator_get_resize_target)

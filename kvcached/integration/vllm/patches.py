@@ -831,11 +831,14 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
                     # Each PP stage manages its own KV memory independently, so
                     # cross-stage IPC is neither needed nor correct.
+                    from kvcached.utils import ENGINECORE_NO_CUDA
+
                     init_kvcached(
                         tp_rank=0,
                         world_size=vllm_config.parallel_config.tensor_parallel_size,
                         is_worker=False,
                         async_sched=_should_enable_async_sched(vllm_config),
+                        control_only=ENGINECORE_NO_CUDA,
                     )
                 except Exception:
                     pass
@@ -929,11 +932,14 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets
             # are registered per TP rank within each stage (w0.sock … w(tp_size-1).sock).
+            from kvcached.utils import ENGINECORE_NO_CUDA
+
             kvi.init_kvcached(
                 tp_rank=0,
                 world_size=tp_size,
                 is_worker=False,
                 async_sched=_should_enable_async_sched(getattr(self, "vllm_config", None)),
+                control_only=ENGINECORE_NO_CUDA,
             )
 
             # Import ElasticBlockPool from the patched module

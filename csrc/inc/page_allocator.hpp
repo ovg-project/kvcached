@@ -59,7 +59,8 @@ public:
                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
                 bool async_sched = false, bool contiguous_layout = true,
                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
-                int64_t group_id = 0, const std::string &ipc_name = "");
+                int64_t group_id = 0, const std::string &ipc_name = "",
+                bool cuda_control_plane = true);
 
   ~PageAllocator();
 
@@ -78,6 +79,7 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   int64_t get_avail_physical_pages() const;
+  void set_mem_info(int64_t free_bytes, int64_t total_bytes);
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
   // (e.g. `kvctl limit`) has written a new total_size. Returns the new
@@ -125,6 +127,8 @@ private:
   void map_pages(const std::vector<page_id_t> &page_ids);
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   void update_memory_usage();
+  void account_mapped_pages(int64_t page_count);
+  void account_unmapped_pages(int64_t page_count);
   void trigger_preallocation();
   void start_prealloc_thread_internal();
   void stop_prealloc_thread_internal();
@@ -141,6 +145,7 @@ private:
   bool async_sched_;
   bool contiguous_layout_;
   bool enable_page_prealloc_;
+  bool cuda_control_plane_;
   double gpu_utilization_;
 
   // Memory tracking
@@ -177,6 +182,8 @@ private:
   // Memory info tracker
   int64_t total_memory_size_;
   std::unique_ptr<MemInfoTracker> mem_info_tracker_;
+  std::atomic<int64_t> cached_free_bytes_{0};
+  std::atomic<int64_t> cached_total_bytes_{0};
 
   // Callback functions for multi-process support
   BroadcastMapCallback broadcast_map_callback_;

@@ -7,7 +7,7 @@ import pickle
 import socket
 import threading
 import uuid
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
@@ -93,7 +93,8 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
-def start_worker_listener_thread(rank: int, pp_rank: int = 0):
+def start_worker_listener_thread(rank: int, pp_rank: int = 0,
+                                 device_index: Optional[int] = None):
     """
     Start a thread that listens for messages on the worker socket.
     pp_rank is used to create a PP-stage-specific subdirectory so that
@@ -130,6 +131,19 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
+                elif msg["cmd"] == "cuda_mem_get_info":
+                    import torch
+
+                    if device_index is None:
+                        free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    else:
+                        with torch.cuda.device(device_index):
+                            free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    send_msg(conn, {
+                        "status": "success",
+                        "free_bytes": int(free_bytes),
+                        "total_bytes": int(total_bytes),
+                    })
                 else:
                     send_msg(conn, {
                         "status": "error",
@@ -137,7 +151,10 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                     })
             except Exception as e:
                 print(f"Worker {rank} error processing message: {e}")
-                send_msg(conn, {"status": "error", "message": str(e)})
+                try:
+                    send_msg(conn, {"status": "error", "message": str(e)})
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
             finally:
                 conn.close()
 
@@ -274,6 +291,40 @@ async def _broadcast_kv_tensors_created(tp_size: int,
     return all_created
 
 
+async def _query_worker_cuda_mem_get_info(tp_size: int,
+                                          pp_rank: int = 0) -> Tuple[int, int]:
+    """Query the representative TP0 worker for CUDA memory limits.
+
+    kvcached maps the same physical KV pages on every TP rank. Querying TP0
+    preserves the allocator's original single-device admission model without
+    putting a synchronous all-rank IPC fan-out on the allocation path.
+    """
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+
+    message = {"cmd": "cuda_mem_get_info"}
+    rank = 0
+    response: Any
+    try:
+        response = await _send_and_receive_message(rank, message, pp_rank)
+    except Exception as exc:
+        response = exc
+    return _parse_worker_cuda_mem_response(response, rank, pp_rank)
+
+
+def _parse_worker_cuda_mem_response(response: Any, rank: int,
+                                    pp_rank: int) -> Tuple[int, int]:
+    if isinstance(response, Exception):
+        raise RuntimeError(
+            f"Worker pp{pp_rank}/rank{rank} failed to query CUDA memory: "
+            f"{response}") from response
+    if not isinstance(response, dict) or response.get("status") != "success":
+        raise RuntimeError(
+            f"Worker pp{pp_rank}/rank{rank} failed to query CUDA memory: "
+            f"{response}")
+    return int(response["free_bytes"]), int(response["total_bytes"])
+
+
 # Wrapper functions to call the async function from sync code
 def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int],
                                 pp_rank: int = 0,
@@ -293,3 +344,18 @@ def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0,
                                  group_id: int = 0) -> bool:
     return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank,
                                                      group_id))
+
+
+def query_worker_cuda_mem_get_info(tp_size: int, pp_rank: int = 0,
+                                   timeout: float = 1.0) -> Tuple[int, int]:
+    """Synchronously query TP0 for the synchronous allocator API.
+
+    This call blocks until the representative worker replies, or raises after
+    ``timeout``, because the allocator API that consumes the result is
+    synchronous.
+    """
+    return asyncio.run(
+        asyncio.wait_for(
+            _query_worker_cuda_mem_get_info(tp_size, pp_rank),
+            timeout=timeout,
+        ))

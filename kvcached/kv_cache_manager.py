@@ -21,6 +21,7 @@ from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
+    MEMINFO_REFRESH_INTERVAL,
     PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
@@ -68,6 +69,7 @@ class KVCacheManager:
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
         group_id: int = 0,
+        cuda_control_plane: bool = True,
     ):
         """
         Args:
@@ -84,6 +86,8 @@ class KVCacheManager:
                 1 for MLA combined KV).
             group_id: KV cache group identifier for hybrid attention models.
                 Different groups have independent FTensors and page spaces.
+            cuda_control_plane: Whether this process may query CUDA directly.
+                When false, physical memory information is read from workers.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -91,6 +95,10 @@ class KVCacheManager:
         self.num_kv_buffers = num_kv_buffers
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
+        self.cuda_control_plane = cuda_control_plane
+        self._last_meminfo_refresh = 0.0
+        self._meminfo_initialized = False
+        self._meminfo_total_bytes = 0
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -125,10 +133,14 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
-            enable_page_prealloc=PAGE_PREALLOC_ENABLED,
+            # A control-only process must not let the C++ preallocation thread
+            # enter Python to reach remote workers.
+            enable_page_prealloc=(PAGE_PREALLOC_ENABLED and
+                                  self.cuda_control_plane),
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
+            cuda_control_plane=self.cuda_control_plane,
         )
         # Tell the C++ PageAllocator whether map/unmap must be broadcast to
         # worker processes over IPC, even with world_size == 1 (e.g. vLLM V1
@@ -251,6 +263,35 @@ class KVCacheManager:
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
 
+    def _refresh_mem_info(self, force: bool = False) -> None:
+        # Preserve compatibility with lightweight managers created via
+        # ``__new__`` by tests and integrations that predate this option.
+        if getattr(self, "cuda_control_plane", True):
+            return
+
+        now = time.monotonic()
+        if (not force and self._meminfo_initialized and
+                now - self._last_meminfo_refresh < MEMINFO_REFRESH_INTERVAL):
+            return
+
+        try:
+            from kvcached.meminfo_provider import query_mem_info
+
+            free_bytes, total_bytes = query_mem_info(
+                self.world_size, self.pp_rank)
+            self.page_allocator.set_mem_info(free_bytes, total_bytes)
+            self._meminfo_total_bytes = total_bytes
+            self._meminfo_initialized = True
+            self._last_meminfo_refresh = now
+        except Exception:
+            if not self._meminfo_initialized:
+                raise
+            # Existing mapped pages remain usable, but do not admit a new
+            # physical allocation while the worker snapshot is unavailable.
+            self.page_allocator.set_mem_info(0, self._meminfo_total_bytes)
+            self._last_meminfo_refresh = now
+            logger.exception("Failed to refresh worker CUDA memory info")
+
     @synchronized
     def _alloc(self,
                need_size: int,
@@ -259,6 +300,9 @@ class KVCacheManager:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
             self._wait_post_init()
+
+        self._refresh_mem_info(
+            force=not getattr(self, "_meminfo_initialized", False))
 
         new_mem_size = self.page_allocator.get_resize_target()
         if new_mem_size > 0:
@@ -456,6 +500,7 @@ class KVCacheManager:
 
     @synchronized
     def available_size(self) -> int:
+        self._refresh_mem_info()
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
             blocks_from_free_pages = 0

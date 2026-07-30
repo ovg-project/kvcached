@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -38,6 +39,27 @@ const double GPU_UTILIZATION = []() {
   const char *env_val = std::getenv("KVCACHED_GPU_UTILIZATION");
   return env_val ? std::atof(env_val) : 0.95;
 }();
+
+namespace {
+
+int64_t saturating_page_bytes(int64_t page_count, int64_t page_size,
+                              int64_t num_layers, int64_t num_kv_buffers) {
+  if (page_count <= 0 || page_size <= 0 || num_layers <= 0 ||
+      num_kv_buffers <= 0) {
+    return 0;
+  }
+
+  int64_t result = page_count;
+  for (const int64_t factor : {page_size, num_layers, num_kv_buffers}) {
+    if (result > std::numeric_limits<int64_t>::max() / factor) {
+      return std::numeric_limits<int64_t>::max();
+    }
+    result *= factor;
+  }
+  return result;
+}
+
+} // namespace
 
 // InternalPage implementation
 InternalPage::InternalPage(page_id_t id, int64_t size)
@@ -108,12 +130,14 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              int64_t pp_rank, bool async_sched,
                              bool contiguous_layout, bool enable_page_prealloc,
                              int64_t num_kv_buffers, int64_t group_id,
-                             const std::string &ipc_name)
+                             const std::string &ipc_name,
+                             bool cuda_control_plane)
     : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
       enable_page_prealloc_(enable_page_prealloc),
+      cuda_control_plane_(cuda_control_plane),
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
@@ -145,6 +169,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
             << "async_sched=" << async_sched << ", "
             << "contiguous_layout=" << contiguous_layout << ", "
             << "enable_prealloc=" << enable_page_prealloc << ", "
+            << "cuda_control_plane=" << cuda_control_plane << ", "
             << "num_kv_buffers=" << num_kv_buffers << ", "
             << "group_id=" << group_id << ", "
             << "min_reserved_pages=" << min_reserved_pages_ << ", "
@@ -443,19 +468,38 @@ int64_t PageAllocator::get_num_reserved_pages() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
-  size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  size_t avail_phy_mem_size = 0;
+  size_t total_phy_mem_size = 0;
+  if (cuda_control_plane_) {
+    CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  } else {
+    avail_phy_mem_size = static_cast<size_t>(std::max(
+        cached_free_bytes_.load(std::memory_order_relaxed), int64_t{0}));
+    total_phy_mem_size = static_cast<size_t>(std::max(
+        cached_total_bytes_.load(std::memory_order_relaxed), int64_t{0}));
+  }
 
-  const size_t headroom =
-      static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
+  const double effective_gpu_utilization =
+      std::clamp(gpu_utilization_, 0.0, 1.0);
+  const size_t headroom = static_cast<size_t>(
+      total_phy_mem_size * (1.0 - effective_gpu_utilization));
   const size_t usable_phy_mem_size =
       saturating_subtract(avail_phy_mem_size, headroom);
 
   // Calculate available pages considering layers and KV buffers
-  int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
+  int64_t avail_phy_pages =
+      static_cast<int64_t>(usable_phy_mem_size / page_size_);
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
   return avail_pages_per_layer;
+}
+
+void PageAllocator::set_mem_info(int64_t free_bytes, int64_t total_bytes) {
+  if (free_bytes < 0 || total_bytes <= 0 || free_bytes > total_bytes) {
+    throw std::invalid_argument("invalid CUDA memory information");
+  }
+  cached_free_bytes_.store(free_bytes, std::memory_order_relaxed);
+  cached_total_bytes_.store(total_bytes, std::memory_order_relaxed);
 }
 
 page_id_t PageAllocator::get_page_id(int64_t block_id,
@@ -660,6 +704,7 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
+  account_mapped_pages(static_cast<int64_t>(page_ids.size()));
   LOGGER(INFO, "Mapped %zu pages to KV tensors", page_ids.size());
 }
 
@@ -696,11 +741,47 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
+  account_unmapped_pages(static_cast<int64_t>(page_ids.size()));
+
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
   LOGGER(INFO, "Unmapped %zu pages from KV tensors, cost: %lu us",
          page_ids.size(), duration.count());
+}
+
+void PageAllocator::account_mapped_pages(int64_t page_count) {
+  if (cuda_control_plane_ || page_count <= 0) {
+    return;
+  }
+  const int64_t mapped_bytes = saturating_page_bytes(
+      page_count, page_size_, num_layers_, num_kv_buffers_);
+  int64_t current = cached_free_bytes_.load(std::memory_order_relaxed);
+  while (!cached_free_bytes_.compare_exchange_weak(
+      current, std::max(current - mapped_bytes, int64_t{0}),
+      std::memory_order_relaxed)) {
+  }
+}
+
+void PageAllocator::account_unmapped_pages(int64_t page_count) {
+  if (cuda_control_plane_ || page_count <= 0) {
+    return;
+  }
+  const int64_t unmapped_bytes = saturating_page_bytes(
+      page_count, page_size_, num_layers_, num_kv_buffers_);
+  const int64_t total =
+      std::max(cached_total_bytes_.load(std::memory_order_relaxed), int64_t{0});
+  int64_t current = cached_free_bytes_.load(std::memory_order_relaxed);
+  while (true) {
+    const int64_t bounded_current = std::clamp(current, int64_t{0}, total);
+    const int64_t remaining = total - bounded_current;
+    const int64_t desired =
+        unmapped_bytes >= remaining ? total : bounded_current + unmapped_bytes;
+    if (cached_free_bytes_.compare_exchange_weak(current, desired,
+                                                 std::memory_order_relaxed)) {
+      break;
+    }
+  }
 }
 
 void PageAllocator::update_memory_usage() {
