@@ -101,7 +101,8 @@ jobs:
             --engine "${ENGINE}"
             --target-repository "${TARGET}"
             --upstream-repository "${UPSTREAM}"
-            --sync-branch "automation/upstream-${ENGINE}-${GITHUB_RUN_ID}"
+            --sync-branch "automation/upstream-${ENGINE}"
+            --update-existing-branch
             --result-json "sync-artifacts/${ENGINE}.json"
             --report "sync-artifacts/${ENGINE}.md"
             --check "python ${compat_tool} --engine ${ENGINE} --repo . --report ${compat_report}"
@@ -131,12 +132,27 @@ jobs:
           fi
           repository="${TARGET#https://github.com/}"
           repository="${repository%.git}"
-          gh pr create \
-            --repo "${repository}" \
-            --base main \
-            --head "automation/upstream-${ENGINE}-${GITHUB_RUN_ID}" \
-            --title "chore: sync ${ENGINE} upstream" \
-            --body-file "sync-artifacts/${ENGINE}.md"
+          branch="automation/upstream-${ENGINE}"
+          existing="$(
+            gh pr list \
+              --repo "${repository}" \
+              --state open \
+              --head "${branch}" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${existing}" ]]; then
+            gh pr edit "${existing}" \
+              --repo "${repository}" \
+              --body-file "sync-artifacts/${ENGINE}.md"
+          else
+            gh pr create \
+              --repo "${repository}" \
+              --base main \
+              --head "${branch}" \
+              --title "chore: sync ${ENGINE} upstream" \
+              --body-file "sync-artifacts/${ENGINE}.md"
+          fi
 
       - name: Upload sync report
         if: always() && steps.config.outputs.skip == 'false'

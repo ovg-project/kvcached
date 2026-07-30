@@ -190,3 +190,32 @@ def test_sync_can_leave_conflict_worktree_for_repair_agent(tmp_path):
     assert f"`{repair_dir / 'engine'}`" in report
     conflict_text = (repair_dir / "engine" / "engine.txt").read_text()
     assert "<<<<<<< HEAD" in conflict_text
+
+
+def test_stable_sync_branch_updates_without_duplicate_branch(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    write(upstream / "first.txt", "first upstream feature\n")
+    commit(upstream, "first upstream feature")
+    completed, first, _ = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--push",
+        "--update-existing-branch",
+    )
+    assert completed.returncode == 0
+    first_tip = git(target, "rev-parse", "refs/heads/automation/test-sync")
+
+    write(upstream / "second.txt", "second upstream feature\n")
+    commit(upstream, "second upstream feature")
+    completed, second, _ = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--push",
+        "--update-existing-branch",
+    )
+
+    assert completed.returncode == 0
+    assert first["sync_branch"] == second["sync_branch"]
+    assert git(target, "rev-parse", "refs/heads/automation/test-sync") != first_tip

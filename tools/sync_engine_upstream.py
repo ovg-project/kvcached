@@ -235,7 +235,11 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
 
     result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
     if args.push:
-        git(repository, "push", "origin", f"HEAD:refs/heads/{args.sync_branch}")
+        push_args = ["push"]
+        if args.update_existing_branch:
+            push_args.append("--force-with-lease")
+        push_args.extend(["origin", f"HEAD:refs/heads/{args.sync_branch}"])
+        git(repository, *push_args)
         result.message = "Upstream merged, checks passed, and the sync branch was pushed."
     else:
         result.message = "Upstream merged and checks passed. Dry run: no branch was pushed."
@@ -258,6 +262,14 @@ def parse_args() -> argparse.Namespace:
         help="Compatibility check command. May be specified more than once.",
     )
     parser.add_argument("--push", action="store_true")
+    parser.add_argument(
+        "--update-existing-branch",
+        action="store_true",
+        help=(
+            "Update a stable remote sync branch with force-with-lease. "
+            "This is safe for automation-owned branches and avoids duplicate PRs."
+        ),
+    )
     parser.add_argument(
         "--workdir",
         type=Path,
