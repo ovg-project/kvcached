@@ -1,7 +1,7 @@
 # OVG engine fork synchronization
 
-`.github/workflows/engine-upstream-sync.yml` is the first automation layer for
-OVG-maintained vLLM and SGLang forks.
+`.github/workflows/engine-upstream-sync.yml` is the automated synchronization
+layer for OVG-maintained vLLM and SGLang forks.
 
 Configure repository variables:
 
@@ -21,6 +21,10 @@ The daily workflow:
 4. runs compatibility checks;
 5. pushes the branch and opens a pull request;
 6. uploads JSON and Markdown reports.
+
+Each engine uses one stable automation-owned branch. A later daily run updates
+that branch with `force-with-lease` and refreshes the existing pull request
+body, so an unmerged update never creates duplicate pull requests.
 
 Conflicts and failed checks intentionally stop before push. The JSON report
 contains conflict paths, commits, commands, return codes, and log tails. That
