@@ -16,7 +16,18 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, NamedTuple, Optional, Protocol, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 
 class OffloadError(RuntimeError):
@@ -89,7 +100,7 @@ class PageTransferBackend(Protocol):
     has completed successfully.
     """
 
-    def read_gpu_page(self, page_id: int, geometry: PageGeometry) -> Sequence[bytes]:
+    def read_gpu_page(self, page_id: int, geometry: PageGeometry) -> Sequence[Any]:
         ...
 
     def release_gpu_page(self, page_id: int) -> None:
@@ -101,9 +112,12 @@ class PageTransferBackend(Protocol):
     def write_gpu_page(
         self,
         page_id: int,
-        payloads: Sequence[bytes],
+        payloads: Sequence[Any],
         geometry: PageGeometry,
     ) -> None:
+        ...
+
+    def commit_gpu_page(self, page_id: int) -> None:
         ...
 
     def rollback_gpu_page(self, page_id: int) -> None:
@@ -199,6 +213,283 @@ class CPUOffloadStore:
     def clear(self) -> None:
         self._pages.clear()
         self._used_bytes = 0
+
+
+@dataclass(frozen=True)
+class PinnedOffloadedPage:
+    """Pinned CPU tensors for one logical page.
+
+    The tensors deliberately remain opaque here so importing this module does
+    not require PyTorch on CPU-only policy test runners.
+    """
+
+    page_id: int
+    payloads: Tuple[Any, ...]
+    size_bytes: int
+
+
+class PinnedMemoryOffloadStore:
+    """Bounded LRU store that retains page-locked CPU tensors without copying."""
+
+    def __init__(self, geometry: PageGeometry, max_bytes: int):
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        self.geometry = geometry
+        self.max_bytes = max_bytes
+        self._pages: "OrderedDict[int, PinnedOffloadedPage]" = OrderedDict()
+        self._used_bytes = 0
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+    def __len__(self) -> int:
+        return len(self._pages)
+
+    def __contains__(self, page_id: object) -> bool:
+        return page_id in self._pages
+
+    def page_ids(self) -> Tuple[int, ...]:
+        return tuple(self._pages)
+
+    def _normalize_payloads(self, payloads: Iterable[Any]) -> Tuple[Any, ...]:
+        normalized = tuple(payloads)
+        if len(normalized) != self.geometry.payload_count:
+            raise ValueError(
+                "offloaded page has "
+                f"{len(normalized)} payloads; expected {self.geometry.payload_count}"
+            )
+
+        for payload in normalized:
+            device = getattr(payload, "device", None)
+            if getattr(device, "type", None) != "cpu":
+                raise ValueError("pinned payloads must be CPU tensors")
+            if not callable(getattr(payload, "is_pinned", None)) or not payload.is_pinned():
+                raise ValueError("CPU payload tensor must use pinned memory")
+            if not callable(getattr(payload, "is_contiguous", None)) or not payload.is_contiguous():
+                raise ValueError("CPU payload tensor must be contiguous")
+            size_bytes = int(payload.numel()) * int(payload.element_size())
+            if size_bytes != self.geometry.page_size:
+                raise ValueError(
+                    "every pinned payload must be exactly "
+                    f"{self.geometry.page_size} bytes; got {size_bytes}"
+                )
+        return normalized
+
+    def put(self, page_id: int, payloads: Iterable[Any]) -> StoreResult:
+        if page_id < 0:
+            raise ValueError("page_id must be non-negative")
+        normalized = self._normalize_payloads(payloads)
+        page = PinnedOffloadedPage(
+            page_id=page_id,
+            payloads=normalized,
+            size_bytes=self.geometry.logical_page_bytes,
+        )
+        if page.size_bytes > self.max_bytes:
+            return StoreResult(stored=False, evicted_page_ids=())
+
+        evicted: List[int] = []
+        old_page = self._pages.pop(page_id, None)
+        if old_page is not None:
+            self._used_bytes -= old_page.size_bytes
+        while self._pages and self._used_bytes + page.size_bytes > self.max_bytes:
+            evicted_id, evicted_page = self._pages.popitem(last=False)
+            self._used_bytes -= evicted_page.size_bytes
+            evicted.append(evicted_id)
+        self._pages[page_id] = page
+        self._used_bytes += page.size_bytes
+        return StoreResult(stored=True, evicted_page_ids=tuple(evicted))
+
+    def get(self, page_id: int) -> Optional[PinnedOffloadedPage]:
+        page = self._pages.get(page_id)
+        if page is not None:
+            self._pages.move_to_end(page_id)
+        return page
+
+    def remove(self, page_id: int) -> Optional[PinnedOffloadedPage]:
+        page = self._pages.pop(page_id, None)
+        if page is not None:
+            self._used_bytes -= page.size_bytes
+        return page
+
+    def clear(self) -> None:
+        self._pages.clear()
+        self._used_bytes = 0
+
+
+@dataclass(frozen=True)
+class TensorSpan:
+    tensor_index: int
+    byte_offset: int
+    size_bytes: int
+
+
+class PageTensorLayout:
+    """Translate a logical page id into byte spans in raw kvcached tensors."""
+
+    def __init__(
+        self,
+        geometry: PageGeometry,
+        raw_tensor_nbytes: Sequence[int],
+        *,
+        contiguous_layout: bool,
+    ):
+        self.geometry = geometry
+        self.raw_tensor_nbytes = tuple(int(size) for size in raw_tensor_nbytes)
+        self.contiguous_layout = contiguous_layout
+        if any(size <= 0 for size in self.raw_tensor_nbytes):
+            raise ValueError("raw tensor sizes must be positive")
+        expected_tensors = 1 if contiguous_layout else geometry.num_layers
+        if len(self.raw_tensor_nbytes) != expected_tensors:
+            raise ValueError(
+                f"layout expects {expected_tensors} raw tensors, "
+                f"got {len(self.raw_tensor_nbytes)}"
+            )
+        if not contiguous_layout and geometry.num_kv_buffers not in (1, 2):
+            raise ValueError(
+                "non-contiguous tensor layout currently supports one or two "
+                "KV buffers per layer"
+            )
+
+    def spans(self, page_id: int) -> Tuple[TensorSpan, ...]:
+        if page_id < 0:
+            raise ValueError("page_id must be non-negative")
+        page_size = self.geometry.page_size
+        spans: List[TensorSpan] = []
+
+        if self.contiguous_layout:
+            base = page_id * self.geometry.logical_page_bytes
+            end = base + self.geometry.logical_page_bytes
+            if end > self.raw_tensor_nbytes[0]:
+                raise IndexError(f"logical page {page_id} exceeds the contiguous tensor")
+            for payload_index in range(self.geometry.payload_count):
+                spans.append(
+                    TensorSpan(
+                        tensor_index=0,
+                        byte_offset=base + payload_index * page_size,
+                        size_bytes=page_size,
+                    )
+                )
+            return tuple(spans)
+
+        for tensor_index, tensor_nbytes in enumerate(self.raw_tensor_nbytes):
+            if tensor_nbytes % self.geometry.num_kv_buffers:
+                raise ValueError("raw tensor size is not divisible by KV buffer count")
+            buffer_bytes = tensor_nbytes // self.geometry.num_kv_buffers
+            for buffer_index in range(self.geometry.num_kv_buffers):
+                offset = buffer_index * buffer_bytes + page_id * page_size
+                if offset + page_size > (buffer_index + 1) * buffer_bytes:
+                    raise IndexError(
+                        f"logical page {page_id} exceeds raw tensor {tensor_index}"
+                    )
+                spans.append(TensorSpan(tensor_index, offset, page_size))
+        return tuple(spans)
+
+
+class TorchPageTransferBackend:
+    """Pinned-memory CUDA transfer backend for raw kvcached KV tensors."""
+
+    def __init__(
+        self,
+        raw_gpu_tensors: Sequence[Any],
+        geometry: PageGeometry,
+        *,
+        contiguous_layout: bool,
+        release_gpu_page: Callable[[int], None],
+        allocate_gpu_page: Callable[[int], None],
+        commit_gpu_page: Callable[[int], None],
+        rollback_gpu_page: Optional[Callable[[int], None]] = None,
+        stream: Optional[Any] = None,
+    ):
+        import torch
+
+        if not raw_gpu_tensors:
+            raise ValueError("raw_gpu_tensors must not be empty")
+        self._torch = torch
+        self.geometry = geometry
+        self.raw_gpu_tensors = tuple(raw_gpu_tensors)
+        for tensor in self.raw_gpu_tensors:
+            if not tensor.is_cuda:
+                raise ValueError("raw kvcached tensors must be CUDA tensors")
+            if not tensor.is_contiguous():
+                raise ValueError("raw kvcached tensors must be contiguous")
+        self.layout = PageTensorLayout(
+            geometry,
+            [
+                int(tensor.numel()) * int(tensor.element_size())
+                for tensor in self.raw_gpu_tensors
+            ],
+            contiguous_layout=contiguous_layout,
+        )
+        self._release_gpu_page = release_gpu_page
+        self._allocate_gpu_page = allocate_gpu_page
+        self._commit_gpu_page = commit_gpu_page
+        self._rollback_gpu_page = rollback_gpu_page or release_gpu_page
+        device = self.raw_gpu_tensors[0].device
+        if any(tensor.device != device for tensor in self.raw_gpu_tensors):
+            raise ValueError("all raw kvcached tensors must use one CUDA device")
+        self.stream = stream or torch.cuda.Stream(device=device)
+
+    def _gpu_views(self, page_id: int) -> Tuple[Any, ...]:
+        views = []
+        for span in self.layout.spans(page_id):
+            raw_bytes = self.raw_gpu_tensors[span.tensor_index].view(self._torch.uint8)
+            raw_bytes = raw_bytes.reshape(-1)
+            views.append(
+                raw_bytes.narrow(0, span.byte_offset, span.size_bytes)
+            )
+        return tuple(views)
+
+    def read_gpu_page(
+        self,
+        page_id: int,
+        geometry: PageGeometry,
+    ) -> Sequence[Any]:
+        if geometry != self.geometry:
+            raise ValueError("page geometry does not match transfer backend")
+        cpu_payloads = tuple(
+            self._torch.empty(
+                geometry.page_size,
+                dtype=self._torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(geometry.payload_count)
+        )
+        with self._torch.cuda.stream(self.stream):
+            for cpu_payload, gpu_view in zip(cpu_payloads, self._gpu_views(page_id)):
+                cpu_payload.copy_(gpu_view, non_blocking=True)
+        self.stream.synchronize()
+        return cpu_payloads
+
+    def release_gpu_page(self, page_id: int) -> None:
+        self._release_gpu_page(page_id)
+
+    def allocate_gpu_page(self, page_id: int) -> None:
+        self._allocate_gpu_page(page_id)
+
+    def write_gpu_page(
+        self,
+        page_id: int,
+        payloads: Sequence[Any],
+        geometry: PageGeometry,
+    ) -> None:
+        if geometry != self.geometry:
+            raise ValueError("page geometry does not match transfer backend")
+        if len(payloads) != geometry.payload_count:
+            raise ValueError("payload count does not match page geometry")
+        with self._torch.cuda.stream(self.stream):
+            for gpu_view, cpu_payload in zip(self._gpu_views(page_id), payloads):
+                if not cpu_payload.is_pinned():
+                    raise ValueError("restore payload must use pinned CPU memory")
+                gpu_view.copy_(cpu_payload, non_blocking=True)
+        self.stream.synchronize()
+
+    def rollback_gpu_page(self, page_id: int) -> None:
+        self._rollback_gpu_page(page_id)
+
+    def commit_gpu_page(self, page_id: int) -> None:
+        self._commit_gpu_page(page_id)
 
 
 @dataclass(frozen=True)
@@ -360,6 +651,7 @@ class CPUOffloadManager:
                 page.payloads,
                 self.store.geometry,
             )
+            self.backend.commit_gpu_page(page_id)
         except Exception as exc:
             try:
                 self.backend.rollback_gpu_page(page_id)

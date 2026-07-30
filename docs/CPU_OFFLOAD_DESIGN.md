@@ -1,8 +1,9 @@
 # CPU offloading milestone
 
-`kvcached/cpu_offload.py` implements the control-plane foundation for
-CPU-backed KV cache pages. It is intentionally not enabled in vLLM or SGLang
-yet.
+`kvcached/cpu_offload.py` implements the control plane and pinned-memory CUDA
+data path for CPU-backed KV cache pages. The PageAllocator now preserves a
+stable virtual page id while replacing its private GPU mapping with the shared
+zero page, then maps the same id again before restore.
 
 ## Page model
 
@@ -27,49 +28,48 @@ most of the model's KV state.
   release failure, so engine metadata can still be invalidated;
 - a page-level planner that rejects active pages and respects CPU capacity;
 - a transfer-versus-recompute break-even estimator;
-- a transfer-backend protocol that keeps CUDA details outside policy code;
+- a pinned-memory CUDA transfer backend with a dedicated stream;
+- non-contiguous and compound-page tensor span calculation;
+- transactional `map -> H2D copy -> commit` restore visibility;
+- PageAllocator offload/restore state, transition guards, memory accounting,
+  and Python bindings;
+- KVCacheManager tracking that removes offloaded pages from block allocation;
 - a pinned-memory CUDA transfer microbenchmark;
-- CPU-only tests for all of the above.
+- a real VMM round-trip correctness and memory-reclamation experiment;
+- CPU-only tests for policy, tensor geometry, and C++ binding contracts.
 
 The safety rule is: save a complete CPU copy before releasing GPU memory. On
 restore, keep the CPU copy until GPU allocation and copy-back both succeed.
 Callers must invalidate prefix-cache metadata for every `evicted_page_ids`
 entry returned by `OffloadResult` or `OffloadError`.
 
-## GPU implementation milestone
+## Transaction
 
-The first GPU backend should:
+Offload executes:
 
-1. allocate pinned host buffers for every layer/KV-buffer slice;
-2. expose page-copy methods from `FTensorAllocator`;
-3. copy on a dedicated CUDA stream and record a completion event;
-4. unmap the GPU page only after the device-to-host event completes;
-5. map a GPU page before host-to-device restore;
-6. connect restored pages to vLLM's prefix-cache metadata;
-7. invalidate prefix metadata when the CPU LRU evicts its only copy.
+1. copy every layer/KV-buffer slice to pinned host memory;
+2. synchronize the transfer stream;
+3. commit the complete page to the bounded CPU store;
+4. replace the page's private GPU mapping with the shared zero page;
+5. keep its virtual page id and block metadata unavailable to new allocation.
 
-The initial benchmark should compare:
+Restore executes:
 
-- CPU offload and restore latency;
-- recomputing the same prefix;
-- time to first token after a CPU-cache hit;
-- GPU memory reclaimed;
-- CPU cache hit rate and LRU eviction count.
+1. map fresh GPU physical memory at the same virtual page id;
+2. copy every pinned payload back on the transfer stream;
+3. synchronize the transfer stream;
+4. expose the page to block allocation only after the copy succeeds;
+5. retain the CPU copy and undo the GPU mapping after any failure.
 
 Only pages whose blocks are inactive and reusable should enter this path.
 Active request pages must never be offloaded.
 
-Run the data-plane microbenchmark on a CUDA machine:
+Run the complete provider-neutral VMM validation on a CUDA machine:
 
 ```bash
-python tools/benchmark_cpu_offload.py \
-  --page-size-mb 2 \
-  --layers 32 \
-  --kv-buffers 2 \
-  --iterations 50 \
-  --report cpu-offload-transfer.json
+bash tools/run_cpu_offload_h20_validation.sh
 ```
 
-The measured H2D latency is the lower bound for a CPU-cache restore. Compare it
-with prefix recomputation latency before deciding which pages are worth
-keeping on CPU.
+The command builds the current checkout, runs repeated real-page round trips,
+checks byte-level correctness and VMM state, runs the transfer benchmark, and
+creates a checksummed artifact archive.

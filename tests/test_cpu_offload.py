@@ -46,6 +46,9 @@ class FakeBackend:
             raise RuntimeError("simulated copy failure")
         self.gpu_pages[page_id] = list(payloads)
 
+    def commit_gpu_page(self, page_id):
+        self.calls.append(f"commit:{page_id}")
+
     def rollback_gpu_page(self, page_id):
         self.calls.append(f"rollback:{page_id}")
         self.gpu_pages.pop(page_id, None)
@@ -53,6 +56,30 @@ class FakeBackend:
 
 def payloads(byte_value: int, count: int = 2, page_size: int = 4):
     return [bytes([byte_value]) * page_size for _ in range(count)]
+
+
+class FakeDevice:
+    type = "cpu"
+
+
+class FakePinnedTensor:
+    device = FakeDevice()
+
+    def __init__(self, size_bytes: int, *, pinned: bool = True):
+        self.size_bytes = size_bytes
+        self.pinned = pinned
+
+    def is_pinned(self):
+        return self.pinned
+
+    def is_contiguous(self):
+        return True
+
+    def numel(self):
+        return self.size_bytes
+
+    def element_size(self):
+        return 1
 
 
 def test_store_validates_logical_page_geometry():
@@ -147,7 +174,7 @@ def test_restore_keeps_cpu_copy_until_gpu_copy_finishes():
     manager = offload.CPUOffloadManager(store, backend)
 
     assert manager.restore(5)
-    assert backend.calls == ["allocate:5", "write:5"]
+    assert backend.calls == ["allocate:5", "write:5", "commit:5"]
     assert backend.gpu_pages[5] == payloads(5)
     assert 5 not in store
 
@@ -260,3 +287,64 @@ def test_restore_break_even_uses_complete_logical_page_size():
         estimated_recompute_ms=3.0,
         bandwidth_gbps=10.0,
     )
+
+
+def test_pinned_store_preserves_tensors_and_lru_capacity():
+    geometry = offload.PageGeometry(page_size=4, num_layers=1, num_kv_buffers=2)
+    store = offload.PinnedMemoryOffloadStore(geometry, max_bytes=16)
+    first = (FakePinnedTensor(4), FakePinnedTensor(4))
+    second = (FakePinnedTensor(4), FakePinnedTensor(4))
+    third = (FakePinnedTensor(4), FakePinnedTensor(4))
+
+    assert store.put(1, first).stored
+    assert store.put(2, second).stored
+    assert store.get(1).payloads == first
+    result = store.put(3, third)
+
+    assert result.evicted_page_ids == (2,)
+    assert store.page_ids() == (1, 3)
+    assert store.used_bytes == 16
+
+
+def test_pinned_store_rejects_pageable_or_wrong_sized_payloads():
+    geometry = offload.PageGeometry(page_size=4, num_layers=1, num_kv_buffers=2)
+    store = offload.PinnedMemoryOffloadStore(geometry, max_bytes=8)
+
+    with pytest.raises(ValueError, match="pinned memory"):
+        store.put(1, [FakePinnedTensor(4, pinned=False), FakePinnedTensor(4)])
+    with pytest.raises(ValueError, match="exactly 4 bytes"):
+        store.put(1, [FakePinnedTensor(3), FakePinnedTensor(4)])
+
+
+def test_non_contiguous_page_layout_splits_k_and_v_per_layer():
+    geometry = offload.PageGeometry(page_size=4, num_layers=2, num_kv_buffers=2)
+    layout = offload.PageTensorLayout(
+        geometry,
+        raw_tensor_nbytes=[32, 32],
+        contiguous_layout=False,
+    )
+
+    assert layout.spans(1) == (
+        offload.TensorSpan(0, 4, 4),
+        offload.TensorSpan(0, 20, 4),
+        offload.TensorSpan(1, 4, 4),
+        offload.TensorSpan(1, 20, 4),
+    )
+
+
+def test_contiguous_page_layout_splits_one_compound_page():
+    geometry = offload.PageGeometry(page_size=4, num_layers=2, num_kv_buffers=2)
+    layout = offload.PageTensorLayout(
+        geometry,
+        raw_tensor_nbytes=[64],
+        contiguous_layout=True,
+    )
+
+    assert layout.spans(2) == (
+        offload.TensorSpan(0, 32, 4),
+        offload.TensorSpan(0, 36, 4),
+        offload.TensorSpan(0, 40, 4),
+        offload.TensorSpan(0, 44, 4),
+    )
+    with pytest.raises(IndexError, match="exceeds"):
+        layout.spans(4)

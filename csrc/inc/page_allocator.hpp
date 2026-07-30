@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "constants.hpp"
@@ -67,6 +68,8 @@ public:
   std::shared_ptr<InternalPage> alloc_page();
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
+  void offload_page(page_id_t page_id);
+  void restore_page(page_id_t page_id);
 
   // Memory management
   bool resize(int64_t new_mem_size);
@@ -77,6 +80,8 @@ public:
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
+  int64_t get_num_offloaded_pages() const;
+  bool is_page_offloaded(page_id_t page_id) const;
   int64_t get_avail_physical_pages() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
@@ -151,6 +156,8 @@ private:
   std::deque<page_id_t> free_page_list_;
   std::deque<page_id_t> reserved_page_list_;
   std::deque<page_id_t> reclaimed_page_list_;
+  std::unordered_set<page_id_t> offloaded_page_ids_;
+  std::unordered_set<page_id_t> transitioning_page_ids_;
 
   // Preallocation settings
   int64_t min_reserved_pages_;
