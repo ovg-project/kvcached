@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -27,6 +29,20 @@ def parse_args() -> argparse.Namespace:
 def validate_positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+
+
+def summarize_ms(samples: List[float]) -> Dict[str, float]:
+    if not samples:
+        raise ValueError("timing samples must not be empty")
+    ordered = sorted(samples)
+    p95_index = math.ceil(0.95 * len(ordered)) - 1
+    return {
+        "max": max(ordered),
+        "mean": statistics.fmean(ordered),
+        "min": min(ordered),
+        "p50": statistics.median(ordered),
+        "p95": ordered[p95_index],
+    }
 
 
 def benchmark(args: argparse.Namespace) -> Dict[str, Any]:
@@ -72,17 +88,20 @@ def benchmark(args: argparse.Namespace) -> Dict[str, Any]:
         copy_h2d()
     stream.synchronize()
 
-    def timed_ms(operation) -> float:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record(stream)
+    def timed_ms(operation) -> List[float]:
+        events = []
         for _ in range(args.iterations):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(stream)
             operation()
-        end.record(stream)
-        end.synchronize()
-        return start.elapsed_time(end) / args.iterations
+            end.record(stream)
+            events.append((start, end))
+        events[-1][1].synchronize()
+        return [start.elapsed_time(end) for start, end in events]
 
-    d2h_ms = timed_ms(copy_d2h)
+    d2h_samples = timed_ms(copy_d2h)
+    d2h_ms = summarize_ms(d2h_samples)
     expected = [index % 251 for index in range(payload_count)]
     observed_cpu = [int(cpu_page[0]) for cpu_page in cpu_pages]
     if observed_cpu != expected:
@@ -90,7 +109,8 @@ def benchmark(args: argparse.Namespace) -> Dict[str, Any]:
 
     for gpu_page in gpu_pages:
         gpu_page.zero_()
-    h2d_ms = timed_ms(copy_h2d)
+    h2d_samples = timed_ms(copy_h2d)
+    h2d_ms = summarize_ms(h2d_samples)
     observed_gpu = [int(gpu_page[0]) for gpu_page in gpu_pages]
     if observed_gpu != expected:
         raise RuntimeError("H2D correctness check failed")
@@ -100,10 +120,10 @@ def benchmark(args: argparse.Namespace) -> Dict[str, Any]:
 
     return {
         "cuda_device": torch.cuda.get_device_name(device),
-        "d2h_effective_gbps": effective_gbps(d2h_ms),
+        "d2h_effective_gbps": effective_gbps(d2h_ms["mean"]),
         "d2h_ms": d2h_ms,
         "device": str(device),
-        "h2d_effective_gbps": effective_gbps(h2d_ms),
+        "h2d_effective_gbps": effective_gbps(h2d_ms["mean"]),
         "h2d_ms": h2d_ms,
         "iterations": args.iterations,
         "kv_buffers": args.kv_buffers,
