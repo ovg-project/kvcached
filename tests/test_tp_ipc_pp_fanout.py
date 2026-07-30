@@ -22,6 +22,7 @@ def _import_tp_ipc_util(monkeypatch):
     vmm_ops.unmap_from_kv_tensors = lambda offsets, group_id=0: True
     monkeypatch.setitem(sys.modules, vmm_ops.__name__, vmm_ops)
 
+    sys.modules.pop("kvcached.tp_ipc_util", None)
     from kvcached import tp_ipc_util
 
     return tp_ipc_util

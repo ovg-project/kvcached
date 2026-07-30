@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include <ATen/core/Tensor.h>
 #include <c10/core/Device.h>
@@ -28,7 +29,13 @@ public:
   inline at::Tensor get_tensor() noexcept { return tensor_; }
 
 private:
+  friend class FTensorAllocator;
+
+  bool is_mapped_(offset_t offset) const;
+  bool unmap_retain_(offset_t offset, std::unique_ptr<Page> &retained_page);
+  bool restore_mapping_(offset_t offset, std::unique_ptr<Page> &retained_page);
   bool map_(Page *page, offset_t offset, bool set_access = true);
+  void validate_offset_(offset_t offset) const;
   bool set_access_(generic_ptr_t addr, size_t size);
   bool init_with_zero_();
 
@@ -42,6 +49,7 @@ private:
 
   at::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
+  std::vector<std::unique_ptr<Page>> failed_pages_;
 };
 
 } // namespace kvcached
