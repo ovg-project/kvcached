@@ -11,6 +11,7 @@ cd "${ROOT_DIR}"
 
 PYTHON="${PYTHON:-python}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/cpu-offload-vmm-artifacts}"
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${HOME}/.cache/kvcached/gcc-11}"
 mkdir -p "${ARTIFACT_DIR}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -18,8 +19,31 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 2
 fi
 
+compiler="${CXX:-c++}"
+compiler_major="$("${compiler}" -dumpversion 2>/dev/null | cut -d. -f1 || true)"
+if [[ ! "${compiler_major}" =~ ^[0-9]+$ ]] || [[ "${compiler_major}" -lt 9 ]]; then
+  if ! command -v conda >/dev/null 2>&1; then
+    echo "GCC 9+ is required and conda is unavailable for automatic provisioning" >&2
+    exit 2
+  fi
+  if [[ ! -x "${TOOLCHAIN_DIR}/bin/x86_64-conda-linux-gnu-g++" ]]; then
+    conda create -y -p "${TOOLCHAIN_DIR}" -c conda-forge \
+      "gcc_linux-64=11.4" "gxx_linux-64=11.4" \
+      2>&1 | tee "${ARTIFACT_DIR}/toolchain-install.log"
+  fi
+  export CC="${TOOLCHAIN_DIR}/bin/x86_64-conda-linux-gnu-gcc"
+  export CXX="${TOOLCHAIN_DIR}/bin/x86_64-conda-linux-gnu-g++"
+  export CUDAHOSTCXX="${CXX}"
+  export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
+fi
+
 nvidia-smi --query-gpu=index,name,memory.total,driver_version \
   --format=csv,noheader | tee "${ARTIFACT_DIR}/nvidia-smi.txt"
+{
+  "${CC:-cc}" --version | head -1
+  "${CXX:-c++}" --version | head -1
+  nvcc --version | tail -1
+} | tee "${ARTIFACT_DIR}/compiler.txt"
 "${PYTHON}" -m pip install \
   "packaging>=24.2" "setuptools>=77" wheel \
   2>&1 | tee "${ARTIFACT_DIR}/bootstrap.log"

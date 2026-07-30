@@ -77,6 +77,11 @@ The command builds the current checkout, runs repeated real-page round trips,
 checks byte-level correctness and VMM state, runs the transfer benchmark, and
 creates a checksummed artifact archive.
 
+It also handles the two requirements found during H20 validation: when the
+host compiler is older than GCC 9 it provisions an isolated Conda GCC 11.4
+toolchain, and the extension build automatically links through the CUDA
+toolkit stub when a container exposes only the versioned driver library.
+
 The same validation is available through
 `.github/workflows/cpu-offload-gpu.yml`. It supports manual page/cycle counts,
 runs weekly by default, serializes access to the persistent GPU runner, and
