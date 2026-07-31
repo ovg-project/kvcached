@@ -7,7 +7,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "tools" / "run_engine_smoke.sh"
 

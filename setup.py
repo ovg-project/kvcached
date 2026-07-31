@@ -15,9 +15,9 @@ from setuptools.command.install import install
 try:
     import torch
     from torch.utils.cpp_extension import (
+        CUDA_HOME,
         BuildExtension,
         CppExtension,
-        CUDA_HOME,
         CUDAExtension,
         include_paths,
         library_paths,

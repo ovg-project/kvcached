@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "tools" / "run_gpu_ci.sh"
 
