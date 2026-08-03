@@ -25,14 +25,21 @@ bash tools/bootstrap_gpu_ci_envs.sh
 
 The bootstrap creates separate core, vLLM, and SGLang environments, builds
 kvcached as a separate installed wheel in each one, runs `pip check`, and
-prints the three repository
-variables to configure:
+prints the three Python repository variables to configure:
 
 ```text
 KVCACHED_GPU_PYTHON
 KVCACHED_VLLM_PYTHON
 KVCACHED_SGLANG_PYTHON
 ```
+
+Separately, set repository variable `KVCACHED_GPU_VISIBLE_DEVICES` to the
+physical GPU index or UUID assigned to this runner, for example `0`. A manual
+`nixl` run must select exactly two devices through the workflow's `devices`
+input, for example `0,1`. If an external scheduler already exports
+`CUDA_VISIBLE_DEVICES`, the script accepts that value instead. All subprocesses
+then see only the selected devices, renumbered as logical `cuda:0` (and
+`cuda:1` for NIXL).
 
 The default engine versions match the public kvcached engine images. Override
 `CORE_TORCH_SPEC`, `VLLM_SPEC`, or `SGLANG_SPEC` when testing another upstream
@@ -47,7 +54,8 @@ version. Add secret `HF_TOKEN` only when the selected model is gated.
 - Maintainers can start every profile from **Actions > GPU Tests > Run
   workflow**.
 
-The `nixl` profile requires two visible GPUs. The other profiles use one GPU:
+The `nixl` profile requires exactly two selected GPUs. The other profiles use
+exactly one GPU:
 
 - `core`: allocator and extension tests;
 - `vllm` or `sglang`: core plus one real engine correctness request;
@@ -59,7 +67,7 @@ artifact even when the test fails.
 The runner script also:
 
 - acquires a host-wide `flock` so CI and local jobs cannot overlap;
-- refuses to start on a busy GPU by default;
+- refuses to start when one of the selected GPUs is busy by default;
 - records the driver, GPU model, PyTorch/CUDA and compiler versions, package
   snapshot, commit, `/dev/shm` capacity, and compute processes;
 - supports repeat counts from 1 to 10 for flaky-test detection;
@@ -78,10 +86,12 @@ run.
 Before registering the runner, the script can be checked on any machine:
 
 ```bash
-CHECK_ONLY=1 GPU_CI_PROFILE=core bash tools/run_gpu_ci.sh
+CHECK_ONLY=1 GPU_CI_PROFILE=core \
+  KVCACHED_GPU_VISIBLE_DEVICES=0 bash tools/run_gpu_ci.sh
 ```
 
-The only deployment-specific inputs are the runner registration and schedule.
-Register the machine with the labels shown above, configure the three printed
-Python variables, and adjust the UTC cron expression in
+The only deployment-specific inputs are the runner registration, selected GPU,
+and schedule. Register the machine with the labels shown above, configure the
+three printed Python variables and `KVCACHED_GPU_VISIBLE_DEVICES`, then adjust
+the UTC cron expression in
 `.github/workflows/gpu-tests.yml` if the default `09:41 UTC` is unsuitable.

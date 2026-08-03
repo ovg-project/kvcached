@@ -41,6 +41,38 @@ case "${GPU_CI_PROFILE}" in
     ;;
 esac
 
+EXPECTED_GPU_COUNT=1
+if [[ "${GPU_CI_PROFILE}" == "nixl" ]]; then
+  EXPECTED_GPU_COUNT=2
+fi
+
+# A scheduler may provide CUDA_VISIBLE_DEVICES directly. Otherwise require the
+# runner/repository configuration to name the physical GPU indices or UUIDs.
+KVCACHED_GPU_VISIBLE_DEVICES="${KVCACHED_GPU_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
+if [[ -z "${KVCACHED_GPU_VISIBLE_DEVICES}" ]]; then
+  echo "KVCACHED_GPU_VISIBLE_DEVICES (or CUDA_VISIBLE_DEVICES) must select ${EXPECTED_GPU_COUNT} GPU(s)" >&2
+  exit 2
+fi
+if [[ ! "${KVCACHED_GPU_VISIBLE_DEVICES}" =~ ^[^,[:space:]]+(,[^,[:space:]]+)*$ ]]; then
+  echo "GPU device selection must be a comma-separated list without spaces" >&2
+  exit 2
+fi
+IFS=',' read -r -a SELECTED_GPU_IDS <<< "${KVCACHED_GPU_VISIBLE_DEVICES}"
+if [[ "${#SELECTED_GPU_IDS[@]}" -ne "${EXPECTED_GPU_COUNT}" ]]; then
+  echo "Profile '${GPU_CI_PROFILE}' requires exactly ${EXPECTED_GPU_COUNT} selected GPU(s); got ${#SELECTED_GPU_IDS[@]}" >&2
+  exit 2
+fi
+for ((i = 0; i < ${#SELECTED_GPU_IDS[@]}; i++)); do
+  for ((j = i + 1; j < ${#SELECTED_GPU_IDS[@]}; j++)); do
+    if [[ "${SELECTED_GPU_IDS[i]}" == "${SELECTED_GPU_IDS[j]}" ]]; then
+      echo "GPU device selection contains duplicate ID '${SELECTED_GPU_IDS[i]}'" >&2
+      exit 2
+    fi
+  done
+done
+export KVCACHED_GPU_VISIBLE_DEVICES
+export CUDA_VISIBLE_DEVICES="${KVCACHED_GPU_VISIBLE_DEVICES}"
+
 if [[ ! "${GPU_CI_REPEAT}" =~ ^[1-9][0-9]*$ ]] ||
    [[ "${GPU_CI_REPEAT}" -gt 10 ]]; then
   echo "GPU_CI_REPEAT must be an integer from 1 to 10" >&2
@@ -78,7 +110,7 @@ if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
 fi
 
 if [[ "${CHECK_ONLY}" == "1" ]]; then
-  echo "GPU CI preflight passed: profile=${GPU_CI_PROFILE}, python=${PYTHON}"
+  echo "GPU CI preflight passed: profile=${GPU_CI_PROFILE}, devices=${KVCACHED_GPU_VISIBLE_DEVICES}, python=${PYTHON}"
   exit 0
 fi
 
@@ -106,7 +138,8 @@ finalize() {
   set +e
   local finished_at
   finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+  nvidia-smi --id="${KVCACHED_GPU_VISIBLE_DEVICES}" \
+    --query-compute-apps=pid,process_name,used_memory \
     --format=csv,noheader \
     >"${GPU_CI_ARTIFACT_DIR}/compute-apps-after.txt" 2>&1
   STARTED_AT="${STARTED_AT}" \
@@ -114,6 +147,7 @@ finalize() {
   EXIT_CODE="${exit_code}" \
   GPU_CI_PROFILE="${GPU_CI_PROFILE}" \
   GPU_CI_REPEAT="${GPU_CI_REPEAT}" \
+  KVCACHED_GPU_VISIBLE_DEVICES="${KVCACHED_GPU_VISIBLE_DEVICES}" \
   GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)" \
     "${PYTHON}" - <<'PY' >"${GPU_CI_ARTIFACT_DIR}/summary.json"
 import json
@@ -125,6 +159,7 @@ print(json.dumps({
     "git_commit": os.environ["GIT_COMMIT"],
     "profile": os.environ["GPU_CI_PROFILE"],
     "repeat": int(os.environ["GPU_CI_REPEAT"]),
+    "selected_devices": os.environ["KVCACHED_GPU_VISIBLE_DEVICES"].split(","),
     "started_at": os.environ["STARTED_AT"],
     "status": "passed" if os.environ["EXIT_CODE"] == "0" else "failed",
 }, indent=2, sort_keys=True))
@@ -133,9 +168,11 @@ PY
 }
 trap finalize EXIT
 
-nvidia-smi --query-gpu=index,name,memory.total,driver_version \
+nvidia-smi --id="${KVCACHED_GPU_VISIBLE_DEVICES}" \
+  --query-gpu=index,name,memory.total,driver_version \
   --format=csv,noheader | tee "${GPU_CI_ARTIFACT_DIR}/nvidia-smi.txt"
-nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+nvidia-smi --id="${KVCACHED_GPU_VISIBLE_DEVICES}" \
+  --query-compute-apps=pid,process_name,used_memory \
   --format=csv,noheader \
   >"${GPU_CI_ARTIFACT_DIR}/compute-apps-before.txt" 2>&1
 
@@ -152,6 +189,7 @@ fi
   echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo uploaded-worktree)"
   echo "profile=${GPU_CI_PROFILE}"
   echo "repeat=${GPU_CI_REPEAT}"
+  echo "selected_physical_devices=${KVCACHED_GPU_VISIBLE_DEVICES}"
   echo "core_python=${PYTHON}"
   echo "vllm_python=${VLLM_PYTHON}"
   echo "sglang_python=${SGLANG_PYTHON}"
@@ -164,7 +202,9 @@ fi
   df -h /dev/shm 2>/dev/null || true
 } | tee "${GPU_CI_ARTIFACT_DIR}/runner-environment.txt"
 
-"${PYTHON}" - <<'PY' | tee "${GPU_CI_ARTIFACT_DIR}/torch-environment.txt"
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT}" \
+  "${PYTHON}" - <<'PY' | tee "${GPU_CI_ARTIFACT_DIR}/torch-environment.txt"
+import os
 import sys
 
 import torch
@@ -175,6 +215,12 @@ print(f"cuda_available={torch.cuda.is_available()}")
 print(f"cuda_device_count={torch.cuda.device_count()}")
 if not torch.cuda.is_available():
     raise SystemExit("PyTorch cannot access CUDA on this runner")
+expected = int(os.environ["EXPECTED_GPU_COUNT"])
+if torch.cuda.device_count() != expected:
+    raise SystemExit(
+        f"Expected exactly {expected} visible logical GPU(s), "
+        f"but PyTorch found {torch.cuda.device_count()}"
+    )
 for index in range(torch.cuda.device_count()):
     print(f"gpu[{index}]={torch.cuda.get_device_name(index)}")
 PY
@@ -230,8 +276,8 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   fi
 
   if [[ "${GPU_CI_PROFILE}" == "nixl" ]]; then
-    if [[ "$("${VLLM_PYTHON}" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ]]; then
-      echo "The nixl profile requires at least two visible GPUs" >&2
+    if [[ "$("${VLLM_PYTHON}" -c 'import torch; print(torch.cuda.device_count())')" -ne 2 ]]; then
+      echo "The nixl profile requires exactly two visible logical GPUs" >&2
       exit 2
     fi
 
@@ -240,6 +286,8 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
     INSTALL_DEPS=0 \
     INSTALL_EDITABLE=0 \
     INSTALL_VLLM=0 \
+    PREFILL_GPU="${SELECTED_GPU_IDS[0]}" \
+    DECODE_GPU="${SELECTED_GPU_IDS[1]}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/nixl-${iteration}" \
       bash tools/run_vllm_nixl_pd_smoke.sh \
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/nixl-pd-smoke-${iteration}.log"

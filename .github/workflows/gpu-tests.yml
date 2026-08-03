@@ -26,6 +26,10 @@ on:
         required: true
         default: 1
         type: number
+      devices:
+        description: Physical GPU indices or UUIDs (one normally, two for NIXL)
+        required: false
+        type: string
   pull_request:
     types: [opened, reopened, synchronize, labeled]
   push:
@@ -64,6 +68,8 @@ jobs:
             ${{ github.event_name == 'schedule' && 'engines' ||
             inputs.profile || 'core' }}
           GPU_CI_REPEAT: ${{ inputs.repeat || 1 }}
+          KVCACHED_GPU_VISIBLE_DEVICES: >-
+            ${{ inputs.devices || vars.KVCACHED_GPU_VISIBLE_DEVICES }}
           GPU_CI_REQUIRE_IDLE: ${{ vars.KVCACHED_GPU_REQUIRE_IDLE || 1 }}
           GPU_CI_ARTIFACT_DIR: >-
             gpu-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}
