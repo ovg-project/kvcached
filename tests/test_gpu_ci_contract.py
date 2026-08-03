@@ -17,10 +17,14 @@ def run_preflight(
     profile: str,
     repeat: str = "1",
     skip_core: str = "0",
+    visible_devices: Optional[str] = None,
+    cuda_visible_devices: Optional[str] = None,
     vllm_python: Optional[str] = None,
     sglang_python: Optional[str] = None,
 ):
     env = os.environ.copy()
+    env.pop("KVCACHED_GPU_VISIBLE_DEVICES", None)
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     env.update(
         {
             "CHECK_ONLY": "1",
@@ -30,6 +34,11 @@ def run_preflight(
             "GPU_CI_SKIP_CORE": skip_core,
         }
     )
+    if visible_devices is None:
+        visible_devices = "0,1" if profile == "nixl" else "0"
+    env["KVCACHED_GPU_VISIBLE_DEVICES"] = visible_devices
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     if vllm_python is not None:
         env["VLLM_PYTHON"] = vllm_python
     if sglang_python is not None:
@@ -68,6 +77,33 @@ def test_skip_core_is_boolean(tmp_path):
     completed = run_preflight(tmp_path, "nixl", skip_core="yes")
     assert completed.returncode == 2
     assert "GPU_CI_SKIP_CORE must be 0 or 1" in completed.stdout
+
+
+def test_profiles_require_exact_selected_gpu_count(tmp_path):
+    completed = run_preflight(tmp_path, "core", visible_devices="0,1")
+    assert completed.returncode == 2
+    assert "requires exactly 1 selected GPU" in completed.stdout
+
+    completed = run_preflight(tmp_path, "nixl", visible_devices="0")
+    assert completed.returncode == 2
+    assert "requires exactly 2 selected GPU" in completed.stdout
+
+
+def test_device_selection_rejects_invalid_or_duplicate_ids(tmp_path):
+    for devices in ("", "0, 1", "0,,1", "0,0"):
+        completed = run_preflight(tmp_path, "nixl", visible_devices=devices)
+        assert completed.returncode == 2
+
+
+def test_cuda_visible_devices_is_accepted_from_external_scheduler(tmp_path):
+    completed = run_preflight(
+        tmp_path,
+        "core",
+        visible_devices="",
+        cuda_visible_devices="4",
+    )
+    assert completed.returncode == 0
+    assert "devices=4" in completed.stdout
 
 
 def test_engine_profiles_validate_their_isolated_python(tmp_path):
