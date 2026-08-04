@@ -4,7 +4,7 @@
 """Policy and state management for CPU-backed KV page offloading.
 
 The GPU transfer itself is deliberately hidden behind ``PageTransferBackend``.
-That keeps the eviction policy testable on CPU-only CI and lets engine-specific
+That keeps the placement policy testable on CPU-only CI and lets engine-specific
 CUDA implementations be added without coupling them to cache bookkeeping.
 
 One kvcached page id represents the same byte range in every layer and KV
@@ -39,12 +39,10 @@ class OffloadError(RuntimeError):
         *,
         page_id: int,
         operation: str,
-        evicted_page_ids: Tuple[int, ...] = (),
     ):
         super().__init__(message)
         self.page_id = page_id
         self.operation = operation
-        self.evicted_page_ids = evicted_page_ids
 
 
 @dataclass(frozen=True)
@@ -88,7 +86,6 @@ class StoreResult(NamedTuple):
     """Result of inserting one page into the bounded CPU store."""
 
     stored: bool
-    evicted_page_ids: Tuple[int, ...]
 
 
 class PageTransferBackend(Protocol):
@@ -125,11 +122,13 @@ class PageTransferBackend(Protocol):
 
 
 class CPUOffloadStore:
-    """Bounded LRU store for CPU-resident KV pages.
+    """Bounded, recency-ordered store for CPU-resident KV pages.
 
-    The oldest page is evicted first when ``max_bytes`` would be exceeded.
-    Reading a page refreshes its recency.  The store owns immutable ``bytes``
-    objects so callers cannot mutate a cached page behind its bookkeeping.
+    An insertion that would exceed ``max_bytes`` is rejected without changing
+    existing pages. Reading a page refreshes its recency so an engine can pick
+    an explicit victim after invalidating the matching cache metadata. The
+    store owns immutable ``bytes`` objects so callers cannot mutate a cached
+    page behind its bookkeeping.
     """
 
     def __init__(self, geometry: PageGeometry, max_bytes: int):
@@ -181,21 +180,18 @@ class CPUOffloadStore:
         normalized = self._normalize_payloads(payloads)
         page = OffloadedPage(page_id=page_id, payloads=normalized)
         if page.size_bytes > self.max_bytes:
-            return StoreResult(stored=False, evicted_page_ids=())
+            return StoreResult(stored=False)
 
-        evicted: List[int] = []
-        old_page = self._pages.pop(page_id, None)
-        if old_page is not None:
-            self._used_bytes -= old_page.size_bytes
+        old_page = self._pages.get(page_id)
+        old_size = old_page.size_bytes if old_page is not None else 0
+        if self._used_bytes - old_size + page.size_bytes > self.max_bytes:
+            return StoreResult(stored=False)
 
-        while self._pages and self._used_bytes + page.size_bytes > self.max_bytes:
-            evicted_id, evicted_page = self._pages.popitem(last=False)
-            self._used_bytes -= evicted_page.size_bytes
-            evicted.append(evicted_id)
-
+        self._pages.pop(page_id, None)
+        self._used_bytes -= old_size
         self._pages[page_id] = page
         self._used_bytes += page.size_bytes
-        return StoreResult(stored=True, evicted_page_ids=tuple(evicted))
+        return StoreResult(stored=True)
 
     def get(self, page_id: int) -> Optional[OffloadedPage]:
         page = self._pages.get(page_id)
@@ -229,7 +225,7 @@ class PinnedOffloadedPage:
 
 
 class PinnedMemoryOffloadStore:
-    """Bounded LRU store that retains page-locked CPU tensors without copying."""
+    """Bounded store that retains page-locked CPU tensors without copying."""
 
     def __init__(self, geometry: PageGeometry, max_bytes: int):
         if max_bytes < 0:
@@ -286,19 +282,18 @@ class PinnedMemoryOffloadStore:
             size_bytes=self.geometry.logical_page_bytes,
         )
         if page.size_bytes > self.max_bytes:
-            return StoreResult(stored=False, evicted_page_ids=())
+            return StoreResult(stored=False)
 
-        evicted: List[int] = []
-        old_page = self._pages.pop(page_id, None)
-        if old_page is not None:
-            self._used_bytes -= old_page.size_bytes
-        while self._pages and self._used_bytes + page.size_bytes > self.max_bytes:
-            evicted_id, evicted_page = self._pages.popitem(last=False)
-            self._used_bytes -= evicted_page.size_bytes
-            evicted.append(evicted_id)
+        old_page = self._pages.get(page_id)
+        old_size = old_page.size_bytes if old_page is not None else 0
+        if self._used_bytes - old_size + page.size_bytes > self.max_bytes:
+            return StoreResult(stored=False)
+
+        self._pages.pop(page_id, None)
+        self._used_bytes -= old_size
         self._pages[page_id] = page
         self._used_bytes += page.size_bytes
-        return StoreResult(stored=True, evicted_page_ids=tuple(evicted))
+        return StoreResult(stored=True)
 
     def get(self, page_id: int) -> Optional[PinnedOffloadedPage]:
         page = self._pages.get(page_id)
@@ -498,7 +493,6 @@ class OffloadResult:
 
     page_id: int
     stored: bool
-    evicted_page_ids: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -630,14 +624,9 @@ class CPUOffloadManager:
                 "the CPU copy was retained for recovery",
                 page_id=page_id,
                 operation="release",
-                evicted_page_ids=result.evicted_page_ids,
             ) from exc
 
-        return OffloadResult(
-            page_id=page_id,
-            stored=True,
-            evicted_page_ids=result.evicted_page_ids,
-        )
+        return OffloadResult(page_id=page_id, stored=True)
 
     def restore(self, page_id: int) -> bool:
         page = self.store.get(page_id)
@@ -665,9 +654,6 @@ class CPUOffloadManager:
 
         self.store.remove(page_id)
         return True
-
-    def discard(self, page_id: int) -> bool:
-        return self.store.remove(page_id) is not None
 
     def stats(self) -> Dict[str, int]:
         return {

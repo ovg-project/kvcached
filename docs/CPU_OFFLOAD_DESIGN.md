@@ -19,13 +19,12 @@ most of the model's KV state.
 
 ## Implemented now
 
-- bounded CPU capacity with least-recently-used eviction;
+- bounded CPU capacity with atomic rejection when the store is full;
 - strict page geometry validation;
 - GPU-to-CPU transaction ordering;
 - restore rollback when a copy fails;
-- explicit reporting of CPU pages evicted by the capacity policy;
-- structured failure reporting, including page ids evicted before a later GPU
-  release failure, so engine metadata can still be invalidated;
+- recency tracking for an engine-level policy to choose explicit victims;
+- structured failure reporting for GPU release and restore failures;
 - a page-level planner that rejects active pages and respects CPU capacity;
 - a transfer-versus-recompute break-even estimator;
 - a pinned-memory CUDA transfer backend with a dedicated stream;
@@ -40,8 +39,12 @@ most of the model's KV state.
 
 The safety rule is: save a complete CPU copy before releasing GPU memory. On
 restore, keep the CPU copy until GPU allocation and copy-back both succeed.
-Callers must invalidate prefix-cache metadata for every `evicted_page_ids`
-entry returned by `OffloadResult` or `OffloadError`.
+The store never drops the only CPU copy to make room implicitly. To reuse CPU
+capacity in this milestone, the caller restores a chosen page, invalidates and
+frees it through the engine's normal cache lifecycle, then retries the new
+offload. A direct CPU-resident-page retirement API belongs with the later
+engine integration because it must update prefix metadata and page ownership
+atomically.
 
 ## Transaction
 

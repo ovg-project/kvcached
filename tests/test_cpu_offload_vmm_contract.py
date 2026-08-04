@@ -52,3 +52,13 @@ def test_gpu_workflow_targets_the_persistent_runner():
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "gpu", "kvcached"]
     run_step = next(step for step in job["steps"] if "run" in step)
     assert run_step["run"] == "bash tools/run_cpu_offload_h20_validation.sh"
+
+
+def test_actionlint_knows_cpu_offload_runner_labels():
+    config = yaml.safe_load(
+        (ROOT / ".github" / "actionlint.yaml").read_text(encoding="utf-8")
+    )
+
+    labels = config["self-hosted-runner"]["labels"]
+    assert "gpu" in labels
+    assert "kvcached" in labels

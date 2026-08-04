@@ -92,18 +92,18 @@ def test_store_validates_logical_page_geometry():
         store.put(0, [b"1234", b"12"])
 
 
-def test_store_evicts_least_recently_used_page():
+def test_store_rejects_capacity_overflow_without_dropping_existing_pages():
     geometry = offload.PageGeometry(page_size=4, num_layers=1, num_kv_buffers=2)
     store = offload.CPUOffloadStore(geometry, max_bytes=16)
 
     assert store.put(1, payloads(1)).stored
     assert store.put(2, payloads(2)).stored
-    assert store.get(1) is not None  # Refresh page 1; page 2 is now oldest.
+    assert store.get(1) is not None
 
     result = store.put(3, payloads(3))
 
-    assert result.evicted_page_ids == (2,)
-    assert store.page_ids() == (1, 3)
+    assert not result.stored
+    assert store.page_ids() == (2, 1)
     assert store.used_bytes == 16
 
 
@@ -128,7 +128,7 @@ def test_replacing_page_does_not_drift_capacity_accounting():
 
     result = store.put(1, payloads(3))
 
-    assert result.evicted_page_ids == ()
+    assert result.stored
     assert store.used_bytes == 16
     assert store.page_ids() == (2, 1)
     assert store.get(1).payloads == tuple(payloads(3))
@@ -191,25 +191,23 @@ def test_offload_keeps_cpu_copy_when_gpu_release_fails():
 
     assert exc_info.value.page_id == 8
     assert exc_info.value.operation == "release"
-    assert exc_info.value.evicted_page_ids == ()
     assert backend.calls == ["read:8", "release:8"]
     assert 8 in backend.gpu_pages
     assert 8 in store
 
 
-def test_release_failure_reports_cpu_pages_evicted_during_store():
+def test_full_store_rejection_does_not_attempt_gpu_release():
     geometry = offload.PageGeometry(page_size=4, num_layers=1, num_kv_buffers=2)
     store = offload.CPUOffloadStore(geometry, max_bytes=8)
     store.put(1, payloads(1))
     backend = FakeBackend({2: payloads(2)})
-    backend.fail_release = True
     manager = offload.CPUOffloadManager(store, backend)
 
-    with pytest.raises(offload.OffloadError) as exc_info:
-        manager.offload(2)
+    result = manager.offload(2)
 
-    assert exc_info.value.evicted_page_ids == (1,)
-    assert store.page_ids() == (2,)
+    assert not result.stored
+    assert backend.calls == ["read:2"]
+    assert store.page_ids() == (1,)
     assert 2 in backend.gpu_pages
 
 
@@ -289,7 +287,7 @@ def test_restore_break_even_uses_complete_logical_page_size():
     )
 
 
-def test_pinned_store_preserves_tensors_and_lru_capacity():
+def test_pinned_store_preserves_existing_pages_when_capacity_is_full():
     geometry = offload.PageGeometry(page_size=4, num_layers=1, num_kv_buffers=2)
     store = offload.PinnedMemoryOffloadStore(geometry, max_bytes=16)
     first = (FakePinnedTensor(4), FakePinnedTensor(4))
@@ -301,8 +299,8 @@ def test_pinned_store_preserves_tensors_and_lru_capacity():
     assert store.get(1).payloads == first
     result = store.put(3, third)
 
-    assert result.evicted_page_ids == (2,)
-    assert store.page_ids() == (1, 3)
+    assert not result.stored
+    assert store.page_ids() == (2, 1)
     assert store.used_bytes == 16
 
 
