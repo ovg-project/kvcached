@@ -39,7 +39,6 @@ except ImportError as e:
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
-PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
 def synchronized(method):
@@ -131,15 +130,21 @@ class KVCacheManager:
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
         )
-        # Register should_use_worker_ipc callback so C++ PageAllocator
-        # knows when to use broadcast IPC even with world_size == 1
-        # (e.g. vLLM V1 EngineCore + worker in separate processes).
+        # Tell the C++ PageAllocator whether map/unmap must be broadcast to
+        # worker processes over IPC, even with world_size == 1 (e.g. vLLM V1
+        # EngineCore + worker in separate processes). The value is pushed once
+        # rather than pulled through a Python callback: a callback would make
+        # the C++ prealloc thread re-enter Python, which needs the GIL and
+        # deadlocks against a caller blocked inside a binding (issue #371).
+        # The decision is stable by this point -- the same-process worker flip
+        # (init_kvcached(is_worker=True)) happens before KVCacheManager is
+        # constructed in every integration flow.
         try:
             from kvcached.integration.vllm.interfaces import should_use_worker_ipc
-            self.page_allocator.set_should_use_worker_ipc_callback(should_use_worker_ipc)
             use_worker_ipc = should_use_worker_ipc()
         except ImportError:
             use_worker_ipc = False
+        self.page_allocator.set_use_worker_ipc(use_worker_ipc)
 
         if self.world_size > 1 or use_worker_ipc:
             try:
@@ -517,8 +522,9 @@ class KVCacheManager:
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
-        self.page_allocator._stop_prealloc_thread(
-            timeout=PREALLOC_THREAD_TIMEOUT)
+        # (This used to call a `_stop_prealloc_thread(timeout=...)` binding
+        # that never existed, so clear() raised AttributeError.)
+        self.page_allocator.stop_prealloc_thread()
 
         # Clear reserved blocks
         self.free_reserved()
