@@ -68,8 +68,9 @@ jobs:
             target="${REQUESTED_TARGET}"
           fi
           if [[ -z "${target}" ]]; then
-            echo "::error::No target configured for ${ENGINE}. Set the matching OVG repository variable or provide a workflow-dispatch override."
-            exit 1
+            echo "::notice::No target configured for ${ENGINE}; skipping until the matching OVG repository variable is set."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           if [[ "${target}" != http://* && "${target}" != https://* ]]; then

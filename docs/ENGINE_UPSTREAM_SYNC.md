@@ -10,6 +10,10 @@ OVG_VLLM_REPOSITORY=ovg-project/vllm
 OVG_SGLANG_REPOSITORY=ovg-project/sglang
 ```
 
+Until a target variable is configured, the scheduled job reports a notice and
+skips that engine. This lets the synchronization code land before the matching
+OVG repository is created without producing a failing daily workflow.
+
 Add `OVG_SYNC_TOKEN` as a repository secret. The token needs permission to push
 branches and create pull requests in both target repositories.
 
