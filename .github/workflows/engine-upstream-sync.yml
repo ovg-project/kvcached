@@ -17,6 +17,10 @@ on:
         description: Optional owner/repository override
         required: false
         type: string
+      base_branch:
+        description: Optional OVG integration branch override
+        required: false
+        type: string
       dry_run:
         description: Merge and test without pushing a branch
         required: true
@@ -46,9 +50,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_ENGINE: ${{ inputs.engine }}
           REQUESTED_TARGET: ${{ inputs.target_repository }}
+          REQUESTED_BASE: ${{ inputs.base_branch }}
           ENGINE: ${{ matrix.engine }}
           VLLM_TARGET: ${{ vars.OVG_VLLM_REPOSITORY }}
           SGLANG_TARGET: ${{ vars.OVG_SGLANG_REPOSITORY }}
+          VLLM_BASE: ${{ vars.OVG_VLLM_BASE_BRANCH }}
+          SGLANG_BASE: ${{ vars.OVG_SGLANG_BASE_BRANCH }}
         run: |
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]] &&
              [[ "${REQUESTED_ENGINE}" != "${ENGINE}" ]]; then
@@ -58,14 +65,19 @@ jobs:
 
           if [[ "${ENGINE}" == "vllm" ]]; then
             target="${VLLM_TARGET}"
+            base="${VLLM_BASE:-kvcached-main}"
             upstream="https://github.com/vllm-project/vllm.git"
           else
             target="${SGLANG_TARGET}"
+            base="${SGLANG_BASE:-kvcached-main}"
             upstream="https://github.com/sgl-project/sglang.git"
           fi
 
           if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_TARGET}" ]]; then
             target="${REQUESTED_TARGET}"
+          fi
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_BASE}" ]]; then
+            base="${REQUESTED_BASE}"
           fi
           if [[ -z "${target}" ]]; then
             echo "::notice::No target configured for ${ENGINE}; skipping until the matching OVG repository variable is set."
@@ -78,6 +90,7 @@ jobs:
           fi
           echo "skip=false" >> "${GITHUB_OUTPUT}"
           echo "target=${target}" >> "${GITHUB_OUTPUT}"
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
           echo "upstream=${upstream}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure cross-repository Git authentication
@@ -104,7 +117,9 @@ jobs:
             --engine "${ENGINE}"
             --target-repository "${TARGET}"
             --upstream-repository "${UPSTREAM}"
+            --base-branch "${{ steps.config.outputs.base }}"
             --sync-branch "automation/upstream-${ENGINE}"
+            --strategy rebase
             --update-existing-branch
             --result-json "sync-artifacts/${ENGINE}.json"
             --report "sync-artifacts/${ENGINE}.md"
@@ -125,6 +140,7 @@ jobs:
           GH_TOKEN: ${{ secrets.OVG_SYNC_TOKEN }}
           ENGINE: ${{ matrix.engine }}
           TARGET: ${{ steps.config.outputs.target }}
+          BASE: ${{ steps.config.outputs.base }}
         run: |
           status="$(
             python -c \
@@ -151,7 +167,7 @@ jobs:
           else
             gh pr create \
               --repo "${repository}" \
-              --base main \
+              --base "${BASE}" \
               --head "${branch}" \
               --title "chore: sync ${ENGINE} upstream" \
               --body-file "sync-artifacts/${ENGINE}.md"
