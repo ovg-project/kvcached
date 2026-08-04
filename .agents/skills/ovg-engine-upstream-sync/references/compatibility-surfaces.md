@@ -29,9 +29,12 @@ When these areas change, run both GPU profiles and an output-correctness probe.
 
 Primary patch modules:
 
-- `sglang.srt.mem_cache.allocator`:
-  `BaseTokenToKVPoolAllocator`, `alloc_extend_kernel`,
-  `alloc_decode_kernel`
+- `sglang.srt.mem_cache.allocator`: public allocator classes
+- `sglang.srt.mem_cache.allocator.base`:
+  `BaseTokenToKVPoolAllocator` in package-based releases
+- `sglang.srt.mem_cache.allocator.paged`:
+  `PagedTokenToKVPoolAllocator`, `alloc_extend_kernel`, and
+  `alloc_decode_kernel` in package-based releases
 - `sglang.srt.mem_cache.memory_pool`:
   `KVCache`, `MHATokenToKVPool`, `MLATokenToKVPool`
 - optional memory pools: `MambaPool`, `HybridLinearKVPool`
@@ -41,6 +44,7 @@ Primary patch modules:
 High-risk behavior:
 
 - token/page allocation and free-group semantics;
+- the optional `num_new_pages` hint and paged-kernel launch signature;
 - MHA, MLA, Mamba, and hybrid pool constructors;
 - page size, null slot, data pointers, and layer ranges;
 - overlap scheduling and memory-leak checks;

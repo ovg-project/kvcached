@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 
@@ -25,10 +26,15 @@ def write_module(root: Path, relative: str, source: str) -> None:
 def materialize_contract(repo: Path, engine: str) -> Path:
     package_root = repo / ("vllm" if engine == "vllm" else "python/sglang")
     for contract in compat.CONTRACTS[engine]:
-        source = "\n".join(
-            f"class {symbol}:\n    def marker(self, value=None):\n        pass\n"
-            for symbol in contract.required
-        )
+        definitions = []
+        for symbol in contract.required:
+            methods = contract.required_methods.get(symbol, ("marker",))
+            body = "\n".join(
+                f"    def {method}(self, value=None):\n        pass"
+                for method in methods
+            )
+            definitions.append(f"class {symbol}:\n{body}\n")
+        source = "\n".join(definitions)
         write_module(package_root, contract.path, source)
     return package_root
 
@@ -55,6 +61,36 @@ def test_sglang_contract_supports_python_package_layout(tmp_path):
     assert result.package_root == str(package_root)
 
 
+def test_sglang_contract_accepts_legacy_single_file_allocator(tmp_path):
+    package_root = materialize_contract(tmp_path, "sglang")
+    allocator_package = package_root / "srt/mem_cache/allocator"
+    legacy_allocator = package_root / "srt/mem_cache/allocator.py"
+    shutil.rmtree(allocator_package)
+    legacy_allocator.write_text(
+        "class BaseTokenToKVPoolAllocator:\n"
+        "    def __init__(self): pass\n"
+        "    def available_size(self): pass\n"
+        "    def free_group_begin(self): pass\n"
+        "    def free_group_end(self): pass\n"
+        "    def clear(self): pass\n"
+        "    def alloc(self): pass\n"
+        "    def free(self): pass\n\n"
+        "class PagedTokenToKVPoolAllocator:\n"
+        "    def alloc_extend(self): pass\n"
+        "    def alloc_decode(self): pass\n\n"
+        "def alloc_decode_kernel(): pass\n\n"
+        "def alloc_extend_kernel(): pass\n",
+        encoding="utf-8",
+    )
+    result = compat.check_repository(tmp_path, "sglang")
+
+    assert result.status == "compatible"
+    allocator_modules = [
+        module for module in result.modules if module.path == str(legacy_allocator)
+    ]
+    assert len(allocator_modules) == 2
+
+
 def test_missing_required_symbol_fails_contract(tmp_path):
     package_root = materialize_contract(tmp_path, "vllm")
     write_module(package_root, "v1/engine/core.py", "class RenamedEngineCore:\n    pass\n")
@@ -67,3 +103,26 @@ def test_missing_required_symbol_fails_contract(tmp_path):
         if module.path == str(package_root / "v1/engine/core.py")
     )
     assert engine_core.missing_required == ["EngineCore"]
+
+
+def test_missing_required_method_fails_contract(tmp_path):
+    package_root = materialize_contract(tmp_path, "sglang")
+    write_module(
+        package_root,
+        "srt/mem_cache/allocator/paged.py",
+        "class PagedTokenToKVPoolAllocator:\n"
+        "    def alloc_decode(self): pass\n\n"
+        "def alloc_decode_kernel(): pass\n\n"
+        "def alloc_extend_kernel(): pass\n",
+    )
+
+    result = compat.check_repository(tmp_path, "sglang")
+
+    assert result.status == "incompatible"
+    paged = next(
+        module for module in result.modules
+        if module.path == str(package_root / "srt/mem_cache/allocator/paged.py")
+    )
+    assert paged.missing_required_methods == [
+        "PagedTokenToKVPoolAllocator.alloc_extend"
+    ]

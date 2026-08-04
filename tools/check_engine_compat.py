@@ -19,6 +19,8 @@ class ModuleContract:
     path: str
     required: Sequence[str]
     optional: Sequence[str] = ()
+    alternative_paths: Sequence[str] = ()
+    required_methods: Mapping[str, Sequence[str]] = field(default_factory=dict)
 
 
 CONTRACTS: Mapping[str, Sequence[ModuleContract]] = {
@@ -40,12 +42,32 @@ CONTRACTS: Mapping[str, Sequence[ModuleContract]] = {
     ),
     "sglang": (
         ModuleContract(
-            "srt/mem_cache/allocator.py",
+            "srt/mem_cache/allocator/base.py",
+            ("BaseTokenToKVPoolAllocator",),
+            alternative_paths=("srt/mem_cache/allocator.py",),
+            required_methods={
+                "BaseTokenToKVPoolAllocator": (
+                    "__init__",
+                    "available_size",
+                    "free_group_begin",
+                    "free_group_end",
+                    "clear",
+                    "alloc",
+                    "free",
+                ),
+            },
+        ),
+        ModuleContract(
+            "srt/mem_cache/allocator/paged.py",
             (
-                "BaseTokenToKVPoolAllocator",
+                "PagedTokenToKVPoolAllocator",
                 "alloc_decode_kernel",
                 "alloc_extend_kernel",
             ),
+            alternative_paths=("srt/mem_cache/allocator.py",),
+            required_methods={
+                "PagedTokenToKVPoolAllocator": ("alloc_extend", "alloc_decode"),
+            },
         ),
         ModuleContract(
             "srt/mem_cache/memory_pool.py",
@@ -62,6 +84,7 @@ CONTRACTS: Mapping[str, Sequence[ModuleContract]] = {
 class ModuleResult:
     path: str
     missing_required: List[str] = field(default_factory=list)
+    missing_required_methods: List[str] = field(default_factory=list)
     optional_present: List[str] = field(default_factory=list)
     symbols: Dict[str, List[str]] = field(default_factory=dict)
     parse_error: str = ""
@@ -135,11 +158,19 @@ def collect_symbols(tree: ast.Module) -> Dict[str, List[str]]:
 
 
 def inspect_module(package_root: Path, contract: ModuleContract) -> ModuleResult:
-    path = package_root / contract.path
+    candidates = [
+        package_root / relative
+        for relative in (contract.path, *contract.alternative_paths)
+    ]
+    path = next(
+        (candidate for candidate in candidates if candidate.is_file()),
+        candidates[0],
+    )
     result = ModuleResult(path=str(path))
     if not path.is_file():
         result.missing_required = list(contract.required)
-        result.parse_error = "module file not found"
+        rendered = ", ".join(str(candidate) for candidate in candidates)
+        result.parse_error = f"module file not found; checked {rendered}"
         return result
 
     try:
@@ -152,6 +183,15 @@ def inspect_module(package_root: Path, contract: ModuleContract) -> ModuleResult
     result.symbols = collect_symbols(tree)
     present: Set[str] = set(result.symbols)
     result.missing_required = sorted(set(contract.required) - present)
+    for class_name, methods in contract.required_methods.items():
+        fingerprints = result.symbols.get(class_name, ())
+        present_methods = {fingerprint.split("(", 1)[0] for fingerprint in fingerprints}
+        result.missing_required_methods.extend(
+            f"{class_name}.{method}"
+            for method in methods
+            if method not in present_methods
+        )
+    result.missing_required_methods.sort()
     result.optional_present = sorted(set(contract.optional) & present)
     return result
 
@@ -162,7 +202,10 @@ def check_repository(repository: Path, engine: str) -> CompatibilityResult:
         inspect_module(package_root, contract)
         for contract in CONTRACTS[engine]
     ]
-    compatible = all(not module.missing_required for module in modules)
+    compatible = all(
+        not module.missing_required and not module.missing_required_methods
+        for module in modules
+    )
     return CompatibilityResult(
         engine=engine,
         package_root=str(package_root),
