@@ -89,6 +89,8 @@ jobs:
         id: sync
         if: steps.config.outputs.skip == 'false'
         env:
+          GH_TOKEN: >-
+            ${{ inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || '' }}
           ENGINE: ${{ matrix.engine }}
           TARGET: ${{ steps.config.outputs.target }}
           UPSTREAM: ${{ steps.config.outputs.upstream }}

@@ -37,10 +37,10 @@ conflicted worktree, inspect kvcached's vLLM/SGLang compatibility surfaces,
 repair only the affected integration, add regression coverage, and require
 the appropriate GPU gate before proposing a pull request.
 
-`tools/check_engine_compat.py` scans the merged engine source for every module
-and class currently patched by kvcached. Its JSON report includes method
-signature fingerprints. This catches common upstream drift before a GPU is
-occupied, but does not replace runtime tests.
+`tools/check_engine_compat.py` scans the merged engine source for every module,
+class, and required allocator method currently patched by kvcached. Its JSON
+report includes method signature fingerprints. This catches common upstream
+drift before a GPU is occupied, but does not replace runtime tests.
 
 The Git operation can also be exercised locally without pushing:
 
