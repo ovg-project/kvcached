@@ -162,8 +162,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             alloc_extend_kernel_fn = getattr(
                 alloc_extend_kernel, "fn", alloc_extend_kernel
             )
-            alloc_extend_uses_max_tokens = (
-                len(inspect.signature(alloc_extend_kernel_fn).parameters) == 8
+            alloc_extend_param_names = tuple(
+                inspect.signature(alloc_extend_kernel_fn).parameters
             )
 
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
@@ -246,20 +246,25 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     out_indices = torch.empty(
                         (extend_num_tokens,), dtype=torch.int64, device=self.device
                     )
-                    kernel_args: List[Any] = [
-                        prefix_lens,
-                        seq_lens,
-                        last_loc,
-                        free_pages,
-                        out_indices,
-                        next_power_of_2(bs),
-                        self.page_size,
-                    ]
-                    if alloc_extend_uses_max_tokens:
-                        kernel_args.append(
+                    kernel_kwargs: dict[str, Any] = {
+                        "pre_lens_ptr": prefix_lens,
+                        "seq_lens_ptr": seq_lens,
+                        "last_loc_ptr": last_loc,
+                        "free_page_ptr": free_pages,
+                        "out_indices": out_indices,
+                        "bs_upper": next_power_of_2(bs),
+                        "page_size": self.page_size,
+                    }
+                    if "ret_values" in alloc_extend_param_names:
+                        kernel_kwargs["ret_values"] = torch.empty(
+                            (), dtype=torch.int64, device=self.device
+                        )
+                    if "max_num_extend_tokens" in alloc_extend_param_names:
+                        kernel_kwargs["max_num_extend_tokens"] = (
                             self.seen_max_num_extend_tokens_next_power_of_2
                         )
-                    alloc_extend_kernel[(bs,)](*kernel_args)
+
+                    alloc_extend_kernel[(bs,)](**kernel_kwargs)
                     return out_indices
 
                 def alloc_decode(
