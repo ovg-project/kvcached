@@ -29,6 +29,16 @@ def test_page_allocator_exposes_stable_id_offload_lifecycle():
     assert "Cannot resize while pages are CPU-offloaded" in implementation
 
 
+def test_offload_bindings_release_the_gil_while_mapping_pages():
+    bindings = (ROOT / "csrc" / "torch_bindings.cpp").read_text()
+
+    for method in ("offload_page", "restore_page"):
+        binding = bindings.split(f'.def("{method}"', 1)[1].split(
+            "\n      .def(", 1
+        )[0]
+        assert "gil_scoped_release" in binding
+
+
 def test_offload_unmaps_and_restore_maps_the_same_page_id():
     implementation = (ROOT / "csrc" / "page_allocator.cpp").read_text()
 
