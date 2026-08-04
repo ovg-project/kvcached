@@ -26,6 +26,21 @@ def test_fork_token_is_not_exposed_to_dry_runs():
     assert "inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || ''" in source
 
 
+def test_scheduled_sync_rebases_the_ovg_patch_stack():
+    source = WORKFLOW.read_text(encoding="utf-8")
+
+    assert "--strategy rebase" in source
+
+
+def test_sync_targets_a_separate_kvcached_integration_branch():
+    source = WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'base="${VLLM_BASE:-kvcached-main}"' in source
+    assert 'base="${SGLANG_BASE:-kvcached-main}"' in source
+    assert '--base-branch "${{ steps.config.outputs.base }}"' in source
+    assert '--base "${BASE}"' in source
+
+
 def test_unconfigured_engine_repository_is_skipped_without_failing_schedule():
     source = WORKFLOW.read_text(encoding="utf-8")
 

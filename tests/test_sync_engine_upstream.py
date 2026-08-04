@@ -108,6 +108,36 @@ def test_sync_pushes_checked_upstream_merge(tmp_path):
     assert "Status: `synced`" in report
 
 
+def test_rebase_strategy_replays_ovg_patch_on_new_upstream(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+
+    target_worktree = tmp_path / "target-worktree"
+    git(tmp_path, "clone", str(target), str(target_worktree))
+    write(target_worktree / "ovg.txt", "kvcached integration\n")
+    commit(target_worktree, "ovg patch")
+    git(target_worktree, "push", "origin", "main")
+
+    write(upstream / "upstream.txt", "new upstream feature\n")
+    commit(upstream, "upstream feature")
+
+    completed, result, report = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--strategy",
+        "rebase",
+        "--push",
+    )
+
+    assert completed.returncode == 0
+    assert result["status"] == "synced"
+    assert result["strategy"] == "rebase"
+    sync_tip = git(target, "rev-parse", "refs/heads/automation/test-sync")
+    upstream_tip = git(upstream, "rev-parse", "main")
+    assert git(target, "merge-base", sync_tip, upstream_tip) == upstream_tip
+    assert "Strategy: `rebase`" in report
+
+
 def test_sync_reports_up_to_date_without_creating_branch(tmp_path):
     upstream, target = initialize_repositories(tmp_path)
 
@@ -178,6 +208,8 @@ def test_sync_can_leave_conflict_worktree_for_repair_agent(tmp_path):
         tmp_path,
         upstream,
         target,
+        "--strategy",
+        "rebase",
         "--workdir",
         str(repair_dir),
         "--keep-conflicts",

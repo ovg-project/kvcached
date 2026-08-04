@@ -37,6 +37,7 @@ class SyncResult:
     upstream_repository: str
     base_branch: str
     sync_branch: str
+    strategy: str = "merge"
     upstream_commit: str = ""
     result_commit: str = ""
     worktree: str = ""
@@ -98,6 +99,7 @@ def write_reports(result: SyncResult, json_path: Path, markdown_path: Path) -> N
         f"- Upstream: `{result.upstream_repository}`",
         f"- Base branch: `{result.base_branch}`",
         f"- Sync branch: `{result.sync_branch}`",
+        f"- Strategy: `{result.strategy}`",
     ]
     if result.upstream_commit:
         lines.append(f"- Upstream commit: `{result.upstream_commit}`")
@@ -135,6 +137,7 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
         upstream_repository=args.upstream_repository,
         base_branch=args.base_branch,
         sync_branch=args.sync_branch,
+        strategy=args.strategy,
     )
 
     repository = workdir / "engine"
@@ -182,15 +185,15 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
 
     git(repository, "checkout", "-b", args.sync_branch)
     result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
-    merge = git(
-        repository,
-        "merge",
-        "--no-ff",
-        "--no-edit",
-        upstream_ref,
-        check=False,
-    )
-    if merge.returncode != 0:
+    if args.strategy == "rebase":
+        integrate_command = ["rebase", upstream_ref]
+        abort_command = ["rebase", "--abort"]
+    else:
+        integrate_command = ["merge", "--no-ff", "--no-edit", upstream_ref]
+        abort_command = ["merge", "--abort"]
+
+    integration = git(repository, *integrate_command, check=False)
+    if integration.returncode != 0:
         conflicts = git(
             repository,
             "diff",
@@ -201,12 +204,12 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
         result.status = "conflict"
         result.conflict_files = sorted(path for path in conflicts if path)
         result.message = (
-            "Git could not merge upstream automatically. The conflict list and "
-            "repository versions in the JSON report are intended as input for "
-            "a maintainer or repair agent."
+            f"Git could not {args.strategy} upstream automatically. The conflict "
+            "list and repository versions in the JSON report are intended as "
+            "input for a maintainer or repair agent."
         )
         if not args.keep_conflicts:
-            git(repository, "merge", "--abort", check=False)
+            git(repository, *abort_command, check=False)
             result.worktree = ""
         return result
 
@@ -228,8 +231,8 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
                 repository, "rev-parse", "HEAD"
             ).stdout.strip()
             result.message = (
-                "The upstream merge completed, but a compatibility check failed. "
-                "No branch was pushed."
+                f"The upstream {args.strategy} completed, but a compatibility "
+                "check failed. No branch was pushed."
             )
             return result
 
@@ -240,9 +243,15 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
             push_args.append("--force-with-lease")
         push_args.extend(["origin", f"HEAD:refs/heads/{args.sync_branch}"])
         git(repository, *push_args)
-        result.message = "Upstream merged, checks passed, and the sync branch was pushed."
+        result.message = (
+            f"Upstream {args.strategy} completed, checks passed, and the sync "
+            "branch was pushed."
+        )
     else:
-        result.message = "Upstream merged and checks passed. Dry run: no branch was pushed."
+        result.message = (
+            f"Upstream {args.strategy} completed and checks passed. "
+            "Dry run: no branch was pushed."
+        )
     result.status = "synced"
     return result
 
@@ -255,6 +264,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-branch", default="main")
     parser.add_argument("--upstream-branch", default="main")
     parser.add_argument("--sync-branch", required=True)
+    parser.add_argument(
+        "--strategy",
+        choices=("merge", "rebase"),
+        default="merge",
+        help="How to integrate upstream into the OVG-maintained branch.",
+    )
     parser.add_argument(
         "--check",
         action="append",
@@ -278,7 +293,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-conflicts",
         action="store_true",
-        help="Leave merge conflict markers in --workdir for an agent to repair.",
+        help="Leave integration conflict markers in --workdir for an agent to repair.",
     )
     parser.add_argument("--result-json", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -308,6 +323,7 @@ def main() -> int:
             upstream_repository=args.upstream_repository,
             base_branch=args.base_branch,
             sync_branch=args.sync_branch,
+            strategy=args.strategy,
             message=str(exc),
         )
 
