@@ -1621,6 +1621,269 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)
         return True
 
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_use_uniform_kv_cache(self, GPUModelRunner) -> bool:
+        """Patch use_uniform_kv_cache to return False when kvcached cannot support
+        cross-layer layout.
+
+        When kvcached is active but CONTIGUOUS_LAYOUT is disabled or
+        kernel_block_size != block_size, cross-layer allocation is not feasible.
+        By returning False here, vLLM's ``initialize_kv_cache_tensors`` will
+        naturally take the per-layer path (``_allocate_kv_cache_tensors``),
+        which is intercepted by kvcached's per-layer patch.
+
+        This avoids duplicating vLLM's tail logic (shared_kv_cache_layers,
+        bind_kv_cache, etc.) inside our patch, improving forward compatibility.
+        """
+        if not hasattr(GPUModelRunner, "use_uniform_kv_cache"):
+            return False
+
+        original_method = GPUModelRunner.use_uniform_kv_cache
+        if self._is_already_patched(original_method, "use_uniform_kv_cache"):
+            return True
+
+        logger = self.logger
+
+        def _patched_use_uniform_kv_cache(attn_groups, cache_dtype):
+            # If kvcached is not active, defer to the original logic
+            if not enable_kvcached():
+                return original_method(attn_groups, cache_dtype)
+
+            # kvcached is active — check if contiguous layout is available
+            from kvcached.utils import CONTIGUOUS_LAYOUT as _kvcached_contiguous
+            if not _kvcached_contiguous:
+                logger.info(
+                    "KVCACHED_CONTIGUOUS_LAYOUT=false, forcing "
+                    "use_uniform_kv_cache=False for per-layer allocation"
+                )
+                return False
+
+            # All kvcached constraints satisfied, defer to original logic
+            return original_method(attn_groups, cache_dtype)
+
+        self._mark_as_patched(_patched_use_uniform_kv_cache, "use_uniform_kv_cache")
+        GPUModelRunner.use_uniform_kv_cache = staticmethod(_patched_use_uniform_kv_cache)
+        return True
+
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_initialize_kv_cache_tensors(self, GPUModelRunner) -> bool:
+        """Patch initialize_kv_cache_tensors to support cross-layer KV cache
+        layout with kvcached, preserving offloading/P2P transfer performance.
+
+        Relies on the patched ``use_uniform_kv_cache()`` to gate cross-layer
+        vs per-layer paths.  When cross-layer is selected, kvcached allocates a
+        single contiguous VM-backed buffer and constructs a
+        ``cross_layers_kv_cache`` tensor from it, enabling bulk DMA transfers
+        for offloading and disaggregated P2P.
+
+        When ``use_uniform_kv_cache()`` returns False (either because the
+        connector doesn't need it, or because kvcached constraints are not met),
+        falls back to the original method which routes through kvcached's per-layer
+        ``_allocate_kv_cache_tensors`` patch.
+        """
+        if not hasattr(GPUModelRunner, "initialize_kv_cache_tensors"):
+            return False
+
+        original_method = getattr(GPUModelRunner, "initialize_kv_cache_tensors")
+        if self._is_already_patched(original_method, "initialize_kv_cache_tensors"):
+            return True
+
+        logger = self.logger
+
+        def _patched_initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes, *args, **kwargs):
+            import math
+
+            import torch
+            from vllm.v1.utils import bind_kv_cache
+
+            # --- Gate: fall back to original if kvcached is not active ---
+            if not enable_kvcached():
+                return original_method(self, kv_cache_config, kernel_block_sizes, *args, **kwargs)
+
+            # --- Use (patched) use_uniform_kv_cache to decide path ---
+            # The patched use_uniform_kv_cache already handles kvcached constraints
+            # (CONTIGUOUS_LAYOUT=false → returns False), so we only need to
+            # check kernel_block_size here.
+            cache_dtype = self.cache_config.cache_dtype
+            use_cross_layer = self.use_uniform_kv_cache(self.attn_groups, cache_dtype)
+
+            if not use_cross_layer:
+                # Per-layer path: original_method → _allocate_kv_cache_tensors
+                # → kvcached per-layer patch handles it.
+                logger.info("use_uniform_kv_cache=False, "
+                            "using per-layer kvcached allocation")
+                return original_method(self, kv_cache_config, kernel_block_sizes, *args, **kwargs)
+
+            # --- Cross-layer selected; final kernel_block_size check ---
+            attn_group = self.attn_groups[0][0]
+            kv_cache_spec = attn_group.kv_cache_spec
+            attn_backend = attn_group.backend
+
+            if len(kernel_block_sizes) == 1 and kernel_block_sizes[0] != kv_cache_spec.block_size:
+                logger.info(
+                    "kernel_block_size (%d) != block_size (%d), "
+                    "contiguous layout with ratio>1 not supported, "
+                    "falling back to per-layer",
+                    kernel_block_sizes[0], kv_cache_spec.block_size,
+                )
+                # Temporarily override use_uniform_kv_cache to False so that
+                # original_method takes the per-layer path.
+                orig_uukc = type(self).use_uniform_kv_cache
+                type(self).use_uniform_kv_cache = staticmethod(lambda *a: False)
+                try:
+                    return original_method(self, kv_cache_config, kernel_block_sizes, *args, **kwargs)
+                finally:
+                    type(self).use_uniform_kv_cache = orig_uukc
+
+            # --- Cross-layer kvcached allocation ---
+            logger.info("Using cross-layer contiguous KV cache layout "
+                        "for offloading-compatible bulk DMA transfers")
+
+            # Determine dimensions
+            attention_type = _infer_attention_type(kv_cache_config)
+            dtype = kv_cache_spec.dtype
+
+            # Use kv_cache_tensors to determine num_blocks and num_layers
+            tensor_sizes = set(
+                t.size for t in kv_cache_config.kv_cache_tensors
+            )
+            assert len(tensor_sizes) == 1, (
+                f"Cross-layer layout requires uniform tensor sizes, "
+                f"got {tensor_sizes}"
+            )
+            tensor_size = tensor_sizes.pop()
+            page_size = kv_cache_spec.page_size_bytes
+            assert tensor_size % page_size == 0
+            num_blocks = tensor_size // page_size
+            num_layers = len(kv_cache_config.kv_cache_tensors)
+
+            assert len(kernel_block_sizes) == 1
+            kernel_block_size = kernel_block_sizes[0]
+            num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+            kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+
+            # Get per-layer kv_cache_shape from the attention backend
+            per_layer_kv_cache_shape = attn_backend.get_kv_cache_shape(
+                kernel_num_blocks,
+                kernel_block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
+
+            # Allocate via kvcached with contiguous layout
+            from kvcached.integration.vllm import interfaces as kvi
+            kv_cache_buffers = kvi.alloc_kv_cache(
+                per_layer_kv_cache_shape,
+                kv_cache_spec.block_size,
+                dtype,
+                getattr(self, "device", torch.device("cuda")).type,
+                num_layers,
+                attention_type=attention_type,
+                kv_layout="NHD",
+                kernel_block_size=(
+                    kernel_block_size if kernel_block_size != kv_cache_spec.block_size
+                    else None
+                ),
+            )
+
+            # kv_cache_buffers is a list of per-layer tensors, each a view of
+            # the same underlying contiguous buffer (in kvcached contiguous mode).
+            # Build per-layer kv_caches dict.
+            kv_caches = {}
+            layer_idx = 0
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                tensor = kv_cache_buffers[layer_idx]
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_caches[layer_name] = tensor
+                layer_idx += 1
+
+            # Build the cross_layers_kv_cache tensor from the same underlying
+            # kvcached contiguous buffer.
+            #
+            # kvcached contiguous layout stores data as:
+            #   [blocks, layers, <per-block-per-layer data>]
+            # We need to construct a view that matches vLLM's cross-layer
+            # physical shape (determined by backend's stride order).
+            try:
+                # kvcached may allocate more blocks than vLLM requested (it uses
+                # the full GPU memory). Use the actual shape from the returned
+                # tensors rather than the requested per_layer_kv_cache_shape.
+                actual_per_layer_shape = tuple(kv_cache_buffers[0].shape)
+
+                # Prepend num_layers dimension to the actual per-layer shape
+                cross_layer_logical_shape = (num_layers,) + actual_per_layer_shape
+
+                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
+                    include_num_layers_dimension=True
+                )
+                assert len(kv_cache_stride_order) == len(cross_layer_logical_shape)
+
+                # Physical shape after applying stride order
+                physical_shape = tuple(
+                    cross_layer_logical_shape[i] for i in kv_cache_stride_order
+                )
+
+                # Total elements needed for the cross-layer tensor
+                total_elements = math.prod(physical_shape)
+                total_bytes = total_elements * dtype.itemsize
+
+                # Get the raw buffer from the first layer tensor. In kvcached
+                # contiguous mode, all layers share the same flat buffer.
+                storage = kv_cache_buffers[0].untyped_storage()
+                storage_elements = storage.size() // dtype.itemsize
+                flat_buffer = (
+                    torch.empty(0, dtype=dtype, device=self.device)
+                    .set_(storage)
+                    .view(storage_elements)
+                )
+
+                # Slice to exactly the cross-layer region and reshape
+                cross_layers_kv_cache = (
+                    flat_buffer[:total_elements].view(physical_shape)
+                )
+
+                self.cross_layers_kv_cache = cross_layers_kv_cache
+                self.cross_layers_attn_backend = type(attn_backend) if not isinstance(attn_backend, type) else attn_backend
+
+                logger.info(
+                    "Cross-layer KV cache created: physical_shape=%s, "
+                    "stride_order=%s, dtype=%s, total_bytes=%.2f MB",
+                    physical_shape, kv_cache_stride_order, dtype,
+                    total_bytes / (1024 * 1024),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to build cross_layers_kv_cache, "
+                    "offloading will use per-layer path: %s", e,
+                )
+                # cross_layers_kv_cache stays None → per-layer register path
+
+            # Set up cross-layer KV cache sharing (e.g. YOCO)
+            shared_kv_cache_layers = getattr(self, "shared_kv_cache_layers", {})
+            for layer_name, target_layer_name in shared_kv_cache_layers.items():
+                logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+                kv_caches[layer_name] = kv_caches[target_layer_name]
+
+            num_attn_module = (
+                2 if self.model_config.hf_config.model_type == "longcat_flash"
+                else 1
+            )
+            bind_kv_cache(
+                kv_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_caches,
+                num_attn_module,
+            )
+
+            return kv_caches
+
+        self._mark_as_patched(
+            _patched_initialize_kv_cache_tensors, "initialize_kv_cache_tensors"
+        )
+        GPUModelRunner.initialize_kv_cache_tensors = _patched_initialize_kv_cache_tensors
+        return True
+
     # Version-specific helper methods for attention backend access
     def get_attention_backend_v8(self, model_runner_instance, kv_cache_group_id=0):
         """Get attention backend for vLLM 0.8.x versions"""
