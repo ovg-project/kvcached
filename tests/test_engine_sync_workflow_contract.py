@@ -24,3 +24,16 @@ def test_fork_token_is_not_exposed_to_dry_runs():
     source = WORKFLOW.read_text(encoding="utf-8")
 
     assert "inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || ''" in source
+
+
+def test_unconfigured_engine_repository_is_skipped_without_failing_schedule():
+    source = WORKFLOW.read_text(encoding="utf-8")
+
+    missing_target = source.split('if [[ -z "${target}" ]]', maxsplit=1)[1].split(
+        "\n          fi", maxsplit=1
+    )[0]
+
+    assert "::notice::No target configured" in missing_target
+    assert 'echo "skip=true" >> "${GITHUB_OUTPUT}"' in missing_target
+    assert "exit 0" in missing_target
+    assert "::error::" not in missing_target
