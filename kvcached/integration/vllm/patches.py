@@ -1899,6 +1899,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 num_layers,
                 attention_type=attention_type,
                 kv_layout="NHD",
+                padded_page_size_bytes=getattr(
+                    kv_cache_spec, "page_size_padded", None),
             )
             layer_id = 0
             for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -2149,6 +2151,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 kv_layout=kv_layout,
                 kernel_block_size=kernel_block_size,
                 return_meta=is_hetero,
+                padded_page_size_bytes=getattr(
+                    kv_cache_spec, "page_size_padded", None),
             )
 
             if attention_type == "HYBRID_LINEAR":
@@ -2184,6 +2188,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
                         kernel_block_size=gkbs,
                         kv_layout=_get_packed_kv_layout(gbackend) if packed_kv else "NHD",
+                        padded_page_size_bytes=getattr(
+                            gspec, "page_size_padded", None),
                     )
                     for pool_idx, layer_name in enumerate(
                             _tensor_backed_layer_names(grp, runner_only_attn_layers)):
