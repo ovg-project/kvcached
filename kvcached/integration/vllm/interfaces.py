@@ -85,6 +85,41 @@ def shutdown_kvcached() -> None:
     _async_sched = False
 
 
+def _resolve_page_geometry(
+    logical_page_size_bytes: int,
+    padded_page_size_bytes: Optional[int],
+    num_k_or_v: int,
+    dtype: torch.dtype,
+    kernel_blocks_per_page: int,
+) -> Tuple[int, int]:
+    """Return the physical page and per-buffer block sizes in bytes."""
+    page_size_bytes = (
+        logical_page_size_bytes
+        if padded_page_size_bytes is None
+        else padded_page_size_bytes
+    )
+    if page_size_bytes < logical_page_size_bytes:
+        raise ValueError(
+            f"physical page size ({page_size_bytes}) is smaller than the "
+            f"logical KV page ({logical_page_size_bytes})")
+    if page_size_bytes % num_k_or_v != 0:
+        raise ValueError(
+            f"physical page size ({page_size_bytes}) is not divisible by "
+            f"the K/V count ({num_k_or_v})")
+
+    block_mem_bytes = page_size_bytes // num_k_or_v
+    if block_mem_bytes % dtype.itemsize != 0:
+        raise ValueError(
+            f"per-buffer block size ({block_mem_bytes}) is not aligned to "
+            f"dtype size ({dtype.itemsize})")
+    if (page_size_bytes != logical_page_size_bytes
+            and kernel_blocks_per_page > 1):
+        raise NotImplementedError(
+            "kvcached cannot represent a padded virtual KV page that is split "
+            "into multiple kernel blocks with one strided tensor view")
+    return page_size_bytes, block_mem_bytes
+
+
 def build_kv_views(
     raw_kv_tensors: List[torch.Tensor],
     kvcache_shape: Tuple[int, ...],
@@ -95,6 +130,7 @@ def build_kv_views(
     gpu_mem_bytes_per_layer_k_or_v: int,
     num_layers: int,
     kernel_block_size: Optional[int] = None,
+    padded_page_size_bytes: Optional[int] = None,
 ) -> Tuple[List[torch.Tensor], int]:
     """Reinterpret already-allocated raw KV pools as per-layer KV views.
 
@@ -105,7 +141,8 @@ def build_kv_views(
     groups with different ``(block_size, num_kv_heads, head_size)`` but identical
     ``block_mem_size``) build a DIFFERENT view per group over the SAME physical
     pools. Returns ``(kv_tensors, page_size_bytes)``. Non-contiguous layout only
-    for heterogeneous callers.
+    for heterogeneous callers. ``padded_page_size_bytes`` is vLLM's unified
+    physical page size; when omitted, the logical tensor geometry is unchanged.
     """
     is_mla = attention_type == "MLA"
     unified_pool = attention_type == "HYBRID_LINEAR"
@@ -133,9 +170,16 @@ def build_kv_views(
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
 
-    page_size_bytes = math.prod(
+    logical_page_size_bytes = math.prod(
         actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
     ) * dtype.itemsize
+    page_size_bytes, block_mem_bytes = _resolve_page_geometry(
+        logical_page_size_bytes,
+        padded_page_size_bytes,
+        num_k_or_v,
+        dtype,
+        ratio,
+    )
 
     kernel_kvcache_shape: List[int] = list(actual_kvcache_shape)
     if ratio > 1:
@@ -146,11 +190,19 @@ def build_kv_views(
     if not _contiguous_layout:
         kv_tensors: List[torch.Tensor] = []
         if is_mla:
-            num_eles = math.prod(kernel_kvcache_shape)
-            kv_tensors = [
-                t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
-                for t in raw_kv_tensors
-            ]
+            if page_size_bytes == logical_page_size_bytes:
+                num_eles = math.prod(kernel_kvcache_shape)
+                kv_tensors = [
+                    t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
+                    for t in raw_kv_tensors
+                ]
+            else:
+                strides = list(torch.empty(kernel_kvcache_shape).stride())
+                strides[blocks_dim_idx] = block_mem_bytes // dtype.itemsize
+                kv_tensors = [
+                    torch.as_strided(t.view(dtype=dtype), kernel_kvcache_shape, strides)
+                    for t in raw_kv_tensors
+                ]
         else:
             shape = list(kernel_kvcache_shape)
             strides = [0] * len(shape)
@@ -158,6 +210,11 @@ def build_kv_views(
             for i in range(len(shape) - 2, 1, -1):
                 strides[i] = strides[i + 1] * shape[i + 1]
             hidden_size_eles = strides[2] * shape[2]
+            block_stride_eles = (
+                block_mem_bytes // dtype.itemsize
+                if page_size_bytes != logical_page_size_bytes
+                else hidden_size_eles
+            )
             if unified_pool:
                 if blocks_dim_idx == 1:
                     strides[1] = 2 * hidden_size_eles
@@ -168,10 +225,10 @@ def build_kv_views(
             else:
                 v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
                 if blocks_dim_idx == 1:
-                    strides[1] = hidden_size_eles
+                    strides[1] = block_stride_eles
                     strides[0] = v_offset_eles
                 else:
-                    strides[0] = hidden_size_eles
+                    strides[0] = block_stride_eles
                     strides[1] = v_offset_eles
             for t in raw_kv_tensors:
                 kv_tensors.append(
@@ -180,13 +237,37 @@ def build_kv_views(
     # (heterogeneous grouping requires the non-contiguous layout and
     # excludes hybrid-linear); the kernel-block-granular contiguous view
     # for the unified pool lives in alloc_kv_cache.
-    else:
+    elif page_size_bytes == logical_page_size_bytes:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         kv_tensors = [
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
+        ]
+    else:
+        shape = list(kernel_kvcache_shape)
+        strides = list(torch.empty(shape).stride())
+        page_stride_eles = page_size_bytes // dtype.itemsize
+        block_stride_eles = num_layers * page_stride_eles
+        kv_stride_eles = block_mem_bytes // dtype.itemsize
+        if is_mla:
+            strides[blocks_dim_idx] = block_stride_eles
+        elif blocks_dim_idx == 1:
+            strides[1] = block_stride_eles
+            strides[0] = kv_stride_eles
+        else:
+            strides[0] = block_stride_eles
+            strides[1] = kv_stride_eles
+        flat = raw_kv_tensors[0].view(dtype=dtype)
+        kv_tensors = [
+            torch.as_strided(
+                flat,
+                shape,
+                strides,
+                storage_offset=i * page_stride_eles,
+            )
+            for i in range(num_layers)
         ]
 
     return kv_tensors, page_size_bytes
@@ -203,6 +284,7 @@ def alloc_kv_cache(
     group_id: int = 0,
     kernel_block_size: Optional[int] = None,
     return_meta: bool = False,
+    padded_page_size_bytes: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """Allocate KV cache tensors for all supported attention types.
 
@@ -217,6 +299,9 @@ def alloc_kv_cache(
       - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
     For MLA, kvcache_shape is expected to be:
       - (num_blocks, block_size, head_size)
+
+    ``padded_page_size_bytes`` must be provided when vLLM pads attention pages
+    during page-size unification. It controls both capacity and block strides.
 
     ``attention_type="HYBRID_LINEAR"`` selects the layout for hybrid
     models that mix full attention with linear attention (mamba/SSM).
@@ -293,7 +378,7 @@ def alloc_kv_cache(
             )
         blocks_dim_idx = 0
         permute_order = list(range(len(kvcache_shape)))
-        block_mem_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize
+        logical_page_size_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize
     else:
         # MHA/GQA shape with K/V dimension
         if (len(kvcache_shape) <= 3
@@ -312,7 +397,17 @@ def alloc_kv_cache(
         else:
             raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
-        block_mem_bytes = math.prod(kvcache_shape[2:]) * dtype.itemsize
+        logical_page_size_bytes = math.prod(
+            kvcache_shape[:blocks_dim_idx] + kvcache_shape[blocks_dim_idx + 1:]
+        ) * dtype.itemsize
+
+    page_size_bytes, block_mem_bytes = _resolve_page_geometry(
+        logical_page_size_bytes,
+        padded_page_size_bytes,
+        num_k_or_v,
+        dtype,
+        ratio,
+    )
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
@@ -362,10 +457,6 @@ def alloc_kv_cache(
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
 
-    page_size_bytes = math.prod(
-        actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
-    ) * dtype.itemsize
-
     # Build a second shape expressed at kernel-block granularity. vLLM's zero
     # kernel and attention kernels index the KV tensor using ``kernel_bs``-
     # token blocks; each virtual block is ``ratio`` contiguous kernel blocks.
@@ -381,11 +472,19 @@ def alloc_kv_cache(
     if not _contiguous_layout:
         kv_tensors: List[torch.Tensor] = []
         if is_mla:
-            num_eles = math.prod(kernel_kvcache_shape)
-            kv_tensors = [
-                t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
-                for t in raw_kv_tensors
-            ]
+            if page_size_bytes == logical_page_size_bytes:
+                num_eles = math.prod(kernel_kvcache_shape)
+                kv_tensors = [
+                    t.view(dtype=dtype)[:num_eles].view(kernel_kvcache_shape)
+                    for t in raw_kv_tensors
+                ]
+            else:
+                strides = list(torch.empty(kernel_kvcache_shape).stride())
+                strides[blocks_dim_idx] = block_mem_bytes // dtype.itemsize
+                kv_tensors = [
+                    torch.as_strided(t.view(dtype=dtype), kernel_kvcache_shape, strides)
+                    for t in raw_kv_tensors
+                ]
         else:
             # Build attention view with as_strided. Two modes:
             #   split-half (default): K occupies [0, v_offset), V occupies
@@ -403,6 +502,11 @@ def alloc_kv_cache(
                 strides[i] = strides[i + 1] * shape[i + 1]
             # hidden_size_eles uses kernel_block_size (shape[2]), not block_size.
             hidden_size_eles = strides[2] * shape[2]  # = kernel_bs * h * d
+            block_stride_eles = (
+                block_mem_bytes // dtype.itemsize
+                if page_size_bytes != logical_page_size_bytes
+                else hidden_size_eles
+            )
             if unified_pool:
                 # Block-interleaved at kernel granularity: inter-(kernel-)block
                 # stride = 2*hidden_size; K/V dim stride = hidden_size.
@@ -415,10 +519,10 @@ def alloc_kv_cache(
             else:
                 v_offset_eles = gpu_mem_bytes_per_layer_k_or_v // dtype.itemsize
                 if blocks_dim_idx == 1:          # FlashAttn (2, N*ratio, ...)
-                    strides[1] = hidden_size_eles
+                    strides[1] = block_stride_eles
                     strides[0] = v_offset_eles
                 else:                             # FlashInfer (N*ratio, 2, ...)
-                    strides[0] = hidden_size_eles
+                    strides[0] = block_stride_eles
                     strides[1] = v_offset_eles
             for t in raw_kv_tensors:
                 kv_tensors.append(
@@ -450,13 +554,37 @@ def alloc_kv_cache(
                              storage_offset=i * 2 * hidden_size_eles)
             for i in range(num_layers)
         ]
-    else:
+    elif page_size_bytes == logical_page_size_bytes:
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
         num_eles = math.prod(contiguous_shape)
         contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
         kv_tensors = [
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
+        ]
+    else:
+        shape = list(kernel_kvcache_shape)
+        strides = list(torch.empty(shape).stride())
+        page_stride_eles = page_size_bytes // dtype.itemsize
+        block_stride_eles = num_layers * page_stride_eles
+        kv_stride_eles = block_mem_bytes // dtype.itemsize
+        if is_mla:
+            strides[blocks_dim_idx] = block_stride_eles
+        elif blocks_dim_idx == 1:
+            strides[1] = block_stride_eles
+            strides[0] = kv_stride_eles
+        else:
+            strides[0] = block_stride_eles
+            strides[1] = kv_stride_eles
+        flat = raw_kv_tensors[0].view(dtype=dtype)
+        kv_tensors = [
+            torch.as_strided(
+                flat,
+                shape,
+                strides,
+                storage_offset=i * page_stride_eles,
+            )
+            for i in range(num_layers)
         ]
 
     meta = {
@@ -465,6 +593,7 @@ def alloc_kv_cache(
         "gpu_mem_bytes_per_layer_k_or_v": gpu_mem_bytes_per_layer_k_or_v,
         "num_layers": num_layers,
         "dtype": dtype,
+        "page_size_bytes": page_size_bytes,
     }
 
     if not unified_pool:
