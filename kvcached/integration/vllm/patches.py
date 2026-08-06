@@ -306,12 +306,16 @@ def _get_max_cached_blocks(block_size: int) -> int:
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns MAX_CACHED_TOKENS // block_size.
+    Otherwise returns MAX_CACHED_TOKENS // block_size, floored at 1 so that a
+    positive token budget smaller than block_size still keeps prefix caching
+    enabled instead of silently disabling it.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
     if MAX_CACHED_TOKENS < 0:
         return -1
-    return MAX_CACHED_TOKENS // block_size
+    if MAX_CACHED_TOKENS == 0:
+        return 0
+    return max(1, MAX_CACHED_TOKENS // block_size)
 
 
 def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
