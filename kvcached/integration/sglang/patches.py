@@ -150,8 +150,21 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
-            alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
-            alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+            try:
+                alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
+                alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+            except AttributeError:
+                from sglang.srt.mem_cache.triton_ops import allocator as triton_allocator
+
+                alloc_extend_kernel = triton_allocator.alloc_extend_kernel
+                alloc_decode_kernel = triton_allocator.alloc_decode_kernel
+
+            alloc_extend_kernel_fn = getattr(
+                alloc_extend_kernel, "fn", alloc_extend_kernel
+            )
+            alloc_extend_param_names = tuple(
+                inspect.signature(alloc_extend_kernel_fn).parameters
+            )
 
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
@@ -205,6 +218,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     seq_lens_cpu: torch.Tensor,
                     last_loc: torch.Tensor,
                     extend_num_tokens: int,
+                    num_new_pages: Optional[int] = None,
                 ):
                     self.seen_max_num_extend_tokens_next_power_of_2 = max(
                         self.seen_max_num_extend_tokens_next_power_of_2,
@@ -212,11 +226,12 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
                     bs = len(prefix_lens)
 
-                    num_new_pages = get_num_new_pages(
-                        seq_lens=seq_lens_cpu,
-                        page_size=self.page_size,
-                        prefix_lens=prefix_lens_cpu,
-                    )
+                    if num_new_pages is None:
+                        num_new_pages = get_num_new_pages(
+                            seq_lens=seq_lens_cpu,
+                            page_size=self.page_size,
+                            prefix_lens=prefix_lens_cpu,
+                        )
 
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
@@ -231,16 +246,25 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     out_indices = torch.empty(
                         (extend_num_tokens,), dtype=torch.int64, device=self.device
                     )
-                    alloc_extend_kernel[(bs,)](
-                        prefix_lens,
-                        seq_lens,
-                        last_loc,
-                        free_pages,
-                        out_indices,
-                        next_power_of_2(bs),
-                        self.page_size,
-                        self.seen_max_num_extend_tokens_next_power_of_2,
-                    )
+                    kernel_kwargs: dict[str, Any] = {
+                        "pre_lens_ptr": prefix_lens,
+                        "seq_lens_ptr": seq_lens,
+                        "last_loc_ptr": last_loc,
+                        "free_page_ptr": free_pages,
+                        "out_indices": out_indices,
+                        "bs_upper": next_power_of_2(bs),
+                        "page_size": self.page_size,
+                    }
+                    if "ret_values" in alloc_extend_param_names:
+                        kernel_kwargs["ret_values"] = torch.empty(
+                            (), dtype=torch.int64, device=self.device
+                        )
+                    if "max_num_extend_tokens" in alloc_extend_param_names:
+                        kernel_kwargs["max_num_extend_tokens"] = (
+                            self.seen_max_num_extend_tokens_next_power_of_2
+                        )
+
+                    alloc_extend_kernel[(bs,)](**kernel_kwargs)
                     return out_indices
 
                 def alloc_decode(
@@ -1234,8 +1258,8 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
 
         Older SGLang keeps the whole check in a single Scheduler method whose
         source mentions ``token_to_kv_pool_allocator``.  Newer SGLang
-        (>=0.5.11) moved it into ``SchedulerRuntimeCheckerMixin`` and split it
-        across several small methods (e.g. ``_check_req_pool`` raises directly,
+        moved it into helpers such as ``SchedulerRuntimeCheckerMixin`` or
+        ``SchedulerInvariantChecker`` (e.g. ``_check_req_pool`` raises directly,
         ``_report_leak`` is the generic choke point for *token/KV* pool leaks).
 
         We suppress only the leak checks for pools kvcached actually manages
@@ -1251,23 +1275,31 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
         if Scheduler is None:
             return False
 
-        target_method_names: List[str] = []
-        for name, fn in inspect.getmembers(Scheduler, predicate=inspect.isfunction):
-            try:
-                src = inspect.getsource(fn)
-            except Exception:
-                continue
-            if "memory leak detected" not in src:
-                continue
-            # Skip a check that is specific to the request pool, which kvcached
-            # does not manage.  The generic reporter names no pool (so it is not
-            # excluded) and the legacy combined check names the KV allocator.
-            if "req_to_token_pool" in src and "token_to_kv_pool" not in src:
-                continue
-            target_method_names.append(name)
+        target_classes: List[Tuple[str, Any]] = [("Scheduler", Scheduler)]
+        InvariantChecker = getattr(sched_mod, "SchedulerInvariantChecker", None)
+        if InvariantChecker is not None:
+            target_classes.append(("SchedulerInvariantChecker", InvariantChecker))
 
-        if not target_method_names:
-            self.logger.debug("No memory leak detection method found in Scheduler")
+        target_methods: List[Tuple[str, Any, str]] = []
+        for class_name, cls in target_classes:
+            for name, fn in inspect.getmembers(cls, predicate=inspect.isfunction):
+                try:
+                    src = inspect.getsource(fn)
+                except Exception:
+                    continue
+                if "memory leak detected" not in src:
+                    continue
+                # Skip a check that is specific to the request pool, which kvcached
+                # does not manage.  The generic reporter names no pool (so it is not
+                # excluded) and the legacy combined check names the KV allocator.
+                if "req_to_token_pool" in src and "token_to_kv_pool" not in src:
+                    continue
+                target_methods.append((class_name, cls, name))
+
+        if not target_methods:
+            self.logger.debug(
+                "No memory leak detection method found in SGLang scheduler"
+            )
             return False
 
         def _make_wrapped(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -1283,17 +1315,18 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
             return _wrapped
 
         patched_any = False
-        for target_method_name in target_method_names:
-            original = getattr(Scheduler, target_method_name)
+        for class_name, cls, target_method_name in target_methods:
+            original = getattr(cls, target_method_name)
             if self._is_already_patched(original):
                 self.logger.debug(
-                    f"Scheduler.{target_method_name} leak check already patched")
+                    f"{class_name}.{target_method_name} leak check already patched"
+                )
                 patched_any = True
                 continue
 
             wrapped = _make_wrapped(original)
             self._mark_as_patched(wrapped)
-            setattr(Scheduler, target_method_name, wrapped)
+            setattr(cls, target_method_name, wrapped)
             patched_any = True
 
         return patched_any
