@@ -552,6 +552,29 @@ class TestEdgeCases:
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         assert len(pool._cached_blocks) == 2
 
+    def test_duplicate_hashes_keep_each_block_metadata(self, pool_and_manager):
+        """Concurrent requests may materialize the same prefix twice."""
+        pool, _ = pool_and_manager
+        first = pool.get_new_blocks(1)
+        second = pool.get_new_blocks(1)
+        req = MockRequest(["shared-prefix"])
+
+        pool.cache_full_blocks(req, first, 0, 1, 16, 0)
+        pool.cache_full_blocks(req, second, 0, 1, 16, 0)
+
+        assert first[0].block_hash is not None
+        assert second[0].block_hash == first[0].block_hash
+        assert len(pool._cached_blocks) == 1
+        assert pool.get_cached_block("shared-prefix", [0]) is not None
+
+        _finish_request(pool, first)
+        _finish_request(pool, second)
+        pool._evict_blocks_from_pool(1)
+
+        assert first[0].block_hash is None
+        assert second[0].block_hash is not None
+        assert pool.get_cached_block("shared-prefix", [0]) == [second[0]]
+
     def test_reuse_after_eviction_and_realloc(self, pool_factory):
         """After eviction, block IDs can be reallocated and recached."""
         pool, mgr = pool_factory(5)  # +1 for null_block
