@@ -61,6 +61,10 @@ dev = [
     "wheel",
 ]
 
+[tool.pytest.ini_options]
+# Run `async def` tests and fixtures on asyncio without per-test markers.
+asyncio_mode = "auto"
+
 [tool.setuptools]
 include-package-data = true
 
