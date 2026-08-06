@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import inspect
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -312,6 +313,65 @@ def _get_max_cached_blocks(block_size: int) -> int:
     if MAX_CACHED_TOKENS < 0:
         return -1
     return MAX_CACHED_TOKENS // block_size
+
+
+def _cache_dtype_str(model_runner: Any) -> Optional[str]:
+    """Extract the KV cache dtype string from a GPUModelRunner, if available."""
+    cache_config = getattr(model_runner, "cache_config", None)
+    if cache_config is None:
+        vllm_config = getattr(model_runner, "vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+    return getattr(cache_config, "cache_dtype", None)
+
+
+def _get_kv_cache_shape_compat(attn_backend: Any, num_blocks: int,
+                               block_size: int, num_kv_heads: int,
+                               head_size: int,
+                               cache_dtype_str: Optional[str]) -> Any:
+    """Call ``get_kv_cache_shape``, forwarding ``cache_dtype_str`` when the
+    backend's signature accepts it.
+
+    Per-token-head quantization modes (fp8_per_token_head,
+    int8_per_token_head, nvfp4) widen ``head_size`` by a few elements to
+    inline per-head scales into the KV page. Omitting ``cache_dtype_str``
+    makes the backend compute the un-widened shape, so every page stride is
+    wrong and output is garbled (#424). Older vLLM versions do not take the
+    parameter, so it is only forwarded when declared.
+
+    Module-level so it is unit-testable without an installed vLLM or a GPU.
+    """
+    if cache_dtype_str is not None:
+        try:
+            declares_dtype = "cache_dtype_str" in inspect.signature(
+                attn_backend.get_kv_cache_shape).parameters
+        except (TypeError, ValueError):
+            declares_dtype = False
+        if declares_dtype:
+            return attn_backend.get_kv_cache_shape(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size,
+                cache_dtype_str=cache_dtype_str,
+            )
+    return attn_backend.get_kv_cache_shape(num_blocks, block_size,
+                                           num_kv_heads, head_size)
+
+
+def _kv_cache_uses_inline_scales(cache_dtype_str: Optional[str]) -> bool:
+    """Whether this KV cache dtype inlines per-token-head scales in the page.
+
+    Prefers vLLM's own predicate when available; falls back to a string
+    heuristic on versions that do not expose it.
+    """
+    if not cache_dtype_str:
+        return False
+    try:
+        from vllm.utils.torch_utils import kv_cache_uses_per_token_head_scales
+        return bool(kv_cache_uses_per_token_head_scales(cache_dtype_str))
+    except ImportError:
+        pass
+    return "per_token_head" in cache_dtype_str or cache_dtype_str == "nvfp4"
 
 
 def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
@@ -1245,11 +1305,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             dtype = kv_cache_spec.dtype
             num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
             assert num_blocks >= kv_cache_config.num_blocks
-            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+            kv_cache_shape = _get_kv_cache_shape_compat(
+                self.attn_backend,
                 num_blocks,
                 kv_cache_spec.block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
+                _cache_dtype_str(self),
             )
 
             kv_cache_buffers = kvi.alloc_kv_cache(
@@ -1360,12 +1422,29 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
                 set_kv_cache_layout(selected_layout)
 
-            kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
+            cache_dtype = _cache_dtype_str(self)
+            kv_cache_shape = _get_kv_cache_shape_compat(
+                attn_backend_cls,
                 num_blocks,
                 kv_cache_spec.block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
+                cache_dtype,
             )
+
+            from kvcached.utils import CONTIGUOUS_LAYOUT
+            if CONTIGUOUS_LAYOUT and _kv_cache_uses_inline_scales(cache_dtype):
+                # Verified on an L40S (vLLM 0.20, TRITON_ATTN, Qwen3-0.6B):
+                # with inline scales the widened K+V block bytes no longer
+                # divide the physical page size, the contiguous layout's
+                # linear block math breaks, and output is garbled even when
+                # the widened shape above is correct. The non-contiguous
+                # layout produces output identical to vLLM without kvcached.
+                raise NotImplementedError(
+                    "kvcached contiguous layout does not support per-token-"
+                    f"head KV cache quantization (kv_cache_dtype="
+                    f"{cache_dtype}). Re-launch with "
+                    "KVCACHED_CONTIGUOUS_LAYOUT=false.")
 
             if attention_type == "HYBRID_LINEAR":
                 # The unified-pool layout math (both layouts; load-bearing for
@@ -1505,9 +1584,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     gbackend = patch_instance._get_version_specific_attention_backend(
                         self, kv_cache_group_id=gid
                     )
-                    gshape = gbackend.get_kv_cache_shape(
-                        num_blocks, gspec.block_size, gspec.num_kv_heads,
-                        gspec.head_size,
+                    gshape = _get_kv_cache_shape_compat(
+                        gbackend, num_blocks, gspec.block_size,
+                        gspec.num_kv_heads, gspec.head_size,
+                        _cache_dtype_str(self),
                     )
                     gkbs = (kernel_block_sizes[gid]
                             if kernel_block_sizes is not None
