@@ -27,6 +27,24 @@ def _is_supported_gpu_device(device: str) -> bool:
     return device_str.startswith("cuda") or device_str.startswith("hip")
 
 
+def _free_page_ids(free_index: Any, page_size: int) -> List[int]:
+    """Derive the unique page ids covered by ``free_index`` as Python ints.
+
+    The allocator backend only needs page-id integers for bookkeeping, so the
+    tensor is moved to CPU *before* the unique/int conversion. Running
+    ``torch.unique`` on a GPU ``free_index`` would couple free bookkeeping to
+    CUDA execution and synchronization behavior, which is fragile on
+    high-concurrency serving paths.
+
+    Module-level (rather than a method on the injected allocator class) so it
+    is unit-testable without an installed SGLang or a GPU.
+    """
+    import torch
+
+    free_index_cpu = free_index.cpu()
+    return torch.unique(free_index_cpu // page_size).tolist()
+
+
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticTokenToKVPoolAllocator into SGLang's allocator module"""
 
@@ -283,12 +301,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         return
 
                     if self.is_not_in_free_group:
-                        page_ids = torch.unique(free_index // self.page_size)
-                        try:
-                            indices: list[int] = page_ids.cpu().numpy().tolist()
-                        except Exception:
-                            indices = list(page_ids)
-                        return self.kvcached_allocator.free(indices)
+                        return self.kvcached_allocator.free(
+                            _free_page_ids(free_index, self.page_size)
+                        )
                     else:
                         self.free_group.append(free_index)
 
