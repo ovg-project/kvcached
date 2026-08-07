@@ -77,6 +77,7 @@ private:
   bool contiguous_layout_;
   bool unified_pool_;
   size_t kv_tensor_size_per_layer_;
+  size_t physical_bytes_per_offset_;
 
   mutable std::mutex mtx_;
   // For per-layer layout: one tensor per layer

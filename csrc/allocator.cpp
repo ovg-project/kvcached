@@ -1,9 +1,20 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -12,6 +23,128 @@
 #include "page.hpp"
 
 namespace kvcached {
+namespace {
+
+int resolve_device_index(const c10::Device &device) {
+  return device.index() >= 0 ? device.index() : gpu_vmm::current_device();
+}
+
+double gpu_utilization_limit() {
+  constexpr double kDefaultUtilization = 0.95;
+  const char *value = std::getenv("KVCACHED_GPU_UTILIZATION");
+  if (value == nullptr || *value == '\0') {
+    return kDefaultUtilization;
+  }
+
+  char *end = nullptr;
+  errno = 0;
+  const double parsed = std::strtod(value, &end);
+  if (errno != 0 || end == value || *end != '\0' || parsed <= 0.0 ||
+      parsed > 1.0) {
+    throw std::runtime_error(
+        "KVCACHED_GPU_UTILIZATION must be in the range (0, 1]");
+  }
+  return parsed;
+}
+
+std::string physical_gpu_lock_path(int dev_idx) {
+  char pci_bus_id[64] = {};
+  const auto status = gpu_vmm::device_get_pci_bus_id(
+      pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), dev_idx);
+  if (!gpu_vmm::is_success(status)) {
+    throw std::runtime_error(std::string("failed to resolve physical GPU: ") +
+                             gpu_vmm::error_string(status));
+  }
+
+  std::string key(pci_bus_id);
+  for (char &value : key) {
+    if (!std::isalnum(static_cast<unsigned char>(value))) {
+      value = '_';
+    }
+  }
+
+  const char *configured_dir = std::getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR");
+  std::string lock_dir = configured_dir != nullptr && *configured_dir != '\0'
+                             ? configured_dir
+                             : "/tmp";
+  while (lock_dir.size() > 1 && lock_dir.back() == '/') {
+    lock_dir.pop_back();
+  }
+  return lock_dir + "/kvcached-physical-growth-" + key + ".lock";
+}
+
+class PhysicalGrowthGuard {
+public:
+  PhysicalGrowthGuard(int dev_idx, size_t required_bytes) : fd_(-1) {
+    const std::string path = physical_gpu_lock_path(dev_idx);
+    fd_ = open(path.c_str(), O_CREAT | O_CLOEXEC | O_RDWR, 0660);
+    if (fd_ < 0) {
+      throw std::runtime_error("failed to open physical GPU growth lock " +
+                               path + ": " + std::strerror(errno));
+    }
+    if (flock(fd_, LOCK_EX) != 0) {
+      const int lock_errno = errno;
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("failed to acquire physical GPU growth lock " +
+                               path + ": " + std::strerror(lock_errno));
+    }
+
+    try {
+      const auto device_status = gpu_vmm::set_device(dev_idx);
+      if (!gpu_vmm::is_success(device_status)) {
+        throw std::runtime_error(
+            std::string("failed to select physical GPU: ") +
+            gpu_vmm::error_string(device_status));
+      }
+
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      const auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+      if (!gpu_vmm::is_success(status)) {
+        throw std::runtime_error(std::string("GPU memory query failed: ") +
+                                 gpu_vmm::error_string(status));
+      }
+      const size_t headroom = static_cast<size_t>(
+          static_cast<double>(total_bytes) * (1.0 - gpu_utilization_limit()));
+      const size_t usable_bytes =
+          free_bytes > headroom ? free_bytes - headroom : 0;
+      if (required_bytes > usable_bytes) {
+        throw std::runtime_error(
+            "capacity_exhausted: physical GPU headroom would be crossed");
+      }
+    } catch (...) {
+      (void)flock(fd_, LOCK_UN);
+      (void)close(fd_);
+      fd_ = -1;
+      throw;
+    }
+  }
+
+  PhysicalGrowthGuard(const PhysicalGrowthGuard &) = delete;
+  PhysicalGrowthGuard &operator=(const PhysicalGrowthGuard &) = delete;
+
+  ~PhysicalGrowthGuard() {
+    if (fd_ >= 0) {
+      (void)flock(fd_, LOCK_UN);
+      (void)close(fd_);
+    }
+  }
+
+private:
+  int fd_;
+};
+
+size_t checked_transaction_bytes(size_t bytes_per_offset, size_t offset_count) {
+  if (offset_count != 0 &&
+      bytes_per_offset > std::numeric_limits<size_t>::max() / offset_count) {
+    throw std::overflow_error("KV mapping transaction size overflow");
+  }
+  return bytes_per_offset * offset_count;
+}
+
+} // namespace
+
 // Global configurable page size
 size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 
@@ -54,7 +187,8 @@ static inline size_t get_v_base_offset(const at::Tensor &tensor) {
 FTensorAllocator::FTensorAllocator(const c10::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
-      unified_pool_(false), kv_tensor_size_per_layer_(0) {
+      unified_pool_(false), kv_tensor_size_per_layer_(0),
+      physical_bytes_per_offset_(0) {
   if (dev_.is_cuda()) {
     init_gpu_();
   }
@@ -124,8 +258,15 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
   std::lock_guard<std::mutex> lock(mtx_);
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
+  if (num_layers <= 0 || num_kv_buffers <= 0) {
+    throw std::invalid_argument(
+        "num_layers and num_kv_buffers must both be positive");
+  }
   num_layers_ = num_layers;
   unified_pool_ = unified_pool;
+  physical_bytes_per_offset_ = checked_transaction_bytes(
+      checked_transaction_bytes(kPageSize, static_cast<size_t>(num_layers)),
+      static_cast<size_t>(num_kv_buffers));
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
   if (size % kPageSize != 0) {
@@ -163,6 +304,14 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   if (num_layers_ == 0) {
     LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
     return false;
+  }
+
+  std::unique_ptr<PhysicalGrowthGuard> growth_guard;
+  if (dev_.is_cuda() && !offsets.empty()) {
+    const size_t required_bytes =
+        checked_transaction_bytes(physical_bytes_per_offset_, offsets.size());
+    growth_guard = std::make_unique<PhysicalGrowthGuard>(
+        resolve_device_index(dev_), required_bytes);
   }
 
   if (contiguous_layout_) {

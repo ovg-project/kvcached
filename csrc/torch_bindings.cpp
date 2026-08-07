@@ -108,6 +108,11 @@ void page_allocator_trim(std::shared_ptr<PageAllocator> allocator) {
   allocator->trim();
 }
 
+void page_allocator_set_physical_page_limit(
+    std::shared_ptr<PageAllocator> allocator, int64_t max_pages) {
+  allocator->set_physical_page_limit(max_pages);
+}
+
 void page_allocator_reset_free_page_order(
     std::shared_ptr<PageAllocator> allocator) {
   allocator->reset_free_page_order();
@@ -136,6 +141,21 @@ int64_t page_allocator_get_num_reserved_pages(
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
+}
+
+int64_t page_allocator_get_physical_page_limit(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_physical_page_limit();
+}
+
+int64_t
+page_allocator_get_num_mapped_pages(std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_num_mapped_pages();
+}
+
+int64_t page_allocator_get_num_physical_limit_remaining_pages(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_num_physical_limit_remaining_pages();
 }
 
 int64_t page_allocator_check_and_get_resize_target(
@@ -227,6 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("trim", &kvcached::page_allocator_trim,
            py::call_guard<py::gil_scoped_release>())
+      .def("set_physical_page_limit",
+           &kvcached::page_allocator_set_physical_page_limit,
+           py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
            &kvcached::page_allocator_reset_free_page_order)
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
@@ -236,6 +259,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("get_physical_page_limit",
+           &kvcached::page_allocator_get_physical_page_limit)
+      .def("get_num_mapped_pages",
+           &kvcached::page_allocator_get_num_mapped_pages)
+      .def("get_num_physical_limit_remaining_pages",
+           &kvcached::page_allocator_get_num_physical_limit_remaining_pages)
       .def("check_and_get_resize_target",
            &kvcached::page_allocator_check_and_get_resize_target)
       .def("get_resize_target", &kvcached::page_allocator_get_resize_target)

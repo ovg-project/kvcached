@@ -71,6 +71,7 @@ public:
   // Memory management
   bool resize(int64_t new_mem_size);
   void trim();
+  void set_physical_page_limit(int64_t max_pages);
 
   // Status queries
   int64_t get_num_free_pages() const;
@@ -78,6 +79,9 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   int64_t get_avail_physical_pages() const;
+  int64_t get_physical_page_limit() const;
+  int64_t get_num_mapped_pages() const;
+  int64_t get_num_physical_limit_remaining_pages() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
   // (e.g. `kvctl limit`) has written a new total_size. Returns the new
@@ -129,6 +133,9 @@ private:
   void start_prealloc_thread_internal();
   void stop_prealloc_thread_internal();
   bool should_use_worker_ipc() const;
+  int64_t get_num_mapped_or_pending_pages_unlocked() const;
+  int64_t get_num_physical_limit_remaining_pages_unlocked() const;
+  int64_t get_avail_unlimited_physical_pages() const;
 
   // Configuration
   int64_t num_layers_;
@@ -146,6 +153,9 @@ private:
   // Memory tracking
   int64_t num_free_pages_;
   int64_t num_total_pages_;
+  int64_t physical_page_limit_;
+  int64_t pending_foreground_pages_;
+  int64_t pending_prealloc_pages_;
 
   // Page lists
   std::deque<page_id_t> free_page_list_;
