@@ -10,6 +10,7 @@ from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.vllm.nixl_compat import NixlConnectorPatch
 from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
+    VLLM_OFFLOADING_HMA_RANGE,
     VLLM_V8_RANGE,
     VLLM_V9_PLUS_RANGE,
     ElasticBlockPoolPatch,
@@ -18,6 +19,7 @@ from kvcached.integration.vllm.patches import (
     GPUWorkerPatch,
     KVCacheCoordinatorPatch,
     KVCacheManagerPatch,
+    OffloadingConnectorPatch,
 )
 from kvcached.utils import get_kvcached_logger
 
@@ -46,6 +48,9 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
+            # Issue #267: backport vLLM 0.21+ SupportsHMA fix for
+            # OffloadingConnector to older vLLM versions (0.16-0.20).
+            (OffloadingConnectorPatch(), VLLM_OFFLOADING_HMA_RANGE),
         ]
     )
 

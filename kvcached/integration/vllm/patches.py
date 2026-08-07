@@ -258,6 +258,13 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+# vLLM versions where OffloadingConnector exists but does NOT declare
+# SupportsHMA. Upstream vLLM 0.21.0 added the SupportsHMA inheritance and
+# request_finished_all_groups method; on >=0.21.0 our backport patch
+# self-disables via can_apply(). Lower bound is 0.16.0 since that is when
+# the HMA gate (factory.py: "does not support HMA but HMA is enabled")
+# was introduced. See issue #267.
+VLLM_OFFLOADING_HMA_RANGE = ">=0.16.0,<0.21.0"
 
 
 def _get_kv_cache_params(
@@ -1762,4 +1769,127 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class OffloadingConnectorPatch(VersionAwarePatch, BasePatch):
+    """Backport upstream vLLM 0.21+ HMA support to OffloadingConnector.
+
+    Problem (issue #267):
+        On vLLM 0.16-0.20, ``OffloadingConnector`` exists but does NOT
+        declare ``SupportsHMA``. vLLM 0.16+ enables the Hybrid Memory
+        Allocator (HMA) by default, and ``KVConnectorFactory.create_connector``
+        rejects any connector that lacks ``SupportsHMA`` when HMA is on::
+
+            ValueError: Connector OffloadingConnector does not support HMA
+            but HMA is enabled. Please set ``--disable-hybrid-kv-cache-manager``.
+
+        This means ``vllm serve ... --kv-offloading-size N`` fails to start
+        the engine on vLLM 0.16-0.20 unless the user manually disables HMA.
+
+    Fix:
+        Upstream vLLM 0.21.0 fixed this by making ``OffloadingConnector``
+        inherit ``SupportsHMA`` and implementing ``request_finished_all_groups``
+        as a thin delegate to the existing single-group scheduler method.
+        This patch backports the same fix for older vLLM versions.
+
+        For single-group KV cache models (Qwen, Llama, ...; the vast
+        majority today), ``request_finished_all_groups`` is exactly
+        equivalent to vLLM's pre-HMA code path at
+        ``vllm/v1/core/sched/scheduler.py``::
+
+            if not isinstance(self.connector, SupportsHMA):
+                assert len(self.kv_cache_config.kv_cache_groups) == 1
+                return self.connector.request_finished(request, block_ids[0])
+            return self.connector.request_finished_all_groups(request, block_ids)
+
+        For multi-group hybrid-attention models the underlying
+        ``OffloadingConnectorScheduler`` tracks blocks as a single
+        ``list[int]`` per request and has no per-group state, so we raise
+        a clear ``NotImplementedError`` instead of silently corrupting.
+        Such users should still pass ``--disable-hybrid-kv-cache-manager``.
+
+    Self-disables on vLLM >=0.21.0 via ``can_apply()`` (which checks
+    whether ``OffloadingConnector`` already inherits ``SupportsHMA``), so
+    upgrading vLLM never produces a stale/conflicting patch.
+    """
+
+    library = "vllm"
+    target_module = "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector"
+    target_class = "OffloadingConnector"
+    patch_name = "offloading_connector_hma"
+
+    def can_apply(self, target_module: types.ModuleType) -> bool:
+        OC = getattr(target_module, self.target_class, None)
+        if OC is None:
+            return False
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: F401
+                SupportsHMA,
+            )
+        except ImportError:
+            # vLLM too old to have SupportsHMA -> no HMA gate to bypass.
+            return False
+        if issubclass(OC, SupportsHMA):
+            # Upstream-fixed vLLM (>=0.21.0); nothing to backport.
+            return False
+        return True
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.inject_hma_support(target_module)
+
+    @version_range(VLLM_OFFLOADING_HMA_RANGE)
+    def inject_hma_support(self, target_module: types.ModuleType) -> bool:
+        OffloadingConnector = self._get_target_class(target_module)
+        if OffloadingConnector is None:
+            return False
+        if self._is_already_patched(OffloadingConnector, "hma"):
+            self.logger.debug("OffloadingConnector already patched for HMA")
+            return True
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+
+        def request_finished_all_groups(
+            self: Any,
+            request: "Request",
+            block_ids: tuple,
+        ) -> tuple:
+            # Single-group case (Qwen, Llama, MLA, etc.): exactly the
+            # same call vLLM's non-HMA scheduler path makes.
+            if len(block_ids) != 1:
+                raise NotImplementedError(
+                    "OffloadingConnector does not yet support models with "
+                    "multiple KV cache groups (hybrid attention). For now, "
+                    "pass --disable-hybrid-kv-cache-manager when using "
+                    "--kv-offloading-size with such models."
+                )
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.request_finished(request, block_ids[0])
+
+        _HMACompatibleOffloadingConnector = type(
+            OffloadingConnector.__name__,
+            (OffloadingConnector, SupportsHMA),
+            {
+                "__doc__": (
+                    "OffloadingConnector + SupportsHMA "
+                    "(kvcached backport of upstream vLLM 0.21+)."
+                ),
+                "request_finished_all_groups": request_finished_all_groups,
+            },
+        )
+
+        # Preserve identity so factory logs ("Creating v1 connector with name:
+        # %s") and introspection look like the upstream-fixed class rather
+        # than a kvcached-internal one.
+        _HMACompatibleOffloadingConnector.__name__ = OffloadingConnector.__name__
+        _HMACompatibleOffloadingConnector.__qualname__ = OffloadingConnector.__qualname__
+        _HMACompatibleOffloadingConnector.__module__ = OffloadingConnector.__module__
+
+        self._mark_as_patched(_HMACompatibleOffloadingConnector, "hma")
+        # The factory's lazy registry resolves the class via
+        # ``getattr(module, "OffloadingConnector")`` at create_connector
+        # time, so swapping the module attribute is sufficient.
+        setattr(target_module, self.target_class, _HMACompatibleOffloadingConnector)
         return True
