@@ -9,7 +9,7 @@ import importlib
 import os
 import types
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from kvcached.integration.version_utils import VersionManager, VersionRange
 from kvcached.utils import get_kvcached_logger
@@ -25,7 +25,7 @@ class BasePatch(ABC):
     """Base class for all patches"""
 
     library: Optional[str] = None  # Override in subclass ("vllm" or "sglang")
-    target_module: Optional[str] = None  # Module to patch
+    target_module: Optional[Union[str, List[str]]] = None  # Module or modules to patch
     target_class: Optional[str] = None  # Class to patch (optional)
     patch_name: Optional[str] = None  # Human-readable name for logging
 
@@ -125,7 +125,6 @@ class PatchManager:
 
         return results
 
-
     def _is_patch_compatible(self, patch: BasePatch, version_range: str) -> bool:
         """Check if patch is compatible with the current library version"""
         library_version = self.version_manager.detect_version(self.library_name)
@@ -144,29 +143,40 @@ class PatchManager:
 
     def _apply_single_patch(self, patch: BasePatch) -> bool:
         """Apply a single patch"""
-        try:
-            # Import target module
-            if patch.target_module is None:
-                self.logger.error(f"target_module not specified for {patch.patch_name}")
-                return False
-            target_module = importlib.import_module(patch.target_module)
+        if patch.target_module is None:
+            self.logger.error(f"target_module not specified for {patch.patch_name}")
+            return False
 
-            # Check if patch can be applied
+        target_modules = (
+            [patch.target_module]
+            if isinstance(patch.target_module, str)
+            else list(patch.target_module)
+        )
+
+        last_error: Optional[ImportError] = None
+        for target_module_name in target_modules:
+            try:
+                target_module = importlib.import_module(target_module_name)
+            except ImportError as e:
+                last_error = e
+                continue
+
             if not patch.can_apply(target_module):
-                self.logger.debug(f"Skipping {patch.patch_name} - prerequisites not met")
+                self.logger.debug(
+                    f"Skipping {patch.patch_name} for {target_module_name} - prerequisites not met"
+                )
+                continue
+
+            try:
+                return patch.apply(target_module)
+            except Exception as e:
+                self.logger.error(f"Unexpected error applying {patch.patch_name}: {e}")
                 return False
 
-            # Apply the patch
-            return patch.apply(target_module)
-
-        except ImportError as e:
-            self.logger.error(
-                f"Could not import target module {patch.target_module} for {patch.patch_name}: {e}"
-            )
-            return False
-        except Exception as e:
-            self.logger.error(f"Unexpected error applying {patch.patch_name}: {e}")
-            return False
+        self.logger.error(
+            f"Could not import any target module(s) {target_modules} for {patch.patch_name}: {last_error}"
+        )
+        return False
 
 
 def log_patch_results(library_name: str, results: Dict[str, bool]) -> None:
