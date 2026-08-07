@@ -415,6 +415,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # calls _create_buffers() which needs self._group_id.
                     self._group_id = ElasticMHATokenToKVPool._next_group_id
                     ElasticMHATokenToKVPool._next_group_id += 1
+                    # Older SGLang pools do not expose a separate physical
+                    # storage dtype. The parent may call our _create_buffers()
+                    # before returning, so install the logical fallback first.
+                    self.store_dtype = dtype
 
                     super().__init__(
                         size=size,
@@ -432,7 +436,9 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    self.cell_size = self.head_num * self.head_dim * dtype.itemsize
+                    self.cell_size = (
+                        self.head_num * self.head_dim * self.store_dtype.itemsize
+                    )
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
@@ -494,7 +500,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 self.head_num,
                                 self.head_dim,
                             ),
-                            dtype=self.dtype,
+                            dtype=self.store_dtype,
                             device=self.device,
                             num_layers=self.layer_num,
                             page_size=self.page_size,
@@ -512,7 +518,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.head_num * self.head_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self.store_dtype.itemsize
 
                     k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
                     v_size_bytes = k_size_bytes
@@ -605,15 +611,23 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         start_layer,
                         end_layer,
                     )
+                    self.store_dtype = getattr(
+                        self, "store_dtype", getattr(self, "dtype", dtype)
+                    )
 
                     # MLA-specific attributes (mirroring MLATokenToKVPool)
                     self.kv_lora_rank = kv_lora_rank
                     self.qk_rope_head_dim = qk_rope_head_dim
                     self.use_nsa = kwargs.get("use_nsa", False)
-                    self.nsa_kv_cache_store_fp8 = (
-                        self.use_nsa and dtype == torch.float8_e4m3fn
-                    )
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.nsa_kv_cache_store_fp8 = (
+                        self.use_nsa
+                        and override_kv_cache_dim is not None
+                        and (
+                            dtype == torch.float8_e4m3fn
+                            or self.store_dtype == torch.float8_e4m3fn
+                        )
+                    )
                     self.kv_cache_dim = (
                         override_kv_cache_dim
                         if self.use_nsa and self.nsa_kv_cache_store_fp8
@@ -659,7 +673,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 1,
                                 self.kv_cache_dim,
                             ),
-                            dtype=dtype,
+                            dtype=self.store_dtype,
                             device=device,
                             num_layers=layer_num,
                             page_size=page_size,
@@ -673,7 +687,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         device=self.device,
                     )
 
-                    self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
+                    self.cell_size = (
+                        self.kv_cache_dim * self.store_dtype.itemsize
+                    )
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         size + page_size, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
@@ -697,7 +713,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """Return the physical memory limits of the KV buffer."""
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.kv_cache_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self.store_dtype.itemsize
 
                     return self.layer_num * total_tokens * elems_per_token * bytes_per_elem
 
