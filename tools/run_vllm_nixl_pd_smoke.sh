@@ -68,6 +68,7 @@ VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
 VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
 NIXL_LOG_LEVEL="${NIXL_LOG_LEVEL:-DEBUG}"
 LOG_DIR="${LOG_DIR:-$(mktemp -d /tmp/kvcached-nixl-pd-smoke.XXXXXX)}"
+SUMMARY_FILE="${SUMMARY_FILE:-${LOG_DIR}/summary.jsonl}"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   GPU_COUNT="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
@@ -698,16 +699,51 @@ run_case() {
   fi
   check_logs "${enable_kvcached}"
 
+  SUMMARY_FILE="${SUMMARY_FILE}" \
+  RUN_LABEL="${run_label}" \
+  MODEL="${MODEL}" \
+  CLIENT_ENDPOINT="${CLIENT_ENDPOINT}" \
+  NUM_REQUESTS="${NUM_REQUESTS}" \
+  MAX_TOKENS="${MAX_TOKENS}" \
+  MIN_REMOTE_BLOCKS="${MIN_REMOTE_BLOCKS}" \
+  ENABLE_KVCACHED="${enable_kvcached}" \
+  KVCACHED_NIXL_CONTIGUOUS_LAYOUT="${KVCACHED_NIXL_CONTIGUOUS_LAYOUT}" \
+  PREFILL_LOG="${PREFILL_LOG}" \
+  DECODE_LOG="${DECODE_LOG}" \
+  CLIENT_LOG="${CLIENT_LOG}" \
+  python - <<'PY'
+import json
+import os
+
+with open(os.environ["SUMMARY_FILE"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "status": "PASS",
+        "mode": os.environ["RUN_LABEL"],
+        "model": os.environ["MODEL"],
+        "client_endpoint": os.environ["CLIENT_ENDPOINT"],
+        "num_requests": int(os.environ["NUM_REQUESTS"]),
+        "max_tokens": int(os.environ["MAX_TOKENS"]),
+        "min_remote_blocks": int(os.environ["MIN_REMOTE_BLOCKS"]),
+        "kvcached": os.environ["ENABLE_KVCACHED"] == "true",
+        "kvcached_nixl_contiguous_layout": os.environ["KVCACHED_NIXL_CONTIGUOUS_LAYOUT"],
+        "prefill_log": os.environ["PREFILL_LOG"],
+        "decode_log": os.environ["DECODE_LOG"],
+        "client_log": os.environ["CLIENT_LOG"],
+    }, sort_keys=True) + "\\n")
+PY
+
   log "${run_label} PASS"
   log "${run_label} prefill log: ${PREFILL_LOG}"
   log "${run_label} decode log: ${DECODE_LOG}"
   log "${run_label} client log: ${CLIENT_LOG}"
+  log "${run_label} summary: ${SUMMARY_FILE}"
   stop_servers
 }
 
 main() {
   mkdir -p "${LOG_DIR}"
   log "Logs: ${LOG_DIR}"
+  log "Summary file: ${SUMMARY_FILE}"
   log "Model: ${MODEL}"
   log "GPU count detected: ${GPU_COUNT}; prefill GPU=${PREFILL_GPU}; decode GPU=${DECODE_GPU}"
   log "Block size: ${BLOCK_SIZE}; max model len: ${MAX_MODEL_LEN}; GPU utilization: ${GPU_MEMORY_UTILIZATION:-vLLM default}"
