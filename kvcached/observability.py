@@ -68,6 +68,14 @@ class KVCachePoolSnapshot:
     ``reserved_pages``, which counts *physical pages* held by the background
     pre-allocation thread.
 
+    Virtual reservation:
+
+    * ``virtual_per_layer_bytes`` -- virtual bytes reserved for one layer,
+      across all of its KV buffers (K and V for MHA, the single combined
+      buffer for MLA).
+    * ``virtual_total_bytes`` -- the whole pool, i.e.
+      ``virtual_per_layer_bytes * num_layers``.
+
     Values are best-effort rather than a consistent point-in-time cut: the
     C++ pre-allocation thread mutates page counters without taking the
     manager lock, so fields may come from marginally different instants.
@@ -165,9 +173,15 @@ def build_kv_cache_pool_snapshot(
         effective_free_pages = min(free_pages, available_physical_pages + reserved_pages)
 
     mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
-    virtual_per_layer_bytes = _int_attr(manager, "mem_size") or 0
     num_layers = _int_attr(manager, "num_layers") or 0
     num_kv_buffers = _int_attr(manager, "num_kv_buffers") or 0
+    # manager.mem_size is the virtual reservation for ONE KV buffer of ONE
+    # layer -- K (or V) for MHA, the single combined buffer for MLA -- which
+    # is why the total scales by both num_layers and num_kv_buffers. Scale by
+    # num_kv_buffers here so the exported field means what its name says: all
+    # KV buffers of one layer.
+    virtual_bytes_per_buffer = _int_attr(manager, "mem_size") or 0
+    virtual_per_layer_bytes = virtual_bytes_per_buffer * num_kv_buffers
     block_size_bytes = _int_attr(manager, "block_mem_size") or 0
     bytes_per_block = block_size_bytes * num_layers * num_kv_buffers
     # available_size() can transiently go negative: it derives from
@@ -198,7 +212,7 @@ def build_kv_cache_pool_snapshot(
         reserved_bytes=reserved_blocks * bytes_per_block,
         null_block_reserved=getattr(manager, "null_block", None) is not None,
         virtual_per_layer_bytes=virtual_per_layer_bytes,
-        virtual_total_bytes=virtual_per_layer_bytes * num_layers * num_kv_buffers,
+        virtual_total_bytes=virtual_per_layer_bytes * num_layers,
         mapped_bytes=mapped_bytes,
         total_pages=_call_int(allocator, "get_num_total_pages"),
         free_pages=free_pages,
