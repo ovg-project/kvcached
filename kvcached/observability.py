@@ -212,6 +212,28 @@ def build_kv_cache_pool_snapshot(
     )
 
 
+def _snapshot_one_pool(
+    manager: Any,
+    integration: Optional[str],
+) -> KVCachePoolSnapshot:
+    """Snapshot one pool through its own synchronized entry point.
+
+    ``KVCacheManager.observability_snapshot()`` is ``@synchronized``, so the
+    whole snapshot is taken under a single hold of the manager lock (the
+    nested per-accessor acquisitions are reentrant). Calling
+    ``build_kv_cache_pool_snapshot()`` directly instead takes the lock once
+    per accessor, which lets a writer commit in the gaps and stitches the
+    result together from several different instants.
+
+    Fall back to the module-level builder for the duck-typed manager-likes
+    that ``build_kv_cache_pool_snapshot`` is documented to accept.
+    """
+    take_snapshot = getattr(manager, "observability_snapshot", None)
+    if take_snapshot is None:
+        return build_kv_cache_pool_snapshot(manager, integration=integration)
+    return take_snapshot(integration=integration)
+
+
 def get_registered_kv_cache_pool_snapshots(
     *,
     integration: Optional[str] = None,
@@ -223,10 +245,7 @@ def get_registered_kv_cache_pool_snapshots(
         integration=integration
     ):
         snapshots.append(
-            build_kv_cache_pool_snapshot(
-                manager,
-                integration=registered_integration,
-            )
+            _snapshot_one_pool(manager, registered_integration)
         )
     return sorted(
         snapshots,
