@@ -11,7 +11,7 @@ import ast
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Sequence, Set
 
 
 @dataclass(frozen=True)

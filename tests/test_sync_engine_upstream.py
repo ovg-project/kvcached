@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[1] / "tools" / "sync_engine_upstream.py"
 
 

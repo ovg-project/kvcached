@@ -6,7 +6,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 PATCHES = Path(__file__).parents[1] / "kvcached/integration/sglang/patches.py"
 
 
