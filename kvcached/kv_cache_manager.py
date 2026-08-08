@@ -274,6 +274,7 @@ class KVCacheManager:
 
         remaining_need = need_size
 
+        num_from_reserved = 0
         if self.reserved_blocks:  # Try to allocate from reserved blocks first
             num_from_reserved = min(len(self.reserved_blocks), remaining_need)
             # ret_index is empty before so we directly assign it
@@ -281,32 +282,60 @@ class KVCacheManager:
             self.reserved_blocks = self.reserved_blocks[num_from_reserved:]
             remaining_need -= num_from_reserved
 
-        while remaining_need > 0:  # Allocate the remaining blocks from pages
-            if not self.avail_pages:
-                page = self.page_allocator.alloc_page()
-                page.init(self.block_mem_size)
-                # A page may have zero usable blocks when block_mem_size is
-                # large (e.g. HYBRID_LINEAR) and every aligned block would
-                # straddle the page boundary. Park it in full_pages so it's
-                # not re-handed-out but stays lookupable by free().
-                if page.num_free_blocks() == 0:
+        try:
+            while remaining_need > 0:  # Allocate the remaining blocks from pages
+                if not self.avail_pages:
+                    page = self.page_allocator.alloc_page()
+                    page.init(self.block_mem_size)
+                    # A page may have zero usable blocks when block_mem_size is
+                    # large (e.g. HYBRID_LINEAR) and every aligned block would
+                    # straddle the page boundary. Park it in full_pages so it's
+                    # not re-handed-out but stays lookupable by free().
+                    if page.num_free_blocks() == 0:
+                        self.full_pages[page.page_id] = page
+                        continue
+                    self.num_avail_blocks += page.num_free_blocks()
+                else:
+                    page = self._pick_avail_page(remaining_need)
+                num_from_page = min(page.num_free_blocks(), remaining_need)
+                alloced_index = page.alloc(num_from_page)
+                ret_index.extend(alloced_index)
+                if page.full():
                     self.full_pages[page.page_id] = page
-                    continue
-                self.num_avail_blocks += page.num_free_blocks()
-            else:
-                page = self._pick_avail_page(remaining_need)
-            num_from_page = min(page.num_free_blocks(), remaining_need)
-            alloced_index = page.alloc(num_from_page)
-            ret_index.extend(alloced_index)
-            if page.full():
-                self.full_pages[page.page_id] = page
-            else:
-                self.avail_pages[page.page_id] = page
+                else:
+                    self.avail_pages[page.page_id] = page
 
-            self.num_avail_blocks -= num_from_page
-            remaining_need -= num_from_page
+                self.num_avail_blocks -= num_from_page
+                remaining_need -= num_from_page
+        except RuntimeError as e:
+            # available_size() saw enough logical capacity, but another
+            # instance sharing the physical pool consumed pages before we
+            # reached alloc_page(). Roll back the partial allocation and
+            # report an allocation miss so the caller's existing miss
+            # handling applies instead of leaking blocks or crashing.
+            self._rollback_partial_alloc(ret_index, num_from_reserved)
+            logger.warning(
+                f"alloc_page() failed after partially allocating "
+                f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+            return None
 
         return ret_index
+
+    def _rollback_partial_alloc(self, ret_index: List[int],
+                                num_from_reserved: int) -> None:
+        """Return partially allocated blocks after a mid-alloc failure.
+
+        The first ``num_from_reserved`` entries of ``ret_index`` came off the
+        reservation ledger and are prepended back onto it; the rest came from
+        pages and go back through the regular free() path (safe to call here:
+        the lock is re-entrant).
+        """
+        page_blocks = ret_index[num_from_reserved:]
+        if page_blocks:
+            self.free(page_blocks)
+        reserved_blocks = ret_index[:num_from_reserved]
+        if reserved_blocks:
+            self.reserved_blocks = reserved_blocks + self.reserved_blocks
 
     def _pick_avail_page(self, remaining_need: int) -> InternalPage:
         """Pick the available page this allocation fits into best.
