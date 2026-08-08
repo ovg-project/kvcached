@@ -420,7 +420,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 self.kv_cache_manager = get_kv_cache_manager(
                     num_gpu_blocks, block_size, cell_size, num_layers,
-                    num_kv_buffers=num_kv_buffers)
+                    num_kv_buffers=num_kv_buffers,
+                    pool_name="block_pool")
 
                 # Allocate a dedicated null block – a placeholder for skipped
                 # positions (e.g. sliding-window / chunked-local attention).
