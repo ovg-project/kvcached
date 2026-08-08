@@ -122,6 +122,7 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["allocated_bytes"] == 16 * bytes_per_block
     assert data["reserved_bytes"] == 2 * bytes_per_block
     assert data["null_block_reserved"] is True
+    assert data["virtual_per_layer_bytes"] == 128 * 4096 * 2
     assert data["virtual_total_bytes"] == 128 * 4096 * 8 * 2
     assert data["mapped_bytes"] == 6 * 8 * (2 * 1024 * 1024) * 2
     assert data["total_pages"] == 20
@@ -132,6 +133,42 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["effective_free_pages"] == 6
     assert data["resize_target_bytes"] == 0
     json.dumps(data)
+
+
+def test_pool_snapshot_clamps_negative_block_gauges():
+    class NegativeBlockManager(FakeManager):
+        def available_size(self):
+            return -127
+
+        def _get_num_alloced_blocks(self):
+            return -1
+
+    data = build_kv_cache_pool_snapshot(NegativeBlockManager()).to_dict()
+
+    assert data["available_blocks"] == 0
+    assert data["available_bytes"] == 0
+    assert data["allocated_blocks"] == 0
+    assert data["allocated_bytes"] == 0
+
+
+def test_registered_pool_snapshot_uses_manager_snapshot_entrypoint():
+    clear_registered_kv_cache_pools()
+
+    class SynchronizedManager(FakeManager):
+        snapshot_calls = 0
+
+        def observability_snapshot(self, *, integration=None):
+            self.snapshot_calls += 1
+            return build_kv_cache_pool_snapshot(self, integration=integration)
+
+    manager = SynchronizedManager()
+    register_kv_cache_pool(manager, integration="vllm")
+
+    snapshots = get_registered_kv_cache_pool_snapshot_dicts(integration="vllm")
+
+    assert len(snapshots) == 1
+    assert manager.snapshot_calls == 1
+    clear_registered_kv_cache_pools()
 
 
 def test_registered_pool_snapshots_are_filtered_and_do_not_keep_managers_alive():
