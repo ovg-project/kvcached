@@ -51,7 +51,27 @@ class RuntimeSnapshot:
 
 @dataclass(frozen=True)
 class KVCachePoolSnapshot:
-    """Read-only state of one kvcached-backed KV pool."""
+    """Read-only state of one kvcached-backed KV pool.
+
+    Block accounting (these fields are NOT mutually exclusive -- do not sum
+    them):
+
+    * ``allocated_blocks`` -- blocks currently handed out of their pages.
+      Includes ``reserved_blocks``.
+    * ``reserved_blocks`` -- the subset of ``allocated_blocks`` held on the
+      pool's reserve ledger. ``alloc()`` drains this ledger first.
+    * ``available_blocks`` -- what the next request could obtain. Because
+      ``alloc()`` drains the reserve ledger first, this also includes
+      ``reserved_blocks``.
+
+    ``reserved_blocks`` counts *blocks* on that ledger and is unrelated to
+    ``reserved_pages``, which counts *physical pages* held by the background
+    pre-allocation thread.
+
+    Values are best-effort rather than a consistent point-in-time cut: the
+    C++ pre-allocation thread mutates page counters without taking the
+    manager lock, so fields may come from marginally different instants.
+    """
 
     schema_version: str
     pool_type: str
@@ -150,8 +170,13 @@ def build_kv_cache_pool_snapshot(
     num_kv_buffers = _int_attr(manager, "num_kv_buffers") or 0
     block_size_bytes = _int_attr(manager, "block_mem_size") or 0
     bytes_per_block = block_size_bytes * num_layers * num_kv_buffers
-    available_blocks = int(manager.available_size())
-    allocated_blocks = int(manager._get_num_alloced_blocks())
+    # available_size() can transiently go negative: it derives from
+    # PageAllocator::get_num_free_pages(), which reads a mutable counter
+    # without holding the allocator mutex, so a concurrent snapshot may
+    # observe an intermediate value. A negative gauge is never meaningful to
+    # an exporter, so clamp at zero.
+    available_blocks = max(int(manager.available_size()), 0)
+    allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
 
     return KVCachePoolSnapshot(

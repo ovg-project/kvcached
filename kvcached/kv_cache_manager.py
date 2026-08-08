@@ -582,6 +582,12 @@ class KVCacheManager:
     # Private methods
     @synchronized
     def _get_num_alloced_blocks(self) -> int:
+        """Return how many blocks are currently handed out of their pages.
+
+        Reserved blocks (``self.reserved_blocks``) are part of this count:
+        try_to_reserve() obtains them via alloc(), so they have already left
+        their pages. They are deliberately NOT added a second time below.
+        """
         # Blocks from fully allocated pages
         blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size)
@@ -591,7 +597,4 @@ class KVCacheManager:
         # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size) - self.num_avail_blocks
-        # Blocks from reserved blocks
-        blocks_from_reserved_blocks = len(self.reserved_blocks)
-        return (blocks_from_full_pages + blocks_from_avail_pages +
-                blocks_from_reserved_blocks)
+        return blocks_from_full_pages + blocks_from_avail_pages
