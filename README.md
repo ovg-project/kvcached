@@ -166,6 +166,9 @@ More instructions can be found [here](https://github.com/ovg-project/kvcached/bl
 
 kvcached is indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for LLM-powered documentation.
 
+For maintainers, see the
+[OVG engine upstream synchronization guide](docs/ENGINE_UPSTREAM_SYNC.md).
+
 The documentation covers:
 - Core architecture and memory management system
 - Integration with vLLM and SGLang

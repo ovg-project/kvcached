@@ -1,0 +1,183 @@
+name: Engine Upstream Sync
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: Engine fork to synchronize
+        required: true
+        default: vllm
+        type: choice
+        options:
+          - vllm
+          - sglang
+      target_repository:
+        description: Optional owner/repository override
+        required: false
+        type: string
+      base_branch:
+        description: Optional OVG integration branch override
+        required: false
+        type: string
+      dry_run:
+        description: Merge and test without pushing a branch
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [vllm, sglang]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve repositories
+        id: config
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_ENGINE: ${{ inputs.engine }}
+          REQUESTED_TARGET: ${{ inputs.target_repository }}
+          REQUESTED_BASE: ${{ inputs.base_branch }}
+          ENGINE: ${{ matrix.engine }}
+          VLLM_TARGET: ${{ vars.OVG_VLLM_REPOSITORY }}
+          SGLANG_TARGET: ${{ vars.OVG_SGLANG_REPOSITORY }}
+          VLLM_BASE: ${{ vars.OVG_VLLM_BASE_BRANCH }}
+          SGLANG_BASE: ${{ vars.OVG_SGLANG_BASE_BRANCH }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]] &&
+             [[ "${REQUESTED_ENGINE}" != "${ENGINE}" ]]; then
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${ENGINE}" == "vllm" ]]; then
+            target="${VLLM_TARGET}"
+            base="${VLLM_BASE:-kvcached-main}"
+            upstream="https://github.com/vllm-project/vllm.git"
+          else
+            target="${SGLANG_TARGET}"
+            base="${SGLANG_BASE:-kvcached-main}"
+            upstream="https://github.com/sgl-project/sglang.git"
+          fi
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_TARGET}" ]]; then
+            target="${REQUESTED_TARGET}"
+          fi
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_BASE}" ]]; then
+            base="${REQUESTED_BASE}"
+          fi
+          if [[ -z "${target}" ]]; then
+            echo "::notice::No target configured for ${ENGINE}; skipping until the matching OVG repository variable is set."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${target}" != http://* && "${target}" != https://* ]]; then
+            target="https://github.com/${target}.git"
+          fi
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "target=${target}" >> "${GITHUB_OUTPUT}"
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+          echo "upstream=${upstream}" >> "${GITHUB_OUTPUT}"
+
+      - name: Configure cross-repository Git authentication
+        if: steps.config.outputs.skip == 'false' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.OVG_SYNC_TOKEN }}
+        run: gh auth setup-git
+
+      - name: Merge upstream and run compatibility checks
+        id: sync
+        if: steps.config.outputs.skip == 'false'
+        env:
+          GH_TOKEN: >-
+            ${{ inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || '' }}
+          ENGINE: ${{ matrix.engine }}
+          TARGET: ${{ steps.config.outputs.target }}
+          UPSTREAM: ${{ steps.config.outputs.upstream }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          mkdir -p sync-artifacts
+          compat_tool="${GITHUB_WORKSPACE}/tools/check_engine_compat.py"
+          compat_report="${GITHUB_WORKSPACE}/sync-artifacts/${ENGINE}-compat.json"
+          args=(
+            --engine "${ENGINE}"
+            --target-repository "${TARGET}"
+            --upstream-repository "${UPSTREAM}"
+            --base-branch "${{ steps.config.outputs.base }}"
+            --sync-branch "automation/upstream-${ENGINE}"
+            --strategy rebase
+            --update-existing-branch
+            --result-json "sync-artifacts/${ENGINE}.json"
+            --report "sync-artifacts/${ENGINE}.md"
+            --check "python ${compat_tool} --engine ${ENGINE} --repo . --report ${compat_report}"
+            --check "python -m compileall -q ."
+          )
+          if [[ "${DRY_RUN}" != "true" ]]; then
+            args+=(--push)
+          fi
+          python tools/sync_engine_upstream.py "${args[@]}"
+
+      - name: Open compatibility pull request
+        if: >-
+          steps.config.outputs.skip == 'false' &&
+          inputs.dry_run != true &&
+          steps.sync.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.OVG_SYNC_TOKEN }}
+          ENGINE: ${{ matrix.engine }}
+          TARGET: ${{ steps.config.outputs.target }}
+          BASE: ${{ steps.config.outputs.base }}
+        run: |
+          status="$(
+            python -c \
+              "import json; print(json.load(open('sync-artifacts/${ENGINE}.json'))['status'])"
+          )"
+          if [[ "${status}" != "synced" ]]; then
+            exit 0
+          fi
+          repository="${TARGET#https://github.com/}"
+          repository="${repository%.git}"
+          branch="automation/upstream-${ENGINE}"
+          existing="$(
+            gh pr list \
+              --repo "${repository}" \
+              --state open \
+              --head "${branch}" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${existing}" ]]; then
+            gh pr edit "${existing}" \
+              --repo "${repository}" \
+              --body-file "sync-artifacts/${ENGINE}.md"
+          else
+            gh pr create \
+              --repo "${repository}" \
+              --base "${BASE}" \
+              --head "${branch}" \
+              --title "chore: sync ${ENGINE} upstream" \
+              --body-file "sync-artifacts/${ENGINE}.md"
+          fi
+
+      - name: Upload sync report
+        if: always() && steps.config.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-${{ matrix.engine }}-${{ github.run_id }}
+          path: sync-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
