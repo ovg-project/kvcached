@@ -283,8 +283,25 @@ class KVCacheManager:
 
         while remaining_need > 0:  # Allocate the remaining blocks from pages
             if not self.avail_pages:
-                page = self.page_allocator.alloc_page()
-                page.init(self.block_mem_size)
+                try:
+                    page = self.page_allocator.alloc_page()
+                    page.init(self.block_mem_size)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "Physical KV page allocation failed; returning "
+                        "allocation miss instead of crashing scheduler: %s",
+                        exc,
+                    )
+                    if ret_index:
+                        try:
+                            self._free(ret_index, release_empty_pages=False)
+                        except Exception as rollback_exc:
+                            logger.warning(
+                                "Failed to roll back partially allocated KV "
+                                "blocks after page allocation miss: %s",
+                                rollback_exc,
+                            )
+                    return None
                 # A page may have zero usable blocks when block_mem_size is
                 # large (e.g. HYBRID_LINEAR) and every aligned block would
                 # straddle the page boundary. Park it in full_pages so it's
@@ -344,8 +361,7 @@ class KVCacheManager:
         assert chosen is not None, "caller guarantees avail_pages is non-empty"
         return self.avail_pages.pop(chosen)
 
-    @synchronized
-    def free(self, indices: List[int]):
+    def _free(self, indices: List[int], *, release_empty_pages: bool):
         self._wait_post_init()
 
         if len(indices) == 0:
@@ -384,8 +400,11 @@ class KVCacheManager:
             page.free_batch(idxs)
 
             if page.empty():
-                pages_to_free.append(page.page_id)
-                self.num_avail_blocks -= page.num_free_blocks()
+                if release_empty_pages:
+                    pages_to_free.append(page.page_id)
+                    self.num_avail_blocks -= page.num_free_blocks()
+                else:
+                    self.avail_pages[page_id] = page
             else:
                 self.avail_pages[page_id] = page
 
@@ -399,6 +418,10 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
+
+    @synchronized
+    def free(self, indices: List[int]):
+        self._free(indices, release_empty_pages=True)
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
