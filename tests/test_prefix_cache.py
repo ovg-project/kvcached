@@ -33,6 +33,9 @@ sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 # This avoids importing torch / C extensions transitively via interfaces.py.
 _interfaces_mock = mock.MagicMock()
 sys.modules.setdefault("kvcached.integration.vllm.interfaces", _interfaces_mock)
+import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
+
+setattr(_vllm_pkg, "interfaces", _interfaces_mock)
 
 import pytest  # noqa: E402
 
