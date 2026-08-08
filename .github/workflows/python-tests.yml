@@ -1,0 +1,52 @@
+name: Python Tests
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest-cpu:
+    name: pytest (CPU-only)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install CPU-only PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyyaml numpy aiohttp
+
+      # Run the subset of the pytest suite that works without a GPU and
+      # without the compiled kvcached.vmm_ops extension (building vmm_ops
+      # requires a CUDA or ROCm PyTorch, which CI runners don't have).
+      #
+      # Excluded and why:
+      #   - test_ElasticMLAMemoryPool, test_kvcache_manager,
+      #     test_offline_serving, test_paged_allocator_aliasing,
+      #     test_alloc_kv_cache_alignment, test_hybrid_contiguous_layout,
+      #     test_ipc_timeout: import or exercise kvcached.vmm_ops
+      #   - test_sleep_manager: async tests that expect running
+      #     vLLM/SGLang server endpoints
+      - name: Run CPU-only pytest suite
+        run: |
+          python -m pytest tests/ -v \
+            --ignore=tests/test_ElasticMLAMemoryPool.py \
+            --ignore=tests/test_kvcache_manager.py \
+            --ignore=tests/test_offline_serving.py \
+            --ignore=tests/test_paged_allocator_aliasing.py \
+            --ignore=tests/test_alloc_kv_cache_alignment.py \
+            --ignore=tests/test_hybrid_contiguous_layout.py \
+            --ignore=tests/test_ipc_timeout.py \
+            --ignore=tests/test_sleep_manager.py
