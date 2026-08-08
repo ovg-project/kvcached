@@ -358,22 +358,6 @@ def _get_kv_cache_shape_compat(attn_backend: Any, num_blocks: int,
                                            num_kv_heads, head_size)
 
 
-def _kv_cache_uses_inline_scales(cache_dtype_str: Optional[str]) -> bool:
-    """Whether this KV cache dtype inlines per-token-head scales in the page.
-
-    Prefers vLLM's own predicate when available; falls back to a string
-    heuristic on versions that do not expose it.
-    """
-    if not cache_dtype_str:
-        return False
-    try:
-        from vllm.utils.torch_utils import kv_cache_uses_per_token_head_scales
-        return bool(kv_cache_uses_per_token_head_scales(cache_dtype_str))
-    except ImportError:
-        pass
-    return "per_token_head" in cache_dtype_str or cache_dtype_str == "nvfp4"
-
-
 def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
     """Pack block_hash + group_id into a composite cache key.
 
@@ -1432,20 +1416,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 cache_dtype,
             )
 
-            from kvcached.utils import CONTIGUOUS_LAYOUT
-            if CONTIGUOUS_LAYOUT and _kv_cache_uses_inline_scales(cache_dtype):
-                # Verified on an L40S (vLLM 0.20, TRITON_ATTN, Qwen3-0.6B):
-                # with inline scales the widened K+V block bytes no longer
-                # divide the physical page size, the contiguous layout's
-                # linear block math breaks, and output is garbled even when
-                # the widened shape above is correct. The non-contiguous
-                # layout produces output identical to vLLM without kvcached.
-                raise NotImplementedError(
-                    "kvcached contiguous layout does not support per-token-"
-                    f"head KV cache quantization (kv_cache_dtype="
-                    f"{cache_dtype}). Re-launch with "
-                    "KVCACHED_CONTIGUOUS_LAYOUT=false.")
-
             if attention_type == "HYBRID_LINEAR":
                 # The unified-pool layout math (both layouts; load-bearing for
                 # contiguous ratio>1 linearity) assumes the spec's page is
@@ -1842,4 +1812,67 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class TritonAttentionPatch(VersionAwarePatch, BasePatch):
+    """Build the per-token-head scale views from the KV tensor, not raw storage.
+
+    ``TritonAttentionImpl._ensure_scale_caches`` carves the per-head scale
+    planes out of ``kv_cache.untyped_storage()`` under a hard-coded dense
+    layout, ignoring both ``stride()`` and ``storage_offset()``. Every kvcached
+    KV tensor is a strided view: K and V occupy separate halves of the layer
+    buffer, and in the contiguous layout each layer is a slice of one shared
+    buffer at a non-zero offset. The computed addresses are therefore wrong --
+    below the K/V split they land on some other block's scale padding (a
+    consistent, harmless relabeling), above it they land on KV data and corrupt
+    it, and in the contiguous layout every layer's scale plane collapses onto
+    layer 0's.
+
+    Slicing the tensor carries the strides and the storage offset along, so the
+    addresses follow whatever layout is actually in use. For vLLM's own dense
+    tensors this yields exactly the same views as upstream. See #424 / #434.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.attention.backends.triton_attn"
+    target_class = "TritonAttentionImpl"
+    patch_name = "triton_attention_scales"
+
+    def apply(self, triton_attn_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_ensure_scale_caches(triton_attn_mod)
+
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_ensure_scale_caches(self,
+                                  triton_attn_mod: types.ModuleType) -> bool:
+        impl_cls = self._get_target_class(triton_attn_mod)
+        if impl_cls is None:
+            return False
+        if not hasattr(impl_cls, "_ensure_scale_caches"):
+            # vLLM without per-token-head KV quantization: nothing to patch.
+            self.logger.debug("TritonAttentionImpl has no _ensure_scale_caches")
+            return True
+        if self._is_already_patched(impl_cls, "ensure_scale_caches"):
+            return True
+
+        def _ensure_scale_caches(self, kv_cache: Any) -> None:
+            import torch
+
+            if self._k_scale_cache is not None:
+                return
+            # kv_cache is (num_blocks, 2, block_size, num_kv_heads, padded_hs);
+            # the last ``scale_pad`` elements of each head hold one float32.
+            padded_hs = kv_cache.shape[-1]
+            head_size = padded_hs - 4 // kv_cache.element_size()
+            self._k_scale_cache = (kv_cache[:, 0, :, :, head_size:].view(
+                torch.float32).squeeze(-1))
+            self._v_scale_cache = (kv_cache[:, 1, :, :, head_size:].view(
+                torch.float32).squeeze(-1))
+            self._k_scale_cache.fill_(1.0)
+            self._v_scale_cache.fill_(1.0)
+
+        self._mark_as_patched(impl_cls, "ensure_scale_caches")
+        impl_cls._ensure_scale_caches = _ensure_scale_caches
         return True
