@@ -8,7 +8,6 @@ import shutil
 import sys
 from pathlib import Path
 
-
 MODULE_PATH = Path(__file__).parents[1] / "tools" / "check_engine_compat.py"
 SPEC = importlib.util.spec_from_file_location("check_engine_compat", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None

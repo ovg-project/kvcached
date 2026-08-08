@@ -1,12 +1,6 @@
 ---
 name: ovg-engine-upstream-sync
-description: >-
-  Synchronize OVG-maintained vLLM or SGLang forks with official upstream,
-  diagnose merge and API compatibility failures, repair narrowly scoped
-  kvcached integration patches, run CPU and GPU validation gates, and prepare
-  a reviewable pull request. Use for scheduled engine updates, failed Engine
-  Upstream Sync workflows, compatibility drift after an upstream release, or
-  requests to update the OVG engine forks.
+description: Synchronize OVG-maintained vLLM or SGLang forks with official upstream, diagnose merge and API compatibility failures, repair narrowly scoped kvcached integration patches, run CPU and GPU validation gates, and prepare a reviewable pull request. Use for scheduled engine updates, failed Engine Upstream Sync workflows, compatibility drift after an upstream release, or requests to update the OVG engine forks.
 ---
 
 # OVG Engine Upstream Sync

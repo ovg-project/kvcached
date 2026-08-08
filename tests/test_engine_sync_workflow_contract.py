@@ -3,7 +3,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "engine-upstream-sync.yml"
 
