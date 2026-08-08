@@ -7,6 +7,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.observability import (
+    build_runtime_snapshot,
+    get_registered_kv_cache_pool_operation_snapshot_dicts,
+    get_registered_kv_cache_pool_operation_snapshots,
+    get_registered_kv_cache_pool_snapshot_dicts,
+    get_registered_kv_cache_pool_snapshots,
+)
+from kvcached.pool_registry import (
+    clear_registered_kv_cache_pools,
+    register_kv_cache_pool,
+)
 from kvcached.tp_ipc_util import start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
@@ -55,12 +66,52 @@ def init_kvcached(
 def shutdown_kvcached() -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
+        clear_registered_kv_cache_pools(integration="sglang")
         return
 
     _shutdown_kvcached_impl()
+    clear_registered_kv_cache_pools(integration="sglang")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+
+
+def observability_snapshot():
+    """Return a read-only snapshot of the SGLang integration state."""
+    return build_runtime_snapshot(
+        engine="sglang",
+        initialized=_kvcached_initialized,
+        device=_kvcached_device,
+        world_size=_world_size,
+        pp_rank=_pp_rank,
+        async_sched=_async_sched,
+        contiguous_layout=_contiguous_layout,
+    )
+
+
+def observability_snapshot_dict() -> Dict[str, Any]:
+    """Return a JSON-serializable snapshot of the SGLang integration state."""
+    return observability_snapshot().to_dict()
+
+
+def kv_cache_pool_snapshots():
+    """Return read-only snapshots for all live SGLang KV pools."""
+    return get_registered_kv_cache_pool_snapshots(integration="sglang")
+
+
+def kv_cache_pool_snapshot_dicts() -> List[Dict[str, Any]]:
+    """Return JSON-serializable snapshots for all live SGLang KV pools."""
+    return get_registered_kv_cache_pool_snapshot_dicts(integration="sglang")
+
+
+def kv_cache_pool_operation_snapshots():
+    """Return operation snapshots for all live SGLang KV pools."""
+    return get_registered_kv_cache_pool_operation_snapshots(integration="sglang")
+
+
+def kv_cache_pool_operation_snapshot_dicts() -> List[Dict[str, Any]]:
+    """Return JSON-serializable operation snapshots for live SGLang KV pools."""
+    return get_registered_kv_cache_pool_operation_snapshot_dicts(integration="sglang")
 
 
 def alloc_kv_cache(
@@ -409,11 +460,12 @@ def get_kv_cache_manager(
     reserve_null_block: bool = True,
     num_kv_buffers: int = 2,
     group_id: int = 0,
+    pool_name: Optional[str] = None,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(
+    manager = KVCacheManager(
         num_blocks,
         block_size,
         cell_size,
@@ -424,4 +476,10 @@ def get_kv_cache_manager(
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
+        pool_name=pool_name,
     )
+    register_kv_cache_pool(
+        manager,
+        integration="sglang",
+    )
+    return manager
