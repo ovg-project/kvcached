@@ -9,12 +9,14 @@ must be forwarded to ``get_kv_cache_shape`` on vLLM versions that accept it
 (the widened head_size inlines per-head scales into the KV page), and must be
 omitted on older versions whose signature does not declare it.
 """
+import ast
+import pathlib
 from types import SimpleNamespace
 
+import kvcached.integration.vllm.patches as patches
 from kvcached.integration.vllm.patches import (
     _cache_dtype_str,
     _get_kv_cache_shape_compat,
-    _kv_cache_uses_inline_scales,
 )
 
 # Widening applied by per-token-head modes in the fake backend below.
@@ -82,11 +84,20 @@ def test_cache_dtype_str_absent_returns_none():
     assert _cache_dtype_str(SimpleNamespace()) is None
 
 
-def test_inline_scales_detection():
-    assert _kv_cache_uses_inline_scales("fp8_per_token_head")
-    assert _kv_cache_uses_inline_scales("int8_per_token_head")
-    assert _kv_cache_uses_inline_scales("nvfp4")
-    assert not _kv_cache_uses_inline_scales("auto")
-    assert not _kv_cache_uses_inline_scales("fp8")
-    assert not _kv_cache_uses_inline_scales(None)
-    assert not _kv_cache_uses_inline_scales("")
+def test_no_direct_get_kv_cache_shape_calls():
+    """Every call site must route through the compat helper, so the #424 fix
+    cannot be reverted at one of them while the helper stays behind."""
+    tree = ast.parse(pathlib.Path(patches.__file__).read_text())
+    # The helper itself is the one place allowed to call the backend directly.
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "_get_kv_cache_shape_compat"):
+            node.body = []
+    direct = [
+        n.lineno for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "get_kv_cache_shape"
+    ]
+    assert not direct, (
+        "get_kv_cache_shape must be called via _get_kv_cache_shape_compat so "
+        f"cache_dtype_str is forwarded (#424); direct calls at lines {direct}")
