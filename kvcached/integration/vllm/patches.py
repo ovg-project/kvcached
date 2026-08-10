@@ -765,10 +765,13 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             try:
                 self._setup_kvcached_coordinator()
-            except KVCachedConfigError:
+            except (KVCachedConfigError, RuntimeError):
                 # User-fixable misconfiguration (e.g. KV block larger than the
-                # page size). Abort loudly instead of silently disabling
-                # kvcached and falling back to vanilla allocation.
+                # page size), or a broken kvcached invariant such as
+                # get_world_size() finding kvcached uninitialized. Abort loudly
+                # instead of silently disabling kvcached and falling back to
+                # vanilla allocation: a half-applied coordinator patch changes
+                # KV behaviour while leaving only a warning in the log.
                 raise
             except Exception as e:
                 logger.warning("Failed to patch kv_cache_coordinator: %s", e)

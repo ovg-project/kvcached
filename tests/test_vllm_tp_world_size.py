@@ -167,3 +167,54 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
 
     assert init_kvcached.call_args.kwargs["world_size"] == 4
     assert isinstance(getattr(coordinator, "block_pool"), FakeElasticBlockPool)
+
+
+def test_coordinator_propagates_uninitialized_world_size(
+    monkeypatch, vllm_modules
+):
+    """An uninitialized kvcached must abort startup, not warn and continue.
+
+    ``get_world_size()`` raises when ``init_kvcached()`` never ran, and the
+    coordinator patch used to swallow that into a warning — leaving the engine
+    running with a half-applied patch and no signal beyond one log line.
+    """
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(
+        patches,
+        "_get_first_attention_group",
+        lambda cfg: types.SimpleNamespace(
+            kv_cache_spec=types.SimpleNamespace(block_size=16)
+        ),
+    )
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(
+        patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
+    )
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    # EngineCore never recorded a world size, so get_world_size() raises.
+    monkeypatch.setattr(interfaces, "_kvcached_initialized", False)
+
+    fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(fake_block_pool_mod, "ElasticBlockPool", FakeElasticBlockPool)
+    monkeypatch.setitem(
+        sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod
+    )
+
+    kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
+
+    class FakeKVCacheCoordinator:
+        def __init__(self, *args, **kwargs):
+            self.enable_caching = False
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
+            self.single_type_managers = [types.SimpleNamespace()]
+
+    setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
+
+    assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        kvcoord_mod.KVCacheCoordinator()
