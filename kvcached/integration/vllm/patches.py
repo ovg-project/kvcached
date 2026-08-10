@@ -888,22 +888,19 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                try:
-                    from kvcached.integration.vllm.interfaces import init_kvcached
+                from kvcached.integration.vllm.interfaces import init_kvcached
 
-                    # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
-                    # The kvcached IPC mechanism coordinates KV tensor readiness
-                    # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
-                    # Each PP stage manages its own KV memory independently, so
-                    # cross-stage IPC is neither needed nor correct.
-                    init_kvcached(
-                        tp_rank=0,
-                        world_size=vllm_config.parallel_config.tensor_parallel_size,
-                        is_worker=False,
-                        async_sched=_should_enable_async_sched(vllm_config),
-                    )
-                except Exception:
-                    pass
+                # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
+                # The kvcached IPC mechanism coordinates KV tensor readiness
+                # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
+                # Each PP stage manages its own KV memory independently, so
+                # cross-stage IPC is neither needed nor correct.
+                init_kvcached(
+                    tp_rank=0,
+                    world_size=vllm_config.parallel_config.tensor_parallel_size,
+                    is_worker=False,
+                    async_sched=_should_enable_async_sched(vllm_config),
+                )
             return original_init(self, vllm_config, *args, **kwargs)
 
         self._mark_as_patched(_patched_engine_init, "init")
@@ -949,10 +946,13 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             try:
                 self._setup_kvcached_coordinator()
-            except KVCachedConfigError:
+            except (KVCachedConfigError, RuntimeError):
                 # User-fixable misconfiguration (e.g. KV block larger than the
-                # page size). Abort loudly instead of silently disabling
-                # kvcached and falling back to vanilla allocation.
+                # page size), or a broken kvcached invariant such as
+                # get_world_size() finding kvcached uninitialized. Abort loudly
+                # instead of silently disabling kvcached and falling back to
+                # vanilla allocation: a half-applied coordinator patch changes
+                # KV behaviour while leaving only a warning in the log.
                 raise
             except Exception as e:
                 logger.warning("Failed to patch kv_cache_coordinator: %s", e)
@@ -982,14 +982,12 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             cell_size, num_kv_buffers = _get_kv_cache_params(
                 kv_cache_spec, block_size, attention_type=attention_type)
 
-            try:
-                from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-
-                tp_size = int(get_tensor_model_parallel_world_size())
-            except Exception:
-                tp_size = 1
-
             from kvcached.integration.vllm import interfaces as kvi
+
+            # EngineCore records tensor_parallel_size before constructing this
+            # coordinator. parallel_state is not authoritative here: depending
+            # on startup timing it can either raise or still report world size 1.
+            tp_size = int(kvi.get_world_size())
 
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets
