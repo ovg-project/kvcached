@@ -9,6 +9,7 @@
 #   vllm - run core and one kvcached-backed vLLM correctness request.
 #   sglang - run core and one kvcached-backed SGLang correctness request.
 #   engines - run both single-GPU engine smoke tests sequentially.
+#   compat - run the manually selected model compatibility matrix.
 #   nixl  - run core, then the two-GPU vLLM+NIXL P/D smoke test.
 #
 # CHECK_ONLY=1 validates the runner configuration without requiring a GPU.
@@ -34,7 +35,7 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "${GPU_CI_ARTIFACT_DIR}"
 
 case "${GPU_CI_PROFILE}" in
-  core|vllm|sglang|engines|nixl) ;;
+  core|vllm|sglang|engines|compat|nixl) ;;
   *)
     echo "Unknown GPU_CI_PROFILE: '${GPU_CI_PROFILE}'" >&2
     exit 2
@@ -86,7 +87,9 @@ fi
 for required_file in \
   pyproject.toml \
   tools/dev_copy_pth.py \
+  tools/model_compatibility_matrix.json \
   tools/run_engine_smoke.sh \
+  tools/run_model_compatibility_matrix.py \
   tools/run_vllm_nixl_pd_smoke.sh; do
   if [[ ! -f "${required_file}" ]]; then
     echo "Missing required file: ${required_file}" >&2
@@ -98,12 +101,12 @@ if ! command -v "${PYTHON}" >/dev/null 2>&1; then
   echo "Python command not found: ${PYTHON}" >&2
   exit 2
 fi
-if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|compat|nixl)$ ]] &&
    ! command -v "${VLLM_PYTHON}" >/dev/null 2>&1; then
   echo "vLLM Python command not found: ${VLLM_PYTHON}" >&2
   exit 2
 fi
-if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|compat)$ ]] &&
    ! command -v "${SGLANG_PYTHON}" >/dev/null 2>&1; then
   echo "SGLang Python command not found: ${SGLANG_PYTHON}" >&2
   exit 2
@@ -248,11 +251,11 @@ install_project() {
 
 if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
   install_project "${PYTHON}" core
-  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|compat|nixl)$ ]] &&
      [[ "${VLLM_PYTHON}" != "${PYTHON}" ]]; then
     install_project "${VLLM_PYTHON}" vllm
   fi
-  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|compat)$ ]] &&
      [[ "${SGLANG_PYTHON}" != "${PYTHON}" ]] &&
      [[ "${SGLANG_PYTHON}" != "${VLLM_PYTHON}" ]]; then
     install_project "${SGLANG_PYTHON}" sglang
@@ -309,6 +312,26 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
     MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/sglang-${iteration}" \
       bash tools/run_engine_smoke.sh
+  fi
+
+  if [[ "${GPU_CI_PROFILE}" == "compat" ]]; then
+    matrix_args=(
+      --artifact-dir "${GPU_CI_ARTIFACT_DIR}/model-compatibility-${iteration}"
+      --engine "${MODEL_COMPAT_ENGINE:-all}"
+      --layout "${MODEL_COMPAT_LAYOUT:-all}"
+      --model "${MODEL_COMPAT_MODEL:-all}"
+      --startup-timeout "${MODEL_COMPAT_STARTUP_TIMEOUT:-900}"
+      --max-model-len "${MAX_MODEL_LEN:-1024}"
+    )
+    if [[ -n "${MODEL_COMPAT_MODEL_OVERRIDE:-}" ]]; then
+      matrix_args+=(--model-override "${MODEL_COMPAT_MODEL_OVERRIDE}")
+    fi
+    if [[ "${MODEL_COMPAT_FAIL_ON_NON_PASS:-0}" == "1" ]]; then
+      matrix_args+=(--fail-on-non-pass)
+    fi
+    VLLM_PYTHON="${VLLM_PYTHON}" \
+    SGLANG_PYTHON="${SGLANG_PYTHON}" \
+      "${PYTHON}" tools/run_model_compatibility_matrix.py "${matrix_args[@]}"
   fi
 
 done

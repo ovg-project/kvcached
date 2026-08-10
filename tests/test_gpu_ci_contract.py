@@ -54,7 +54,7 @@ def run_preflight(
 
 
 def test_supported_profiles_pass_cpu_only_preflight(tmp_path):
-    for profile in ("core", "vllm", "sglang", "engines", "nixl"):
+    for profile in ("core", "vllm", "sglang", "engines", "compat", "nixl"):
         completed = run_preflight(tmp_path, profile)
         assert completed.returncode == 0
         assert f"profile={profile}" in completed.stdout
@@ -122,3 +122,11 @@ def test_engine_profiles_validate_their_isolated_python(tmp_path):
     )
     assert completed.returncode == 2
     assert "SGLang Python command not found" in completed.stdout
+
+    completed = run_preflight(
+        tmp_path,
+        "compat",
+        vllm_python="missing-vllm-python",
+    )
+    assert completed.returncode == 2
+    assert "vLLM Python command not found" in completed.stdout

@@ -16,8 +16,12 @@ PORT="${PORT:-}"
 PYTHON="${PYTHON:-python}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-360}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024}"
+LAYOUT="${LAYOUT:-contiguous}"
+RESULT_FILE="${RESULT_FILE:-}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/gpu-ci-artifacts}"
+PHASE="preflight"
+RESULT_STATUS=""
 
 case "${ENGINE}" in
   vllm)
@@ -31,6 +35,20 @@ case "${ENGINE}" in
     exit 2
     ;;
 esac
+
+case "${LAYOUT}" in
+  contiguous)
+    KVCACHED_CONTIGUOUS_LAYOUT=true
+    ;;
+  non-contiguous)
+    KVCACHED_CONTIGUOUS_LAYOUT=false
+    ;;
+  *)
+    echo "LAYOUT must be 'contiguous' or 'non-contiguous', got '${LAYOUT}'" >&2
+    exit 2
+    ;;
+esac
+export KVCACHED_CONTIGUOUS_LAYOUT
 
 if [[ ! "${STARTUP_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "STARTUP_TIMEOUT must be a positive integer" >&2
@@ -53,7 +71,7 @@ GPU_PIDS_AFTER="${LOG_DIR}/${ENGINE}-gpu-pids-after.txt"
 GPU_PIDS_INTRODUCED="${LOG_DIR}/${ENGINE}-gpu-pids-introduced.txt"
 
 if [[ "${CHECK_ONLY}" == "1" ]]; then
-  echo "Engine smoke preflight passed: engine=${ENGINE}, port=${PORT}"
+  echo "Engine smoke preflight passed: engine=${ENGINE}, layout=${LAYOUT}, port=${PORT}"
   exit 0
 fi
 
@@ -110,6 +128,38 @@ cleanup() {
     echo "Engine smoke left processes on selected GPU(s):" >&2
     cat "${GPU_PIDS_INTRODUCED}" >&2
     exit_code=1
+    RESULT_STATUS="crash-at-startup"
+  fi
+  if [[ -n "${RESULT_FILE}" ]]; then
+    local status="${RESULT_STATUS}"
+    if [[ -z "${status}" ]]; then
+      if [[ "${exit_code}" -eq 0 ]]; then
+        status="pass"
+      elif [[ "${PHASE}" == "ready" ]]; then
+        status="garbled-output"
+      else
+        status="crash-at-startup"
+      fi
+    fi
+    mkdir -p "$(dirname "${RESULT_FILE}")"
+    ENGINE="${ENGINE}" MODEL="${MODEL}" LAYOUT="${LAYOUT}" \
+    STATUS="${status}" EXIT_CODE="${exit_code}" PHASE="${PHASE}" \
+    RESULT_FILE="${RESULT_FILE}" "${PYTHON}" - <<'PY'
+import json
+import os
+
+result = {
+    "engine": os.environ["ENGINE"],
+    "exit_code": int(os.environ["EXIT_CODE"]),
+    "layout": os.environ["LAYOUT"],
+    "model": os.environ["MODEL"],
+    "phase": os.environ["PHASE"],
+    "status": os.environ["STATUS"],
+}
+with open(os.environ["RESULT_FILE"], "w", encoding="utf-8") as output:
+    json.dump(result, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
   fi
   exit "${exit_code}"
 }
@@ -123,6 +173,7 @@ export VLLM_USE_V1=1
 export no_proxy="localhost,127.0.0.1,::1"
 export NO_PROXY="${no_proxy}"
 
+PHASE="starting"
 if [[ "${ENGINE}" == "vllm" ]]; then
   "${PYTHON}" -c \
     'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
@@ -161,6 +212,7 @@ until curl -fsS "http://${HOST}:${PORT}/v1/models" >/dev/null 2>&1; do
   fi
   sleep 2
 done
+PHASE="ready"
 
 ENGINE="${ENGINE}" MODEL="${MODEL}" HOST="${HOST}" PORT="${PORT}" \
 CLIENT_LOG="${CLIENT_LOG}" \
@@ -213,7 +265,9 @@ if ! "${PYTHON}" tools/check_engine_activation.py \
   --engine "${ENGINE}" --log "${SERVER_LOG}"; then
   echo "Server answered correctly, but kvcached allocator initialization was not verified" >&2
   tail -n 120 "${SERVER_LOG}" >&2
+  RESULT_STATUS="crash-at-startup"
   exit 1
 fi
 
+RESULT_STATUS="pass"
 echo "ENGINE_SMOKE_OK engine=${ENGINE} model=${MODEL}"

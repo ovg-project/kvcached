@@ -12,13 +12,19 @@ SCRIPT = ROOT / "tools" / "run_engine_smoke.sh"
 ACTIVATION_CHECK = ROOT / "tools" / "check_engine_activation.py"
 
 
-def run_preflight(tmp_path: Path, engine: str, port: str = "12346"):
+def run_preflight(
+    tmp_path: Path,
+    engine: str,
+    port: str = "12346",
+    layout: str = "contiguous",
+):
     env = os.environ.copy()
     env.update(
         {
             "CHECK_ONLY": "1",
             "ENGINE": engine,
             "LOG_DIR": str(tmp_path / "logs"),
+            "LAYOUT": layout,
             "PORT": port,
         }
     )
@@ -99,3 +105,13 @@ def test_engine_server_uses_and_cleans_a_dedicated_process_group():
     assert 'kill -TERM -- "-${SERVER_PID}"' in source
     assert 'kill -KILL -- "-${SERVER_PID}"' in source
     assert "introduced_gpu_pids" in source
+
+
+def test_layout_preflight_and_validation(tmp_path):
+    completed = run_preflight(tmp_path, "vllm", layout="non-contiguous")
+    assert completed.returncode == 0
+    assert "layout=non-contiguous" in completed.stdout
+
+    completed = run_preflight(tmp_path, "vllm", layout="unknown")
+    assert completed.returncode == 2
+    assert "LAYOUT must be" in completed.stdout
