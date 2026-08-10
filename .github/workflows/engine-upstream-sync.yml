@@ -88,10 +88,12 @@ jobs:
           if [[ "${target}" != http://* && "${target}" != https://* ]]; then
             target="https://github.com/${target}.git"
           fi
-          echo "skip=false" >> "${GITHUB_OUTPUT}"
-          echo "target=${target}" >> "${GITHUB_OUTPUT}"
-          echo "base=${base}" >> "${GITHUB_OUTPUT}"
-          echo "upstream=${upstream}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "skip=false"
+            echo "target=${target}"
+            echo "base=${base}"
+            echo "upstream=${upstream}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Configure cross-repository Git authentication
         if: steps.config.outputs.skip == 'false' && inputs.dry_run != true
