@@ -282,42 +282,47 @@ class KVCacheManager:
             self.reserved_blocks = self.reserved_blocks[num_from_reserved:]
             remaining_need -= num_from_reserved
 
-        try:
-            while remaining_need > 0:  # Allocate the remaining blocks from pages
-                if not self.avail_pages:
+        while remaining_need > 0:  # Allocate the remaining blocks from pages
+            if not self.avail_pages:
+                # Only alloc_page() is recoverable here. available_size() saw
+                # enough logical capacity, but another instance sharing the
+                # physical pool consumed pages before we reached this call, so
+                # roll back and report an allocation miss instead of leaking
+                # blocks or crashing. Anything else raising in this loop is an
+                # invariant failure (e.g. InternalPage.alloc()'s "Not enough
+                # free blocks in page", raised after _pick_avail_page() has
+                # already removed the page from avail_pages and before its
+                # blocks reach ret_index, which rollback therefore cannot
+                # restore) and must stay fail-loud.
+                try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
-                    # A page may have zero usable blocks when block_mem_size is
-                    # large (e.g. HYBRID_LINEAR) and every aligned block would
-                    # straddle the page boundary. Park it in full_pages so it's
-                    # not re-handed-out but stays lookupable by free().
-                    if page.num_free_blocks() == 0:
-                        self.full_pages[page.page_id] = page
-                        continue
-                    self.num_avail_blocks += page.num_free_blocks()
-                else:
-                    page = self._pick_avail_page(remaining_need)
-                num_from_page = min(page.num_free_blocks(), remaining_need)
-                alloced_index = page.alloc(num_from_page)
-                ret_index.extend(alloced_index)
-                if page.full():
+                except RuntimeError as e:
+                    self._rollback_partial_alloc(ret_index, num_from_reserved)
+                    logger.warning(
+                        f"alloc_page() failed after partially allocating "
+                        f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+                    return None
+                # A page may have zero usable blocks when block_mem_size is
+                # large (e.g. HYBRID_LINEAR) and every aligned block would
+                # straddle the page boundary. Park it in full_pages so it's
+                # not re-handed-out but stays lookupable by free().
+                if page.num_free_blocks() == 0:
                     self.full_pages[page.page_id] = page
-                else:
-                    self.avail_pages[page.page_id] = page
+                    continue
+                self.num_avail_blocks += page.num_free_blocks()
+            else:
+                page = self._pick_avail_page(remaining_need)
+            num_from_page = min(page.num_free_blocks(), remaining_need)
+            alloced_index = page.alloc(num_from_page)
+            ret_index.extend(alloced_index)
+            if page.full():
+                self.full_pages[page.page_id] = page
+            else:
+                self.avail_pages[page.page_id] = page
 
-                self.num_avail_blocks -= num_from_page
-                remaining_need -= num_from_page
-        except RuntimeError as e:
-            # available_size() saw enough logical capacity, but another
-            # instance sharing the physical pool consumed pages before we
-            # reached alloc_page(). Roll back the partial allocation and
-            # report an allocation miss so the caller's existing miss
-            # handling applies instead of leaking blocks or crashing.
-            self._rollback_partial_alloc(ret_index, num_from_reserved)
-            logger.warning(
-                f"alloc_page() failed after partially allocating "
-                f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
-            return None
+            self.num_avail_blocks -= num_from_page
+            remaining_need -= num_from_page
 
         return ret_index
 
