@@ -3,6 +3,8 @@
 
 #include "page_allocator.hpp"
 
+#include <Python.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 
 #include "allocator.hpp"
 #include "gpu_utils.hpp"
+#include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
 
 namespace kvcached {
@@ -443,12 +446,13 @@ int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
-  size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
-  avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+  const size_t headroom =
+      static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
+  const size_t usable_phy_mem_size =
+      saturating_subtract(avail_phy_mem_size, headroom);
 
   // Calculate available pages considering layers and KV buffers
-  int64_t avail_phy_pages = avail_phy_mem_size / page_size_;
+  int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
   return avail_pages_per_layer;
@@ -498,27 +502,41 @@ PageAllocator::group_indices_by_page(const std::vector<int64_t> &indices,
 }
 
 // Callback function setters
+//
+// The swap-then-assign shape in the two setters below is deliberate: these
+// callbacks wrap Python callables, and destroying one acquires the GIL. With
+// the blocking bindings releasing the GIL, destroying a callback while holding
+// lock_ would invert the lock/GIL order against a thread that holds lock_ and
+// needs the GIL -- so the old callback must be destroyed after lock_ is
+// released (when `old` goes out of scope).
 void PageAllocator::set_broadcast_map_callback(BroadcastMapCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  broadcast_map_callback_ = callback;
+  BroadcastMapCallback old;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    old = std::move(broadcast_map_callback_);
+    broadcast_map_callback_ = std::move(callback);
+  }
   LOGGER(INFO, "Broadcast map callback set for PageAllocator (world_size=%ld)",
          world_size_);
 }
 
 void PageAllocator::set_broadcast_unmap_callback(
     BroadcastUnmapCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  broadcast_unmap_callback_ = callback;
+  BroadcastUnmapCallback old;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    old = std::move(broadcast_unmap_callback_);
+    broadcast_unmap_callback_ = std::move(callback);
+  }
   LOGGER(INFO,
          "Broadcast unmap callback set for PageAllocator (world_size=%ld)",
          world_size_);
 }
 
-void PageAllocator::set_should_use_worker_ipc_callback(
-    ShouldUseWorkerIpcCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  should_use_worker_ipc_callback_ = callback;
-  LOGGER(INFO, "Should-use-worker-ipc callback set for PageAllocator");
+void PageAllocator::set_use_worker_ipc(bool use_worker_ipc) {
+  use_worker_ipc_.store(use_worker_ipc, std::memory_order_release);
+  LOGGER(INFO, "use_worker_ipc set to %d for PageAllocator",
+         static_cast<int>(use_worker_ipc));
 }
 
 void PageAllocator::start_prealloc_thread() {
@@ -715,6 +733,7 @@ void PageAllocator::trigger_preallocation() {
 }
 
 void PageAllocator::start_prealloc_thread_internal() {
+  std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (!prealloc_thread_) {
     prealloc_running_ = true;
     prealloc_thread_ =
@@ -732,7 +751,25 @@ void PageAllocator::start_prealloc_thread_internal() {
   }
 }
 
+namespace {
+// Join a thread without holding the GIL. The prealloc worker may be inside a
+// Python broadcast callback waiting for the GIL; joining it while holding the
+// GIL would deadlock. The stop_prealloc_thread binding already releases the
+// GIL, but the destructor runs from Python garbage collection with the GIL
+// held, so release conditionally here.
+void join_without_gil(std::thread &t) {
+  if (PyGILState_Check()) {
+    PyThreadState *state = PyEval_SaveThread();
+    t.join();
+    PyEval_RestoreThread(state);
+  } else {
+    t.join();
+  }
+}
+} // namespace
+
 void PageAllocator::stop_prealloc_thread_internal() {
+  std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (prealloc_thread_) {
     {
       std::lock_guard<std::mutex> lock(lock_);
@@ -740,7 +777,7 @@ void PageAllocator::stop_prealloc_thread_internal() {
       cond_.notify_all();
     }
 
-    prealloc_thread_->join();
+    join_without_gil(*prealloc_thread_);
     prealloc_thread_.reset();
     LOGGER(DEBUG, "Stopped page preallocation thread");
   }
@@ -748,17 +785,17 @@ void PageAllocator::stop_prealloc_thread_internal() {
   // Stop resize watcher thread
   if (resize_watcher_thread_) {
     resize_watcher_running_ = false;
-    resize_watcher_thread_->join();
+    join_without_gil(*resize_watcher_thread_);
     resize_watcher_thread_.reset();
     LOGGER(DEBUG, "Stopped resize watcher thread");
   }
 }
 
 bool PageAllocator::should_use_worker_ipc() const {
-  if (should_use_worker_ipc_callback_) {
-    return should_use_worker_ipc_callback_();
-  }
-  return false;
+  // A plain pushed value: no thread ever needs Python (or the GIL) to answer
+  // this. The decision is fixed once Python calls set_use_worker_ipc() during
+  // KVCacheManager init, before the prealloc thread starts.
+  return use_worker_ipc_.load(std::memory_order_acquire);
 }
 
 void PageAllocator::resize_watcher() {
