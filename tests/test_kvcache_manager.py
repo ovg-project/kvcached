@@ -181,14 +181,17 @@ def test_reserve_and_free_blocks(setup_kvcache):
 
     # initial reserved blocks
     initial_reserved_blocks = len(manager.reserved_blocks)
+    initial_allocated_blocks = manager._get_num_alloced_blocks()
 
     # reserve some blocks
     n_blocks = 512
     manager.try_to_reserve(n_blocks)
     after_reserve_blocks = len(manager.reserved_blocks)
     assert after_reserve_blocks == initial_reserved_blocks + n_blocks
+    assert manager._get_num_alloced_blocks() == initial_allocated_blocks + n_blocks
 
     # free the reserved blocks
     manager.free_reserved()
     after_free_blocks = len(manager.reserved_blocks)
     assert after_free_blocks == 0
+    assert manager._get_num_alloced_blocks() == initial_allocated_blocks

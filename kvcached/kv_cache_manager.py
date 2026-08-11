@@ -39,7 +39,6 @@ except ImportError as e:
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
-PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
 def synchronized(method):
@@ -69,6 +68,7 @@ class KVCacheManager:
         reserve_null_block: bool = False,
         num_kv_buffers: int = 2,
         group_id: int = 0,
+        pool_name: Optional[str] = None,
     ):
         """
         Args:
@@ -85,6 +85,8 @@ class KVCacheManager:
                 1 for MLA combined KV).
             group_id: KV cache group identifier for hybrid attention models.
                 Different groups have independent FTensors and page spaces.
+            pool_name: Stable, low-cardinality name assigned by the engine
+                integration when this pool is created.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -92,6 +94,7 @@ class KVCacheManager:
         self.num_kv_buffers = num_kv_buffers
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
+        self._pool_name = pool_name
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -131,15 +134,21 @@ class KVCacheManager:
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
         )
-        # Register should_use_worker_ipc callback so C++ PageAllocator
-        # knows when to use broadcast IPC even with world_size == 1
-        # (e.g. vLLM V1 EngineCore + worker in separate processes).
+        # Tell the C++ PageAllocator whether map/unmap must be broadcast to
+        # worker processes over IPC, even with world_size == 1 (e.g. vLLM V1
+        # EngineCore + worker in separate processes). The value is pushed once
+        # rather than pulled through a Python callback: a callback would make
+        # the C++ prealloc thread re-enter Python, which needs the GIL and
+        # deadlocks against a caller blocked inside a binding (issue #371).
+        # The decision is stable by this point -- the same-process worker flip
+        # (init_kvcached(is_worker=True)) happens before KVCacheManager is
+        # constructed in every integration flow.
         try:
             from kvcached.integration.vllm.interfaces import should_use_worker_ipc
-            self.page_allocator.set_should_use_worker_ipc_callback(should_use_worker_ipc)
             use_worker_ipc = should_use_worker_ipc()
         except ImportError:
             use_worker_ipc = False
+        self.page_allocator.set_use_worker_ipc(use_worker_ipc)
 
         if self.world_size > 1 or use_worker_ipc:
             try:
@@ -289,7 +298,7 @@ class KVCacheManager:
                     continue
                 self.num_avail_blocks += page.num_free_blocks()
             else:
-                _, page = self.avail_pages.popitem()
+                page = self._pick_avail_page(remaining_need)
             num_from_page = min(page.num_free_blocks(), remaining_need)
             alloced_index = page.alloc(num_from_page)
             ret_index.extend(alloced_index)
@@ -302,6 +311,42 @@ class KVCacheManager:
             remaining_need -= num_from_page
 
         return ret_index
+
+    def _pick_avail_page(self, remaining_need: int) -> InternalPage:
+        """Pick the available page this allocation fits into best.
+
+        `avail_pages.popitem()` hands back the most recently touched page, and
+        a partially consumed page is re-inserted at the tail, so allocation
+        drains one page dry before moving on. That is fine for a single block,
+        but a long prefill run then walks whatever partly-filled pages happen
+        to sit at the tail and smears itself over many of them. Since a page
+        only returns physical memory once every block on it is free, a request
+        whose blocks are spread over a dozen pages pins all twelve for as long
+        as any one of those blocks survives in the prefix cache.
+
+        Choosing the smallest page that still holds the whole remaining run
+        (and the emptiest page when none does, so the next bite is as big as
+        possible) keeps a request's blocks together instead.
+
+        This is O(len(avail_pages)) and runs once per page consumed, not per
+        block; measured at ~7us for 100 available pages, with no throughput
+        change on a 96-way serving workload. Bucketing pages by free-block
+        count would make it independent of pool size if that ever matters.
+        """
+        best_id: Optional[int] = None
+        best_free: Optional[int] = None
+        fallback_id: Optional[int] = None
+        fallback_free = -1
+        for page_id, page in self.avail_pages.items():
+            free = page.num_free_blocks()
+            if free >= remaining_need:
+                if best_free is None or free < best_free:
+                    best_id, best_free = page_id, free
+            elif free > fallback_free:
+                fallback_id, fallback_free = page_id, free
+        chosen = best_id if best_id is not None else fallback_id
+        assert chosen is not None, "caller guarantees avail_pages is non-empty"
+        return self.avail_pages.pop(chosen)
 
     @synchronized
     def free(self, indices: List[int]):
@@ -374,8 +419,12 @@ class KVCacheManager:
     @synchronized
     def free_reserved(self):
         if self.reserved_blocks:
-            self.free(self.reserved_blocks)
-            self.reserved_blocks.clear()
+            # Detach first: once off the ledger the blocks are ordinary
+            # blocks, so free()'s sanity check (which forbids freeing a
+            # block that is still reserved) correctly stays quiet. Freeing
+            # before detaching trips that check under KVCACHED_SANITY_CHECK.
+            blocks, self.reserved_blocks = self.reserved_blocks, []
+            self.free(blocks)
 
     @synchronized
     def resize(self, new_mem_size: int):
@@ -390,14 +439,15 @@ class KVCacheManager:
                 self.in_shrink = False
                 self.target_num_blocks = None
             return True  # Successfully resized.
-        # Failed to resize due to too many in-use blocks.
-        assert (len(self.reserved_blocks) == 0
-                ), "Reserved blocks must be freed before resizing."
+        # Failed to resize due to too many in-use blocks. Free any
+        # outstanding reserved blocks before entering the lazy shrink wait.
         # NOTE: we can support resizing with reserved blocks, but we want to
         # enforce this check for now to ensure correctness.
+        self.free_reserved()
+        assert (len(self.reserved_blocks) == 0
+                ), "Reserved blocks must be freed before resizing."
         self.in_shrink = True
         self.target_num_blocks = new_mem_size // self.block_mem_size
-        self.free_reserved()
         return False
 
     @synchronized
@@ -423,6 +473,31 @@ class KVCacheManager:
         return avail_blocks + blocks_from_free_pages
 
     @synchronized
+    def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
+        """Return the number of allocated blocks on each of `page_ids`.
+
+        A page only returns physical memory once every block on it is freed, so
+        callers choosing which blocks to evict need to know how many blocks a
+        page still holds. Page ids the manager does not track report 0.
+        """
+        occupancy: Dict[int, int] = {}
+        for page_id in page_ids:
+            if page_id in self.full_pages:
+                page = self.full_pages[page_id]
+            elif page_id in self.avail_pages:
+                page = self.avail_pages[page_id]
+            else:
+                occupancy[page_id] = 0
+                continue
+            # Blocks straddling a page boundary belong to neither page, so a
+            # page's capacity comes from its own block range rather than from
+            # page_size // block_mem_size.
+            start, end = InternalPage.get_block_range(page_id, self.page_size,
+                                                      self.block_mem_size)
+            occupancy[page_id] = (end - start) - page.num_free_blocks()
+        return occupancy
+
+    @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         memory_bytes = (self.page_allocator.get_num_inuse_pages() *
@@ -440,6 +515,27 @@ class KVCacheManager:
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
+    @property
+    def pool_name(self) -> Optional[str]:
+        """Return the stable name assigned when this pool was created."""
+        return self._pool_name
+
+    @synchronized
+    def observability_snapshot(self, *, integration=None):
+        """Return a read-only snapshot of this KV cache pool."""
+        from kvcached.observability import build_kv_cache_pool_snapshot
+        return build_kv_cache_pool_snapshot(
+            self,
+            integration=integration,
+        )
+
+    @synchronized
+    def observability_snapshot_dict(self, *, integration=None):
+        """Return a JSON-serializable read-only snapshot of this KV cache pool."""
+        return self.observability_snapshot(
+            integration=integration,
+        ).to_dict()
+
     @synchronized
     def clear(self):
         """
@@ -451,8 +547,9 @@ class KVCacheManager:
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
-        self.page_allocator._stop_prealloc_thread(
-            timeout=PREALLOC_THREAD_TIMEOUT)
+        # (This used to call a `_stop_prealloc_thread(timeout=...)` binding
+        # that never existed, so clear() raised AttributeError.)
+        self.page_allocator.stop_prealloc_thread()
 
         # Clear reserved blocks
         self.free_reserved()
@@ -491,6 +588,12 @@ class KVCacheManager:
     # Private methods
     @synchronized
     def _get_num_alloced_blocks(self) -> int:
+        """Return how many blocks are currently handed out of their pages.
+
+        Reserved blocks (``self.reserved_blocks``) are part of this count:
+        try_to_reserve() obtains them via alloc(), so they have already left
+        their pages. They are deliberately NOT added a second time below.
+        """
         # Blocks from fully allocated pages
         blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size)
@@ -500,7 +603,4 @@ class KVCacheManager:
         # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size) - self.num_avail_blocks
-        # Blocks from reserved blocks
-        blocks_from_reserved_blocks = len(self.reserved_blocks)
-        return (blocks_from_full_pages + blocks_from_avail_pages +
-                blocks_from_reserved_blocks)
+        return blocks_from_full_pages + blocks_from_avail_pages

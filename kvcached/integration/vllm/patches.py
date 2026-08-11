@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import inspect
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -208,6 +209,50 @@ def _reshape_mamba_non_contiguous(
     return state_tensors
 
 
+def _reshape_mamba_contiguous(
+    mamba_info: dict, kv_cache_spec: Any, pool_idx: int, get_dtype_size: Any,
+) -> list:
+    """Create strided mamba state views from a contiguous interleaved buffer.
+
+    In contiguous layout there is a single base buffer shared by all pools.
+    Block N for pool L sits at byte offset
+    ``(N * num_pools + L) * page_size_bytes`` inside that base buffer, so the
+    inter-block stride is ``block_stride_bytes == num_pools * page_size_bytes``
+    (not ``page_size_bytes`` as in the non-contiguous per-pool case), and the
+    per-pool base offset is ``pool_idx * page_size_bytes``. This aliases exactly
+    the same cell the contiguous attention view (contiguous_tensor[:, L]) reads,
+    so a hybrid model's attention and mamba layers share one physical block.
+    """
+    import torch
+
+    base_buffer = mamba_info["buffers"][0]  # flat int8 buffer
+    num_blocks = mamba_info["num_blocks"]
+    page_size_bytes = mamba_info["page_size_bytes"]
+    block_stride_bytes = mamba_info["block_stride_bytes"]
+
+    layer_offset_bytes = pool_idx * page_size_bytes
+
+    state_tensors: list = []
+    inner_offset_bytes = 0
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        dtype_size = get_dtype_size(dtype)
+        block_stride_elems = block_stride_bytes // dtype_size
+        target_shape = (num_blocks, *shape)
+        inner_stride = torch.empty(target_shape).stride()
+        target_stride = (block_stride_elems, *inner_stride[1:])
+        assert (layer_offset_bytes + inner_offset_bytes) % dtype_size == 0
+        storage_offset = (layer_offset_bytes + inner_offset_bytes) // dtype_size
+        tensor = torch.as_strided(
+            base_buffer.view(dtype),
+            size=target_shape,
+            stride=target_stride,
+            storage_offset=storage_offset,
+        )
+        state_tensors.append(tensor)
+        inner_offset_bytes += inner_stride[0] * dtype_size
+    return state_tensors
+
+
 # Version ranges for vLLM support
 VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.post1
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
@@ -268,6 +313,49 @@ def _get_max_cached_blocks(block_size: int) -> int:
     if MAX_CACHED_TOKENS < 0:
         return -1
     return MAX_CACHED_TOKENS // block_size
+
+
+def _cache_dtype_str(model_runner: Any) -> Optional[str]:
+    """Extract the KV cache dtype string from a GPUModelRunner, if available."""
+    cache_config = getattr(model_runner, "cache_config", None)
+    if cache_config is None:
+        vllm_config = getattr(model_runner, "vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+    return getattr(cache_config, "cache_dtype", None)
+
+
+def _get_kv_cache_shape_compat(attn_backend: Any, num_blocks: int,
+                               block_size: int, num_kv_heads: int,
+                               head_size: int,
+                               cache_dtype_str: Optional[str]) -> Any:
+    """Call ``get_kv_cache_shape``, forwarding ``cache_dtype_str`` when the
+    backend's signature accepts it.
+
+    Per-token-head quantization modes (fp8_per_token_head,
+    int8_per_token_head, nvfp4) widen ``head_size`` by a few elements to
+    inline per-head scales into the KV page. Omitting ``cache_dtype_str``
+    makes the backend compute the un-widened shape, so every page stride is
+    wrong and output is garbled (#424). Older vLLM versions do not take the
+    parameter, so it is only forwarded when declared.
+
+    Module-level so it is unit-testable without an installed vLLM or a GPU.
+    """
+    if cache_dtype_str is not None:
+        try:
+            declares_dtype = "cache_dtype_str" in inspect.signature(
+                attn_backend.get_kv_cache_shape).parameters
+        except (TypeError, ValueError):
+            declares_dtype = False
+        if declares_dtype:
+            return attn_backend.get_kv_cache_shape(
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size,
+                cache_dtype_str=cache_dtype_str,
+            )
+    return attn_backend.get_kv_cache_shape(num_blocks, block_size,
+                                           num_kv_heads, head_size)
 
 
 def _make_cache_key(block_hash: Any, group_id: int) -> bytes:
@@ -376,7 +464,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                 self.kv_cache_manager = get_kv_cache_manager(
                     num_gpu_blocks, block_size, cell_size, num_layers,
-                    num_kv_buffers=num_kv_buffers)
+                    num_kv_buffers=num_kv_buffers,
+                    pool_name="block_pool")
 
                 # Allocate a dedicated null block – a placeholder for skipped
                 # positions (e.g. sliding-window / chunked-local attention).
@@ -397,16 +486,36 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self.null_block = self.kv_block_pool[0]
                 self.null_block.is_null = True
 
-                # Prefix cache: (block_hash, group_id) -> KVCacheBlock
+                # Prefix cache: (block_hash, group_id) -> {block_id: block}.
+                # Multiple in-flight requests can materialize the same prefix
+                # before either block becomes reusable. vLLM preserves every
+                # such block because request block tables are append-only.
                 # The key embeds group_id to support hybrid attention
                 # (multiple KV cache groups with different attention types).
-                self._cached_blocks: dict[Any, KVCacheBlock] = {}
+                self._cached_blocks: dict[Any, dict[int, KVCacheBlock]] = {}
                 # Reverse index: block_id -> cache key for O(1) eviction.
                 # Each block_id belongs to exactly one group.
                 self._block_id_to_key: dict[int, Any] = {}
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+
+            def _get_one_cached_block(self, key: Any) -> Optional[KVCacheBlock]:
+                blocks = self._cached_blocks.get(key)
+                if not blocks:
+                    return None
+                return next(iter(blocks.values()))
+
+            def _remove_cached_block(
+                self, key: Any, block_id: int
+            ) -> Optional[KVCacheBlock]:
+                blocks = self._cached_blocks.get(key)
+                if not blocks:
+                    return None
+                block = blocks.pop(block_id, None)
+                if not blocks:
+                    self._cached_blocks.pop(key, None)
+                return block
 
             def get_cached_block(
                 self,
@@ -423,14 +532,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 #   expect one block per group.
                 if kv_cache_group_ids is None:
                     key = _make_cache_key(block_hash, 0)
-                    return self._cached_blocks.get(key)
+                    return self._get_one_cached_block(key)
                 if isinstance(kv_cache_group_ids, int):
                     kv_cache_group_ids = [int(kv_cache_group_ids)]
 
                 cached_blocks: list[KVCacheBlock] = []
                 for group_id in kv_cache_group_ids:
                     key = _make_cache_key(block_hash, int(group_id))
-                    block = self._cached_blocks.get(key)
+                    block = self._get_one_cached_block(key)
                     if block is None:
                         # Atomic: all groups must hit or return None
                         return None
@@ -503,31 +612,98 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     block_hash = block_hashes[block_idx]
                     key = _make_cache_key(block_hash, kv_cache_group_id)
 
-                    # Already cached, idempotent
-                    if key in self._cached_blocks:
-                        continue
-
                     # ElasticBlockPool tracks cached blocks through its own maps,
                     # but vLLM manager code may still read KVCacheBlock.block_hash
                     # after cache_full_blocks. Preserve that metadata contract and
                     # clear it before the block is evicted or reused.
+                    previous_key = self._block_id_to_key.get(block.block_id)
+                    if previous_key is not None and previous_key != key:
+                        self._remove_cached_block(previous_key, block.block_id)
+                        _reset_block_hash(block)
                     if getattr(block, "block_hash", None) is None:
                         _set_block_hash(block, key)
-                    self._cached_blocks[key] = block
+                    self._cached_blocks.setdefault(key, {})[block.block_id] = block
                     self._block_id_to_key[block.block_id] = key
 
-            def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
-                """Evict oldest blocks from evictable pool, free to kvcached.
+            def _page_aligned_victims(self, num_to_evict: int) -> list[int]:
+                """Order evictable blocks so whole pages come free.
+
+                kvcached only returns physical memory once every block on a page
+                is freed, so evicting in LRU order can free no memory at all when
+                the survivors stay scattered across pages. Prefer pages this pool
+                can empty outright, cheapest first; draining a page only part of
+                the way costs hit rate and frees nothing.
+                """
+                mgr = self.kv_cache_manager
+                allocator = getattr(mgr, "page_allocator", None)
+                if allocator is None:
+                    return []
+
+                bids = list(self._evictable_blocks)
+                by_page = allocator.group_indices_by_page(
+                    bids, mgr.block_mem_size)
+                # Blocks held by running requests are absent from
+                # _evictable_blocks, so a page whose occupancy exceeds its
+                # evictable count cannot be emptied here -- skip it.
+                occupancy = mgr.get_page_occupancy(list(by_page))
+                lru_rank = {bid: i for i, bid in enumerate(bids)}
+
+                pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
+                         for page_id, ids in by_page.items()
+                         if len(ids) >= occupancy.get(page_id, 0)]
+                # Cheapest page first; break ties on the page whose most
+                # recently used block is oldest, so hot pages are kept.
+                pages.sort(key=lambda page: (page[0], page[1]))
+
+                victims: list[int] = []
+                for cost, _rank, ids in pages:
+                    if len(victims) + cost > num_to_evict:
+                        break
+                    victims.extend(ids)
+                return victims
+
+            def _evict_blocks_from_pool(self,
+                                        num_to_evict: int,
+                                        page_aware: bool = True) -> int:
+                """Evict blocks from evictable pool, free to kvcached.
+
+                With page_aware set, prefers victims that empty whole pages so
+                freeing them returns physical memory, then falls back to LRU
+                order for the remainder. Use it only when the goal is physical
+                release (cap trimming): a page returns memory only once every
+                block on it is free.
+
+                With page_aware clear, evicts in pure LRU order. Callers that
+                reuse the freed logical slot immediately (allocation shortage)
+                get no page benefit -- the page is neither unmapped nor
+                remapped -- so reordering victims by page only trades away a
+                newer prefix for an older one and pays for the full evictable
+                scan and page sort.
 
                 Returns the number of blocks actually evicted.
                 """
+                num_to_evict = min(num_to_evict, len(self._evictable_blocks))
+                if num_to_evict <= 0:
+                    return 0
+
+                if page_aware:
+                    ordered = self._page_aligned_victims(num_to_evict)
+                    chosen = set(ordered)
+                    # Top up in LRU order: page alignment is best-effort, but
+                    # the caller still needs the count it asked for.
+                    ordered.extend(bid for bid in self._evictable_blocks
+                                   if bid not in chosen)
+                else:
+                    ordered = list(self._evictable_blocks)
+
                 ids_to_free: list[int] = []
-                for _ in range(min(num_to_evict, len(self._evictable_blocks))):
-                    bid, block = self._evictable_blocks.popitem(last=False)
+                for bid in ordered[:num_to_evict]:
+                    block = self._evictable_blocks.pop(bid, None)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        self._cached_blocks.pop(key, None)
-                    _reset_block_hash(block)
+                        self._remove_cached_block(key, bid)
+                    if block is not None:
+                        _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
                     self.kv_cache_manager.free(ids_to_free)
@@ -545,7 +721,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if self.enable_prefix_cache:
                         kvcached_free = self.kv_cache_manager.available_size()
                         if kvcached_free < num_blocks and self._evictable_blocks:
-                            self._evict_blocks_from_pool(num_blocks - kvcached_free)
+                            # Allocation shortage: the freed slot is reused
+                            # immediately, so page-aware selection buys no
+                            # memory and would evict a newer prefix over the
+                            # LRU victim. Keep pure LRU here.
+                            self._evict_blocks_from_pool(
+                                num_blocks - kvcached_free, page_aware=False)
                     block_ids = self.kv_cache_manager.alloc(num_blocks)
                     if block_ids is not None:
                         break
@@ -630,7 +811,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 for bid in block_ids:
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
-                        block = self._cached_blocks.pop(key, None)
+                        block = self._remove_cached_block(key, bid)
                         if block is not None:
                             _reset_block_hash(block)
                         removed += 1
@@ -707,22 +888,19 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                try:
-                    from kvcached.integration.vllm.interfaces import init_kvcached
+                from kvcached.integration.vllm.interfaces import init_kvcached
 
-                    # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
-                    # The kvcached IPC mechanism coordinates KV tensor readiness
-                    # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
-                    # Each PP stage manages its own KV memory independently, so
-                    # cross-stage IPC is neither needed nor correct.
-                    init_kvcached(
-                        tp_rank=0,
-                        world_size=vllm_config.parallel_config.tensor_parallel_size,
-                        is_worker=False,
-                        async_sched=_should_enable_async_sched(vllm_config),
-                    )
-                except Exception:
-                    pass
+                # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
+                # The kvcached IPC mechanism coordinates KV tensor readiness
+                # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
+                # Each PP stage manages its own KV memory independently, so
+                # cross-stage IPC is neither needed nor correct.
+                init_kvcached(
+                    tp_rank=0,
+                    world_size=vllm_config.parallel_config.tensor_parallel_size,
+                    is_worker=False,
+                    async_sched=_should_enable_async_sched(vllm_config),
+                )
             return original_init(self, vllm_config, *args, **kwargs)
 
         self._mark_as_patched(_patched_engine_init, "init")
@@ -768,10 +946,13 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             try:
                 self._setup_kvcached_coordinator()
-            except KVCachedConfigError:
+            except (KVCachedConfigError, RuntimeError):
                 # User-fixable misconfiguration (e.g. KV block larger than the
-                # page size). Abort loudly instead of silently disabling
-                # kvcached and falling back to vanilla allocation.
+                # page size), or a broken kvcached invariant such as
+                # get_world_size() finding kvcached uninitialized. Abort loudly
+                # instead of silently disabling kvcached and falling back to
+                # vanilla allocation: a half-applied coordinator patch changes
+                # KV behaviour while leaving only a warning in the log.
                 raise
             except Exception as e:
                 logger.warning("Failed to patch kv_cache_coordinator: %s", e)
@@ -801,14 +982,12 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             cell_size, num_kv_buffers = _get_kv_cache_params(
                 kv_cache_spec, block_size, attention_type=attention_type)
 
-            try:
-                from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-
-                tp_size = int(get_tensor_model_parallel_world_size())
-            except Exception:
-                tp_size = 1
-
             from kvcached.integration.vllm import interfaces as kvi
+
+            # EngineCore records tensor_parallel_size before constructing this
+            # coordinator. parallel_state is not authoritative here: depending
+            # on startup timing it can either raise or still report world size 1.
+            tp_size = int(kvi.get_world_size())
 
             # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
             # Each PP stage manages its own KV tensors independently. The IPC sockets
@@ -1109,11 +1288,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             dtype = kv_cache_spec.dtype
             num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
             assert num_blocks >= kv_cache_config.num_blocks
-            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+            kv_cache_shape = _get_kv_cache_shape_compat(
+                self.attn_backend,
                 num_blocks,
                 kv_cache_spec.block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
+                _cache_dtype_str(self),
             )
 
             kv_cache_buffers = kvi.alloc_kv_cache(
@@ -1224,12 +1405,36 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
                 set_kv_cache_layout(selected_layout)
 
-            kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
+            cache_dtype = _cache_dtype_str(self)
+            kv_cache_shape = _get_kv_cache_shape_compat(
+                attn_backend_cls,
                 num_blocks,
                 kv_cache_spec.block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
+                cache_dtype,
             )
+
+            if attention_type == "HYBRID_LINEAR":
+                # The unified-pool layout math (both layouts; load-bearing for
+                # contiguous ratio>1 linearity) assumes the spec's page is
+                # EXACTLY the geometric K+V bytes of one block:
+                #   page_size_bytes == 2 * block_size * H * D * itemsize.
+                # Quantized KV modes that inline per-token scales into the
+                # page, or a padded attention page (page_size_padded), break
+                # that identity silently -- fail loud instead of garbling.
+                import math as _math
+                _geom_page = (_math.prod(kv_cache_shape) // num_blocks *
+                              kv_cache_spec.dtype.itemsize)
+                if kv_cache_spec.page_size_bytes != _geom_page:
+                    raise NotImplementedError(
+                        "kvcached hybrid-linear requires the attention page "
+                        "size to equal the geometric K+V block bytes, but "
+                        f"page_size_bytes={kv_cache_spec.page_size_bytes} != "
+                        f"{_geom_page}. This typically means a quantized KV "
+                        "cache dtype with inline scales (e.g. "
+                        "fp8_per_token_head) or a padded attention page, "
+                        "which the unified hybrid pool does not support yet.")
 
             # Allocate group_size shared VM-backed pools, mirroring vLLM's
             # KVCacheTensor sharing: pool i is shared by layer i from each
@@ -1348,9 +1553,10 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     gbackend = patch_instance._get_version_specific_attention_backend(
                         self, kv_cache_group_id=gid
                     )
-                    gshape = gbackend.get_kv_cache_shape(
-                        num_blocks, gspec.block_size, gspec.num_kv_heads,
-                        gspec.head_size,
+                    gshape = _get_kv_cache_shape_compat(
+                        gbackend, num_blocks, gspec.block_size,
+                        gspec.num_kv_heads, gspec.head_size,
+                        _cache_dtype_str(self),
                     )
                     gkbs = (kernel_block_sizes[gid]
                             if kernel_block_sizes is not None
@@ -1428,10 +1634,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
-                        state_tensors = _reshape_mamba_non_contiguous(
-                            mamba_info["buffers"][pool_idx],
-                            kv_cache_spec, get_dtype_size,
-                        )
+                        if mamba_info.get("is_contiguous"):
+                            state_tensors = _reshape_mamba_contiguous(
+                                mamba_info, kv_cache_spec, pool_idx,
+                                get_dtype_size,
+                            )
+                        else:
+                            state_tensors = _reshape_mamba_non_contiguous(
+                                mamba_info["buffers"][pool_idx],
+                                kv_cache_spec, get_dtype_size,
+                            )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
@@ -1599,4 +1811,67 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class TritonAttentionPatch(VersionAwarePatch, BasePatch):
+    """Build the per-token-head scale views from the KV tensor, not raw storage.
+
+    ``TritonAttentionImpl._ensure_scale_caches`` carves the per-head scale
+    planes out of ``kv_cache.untyped_storage()`` under a hard-coded dense
+    layout, ignoring both ``stride()`` and ``storage_offset()``. Every kvcached
+    KV tensor is a strided view: K and V occupy separate halves of the layer
+    buffer, and in the contiguous layout each layer is a slice of one shared
+    buffer at a non-zero offset. The computed addresses are therefore wrong --
+    below the K/V split they land on some other block's scale padding (a
+    consistent, harmless relabeling), above it they land on KV data and corrupt
+    it, and in the contiguous layout every layer's scale plane collapses onto
+    layer 0's.
+
+    Slicing the tensor carries the strides and the storage offset along, so the
+    addresses follow whatever layout is actually in use. For vLLM's own dense
+    tensors this yields exactly the same views as upstream. See #424 / #434.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.attention.backends.triton_attn"
+    target_class = "TritonAttentionImpl"
+    patch_name = "triton_attention_scales"
+
+    def apply(self, triton_attn_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_ensure_scale_caches(triton_attn_mod)
+
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_ensure_scale_caches(self,
+                                  triton_attn_mod: types.ModuleType) -> bool:
+        impl_cls = self._get_target_class(triton_attn_mod)
+        if impl_cls is None:
+            return False
+        if not hasattr(impl_cls, "_ensure_scale_caches"):
+            # vLLM without per-token-head KV quantization: nothing to patch.
+            self.logger.debug("TritonAttentionImpl has no _ensure_scale_caches")
+            return True
+        if self._is_already_patched(impl_cls, "ensure_scale_caches"):
+            return True
+
+        def _ensure_scale_caches(self, kv_cache: Any) -> None:
+            import torch
+
+            if self._k_scale_cache is not None:
+                return
+            # kv_cache is (num_blocks, 2, block_size, num_kv_heads, padded_hs);
+            # the last ``scale_pad`` elements of each head hold one float32.
+            padded_hs = kv_cache.shape[-1]
+            head_size = padded_hs - 4 // kv_cache.element_size()
+            self._k_scale_cache = (kv_cache[:, 0, :, :, head_size:].view(
+                torch.float32).squeeze(-1))
+            self._v_scale_cache = (kv_cache[:, 1, :, :, head_size:].view(
+                torch.float32).squeeze(-1))
+            self._k_scale_cache.fill_(1.0)
+            self._v_scale_cache.fill_(1.0)
+
+        self._mark_as_patched(impl_cls, "ensure_scale_caches")
+        impl_cls._ensure_scale_caches = _ensure_scale_caches
         return True

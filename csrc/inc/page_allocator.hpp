@@ -27,7 +27,6 @@ using BroadcastMapCallback =
     std::function<void(int64_t, const std::vector<offset_t> &)>;
 using BroadcastUnmapCallback =
     std::function<void(int64_t, const std::vector<offset_t> &)>;
-using ShouldUseWorkerIpcCallback = std::function<bool()>;
 
 // Independent InternalPage class
 class InternalPage {
@@ -107,7 +106,13 @@ public:
   // Callback function setters for multi-process support
   void set_broadcast_map_callback(BroadcastMapCallback callback);
   void set_broadcast_unmap_callback(BroadcastUnmapCallback callback);
-  void set_should_use_worker_ipc_callback(ShouldUseWorkerIpcCallback callback);
+  // Whether map/unmap must be broadcast to worker processes over IPC. Python
+  // pushes the decision once at init. A pushed value instead of a pulled
+  // callback keeps every allocator thread (the prealloc worker in particular)
+  // out of Python: calling back into Python needs the GIL, and a thread that
+  // blocks inside this class while some other thread holds the GIL forever is
+  // exactly the deadlock of issue #371.
+  void set_use_worker_ipc(bool use_worker_ipc);
 
 private:
   // Preallocation thread worker
@@ -156,6 +161,12 @@ private:
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
+  // Serializes start/stop of the background threads. Before the blocking
+  // bindings released the GIL, concurrent start and stop callers were
+  // accidentally serialized by the GIL itself; they no longer are, so the
+  // thread handles need their own lock. Held across join(): the workers
+  // never take this lock, so no cycle.
+  std::mutex thread_ctl_lock_;
   std::unique_ptr<std::thread> prealloc_thread_;
 
   // Resize watcher thread
@@ -170,7 +181,7 @@ private:
   // Callback functions for multi-process support
   BroadcastMapCallback broadcast_map_callback_;
   BroadcastUnmapCallback broadcast_unmap_callback_;
-  ShouldUseWorkerIpcCallback should_use_worker_ipc_callback_;
+  std::atomic<bool> use_worker_ipc_{false};
 };
 
 } // namespace kvcached
