@@ -25,6 +25,11 @@ sys.modules.setdefault("torch.utils.cpp_extension", _torch_mock.utils.cpp_extens
 sys.modules.setdefault("posix_ipc", mock.MagicMock())
 sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 sys.modules.setdefault("kvcached.integration.vllm.interfaces", mock.MagicMock())
+import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
+
+# See tests/test_prefix_cache.py: mock.patch() needs the parent package
+# attribute, which a hand-installed sys.modules entry does not create.
+_vllm_pkg.interfaces = sys.modules["kvcached.integration.vllm.interfaces"]
 
 import pytest  # noqa: E402
 

@@ -1,0 +1,41 @@
+name: CPU Tests
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-pytest:
+    name: CPU pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # CPU-only PyTorch is what lets most of the suite run on a hosted
+      # runner: without it every module that reaches torch through an import
+      # chain has to be classified away from the cpu manifest.
+      - name: Install CPU-only PyTorch
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install "pytest>=8,<9" packaging
+          python -m pip install -r requirements.txt
+          python -m pip install pyyaml numpy aiohttp
+
+      - name: Validate test classification
+        run: python tools/check_test_classification.py
+
+      - name: Run CPU-only pytest suite
+        run: bash tools/run_cpu_tests.sh
