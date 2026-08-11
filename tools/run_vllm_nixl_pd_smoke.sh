@@ -69,6 +69,10 @@ VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
 NIXL_LOG_LEVEL="${NIXL_LOG_LEVEL:-DEBUG}"
 LOG_DIR="${LOG_DIR:-$(mktemp -d /tmp/kvcached-nixl-pd-smoke.XXXXXX)}"
 SUMMARY_FILE="${SUMMARY_FILE:-${LOG_DIR}/summary.jsonl}"
+# Set by run_case() so write_summary() can label a record even when it is
+# reached from die() outside that function.
+CURRENT_RUN_LABEL=""
+CURRENT_ENABLE_KVCACHED=""
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   GPU_COUNT="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
@@ -125,8 +129,54 @@ dump_runtime_state() {
   done
 }
 
+# Append one JSON object to SUMMARY_FILE describing how a case ended.
+# $1 is PASS or FAIL, $2 the reason (empty for PASS). Called from run_case()
+# on success and from die() on every failure path, so the file records what
+# went wrong -- which is the part worth pasting into an issue.
+write_summary() {
+  local status="$1"
+  local reason="${2:-}"
+  [[ -n "${SUMMARY_FILE:-}" ]] || return 0
+  SUMMARY_FILE="${SUMMARY_FILE}" \
+  SUMMARY_STATUS="${status}" \
+  SUMMARY_REASON="${reason}" \
+  RUN_LABEL="${CURRENT_RUN_LABEL:-unknown}" \
+  MODEL="${MODEL}" \
+  CLIENT_ENDPOINT="${CLIENT_ENDPOINT}" \
+  NUM_REQUESTS="${NUM_REQUESTS}" \
+  MAX_TOKENS="${MAX_TOKENS}" \
+  MIN_REMOTE_BLOCKS="${MIN_REMOTE_BLOCKS}" \
+  ENABLE_KVCACHED="${CURRENT_ENABLE_KVCACHED:-unknown}" \
+  KVCACHED_NIXL_CONTIGUOUS_LAYOUT="${KVCACHED_NIXL_CONTIGUOUS_LAYOUT}" \
+  PREFILL_LOG="${PREFILL_LOG}" \
+  DECODE_LOG="${DECODE_LOG}" \
+  CLIENT_LOG="${CLIENT_LOG}" \
+  python - <<'PY' || true
+import json
+import os
+
+with open(os.environ["SUMMARY_FILE"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "status": os.environ["SUMMARY_STATUS"],
+        "reason": os.environ["SUMMARY_REASON"],
+        "mode": os.environ["RUN_LABEL"],
+        "model": os.environ["MODEL"],
+        "client_endpoint": os.environ["CLIENT_ENDPOINT"],
+        "num_requests": int(os.environ["NUM_REQUESTS"]),
+        "max_tokens": int(os.environ["MAX_TOKENS"]),
+        "min_remote_blocks": int(os.environ["MIN_REMOTE_BLOCKS"]),
+        "kvcached": os.environ["ENABLE_KVCACHED"] == "true",
+        "kvcached_nixl_contiguous_layout": os.environ["KVCACHED_NIXL_CONTIGUOUS_LAYOUT"],
+        "prefill_log": os.environ["PREFILL_LOG"],
+        "decode_log": os.environ["DECODE_LOG"],
+        "client_log": os.environ["CLIENT_LOG"],
+    }, sort_keys=True) + "\n")
+PY
+}
+
 die() {
   printf '[nixl-smoke][FAIL] %s\n' "$*" >&2
+  write_summary FAIL "$*"
   dump_runtime_state
   if [[ -f "${PREFILL_LOG}" ]]; then
     printf '\n--- tail %s ---\n' "${PREFILL_LOG}" >&2
@@ -683,6 +733,9 @@ run_case() {
   local run_label="$1"
   local enable_kvcached="$2"
 
+  CURRENT_RUN_LABEL="${run_label}"
+  CURRENT_ENABLE_KVCACHED="${enable_kvcached}"
+
   PREFILL_LOG="${LOG_DIR}/${run_label}.prefill.log"
   DECODE_LOG="${LOG_DIR}/${run_label}.decode.log"
   CLIENT_LOG="${LOG_DIR}/${run_label}.client.log"
@@ -699,38 +752,7 @@ run_case() {
   fi
   check_logs "${enable_kvcached}"
 
-  SUMMARY_FILE="${SUMMARY_FILE}" \
-  RUN_LABEL="${run_label}" \
-  MODEL="${MODEL}" \
-  CLIENT_ENDPOINT="${CLIENT_ENDPOINT}" \
-  NUM_REQUESTS="${NUM_REQUESTS}" \
-  MAX_TOKENS="${MAX_TOKENS}" \
-  MIN_REMOTE_BLOCKS="${MIN_REMOTE_BLOCKS}" \
-  ENABLE_KVCACHED="${enable_kvcached}" \
-  KVCACHED_NIXL_CONTIGUOUS_LAYOUT="${KVCACHED_NIXL_CONTIGUOUS_LAYOUT}" \
-  PREFILL_LOG="${PREFILL_LOG}" \
-  DECODE_LOG="${DECODE_LOG}" \
-  CLIENT_LOG="${CLIENT_LOG}" \
-  python - <<'PY'
-import json
-import os
-
-with open(os.environ["SUMMARY_FILE"], "a", encoding="utf-8") as f:
-    f.write(json.dumps({
-        "status": "PASS",
-        "mode": os.environ["RUN_LABEL"],
-        "model": os.environ["MODEL"],
-        "client_endpoint": os.environ["CLIENT_ENDPOINT"],
-        "num_requests": int(os.environ["NUM_REQUESTS"]),
-        "max_tokens": int(os.environ["MAX_TOKENS"]),
-        "min_remote_blocks": int(os.environ["MIN_REMOTE_BLOCKS"]),
-        "kvcached": os.environ["ENABLE_KVCACHED"] == "true",
-        "kvcached_nixl_contiguous_layout": os.environ["KVCACHED_NIXL_CONTIGUOUS_LAYOUT"],
-        "prefill_log": os.environ["PREFILL_LOG"],
-        "decode_log": os.environ["DECODE_LOG"],
-        "client_log": os.environ["CLIENT_LOG"],
-    }, sort_keys=True) + "\\n")
-PY
+  write_summary PASS ""
 
   log "${run_label} PASS"
   log "${run_label} prefill log: ${PREFILL_LOG}"
