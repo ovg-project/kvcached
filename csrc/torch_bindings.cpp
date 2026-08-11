@@ -148,8 +148,8 @@ int64_t page_allocator_get_num_offloaded_pages(
   return allocator->get_num_offloaded_pages();
 }
 
-bool page_allocator_is_page_offloaded(
-    std::shared_ptr<PageAllocator> allocator, page_id_t page_id) {
+bool page_allocator_is_page_offloaded(std::shared_ptr<PageAllocator> allocator,
+                                      page_id_t page_id) {
   return allocator->is_page_offloaded(page_id);
 }
 
@@ -260,8 +260,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_num_offloaded_pages",
            &kvcached::page_allocator_get_num_offloaded_pages)
-      .def("is_page_offloaded",
-           &kvcached::page_allocator_is_page_offloaded)
+      .def("is_page_offloaded", &kvcached::page_allocator_is_page_offloaded)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
       .def("check_and_get_resize_target",

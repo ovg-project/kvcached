@@ -244,9 +244,9 @@ void PageAllocator::free_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(lock_);
     if (offloaded_page_ids_.count(page_id) != 0 ||
         transitioning_page_ids_.count(page_id) != 0) {
-      throw std::runtime_error(
-          "Restore a CPU-offloaded page before returning it to the free list: " +
-          std::to_string(page_id));
+      throw std::runtime_error("Restore a CPU-offloaded page before returning "
+                               "it to the free list: " +
+                               std::to_string(page_id));
     }
     num_free_pages_++;
 
@@ -280,8 +280,8 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
     for (page_id_t page_id : page_ids) {
       if (offloaded_page_ids_.count(page_id) != 0 ||
           transitioning_page_ids_.count(page_id) != 0) {
-        throw std::runtime_error(
-            "Restore CPU-offloaded pages before returning them to the free list");
+        throw std::runtime_error("Restore CPU-offloaded pages before returning "
+                                 "them to the free list");
       }
     }
     num_free_pages_ += page_ids.size();

@@ -10,7 +10,6 @@ from typing import Dict, List, Sequence
 
 import pytest
 
-
 MODULE_PATH = Path(__file__).parents[1] / "kvcached" / "cpu_offload.py"
 SPEC = importlib.util.spec_from_file_location("kvcached_cpu_offload", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
