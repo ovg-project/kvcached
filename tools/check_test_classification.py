@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -105,7 +106,20 @@ def main() -> int:
 
     manifests = load_manifests()
     discovered = discover_tests()
-    validate_classification(discovered, manifests)
+    try:
+        validate_classification(discovered, manifests)
+    except ClassificationError as exc:
+        # A traceback buries the one line that says what to do.
+        print(f"test classification invalid: {exc}", file=sys.stderr)
+        print(
+            "Add each test module to exactly one of "
+            + ", ".join(f"tests/manifests/{category}.txt"
+                        for category in CATEGORIES)
+            + " (cpu: runs on a hosted runner; gpu: needs a device or the "
+            "compiled kvcached.vmm_ops; integration: needs a running engine).",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.list_category:
         print("\n".join(manifests[args.list_category]))
