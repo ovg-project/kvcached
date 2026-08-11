@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+SYNC_MANAGED_TRAILER = "OVG-Sync-Managed: true"
+
 
 @dataclass
 class CheckResult:
@@ -183,6 +185,45 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
             ancestor.stdout,
         )
 
+    expected_remote_tip = ""
+    if args.update_existing_branch:
+        remote_sync_ref = f"refs/remotes/origin/{args.sync_branch}"
+        remote_branch = git(
+            repository,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            remote_sync_ref,
+            check=False,
+        )
+        if remote_branch.returncode == 0:
+            expected_remote_tip = git(
+                repository, "rev-parse", remote_sync_ref
+            ).stdout.strip()
+            remote_message = git(
+                repository,
+                "show",
+                "-s",
+                "--format=%B",
+                remote_sync_ref,
+            ).stdout.splitlines()
+            if SYNC_MANAGED_TRAILER not in remote_message:
+                result.status = "remote-diverged"
+                result.result_commit = expected_remote_tip
+                result.message = (
+                    "The remote sync branch contains commits that were not "
+                    "produced by the synchronization job. The update stopped "
+                    "without pushing so maintainer or repair-agent work is not "
+                    "overwritten."
+                )
+                return result
+        elif remote_branch.returncode != 1:
+            raise CommandError(
+                ["git", "show-ref", "--verify", "--quiet", remote_sync_ref],
+                remote_branch.returncode,
+                remote_branch.stdout,
+            )
+
     git(repository, "checkout", "-b", args.sync_branch)
     result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
     if args.strategy == "rebase":
@@ -236,11 +277,24 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
             )
             return result
 
-    result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
     if args.push:
+        if args.update_existing_branch:
+            git(
+                repository,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "chore: record automated upstream sync",
+                "-m",
+                SYNC_MANAGED_TRAILER,
+                "-m",
+                f"OVG-Upstream-Commit: {result.upstream_commit}",
+            )
+        result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
         push_args = ["push"]
         if args.update_existing_branch:
-            push_args.append("--force-with-lease")
+            lease = f"refs/heads/{args.sync_branch}:{expected_remote_tip}"
+            push_args.append(f"--force-with-lease={lease}")
         push_args.extend(["origin", f"HEAD:refs/heads/{args.sync_branch}"])
         git(repository, *push_args)
         result.message = (
@@ -248,6 +302,7 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
             "branch was pushed."
         )
     else:
+        result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
         result.message = (
             f"Upstream {args.strategy} completed and checks passed. "
             "Dry run: no branch was pushed."
@@ -334,6 +389,7 @@ def main() -> int:
         "synced": 0,
         "conflict": 2,
         "check-failed": 3,
+        "remote-diverged": 4,
     }.get(result.status, 1)
 
 

@@ -250,3 +250,43 @@ def test_stable_sync_branch_updates_without_duplicate_branch(tmp_path):
     assert completed.returncode == 0
     assert first["sync_branch"] == second["sync_branch"]
     assert git(target, "rev-parse", "refs/heads/automation/test-sync") != first_tip
+
+
+def test_sync_refuses_to_overwrite_repair_commit_on_remote_branch(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    write(upstream / "first.txt", "first upstream feature\n")
+    commit(upstream, "first upstream feature")
+    completed, _, _ = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--push",
+        "--update-existing-branch",
+    )
+    assert completed.returncode == 0
+
+    repair_worktree = tmp_path / "repair-worktree"
+    git(tmp_path, "clone", str(target), str(repair_worktree))
+    git(repair_worktree, "checkout", "automation/test-sync")
+    write(repair_worktree / "repair.txt", "human compatibility fix\n")
+    commit(repair_worktree, "preserve this repair")
+    git(repair_worktree, "push", "origin", "automation/test-sync")
+    repair_tip = git(target, "rev-parse", "refs/heads/automation/test-sync")
+
+    write(upstream / "second.txt", "second upstream feature\n")
+    commit(upstream, "second upstream feature")
+    completed, result, report = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--push",
+        "--update-existing-branch",
+    )
+
+    assert completed.returncode == 4
+    assert result["status"] == "remote-diverged"
+    assert git(target, "rev-parse", "refs/heads/automation/test-sync") == repair_tip
+    assert "not overwritten" in report
+    assert git(target, "show", "automation/test-sync:repair.txt") == (
+        "human compatibility fix"
+    )
