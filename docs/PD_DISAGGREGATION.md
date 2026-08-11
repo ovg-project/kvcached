@@ -10,14 +10,33 @@ Related issues: [#302](https://github.com/ovg-project/kvcached/issues/302),
 
 ## Support Matrix
 
+vLLM registers fifteen KV connectors. This document covers the ones that are
+either being validated now or are tied to work already in flight; the rest are
+listed with the reason they are out of scope, so an omission is never silent.
+
+### Under validation
+
 | Connector | Transport / storage path | kvcached status | Validation entrypoint | Notes |
 |---|---|---|---|---|
 | `NixlConnector` | NIXL / UCX | Smoke harness available | `tools/run_vllm_nixl_pd_smoke.sh` | Requires `KVCACHED_CONTIGUOUS_LAYOUT=false` because NIXL registers each layer's K/V blocks as independently block-contiguous regions. |
+
+### Planned
+
+| Connector | Transport / storage path | kvcached status | Validation entrypoint | Notes |
+|---|---|---|---|---|
 | `P2pNcclConnector` | NCCL peer-to-peer | Untested | TBD | Needs a minimal baseline run, then a kvcached run that checks NCCL with VMM-backed KV tensors. |
 | `LMCacheConnectorV1` | LMCache | Untested | TBD | Needs a minimal multi-component configuration and a kvcached correctness run. LMCache may have different tensor ownership/layout assumptions from NIXL. |
-| `MooncakeConnector` | Mooncake | Not in current scope | TBD | Revisit after the three connectors above are understood. |
-| `SharedStorageConnector` | Shared storage | Not in current scope | TBD | Revisit after the three connectors above are understood. |
-| `MultiConnector` | Composite connector | Not in current scope | TBD | Should be tested only after the individual component connectors have known behavior. |
+| `OffloadingConnector` | KV offloading | Untested | TBD | [#351](https://github.com/ovg-project/kvcached/pull/351) is adding HMA support for it. |
+| `SimpleCPUOffloadConnector` | CPU offloading | Untested | TBD | Covered by the CPU-offloading work in [#93](https://github.com/ovg-project/kvcached/issues/93) / [#269](https://github.com/ovg-project/kvcached/pull/269). |
+
+### Not covered
+
+| Connector | Why |
+|---|---|
+| `MooncakeConnector`, `MooncakeStoreConnector` | Need an external Mooncake transfer-engine service. |
+| `MultiConnector` | Composes other connectors; only meaningful once the individual ones have known behaviour. |
+| `FlexKVConnectorV1`, `HF3FSKVConnector`, `MoRIIOConnector`, `LMCacheMPConnector` | No current kvcached use case; revisit on request. |
+| `ExampleConnector`, `ExampleHiddenStatesConnector`, `DecodeBenchConnector` | Reference implementations and a benchmarking stub, not production transfer paths. |
 
 ## NIXL Smoke Test
 
