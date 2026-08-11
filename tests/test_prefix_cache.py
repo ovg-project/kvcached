@@ -31,11 +31,16 @@ sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 
 # Pre-mock the interfaces module so mock.patch can resolve its attributes.
 # This avoids importing torch / C extensions transitively via interfaces.py.
-_interfaces_mock = mock.MagicMock()
-sys.modules.setdefault("kvcached.integration.vllm.interfaces", _interfaces_mock)
+sys.modules.setdefault("kvcached.integration.vllm.interfaces",
+                       mock.MagicMock())
 import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
 
-setattr(_vllm_pkg, "interfaces", _interfaces_mock)
+# Binding the stub into sys.modules is not enough: mock.patch() resolves a
+# dotted target with getattr() on the parent package, and a hand-installed
+# sys.modules entry never sets that attribute. Point it at whatever is
+# actually in sys.modules -- another test module may have stubbed this first,
+# and patching a different object than the code imports silently does nothing.
+_vllm_pkg.interfaces = sys.modules["kvcached.integration.vllm.interfaces"]
 
 import pytest  # noqa: E402
 
