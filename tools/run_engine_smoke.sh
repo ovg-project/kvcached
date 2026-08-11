@@ -48,6 +48,9 @@ fi
 mkdir -p "${LOG_DIR}"
 SERVER_LOG="${LOG_DIR}/${ENGINE}-server.log"
 CLIENT_LOG="${LOG_DIR}/${ENGINE}-client.json"
+GPU_PIDS_BEFORE="${LOG_DIR}/${ENGINE}-gpu-pids-before.txt"
+GPU_PIDS_AFTER="${LOG_DIR}/${ENGINE}-gpu-pids-after.txt"
+GPU_PIDS_INTRODUCED="${LOG_DIR}/${ENGINE}-gpu-pids-introduced.txt"
 
 if [[ "${CHECK_ONLY}" == "1" ]]; then
   echo "Engine smoke preflight passed: engine=${ENGINE}, port=${PORT}"
@@ -58,24 +61,61 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required" >&2
   exit 2
 fi
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "nvidia-smi is required" >&2
+  exit 2
+fi
+GPU_DEVICE_SELECTOR="${KVCACHED_GPU_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
+if [[ -z "${GPU_DEVICE_SELECTOR}" ]]; then
+  echo "KVCACHED_GPU_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES must select the smoke-test GPU" >&2
+  exit 2
+fi
 "${PYTHON}" -c "import ${ENGINE}" >/dev/null
 
 SERVER_PID=""
+snapshot_gpu_pids() {
+  local output_file="$1"
+  {
+    nvidia-smi --id="${GPU_DEVICE_SELECTOR}" \
+      --query-compute-apps=pid \
+      --format=csv,noheader,nounits 2>/dev/null || true
+  } | sed -e 's/[[:space:]]//g' -e '/^$/d' | sort -u >"${output_file}"
+}
+
+introduced_gpu_pids() {
+  snapshot_gpu_pids "${GPU_PIDS_AFTER}"
+  comm -13 "${GPU_PIDS_BEFORE}" "${GPU_PIDS_AFTER}" >"${GPU_PIDS_INTRODUCED}"
+  [[ ! -s "${GPU_PIDS_INTRODUCED}" ]]
+}
+
 cleanup() {
   local exit_code=$?
   set +e
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill "${SERVER_PID}" 2>/dev/null
+  trap - EXIT INT TERM
+  if [[ -n "${SERVER_PID}" ]] && kill -0 -- "-${SERVER_PID}" 2>/dev/null; then
+    kill -TERM -- "-${SERVER_PID}" 2>/dev/null
     for _ in $(seq 1 30); do
-      kill -0 "${SERVER_PID}" 2>/dev/null || break
+      kill -0 -- "-${SERVER_PID}" 2>/dev/null || break
       sleep 1
     done
-    kill -9 "${SERVER_PID}" 2>/dev/null || true
+    kill -KILL -- "-${SERVER_PID}" 2>/dev/null || true
   fi
   wait "${SERVER_PID}" 2>/dev/null || true
+
+  for _ in $(seq 1 30); do
+    introduced_gpu_pids && break
+    sleep 1
+  done
+  if ! introduced_gpu_pids; then
+    echo "Engine smoke left processes on selected GPU(s):" >&2
+    cat "${GPU_PIDS_INTRODUCED}" >&2
+    exit_code=1
+  fi
   exit "${exit_code}"
 }
 trap cleanup EXIT INT TERM
+
+snapshot_gpu_pids "${GPU_PIDS_BEFORE}"
 
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
@@ -84,7 +124,9 @@ export no_proxy="localhost,127.0.0.1,::1"
 export NO_PROXY="${no_proxy}"
 
 if [[ "${ENGINE}" == "vllm" ]]; then
-  "${PYTHON}" -m vllm.entrypoints.openai.api_server \
+  "${PYTHON}" -c \
+    'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    "${PYTHON}" -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
@@ -92,7 +134,9 @@ if [[ "${ENGINE}" == "vllm" ]]; then
     --no-enable-prefix-caching \
     >"${SERVER_LOG}" 2>&1 &
 else
-  "${PYTHON}" -m sglang.launch_server \
+  "${PYTHON}" -c \
+    'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    "${PYTHON}" -m sglang.launch_server \
     --model "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
@@ -165,8 +209,9 @@ if grep -E "Traceback|CUDA error|illegal memory access|core dumped|Segmentation 
   exit 1
 fi
 
-if ! grep -i "kvcached" "${SERVER_LOG}" >/dev/null 2>&1; then
-  echo "Server answered correctly, but no kvcached activation evidence was logged" >&2
+if ! "${PYTHON}" tools/check_engine_activation.py \
+  --engine "${ENGINE}" --log "${SERVER_LOG}"; then
+  echo "Server answered correctly, but kvcached allocator initialization was not verified" >&2
   tail -n 120 "${SERVER_LOG}" >&2
   exit 1
 fi

@@ -84,6 +84,11 @@ def init_kvcached(
     _async_sched = async_sched
     _is_worker = is_worker
 
+    logger.info(
+        "KVCACHED_ENGINE_INTEGRATION_READY engine=vllm device=%s",
+        device,
+    )
+
     if _async_sched:
         logger.info("kvcached async scheduler enabled")
 

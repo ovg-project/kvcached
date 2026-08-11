@@ -56,6 +56,11 @@ def init_kvcached(
     _world_size = world_size
     _pp_rank = pp_rank
 
+    logger.info(
+        "KVCACHED_ENGINE_INTEGRATION_READY engine=sglang device=%s",
+        device,
+    )
+
     if world_size > 1:
         # start the listener thread for tensor parallel kv cache management
         start_worker_listener_thread(tp_rank, pp_rank)
