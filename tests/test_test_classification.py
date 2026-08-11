@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 MODULE_PATH = (
     Path(__file__).parents[1] / "tools" / "check_test_classification.py"
 )
