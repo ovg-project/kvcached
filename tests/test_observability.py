@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
@@ -24,6 +25,17 @@ from kvcached.pool_registry import (  # noqa: E402
 
 
 class FakePageAllocator:
+    page_state_calls = 0
+
+    def get_page_state(self):
+        self.page_state_calls += 1
+        return {
+            "total_pages": 20,
+            "free_pages": 10,
+            "inuse_pages": 10,
+            "reserved_pages": 2,
+        }
+
     def get_num_free_pages(self):
         return 10
 
@@ -104,6 +116,7 @@ def test_runtime_snapshot_dict():
 
 
 def test_kv_cache_pool_snapshot_from_manager_like_object():
+    FakeManager.page_allocator.page_state_calls = 0
     snapshot = build_kv_cache_pool_snapshot(
         FakeManager(),
         integration="sglang",
@@ -124,15 +137,47 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["null_block_reserved"] is True
     assert data["virtual_per_layer_bytes"] == 128 * 4096 * 2
     assert data["virtual_total_bytes"] == 128 * 4096 * 8 * 2
-    assert data["mapped_bytes"] == 6 * 8 * (2 * 1024 * 1024) * 2
+    assert data["mapped_bytes"] == 10 * 8 * (2 * 1024 * 1024) * 2
     assert data["total_pages"] == 20
     assert data["free_pages"] == 10
-    assert data["inuse_pages"] == 6
+    assert data["inuse_pages"] == 10
     assert data["reserved_pages"] == 2
     assert data["available_physical_pages"] == 4
     assert data["effective_free_pages"] == 6
     assert data["resize_target_bytes"] == 0
+    assert FakeManager.page_allocator.page_state_calls == 1
     json.dumps(data)
+
+
+def test_pool_snapshot_falls_back_for_older_page_allocator():
+    class LegacyPageAllocator:
+        def get_num_free_pages(self):
+            return 7
+
+        def get_num_inuse_pages(self):
+            return 5
+
+        def get_num_total_pages(self):
+            return 12
+
+        def get_num_reserved_pages(self):
+            return 1
+
+        def get_avail_physical_pages(self):
+            return 3
+
+        def get_resize_target(self):
+            return -1
+
+    class LegacyManager(FakeManager):
+        page_allocator: Any = LegacyPageAllocator()
+
+    data = build_kv_cache_pool_snapshot(LegacyManager()).to_dict()
+
+    assert data["total_pages"] == 12
+    assert data["free_pages"] == 7
+    assert data["inuse_pages"] == 5
+    assert data["reserved_pages"] == 1
 
 
 def test_pool_snapshot_clamps_negative_block_gauges():
