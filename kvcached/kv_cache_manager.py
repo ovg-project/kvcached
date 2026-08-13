@@ -186,6 +186,9 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._memory_limit_bytes: Optional[int] = None
+        self._memory_limit_effective_bytes: Optional[int] = None
+        self._memory_limit_revision = -1
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -467,7 +470,7 @@ class KVCacheManager:
         new_mem_size: the memory size of the K or V tensor in one layer
         """
         self._wait_post_init()
-        assert new_mem_size > 0, "new_mem_size must be positive"
+        assert new_mem_size >= 0, "new_mem_size must be non-negative"
         if self.page_allocator.resize(new_mem_size):
             if self.in_shrink:
                 self.in_shrink = False
@@ -491,6 +494,87 @@ class KVCacheManager:
         """
         self._wait_post_init()
         self.page_allocator.trim()
+
+    @synchronized
+    def set_memory_limit(
+        self,
+        limit_bytes: int,
+        *,
+        revision: int,
+    ) -> Dict[str, Any]:
+        """Apply a revisioned memory limit through the existing resize path."""
+        limit_bytes = int(limit_bytes)
+        revision = int(revision)
+        if limit_bytes < 0:
+            raise ValueError("limit_bytes must be non-negative")
+        if revision < 0:
+            raise ValueError("revision must be non-negative")
+
+        current_revision = self._memory_limit_revision
+        current_limit = self._memory_limit_bytes
+        if revision < current_revision:
+            return self._memory_limit_state(status="stale")
+        if revision == current_revision and current_limit == limit_bytes:
+            return self._memory_limit_state()
+        if revision == current_revision:
+            return self._memory_limit_state(status="conflict")
+
+        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
+        max_pages = self.mem_size // self.page_size
+        target_pages = min(limit_bytes // page_bundle_bytes, max_pages)
+        effective_limit_bytes = target_pages * page_bundle_bytes
+
+        self.resize(target_pages * self.page_size)
+        self._memory_limit_bytes = limit_bytes
+        self._memory_limit_effective_bytes = effective_limit_bytes
+        self._memory_limit_revision = revision
+        return self._memory_limit_state()
+
+    def _memory_limit_page_bundle_bytes(self) -> int:
+        return self.page_size * self.num_layers * self.num_kv_buffers
+
+    def _memory_limit_state(
+        self,
+        *,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        page_state = self.page_allocator.get_page_state()
+        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
+        mapped_pages = (int(page_state["inuse_pages"])
+                        + int(page_state["reserved_pages"]))
+        mapped_bytes = mapped_pages * page_bundle_bytes
+        effective_limit_bytes = self._memory_limit_effective_bytes
+        if status is None:
+            status = "deferred" if self.in_shrink else "applied"
+        return {
+            "status": status,
+            "pool_name": str(self.pool_name or ""),
+            "group_id": self.group_id,
+            "limit_bytes": self._memory_limit_bytes,
+            "effective_limit_bytes": effective_limit_bytes,
+            "current_capacity_bytes": (
+                int(page_state["total_pages"]) * page_bundle_bytes
+            ),
+            "revision": self._memory_limit_revision,
+            "mapped_bytes": mapped_bytes,
+            "remaining_bytes": (
+                None if effective_limit_bytes is None else
+                max(0, effective_limit_bytes - mapped_bytes)
+            ),
+            "overage_bytes": (
+                0 if effective_limit_bytes is None else
+                max(0, mapped_bytes - effective_limit_bytes)
+            ),
+            "reason": {
+                "deferred": "inuse_capacity_above_limit",
+                "conflict": "revision_reused_with_different_limit",
+            }.get(status, ""),
+        }
+
+    @synchronized
+    def memory_limit_state(self) -> Dict[str, Any]:
+        """Return the current revisioned resize limit and apply state."""
+        return self._memory_limit_state()
 
     @synchronized
     def available_size(self) -> int:
