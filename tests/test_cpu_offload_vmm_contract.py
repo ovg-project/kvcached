@@ -71,3 +71,18 @@ def test_actionlint_knows_cpu_offload_runner_labels():
     labels = config["self-hosted-runner"]["labels"]
     assert "gpu" in labels
     assert "kvcached" in labels
+
+
+def test_two_gpu_campaign_preserves_results_and_compares_vllm_baseline():
+    script = (ROOT / "tools" / "run_two_gpu_cpu_offload_campaign.sh").read_text()
+
+    assert 'ARTIFACT_ROOT="${ARTIFACT_ROOT:-}"' in script
+    assert "trap finalize EXIT" in script
+    assert "core-gpu0" in script
+    assert "core-gpu1" in script
+    assert "dual-gpu-isolation" in script
+    assert "vllm-baseline-vs-offload" in script
+    assert "nixl-regression" in script
+    assert "targeted-model-matrix" in script
+    assert 'BASELINE_URL="http://127.0.0.1:${BASELINE_PORT}"' in script
+    assert "MANIFEST.sha256" in script
