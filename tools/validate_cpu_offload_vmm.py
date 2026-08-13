@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -21,16 +22,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--pages", type=int, default=4)
     parser.add_argument("--cycles", type=int, default=5)
+    parser.add_argument("--require-reclaimed-bytes", action="store_true")
     parser.add_argument("--report", type=Path, required=True)
     return parser.parse_args()
 
 
 def summarize(values: List[float]) -> Dict[str, float]:
+    if not values:
+        raise ValueError("samples must not be empty")
     ordered = sorted(values)
+    p95_index = math.ceil(0.95 * len(ordered)) - 1
+    p99_index = math.ceil(0.99 * len(ordered)) - 1
     return {
         "mean": statistics.fmean(ordered),
         "min": min(ordered),
         "p50": statistics.median(ordered),
+        "p95": ordered[p95_index],
+        "p99": ordered[p99_index],
         "max": max(ordered),
     }
 
@@ -136,8 +144,10 @@ def main() -> int:
         offload_ms: List[float] = []
         restore_ms: List[float] = []
         reclaimed_bytes: List[int] = []
+        cycle_reclaimed_bytes: List[int] = []
 
         for _ in range(args.cycles):
+            cycle_free_before, _ = torch.cuda.mem_get_info(args.device)
             for page_id in page_ids:
                 free_before, _ = torch.cuda.mem_get_info(args.device)
                 start = time.perf_counter()
@@ -147,6 +157,11 @@ def main() -> int:
                 reclaimed_bytes.append(max(0, free_after - free_before))
                 if not result.stored or not allocator.is_page_offloaded(page_id):
                     raise RuntimeError(f"page {page_id} did not enter offloaded state")
+
+            cycle_free_after, _ = torch.cuda.mem_get_info(args.device)
+            cycle_reclaimed_bytes.append(
+                max(0, cycle_free_after - cycle_free_before)
+            )
 
             if allocator.get_num_offloaded_pages() != len(page_ids):
                 raise RuntimeError("offloaded page count does not match")
@@ -158,12 +173,16 @@ def main() -> int:
                 restore_ms.append((time.perf_counter() - start) * 1000)
                 if allocator.is_page_offloaded(page_id):
                     raise RuntimeError(f"page {page_id} remained offloaded")
-                observed = [int(view[0]) for view in gpu_views(page_id)]
-                if observed != expected[page_id]:
-                    raise RuntimeError(
-                        f"round-trip mismatch for page {page_id}: "
-                        f"expected={expected[page_id]}, observed={observed}"
-                    )
+                for payload_index, view in enumerate(gpu_views(page_id)):
+                    expected_value = expected[page_id][payload_index]
+                    if not bool(torch.all(view == expected_value).item()):
+                        raise RuntimeError(
+                            f"round-trip payload mismatch for page {page_id}, "
+                            f"payload {payload_index}"
+                        )
+
+        if args.require_reclaimed_bytes and max(cycle_reclaimed_bytes) <= 0:
+            raise RuntimeError("GPU memory did not increase after page offload")
 
         report: Dict[str, Any] = {
             "cycles": args.cycles,
@@ -171,6 +190,9 @@ def main() -> int:
             "gpu": torch.cuda.get_device_name(torch.device(args.device)),
             "layers": args.layers,
             "logical_page_bytes": geometry.logical_page_bytes,
+            "cycle_reclaimed_bytes": summarize(
+                [float(value) for value in cycle_reclaimed_bytes]
+            ),
             "offload_ms": summarize(offload_ms),
             "page_size_bytes": page_size,
             "pages": args.pages,

@@ -12,7 +12,39 @@ cd "${ROOT_DIR}"
 PYTHON="${PYTHON:-python}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/cpu-offload-vmm-artifacts}"
 TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${HOME}/.cache/kvcached/gcc-11}"
+DEVICE="${DEVICE:-cuda:0}"
+INSTALL_PACKAGE="${INSTALL_PACKAGE:-1}"
 mkdir -p "${ARTIFACT_DIR}"
+
+archive="${ARTIFACT_DIR%/}.tar.gz"
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+finalize() {
+  local exit_code=$?
+  trap - EXIT
+  set +e
+  nvidia-smi >"${ARTIFACT_DIR}/nvidia-smi-final.txt" 2>&1
+  {
+    printf 'status=%s\n' "$([[ "${exit_code}" -eq 0 ]] && printf passed || printf failed)"
+    printf 'exit_code=%s\n' "${exit_code}"
+    printf 'started_at=%s\n' "${started_at}"
+    printf 'finished_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'device=%s\n' "${DEVICE}"
+  } >"${ARTIFACT_DIR}/run-status.txt"
+  (
+    cd "${ARTIFACT_DIR}" || exit
+    find . -type f ! -name MANIFEST.sha256 -print0 \
+      | sort -z \
+      | xargs -0 sha256sum > MANIFEST.sha256
+  )
+  tar -czf "${archive}" -C "$(dirname "${ARTIFACT_DIR}")" \
+    "$(basename "${ARTIFACT_DIR}")"
+  sha256sum "${archive}" >"${archive}.sha256"
+  printf 'Artifacts: %s\nArchive: %s\n' "${ARTIFACT_DIR}" "${archive}"
+  cat "${archive}.sha256" 2>/dev/null || true
+  exit "${exit_code}"
+}
+trap finalize EXIT
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi is required" >&2
@@ -40,26 +72,42 @@ fi
 nvidia-smi --query-gpu=index,name,memory.total,driver_version \
   --format=csv,noheader | tee "${ARTIFACT_DIR}/nvidia-smi.txt"
 {
+  printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+  printf 'git_branch=%s\n' "$(git branch --show-current)"
+  printf 'git_status_begin\n'
+  git status --short
+  printf 'git_status_end\n'
+  printf 'device=%s\n' "${DEVICE}"
+  printf 'python=%s\n' "$("${PYTHON}" --version 2>&1)"
+  uname -a
+  df -h "${ARTIFACT_DIR}"
+} | tee "${ARTIFACT_DIR}/environment.txt"
+{
   "${CC:-cc}" --version | head -1
   "${CXX:-c++}" --version | head -1
   nvcc --version | tail -1
 } | tee "${ARTIFACT_DIR}/compiler.txt"
-"${PYTHON}" -m pip install \
-  "packaging>=24.2" "setuptools>=77" wheel \
-  2>&1 | tee "${ARTIFACT_DIR}/bootstrap.log"
-"${PYTHON}" -m pip install . --force-reinstall --no-deps \
-  --no-build-isolation --no-cache-dir \
-  2>&1 | tee "${ARTIFACT_DIR}/install.log"
+if [[ "${INSTALL_PACKAGE}" == "1" ]]; then
+  "${PYTHON}" -m pip install \
+    "packaging>=24.2" "setuptools>=77" wheel \
+    2>&1 | tee "${ARTIFACT_DIR}/bootstrap.log"
+  "${PYTHON}" -m pip install . --force-reinstall --no-deps \
+    --no-build-isolation --no-cache-dir \
+    2>&1 | tee "${ARTIFACT_DIR}/install.log"
+fi
 
 "${PYTHON}" tools/validate_cpu_offload_vmm.py \
+  --device "${DEVICE}" \
   --page-size-mb "${PAGE_SIZE_MB:-2}" \
   --layers "${LAYERS:-8}" \
   --pages "${PAGES:-4}" \
   --cycles "${CYCLES:-5}" \
+  --require-reclaimed-bytes \
   --report "${ARTIFACT_DIR}/vmm-roundtrip.json" \
   2>&1 | tee "${ARTIFACT_DIR}/vmm-roundtrip.log"
 
 "${PYTHON}" tools/benchmark_cpu_offload.py \
+  --device "${DEVICE}" \
   --page-size-mb "${PAGE_SIZE_MB:-2}" \
   --layers "${BENCH_LAYERS:-32}" \
   --kv-buffers 2 \
@@ -67,18 +115,4 @@ nvidia-smi --query-gpu=index,name,memory.total,driver_version \
   --report "${ARTIFACT_DIR}/transfer-benchmark.json" \
   2>&1 | tee "${ARTIFACT_DIR}/transfer-benchmark.log"
 
-(
-  cd "${ARTIFACT_DIR}"
-  find . -type f ! -name MANIFEST.sha256 -print0 \
-    | sort -z \
-    | xargs -0 sha256sum > MANIFEST.sha256
-)
-
-archive="${ARTIFACT_DIR%/}.tar.gz"
-tar -czf "${archive}" -C "$(dirname "${ARTIFACT_DIR}")" \
-  "$(basename "${ARTIFACT_DIR}")"
-sha256sum "${archive}" > "${archive}.sha256"
 echo "CPU offload validation passed"
-echo "Artifacts: ${ARTIFACT_DIR}"
-echo "Archive: ${archive}"
-cat "${archive}.sha256"

@@ -36,12 +36,14 @@ def summarize_ms(samples: List[float]) -> Dict[str, float]:
         raise ValueError("timing samples must not be empty")
     ordered = sorted(samples)
     p95_index = math.ceil(0.95 * len(ordered)) - 1
+    p99_index = math.ceil(0.99 * len(ordered)) - 1
     return {
         "max": max(ordered),
         "mean": statistics.fmean(ordered),
         "min": min(ordered),
         "p50": statistics.median(ordered),
         "p95": ordered[p95_index],
+        "p99": ordered[p99_index],
     }
 
 

@@ -15,6 +15,7 @@ def test_summarize_ms_reports_tail_latency():
         "min": 1.0,
         "p50": 3.0,
         "p95": 100.0,
+        "p99": 100.0,
     }
 
 
