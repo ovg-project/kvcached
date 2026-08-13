@@ -125,8 +125,12 @@ def build_kv_views(
     heterogeneous hybrid model (e.g. Gemma: sliding-window + full-attention
     groups with different ``(block_size, num_kv_heads, head_size)`` but identical
     ``block_mem_size``) build a DIFFERENT view per group over the SAME physical
-    pools. Returns ``(kv_tensors, page_size_bytes)``. Non-contiguous layout only
-    for heterogeneous callers.
+    pools. Returns ``(kv_tensors, page_size_bytes)``.
+
+    Both layouts are supported for heterogeneous callers: the shared
+    ``block_mem_size`` means block N occupies the same bytes whichever group's
+    view addresses it, so each branch below only has to re-derive the per-group
+    shape/stride from that one uniform block stride.
     """
     is_mla = attention_type == "MLA"
     unified_pool = attention_type == "HYBRID_LINEAR"

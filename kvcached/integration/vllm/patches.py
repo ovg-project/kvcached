@@ -1538,15 +1538,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 self._kvcached_mamba_raw_info = raw_info
             elif is_hetero:
                 kv_cache_raw_tensors, meta = alloc_result
-                if getattr(kvi, "_contiguous_layout", False):
-                    raise RuntimeError(
-                        "kvcached: heterogeneous attention KV groups (e.g. Gemma "
-                        "sliding-window + full-attention) currently require the "
-                        "non-contiguous layout. Re-launch with "
-                        "KVCACHED_CONTIGUOUS_LAYOUT=false."
-                    )
                 # Build a per-group view over the shared physical pools using each
-                # group's own (block_size, num_kv_heads, head_size).
+                # group's own (block_size, num_kv_heads, head_size). Both layouts
+                # work: every group has the same block_mem_size (validated
+                # above), so block N sits at the same byte offset whichever
+                # group's view addresses it, and build_kv_views derives the
+                # per-group shape/stride from that one uniform block stride.
                 layer_views: dict = {}
                 for gid, grp in attn_group_list:
                     gspec = grp.kv_cache_spec
