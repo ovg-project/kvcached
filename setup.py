@@ -41,6 +41,14 @@ def get_csrc_files(path) -> List[str]:
     return cpp_files
 
 
+def get_torch_extension_paths(path_getter) -> List[str]:
+    """Support both the pre-2.6 and current PyTorch extension APIs."""
+    try:
+        return path_getter(device_type="cuda")
+    except TypeError:
+        return path_getter(cuda=True)
+
+
 def get_extensions():
     csrc_files = get_csrc_files(CSRC_PATH)
 
@@ -67,10 +75,10 @@ def get_extensions():
         backend_define,
     ]
 
-    ext_include_dirs = include_paths(device_type="cuda") + [
+    ext_include_dirs = get_torch_extension_paths(include_paths) + [
         os.path.join(CSRC_PATH, "inc")
     ]
-    ext_library_dirs = library_paths(device_type="cuda")
+    ext_library_dirs = get_torch_extension_paths(library_paths)
 
     if is_hip_build:
         # HIP builds: use CppExtension to avoid PyTorch's hipify step.
