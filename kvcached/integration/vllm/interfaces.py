@@ -130,7 +130,10 @@ def build_kv_views(
     Both layouts are supported for heterogeneous callers: the shared
     ``block_mem_size`` means block N occupies the same bytes whichever group's
     view addresses it, so each branch below only has to re-derive the per-group
-    shape/stride from that one uniform block stride.
+    shape/stride from that one uniform block stride. The one exception is
+    ``contiguous`` + ``kernel_block_size != block_size``, which raises: that
+    branch reshapes at virtual-block granularity and has no kernel-block form
+    yet.
     """
     is_mla = attention_type == "MLA"
     unified_pool = attention_type == "HYBRID_LINEAR"
@@ -201,11 +204,23 @@ def build_kv_views(
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
-    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views today
-    # (heterogeneous grouping requires the non-contiguous layout and
-    # excludes hybrid-linear); the kernel-block-granular contiguous view
-    # for the unified pool lives in alloc_kv_cache.
+    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views (hybrid-linear
+    # is excluded from heterogeneous grouping); the kernel-block-granular
+    # contiguous view for the unified pool lives in alloc_kv_cache.
     else:
+        if ratio > 1:
+            # The branch below reshapes at VIRTUAL block granularity: it never
+            # consults kernel_kvcache_shape, so with ratio > 1 the views would
+            # disagree with the kernel's kernel_bs-token indexing and read
+            # silently wrong KV. The non-contiguous branch above does handle
+            # this. No engine config has produced ratio > 1 here yet (Gemma 3/4
+            # report kernel_block_size == block_size for every group), so rather
+            # than ship an unexercised stride derivation, fail loud.
+            raise NotImplementedError(
+                "kvcached: heterogeneous attention KV groups on the contiguous "
+                f"layout do not support kernel_block_size ({kernel_block_size}) "
+                f"!= block_size ({block_size}). Re-launch with "
+                "KVCACHED_CONTIGUOUS_LAYOUT=false.")
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
         num_eles = math.prod(contiguous_shape)

@@ -59,11 +59,12 @@ def _raw_pools(contiguous):
     return [torch.zeros(eles_per_layer, dtype=DTYPE) for _ in range(NUM_LAYERS)]
 
 
-def _views(ifc, monkeypatch, group, raw, contiguous):
+def _views(ifc, monkeypatch, group, raw, contiguous, kernel_block_size=None):
     monkeypatch.setattr(ifc, "_contiguous_layout", contiguous)
     views, _ = ifc.build_kv_views(
         raw, _shape(group), group["block_size"], DTYPE, "MHA",
         NUM_BLOCKS, BYTES_PER_LAYER_K_OR_V, NUM_LAYERS,
+        kernel_block_size=kernel_block_size,
     )
     return views
 
@@ -145,3 +146,31 @@ def test_distinct_layers_do_not_overlap(ifc, monkeypatch, contiguous):
     views = _views(ifc, monkeypatch, SLIDING, raw, contiguous)
     ptrs = {views[layer][0][0].data_ptr() for layer in range(NUM_LAYERS)}
     assert len(ptrs) == NUM_LAYERS
+
+
+def test_contiguous_rejects_kernel_block_size_smaller_than_block_size(
+        ifc, monkeypatch):
+    """contiguous + ratio > 1 must fail loud, not build wrong strides.
+
+    The contiguous branch reshapes at virtual-block granularity and never
+    consults kernel_kvcache_shape, so with ratio > 1 its views would disagree
+    with the kernel's kernel_bs-token indexing. No engine config has produced
+    ratio > 1 on this path yet, so it is unexercised rather than known-good.
+    """
+    raw = _raw_pools(True)
+    with pytest.raises(NotImplementedError, match="kernel_block_size"):
+        _views(ifc, monkeypatch, SLIDING, raw, True,
+               kernel_block_size=SLIDING["block_size"] // 2)
+
+
+def test_noncontiguous_accepts_kernel_block_size_smaller_than_block_size(
+        ifc, monkeypatch):
+    """The non-contiguous branch does derive kernel-block-granular views, so it
+    stays available for ratio > 1 -- which is what the guard above points at."""
+    raw = _raw_pools(False)
+    views = _views(ifc, monkeypatch, SLIDING, raw, False,
+                   kernel_block_size=SLIDING["block_size"] // 2)
+    assert len(views) == NUM_LAYERS
+    # Twice as many kernel blocks, each half as many tokens.
+    assert views[0].shape[1] == NUM_BLOCKS * 2
+    assert views[0].shape[2] == SLIDING["block_size"] // 2

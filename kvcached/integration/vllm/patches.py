@@ -1540,10 +1540,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 kv_cache_raw_tensors, meta = alloc_result
                 # Build a per-group view over the shared physical pools using each
                 # group's own (block_size, num_kv_heads, head_size). Both layouts
-                # work: every group has the same block_mem_size (validated
-                # above), so block N sits at the same byte offset whichever
-                # group's view addresses it, and build_kv_views derives the
-                # per-group shape/stride from that one uniform block stride.
+                # work at kernel_block_size == block_size: every group has the
+                # same block_mem_size (validated above), so block N sits at the
+                # same byte offset whichever group's view addresses it, and
+                # build_kv_views derives the per-group shape/stride from that one
+                # uniform block stride. build_kv_views still fails loud for
+                # contiguous + kernel_block_size != block_size.
                 layer_views: dict = {}
                 for gid, grp in attn_group_list:
                     gspec = grp.kv_cache_spec
