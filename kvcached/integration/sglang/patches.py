@@ -872,8 +872,23 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     mamba_layer_ids: Optional[List[int]] = None,
                     enable_memory_saver: bool = False,
                     speculative_num_draft_tokens: Optional[int] = None,
+                    speculative_eagle_topk: Optional[int] = None,
+                    enable_linear_replayssm: bool = False,
+                    linear_replayssm_cache_len: int = 16,
+                    envelope_layout: bool = False,
                 ) -> None:
                     import kvcached.integration.sglang.interfaces as kvi
+
+                    if enable_linear_replayssm:
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support SGLang "
+                            "linear ReplaySSM buffers yet."
+                        )
+                    if envelope_layout:
+                        raise NotImplementedError(
+                            "ElasticMambaPool uses the kvcached mamba state "
+                            "layout and does not support SGLang envelope_layout."
+                        )
 
                     # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
                     # does so the IPC socket naming matches.
@@ -909,6 +924,10 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.size = size
                     self.device = device
+                    self.enable_linear_replayssm = False
+                    self.linear_replayssm_cache_len = linear_replayssm_cache_len
+                    self.replayssm_is_kda = False
+                    self.replayssm_write_pos = None
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
