@@ -175,27 +175,34 @@ export NO_PROXY="${no_proxy}"
 
 PHASE="starting"
 if [[ "${ENGINE}" == "vllm" ]]; then
-  "${PYTHON}" -c \
-    'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    "${PYTHON}" -m vllm.entrypoints.openai.api_server \
+  SERVER_COMMAND=(
+    "${PYTHON}" -m vllm.entrypoints.openai.api_server
     --model "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --max-model-len "${MAX_MODEL_LEN}" \
-    --no-enable-prefix-caching \
-    >"${SERVER_LOG}" 2>&1 &
+    --no-enable-prefix-caching
+  )
 else
-  "${PYTHON}" -c \
-    'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    "${PYTHON}" -m sglang.launch_server \
+  SERVER_COMMAND=(
+    "${PYTHON}" -m sglang.launch_server
     --model "${MODEL}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --context-length "${MAX_MODEL_LEN}" \
     --disable-radix-cache \
-    --trust-remote-code \
-    >"${SERVER_LOG}" 2>&1 &
+    --trust-remote-code
+  )
 fi
+
+# Start outside the checkout so its unbuilt source tree cannot shadow the
+# installed wheel, which contains kvcached's compiled extension modules.
+(
+  cd "${LOG_DIR}"
+  exec "${PYTHON}" -c \
+    'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    "${SERVER_COMMAND[@]}"
+) >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 deadline=$((SECONDS + STARTUP_TIMEOUT))

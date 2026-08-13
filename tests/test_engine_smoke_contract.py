@@ -102,6 +102,8 @@ def test_engine_server_uses_and_cleans_a_dedicated_process_group():
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert "os.setsid()" in source
+    assert 'cd "${LOG_DIR}"' in source
+    assert 'exec "${PYTHON}" -c' in source
     assert 'kill -TERM -- "-${SERVER_PID}"' in source
     assert 'kill -KILL -- "-${SERVER_PID}"' in source
     assert "introduced_gpu_pids" in source
