@@ -8,6 +8,7 @@ vLLM-specific patches using unified patch infrastructure.
 from __future__ import annotations
 
 import inspect
+import math
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -1747,8 +1748,86 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             raise ValueError(f"Unsupported vLLM version: {self.detected_version}")
 
 
+def _is_vllm_startup_memory_guard(error: ValueError) -> bool:
+    """Return whether *error* is vLLM's initial whole-device memory guard."""
+    message = str(error)
+    return (
+        "Free memory on device" in message
+        and "on startup is less than desired GPU memory utilization" in message
+    )
+
+
+def _get_virtual_kv_capacity_bytes(init_snapshot: Any, cache_config: Any) -> int:
+    """Derive the scheduler-visible KV capacity from virtual pool geometry.
+
+    kvcached reserves a full-device-sized KV virtual address range and backs it
+    lazily. Preserve vLLM's gpu_memory_utilization setting as the logical upper
+    bound, but do not reduce it based on physical memory consumed by peers.
+    """
+    return math.ceil(
+        init_snapshot.total_memory * cache_config.gpu_memory_utilization
+    )
+
+
+def _get_worker_total_memory_bytes(worker: Any) -> int:
+    """Read device geometry without using mutable whole-device free memory."""
+    import torch
+
+    try:
+        properties = torch.cuda.get_device_properties(worker.device)
+        return int(properties.total_memory)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return int(torch.cuda.mem_get_info()[1])
+
+
+def _should_profile_cudagraph_memory(worker: Any) -> bool:
+    profile_cudagraph = getattr(
+        worker.model_runner, "profile_cudagraph_memory", None
+    )
+    if not callable(profile_cudagraph):
+        return False
+    model_config = getattr(worker, "model_config", None)
+    if bool(getattr(model_config, "enforce_eager", False)):
+        return False
+
+    vllm_config = getattr(worker, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is not None and hasattr(
+        compilation_config, "cudagraph_mode"
+    ):
+        cudagraph_mode = compilation_config.cudagraph_mode
+        mode_name = str(
+            getattr(cudagraph_mode, "name", cudagraph_mode)
+        ).upper()
+        if mode_name == "NONE":
+            return False
+
+    try:
+        from vllm.platforms import current_platform
+
+        is_cuda = getattr(current_platform, "is_cuda", None)
+        if callable(is_cuda) and not bool(is_cuda()):
+            return False
+        is_rocm = getattr(current_platform, "is_rocm", None)
+        if callable(is_rocm) and bool(is_rocm()):
+            return False
+    except ImportError:
+        pass
+    return True
+
+
+def _get_process_local_torch_peak_bytes(device: Any) -> int:
+    import torch
+
+    accelerator = getattr(torch, "accelerator", None)
+    memory_stats = getattr(accelerator, "memory_stats", None)
+    if callable(memory_stats):
+        return int(memory_stats(device).get("allocated_bytes.all.peak", 0))
+    return int(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
+
+
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):
-    """Patch Worker.init_device to ignore GPU free-memory check when kvcached is enabled"""
+    """Decouple kvcached virtual KV capacity from whole-device free memory."""
 
     library = "vllm"
     target_module = "vllm.v1.worker.gpu_worker"
@@ -1761,11 +1840,47 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             return False
 
         # Apply version-specific patches
-        return self.patch_worker_init_device(gpuworker_mod)
+        init_device_patched = self.patch_worker_init_device(gpuworker_mod)
+        memory_profile_patched = self.patch_worker_determine_available_memory(
+            gpuworker_mod
+        )
+        return init_device_patched and memory_profile_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_worker_init_device(self, gpuworker_mod: types.ModuleType) -> bool:
         """Patch Worker.init_device"""
+        original_request_memory = getattr(gpuworker_mod, "request_memory", None)
+        if original_request_memory is not None:
+            if self._is_already_patched(original_request_memory, "request_memory"):
+                self.logger.debug("gpu_worker.request_memory already patched")
+                return True
+
+            logger = self.logger
+
+            def _patched_request_memory(init_snapshot: Any, cache_config: Any) -> int:
+                if not enable_kvcached():
+                    return int(original_request_memory(init_snapshot, cache_config))
+
+                requested_memory = _get_virtual_kv_capacity_bytes(
+                    init_snapshot, cache_config
+                )
+                if int(init_snapshot.free_memory) < requested_memory:
+                    logger.warning(
+                        "Ignoring vLLM's whole-device startup memory guard "
+                        "because kvcached provides virtual KV capacity: free=%d "
+                        "bytes, requested=%d bytes",
+                        int(init_snapshot.free_memory),
+                        requested_memory,
+                    )
+                return requested_memory
+
+            self._mark_as_patched(_patched_request_memory, "request_memory")
+            setattr(gpuworker_mod, "request_memory", _patched_request_memory)
+            return True
+
+        # vLLM releases before request_memory() was factored out perform the
+        # same guard inside Worker.init_device(). Keep a narrow compatibility
+        # fallback for those releases and never swallow unrelated ValueErrors.
         Worker = self._get_target_class(gpuworker_mod)
         if Worker is None:
             return False
@@ -1782,11 +1897,17 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 return original_init_device(self, *args, **kwargs)
 
             try:
-                return original_init_device(self, *args, **kwargs)
+                result = original_init_device(self, *args, **kwargs)
             except ValueError as e:
+                if not _is_vllm_startup_memory_guard(e):
+                    raise
                 # If the original impl still raises due to insufficient memory,
                 # replicate the remainder of its logic while skipping the guard.
-                logger.warning("Ignoring GPU free-memory check: %s", e)
+                logger.warning(
+                    "Ignoring vLLM's whole-device startup memory guard because "
+                    "kvcached provides virtual KV capacity: %s",
+                    e,
+                )
 
                 # The steps below mirror the tail of vLLM's Worker.init_device
                 # after the memory-utilization check.
@@ -1808,13 +1929,15 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 )
                 set_random_seed(self.model_config.seed)
 
-                # Set init_snapshot and requested_memory so later code
-                # (e.g. determine_available_memory) can access them.
+                # Set init_snapshot and requested_memory so later vLLM code can
+                # access a coherent logical budget. Do not use current free
+                # memory: it includes allocations made by colocated engines.
                 if not hasattr(self, "init_snapshot"):
                     self.init_snapshot = MemorySnapshot(device=self.device)
                 if not hasattr(self, "requested_memory"):
-                    # With kvcached, claim all available free memory.
-                    self.requested_memory = self.init_snapshot.free_memory
+                    self.requested_memory = _get_virtual_kv_capacity_bytes(
+                        self.init_snapshot, self.cache_config
+                    )
 
                 # Initialize workspace manager
                 try:
@@ -1831,8 +1954,126 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
                 return None
 
+            # vLLM 0.8.x predates MemorySnapshot/request_memory but is still
+            # supported by kvcached. Persist the same logical budget after its
+            # original init_device() succeeds so the patched profiler can use
+            # process-local accounting.
+            if not hasattr(self, "requested_memory"):
+                total_memory = _get_worker_total_memory_bytes(self)
+                snapshot = types.SimpleNamespace(total_memory=total_memory)
+                self.requested_memory = _get_virtual_kv_capacity_bytes(
+                    snapshot, self.cache_config
+                )
+            return result
+
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_worker_determine_available_memory(
+        self, gpuworker_mod: types.ModuleType
+    ) -> bool:
+        """Use vLLM's explicit-capacity branch with an automatic virtual budget."""
+        Worker = self._get_target_class(gpuworker_mod)
+        if Worker is None:
+            return False
+
+        original_determine = getattr(Worker, "determine_available_memory", None)
+        if original_determine is None:
+            self.logger.error("Worker.determine_available_memory was not found")
+            return False
+        if self._is_already_patched(original_determine, "determine_available_memory"):
+            self.logger.debug("Worker.determine_available_memory already patched")
+            return True
+
+        logger = self.logger
+
+        def _patched_determine_available_memory(
+            self, *args: Any, **kwargs: Any
+        ) -> int:
+            if not enable_kvcached():
+                return original_determine(self, *args, **kwargs)
+
+            cache_config = self.cache_config
+            configured_budget = getattr(cache_config, "kv_cache_memory_bytes", None)
+            if configured_budget is not None:
+                return original_determine(self, *args, **kwargs)
+
+            virtual_budget = int(self.requested_memory)
+            init_snapshot = getattr(self, "init_snapshot", None)
+            if init_snapshot is None:
+                # vLLM 0.8.x has no MemorySnapshot. Resetting peak stats after
+                # model load makes this peak process-local and includes both
+                # resident model weights and the profiling activation peak.
+                import torch
+
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                self.model_runner.profile_run()
+                weights_memory = 0
+                torch_peak_increase = int(
+                    torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+                )
+                cudagraph_memory_estimate = 0
+            else:
+                from vllm.utils.mem_utils import memory_profiling
+
+                weights_memory = int(self.model_runner.model_memory_usage)
+                profile_torch_peak = None
+                cudagraph_memory_estimate = 0
+                with memory_profiling(
+                    init_snapshot, weights_memory=weights_memory
+                ) as profile_result:
+                    self.model_runner.profile_run()
+                    if _should_profile_cudagraph_memory(self):
+                        profile_torch_peak = _get_process_local_torch_peak_bytes(
+                            self.device
+                        )
+                        cudagraph_memory_estimate = int(
+                            self.model_runner.profile_cudagraph_memory()
+                        )
+
+                torch_peak_increase = int(profile_result.torch_peak_increase)
+                if profile_torch_peak is not None:
+                    before_profile = getattr(profile_result, "before_profile", None)
+                    before_torch_peak = getattr(
+                        before_profile, "torch_peak", None
+                    )
+                    if before_torch_peak is not None:
+                        torch_peak_increase = max(
+                            0, profile_torch_peak - int(before_torch_peak)
+                        )
+            available_memory = (
+                virtual_budget
+                - weights_memory
+                - torch_peak_increase
+            )
+
+            self.available_kv_cache_memory_bytes = available_memory
+            # vLLM 0.24 reads this field during compile_or_warm_up_model().
+            # Keep the worker contract without reintroducing the device-wide
+            # non-torch delta that colocated processes can corrupt.
+            self.non_torch_memory = 0
+            self.peak_activation_memory = torch_peak_increase
+            self.cudagraph_memory_estimate = cudagraph_memory_estimate
+            logger.warning(
+                "Using kvcached process-local KV capacity: budget=%d bytes, "
+                "weights=%d bytes, torch_peak=%d bytes, cudagraph=%d bytes "
+                "(ignored), available=%d bytes; "
+                "whole-device non-torch and CUDA Graph deltas are ignored",
+                virtual_budget,
+                weights_memory,
+                torch_peak_increase,
+                cudagraph_memory_estimate,
+                available_memory,
+            )
+            return available_memory
+
+        self._mark_as_patched(
+            _patched_determine_available_memory, "determine_available_memory"
+        )
+        Worker.determine_available_memory = _patched_determine_available_memory
         return True
 
 

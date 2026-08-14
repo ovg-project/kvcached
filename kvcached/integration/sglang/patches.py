@@ -5,6 +5,7 @@
 SGLang-specific patches using unified patch infrastructure.
 """
 
+import functools
 import inspect
 import math
 import types
@@ -15,6 +16,7 @@ from kvcached.integration.version_utils import VersionAwarePatch, version_range
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
+_CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
@@ -25,6 +27,120 @@ logger = get_kvcached_logger()
 def _is_supported_gpu_device(device: str) -> bool:
     device_str = str(device).lower()
     return device_str.startswith("cuda") or device_str.startswith("hip")
+
+
+def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
+    """Return one capacity shared by every rank in the SGLang world group."""
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if int(world_group.world_size) <= 1:
+        return local_bytes
+
+    capacity = torch.tensor(local_bytes, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        capacity,
+        op=torch.distributed.ReduceOp.MIN,
+        group=world_group.cpu_group,
+    )
+    return int(capacity.item())
+
+
+class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
+    """Keep SGLang's logical KV capacity independent of peer processes."""
+
+    library = "sglang"
+    target_module = "sglang.srt.model_executor.model_runner"
+    target_class = "ModelRunner"
+    patch_name = "virtual_kv_capacity"
+
+    def apply(self, model_runner_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_profile_available_bytes(model_runner_mod)
+
+    @version_range(">=0.5.11")
+    def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
+        ModelRunner = self._get_target_class(model_runner_mod)
+        if ModelRunner is None:
+            return False
+
+        original_profile = getattr(ModelRunner, "_profile_available_bytes", None)
+        if original_profile is None:
+            self.logger.warning(
+                "SGLang ModelRunner does not expose _profile_available_bytes"
+            )
+            return False
+        if self._is_already_patched(original_profile, "virtual_kv_capacity"):
+            return True
+
+        @functools.wraps(original_profile)
+        def _patched_profile_available_bytes(runner, pre_model_load_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
+                return original_profile(runner, pre_model_load_memory)
+
+            import torch
+
+            query_error = None
+            try:
+                total_memory = int(
+                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                )
+                mem_fraction_static = float(runner.mem_fraction_static)
+                logical_budget = math.ceil(total_memory * mem_fraction_static)
+                process_local_reserved = int(
+                    torch.cuda.memory_reserved(runner.gpu_id)
+                )
+                local_available_bytes = logical_budget - process_local_reserved
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                query_error = exc
+                total_memory = 0
+                logical_budget = 0
+                process_local_reserved = 0
+                local_available_bytes = _CAPACITY_QUERY_FAILED
+
+            try:
+                available_bytes = _reduce_sglang_world_min_bytes(
+                    torch, local_available_bytes
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Unable to synchronize SGLang virtual KV capacity; "
+                    "falling back to SGLang profiling: %s",
+                    exc,
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if available_bytes == _CAPACITY_QUERY_FAILED:
+                logger.warning(
+                    "Unable to derive stable SGLang virtual KV capacity on "
+                    "at least one rank; falling back to SGLang profiling: %s",
+                    query_error or "peer rank query failed",
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if runner.mambaish_config is not None:
+                available_gib = available_bytes / BYTES_PER_GB
+                available_bytes = int(
+                    runner.handle_max_mamba_cache(available_gib) * BYTES_PER_GB
+                )
+
+            logger.info(
+                "Using kvcached process-local KV capacity for SGLang: "
+                "budget=%d bytes, pytorch_reserved=%d bytes, "
+                "world_min_available=%d bytes (device_total=%d, "
+                "mem_fraction_static=%.4f)",
+                logical_budget,
+                process_local_reserved,
+                available_bytes,
+                total_memory,
+                mem_fraction_static,
+            )
+            return available_bytes
+
+        self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
+        ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        return True
 
 
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
