@@ -31,8 +31,16 @@ sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 
 # Pre-mock the interfaces module so mock.patch can resolve its attributes.
 # This avoids importing torch / C extensions transitively via interfaces.py.
-_interfaces_mock = mock.MagicMock()
-sys.modules.setdefault("kvcached.integration.vllm.interfaces", _interfaces_mock)
+sys.modules.setdefault("kvcached.integration.vllm.interfaces",
+                       mock.MagicMock())
+import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
+
+# Binding the stub into sys.modules is not enough: mock.patch() resolves a
+# dotted target with getattr() on the parent package, and a hand-installed
+# sys.modules entry never sets that attribute. Point it at whatever is
+# actually in sys.modules -- another test module may have stubbed this first,
+# and patching a different object than the code imports silently does nothing.
+_vllm_pkg.interfaces = sys.modules["kvcached.integration.vllm.interfaces"]
 
 import pytest  # noqa: E402
 
@@ -551,6 +559,29 @@ class TestEdgeCases:
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         assert len(pool._cached_blocks) == 2
+
+    def test_duplicate_hashes_keep_each_block_metadata(self, pool_and_manager):
+        """Concurrent requests may materialize the same prefix twice."""
+        pool, _ = pool_and_manager
+        first = pool.get_new_blocks(1)
+        second = pool.get_new_blocks(1)
+        req = MockRequest(["shared-prefix"])
+
+        pool.cache_full_blocks(req, first, 0, 1, 16, 0)
+        pool.cache_full_blocks(req, second, 0, 1, 16, 0)
+
+        assert first[0].block_hash is not None
+        assert second[0].block_hash == first[0].block_hash
+        assert len(pool._cached_blocks) == 1
+        assert pool.get_cached_block("shared-prefix", [0]) is not None
+
+        _finish_request(pool, first)
+        _finish_request(pool, second)
+        pool._evict_blocks_from_pool(1)
+
+        assert first[0].block_hash is None
+        assert second[0].block_hash is not None
+        assert pool.get_cached_block("shared-prefix", [0]) == [second[0]]
 
     def test_reuse_after_eviction_and_realloc(self, pool_factory):
         """After eviction, block IDs can be reallocated and recached."""
