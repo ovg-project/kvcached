@@ -15,6 +15,8 @@ import threading
 import types
 from typing import Dict, List, Optional
 
+import pytest
+
 BLOCKS_PER_PAGE = 4
 
 
@@ -48,6 +50,14 @@ class FakePage:
     @staticmethod
     def get_num_blocks(page_size: int, block_mem_size: int) -> int:
         return page_size // block_mem_size
+
+
+class ExplodingPage(FakePage):
+    """FakePage whose alloc() raises, mimicking InternalPage's "Not enough
+    free blocks in page" invariant failure (csrc/page_allocator.cpp)."""
+
+    def alloc(self, num: int) -> List[int]:
+        raise RuntimeError("Not enough free blocks in page")
 
 
 class FakePageAllocator:
@@ -187,3 +197,22 @@ def test_alloc_after_rollback_succeeds_when_pool_recovers():
     assert result is not None
     assert result[0] == 10  # reserved block reused first
     assert len(result) == 5
+
+
+def test_page_alloc_failure_on_avail_page_stays_fail_loud():
+    # The rollback handler is scoped to alloc_page(): by the time page.alloc()
+    # runs, _pick_avail_page() has removed the page from avail_pages while its
+    # blocks are not yet in ret_index, so rollback could not restore it. The
+    # invariant failure must propagate, not degrade into a None miss (#430).
+    manager = make_manager(fail_after=1)
+    assert manager.alloc(2) == [0, 1]
+    manager.avail_pages[0].__class__ = ExplodingPage
+    with pytest.raises(RuntimeError, match="Not enough free blocks in page"):
+        manager.alloc(2)
+
+
+def test_page_alloc_failure_on_fresh_page_stays_fail_loud():
+    manager = make_manager(fail_after=10)
+    manager.page_allocator.alloc_page = lambda: ExplodingPage(0)
+    with pytest.raises(RuntimeError, match="Not enough free blocks in page"):
+        manager.alloc(2)
