@@ -203,7 +203,7 @@ run_vllm_baseline_and_offload() {
   local dir="${RUN_DIR}/vllm-end-to-end"
   local baseline_log="${dir}/baseline-server.log"
   mkdir -p "${dir}"
-  "${PYTHON}" -m pip install -e "${VLLM_REPO_DIR}"
+  "${PYTHON}" -m pip install --no-build-isolation -e "${VLLM_REPO_DIR}"
 
   local baseline_cmd=(
     "${VLLM_BIN}" serve "${MODEL}"
