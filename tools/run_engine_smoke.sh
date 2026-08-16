@@ -191,6 +191,7 @@ else
     --port "${PORT}" \
     --context-length "${MAX_MODEL_LEN}" \
     --disable-radix-cache \
+    --disable-piecewise-cuda-graph \
     --trust-remote-code
   )
 fi
