@@ -117,13 +117,17 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
-      min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
-      max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
+      min_reserved_pages_(std::min(
+          num_free_pages_.load(std::memory_order_relaxed), MIN_RESERVED_PAGES)),
+      max_reserved_pages_(std::min(
+          num_free_pages_.load(std::memory_order_relaxed), MAX_RESERVED_PAGES)),
       prealloc_running_(false), prealloc_needed_(false),
       total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers) {
 
   // Initialize free page list
-  for (int64_t i = 0; i < num_free_pages_; ++i) {
+  const int64_t initial_free_pages =
+      num_free_pages_.load(std::memory_order_relaxed);
+  for (int64_t i = 0; i < initial_free_pages; ++i) {
     free_page_list_.push_back(i);
   }
 
@@ -172,7 +176,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     if (!reserved_page_list_.empty()) {
       page_id = reserved_page_list_.front();
       reserved_page_list_.pop_front();
-      num_free_pages_--;
+      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
       // Trigger preallocation to refill reserved pool if getting low
       if (reserved_page_list_.size() <
@@ -181,7 +185,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
         cond_.notify_all();
       }
 
-      update_memory_usage();
+      update_memory_usage_unlocked();
       auto end_time = std::chrono::steady_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
           end_time - start_time);
@@ -196,11 +200,11 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     if (!free_page_list_.empty()) {
       page_id = free_page_list_.front();
       free_page_list_.pop_front();
-      num_free_pages_--;
+      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
       break;
     }
 
-    if (num_free_pages_ <= 0) {
+    if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
       throw std::runtime_error("No free pages left");
     }
 
@@ -220,7 +224,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   } catch (const std::exception &e) {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
-    num_free_pages_++;
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
     cond_.notify_all();
     throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
                              ": " + e.what());
@@ -230,7 +234,10 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     trigger_preallocation();
   }
 
-  update_memory_usage();
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    update_memory_usage_unlocked();
+  }
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
@@ -248,12 +255,12 @@ void PageAllocator::free_page(page_id_t page_id) {
                                "it to the free list: " +
                                std::to_string(page_id));
     }
-    num_free_pages_++;
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
 
     if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
       // Fast path: reserve page
       reserved_page_list_.push_back(page_id);
-      update_memory_usage();
+      update_memory_usage_unlocked();
       cond_.notify_all();
       return;
     }
@@ -265,7 +272,7 @@ void PageAllocator::free_page(page_id_t page_id) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.push_back(page_id);
-    update_memory_usage();
+    update_memory_usage_unlocked();
     cond_.notify_all();
   }
 }
@@ -284,7 +291,8 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
                                  "them to the free list");
       }
     }
-    num_free_pages_ += page_ids.size();
+    num_free_pages_.fetch_add(static_cast<int64_t>(page_ids.size()),
+                              std::memory_order_relaxed);
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
 
     if (num_to_reserve > 0) {
@@ -298,7 +306,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       pages_to_unmap.assign(reserve_end, page_ids.end());
 
       if (pages_to_unmap.empty()) {
-        update_memory_usage();
+        update_memory_usage_unlocked();
         cond_.notify_all();
         return;
       }
@@ -314,7 +322,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
     cond_.notify_all();
   }
 
@@ -362,7 +370,7 @@ void PageAllocator::offload_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(lock_);
     transitioning_page_ids_.erase(page_id);
     offloaded_page_ids_.insert(page_id);
-    update_memory_usage();
+    update_memory_usage_unlocked();
   }
 }
 
@@ -391,7 +399,7 @@ void PageAllocator::restore_page(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(lock_);
     transitioning_page_ids_.erase(page_id);
     offloaded_page_ids_.erase(page_id);
-    update_memory_usage();
+    update_memory_usage_unlocked();
   }
 }
 
@@ -408,14 +416,16 @@ bool PageAllocator::resize(int64_t new_mem_size) {
           "Cannot resize while pages are CPU-offloaded or transitioning");
     }
 
-    if (new_num_pages < get_num_inuse_pages()) {
+    if (new_num_pages < get_num_inuse_pages_unlocked()) {
       return false;
     }
 
-    if (new_num_pages == num_total_pages_) {
+    const int64_t current_total_pages =
+        num_total_pages_.load(std::memory_order_relaxed);
+    if (new_num_pages == current_total_pages) {
       return true;
-    } else if (new_num_pages > num_total_pages_) {
-      int64_t num_to_expand = new_num_pages - num_total_pages_;
+    } else if (new_num_pages > current_total_pages) {
+      int64_t num_to_expand = new_num_pages - current_total_pages;
 
       // Reuse previously reclaimed pages first
       int64_t num_to_reuse = std::min(
@@ -426,23 +436,23 @@ bool PageAllocator::resize(int64_t new_mem_size) {
           reclaimed_page_list_.pop_front();
         }
         num_to_expand -= num_to_reuse;
-        num_free_pages_ += num_to_reuse;
+        num_free_pages_.fetch_add(num_to_reuse, std::memory_order_relaxed);
       }
 
       // Allocate new pages if needed
       if (num_to_expand > 0) {
-        for (int64_t i = num_total_pages_; i < num_total_pages_ + num_to_expand;
-             ++i) {
+        for (int64_t i = current_total_pages;
+             i < current_total_pages + num_to_expand; ++i) {
           free_page_list_.push_back(i);
         }
-        num_free_pages_ += num_to_expand;
+        num_free_pages_.fetch_add(num_to_expand, std::memory_order_relaxed);
       }
-      num_total_pages_ = new_num_pages;
-      update_memory_usage();
+      num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
+      update_memory_usage_unlocked();
       return true;
     } else {
       // Shrink path
-      int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
+      int64_t num_to_reclaim = current_total_pages - new_num_pages;
 
       if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
         // Need to trim reserved pages first
@@ -459,8 +469,8 @@ bool PageAllocator::resize(int64_t new_mem_size) {
           reclaimed_page_list_.push_back(free_page_list_.back());
           free_page_list_.pop_back();
         }
-        num_free_pages_ -= num_to_reclaim;
-        num_total_pages_ = new_num_pages;
+        num_free_pages_.fetch_sub(num_to_reclaim, std::memory_order_relaxed);
+        num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
         return true;
       }
     }
@@ -471,11 +481,12 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
+    int64_t num_to_reclaim =
+        num_total_pages_.load(std::memory_order_relaxed) - new_num_pages;
 
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
 
     if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
       return false;
@@ -485,8 +496,8 @@ bool PageAllocator::resize(int64_t new_mem_size) {
       reclaimed_page_list_.push_back(free_page_list_.back());
       free_page_list_.pop_back();
     }
-    num_free_pages_ -= num_to_reclaim;
-    num_total_pages_ = new_num_pages;
+    num_free_pages_.fetch_sub(num_to_reclaim, std::memory_order_relaxed);
+    num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
   }
   return true;
 }
@@ -501,7 +512,7 @@ void PageAllocator::trim() {
     reserved_page_list_.clear();
 
     if (pages_to_unmap.empty()) {
-      update_memory_usage();
+      update_memory_usage_unlocked();
       return;
     }
   }
@@ -513,17 +524,23 @@ void PageAllocator::trim() {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
   }
 }
 
-int64_t PageAllocator::get_num_free_pages() const { return num_free_pages_; }
-
-int64_t PageAllocator::get_num_inuse_pages() const {
-  return num_total_pages_ - num_free_pages_;
+int64_t PageAllocator::get_num_free_pages() const {
+  return num_free_pages_.load(std::memory_order_relaxed);
 }
 
-int64_t PageAllocator::get_num_total_pages() const { return num_total_pages_; }
+int64_t PageAllocator::get_num_inuse_pages() const {
+  const int64_t total = num_total_pages_.load(std::memory_order_relaxed);
+  const int64_t free = num_free_pages_.load(std::memory_order_relaxed);
+  return total - free;
+}
+
+int64_t PageAllocator::get_num_total_pages() const {
+  return num_total_pages_.load(std::memory_order_relaxed);
+}
 
 int64_t PageAllocator::get_num_reserved_pages() const {
   std::lock_guard<std::mutex> lock(lock_);
@@ -538,6 +555,23 @@ int64_t PageAllocator::get_num_offloaded_pages() const {
 bool PageAllocator::is_page_offloaded(page_id_t page_id) const {
   std::lock_guard<std::mutex> lock(lock_);
   return offloaded_page_ids_.count(page_id) != 0;
+}
+
+PageState PageAllocator::get_page_state() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_page_state_unlocked();
+}
+
+int64_t PageAllocator::get_num_inuse_pages_unlocked() const {
+  return num_total_pages_.load(std::memory_order_relaxed) -
+         num_free_pages_.load(std::memory_order_relaxed);
+}
+
+PageState PageAllocator::get_page_state_unlocked() const {
+  const int64_t total = num_total_pages_.load(std::memory_order_relaxed);
+  const int64_t free = num_free_pages_.load(std::memory_order_relaxed);
+  return PageState{total, free, total - free,
+                   static_cast<int64_t>(reserved_page_list_.size())};
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
@@ -709,7 +743,7 @@ void PageAllocator::prealloc_worker() {
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
                                    pages_to_reserve.end());
-        update_memory_usage();
+        update_memory_usage_unlocked();
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
@@ -801,11 +835,12 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
          page_ids.size(), duration.count());
 }
 
-void PageAllocator::update_memory_usage() {
+void PageAllocator::update_memory_usage_unlocked() {
   // Offloaded pages keep their virtual id and cache metadata, but their
   // private physical mappings have been replaced by the shared zero page.
   int64_t resident_inuse_pages =
-      get_num_inuse_pages() - static_cast<int64_t>(offloaded_page_ids_.size());
+      get_num_inuse_pages_unlocked() -
+      static_cast<int64_t>(offloaded_page_ids_.size());
   int64_t used_phy_mem_size =
       resident_inuse_pages * num_layers_ * page_size_ * num_kv_buffers_;
   // Calculate physical memory occupied by preallocated pages
