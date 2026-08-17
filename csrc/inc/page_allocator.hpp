@@ -81,6 +81,10 @@ public:
 
   // Status queries
   int64_t get_num_free_pages() const;
+  // Approximate. Reads num_total_pages_ and num_free_pages_ as two separate
+  // relaxed loads, so a concurrent resize() can land between them; expansion
+  // bumps num_free_pages_ before num_total_pages_, which can make this return
+  // a negative. Use get_page_state() when the value has to be consistent.
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;

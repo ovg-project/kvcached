@@ -202,8 +202,11 @@ def build_kv_cache_pool_snapshot(
     virtual_per_layer_bytes = virtual_bytes_per_buffer * num_kv_buffers
     block_size_bytes = _int_attr(manager, "block_mem_size") or 0
     bytes_per_block = block_size_bytes * num_layers * num_kv_buffers
-    # Keep the clamp for compatibility with older native extensions and
-    # duck-typed managers that do not provide a coherent page-state snapshot.
+    # available_size() reads three allocator getters at three separate instants
+    # and never consults get_page_state(), so it can report an inconsistent
+    # total no matter which native extension is loaded. #436 also observed it
+    # returning a negative value, and that cause has not been established. A
+    # negative gauge is never meaningful to an exporter, so clamp at zero.
     available_blocks = max(int(manager.available_size()), 0)
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
