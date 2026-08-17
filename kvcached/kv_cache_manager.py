@@ -402,8 +402,9 @@ class KVCacheManager:
         idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
 
         pages_to_free: List[int] = []
+        offloaded_pages = getattr(self, "offloaded_pages", {})
         for page_id, idxs in idx_dict.items():
-            if page_id in self.offloaded_pages:
+            if page_id in offloaded_pages:
                 self._restore_page(page_id)
             # Find the page - it must be in either full_pages or avail_pages
             page = None
