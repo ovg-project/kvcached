@@ -85,6 +85,8 @@ fi
 
 for required_file in \
   pyproject.toml \
+  tests/manifests/gpu.txt \
+  tools/check_test_classification.py \
   tools/dev_copy_pth.py \
   tools/run_engine_smoke.sh \
   tools/run_vllm_nixl_pd_smoke.sh; do
@@ -259,11 +261,18 @@ if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
   fi
 fi
 
-default_pytest_targets=(
-  tests/test_kvcache_manager.py
-  tests/test_paged_allocator_aliasing.py
-  tests/test_alloc_kv_cache_alignment.py
-)
+# Read the GPU targets from tests/manifests/gpu.txt rather than repeating them
+# here. check_test_classification.py enforces that every test module sits in
+# exactly one manifest, so a hardcoded list here would silently stop covering
+# new GPU tests as they are added.
+default_pytest_targets=()
+while IFS= read -r test_path; do
+  default_pytest_targets+=("${test_path}")
+done < <("${PYTHON}" tools/check_test_classification.py --list-category gpu)
+if [[ "${#default_pytest_targets[@]}" -eq 0 ]]; then
+  echo "No GPU tests are classified in tests/manifests/gpu.txt" >&2
+  exit 2
+fi
 if [[ -n "${GPU_CI_PYTEST_TARGETS:-}" ]]; then
   IFS=' ' read -r -a pytest_targets <<< "${GPU_CI_PYTEST_TARGETS}"
 else
