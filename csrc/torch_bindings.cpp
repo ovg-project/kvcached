@@ -133,6 +133,21 @@ int64_t page_allocator_get_num_reserved_pages(
   return allocator->get_num_reserved_pages();
 }
 
+py::dict
+page_allocator_get_page_state(std::shared_ptr<PageAllocator> allocator) {
+  PageState state;
+  {
+    py::gil_scoped_release release;
+    state = allocator->get_page_state();
+  }
+  py::dict result;
+  result["total_pages"] = state.total_pages;
+  result["free_pages"] = state.free_pages;
+  result["inuse_pages"] = state.inuse_pages;
+  result["reserved_pages"] = state.reserved_pages;
+  return result;
+}
+
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
@@ -234,6 +249,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
       .def("check_and_get_resize_target",

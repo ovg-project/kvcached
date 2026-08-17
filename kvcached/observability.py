@@ -76,9 +76,9 @@ class KVCachePoolSnapshot:
     * ``virtual_total_bytes`` -- the whole pool, i.e.
       ``virtual_per_layer_bytes * num_layers``.
 
-    Values are best-effort rather than a consistent point-in-time cut: the
-    C++ pre-allocation thread mutates page counters without taking the
-    manager lock, so fields may come from marginally different instants.
+    The page-count fields are captured atomically with respect to allocator
+    mutations. Other fields remain best-effort and may come from marginally
+    different instants.
     """
 
     schema_version: str
@@ -164,17 +164,35 @@ def build_kv_cache_pool_snapshot(
     """Build a read-only snapshot from a ``KVCacheManager``-like object."""
 
     allocator = manager.page_allocator
-    free_pages = _call_int(allocator, "get_num_free_pages")
-    reserved_pages = _call_int(allocator, "get_num_reserved_pages")
+    page_state_fn = getattr(allocator, "get_page_state", None)
+    page_state = page_state_fn() if callable(page_state_fn) else None
+    if page_state is None:
+        total_pages = _call_int(allocator, "get_num_total_pages")
+        free_pages = _call_int(allocator, "get_num_free_pages")
+        inuse_pages = _call_int(allocator, "get_num_inuse_pages")
+        reserved_pages = _call_int(allocator, "get_num_reserved_pages")
+    else:
+        total_pages = int(page_state["total_pages"])
+        free_pages = int(page_state["free_pages"])
+        inuse_pages = int(page_state["inuse_pages"])
+        reserved_pages = int(page_state["reserved_pages"])
     available_physical_pages = _call_int(allocator, "get_avail_physical_pages")
     if free_pages is None or reserved_pages is None or available_physical_pages is None:
         effective_free_pages = None
     else:
         effective_free_pages = min(free_pages, available_physical_pages + reserved_pages)
 
-    mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
     num_layers = _int_attr(manager, "num_layers") or 0
     num_kv_buffers = _int_attr(manager, "num_kv_buffers") or 0
+    if page_state is None or inuse_pages is None:
+        mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
+    else:
+        mapped_bytes = (
+            inuse_pages
+            * (_int_attr(manager, "page_size") or 0)
+            * num_layers
+            * num_kv_buffers
+        )
     # manager.mem_size is the virtual reservation for ONE KV buffer of ONE
     # layer -- K (or V) for MHA, the single combined buffer for MLA -- which
     # is why the total scales by both num_layers and num_kv_buffers. Scale by
@@ -184,11 +202,11 @@ def build_kv_cache_pool_snapshot(
     virtual_per_layer_bytes = virtual_bytes_per_buffer * num_kv_buffers
     block_size_bytes = _int_attr(manager, "block_mem_size") or 0
     bytes_per_block = block_size_bytes * num_layers * num_kv_buffers
-    # available_size() can transiently go negative: it derives from
-    # PageAllocator::get_num_free_pages(), which reads a mutable counter
-    # without holding the allocator mutex, so a concurrent snapshot may
-    # observe an intermediate value. A negative gauge is never meaningful to
-    # an exporter, so clamp at zero.
+    # available_size() reads three allocator getters at three separate instants
+    # and never consults get_page_state(), so it can report an inconsistent
+    # total no matter which native extension is loaded. #436 also observed it
+    # returning a negative value, and that cause has not been established. A
+    # negative gauge is never meaningful to an exporter, so clamp at zero.
     available_blocks = max(int(manager.available_size()), 0)
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
@@ -214,9 +232,9 @@ def build_kv_cache_pool_snapshot(
         virtual_per_layer_bytes=virtual_per_layer_bytes,
         virtual_total_bytes=virtual_per_layer_bytes * num_layers,
         mapped_bytes=mapped_bytes,
-        total_pages=_call_int(allocator, "get_num_total_pages"),
+        total_pages=total_pages,
         free_pages=free_pages,
-        inuse_pages=_call_int(allocator, "get_num_inuse_pages"),
+        inuse_pages=inuse_pages,
         reserved_pages=reserved_pages,
         available_physical_pages=available_physical_pages,
         effective_free_pages=effective_free_pages,
