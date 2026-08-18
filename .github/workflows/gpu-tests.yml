@@ -59,9 +59,9 @@ jobs:
       profile: ${{ steps.plan.outputs.profile }}
       devices: ${{ steps.plan.outputs.devices }}
     steps:
-      - name: Check out history for the scheduled merge count
-        if: github.event_name == 'schedule'
-        uses: actions/checkout@v4
+      # Unconditional: the plan step is a script in this repository, and the
+      # scheduled path additionally needs history to count merges.
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false

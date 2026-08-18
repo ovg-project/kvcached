@@ -167,3 +167,38 @@ def test_unsupported_event_is_rejected(tmp_path):
     plan = resolve(tmp_path, "issue_comment", labels="gpu-ci")
     assert plan["_returncode"] == "2"
     assert "unsupported event" in plan["_stdout"]
+
+
+def _workflow() -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "gpu-tests.yml").read_text("utf-8")
+    )
+
+
+def test_the_plan_job_checks_out_on_every_event():
+    """The plan step runs a script from this repository.
+
+    A first attempt gated the checkout on the scheduled event, because the
+    step used to be an inline shell block that needed no working tree. A
+    pull request then reached `bash tools/resolve_gpu_ci_plan.sh` with
+    nothing checked out and the job died with exit 127.
+    """
+    steps = _workflow()["jobs"]["plan"]["steps"]
+    checkouts = [s for s in steps if "actions/checkout" in s.get("uses", "")]
+    assert checkouts, "the plan job must check out this repository"
+    for step in checkouts:
+        assert "if" not in step, (
+            "the plan job's checkout must not be conditional: the plan step "
+            "runs a script from the working tree on every event"
+        )
+    assert steps.index(checkouts[0]) < next(
+        i for i, s in enumerate(steps) if s.get("id") == "plan"
+    )
+
+
+def test_the_plan_script_the_workflow_names_exists():
+    steps = _workflow()["jobs"]["plan"]["steps"]
+    run = next(s["run"] for s in steps if s.get("id") == "plan")
+    named = run.split()[-1]
+    assert (ROOT / named).is_file(), f"{named} is not in the repository"
