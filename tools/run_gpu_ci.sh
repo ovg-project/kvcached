@@ -119,8 +119,22 @@ if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]] &&
   exit 2
 fi
 
+# Conda-provided GCC wrappers can build against a newer libstdc++ than the
+# host's default dynamic loader finds. Use the runtime shipped with the active
+# compiler so the freshly built extension and its C++ standard library agree.
+CXX_RUNTIME_DIR=""
+if command -v "${CXX:-c++}" >/dev/null 2>&1; then
+  CXX_RUNTIME_PATH="$(
+    "${CXX:-c++}" -print-file-name=libstdc++.so.6 2>/dev/null || true
+  )"
+  if [[ "${CXX_RUNTIME_PATH}" == */* ]] && [[ -f "${CXX_RUNTIME_PATH}" ]]; then
+    CXX_RUNTIME_DIR="$(dirname "${CXX_RUNTIME_PATH}")"
+    export LD_LIBRARY_PATH="${CXX_RUNTIME_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  fi
+fi
+
 if [[ "${CHECK_ONLY}" == "1" ]]; then
-  echo "GPU CI preflight passed: profile=${GPU_CI_PROFILE}, devices=${KVCACHED_GPU_VISIBLE_DEVICES}, python=${PYTHON}"
+  echo "GPU CI preflight passed: profile=${GPU_CI_PROFILE}, devices=${KVCACHED_GPU_VISIBLE_DEVICES}, python=${PYTHON}, cxx_runtime=${CXX_RUNTIME_DIR:-system-default}"
   exit 0
 fi
 
@@ -203,6 +217,7 @@ fi
   echo "core_python=${PYTHON}"
   echo "vllm_python=${VLLM_PYTHON}"
   echo "sglang_python=${SGLANG_PYTHON}"
+  echo "cxx_runtime=${CXX_RUNTIME_DIR:-system-default}"
   command -v "${CC:-cc}" >/dev/null 2>&1 &&
     "${CC:-cc}" --version 2>/dev/null | head -1 || true
   command -v "${CXX:-c++}" >/dev/null 2>&1 &&

@@ -21,6 +21,7 @@ def run_preflight(
     cuda_visible_devices: Optional[str] = None,
     vllm_python: Optional[str] = None,
     sglang_python: Optional[str] = None,
+    cxx: Optional[str] = None,
 ):
     env = os.environ.copy()
     env.pop("KVCACHED_GPU_VISIBLE_DEVICES", None)
@@ -43,6 +44,8 @@ def run_preflight(
         env["VLLM_PYTHON"] = vllm_python
     if sglang_python is not None:
         env["SGLANG_PYTHON"] = sglang_python
+    if cxx is not None:
+        env["CXX"] = cxx
     return subprocess.run(
         ["bash", str(SCRIPT)],
         cwd=ROOT,
@@ -109,6 +112,33 @@ def test_cuda_visible_devices_is_accepted_from_external_scheduler(tmp_path):
     )
     assert completed.returncode == 0
     assert "devices=4" in completed.stdout
+
+
+def test_compiler_runtime_is_added_to_the_environment(tmp_path):
+    runtime_dir = tmp_path / "compiler" / "lib"
+    runtime_dir.mkdir(parents=True)
+    runtime = runtime_dir / "libstdc++.so.6"
+    runtime.touch()
+    compiler = tmp_path / "fake-cxx"
+    compiler.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"${FAKE_CXX_RUNTIME}\"\n",
+        encoding="utf-8",
+    )
+    compiler.chmod(0o755)
+
+    env_runtime = os.environ.get("FAKE_CXX_RUNTIME")
+    os.environ["FAKE_CXX_RUNTIME"] = str(runtime)
+    try:
+        completed = run_preflight(tmp_path, "core", cxx=str(compiler))
+    finally:
+        if env_runtime is None:
+            os.environ.pop("FAKE_CXX_RUNTIME", None)
+        else:
+            os.environ["FAKE_CXX_RUNTIME"] = env_runtime
+
+    assert completed.returncode == 0
+    assert f"cxx_runtime={runtime_dir}" in completed.stdout
 
 
 def test_engine_profiles_validate_their_isolated_python(tmp_path):
