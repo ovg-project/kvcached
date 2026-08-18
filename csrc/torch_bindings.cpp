@@ -99,6 +99,16 @@ void page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
   allocator->free_pages(page_ids);
 }
 
+void page_allocator_offload_page(std::shared_ptr<PageAllocator> allocator,
+                                 page_id_t page_id) {
+  allocator->offload_page(page_id);
+}
+
+void page_allocator_restore_page(std::shared_ptr<PageAllocator> allocator,
+                                 page_id_t page_id) {
+  allocator->restore_page(page_id);
+}
+
 bool page_allocator_resize(std::shared_ptr<PageAllocator> allocator,
                            int64_t new_mem_size) {
   return allocator->resize(new_mem_size);
@@ -131,6 +141,16 @@ page_allocator_get_num_total_pages(std::shared_ptr<PageAllocator> allocator) {
 int64_t page_allocator_get_num_reserved_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_num_reserved_pages();
+}
+
+int64_t page_allocator_get_num_offloaded_pages(
+    std::shared_ptr<PageAllocator> allocator) {
+  return allocator->get_num_offloaded_pages();
+}
+
+bool page_allocator_is_page_offloaded(std::shared_ptr<PageAllocator> allocator,
+                                      page_id_t page_id) {
+  return allocator->is_page_offloaded(page_id);
 }
 
 py::dict
@@ -238,6 +258,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,
            py::call_guard<py::gil_scoped_release>())
+      .def("offload_page", &kvcached::page_allocator_offload_page,
+           py::call_guard<py::gil_scoped_release>())
+      .def("restore_page", &kvcached::page_allocator_restore_page,
+           py::call_guard<py::gil_scoped_release>())
       .def("resize", &kvcached::page_allocator_resize,
            py::call_guard<py::gil_scoped_release>())
       .def("trim", &kvcached::page_allocator_trim,
@@ -249,6 +273,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_num_offloaded_pages",
+           &kvcached::page_allocator_get_num_offloaded_pages)
+      .def("is_page_offloaded", &kvcached::page_allocator_is_page_offloaded)
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)

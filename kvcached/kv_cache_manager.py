@@ -180,6 +180,10 @@ class KVCacheManager:
         self.num_avail_blocks = 0  # Only count free blocks in avail_pages
         self.avail_pages: Dict[int, InternalPage] = {}
         self.full_pages: Dict[int, InternalPage] = {}
+        # Offloaded pages retain their block ids and allocation metadata, but
+        # are removed from allocatable page sets until their GPU mapping and
+        # contents have been restored.
+        self.offloaded_pages: Dict[int, InternalPage] = {}
 
         self.reserved_blocks: List[int] = []
         self.null_block: Optional[list[int]] = None
@@ -398,7 +402,10 @@ class KVCacheManager:
         idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
 
         pages_to_free: List[int] = []
+        offloaded_pages = getattr(self, "offloaded_pages", {})
         for page_id, idxs in idx_dict.items():
+            if page_id in offloaded_pages:
+                self._restore_page(page_id)
             # Find the page - it must be in either full_pages or avail_pages
             page = None
             if page_id in self.full_pages:
@@ -437,6 +444,94 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
+
+    def offload_page(self, page_id: int) -> None:
+        """Unmap one resident page while retaining its block allocation."""
+
+        self._offload_page(page_id)
+
+    @synchronized
+    def _offload_page(self, page_id: int) -> None:
+        self._wait_post_init()
+        if page_id in self.offloaded_pages:
+            raise ValueError(f"Page {page_id} is already CPU-offloaded")
+
+        was_full = page_id in self.full_pages
+        if was_full:
+            page = self.full_pages.pop(page_id)
+        elif page_id in self.avail_pages:
+            page = self.avail_pages.pop(page_id)
+            self.num_avail_blocks -= page.num_free_blocks()
+        else:
+            raise ValueError(f"Page {page_id} is not allocated")
+
+        try:
+            self.page_allocator.offload_page(page_id)
+        except Exception:
+            if was_full:
+                self.full_pages[page_id] = page
+            else:
+                self.avail_pages[page_id] = page
+                self.num_avail_blocks += page.num_free_blocks()
+            raise
+        self.offloaded_pages[page_id] = page
+
+    def restore_page(self, page_id: int) -> None:
+        """Restore one CPU-offloaded page at the same virtual page id."""
+
+        self._restore_page(page_id)
+
+    @synchronized
+    def _restore_page(self, page_id: int) -> None:
+        self._wait_post_init()
+        page = self.offloaded_pages.get(page_id)
+        if page is None:
+            raise ValueError(f"Page {page_id} is not CPU-offloaded")
+
+        self.page_allocator.restore_page(page_id)
+        self._commit_restored_page(page_id)
+
+    @synchronized
+    def begin_restore_page(self, page_id: int) -> None:
+        """Map an offloaded page but keep it hidden from block allocation."""
+
+        self._wait_post_init()
+        if page_id not in self.offloaded_pages:
+            raise ValueError(f"Page {page_id} is not CPU-offloaded")
+        self.page_allocator.restore_page(page_id)
+
+    @synchronized
+    def commit_restored_page(self, page_id: int) -> None:
+        """Expose a restored page only after its H2D copy has completed."""
+
+        self._commit_restored_page(page_id)
+
+    def _commit_restored_page(self, page_id: int) -> None:
+        page = self.offloaded_pages.get(page_id)
+        if page is None:
+            raise ValueError(f"Page {page_id} is not CPU-offloaded")
+        if self.page_allocator.is_page_offloaded(page_id):
+            raise RuntimeError(
+                f"Page {page_id} cannot be committed before GPU remapping")
+        self.offloaded_pages.pop(page_id)
+        if page.full():
+            self.full_pages[page_id] = page
+        else:
+            self.avail_pages[page_id] = page
+            self.num_avail_blocks += page.num_free_blocks()
+
+    @synchronized
+    def rollback_restored_page(self, page_id: int) -> None:
+        """Undo a remap after a failed H2D copy."""
+
+        if page_id not in self.offloaded_pages:
+            raise ValueError(f"Page {page_id} is not CPU-offloaded")
+        if not self.page_allocator.is_page_offloaded(page_id):
+            self.page_allocator.offload_page(page_id)
+
+    @synchronized
+    def is_page_offloaded(self, page_id: int) -> bool:
+        return page_id in self.offloaded_pages
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -520,6 +615,8 @@ class KVCacheManager:
                 page = self.full_pages[page_id]
             elif page_id in self.avail_pages:
                 page = self.avail_pages[page_id]
+            elif page_id in self.offloaded_pages:
+                page = self.offloaded_pages[page_id]
             else:
                 occupancy[page_id] = 0
                 continue
@@ -534,7 +631,11 @@ class KVCacheManager:
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
-        memory_bytes = (self.page_allocator.get_num_inuse_pages() *
+        resident_pages = (
+            self.page_allocator.get_num_inuse_pages()
+            - self.page_allocator.get_num_offloaded_pages()
+        )
+        memory_bytes = (resident_pages *
                         self.num_layers * self.page_size *
                         self.num_kv_buffers)
 
@@ -588,6 +689,9 @@ class KVCacheManager:
         # Clear reserved blocks
         self.free_reserved()
 
+        for page_id in list(self.offloaded_pages):
+            self._restore_page(page_id)
+
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = []
         for page in self.avail_pages.values():
@@ -598,6 +702,7 @@ class KVCacheManager:
             self.page_allocator.free_pages(pages_to_free)
         self.avail_pages.clear()
         self.full_pages.clear()
+        self.offloaded_pages.clear()
 
         # Trim the page allocator to free up reserved pages
         self.trim()
@@ -637,4 +742,10 @@ class KVCacheManager:
         # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
             self.page_size, self.block_mem_size) - self.num_avail_blocks
-        return blocks_from_full_pages + blocks_from_avail_pages
+        blocks_from_offloaded_pages = sum(
+            InternalPage.get_num_blocks(self.page_size, self.block_mem_size)
+            - page.num_free_blocks()
+            for page in self.offloaded_pages.values()
+        )
+        return (blocks_from_full_pages + blocks_from_avail_pages +
+                blocks_from_offloaded_pages)

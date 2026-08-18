@@ -1,0 +1,55 @@
+name: CPU Offload GPU Validation
+
+on:
+  schedule:
+    - cron: '23 10 * * 0'
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: Number of VMM pages in each round trip
+        required: true
+        default: 4
+        type: number
+      cycles:
+        description: Number of complete offload/restore cycles
+        required: true
+        default: 5
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kvcached-cpu-offload-gpu
+  cancel-in-progress: false
+
+jobs:
+  vmm-roundtrip:
+    runs-on: [self-hosted, linux, x64, gpu, kvcached]
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate CPU offload VMM round trips
+        env:
+          PYTHON: ${{ vars.KVCACHED_GPU_PYTHON || 'python' }}
+          PAGES: ${{ inputs.pages || 4 }}
+          CYCLES: ${{ inputs.cycles || 5 }}
+          ARTIFACT_DIR: >-
+            cpu-offload-vmm-artifacts/${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash tools/run_cpu_offload_h20_validation.sh
+
+      - name: Upload CPU offload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-offload-vmm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            cpu-offload-vmm-artifacts/
+            cpu-offload-vmm-artifacts.tar.gz
+            cpu-offload-vmm-artifacts.tar.gz.sha256
+          if-no-files-found: warn
+          retention-days: 30
