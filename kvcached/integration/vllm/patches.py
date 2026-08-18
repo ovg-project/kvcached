@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
-from kvcached.utils import KVCachedConfigError, get_kvcached_logger
+from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -802,7 +802,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         break
 
                 if block_ids is None:
-                    raise ValueError(
+                    # Transient, not a defect: a colocated engine took the last
+                    # physical pages. KVCacheManagerAllocateSlotsPatch turns
+                    # this into the scheduler's own "cannot allocate now"
+                    # signal, so keep it a distinct type the patch can catch
+                    # without also swallowing real contract violations.
+                    raise KVCachePoolExhausted(
                         "Unable to allocate KV cache blocks from physical pool; "
                         f"requested={num_blocks}, available={self.kv_cache_manager.available_size()}"
                     )
@@ -1890,6 +1895,79 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_init_device, "init_device")
         Worker.init_device = _patched_init_device  # type: ignore[assignment]
+        return True
+
+
+class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
+    """Report an exhausted physical KV pool the way vLLM's scheduler expects.
+
+    vLLM's own block pool can raise from `get_new_blocks()` because its free
+    count is process-local and authoritative: if the count says the blocks are
+    there, the allocation cannot fail, so the raise is an invariant guard that
+    never fires. Under kvcached the same count reads device-wide state shared
+    with colocated engines, so it is a snapshot rather than a reservation, and
+    a peer can take the last pages before they are claimed. The guard becomes
+    reachable.
+
+    The scheduler already handles this exact situation -- `allocate_slots()`
+    returning None means "not now", and it preempts a running request and
+    retries on the next step, which incidentally releases physical pages back
+    to the shared pool. What it does not handle is an exception: `schedule()`
+    catches nothing and EngineCore's own handler wraps only `execute_model`,
+    so the exception terminates the engine and every in-flight request with
+    it.
+
+    Translate only `KVCachePoolExhausted`. A plain ValueError from the pool
+    (asking for more blocks than were just reported free) is a contract
+    violation and must stay fail-loud.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.kv_cache_manager"
+    target_class = "KVCacheManager"
+    patch_name = "allocate_slots"
+
+    def apply(self, kvcache_manager_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_allocate_slots(kvcache_manager_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_allocate_slots(self, kvcache_manager_mod: types.ModuleType) -> bool:
+        KVCacheManager = self._get_target_class(kvcache_manager_mod)
+        if KVCacheManager is None:
+            return False
+
+        original_allocate_slots = getattr(KVCacheManager, "allocate_slots", None)
+        if original_allocate_slots is None:
+            self.logger.warning(
+                "KVCacheManager.allocate_slots was not found; an exhausted "
+                "physical KV pool will terminate EngineCore")
+            return False
+        if self._is_already_patched(original_allocate_slots, "allocate_slots"):
+            self.logger.debug("KVCacheManager.allocate_slots already patched")
+            return True
+
+        logger = self.logger
+
+        def _patched_allocate_slots(self, *args: Any, **kwargs: Any) -> Any:
+            if not enable_kvcached():
+                return original_allocate_slots(self, *args, **kwargs)
+            try:
+                return original_allocate_slots(self, *args, **kwargs)
+            except KVCachePoolExhausted as exhausted:
+                # None is the scheduler's own "cannot schedule this request
+                # now" path. Partially allocated blocks are released when the
+                # scheduler preempts or frees the request, so returning here
+                # does not strand them.
+                logger.warning(
+                    "Shared physical KV pool is exhausted; reporting a "
+                    "scheduling miss so the engine can preempt and retry: %s",
+                    exhausted)
+                return None
+
+        self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
+        KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]
         return True
 
 

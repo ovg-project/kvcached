@@ -12,6 +12,22 @@ class KVCachedConfigError(RuntimeError):
     abort startup instead of silently falling back to non-kvcached behavior."""
 
 
+class KVCachePoolExhausted(ValueError):
+    """Raised when the shared physical KV pool cannot back an allocation.
+
+    This is a transient condition, not a defect: colocated engines share one
+    physical pool, so a peer can take the last pages between the moment
+    availability is observed and the moment the pages are claimed. Serving
+    engines already know how to respond -- free something and try again -- so
+    integrations translate this into whatever "cannot allocate right now"
+    signal their engine understands, rather than letting it terminate the
+    process.
+
+    It subclasses ValueError so callers written against the pre-existing
+    behavior keep working.
+    """
+
+
 def _sanitize_segment(segment: str) -> str:
     """Sanitize a segment to safe characters for SHM names."""
     allowed = []
