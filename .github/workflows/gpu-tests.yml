@@ -20,9 +20,8 @@ on:
           - nixl
           - all
       model:
-        description: Model used by the engine and NIXL profiles
+        description: Override the model; blank uses each smoke test's default
         required: false
-        default: Qwen/Qwen2.5-1.5B-Instruct
         type: string
       repeat:
         description: Repeat the selected profile to expose flaky failures
@@ -93,7 +92,9 @@ jobs:
           GPU_CI_REPEAT: ${{ inputs.repeat || 1 }}
           GPU_CI_ARTIFACT_DIR: >-
             gpu-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}
-          MODEL: ${{ inputs.model || 'Qwen/Qwen2.5-1.5B-Instruct' }}
+          # Blank on purpose: run_engine_smoke.sh and run_vllm_nixl_pd_smoke.sh
+          # each carry their own default, and they differ.
+          MODEL: ${{ inputs.model }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: bash tools/run_gpu_ci.sh
 

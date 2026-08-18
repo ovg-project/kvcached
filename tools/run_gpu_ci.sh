@@ -325,7 +325,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|all)$ ]]; then
     ENGINE=vllm \
     PYTHON="${VLLM_PYTHON}" \
-    MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
+    MODEL="${MODEL:-}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/vllm-${iteration}" \
       bash tools/run_engine_smoke.sh
   fi
@@ -333,7 +333,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
   if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]]; then
     ENGINE=sglang \
     PYTHON="${SGLANG_PYTHON}" \
-    MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
+    MODEL="${MODEL:-}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/sglang-${iteration}" \
       bash tools/run_engine_smoke.sh
   fi

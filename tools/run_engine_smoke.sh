@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 ENGINE="${ENGINE:-vllm}"
-MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-}"
 PYTHON="${PYTHON:-python}"
@@ -120,6 +120,15 @@ snapshot_gpu_pids "${GPU_PIDS_BEFORE}"
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
 export VLLM_USE_V1=1
+# The default model is a linear-attention hybrid (Qwen3.5 GDN: three
+# linear-attention layers per full-attention layer). Its per-block recurrent
+# state does not fit the default 2MB page, and kv_cache_manager.py refuses to
+# start rather than hand out an empty KV pool. 4MB fits. The contiguous layout
+# is supported for this family, so leave it at the default, and do not ask
+# either engine to disable its hybrid KV-cache manager -- the attention groups
+# have different specs and cannot be unified. See
+# examples/08_hybrid_attention_models/README.md.
+export KVCACHED_PAGE_SIZE_MB="${KVCACHED_PAGE_SIZE_MB:-4}"
 export no_proxy="localhost,127.0.0.1,::1"
 export NO_PROXY="${no_proxy}"
 
@@ -132,6 +141,7 @@ if [[ "${ENGINE}" == "vllm" ]]; then
     --port "${PORT}" \
     --max-model-len "${MAX_MODEL_LEN}" \
     --no-enable-prefix-caching \
+    --trust-remote-code \
     >"${SERVER_LOG}" 2>&1 &
 else
   "${PYTHON}" -c \
