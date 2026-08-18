@@ -35,7 +35,7 @@ def run_preflight(
         }
     )
     if visible_devices is None:
-        visible_devices = "0,1" if profile == "nixl" else "0"
+        visible_devices = "0,1" if profile in ("nixl", "all") else "0"
     env["KVCACHED_GPU_VISIBLE_DEVICES"] = visible_devices
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
@@ -54,7 +54,7 @@ def run_preflight(
 
 
 def test_supported_profiles_pass_cpu_only_preflight(tmp_path):
-    for profile in ("core", "vllm", "sglang", "engines", "nixl"):
+    for profile in ("core", "vllm", "sglang", "engines", "nixl", "all"):
         completed = run_preflight(tmp_path, profile)
         assert completed.returncode == 0
         assert f"profile={profile}" in completed.stdout
@@ -84,9 +84,10 @@ def test_profiles_require_exact_selected_gpu_count(tmp_path):
     assert completed.returncode == 2
     assert "requires exactly 1 selected GPU" in completed.stdout
 
-    completed = run_preflight(tmp_path, "nixl", visible_devices="0")
-    assert completed.returncode == 2
-    assert "requires exactly 2 selected GPU" in completed.stdout
+    for profile in ("nixl", "all"):
+        completed = run_preflight(tmp_path, profile, visible_devices="0")
+        assert completed.returncode == 2
+        assert "requires exactly 2 selected GPU" in completed.stdout
 
 
 def test_device_selection_rejects_invalid_or_duplicate_ids(tmp_path):

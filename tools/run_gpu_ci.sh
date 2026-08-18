@@ -10,6 +10,7 @@
 #   sglang - run core and one kvcached-backed SGLang correctness request.
 #   engines - run both single-GPU engine smoke tests sequentially.
 #   nixl  - run core, then the two-GPU vLLM+NIXL P/D smoke test.
+#   all   - run core, both engine smoke tests, and the NIXL P/D smoke test.
 #
 # CHECK_ONLY=1 validates the runner configuration without requiring a GPU.
 
@@ -34,7 +35,7 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "${GPU_CI_ARTIFACT_DIR}"
 
 case "${GPU_CI_PROFILE}" in
-  core|vllm|sglang|engines|nixl) ;;
+  core|vllm|sglang|engines|nixl|all) ;;
   *)
     echo "Unknown GPU_CI_PROFILE: '${GPU_CI_PROFILE}'" >&2
     exit 2
@@ -42,7 +43,7 @@ case "${GPU_CI_PROFILE}" in
 esac
 
 EXPECTED_GPU_COUNT=1
-if [[ "${GPU_CI_PROFILE}" == "nixl" ]]; then
+if [[ "${GPU_CI_PROFILE}" =~ ^(nixl|all)$ ]]; then
   EXPECTED_GPU_COUNT=2
 fi
 
@@ -100,12 +101,12 @@ if ! command -v "${PYTHON}" >/dev/null 2>&1; then
   echo "Python command not found: ${PYTHON}" >&2
   exit 2
 fi
-if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl|all)$ ]] &&
    ! command -v "${VLLM_PYTHON}" >/dev/null 2>&1; then
   echo "vLLM Python command not found: ${VLLM_PYTHON}" >&2
   exit 2
 fi
-if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]] &&
    ! command -v "${SGLANG_PYTHON}" >/dev/null 2>&1; then
   echo "SGLang Python command not found: ${SGLANG_PYTHON}" >&2
   exit 2
@@ -250,11 +251,11 @@ install_project() {
 
 if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
   install_project "${PYTHON}" core
-  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl)$ ]] &&
+  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|nixl|all)$ ]] &&
      [[ "${VLLM_PYTHON}" != "${PYTHON}" ]]; then
     install_project "${VLLM_PYTHON}" vllm
   fi
-  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines)$ ]] &&
+  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]] &&
      [[ "${SGLANG_PYTHON}" != "${PYTHON}" ]] &&
      [[ "${SGLANG_PYTHON}" != "${VLLM_PYTHON}" ]]; then
     install_project "${SGLANG_PYTHON}" sglang
@@ -284,7 +285,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/core-pytest-${iteration}.log"
   fi
 
-  if [[ "${GPU_CI_PROFILE}" == "nixl" ]]; then
+  if [[ "${GPU_CI_PROFILE}" =~ ^(nixl|all)$ ]]; then
     if [[ "$("${VLLM_PYTHON}" -c 'import torch; print(torch.cuda.device_count())')" -ne 2 ]]; then
       echo "The nixl profile requires exactly two visible logical GPUs" >&2
       exit 2
@@ -302,8 +303,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/nixl-pd-smoke-${iteration}.log"
   fi
 
-  if [[ "${GPU_CI_PROFILE}" == "vllm" ]] ||
-     [[ "${GPU_CI_PROFILE}" == "engines" ]]; then
+  if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|all)$ ]]; then
     ENGINE=vllm \
     PYTHON="${VLLM_PYTHON}" \
     MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
@@ -311,8 +311,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
       bash tools/run_engine_smoke.sh
   fi
 
-  if [[ "${GPU_CI_PROFILE}" == "sglang" ]] ||
-     [[ "${GPU_CI_PROFILE}" == "engines" ]]; then
+  if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]]; then
     ENGINE=sglang \
     PYTHON="${SGLANG_PYTHON}" \
     MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
