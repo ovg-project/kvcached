@@ -14,8 +14,8 @@ cd "${ROOT_DIR}"
 BASE_PYTHON="${BASE_PYTHON:-python3.11}"
 ENV_ROOT="${ENV_ROOT:-${HOME}/.cache/kvcached/gpu-ci-envs}"
 CORE_TORCH_SPEC="${CORE_TORCH_SPEC:-torch==2.8.0}"
-VLLM_SPEC="${VLLM_SPEC:-vllm==0.19.0}"
-SGLANG_SPEC="${SGLANG_SPEC:-sglang[all]==0.5.10}"
+VLLM_SPEC="${VLLM_SPEC:-vllm==0.24.0}"
+SGLANG_SPEC="${SGLANG_SPEC:-sglang[all]==0.5.15}"
 # Which environments to provision. The engine environments each pull their own
 # PyTorch, so a host that only runs the core profile can skip them and the
 # tens of gigabytes they download.
