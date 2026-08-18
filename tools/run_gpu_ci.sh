@@ -266,6 +266,25 @@ fi
 # here. check_test_classification.py enforces that every test module sits in
 # exactly one manifest, so a hardcoded list here would silently stop covering
 # new GPU tests as they are added.
+# `python -m pytest` puts the working directory first on sys.path. This script
+# runs from the repository root, so the source tree would shadow the wheel that
+# install_project just put in site-packages -- and the source tree carries no
+# compiled extension, so every GPU test dies at collection with
+# "No module named 'kvcached.vmm_ops'". Keep the installed package in front.
+if [[ "${GPU_CI_INSTALL}" == "1" ]]; then
+  export PYTHONSAFEPATH=1
+fi
+
+# Whichever kvcached the tests are about to import, say which one and prove the
+# extension loads. One clear line here beats a pile of collection errors.
+"${PYTHON}" - <<'IMPORTCHECK' | tee "${GPU_CI_ARTIFACT_DIR}/kvcached-import.txt"
+import kvcached
+import kvcached.vmm_ops as ops
+
+print(f"kvcached={kvcached.__file__}")
+print(f"vmm_ops={ops.__file__}")
+IMPORTCHECK
+
 default_pytest_targets=()
 while IFS= read -r test_path; do
   default_pytest_targets+=("${test_path}")
