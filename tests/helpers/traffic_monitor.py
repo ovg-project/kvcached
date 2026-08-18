@@ -2,17 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Comprehensive test script for traffic monitoring functionality
+"""Manual traffic-monitoring smoke script.
+
+Run it against a live controller from the repository's `tests` directory:
+
+    python helpers/traffic_monitor.py
+
+pytest collects nothing here -- the class below is not named `Test*` -- so it
+lives outside the `test_*.py` glob that the manifests classify.
 """
 
 import argparse
 import asyncio
 import random
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from test_utils import load_example_config
+
+# Run directly as a script, sys.path[0] is this directory, not `tests`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from helpers.config import load_example_config
 
 
 def load_config_from_file():
