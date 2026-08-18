@@ -82,7 +82,13 @@ create_env() {
   fi
 
   "${python}" -m pip install --upgrade pip
+  # ninja is a *runtime* dependency of the engine environments, not a build
+  # one: vLLM 0.24 lets FlashInfer JIT-compile its sampling kernels on the
+  # first request, and FlashInfer shells out to ninja. Neither engine declares
+  # it, so without this the engine core dies at startup with a bare
+  # "No such file or directory: 'ninja'".
   "${python}" -m pip install \
+    ninja \
     "packaging>=24.2" \
     "pytest>=8,<9" \
     "setuptools>=77" \

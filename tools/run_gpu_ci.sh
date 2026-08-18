@@ -236,7 +236,10 @@ install_project() {
   local target_python="$1"
   local artifact_prefix="$2"
 
+  # See the same list in tools/bootstrap_gpu_ci_envs.sh: ninja is needed at
+  # run time by FlashInfer's JIT, not only to build.
   "${target_python}" -m pip install \
+    ninja \
     "packaging>=24.2" \
     "pytest>=8,<9" \
     "setuptools>=77" \
@@ -334,6 +337,10 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/vllm-${iteration}" \
       bash tools/run_engine_smoke.sh
 
+    # FlashInfer's JIT shells out to `ninja`, which pip put in the engine
+    # environment's bin directory; invoking the interpreter by path does not
+    # put that directory on PATH.
+    PATH="$(dirname "$(command -v "${VLLM_PYTHON}")"):${PATH}" \
     ENABLE_KVCACHED=true VLLM_USE_V1=1 \
       "${VLLM_PYTHON}" tests/test_elastic_serving.py \
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/vllm-elasticity-${iteration}.log"
@@ -346,6 +353,7 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/sglang-${iteration}" \
       bash tools/run_engine_smoke.sh
 
+    PATH="$(dirname "$(command -v "${SGLANG_PYTHON}")"):${PATH}" \
     ENABLE_KVCACHED=true \
       "${SGLANG_PYTHON}" tests/test_elastic_serving_sglang.py \
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/sglang-elasticity-${iteration}.log"

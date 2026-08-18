@@ -44,6 +44,11 @@ if ! command -v "${PYTHON}" >/dev/null 2>&1; then
   echo "Python command not found: ${PYTHON}" >&2
   exit 2
 fi
+# FlashInfer JIT-compiles kernels on the first request and shells out to
+# `ninja`, which pip installed into this interpreter's environment. Invoking
+# the interpreter by path does not put that directory on PATH.
+PATH="$(dirname "$(command -v "${PYTHON}")"):${PATH}"
+export PATH
 
 mkdir -p "${LOG_DIR}"
 SERVER_LOG="${LOG_DIR}/${ENGINE}-server.log"
