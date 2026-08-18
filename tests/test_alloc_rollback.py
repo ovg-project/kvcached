@@ -52,14 +52,6 @@ class FakePage:
         return page_size // block_mem_size
 
 
-class ExplodingPage(FakePage):
-    """FakePage whose alloc() raises, mimicking InternalPage's "Not enough
-    free blocks in page" invariant failure (csrc/page_allocator.cpp)."""
-
-    def alloc(self, num: int) -> List[int]:
-        raise RuntimeError("Not enough free blocks in page")
-
-
 class FakePageAllocator:
     """Reports ample capacity but fails alloc_page() after ``fail_after``
     pages, mimicking another instance draining the shared physical pool."""
@@ -199,20 +191,28 @@ def test_alloc_after_rollback_succeeds_when_pool_recovers():
     assert len(result) == 5
 
 
-def test_page_alloc_failure_on_avail_page_stays_fail_loud():
+def _explode_alloc(num: int) -> List[int]:
+    """Stand-in for InternalPage.alloc()'s "Not enough free blocks in page"
+    invariant failure (csrc/page_allocator.cpp)."""
+    raise RuntimeError("Not enough free blocks in page")
+
+
+def test_page_alloc_failure_on_avail_page_stays_fail_loud(monkeypatch):
     # The rollback handler is scoped to alloc_page(): by the time page.alloc()
     # runs, _pick_avail_page() has removed the page from avail_pages while its
     # blocks are not yet in ret_index, so rollback could not restore it. The
     # invariant failure must propagate, not degrade into a None miss (#430).
     manager = make_manager(fail_after=1)
     assert manager.alloc(2) == [0, 1]
-    manager.avail_pages[0].__class__ = ExplodingPage
+    monkeypatch.setattr(manager.avail_pages[0], "alloc", _explode_alloc)
     with pytest.raises(RuntimeError, match="Not enough free blocks in page"):
         manager.alloc(2)
 
 
-def test_page_alloc_failure_on_fresh_page_stays_fail_loud():
+def test_page_alloc_failure_on_fresh_page_stays_fail_loud(monkeypatch):
+    # The failing page does not exist until alloc() creates it, so patch the
+    # class rather than an instance.
     manager = make_manager(fail_after=10)
-    manager.page_allocator.alloc_page = lambda: ExplodingPage(0)
+    monkeypatch.setattr(FakePage, "alloc", lambda self, num: _explode_alloc(num))
     with pytest.raises(RuntimeError, match="Not enough free blocks in page"):
         manager.alloc(2)
