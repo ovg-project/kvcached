@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
-from kvcached.utils import KVCachedConfigError
+from kvcached.utils import KVCachedConfigError, get_kvcached_logger
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -28,6 +28,9 @@ if TYPE_CHECKING:
         KVCacheBlock = Any  # type: ignore[misc,assignment]
         KVCacheEvent = Any  # type: ignore[misc,assignment]
         Request = Any  # type: ignore[misc,assignment]
+
+
+logger = get_kvcached_logger()
 
 
 def _is_attention_spec(spec: Any) -> bool:
@@ -307,12 +310,32 @@ def _get_max_cached_blocks(block_size: int) -> int:
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns MAX_CACHED_TOKENS // block_size.
+    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)``.
+
+    The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
+    ``block_size`` (e.g. 8 tokens with a 16-token block) integer-divides to
+    ``0``, which is indistinguishable from the ``== 0`` "disabled" sentinel and
+    would silently turn prefix caching off. Flooring at one block keeps caching
+    enabled for the smallest non-zero budget, matching the user's intent; a
+    warning is logged so the effective granularity is not silent.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
     if MAX_CACHED_TOKENS < 0:
         return -1
-    return MAX_CACHED_TOKENS // block_size
+    if MAX_CACHED_TOKENS == 0:
+        return 0
+    max_cached_blocks = MAX_CACHED_TOKENS // block_size
+    if max_cached_blocks == 0:
+        logger.warning(
+            "KVCACHED_MAX_CACHED_TOKENS=%d is smaller than the KV block size "
+            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
+            "stays enabled. Set KVCACHED_MAX_CACHED_TOKENS=0 to disable "
+            "caching explicitly.",
+            MAX_CACHED_TOKENS,
+            block_size,
+        )
+        return 1
+    return max_cached_blocks
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -400,6 +423,25 @@ def _set_block_hash(block: Any, key: Any) -> None:
         block.block_hash = key
 
 
+def _convert_block_hashes(
+    block_hashes: Any,
+    hash_block_size: int,
+    target_block_size: int,
+) -> Any:
+    if target_block_size == hash_block_size:
+        return block_hashes
+
+    import importlib
+
+    kv_cache_utils = importlib.import_module("vllm.v1.core.kv_cache_utils")
+    converter = getattr(kv_cache_utils, "BlockHashListWithBlockSize", None)
+    if converter is None:
+        raise RuntimeError(
+            "This vLLM version does not support heterogeneous block-hash conversion"
+        )
+    return converter(block_hashes, hash_block_size, target_block_size)
+
+
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticBlockPool into vLLM's block pool module"""
 
@@ -443,7 +485,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 enable_caching: bool,
                 enable_kv_cache_events: bool = False,
                 num_kv_buffers: int = 2,
-                max_cached_blocks: int = 1000
+                max_cached_blocks: int = 1000,
+                hash_block_size: Optional[int] = None,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
@@ -456,6 +499,13 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     "KV cache events are not supported in ElasticBlockPool")
 
                 self.num_gpu_blocks = num_gpu_blocks
+                # Request.block_hashes are computed at hash_block_size, which
+                # can be smaller than a heterogeneous KV group's physical
+                # block_size. Keep this distinct from block_size, which is also
+                # used to configure kvcached's physical allocation geometry.
+                self.hash_block_size = (
+                    block_size if hash_block_size is None else int(hash_block_size)
+                )
                 self.enable_kv_cache_events = enable_kv_cache_events
                 self.kv_event_queue = []  # type: ignore[var-annotated]
                 self.kv_block_pool = [KVCacheBlockClass(i) for i in range(num_gpu_blocks)]
@@ -567,6 +617,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 num_full_blocks = kwargs.pop("num_full_blocks", None)
                 _block_size = kwargs.pop("block_size", None)
                 kv_cache_group_id = kwargs.pop("kv_cache_group_id", 0)
+                block_mask = kwargs.pop("block_mask", None)
                 _hash_fn = kwargs.pop("hash_fn", None)
 
                 remaining_args = list(args)
@@ -581,6 +632,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     _block_size = remaining_args.pop(0)
                 if remaining_args and isinstance(remaining_args[0], int):
                     kv_cache_group_id = remaining_args.pop(0)
+                if (
+                    block_mask is None
+                    and remaining_args
+                    and isinstance(remaining_args[0], (list, tuple))
+                ):
+                    block_mask = remaining_args.pop(0)
                 if remaining_args:
                     # Final positional argument is typically hash_fn; ignored.
                     _hash_fn = remaining_args.pop(0)
@@ -597,15 +654,28 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     return
 
                 new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+                assert block_mask is None or len(block_mask) == len(new_full_blocks)
 
                 if block_hashes is None:
                     assert hasattr(request, "block_hashes"), "Request missing block_hashes attribute"
-                    block_hashes = request.block_hashes
+                    target_block_size = (
+                        self.hash_block_size
+                        if _block_size is None
+                        else int(_block_size)
+                    )
+                    block_hashes = _convert_block_hashes(
+                        request.block_hashes,
+                        self.hash_block_size,
+                        target_block_size,
+                    )
                 assert len(block_hashes) >= num_full_blocks, \
                     f"Request has {len(block_hashes)} hashes but need {num_full_blocks}"
 
                 for i, block in enumerate(new_full_blocks):
-                    if getattr(block, "is_null", False):
+                    if (
+                        getattr(block, "is_null", False)
+                        or (block_mask is not None and not block_mask[i])
+                    ):
                         continue
 
                     block_idx = num_cached_blocks + i
@@ -1006,6 +1076,15 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
             group_size = _get_group_size(kv_cache_config)
+            # vLLM computes Request.block_hashes at a shared fine-grained size
+            # (normally the GCD of heterogeneous group block sizes). Preserve
+            # the value from the native pool before replacing it.
+            native_block_pool = getattr(self, "block_pool", None)
+            hash_block_size = getattr(
+                native_block_pool,
+                "hash_block_size",
+                getattr(self, "hash_block_size", block_size),
+            )
             self.block_pool = ElasticBlockPool(
                 kv_cache_config.num_blocks,
                 block_size,
@@ -1013,7 +1092,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=group_size,
                 enable_caching=getattr(self, "enable_caching", False),
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size)
+                max_cached_blocks=_get_max_cached_blocks(block_size),
+                hash_block_size=hash_block_size,
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
