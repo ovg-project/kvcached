@@ -32,9 +32,13 @@ from kvcached.cli.utils import get_kv_cache_limit, update_kv_cache_limit
 
 MB = 1024 * 1024
 
-# Small by default so the check stays quick. A hybrid linear-attention model
-# also needs KVCACHED_PAGE_SIZE_MB=4; see tools/run_engine_smoke.sh.
-DEFAULT_MODEL = os.getenv("KVCACHED_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+# The same hybrid model the engine smoke tests use, for the same reason: a
+# GQA-only model exercises none of the KV layouts where kvcached's bugs have
+# actually been. Its per-block recurrent state does not fit the default 2MB
+# page, so raise the page size before kvcached initializes -- both engines
+# inherit this environment when they fork their worker.
+DEFAULT_MODEL = os.getenv("KVCACHED_TEST_MODEL", "Qwen/Qwen3.5-4B")
+os.environ.setdefault("KVCACHED_PAGE_SIZE_MB", "4")
 
 PROBE_PROMPT = "The capital of France is"
 
