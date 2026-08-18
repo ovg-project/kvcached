@@ -156,8 +156,9 @@ def pool_factory(monkeypatch):
     Returns (pool, manager) so tests can inspect both.
     """
 
-    def _make(num_blocks: int = 100, enable_caching: bool = True):
-        manager = MockKVCacheManager(num_blocks)
+    def _make(num_blocks: int = 100, enable_caching: bool = True, manager=None):
+        if manager is None:
+            manager = MockKVCacheManager(num_blocks)
 
         kv_cache_utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
         setattr(
@@ -724,3 +725,32 @@ class TestEdgeCases:
         pool.get_new_blocks(50)
         # 50+1(null) allocated, 0 evictable -> 49 free from kvcached
         assert pool.get_usage() == pytest.approx(0.51)
+
+
+class DrainedPoolManager(MockKVCacheManager):
+    """Leave the pool in the state a colocated peer produces.
+
+    ``available_size()`` reads device-wide free memory, so it is a snapshot of
+    state shared with every colocated engine, not a reservation: a peer can
+    take the last pages between the pool reading it and the pages being
+    claimed.
+    """
+
+    def available_size(self) -> int:
+        return 1000
+
+    def alloc(self, n: int):
+        return None
+
+
+def test_exhaustion_raises_the_type_the_integration_translates(pool_factory):
+    """The other half of this fix lives in KVCacheManagerAllocateSlotsPatch,
+    which turns exactly this exception into a scheduling miss. Widening it back
+    to a plain ValueError would silently restore the EngineCore crash."""
+    from kvcached.utils import KVCachePoolExhausted
+
+    pool, _ = pool_factory(manager=DrainedPoolManager(100))
+
+    with pytest.raises(KVCachePoolExhausted,
+                       match="Unable to allocate KV cache blocks"):
+        pool.get_new_blocks(4)
