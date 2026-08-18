@@ -121,6 +121,7 @@ def test_engine_core_propagates_kvcached_initialization_failure(
 class FakeElasticBlockPool:
     def __init__(self, *args, **kwargs):
         self.null_block = object()
+        self.kwargs = kwargs
 
 
 def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
@@ -131,7 +132,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
         patches,
         "_get_first_attention_group",
         lambda cfg: types.SimpleNamespace(
-            kv_cache_spec=types.SimpleNamespace(block_size=16)
+            kv_cache_spec=types.SimpleNamespace(block_size=64)
         ),
     )
     monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
@@ -159,6 +160,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
             self.enable_caching = False
             self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
             self.single_type_managers = [types.SimpleNamespace()]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16)
 
     setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
 
@@ -167,6 +169,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
 
     assert init_kvcached.call_args.kwargs["world_size"] == 4
     assert isinstance(getattr(coordinator, "block_pool"), FakeElasticBlockPool)
+    assert coordinator.block_pool.kwargs["hash_block_size"] == 16
 
 
 def test_coordinator_propagates_uninitialized_world_size(
