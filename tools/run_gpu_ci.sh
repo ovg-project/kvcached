@@ -90,7 +90,9 @@ for required_file in \
   tools/check_test_classification.py \
   tools/dev_copy_pth.py \
   tools/run_engine_smoke.sh \
-  tools/run_vllm_nixl_pd_smoke.sh; do
+  tools/run_vllm_nixl_pd_smoke.sh \
+  tests/test_elastic_serving.py \
+  tests/test_elastic_serving_sglang.py; do
   if [[ ! -f "${required_file}" ]]; then
     echo "Missing required file: ${required_file}" >&2
     exit 2
@@ -322,12 +324,19 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
       2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/nixl-pd-smoke-${iteration}.log"
   fi
 
+  # The smoke test proves the engine boots on kvcached and answers correctly.
+  # The elasticity check is the one that puts the KV cache under real pressure
+  # and watches the mapped footprint grow and fall again, so run both.
   if [[ "${GPU_CI_PROFILE}" =~ ^(vllm|engines|all)$ ]]; then
     ENGINE=vllm \
     PYTHON="${VLLM_PYTHON}" \
     MODEL="${MODEL:-}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/vllm-${iteration}" \
       bash tools/run_engine_smoke.sh
+
+    ENABLE_KVCACHED=true VLLM_USE_V1=1 \
+      "${VLLM_PYTHON}" tests/test_elastic_serving.py \
+      2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/vllm-elasticity-${iteration}.log"
   fi
 
   if [[ "${GPU_CI_PROFILE}" =~ ^(sglang|engines|all)$ ]]; then
@@ -336,6 +345,10 @@ for iteration in $(seq 1 "${GPU_CI_REPEAT}"); do
     MODEL="${MODEL:-}" \
     LOG_DIR="${GPU_CI_ARTIFACT_DIR}/sglang-${iteration}" \
       bash tools/run_engine_smoke.sh
+
+    ENABLE_KVCACHED=true \
+      "${SGLANG_PYTHON}" tests/test_elastic_serving_sglang.py \
+      2>&1 | tee "${GPU_CI_ARTIFACT_DIR}/sglang-elasticity-${iteration}.log"
   fi
 
 done

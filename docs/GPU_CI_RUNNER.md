@@ -106,11 +106,18 @@ Every profile except `nixl` runs it first.
 | Profile | GPUs | What it adds to the GPU pytest set |
 | --- | --- | --- |
 | `core` | 1 | nothing |
-| `vllm` | 1 | one kvcached-backed vLLM correctness request |
-| `sglang` | 1 | one kvcached-backed SGLang correctness request |
-| `engines` | 1 | both engine smoke tests, sequentially |
+| `vllm` | 1 | a kvcached-backed vLLM correctness request, then the vLLM elasticity check |
+| `sglang` | 1 | the same two against SGLang |
+| `engines` | 1 | both engines' smoke and elasticity checks, sequentially |
 | `nixl` | 2 | the vLLM + NIXL prefill/decode disaggregation smoke test |
-| `all` | 2 | both engine smoke tests and the NIXL smoke test |
+| `all` | 2 | everything above |
+
+The smoke test proves the engine boots on kvcached and answers correctly. The
+elasticity check (`tests/test_elastic_serving*.py`) is the one that puts the KV
+cache under real pressure: it drives a 128-prompt batch, watches the mapped
+footprint in the `/dev/shm` segment grow and then fall as requests drain, cuts
+the limit through the same path `kvctl` uses, and finally re-runs a greedy probe
+to confirm the output is unchanged.
 
 Logs are uploaded as a workflow artifact even when the run fails.
 
