@@ -9,7 +9,6 @@
 #
 #   EVENT             schedule | workflow_dispatch | pull_request
 #   LABELS            space-separated pull request label names
-#   SAME_REPO         "true" when the head branch lives in this repository
 #   DISPATCH_PROFILE  the workflow_dispatch profile input
 #   DISPATCH_DEVICES  the workflow_dispatch devices input
 #   SINGLE_DEVICES    device selection for the one-GPU profiles
@@ -23,7 +22,6 @@ set -euo pipefail
 
 EVENT="${EVENT:-}"
 LABELS="${LABELS:-}"
-SAME_REPO="${SAME_REPO:-true}"
 DISPATCH_PROFILE="${DISPATCH_PROFILE:-}"
 DISPATCH_DEVICES="${DISPATCH_DEVICES:-}"
 SINGLE_DEVICES="${SINGLE_DEVICES:-}"
@@ -51,9 +49,16 @@ case "${EVENT}" in
     profile="${DISPATCH_PROFILE:-core}"
     ;;
   pull_request)
-    if [[ "${SAME_REPO}" != "true" ]]; then
-      decline "fork pull request: the self-hosted runner is not used"
-    fi
+    # The label is the only gate, and it is deliberately the only one: a
+    # fork's code runs on the self-hosted machine once someone with write or
+    # triage permission asks for it. GitHub withholds secrets and issues a
+    # read-only token for a fork's pull_request, so the exposure is code
+    # execution on the runner, nothing else. Applying the label means "I read
+    # this diff and I am willing to run it here"; that is the point, since
+    # reviewing a contributor's change before merging it is what the GPU run
+    # is for. Pair it with Settings > Actions > "Require approval for all
+    # outside collaborators" for a second, GitHub-native gate.
+    #
     # Specific labels win over the plain gpu-ci one, so carrying both does
     # not silently downgrade the run to core.
     if   has_label gpu-ci-all;     then profile=all

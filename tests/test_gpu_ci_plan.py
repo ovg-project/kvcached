@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import pytest
 
@@ -29,7 +29,6 @@ def resolve(
     tmp_path: Path,
     event: str,
     labels: str = "",
-    same_repo: str = "true",
     dispatch_profile: str = "",
     dispatch_devices: str = "",
     single_devices: str = "0",
@@ -43,7 +42,6 @@ def resolve(
         {
             "EVENT": event,
             "LABELS": labels,
-            "SAME_REPO": same_repo,
             "DISPATCH_PROFILE": dispatch_profile,
             "DISPATCH_DEVICES": dispatch_devices,
             "SINGLE_DEVICES": single_devices,
@@ -110,12 +108,18 @@ def test_no_labels_do_not_run(tmp_path):
     assert resolve(tmp_path, "pull_request")["run"] == "false"
 
 
-def test_fork_pull_request_never_reaches_the_runner(tmp_path):
-    plan = resolve(
-        tmp_path, "pull_request", labels="gpu-ci-all", same_repo="false"
-    )
-    assert plan["run"] == "false"
-    assert "fork pull request" in plan["_stdout"]
+def test_a_labelled_pull_request_runs_whoever_it_came_from(tmp_path):
+    """The label is the gate, including for a fork.
+
+    Reviewing a contributor's change before merging it is the main reason
+    the GPU run exists, and contributors here work from forks. GitHub
+    withholds secrets and issues a read-only token for a fork's
+    pull_request, so applying the label accepts code execution on the
+    runner and nothing wider.
+    """
+    plan = resolve(tmp_path, "pull_request", labels="gpu-ci-all")
+    assert plan["run"] == "true"
+    assert plan["profile"] == "all"
 
 
 def test_dispatch_uses_its_input(tmp_path):
