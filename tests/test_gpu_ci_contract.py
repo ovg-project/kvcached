@@ -79,15 +79,19 @@ def test_skip_core_is_boolean(tmp_path):
     assert "GPU_CI_SKIP_CORE must be 0 or 1" in completed.stdout
 
 
-def test_profiles_require_exact_selected_gpu_count(tmp_path):
+def test_profiles_select_required_gpus_from_runner_pool(tmp_path):
     completed = run_preflight(tmp_path, "core", visible_devices="0,1")
-    assert completed.returncode == 2
-    assert "requires exactly 1 selected GPU" in completed.stdout
+    assert completed.returncode == 0
+    assert "devices=0" in completed.stdout
+
+    completed = run_preflight(tmp_path, "all", visible_devices="0,1,2")
+    assert completed.returncode == 0
+    assert "devices=0,1" in completed.stdout
 
     for profile in ("nixl", "all"):
         completed = run_preflight(tmp_path, profile, visible_devices="0")
         assert completed.returncode == 2
-        assert "requires exactly 2 selected GPU" in completed.stdout
+        assert "requires at least 2 selected GPU" in completed.stdout
 
 
 def test_device_selection_rejects_invalid_or_duplicate_ids(tmp_path):

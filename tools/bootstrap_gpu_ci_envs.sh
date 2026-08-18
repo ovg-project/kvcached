@@ -126,6 +126,7 @@ done
 
 echo "GPU CI environments are ready in ${ENV_ROOT}"
 echo "Append these lines to the runner's .env (usually ~/actions-runner/.env),"
-echo "add a CUDA_VISIBLE_DEVICES line naming this host's GPUs, and restart the"
-echo "runner service -- .env is read once at startup:"
+echo "add a CUDA_VISIBLE_DEVICES line naming the GPUs reserved for this runner,"
+echo "then restart the runner service -- .env is read once at startup. Profiles"
+echo "select the first one or two GPUs from that pool:"
 cat "${ENV_ROOT}/runner.env"

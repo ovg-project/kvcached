@@ -58,19 +58,24 @@ if [[ ! "${KVCACHED_GPU_VISIBLE_DEVICES}" =~ ^[^,[:space:]]+(,[^,[:space:]]+)*$ 
   echo "GPU device selection must be a comma-separated list without spaces" >&2
   exit 2
 fi
-IFS=',' read -r -a SELECTED_GPU_IDS <<< "${KVCACHED_GPU_VISIBLE_DEVICES}"
-if [[ "${#SELECTED_GPU_IDS[@]}" -ne "${EXPECTED_GPU_COUNT}" ]]; then
-  echo "Profile '${GPU_CI_PROFILE}' requires exactly ${EXPECTED_GPU_COUNT} selected GPU(s); got ${#SELECTED_GPU_IDS[@]}" >&2
-  exit 2
-fi
-for ((i = 0; i < ${#SELECTED_GPU_IDS[@]}; i++)); do
-  for ((j = i + 1; j < ${#SELECTED_GPU_IDS[@]}; j++)); do
-    if [[ "${SELECTED_GPU_IDS[i]}" == "${SELECTED_GPU_IDS[j]}" ]]; then
-      echo "GPU device selection contains duplicate ID '${SELECTED_GPU_IDS[i]}'" >&2
+IFS=',' read -r -a AVAILABLE_GPU_IDS <<< "${KVCACHED_GPU_VISIBLE_DEVICES}"
+for ((i = 0; i < ${#AVAILABLE_GPU_IDS[@]}; i++)); do
+  for ((j = i + 1; j < ${#AVAILABLE_GPU_IDS[@]}; j++)); do
+    if [[ "${AVAILABLE_GPU_IDS[i]}" == "${AVAILABLE_GPU_IDS[j]}" ]]; then
+      echo "GPU device selection contains duplicate ID '${AVAILABLE_GPU_IDS[i]}'" >&2
       exit 2
     fi
   done
 done
+if [[ "${#AVAILABLE_GPU_IDS[@]}" -lt "${EXPECTED_GPU_COUNT}" ]]; then
+  echo "Profile '${GPU_CI_PROFILE}' requires at least ${EXPECTED_GPU_COUNT} selected GPU(s); got ${#AVAILABLE_GPU_IDS[@]}" >&2
+  exit 2
+fi
+
+# CUDA_VISIBLE_DEVICES names the pool reserved for this runner. Profiles use
+# only the first device unless they exercise the two-GPU NIXL path.
+SELECTED_GPU_IDS=("${AVAILABLE_GPU_IDS[@]:0:${EXPECTED_GPU_COUNT}}")
+KVCACHED_GPU_VISIBLE_DEVICES="$(IFS=,; echo "${SELECTED_GPU_IDS[*]}")"
 export KVCACHED_GPU_VISIBLE_DEVICES
 export CUDA_VISIBLE_DEVICES="${KVCACHED_GPU_VISIBLE_DEVICES}"
 
