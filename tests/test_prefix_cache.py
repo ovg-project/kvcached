@@ -117,6 +117,22 @@ class MockRequest:
         self.block_hashes = block_hashes
 
 
+class MockBlockHashListWithBlockSize:
+    def __init__(self, block_hashes, hash_block_size, target_block_size):
+        assert target_block_size % hash_block_size == 0
+        self.block_hashes = block_hashes
+        self.scale_factor = target_block_size // hash_block_size
+
+    def __len__(self):
+        return len(self.block_hashes) // self.scale_factor
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        return self.block_hashes[(index + 1) * self.scale_factor - 1]
+
+
 def test_set_block_hash_supports_legacy_writable_property():
     """vLLM before 0.24 uses a writable block_hash property."""
     from kvcached.integration.vllm.patches import _set_block_hash
@@ -134,7 +150,7 @@ def test_set_block_hash_supports_legacy_writable_property():
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def pool_factory():
+def pool_factory(monkeypatch):
     """Factory that builds an ElasticBlockPool with a given number of blocks.
 
     Returns (pool, manager) so tests can inspect both.
@@ -142,6 +158,16 @@ def pool_factory():
 
     def _make(num_blocks: int = 100, enable_caching: bool = True):
         manager = MockKVCacheManager(num_blocks)
+
+        kv_cache_utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+        setattr(
+            kv_cache_utils,
+            "BlockHashListWithBlockSize",
+            MockBlockHashListWithBlockSize,
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm.v1.core.kv_cache_utils", kv_cache_utils
+        )
 
         # Build a mock module that looks like vllm.v1.core.block_pool
         mock_mod = types.ModuleType("mock_block_pool")
@@ -559,6 +585,76 @@ class TestEdgeCases:
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         assert len(pool._cached_blocks) == 2
+
+    def test_heterogeneous_block_size_uses_final_fine_grained_hash(
+        self, pool_and_manager, monkeypatch
+    ):
+        """A 64-token block uses the final hash from its four 16-token chunks."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest([f"h{i}" for i in range(8)])
+
+        kv_cache_utils = sys.modules["vllm.v1.core.kv_cache_utils"]
+        converter = mock.Mock(side_effect=MockBlockHashListWithBlockSize)
+        monkeypatch.setattr(
+            kv_cache_utils, "BlockHashListWithBlockSize", converter
+        )
+
+        pool.cache_full_blocks(req, blocks, 0, 2, 64, 1)
+
+        converter.assert_called_once_with(req.block_hashes, 16, 64)
+        assert pool.get_cached_block("h0", [1]) is None
+        assert pool.get_cached_block("h1", [1]) is None
+        assert pool.get_cached_block("h3", [1]) == [blocks[0]]
+        assert pool.get_cached_block("h7", [1]) == [blocks[1]]
+
+    def test_heterogeneous_block_size_conversion_respects_cached_offset(
+        self, pool_and_manager
+    ):
+        """Incremental caching indexes the converted hash list by physical block."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest([f"h{i}" for i in range(8)])
+
+        pool.cache_full_blocks(req, blocks, 0, 1, 64, 1)
+        pool.cache_full_blocks(req, blocks, 1, 2, 64, 1)
+
+        assert pool.get_cached_block("h3", [1]) == [blocks[0]]
+        assert pool.get_cached_block("h7", [1]) == [blocks[1]]
+
+    def test_heterogeneous_block_size_requires_vllm_converter(
+        self, pool_and_manager, monkeypatch
+    ):
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(1)
+        req = MockRequest([f"h{i}" for i in range(4)])
+
+        kv_cache_utils = sys.modules["vllm.v1.core.kv_cache_utils"]
+        monkeypatch.delattr(kv_cache_utils, "BlockHashListWithBlockSize")
+
+        with pytest.raises(
+            RuntimeError, match="does not support heterogeneous block-hash conversion"
+        ):
+            pool.cache_full_blocks(req, blocks, 0, 1, 64, 1)
+
+    def test_cache_full_blocks_honors_block_mask(self, pool_and_manager):
+        """Masked physical blocks must not become reusable prefix entries."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest(["h0", "h1"])
+
+        pool.cache_full_blocks(
+            request=req,
+            blocks=blocks,
+            num_cached_blocks=0,
+            num_full_blocks=2,
+            block_size=16,
+            kv_cache_group_id=0,
+            block_mask=[False, True],
+        )
+
+        assert pool.get_cached_block("h0", [0]) is None
+        assert pool.get_cached_block("h1", [0]) == [blocks[1]]
 
     def test_duplicate_hashes_keep_each_block_metadata(self, pool_and_manager):
         """Concurrent requests may materialize the same prefix twice."""
