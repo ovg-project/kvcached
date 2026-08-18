@@ -102,16 +102,24 @@ for requested in ${GPU_CI_ENVS}; do
   esac
 done
 
+# These interpreters belong to this machine, so they go in the runner's own
+# .env rather than in a repository variable: GitHub delivers neither secrets
+# nor repository variables to a workflow triggered by a pull request from a
+# fork, and reviewing a fork's change before merging it is what the GPU run is
+# for. The names below are the ones run_gpu_ci.sh reads.
+#
 # Report every environment that exists, not only the ones built just now, so a
-# host provisioned in stages still gets a complete variable list.
-: >"${ENV_ROOT}/github-actions.env"
+# host provisioned in stages still gets a complete list.
+: >"${ENV_ROOT}/runner.env"
 [[ -x "${ENV_ROOT}/core/bin/python" ]] &&
-  echo "KVCACHED_GPU_PYTHON=${ENV_ROOT}/core/bin/python" >>"${ENV_ROOT}/github-actions.env"
+  echo "PYTHON=${ENV_ROOT}/core/bin/python" >>"${ENV_ROOT}/runner.env"
 [[ -x "${ENV_ROOT}/vllm/bin/python" ]] &&
-  echo "KVCACHED_VLLM_PYTHON=${ENV_ROOT}/vllm/bin/python" >>"${ENV_ROOT}/github-actions.env"
+  echo "VLLM_PYTHON=${ENV_ROOT}/vllm/bin/python" >>"${ENV_ROOT}/runner.env"
 [[ -x "${ENV_ROOT}/sglang/bin/python" ]] &&
-  echo "KVCACHED_SGLANG_PYTHON=${ENV_ROOT}/sglang/bin/python" >>"${ENV_ROOT}/github-actions.env"
+  echo "SGLANG_PYTHON=${ENV_ROOT}/sglang/bin/python" >>"${ENV_ROOT}/runner.env"
 
 echo "GPU CI environments are ready in ${ENV_ROOT}"
-echo "Set the repository variables to:"
-cat "${ENV_ROOT}/github-actions.env"
+echo "Append these lines to the runner's .env (usually ~/actions-runner/.env),"
+echo "add a CUDA_VISIBLE_DEVICES line naming this host's GPUs, and restart the"
+echo "runner service -- .env is read once at startup:"
+cat "${ENV_ROOT}/runner.env"

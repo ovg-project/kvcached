@@ -17,9 +17,11 @@ def test_bootstrap_uses_three_isolated_environments():
 
     for name in ("core", "vllm", "sglang"):
         assert f"create_env {name} " in source
-    assert "KVCACHED_GPU_PYTHON=" in source
-    assert "KVCACHED_VLLM_PYTHON=" in source
-    assert "KVCACHED_SGLANG_PYTHON=" in source
+    # The emitted names must be the ones run_gpu_ci.sh reads, because a host
+    # pastes them straight into the runner's .env.
+    assert "PYTHON=" in source
+    assert "VLLM_PYTHON=" in source
+    assert "SGLANG_PYTHON=" in source
     assert "pip check" in source
 
 
