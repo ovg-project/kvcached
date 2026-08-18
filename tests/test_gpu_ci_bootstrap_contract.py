@@ -25,12 +25,30 @@ def test_bootstrap_uses_three_isolated_environments():
 
 def test_bootstrap_can_provision_a_subset(tmp_path):
     """A host that only runs the core profile should not have to download the
-    two engine environments, which pull their own PyTorch each."""
+    two engine environments, which pull their own PyTorch each.
+
+    The preflight demands a GPU toolchain, which a hosted runner has none of,
+    so stand in for the three commands it looks for. Skipping instead would
+    leave this untested exactly where it runs.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in (
+        ("nvidia-smi", "#!/bin/sh\nexit 0\n"),
+        ("nvcc", "#!/bin/sh\nexit 0\n"),
+        ("c++", '#!/bin/sh\n[ "$1" = -dumpversion ] && echo 13 || exit 0\n'),
+    ):
+        path = fake_bin / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
     env = os.environ.copy()
     env.update({
         "CHECK_ONLY": "1",
         "GPU_CI_ENVS": "core",
         "BASE_PYTHON": sys.executable,
+        "CXX": str(fake_bin / "c++"),
+        "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
     })
     completed = subprocess.run(
         ["bash", str(SCRIPT)], cwd=ROOT, env=env, text=True,

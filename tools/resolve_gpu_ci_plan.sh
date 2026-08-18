@@ -10,22 +10,20 @@
 #   EVENT             schedule | workflow_dispatch | pull_request
 #   LABELS            space-separated pull request label names
 #   DISPATCH_PROFILE  the workflow_dispatch profile input
-#   DISPATCH_DEVICES  the workflow_dispatch devices input
-#   SINGLE_DEVICES    device selection for the one-GPU profiles
-#   DUAL_DEVICES      device selection for nixl and all
 #   MIN_MERGES        commits that must land before a scheduled slot is spent
 #   GH_TOKEN          token for the workflow-runs query (schedule only)
 #
-# Writes `run`, and on a run also `profile` and `devices`, to GITHUB_OUTPUT.
+# Writes `run`, and on a run also `profile`, to GITHUB_OUTPUT.
+#
+# Device selection is deliberately absent: which GPUs exist belongs to the
+# host, and this job runs on a hosted runner that cannot see it. The runner's
+# own .env supplies CUDA_VISIBLE_DEVICES, which run_gpu_ci.sh reads.
 
 set -euo pipefail
 
 EVENT="${EVENT:-}"
 LABELS="${LABELS:-}"
 DISPATCH_PROFILE="${DISPATCH_PROFILE:-}"
-DISPATCH_DEVICES="${DISPATCH_DEVICES:-}"
-SINGLE_DEVICES="${SINGLE_DEVICES:-}"
-DUAL_DEVICES="${DUAL_DEVICES:-}"
 MIN_MERGES="${MIN_MERGES:-5}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 
@@ -100,17 +98,6 @@ if [[ "${EVENT}" == "schedule" ]]; then
   fi
 fi
 
-# nixl and all drive a two-GPU prefill/decode transfer.
-case "${profile}" in
-  nixl|all) devices="${DISPATCH_DEVICES:-${DUAL_DEVICES}}" ;;
-  *)        devices="${DISPATCH_DEVICES:-${SINGLE_DEVICES}}" ;;
-esac
-if [[ -z "${devices}" ]]; then
-  echo "no GPU device selection is configured for profile ${profile}" >&2
-  echo "set KVCACHED_GPU_VISIBLE_DEVICES, or KVCACHED_GPU_DUAL_DEVICES for nixl and all" >&2
-  exit 1
-fi
 
 echo "profile=${profile}"
-echo "devices=${devices}"
-emit "run=true" "profile=${profile}" "devices=${devices}"
+emit "run=true" "profile=${profile}"

@@ -30,9 +30,6 @@ def resolve(
     event: str,
     labels: str = "",
     dispatch_profile: str = "",
-    dispatch_devices: str = "",
-    single_devices: str = "0",
-    dual_devices: str = "0,1",
 ) -> Dict[str, str]:
     """Run the script and return what it wrote to GITHUB_OUTPUT."""
     output = tmp_path / "github_output"
@@ -43,9 +40,6 @@ def resolve(
             "EVENT": event,
             "LABELS": labels,
             "DISPATCH_PROFILE": dispatch_profile,
-            "DISPATCH_DEVICES": dispatch_devices,
-            "SINGLE_DEVICES": single_devices,
-            "DUAL_DEVICES": dual_devices,
             "GITHUB_OUTPUT": str(output),
         }
     )
@@ -131,40 +125,10 @@ def test_dispatch_without_an_input_falls_back_to_core(tmp_path):
     assert resolve(tmp_path, "workflow_dispatch")["profile"] == "core"
 
 
-def test_dispatch_devices_override_the_repository_variables(tmp_path):
-    plan = resolve(
-        tmp_path,
-        "workflow_dispatch",
-        dispatch_profile="nixl",
-        dispatch_devices="4,5",
-    )
-    assert plan["devices"] == "4,5"
 
 
-@pytest.mark.parametrize(
-    ("labels", "devices"),
-    [
-        ("gpu-ci", "0"),
-        ("gpu-ci-vllm", "0"),
-        ("gpu-ci-engines", "0"),
-        ("gpu-ci-nixl", "0,1"),
-        ("gpu-ci-all", "0,1"),
-    ],
-)
-def test_two_gpu_profiles_take_the_dual_device_variable(
-    tmp_path, labels, devices
-):
-    assert resolve(tmp_path, "pull_request", labels=labels)["devices"] == devices
 
 
-@pytest.mark.parametrize("labels", ["gpu-ci-nixl", "gpu-ci-all"])
-def test_missing_dual_device_variable_fails_before_the_gpu_is_taken(
-    tmp_path, labels
-):
-    plan = resolve(tmp_path, "pull_request", labels=labels, dual_devices="")
-    assert plan["_returncode"] == "1"
-    assert "KVCACHED_GPU_DUAL_DEVICES" in plan["_stdout"]
-    assert plan.get("run") != "true"
 
 
 def test_unsupported_event_is_rejected(tmp_path):
