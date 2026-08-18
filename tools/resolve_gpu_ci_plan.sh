@@ -50,14 +50,19 @@ case "${EVENT}" in
     ;;
   pull_request)
     # The label is the only gate, and it is deliberately the only one: a
-    # fork's code runs on the self-hosted machine once someone with write or
+    # fork's code runs on the registered host once someone with write or
     # triage permission asks for it. GitHub withholds secrets and issues a
     # read-only token for a fork's pull_request, so the exposure is code
-    # execution on the runner, nothing else. Applying the label means "I read
-    # this diff and I am willing to run it here"; that is the point, since
-    # reviewing a contributor's change before merging it is what the GPU run
-    # is for. Pair it with Settings > Actions > "Require approval for all
-    # outside collaborators" for a second, GitHub-native gate.
+    # execution on that host, nothing else. Reviewing a contributor's change
+    # before merging it is what the GPU run is for, and the contributors here
+    # work from forks, so a same-repository check would rule out the case
+    # that matters.
+    #
+    # This assumes the owner of the registered host has accepted that policy,
+    # because the person applying the label is not necessarily that owner.
+    # Whoever registers the runner should agree to it first, and can add a
+    # second gate with Settings > Actions > "Require approval for all outside
+    # collaborators".
     #
     # Specific labels win over the plain gpu-ci one, so carrying both does
     # not silently downgrade the run to core.
