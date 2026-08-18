@@ -14,7 +14,9 @@ MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-}"
 PYTHON="${PYTHON:-python}"
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-360}"
+# Measured ~250s for vLLM to serve this model on a warm FlashInfer JIT
+# cache; a cold cache compiles kernels first, so leave real headroom.
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-900}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/gpu-ci-artifacts}"
@@ -122,6 +124,14 @@ trap cleanup EXIT INT TERM
 
 snapshot_gpu_pids "${GPU_PIDS_BEFORE}"
 
+# This script runs from the repository root and launches the server with
+# `python -m`, which puts the working directory first on sys.path. The source
+# tree would then shadow the installed kvcached -- and the source tree carries
+# no compiled extension, so the engine dies at
+# `ModuleNotFoundError: No module named 'kvcached.vmm_ops'`. Keep the installed
+# package in front. run_gpu_ci.sh does the same for the pytest run.
+export PYTHONSAFEPATH=1
+
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
 export VLLM_USE_V1=1
@@ -186,13 +196,14 @@ import urllib.request
 
 payload = {
     "model": os.environ["MODEL"],
-    "prompt": (
-        "France is a country in Western Europe. "
-        "Question: What is the capital of France? "
-        "Answer with only the city name."
-    ),
+    # A plain continuation, not an instruction. /v1/completions applies no
+    # chat template, and a reasoning-tuned model answers an instruction by
+    # opening "<think>" and spending far more than a smoke test's budget
+    # before naming the city. Greedy decoding on this prefix puts the answer
+    # in the first token or two on both engines.
+    "prompt": "The capital of France is",
     "temperature": 0,
-    "max_tokens": 8,
+    "max_tokens": 16,
 }
 request = urllib.request.Request(
     f"http://{os.environ['HOST']}:{os.environ['PORT']}/v1/completions",

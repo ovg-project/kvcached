@@ -99,3 +99,14 @@ def test_engine_server_uses_and_cleans_a_dedicated_process_group():
     assert 'kill -TERM -- "-${SERVER_PID}"' in source
     assert 'kill -KILL -- "-${SERVER_PID}"' in source
     assert "introduced_gpu_pids" in source
+
+
+def test_the_server_is_launched_against_the_installed_kvcached():
+    """`python -m` from the repository root shadows the installed package.
+
+    The source tree has no compiled extension, so both engines died at
+    `ModuleNotFoundError: No module named 'kvcached.vmm_ops'` before this was
+    set -- a failure that only shows up when the smoke test is actually run.
+    """
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "export PYTHONSAFEPATH=1" in source
