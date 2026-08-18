@@ -8,7 +8,7 @@ Mamba GDN per-block state), ``InternalPage.get_block_range`` — which
 ``get_page_occupancy`` already uses — drops blocks straddling the page
 boundary. Some page ids therefore yield *zero* usable blocks while
 ``InternalPage.get_num_blocks`` reports one or more. The 0-block pages are
-parked in ``full_pages`` (kv_cache_manager.py:310) but were still counted by
+parked in ``full_pages`` (kv_cache_manager.py:335) but were still counted by
 the old ``len(self.full_pages) * get_num_blocks(...)`` in
 ``_get_num_alloced_blocks``, inflating the lazy-shrink completion gate
 ``_get_num_alloced_blocks() <= target_num_blocks`` and stalling the
@@ -32,7 +32,7 @@ import pytest
 
 
 class RichInternalPage:
-    """Mirror of the REAL InternalPage statics (csrc/page_allocator.cpp:90-103)
+    """Mirror of the REAL InternalPage static methods (csrc/page_allocator.cpp:90-103)
     so ``_page_capacity`` resolves to boundary-aware math without the compiled
     extension or a GPU."""
 
@@ -52,7 +52,7 @@ def _install_fake_vmm_ops():
     """Register a minimal fake ``kvcached.vmm_ops`` so ``kv_cache_manager``'s
     hard import succeeds without the compiled CUDA/HIP extension. Only the
     PageAllocator / kv_tensors entrypoints are needed for import; the
-    per-page statics are supplied by ``RichInternalPage`` via the autouse
+    per-page static methods are supplied by ``RichInternalPage`` via the autouse
     fixture below, so this stub's InternalPage is only a fallback for the
     very first import (before any other cpu test has stubbed it)."""
 
@@ -73,10 +73,9 @@ try:
 except Exception:  # noqa: BLE001 - any import failure means no GPU build
     _install_fake_vmm_ops()
 
+import kvcached.kv_cache_manager as _kcm  # noqa: E402
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
-
-import kvcached.kv_cache_manager as _kcm  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

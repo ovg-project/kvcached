@@ -63,7 +63,7 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int) -> int:
     ``page_size // block_mem_size`` that ``InternalPage.get_num_blocks``
     returns. When ``block_mem_size`` does not evenly divide ``page_size``
     (e.g. HYBRID_LINEAR / Mamba GDN per-block state — the case the
-    ``_alloc`` 0-usable-block parking comment at kv_cache_manager.py:310
+    ``_alloc`` 0-usable-block parking comment at kv_cache_manager.py:335
     names), some page ids yield *zero* usable blocks while
     ``get_num_blocks`` reports one or more; counting those pages with
     ``get_num_blocks`` inflates both ``available_size`` and the
@@ -530,7 +530,7 @@ class KVCacheManager:
             # so this term can't use the boundary-aware _page_capacity
             # (capacity depends on page_id; some ids yield zero usable blocks
             # when block_mem_size does not divide page_size — see _alloc's
-            # 0-block parking at kv_cache_manager.py:310). get_num_blocks is
+            # 0-block parking at kv_cache_manager.py:335). get_num_blocks is
             # the theoretical page_size // block_mem_size, so this is an UPPER
             # BOUND; the precise accounting in _get_num_alloced_blocks and
             # get_page_occupancy uses _page_capacity / get_block_range. A
@@ -665,7 +665,7 @@ class KVCacheManager:
         # Blocks from fully allocated pages. Capacity is per-page-id because
         # blocks straddling a page boundary belong to neither page (see
         # get_page_occupancy); a parked 0-block page (the _alloc branch at
-        # kv_cache_manager.py:310) contributes nothing here, whereas the
+        # kv_cache_manager.py:335) contributes nothing here, whereas the
         # previous len(self.full_pages) * get_num_blocks(...) inflated it.
         blocks_from_full_pages = sum(
             _page_capacity(page_id, self.page_size, self.block_mem_size)
