@@ -1,16 +1,21 @@
-# GPU CI first delivery
+# GPU CI overview
 
-This delivery turns kvcached GPU testing into a repository-owned workflow.
-It can run on any persistent Linux x86-64 NVIDIA GPU host and does not depend
-on a particular cloud, university cluster, scheduler, or private service.
+kvcached GPU testing is a repository-owned workflow. It can run on any
+persistent Linux x86-64 NVIDIA GPU host and does not depend on a particular
+cloud, university cluster, scheduler, or private service. For setup, see
+[GPU CI runner setup](GPU_CI_RUNNER.md).
 
 ## Included
 
-- Daily and manually dispatched GitHub Actions workflow.
-- Safe opt-in GPU testing for same-repository pull requests.
-- Core allocator, vLLM, SGLang, combined-engine, and two-GPU NIXL profiles.
+- Scheduled and manually dispatched GitHub Actions workflow.
+- Opt-in GPU testing for any pull request, including from a fork, gated on a
+  label only someone with write or triage permission can apply.
+- Core allocator, vLLM, SGLang, combined-engine, two-GPU NIXL, and `all`
+  profiles.
+- The GPU pytest set read from `tests/manifests/gpu.txt` at run time, so a
+  newly classified GPU test is covered without editing the script.
 - Separate Python environments and extension builds for core, vLLM, and
-  SGLang.
+  SGLang, each optional at provisioning time.
 - One-command environment provisioning with dependency checks.
 - Host-wide locking and idle-GPU protection.
 - Deterministic correctness requests for both serving engines.
@@ -21,44 +26,20 @@ on a particular cloud, university cluster, scheduler, or private service.
 
 ## Validated
 
-The core profile was validated on one NVIDIA H20:
-
-- 36 tests passed per run;
-- five complete runs passed consecutively;
-- 180 consecutive test executions passed;
-- the resize regression was restored and passed;
-- a container linker issue was converted into a portable CUDA-stub fix.
-
-The public vLLM/NIXL prefill-decode harness was separately validated on two
+The core profile was validated by the original author on one NVIDIA H20 over
+five consecutive runs, and the public vLLM/NIXL prefill-decode harness on two
 NVIDIA H20 GPUs, both with and without kvcached.
 
-## Deploy
+The label-triggered path was validated end to end on an NVIDIA A100: a labelled
+fork pull request planned the `core` profile and ran the full GPU pytest set on
+the registered host.
 
-On the persistent GPU host:
-
-```bash
-git clone --branch zixuan/gpu-ci-runner \
-  https://github.com/Lanoxia/kvcached.git
-cd kvcached
-bash tools/bootstrap_gpu_ci_envs.sh
-```
-
-After this delivery is merged, use the OVG repository's default branch
-instead.
-
-Register the host as a GitHub Actions runner with these labels:
-
-```text
-self-hosted, linux, x64, gpu, kvcached
-```
-
-Set the three repository variables printed by the bootstrap command, then
-start **Actions > GPU Tests > Run workflow** with the `core` profile. The
-daily `engines` profile runs automatically at the configured UTC cron time.
+## Deployment choices
 
 The deployment owner only chooses:
 
 1. which persistent GPU host to register;
 2. whether one or two GPUs are exposed to the runner;
-3. the preferred daily UTC execution time;
+3. the preferred UTC execution time for the scheduled slot, and how many
+   merges must accumulate before that slot is spent;
 4. an optional Hugging Face token when a gated model is selected.
