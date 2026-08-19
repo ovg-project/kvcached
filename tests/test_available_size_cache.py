@@ -18,7 +18,6 @@ import sys
 import threading
 import time
 import types
-from typing import List
 
 BLOCKS_PER_PAGE = 4
 
