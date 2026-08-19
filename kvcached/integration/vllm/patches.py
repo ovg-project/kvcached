@@ -844,7 +844,13 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def free_blocks(
                 self,
                 ordered_blocks: Iterable[KVCacheBlock],
+                prepend: bool = False,
             ) -> None:
+                # vLLM >= 0.23 passes ``prepend`` to put freed blocks at the
+                # front of its free queue for reuse priority. kvcached has no
+                # linear free queue: reuse order is governed by
+                # KVCacheManager's page-affine allocation, so the hint is
+                # accepted for signature compatibility and unused (#438).
                 if not self.enable_prefix_cache:
                     block_ids = [
                         block.block_id

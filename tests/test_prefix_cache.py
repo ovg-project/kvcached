@@ -716,6 +716,33 @@ class TestEdgeCases:
         assert len(pool._evictable_blocks) == 2
         assert mgr.available_size() == initial_free - 2  # 2 held by pool
 
+    def test_free_blocks_accepts_prepend_kwarg(self, pool_and_manager):
+        """vLLM >= 0.23 calls free_blocks(..., prepend=...); must not raise
+        and must free identically for both values (#438)."""
+        pool, mgr = pool_and_manager
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=False)
+        assert mgr.available_size() == initial_free
+
+    def test_free_blocks_prepend_with_caching_disabled(self, pool_factory):
+        """The caching-disabled fast path must accept prepend too (#438)."""
+        pool, mgr = pool_factory(enable_caching=False)
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(3)
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
     def test_get_usage(self, pool_factory):
         """get_usage reflects the fraction of blocks in use."""
         pool, mgr = pool_factory(100)
