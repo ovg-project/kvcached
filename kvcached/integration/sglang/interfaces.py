@@ -453,12 +453,15 @@ def get_kv_cache_manager(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
+    # Each SGLang TP worker owns and drives its local pool. Keep the real TP
+    # world size in init_kvcached() for rank-aware IPC listener setup, but do
+    # not broadcast this worker's local map/unmap operations to its peers.
     manager = KVCacheManager(
         num_blocks,
         block_size,
         cell_size,
         num_layers,
-        world_size=_world_size,
+        world_size=1,
         pp_rank=_pp_rank,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
