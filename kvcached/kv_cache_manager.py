@@ -158,11 +158,21 @@ class KVCacheManager:
                 )
 
                 # Wrap Python functions to match C++ callback signature
-                def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                def map_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
 
-                def unmap_callback(world_size: int, offsets: List[int]) -> None:
+                def unmap_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
 
@@ -216,10 +226,19 @@ class KVCacheManager:
 
         try:
             total_wait = 0.0
-            while not _check_kv_tensors_created():
+            last_error: Exception | None = None
+            while True:
+                try:
+                    if _check_kv_tensors_created():
+                        break
+                except Exception as e:
+                    last_error = e
                 if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
-                    raise TimeoutError("KV tensors not created after "
-                                       f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    message = ("KV tensors not created after "
+                               f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    if last_error is not None:
+                        message = f"{message}; last error: {last_error}"
+                    raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
             # KV tensors created now

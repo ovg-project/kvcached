@@ -76,13 +76,16 @@ def test_engine_core_records_tp_world_size_before_original_init(
     assert patches.EngineCorePatch().patch_engine_init(engine_mod)
 
     config = types.SimpleNamespace(
-        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=4, pipeline_parallel_size=1
+        )
     )
     engine_mod.EngineCore(config)
 
     init_kvcached.assert_called_once_with(
         tp_rank=0,
         world_size=4,
+        pp_rank=0,
         is_worker=False,
         async_sched=True,
     )
@@ -110,7 +113,9 @@ def test_engine_core_propagates_kvcached_initialization_failure(
     assert patches.EngineCorePatch().patch_engine_init(engine_mod)
 
     config = types.SimpleNamespace(
-        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=4, pipeline_parallel_size=1
+        )
     )
     with pytest.raises(RuntimeError, match="failed to record TP state"):
         engine_mod.EngineCore(config)

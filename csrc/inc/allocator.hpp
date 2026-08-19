@@ -4,10 +4,13 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ATen/core/Tensor.h>
@@ -33,7 +36,13 @@ public:
                                             bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  std::pair<bool, std::vector<offset_t>>
+  map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                     const std::string &transaction_id);
+  bool commit_unmap_from_kv_tensors(const std::string &transaction_id);
+  bool abort_unmap_from_kv_tensors(const std::string &transaction_id);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -46,6 +55,19 @@ public:
   void destroy();
 
 private:
+  struct RetainedMapping {
+    FTensor *ftensor;
+    offset_t offset;
+    std::unique_ptr<Page> page;
+  };
+
+  struct PendingUnmapTransaction {
+    std::string id;
+    std::vector<RetainedMapping> retained;
+  };
+
+  enum class UnmapTransactionOutcome { COMMITTED, ABORTED };
+
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
   std::vector<at::Tensor>
@@ -59,6 +81,13 @@ private:
   at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
                              const std::string &dev_str, std::string name = "");
   void free_ftensor_(at::Tensor &ftensor);
+  std::vector<RetainedMapping>
+  unmap_retain_locked_(const std::vector<offset_t> &offsets);
+  void restore_retained_locked_(std::vector<RetainedMapping> &retained,
+                                const std::string &original_error);
+  void remember_unmap_outcome_locked_(const std::string &transaction_id,
+                                      UnmapTransactionOutcome outcome);
+  void reject_if_unmap_pending_locked_(const char *operation) const;
 
   // GPU VMM util functions.
   void init_gpu_();
@@ -84,6 +113,10 @@ private:
   // For contiguous layout: single tensor containing all layers
   std::unique_ptr<FTensor> contiguous_kv_tensor_;
   std::shared_ptr<Page> zero_page_;
+  std::optional<PendingUnmapTransaction> pending_unmap_;
+  std::unordered_map<std::string, UnmapTransactionOutcome>
+      finalized_unmap_transactions_;
+  std::deque<std::string> finalized_unmap_order_;
 };
 
 } // namespace kvcached
