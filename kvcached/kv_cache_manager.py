@@ -709,10 +709,10 @@ class KVCacheManager:
                 and now - self._avail_physical_pages_ts
                 < _AVAIL_PHYSICAL_PAGES_TTL_S):
             return cached
-        cached = self.page_allocator.get_avail_physical_pages()
-        self._avail_physical_pages_cache = cached
+        result: int = self.page_allocator.get_avail_physical_pages()
+        self._avail_physical_pages_cache = result
         self._avail_physical_pages_ts = now
-        return cached
+        return result
 
     @synchronized
     def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
