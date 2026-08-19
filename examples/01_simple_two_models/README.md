@@ -15,6 +15,7 @@ For vLLM:
 ```bash
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
+export KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=/dev/shm
 export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 vllm serve "${MODEL}" \
@@ -27,6 +28,7 @@ For SGLang:
 ```bash
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
+export KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=/dev/shm
 python3 -m sglang.launch_server --model "${MODEL}" \
   --disable-radix-cache \
   --trust-remote-code \
@@ -34,6 +36,11 @@ python3 -m sglang.launch_server --model "${MODEL}" \
 ```
 
 You might want to start the two engine servers in different terminals.
+
+`KVCACHED_PHYSICAL_GROWTH_LOCK_DIR` must resolve to the same shared filesystem
+directory for every process that can grow KV memory on the same physical GPU.
+For separate containers or pods, mount a shared directory at this path; using
+the same path string in isolated filesystems does not provide serialization.
 
 ### Testing by sending requests
 
