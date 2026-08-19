@@ -87,7 +87,7 @@ def make_manager() -> KVCacheManager:
     manager.num_avail_blocks = 0
     manager.avail_pages = {}
     manager.full_pages = {}
-    manager.reserved_blocks: List[int] = []
+    manager.reserved_blocks = []
     manager.null_block = None
     manager.in_shrink = False
     manager.target_num_blocks = None
