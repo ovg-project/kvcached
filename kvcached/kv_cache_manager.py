@@ -41,6 +41,12 @@ logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 
+# TTL for the cached get_avail_physical_pages() result in available_size().
+# Matches the C++ resize_watcher poll interval (csrc/page_allocator.cpp:838)
+# so physical-free-page staleness is bounded by the same 100 ms window the
+# allocator already tolerates for virtual-free-page polling.
+_AVAIL_PHYSICAL_PAGES_TTL_S: float = 0.1
+
 
 def synchronized(method):
     """
@@ -85,6 +91,12 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
 
 
 class KVCacheManager:
+    # Cached get_avail_physical_pages() result + its monotonic timestamp.
+    # Class-level defaults keep the no-__init__ test-stub pattern
+    # (tests/test_alloc_rollback.py) working without each stub knowing
+    # about the cache; available_size() re-fetches when the TTL elapses.
+    _avail_physical_pages_cache: Optional[int] = None
+    _avail_physical_pages_ts: float = 0.0
 
     def __init__(
         self,
@@ -231,6 +243,11 @@ class KVCacheManager:
         self._memory_limit_bytes: Optional[int] = None
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
+        # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
+        # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated on resize() and
+        # when in_shrink toggles so a resize/shrink is never served stale.
+        self._avail_physical_pages_cache: Optional[int] = None
+        self._avail_physical_pages_ts: float = 0.0
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -582,6 +599,10 @@ class KVCacheManager:
                 else:
                     if resized:
                         self.in_shrink = False
+                        # Exiting shrink: the resize above changed the physical
+                        # footprint and this toggle bypasses resize(), so drop the
+                        # cached value so available_size() re-reads the driver.
+                        self._avail_physical_pages_cache = None
                         self.target_num_blocks = None
                     else:
                         logger.warning(
@@ -618,6 +639,10 @@ class KVCacheManager:
         new_mem_size: the memory size of the K or V tensor in one layer
         """
         self._wait_post_init()
+        # resize() changes the physical footprint (and may toggle in_shrink);
+        # drop the cached avail-physical-pages so the next available_size()
+        # re-reads the driver instead of serving pre-resize data.
+        self._avail_physical_pages_cache = None
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
         try:
             resized = self.page_allocator.resize(new_mem_size)
@@ -744,8 +769,9 @@ class KVCacheManager:
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            physical_free_pages = self.page_allocator.get_avail_physical_pages(
-            ) + self.page_allocator.get_num_reserved_pages()
+            physical_free_pages = (
+                self._get_cached_avail_physical_pages()
+                + self.page_allocator.get_num_reserved_pages())
             free_pages = min(virtual_free_pages, physical_free_pages)
             # The allocator exposes only a COUNT of free pages, not their ids,
             # so this term can't use the boundary-aware _page_capacity
@@ -760,6 +786,29 @@ class KVCacheManager:
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
+
+    def _get_cached_avail_physical_pages(self) -> int:
+        """Return get_avail_physical_pages(), TTL-cached for available_size().
+
+        The underlying call fires cudaMemGetInfo (csrc/page_allocator.cpp:481)
+        on every available_size(), which runs per alloc
+        (kvcached/integration/vllm/patches.py:792) and per scheduler step
+        (:927); the TTL window collapses those to one driver read. The cache
+        is invalidated on resize() and when in_shrink toggles, so a
+        resize/shrink is never served stale physical-free data.
+        get_num_free_pages() and get_num_reserved_pages() stay uncached (cheap
+        / atomic). Called under available_size()'s @synchronized lock, so the
+        cache read/write here is already serialized.
+        """
+        now = time.monotonic()
+        cached = self._avail_physical_pages_cache
+        if (cached is None
+                or now - self._avail_physical_pages_ts
+                >= _AVAIL_PHYSICAL_PAGES_TTL_S):
+            cached = self.page_allocator.get_avail_physical_pages()
+            self._avail_physical_pages_cache = cached
+            self._avail_physical_pages_ts = now
+        return cached
 
     @synchronized
     def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
@@ -866,6 +915,9 @@ class KVCacheManager:
 
         self.target_num_blocks = None
         self.in_shrink = False
+        # clear() freed every page and trimmed; drop the cached value so
+        # the next available_size() re-reads the post-clear physical state.
+        self._avail_physical_pages_cache = None
         self.num_avail_blocks = 0
 
         # Possibly reserve the first block as null block for padding tokens
