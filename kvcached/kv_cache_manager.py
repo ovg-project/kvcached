@@ -705,12 +705,13 @@ class KVCacheManager:
         """
         now = time.monotonic()
         cached = self._avail_physical_pages_cache
-        if (cached is None
-                or now - self._avail_physical_pages_ts
-                >= _AVAIL_PHYSICAL_PAGES_TTL_S):
-            cached = self.page_allocator.get_avail_physical_pages()
-            self._avail_physical_pages_cache = cached
-            self._avail_physical_pages_ts = now
+        if (cached is not None
+                and now - self._avail_physical_pages_ts
+                < _AVAIL_PHYSICAL_PAGES_TTL_S):
+            return cached
+        cached = self.page_allocator.get_avail_physical_pages()
+        self._avail_physical_pages_cache = cached
+        self._avail_physical_pages_ts = now
         return cached
 
     @synchronized
