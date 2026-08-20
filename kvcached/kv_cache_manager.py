@@ -243,13 +243,87 @@ class KVCacheManager:
         """
         Reserve the first block as null block for padding tokens.
         """
-        if self.reserve_null_block:
-            self.null_block = self._alloc(1, _skip_wait=True)
-            if self.null_block != [0]:
-                logger.error(f"Failed to reserve null block, got {self.null_block}")
-                raise RuntimeError("Failed to reserve null block at index 0")
-        else:
+        if not self.reserve_null_block:
             self.null_block = None
+            return
+
+        wait_started = time.monotonic()
+        last_log_at = 0.0
+        last_reason: Optional[str] = None
+        loop_count = 0
+        alloc_attempts = 0
+
+        def _log_wait(reason: str, available_before: int) -> None:
+            nonlocal last_log_at, last_reason
+
+            now = time.monotonic()
+            if reason == last_reason and now - last_log_at < 10.0:
+                return
+
+            last_log_at = now
+            last_reason = reason
+            try:
+                allocator = self.page_allocator
+                allocator_state = (
+                    f"available_before={available_before}, "
+                    f"available_now={self.available_size()}, "
+                    f"num_avail_blocks={self.num_avail_blocks}, "
+                    f"reserved_blocks={len(self.reserved_blocks)}, "
+                    f"avail_pages={len(self.avail_pages)}, "
+                    "virtual_free_pages="
+                    f"{allocator.get_num_free_pages()}, "
+                    "physical_free_pages="
+                    f"{allocator.get_avail_physical_pages()}, "
+                    "reserved_physical_pages="
+                    f"{allocator.get_num_reserved_pages()}"
+                )
+            except Exception as exc:
+                # Diagnostics must never turn a recoverable capacity wait into
+                # a startup failure.
+                allocator_state = (
+                    f"available_before={available_before}, "
+                    f"state_snapshot_error={exc!r}"
+                )
+
+            logger.warning(
+                "Waiting for physical KV capacity to reserve null block: "
+                f"reason={reason}, elapsed={now - wait_started:.1f}s, "
+                f"loops={loop_count}, alloc_attempts={alloc_attempts}, "
+                f"group_id={getattr(self, 'group_id', None)}, "
+                f"pp_rank={getattr(self, 'pp_rank', None)}, "
+                f"{allocator_state}")
+
+        while True:
+            loop_count += 1
+            available_before = self.available_size()
+            if available_before < 1:
+                _log_wait("no_effective_capacity", available_before)
+                time.sleep(0.01)
+                continue
+
+            alloc_attempts += 1
+            null_block = self._alloc(1, _skip_wait=True)
+            if null_block is None:
+                # Another colocated engine may consume the last physical page
+                # between available_size() and alloc_page(), or alloc_page()
+                # may fail after the capacity check. Keep the engine alive and
+                # make the stalled startup state visible in pod logs.
+                _log_wait("alloc_returned_none_after_capacity_check",
+                          available_before)
+                time.sleep(0.01)
+                continue
+            if null_block != [0]:
+                logger.error(f"Failed to reserve null block, got {null_block}")
+                raise RuntimeError("Failed to reserve null block at index 0")
+
+            self.null_block = null_block
+            elapsed = time.monotonic() - wait_started
+            if loop_count > 1:
+                logger.info(
+                    "Reserved null block after waiting for physical KV "
+                    f"capacity: elapsed={elapsed:.1f}s, loops={loop_count}, "
+                    f"alloc_attempts={alloc_attempts}")
+            return
 
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
