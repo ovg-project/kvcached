@@ -452,6 +452,10 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
+                    # alloc_page() mapped a new physical page, shrinking the
+                    # driver's free pool; drop the cached count so the next
+                    # available_size() re-reads instead of serving stale data.
+                    self._avail_physical_pages_cache = None
                 except StateConsistencyError:
                     # Do not run further free/unmap operations on an unsafe pool.
                     raise
@@ -583,6 +587,9 @@ class KVCacheManager:
 
         if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
+            # free_pages() returned physical pages to the driver, growing the
+            # free pool; drop the cached count so available_size() re-reads.
+            self._avail_physical_pages_cache = None
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
@@ -901,6 +908,9 @@ class KVCacheManager:
             pages_to_free.append(page.page_id)
         if pages_to_free:
             self.page_allocator.free_pages(pages_to_free)
+            # free_pages() returned physical pages to the driver, growing the
+            # free pool; drop the cached count so available_size() re-reads.
+            self._avail_physical_pages_cache = None
         self.avail_pages.clear()
         self.full_pages.clear()
 
