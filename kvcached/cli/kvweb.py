@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -41,10 +41,12 @@ from kvcached.cli.utils import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
-#: Requests must carry this key when the variable is set. Passed as the
-#: ``X-API-Key`` header, or as an ``api_key`` query parameter for clients such
-#: as ``EventSource`` that cannot set headers.
+#: Requests must carry this key when the variable is set, as an ``X-API-Key``
+#: header. Only :data:`STREAM_PATH` also accepts it as an ``api_key`` query
+#: parameter, for clients such as ``EventSource`` that cannot set headers.
 API_KEY_ENV_VAR = "KVCACHED_WEB_API_KEY"
+
+STREAM_PATH = "/api/stream"
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -168,23 +170,26 @@ def get_all_status() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def require_api_key(
-    x_api_key: Optional[str] = Header(default=None),
-    api_key: Optional[str] = Query(
-        default=None,
-        description=f"Alternative to the X-API-Key header, for clients that "
-        f"cannot set headers. Only checked when {API_KEY_ENV_VAR} is set."),
-) -> None:
+def require_api_key(request: Request,
+                    x_api_key: Optional[str] = Header(default=None)) -> None:
     """Reject the request unless it carries the configured API key.
 
     A no-op when ``KVCACHED_WEB_API_KEY`` is unset, which keeps the default
     loopback-only deployment usable without any client-side setup.
+
+    Applied to the whole app rather than per route, so a route added later
+    cannot be left unauthenticated by accident.
     """
     expected = os.environ.get(API_KEY_ENV_VAR)
     if not expected:
         return
 
-    presented = x_api_key or api_key
+    presented = x_api_key
+    if presented is None and request.url.path == STREAM_PATH:
+        # EventSource cannot set headers. Query strings end up in access logs
+        # and proxy logs, so only the read-only stream accepts a key this way.
+        presented = request.query_params.get("api_key")
+
     if presented is None or not secrets.compare_digest(presented, expected):
         raise HTTPException(status_code=401,
                             detail="Missing or invalid API key")
@@ -239,6 +244,13 @@ def api_set_limit(name: str, req: LimitSizeRequest) -> Dict[str, Any]:
         size_bytes = parse_size(req.size)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OverflowError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"Size '{req.size}' is too large") from exc
+
+    if size_bytes < 0:
+        raise HTTPException(status_code=400,
+                            detail=f"Size must not be negative: '{req.size}'")
 
     # update_kv_cache_limit() takes a write lock, and RwLockedShm creates the
     # backing file when one is missing. Without this check a typo would leave
@@ -297,9 +309,15 @@ def api_delete_ipc(name: str) -> Dict[str, str]:
     return {"message": f"Deleted IPC segment '{clean_name}'"}
 
 
-@app.get("/api/stream", summary="Server-sent event stream of /api/status")
+@app.get(STREAM_PATH, summary="Server-sent event stream of /api/status")
 async def api_stream_status(
-        interval: float = Query(1.0, ge=0.2, le=10.0)) -> StreamingResponse:
+    interval: float = Query(1.0, ge=0.2, le=10.0),
+    # Consumed by require_api_key, declared here so that /docs shows it.
+    api_key: Optional[str] = Query(
+        default=None,
+        description=f"Alternative to the X-API-Key header, for clients that "
+        f"cannot set headers. Only checked when {API_KEY_ENV_VAR} is set."),
+) -> StreamingResponse:
 
     async def event_generator():
         while True:

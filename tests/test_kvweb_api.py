@@ -75,10 +75,24 @@ def test_set_limit_accepts_a_human_readable_size(client, segment):
                                                                        1024**2)
 
 
-def test_set_limit_rejects_an_unparsable_size(client, segment):
-    res = client.post(f"/api/ipcs/{segment}/limit", json={"size": "banana"})
+@pytest.mark.parametrize("size", ["dummy", "1e999G"])
+def test_set_limit_rejects_an_unusable_size(client, segment, size):
+    res = client.post(f"/api/ipcs/{segment}/limit", json={"size": size})
 
     assert res.status_code == 400
+
+
+def test_set_limit_rejects_a_negative_size(client, segment):
+    """A negative limit hides the segment instead of shrinking it.
+
+    total_size is a signed int64 and _detect_kvcache_ipc_names() skips
+    anything <= 0, so writing one would drop a live engine's segment out of
+    kvtop and out of this API.
+    """
+    res = client.post(f"/api/ipcs/{segment}/limit", json={"size": "-1G"})
+
+    assert res.status_code == 400
+    assert client.get(f"/api/ipcs/{segment}").json()["total_bytes"] == TOTAL_MEM
 
 
 def test_set_limit_404s_instead_of_creating_a_segment(client):
@@ -129,12 +143,13 @@ def test_a_configured_key_is_required(client, monkeypatch):
     }).status_code == 200
 
 
-def test_a_configured_key_is_accepted_as_a_query_parameter(client, monkeypatch):
-    """EventSource cannot set headers, so /api/stream needs this fallback."""
+def test_the_query_parameter_fallback_is_limited_to_the_stream(
+        client, monkeypatch):
+    """Query strings get logged, so only the read-only stream accepts one."""
     monkeypatch.setenv(kvweb.API_KEY_ENV_VAR, "s3cret")
 
-    assert client.get("/api/ipcs?api_key=wrong").status_code == 401
-    assert client.get("/api/ipcs?api_key=s3cret").status_code == 200
+    assert client.get("/api/ipcs?api_key=s3cret").status_code == 401
+    assert client.delete("/api/ipcs/anything?api_key=s3cret").status_code == 401
 
 
 def test_root_reports_service_metadata(client):

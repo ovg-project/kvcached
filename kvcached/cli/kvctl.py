@@ -433,9 +433,11 @@ def interactive_shell():
                     i += 1
                 cmd_top(ipcs_top if ipcs_top else None, refresh)
             elif cmd == 'web':
-                # Syntax: web [--host H] [--port P]
+                # Syntax: web [--host H] [--port P] [--cors-origin O ...]
+                # Keep the accepted flags in step with the `web` subparser.
                 host_web: str = WEB_DEFAULT_HOST
                 port_web: int = WEB_DEFAULT_PORT
+                cors_web: List[str] = []
                 i = 1
                 while i < len(tokens):
                     tok = tokens[i]
@@ -449,10 +451,16 @@ def interactive_shell():
                         if i >= len(tokens):
                             raise ValueError("Expected a port after '--port'")
                         port_web = int(tokens[i])
+                    elif tok == '--cors-origin':
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError(
+                                "Expected an origin after '--cors-origin'")
+                        cors_web.append(tokens[i])
                     else:
                         raise ValueError(f"Unexpected argument '{tok}'")
                     i += 1
-                cmd_web(host_web, port_web)
+                cmd_web(host_web, port_web, cors_web or None)
             elif cmd == 'delete' and len(tokens) == 2:
                 cmd_delete(tokens[1])
             else:

@@ -46,9 +46,11 @@ so the server binds to `127.0.0.1` and sends no CORS headers by default.
 Before exposing it more widely:
 
 - Set `KVCACHED_WEB_API_KEY`. Requests then need that value in an `X-API-Key`
-  header, or in an `api_key` query parameter for clients such as `EventSource`
-  that cannot set headers. Leaving it unset disables the check, which is why
-  `--host` warns when it binds to anything other than loopback.
+  header. `/api/stream` also accepts it as an `api_key` query parameter,
+  because `EventSource` cannot set headers; no other endpoint does, since
+  query strings end up in access and proxy logs. Leaving the variable unset
+  disables the check, which is why `--host` warns when it binds to anything
+  other than loopback.
 - Pass `--cors-origin ORIGIN` (repeatable) only if a separate front-end has to
   call the API from a browser.
 
