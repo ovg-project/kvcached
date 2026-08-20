@@ -59,8 +59,13 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
     return f"{seq}{text}{_ANSI_COLOR_CODES['reset']}"
 
 
+# Defaults for the `web` subcommand. Loopback, because the API can shrink or
+# delete the KV cache of a running engine and ships without authentication.
+WEB_DEFAULT_HOST = '127.0.0.1'
+WEB_DEFAULT_PORT = 8000
+
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
+    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'web', 'delete', 'help',
     'exit', 'quit'
 ]
 
@@ -72,6 +77,7 @@ Available commands:
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
   watch [-n sec] [ipc ...]     Continuously display usage table
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
+  web [--host H] [--port P]    Serve the control API (loopback by default)
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
   delete <ipc>                 Delete IPC segment and its limit entry
@@ -173,7 +179,7 @@ SIZE_SUFFIXES = {
 }
 
 
-def _parse_size(size_str: str) -> int:
+def parse_size(size_str: str) -> int:
     """
     Convert human-friendly size strings such as ``512M``, ``1g`` or
     ``100_000`` into a byte count.
@@ -266,7 +272,7 @@ def cmd_limit(ipc: str, size_str: str):
             print("Active IPC names:", ", ".join(avail), file=sys.stderr)
         return
 
-    size_bytes = _parse_size(size_str)
+    size_bytes = parse_size(size_str)
     update_kv_cache_limit(ipc, size_bytes)
 
 
@@ -301,6 +307,35 @@ def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
 def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
     """Launch the kvtop curses UI (blocks until user quits)."""
     kvtop_ui(ipcs, refresh)
+
+
+# ---------------------------------------------------------------------------
+# Web API command
+# ---------------------------------------------------------------------------
+
+
+def cmd_web(host: str = WEB_DEFAULT_HOST,
+            port: int = WEB_DEFAULT_PORT,
+            cors_origins: Optional[List[str]] = None):
+    """Serve the control API (blocks until interrupted).
+
+    kvweb is imported lazily so that the rest of kvctl keeps working without
+    the optional web dependencies installed.
+    """
+    try:
+        from kvcached.cli.kvweb import serve
+    except ImportError as exc:
+        print(_clr(f"Cannot start the web API: {exc}", 'red', bold=True),
+              file=sys.stderr)
+        print("Install the optional dependencies with "
+              "`pip install kvcached[web]`.",
+              file=sys.stderr)
+        return
+
+    try:
+        serve(host, port, cors_origins)
+    except KeyboardInterrupt:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +432,35 @@ def interactive_shell():
                         ipcs_top.append(tok)
                     i += 1
                 cmd_top(ipcs_top if ipcs_top else None, refresh)
+            elif cmd == 'web':
+                # Syntax: web [--host H] [--port P] [--cors-origin O ...]
+                # Keep the accepted flags in step with the `web` subparser.
+                host_web: str = WEB_DEFAULT_HOST
+                port_web: int = WEB_DEFAULT_PORT
+                cors_web: List[str] = []
+                i = 1
+                while i < len(tokens):
+                    tok = tokens[i]
+                    if tok == '--host':
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError("Expected a host after '--host'")
+                        host_web = tokens[i]
+                    elif tok == '--port':
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError("Expected a port after '--port'")
+                        port_web = int(tokens[i])
+                    elif tok == '--cors-origin':
+                        i += 1
+                        if i >= len(tokens):
+                            raise ValueError(
+                                "Expected an origin after '--cors-origin'")
+                        cors_web.append(tokens[i])
+                    else:
+                        raise ValueError(f"Unexpected argument '{tok}'")
+                    i += 1
+                cmd_web(host_web, port_web, cors_web or None)
             elif cmd == 'delete' and len(tokens) == 2:
                 cmd_delete(tokens[1])
             else:
@@ -454,6 +518,24 @@ def main():
     p_del = sub.add_parser('delete', help='Delete IPC segment')
     p_del.add_argument('ipc')
 
+    # web
+    p_web = sub.add_parser('web', help='Serve the kvcached control API')
+    p_web.add_argument(
+        '--host',
+        default=WEB_DEFAULT_HOST,
+        help=f'Bind address (default: {WEB_DEFAULT_HOST}). Binding to a '
+        'reachable address is only safe with KVCACHED_WEB_API_KEY set.')
+    p_web.add_argument('--port',
+                       type=int,
+                       default=WEB_DEFAULT_PORT,
+                       help=f'Bind port (default: {WEB_DEFAULT_PORT})')
+    p_web.add_argument(
+        '--cors-origin',
+        action='append',
+        dest='cors_origins',
+        metavar='ORIGIN',
+        help='Allow browser requests from ORIGIN. Repeatable.')
+
     # shell
     sub.add_parser('shell', help='Start interactive shell')
 
@@ -469,6 +551,8 @@ def main():
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
+    elif args.command == 'web':
+        cmd_web(args.host, args.port, args.cors_origins)
     elif args.command == 'delete':
         cmd_delete(args.ipc)
     elif args.command == 'shell' or args.command is None:
