@@ -7,11 +7,14 @@ import os
 
 import pytest
 
-pytest.importorskip("fastapi", reason="kvweb needs the `web` extra")
+# Guard on the module under test rather than on one dependency, so that a
+# missing piece of the `web` extra skips instead of failing collection.
+kvweb = pytest.importorskip("kvcached.cli.kvweb",
+                            reason="needs the `web` extra")
+pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from kvcached.cli.kvweb import API_KEY_ENV_VAR, app  # noqa: E402
 from kvcached.cli.utils import (  # noqa: E402
     get_ipc_path,
     init_kv_cache_limit,
@@ -23,7 +26,7 @@ TOTAL_MEM = 10_000_000  # 10 MB
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    return TestClient(kvweb.app)
 
 
 @pytest.fixture
@@ -98,12 +101,12 @@ def test_status_lists_detected_segments(client, segment):
 
 
 def test_requests_are_unauthenticated_when_no_key_is_configured(client):
-    assert API_KEY_ENV_VAR not in os.environ
+    assert kvweb.API_KEY_ENV_VAR not in os.environ
     assert client.get("/api/ipcs").status_code == 200
 
 
 def test_a_configured_key_is_required(client, monkeypatch):
-    monkeypatch.setenv(API_KEY_ENV_VAR, "s3cret")
+    monkeypatch.setenv(kvweb.API_KEY_ENV_VAR, "s3cret")
 
     assert client.get("/api/ipcs").status_code == 401
     assert client.get("/api/ipcs",
@@ -117,7 +120,7 @@ def test_a_configured_key_is_required(client, monkeypatch):
 
 def test_a_configured_key_is_accepted_as_a_query_parameter(client, monkeypatch):
     """EventSource cannot set headers, so /api/stream needs this fallback."""
-    monkeypatch.setenv(API_KEY_ENV_VAR, "s3cret")
+    monkeypatch.setenv(kvweb.API_KEY_ENV_VAR, "s3cret")
 
     assert client.get("/api/ipcs?api_key=wrong").status_code == 401
     assert client.get("/api/ipcs?api_key=s3cret").status_code == 200
