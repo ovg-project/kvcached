@@ -3,6 +3,7 @@
 
 """Endpoint-level tests for the kvcached control API."""
 
+import json
 import os
 
 import pytest
@@ -16,12 +17,23 @@ pytest.importorskip("httpx", reason="fastapi's TestClient needs httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from kvcached.cli.utils import (  # noqa: E402
+    delete_kv_cache_segment,
     get_ipc_path,
     init_kv_cache_limit,
 )
 
 IPC_NAME = "kvweb-test-ipc"
 TOTAL_MEM = 10_000_000  # 10 MB
+
+
+@pytest.fixture(autouse=True)
+def no_configured_api_key(monkeypatch):
+    """Authentication is opt-in, so keep an ambient key out of every test.
+
+    A key in the environment would otherwise 401 every request in this module,
+    not just the tests that are about authentication.
+    """
+    monkeypatch.delenv(kvweb.API_KEY_ENV_VAR, raising=False)
 
 
 @pytest.fixture
@@ -32,11 +44,11 @@ def client():
 @pytest.fixture
 def segment():
     """Create a KV cache segment for the test and remove it afterwards."""
+    # Clear anything an interrupted run left behind.
+    delete_kv_cache_segment(IPC_NAME)
     init_kv_cache_limit(IPC_NAME, TOTAL_MEM)
     yield IPC_NAME
-    path = get_ipc_path(IPC_NAME)
-    if os.path.exists(path):
-        os.remove(path)
+    delete_kv_cache_segment(IPC_NAME)
 
 
 def test_get_ipc_reports_the_configured_limit(client, segment):
@@ -101,7 +113,6 @@ def test_status_lists_detected_segments(client, segment):
 
 
 def test_requests_are_unauthenticated_when_no_key_is_configured(client):
-    assert kvweb.API_KEY_ENV_VAR not in os.environ
     assert client.get("/api/ipcs").status_code == 200
 
 
@@ -124,3 +135,96 @@ def test_a_configured_key_is_accepted_as_a_query_parameter(client, monkeypatch):
 
     assert client.get("/api/ipcs?api_key=wrong").status_code == 401
     assert client.get("/api/ipcs?api_key=s3cret").status_code == 200
+
+
+def test_root_reports_service_metadata(client):
+    body = client.get("/").json()
+
+    assert body["name"] == "kvcached control API"
+    assert body["version"] == kvweb.__version__
+    assert body["docs_url"] == "/docs"
+    assert body["openapi_url"] == "/openapi.json"
+
+
+def test_list_ipcs_includes_the_segment(client, segment):
+    assert segment in client.get("/api/ipcs").json()["ipcs"]
+
+
+def test_set_limit_percent_converts_against_total_gpu_memory(
+        client, segment, monkeypatch):
+    monkeypatch.setattr(kvweb, "get_total_gpu_memory", lambda: 8 * 1024**3)
+
+    res = client.post(f"/api/ipcs/{segment}/limit-percent", json={"percent": 50})
+
+    assert res.status_code == 200
+    assert res.json()["ipc"]["total_bytes"] == 4 * 1024**3
+
+
+def test_set_limit_percent_404s_for_an_unknown_segment(client, monkeypatch):
+    monkeypatch.setattr(kvweb, "get_total_gpu_memory", lambda: 8 * 1024**3)
+
+    res = client.post("/api/ipcs/no-such-segment/limit-percent",
+                      json={"percent": 50})
+
+    assert res.status_code == 404
+    assert not os.path.exists(get_ipc_path("no-such-segment"))
+
+
+def test_set_limit_percent_503s_when_gpu_memory_is_unknown(
+        client, segment, monkeypatch):
+    monkeypatch.setattr(kvweb, "get_total_gpu_memory", lambda: 0)
+
+    res = client.post(f"/api/ipcs/{segment}/limit-percent", json={"percent": 50})
+
+    assert res.status_code == 503
+
+
+@pytest.mark.parametrize("percent", [-1, 101])
+def test_set_limit_percent_rejects_a_value_outside_0_100(client, segment,
+                                                        percent):
+    res = client.post(f"/api/ipcs/{segment}/limit-percent",
+                      json={"percent": percent})
+
+    assert res.status_code == 422
+
+
+def test_set_limit_requires_a_size(client, segment):
+    assert client.post(f"/api/ipcs/{segment}/limit", json={}).status_code == 422
+
+
+@pytest.mark.parametrize("interval", [0.1, 11])
+def test_stream_rejects_an_interval_outside_its_bounds(client, interval):
+    # Validation happens before the generator starts, so this cannot hang.
+    res = client.get(f"/api/stream?interval={interval}")
+
+    assert res.status_code == 422
+
+
+async def test_stream_emits_the_status_payload_as_server_sent_events(segment):
+    """Exercise the response object rather than the endpoint.
+
+    The generator never returns, so pulling it through TestClient blocks
+    forever; taking one chunk from the body iterator is the same code path
+    without the server loop.
+    """
+    response = await kvweb.api_stream_status(interval=0.2)
+
+    assert response.media_type == "text/event-stream"
+
+    chunk = await response.body_iterator.__anext__()
+    assert chunk.startswith("data: ") and chunk.endswith("\n\n")
+
+    payload = json.loads(chunk[len("data: "):])
+    assert segment in [ipc["name"] for ipc in payload["ipcs"]]
+
+
+def test_stream_accepts_the_api_key_as_a_query_parameter(client, monkeypatch):
+    """The fallback exists for EventSource, which cannot send headers."""
+    monkeypatch.setenv(kvweb.API_KEY_ENV_VAR, "s3cret")
+
+    assert client.get("/api/stream?interval=1").status_code == 401
+
+    # A deliberately out-of-range interval: 422 rather than 401 shows the key
+    # was accepted and the request reached validation, and stops the endless
+    # generator from starting and hanging the test.
+    assert client.get("/api/stream?interval=99&api_key=s3cret").status_code == 422
