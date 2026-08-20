@@ -142,3 +142,75 @@ def test_available_size_refetches_after_resize():
     manager.resize(1024)
     manager.available_size()
     assert manager.page_allocator.get_avail_call_count == 2
+
+
+class _FakePage:
+    """Stand-in for a mapped InternalPage; tracks free blocks (no GPU)."""
+
+    def __init__(self, page_id: int, num_blocks: int) -> None:
+        self.page_id = page_id
+        self._free = num_blocks
+
+    def init(self, block_mem_size: int) -> None:  # noqa: ARG002
+        pass
+
+    def num_free_blocks(self) -> int:
+        return self._free
+
+    def alloc(self, n: int) -> list:
+        take = min(n, self._free)
+        self._free -= take
+        return list(range(take))
+
+    def full(self) -> bool:
+        return self._free == 0
+
+
+class AllocMappingPageAllocator(CountingPageAllocator):
+    """Adds alloc_page(): mapping a physical page shrinks the driver free
+    pool, which available_size()'s cache must reflect. Mirrors the C++
+    PageAllocator side of alloc() so the staleness regression is exercisable
+    without a GPU."""
+
+    def __init__(self, physical_free: int = 100, virtual_free: int = 1000) -> None:
+        super().__init__()
+        self.physical_free = physical_free
+        self.virtual_free = virtual_free
+        self._next_page_id = 0
+
+    def get_avail_physical_pages(self) -> int:
+        self.get_avail_call_count += 1
+        return self.physical_free
+
+    def get_num_free_pages(self) -> int:
+        return self.virtual_free
+
+    def alloc_page(self) -> _FakePage:
+        # Mapping a page consumes one physical page from the driver pool and
+        # one virtual free page, so the next available_size() must re-read.
+        self.physical_free -= 1
+        self.virtual_free -= 1
+        page = _FakePage(self._next_page_id, BLOCKS_PER_PAGE)
+        self._next_page_id += 1
+        return page
+
+
+def test_available_size_refetches_after_alloc():
+    """alloc() maps new physical pages, shrinking the driver free pool;
+    available_size() must re-read instead of serving a pre-alloc cached
+    count (regression for the staleness bug reported on #456)."""
+    allocator = AllocMappingPageAllocator(physical_free=100, virtual_free=1000)
+    manager = make_manager()
+    manager.page_allocator = allocator
+
+    initial = manager.available_size()
+    assert allocator.get_avail_call_count == 1  # cached on first call
+
+    manager.alloc(BLOCKS_PER_PAGE)  # maps a page: physical_free 100 -> 99
+
+    after = manager.available_size()
+    # Capacity must drop by one page's worth (BLOCKS_PER_PAGE blocks), not
+    # stay at the pre-alloc cached value.
+    assert after == initial - BLOCKS_PER_PAGE
+    # alloc invalidated the cache, so available_size re-read the driver.
+    assert allocator.get_avail_call_count == 2
