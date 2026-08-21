@@ -54,10 +54,14 @@ def test_get_world_size_rejects_uninitialized_state(monkeypatch, vllm_modules):
         interfaces.get_world_size()
 
 
+@pytest.mark.parametrize("control_only", [False, True])
 def test_engine_core_records_tp_world_size_before_original_init(
-    monkeypatch, vllm_modules
+    monkeypatch, vllm_modules, control_only
 ):
     interfaces, patches = vllm_modules
+    import kvcached.utils as utils
+
+    monkeypatch.setattr(utils, "ENGINECORE_NO_CUDA", control_only)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: True)
     init_kvcached = mock.Mock()
@@ -85,6 +89,7 @@ def test_engine_core_records_tp_world_size_before_original_init(
         world_size=4,
         is_worker=False,
         async_sched=True,
+        control_only=control_only,
     )
     original_init.assert_called_once()
 

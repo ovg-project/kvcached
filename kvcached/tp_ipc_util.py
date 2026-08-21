@@ -7,7 +7,7 @@ import pickle
 import socket
 import threading
 import uuid
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, cast
 
 from kvcached.utils import DEFAULT_IPC_NAME
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
@@ -93,7 +93,19 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
-def start_worker_listener_thread(rank: int, pp_rank: int = 0):
+def _set_listener_device(device_index: Optional[int]) -> None:
+    if device_index is None:
+        return
+
+    import torch
+
+    # CUDA's current device is thread-local. Restore the worker's initialized
+    # device before serving CUDA-backed map operations.
+    torch.cuda.set_device(device_index)
+
+
+def start_worker_listener_thread(rank: int, pp_rank: int = 0,
+                                 device_index: Optional[int] = None):
     """
     Start a thread that listens for messages on the worker socket.
     pp_rank is used to create a PP-stage-specific subdirectory so that
@@ -114,6 +126,7 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     server_sock.listen()
 
     def listen_loop():
+        _set_listener_device(device_index)
         print(f"Worker {rank} IPC listener started at {socket_path}")
         while True:
             conn, _ = server_sock.accept()
@@ -137,7 +150,10 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                     })
             except Exception as e:
                 print(f"Worker {rank} error processing message: {e}")
-                send_msg(conn, {"status": "error", "message": str(e)})
+                try:
+                    send_msg(conn, {"status": "error", "message": str(e)})
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
             finally:
                 conn.close()
 
