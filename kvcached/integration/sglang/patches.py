@@ -12,7 +12,10 @@ import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.integration.version_utils import VersionAwarePatch, version_range
+from kvcached.integration.version_utils import (
+    VersionAwarePatch,
+    version_range,
+)
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
@@ -869,6 +872,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
         success = self.inject_elastic_mamba_pool(mem_pool_mod)
         if success:
             success &= self.alias_mamba_pool_to_elastic(mem_pool_mod)
+        if success and self.patch_mamba_slot_allocator in self.applicable_methods:
+            success &= self.patch_mamba_slot_allocator(mem_pool_mod)
         return success
 
     @version_range(SGLANG_ALL_RANGE)
@@ -1271,6 +1276,127 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias MambaPool to elastic one: {e}")
             return False
+
+    @version_range(">=0.5.13")
+    def patch_mamba_slot_allocator(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Route SGLang's request-level Mamba slots through kvcached.
+
+        SGLang 0.5.13 split slot ownership out of ``MambaPool`` into a
+        separate ``MambaSlotAllocator``.  Merely aliasing ``MambaPool`` then
+        leaves ``ElasticMambaPool.alloc/free`` dead and never maps the VMM
+        pages for request slots.  Wrap ``HybridReqToTokenPool._init_mamba_pool``
+        so the allocator installed after pool construction owns the same IDs
+        through the pool's ``KVCacheManager``.
+        """
+        HybridReqToTokenPool = getattr(mem_pool_mod, "HybridReqToTokenPool", None)
+        if HybridReqToTokenPool is None:
+            self.logger.debug(
+                "HybridReqToTokenPool not found; skipping Mamba slot allocator patch"
+            )
+            return True
+
+        original_init = getattr(HybridReqToTokenPool, "_init_mamba_pool", None)
+        if original_init is None:
+            self.logger.debug(
+                "HybridReqToTokenPool._init_mamba_pool not found; skipping"
+            )
+            return True
+        if "MambaSlotAllocator" not in getattr(original_init, "__globals__", {}):
+            # SGLang <=0.5.12 keeps allocation on MambaPool.alloc/free, which
+            # ElasticMambaPool already overrides directly.
+            self.logger.debug(
+                "SGLang uses MambaPool-owned slots; no separate allocator patch needed"
+            )
+            return True
+        marker = "__kvcached_mamba_slot_allocator_patched__"
+        if self._is_already_patched(original_init, marker):
+            return True
+
+        import torch
+
+        class ElasticMambaSlotAllocator:
+            """SGLang Mamba-slot interface backed by ``ElasticMambaPool``."""
+
+            def __init__(self, size: int, device: str, mamba_pool: Any) -> None:
+                self.size = size
+                self.device = device
+                self.mamba_pool = mamba_pool
+                self._alloc_iter = None
+                self._free_ids = set(range(1, size + 1))
+
+            @property
+            def free_slots(self):
+                # Compatibility for SGLang's debug invariant checker. Normal
+                # scheduling uses available_size() and does not materialize it.
+                return torch.tensor(
+                    sorted(self._free_ids), dtype=torch.int64, device=self.device
+                )
+
+            def available_size(self) -> int:
+                return self.mamba_pool.available_size()
+
+            def schedulable_available_size(self) -> int:
+                return self.available_size()
+
+            def _do_alloc(self, need_size: int):
+                slots = self.mamba_pool.alloc(need_size)
+                if slots is None:
+                    return None
+                self._free_ids.difference_update(slots.tolist())
+                return slots
+
+            def alloc(self, need_size: int):
+                if self._alloc_iter is not None and need_size == 1:
+                    slot = next(self._alloc_iter, None)
+                    if slot is not None:
+                        return slot
+                return self._do_alloc(need_size)
+
+            def free(self, free_index) -> None:
+                if free_index.numel() == 0:
+                    return
+                block_ids = free_index.tolist()
+                self.mamba_pool.free(free_index)
+                self._free_ids.update(block_ids)
+
+            def alloc_group_begin(self, num_reqs: int) -> None:
+                self._alloc_iter = None
+                if num_reqs > 0:
+                    result = self._do_alloc(num_reqs)
+                    if result is not None:
+                        self._alloc_iter = iter(result.split(1))
+
+            def alloc_group_end(self) -> None:
+                if self._alloc_iter is not None:
+                    remaining = list(self._alloc_iter)
+                    if remaining:
+                        self.free(torch.cat(remaining))
+                self._alloc_iter = None
+
+            def clear(self) -> None:
+                self.mamba_pool.clear()
+                self._alloc_iter = None
+                self._free_ids = set(range(1, self.size + 1))
+
+        def _patched_init_mamba_pool(self, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            mamba_pool = getattr(self, "mamba_pool", None)
+            if mamba_pool is None or not hasattr(mamba_pool, "kvcached_allocator"):
+                return
+            self.mamba_allocator = ElasticMambaSlotAllocator(
+                size=mamba_pool.size,
+                device=mamba_pool.device,
+                mamba_pool=mamba_pool,
+            )
+            logger.info(
+                "[kvcached] ElasticMambaSlotAllocator in use: size=%d",
+                mamba_pool.size,
+            )
+
+        self._mark_as_patched(_patched_init_mamba_pool, marker)
+        HybridReqToTokenPool._init_mamba_pool = _patched_init_mamba_pool
+        setattr(mem_pool_mod, "ElasticMambaSlotAllocator", ElasticMambaSlotAllocator)
+        return True
 
 
 class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
