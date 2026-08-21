@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "controller"))
 
-from test_utils import load_example_config
+from helpers.config import load_example_config
 
 from controller.sleep_manager import SleepConfig, SleepManager
 from controller.traffic_monitor import TrafficMonitor

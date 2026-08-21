@@ -24,6 +24,7 @@ Expected output (example):
 import sys
 import time
 
+import pytest
 import torch
 
 from kvcached.integration.sglang.interfaces import (
@@ -47,6 +48,51 @@ NUM_TOKENS       = 65536       # large enough to span many 2 MB pages
 
 passed = 0
 failed = 0
+
+
+@pytest.fixture(scope="module")
+def kvcached_context():
+    """Initialize kvcached once for both aliasing tests."""
+    torch.cuda.set_device(0)
+    init_kvcached(async_sched=False)
+
+    k_tensors, _ = alloc_kv_cache(
+        kvcache_shape=(NUM_TOKENS, HEAD_NUM, HEAD_DIM),
+        dtype=DTYPE,
+        device=DEVICE,
+        num_layers=NUM_LAYERS,
+        page_size=SGLANG_PAGE_SIZE,
+        attention_type="MHA",
+        kv_layout="NHD",
+    )
+
+    t0 = time.time()
+    while not kv_tensors_created():
+        assert time.time() - t0 < 10, "KV tensors not created within 10 s"
+        time.sleep(0.1)
+
+    manager = get_kv_cache_manager(
+        num_blocks=(NUM_TOKENS // SGLANG_PAGE_SIZE) + 1,
+        block_size=SGLANG_PAGE_SIZE,
+        cell_size=HEAD_NUM * HEAD_DIM * DTYPE.itemsize,
+        num_layers=NUM_LAYERS,
+        reserve_null_block=True,
+    )
+    manager._post_init_done.wait(timeout=10.0)
+    assert manager._post_init_done.is_set(), "post-init timed out"
+
+    yield k_tensors, manager
+    shutdown_kvcached()
+
+
+@pytest.fixture(scope="module")
+def k_tensors(kvcached_context):
+    return kvcached_context[0]
+
+
+@pytest.fixture(scope="module")
+def manager(kvcached_context):
+    return kvcached_context[1]
 
 
 def _tokens_per_physical_page(k_buf):
@@ -108,6 +154,10 @@ def test_without_alloc_data_corrupted(k_tensors, manager):
             f"not observed (L2 may be larger than expected)."
         )
         failed += 1
+    assert num_correct < num_pages, (
+        "zero-page aliasing was not observed; the test assumptions may need "
+        "adjustment for this GPU's cache hierarchy"
+    )
 
 
 # ── Test 2 ──────────────────────────────────────────────────────────
@@ -174,6 +224,7 @@ def test_with_alloc_data_correct(k_tensors, manager):
             f"       First 10 actual   : {readbacks[:10]}"
         )
         failed += 1
+    assert num_correct == num_phys_pages
 
 
 # ── Main ────────────────────────────────────────────────────────────
