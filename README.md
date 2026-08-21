@@ -1,3 +1,5 @@
+English | [中文版](README_cn.md)
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/logo-v2.svg" alt="kvcached logo" height="96" />
 
@@ -166,15 +168,23 @@ More instructions can be found [here](https://github.com/ovg-project/kvcached/bl
 
 ## Documentation
 
-kvcached is indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for LLM-powered documentation.
+Full documentation is available in the [`docs/`](./docs) directory and can be built as a local website:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs serve
+```
 
 The documentation covers:
-- Core architecture and memory management system
-- Integration with vLLM and SGLang
-- Multi-model serving and controller system
-- Deployment guides and configuration reference
-- Performance benchmarking and analysis
-- Development tools and testing
+- [Core Architecture](docs/en/core-concepts/architecture.md) — System design and GPU virtual memory model
+- [Getting Started](docs/en/getting-started/installation.md) — Installation, quick start, and Docker deployment
+- [User Guide](docs/en/user-guide/multi-model.md) — Multi-model serving, memory control, router, sleep management
+- [Configuration Reference](docs/en/configuration/environment.md) — Environment variables and engine options
+- [Performance & Benchmarks](docs/en/performance/benchmarks.md) — TTFT benchmarks and tuning guide
+- [Development](docs/en/development/contributing.md) — Contributing, build system, testing
+- [FAQ](docs/en/faq.md) — Common questions and troubleshooting
+
+> kvcached is also indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for AI-powered documentation exploration.
 
 ## Testing
 
