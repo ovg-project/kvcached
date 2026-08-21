@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import functools
 import importlib
 import sys
 import types
@@ -15,6 +16,27 @@ import pytest
 def patches(monkeypatch):
     torch = mock.MagicMock()
     torch.__version__ = "2.6.0"
+    inference_mode_enabled = False
+
+    def inference_mode():
+        def decorate(func):
+            @functools.wraps(func)
+            def wrapped(*args, **kwargs):
+                nonlocal inference_mode_enabled
+                previous = inference_mode_enabled
+                inference_mode_enabled = True
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    inference_mode_enabled = previous
+
+            return wrapped
+
+        return decorate
+
+    torch.inference_mode = inference_mode
+    torch.is_grad_enabled.side_effect = lambda: not inference_mode_enabled
+    torch.is_inference_mode_enabled.side_effect = lambda: inference_mode_enabled
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.cuda", torch.cuda)
     monkeypatch.setitem(sys.modules, "torch.utils", torch.utils)
@@ -236,7 +258,18 @@ def test_legacy_init_device_persists_virtual_budget(monkeypatch, patches):
 def test_determine_available_memory_injects_automatic_virtual_budget(
     monkeypatch, patches
 ):
-    profile_run = mock.Mock()
+    torch = sys.modules["torch"]
+    profile_modes = []
+
+    def profile_run():
+        profile_modes.append(
+            (
+                torch.is_grad_enabled(),
+                torch.is_inference_mode_enabled(),
+            )
+        )
+
+    profile_run = mock.Mock(side_effect=profile_run)
     profile_calls = _install_memory_profiling(
         monkeypatch, torch_peak_increase=50
     )
@@ -269,14 +302,27 @@ def test_determine_available_memory_injects_automatic_virtual_budget(
     assert worker.cache_config.kv_cache_memory_bytes is None
     assert getattr(worker, "available_kv_cache_memory_bytes") == 550
     assert worker.non_torch_memory == 0
+    assert profile_modes == [(False, True)]
     capacity.assert_not_called()
 
 
 def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     monkeypatch, patches
 ):
-    profile_run = mock.Mock()
-    profile_cudagraph = mock.Mock(return_value=30)
+    torch = sys.modules["torch"]
+    profile_modes = []
+
+    def record_profile_mode(result=None):
+        profile_modes.append(
+            (
+                torch.is_grad_enabled(),
+                torch.is_inference_mode_enabled(),
+            )
+        )
+        return result
+
+    profile_run = mock.Mock(side_effect=lambda: record_profile_mode())
+    profile_cudagraph = mock.Mock(side_effect=lambda: record_profile_mode(30))
     _install_memory_profiling(
         monkeypatch,
         torch_peak_increase=999,
@@ -337,6 +383,7 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     assert worker.cudagraph_memory_estimate == 30
     profile_run.assert_called_once_with()
     profile_cudagraph.assert_called_once_with()
+    assert profile_modes == [(False, True), (False, True)]
 
 
 def test_cudagraph_profile_respects_none_mode(patches):

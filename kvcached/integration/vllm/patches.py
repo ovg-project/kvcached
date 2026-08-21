@@ -2055,8 +2055,11 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             self.logger.debug("Worker.determine_available_memory already patched")
             return True
 
+        import torch
+
         logger = self.logger
 
+        @torch.inference_mode()
         def _patched_determine_available_memory(
             self, *args: Any, **kwargs: Any
         ) -> int:
