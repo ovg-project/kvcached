@@ -12,6 +12,22 @@ class KVCachedConfigError(RuntimeError):
     abort startup instead of silently falling back to non-kvcached behavior."""
 
 
+class KVCachePoolExhausted(ValueError):
+    """Raised when the shared physical KV pool cannot back an allocation.
+
+    This is a transient condition, not a defect: colocated engines share one
+    physical pool, so a peer can take the last pages between the moment
+    availability is observed and the moment the pages are claimed. Serving
+    engines already know how to respond -- free something and try again -- so
+    integrations translate this into whatever "cannot allocate right now"
+    signal their engine understands, rather than letting it terminate the
+    process.
+
+    It subclasses ValueError so callers written against the pre-existing
+    behavior keep working.
+    """
+
+
 def _sanitize_segment(segment: str) -> str:
     """Sanitize a segment to safe characters for SHM names."""
     allowed = []
@@ -53,6 +69,14 @@ def _obtain_default_ipc_name() -> str:
     single segment, while separate launches get distinct names.
     """
 
+    explicit = os.getenv("KVCACHED_IPC_NAME")
+    if explicit:
+        # An explicit IPC name is a contract between all processes in one
+        # serving instance.  Treat it as exact after SHM-safe sanitization: do
+        # not probe or auto-suffix it, because late-importing TP workers must
+        # still join the same namespace.
+        return _sanitize_segment(explicit)
+
     engine_tag = _detect_engine_tag()
     try:
         group_id = os.getpgid(0)
@@ -61,24 +85,6 @@ def _obtain_default_ipc_name() -> str:
             group_id = os.getsid(0)
         except Exception:
             group_id = os.getpid()
-
-    explicit = os.getenv("KVCACHED_IPC_NAME")
-    if explicit:
-        preferred = _sanitize_segment(explicit)
-
-        if not _ipc_segment_exists(preferred):
-            return preferred
-
-        base_candidate = f"{preferred}_{engine_tag}_{group_id}"
-        if not _ipc_segment_exists(base_candidate):
-            return base_candidate
-        # As a last resort, append a small numeric suffix until unique
-        for i in range(1, 100):
-            candidate = f"{base_candidate}_{i}"
-            if not _ipc_segment_exists(candidate):
-                return candidate
-        # If everything somehow exists, fall back to PID-specific name
-        return f"{base_candidate}_{os.getpid()}"
 
     # No explicit override: start from conventional base and ensure uniqueness
     base = "kvcached"

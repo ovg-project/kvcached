@@ -5,6 +5,7 @@
 SGLang-specific patches using unified patch infrastructure.
 """
 
+import functools
 import inspect
 import math
 import types
@@ -15,6 +16,7 @@ from kvcached.integration.version_utils import VersionAwarePatch, version_range
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
+_CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
@@ -25,6 +27,120 @@ logger = get_kvcached_logger()
 def _is_supported_gpu_device(device: str) -> bool:
     device_str = str(device).lower()
     return device_str.startswith("cuda") or device_str.startswith("hip")
+
+
+def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
+    """Return one capacity shared by every rank in the SGLang world group."""
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if int(world_group.world_size) <= 1:
+        return local_bytes
+
+    capacity = torch.tensor(local_bytes, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        capacity,
+        op=torch.distributed.ReduceOp.MIN,
+        group=world_group.cpu_group,
+    )
+    return int(capacity.item())
+
+
+class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
+    """Keep SGLang's logical KV capacity independent of peer processes."""
+
+    library = "sglang"
+    target_module = "sglang.srt.model_executor.model_runner"
+    target_class = "ModelRunner"
+    patch_name = "virtual_kv_capacity"
+
+    def apply(self, model_runner_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_profile_available_bytes(model_runner_mod)
+
+    @version_range(">=0.5.11")
+    def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
+        ModelRunner = self._get_target_class(model_runner_mod)
+        if ModelRunner is None:
+            return False
+
+        original_profile = getattr(ModelRunner, "_profile_available_bytes", None)
+        if original_profile is None:
+            self.logger.warning(
+                "SGLang ModelRunner does not expose _profile_available_bytes"
+            )
+            return False
+        if self._is_already_patched(original_profile, "virtual_kv_capacity"):
+            return True
+
+        @functools.wraps(original_profile)
+        def _patched_profile_available_bytes(runner, pre_model_load_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
+                return original_profile(runner, pre_model_load_memory)
+
+            import torch
+
+            query_error = None
+            try:
+                total_memory = int(
+                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                )
+                mem_fraction_static = float(runner.mem_fraction_static)
+                logical_budget = math.ceil(total_memory * mem_fraction_static)
+                process_local_reserved = int(
+                    torch.cuda.memory_reserved(runner.gpu_id)
+                )
+                local_available_bytes = logical_budget - process_local_reserved
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                query_error = exc
+                total_memory = 0
+                logical_budget = 0
+                process_local_reserved = 0
+                local_available_bytes = _CAPACITY_QUERY_FAILED
+
+            try:
+                available_bytes = _reduce_sglang_world_min_bytes(
+                    torch, local_available_bytes
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Unable to synchronize SGLang virtual KV capacity; "
+                    "falling back to SGLang profiling: %s",
+                    exc,
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if available_bytes == _CAPACITY_QUERY_FAILED:
+                logger.warning(
+                    "Unable to derive stable SGLang virtual KV capacity on "
+                    "at least one rank; falling back to SGLang profiling: %s",
+                    query_error or "peer rank query failed",
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if runner.mambaish_config is not None:
+                available_gib = available_bytes / BYTES_PER_GB
+                available_bytes = int(
+                    runner.handle_max_mamba_cache(available_gib) * BYTES_PER_GB
+                )
+
+            logger.info(
+                "Using kvcached process-local KV capacity for SGLang: "
+                "budget=%d bytes, pytorch_reserved=%d bytes, "
+                "world_min_available=%d bytes (device_total=%d, "
+                "mem_fraction_static=%.4f)",
+                logical_budget,
+                process_local_reserved,
+                available_bytes,
+                total_memory,
+                mem_fraction_static,
+            )
+            return available_bytes
+
+        self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
+        ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        return True
 
 
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
@@ -150,8 +266,21 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
-            alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
-            alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+            try:
+                alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
+                alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
+            except AttributeError:
+                from sglang.srt.mem_cache.triton_ops import allocator as triton_allocator
+
+                alloc_extend_kernel = triton_allocator.alloc_extend_kernel
+                alloc_decode_kernel = triton_allocator.alloc_decode_kernel
+
+            alloc_extend_kernel_fn = getattr(
+                alloc_extend_kernel, "fn", alloc_extend_kernel
+            )
+            alloc_extend_param_names = tuple(
+                inspect.signature(alloc_extend_kernel_fn).parameters
+            )
 
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
@@ -205,6 +334,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     seq_lens_cpu: torch.Tensor,
                     last_loc: torch.Tensor,
                     extend_num_tokens: int,
+                    num_new_pages: Optional[int] = None,
                 ):
                     self.seen_max_num_extend_tokens_next_power_of_2 = max(
                         self.seen_max_num_extend_tokens_next_power_of_2,
@@ -212,11 +342,12 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     )
                     bs = len(prefix_lens)
 
-                    num_new_pages = get_num_new_pages(
-                        seq_lens=seq_lens_cpu,
-                        page_size=self.page_size,
-                        prefix_lens=prefix_lens_cpu,
-                    )
+                    if num_new_pages is None:
+                        num_new_pages = get_num_new_pages(
+                            seq_lens=seq_lens_cpu,
+                            page_size=self.page_size,
+                            prefix_lens=prefix_lens_cpu,
+                        )
 
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
@@ -231,16 +362,25 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     out_indices = torch.empty(
                         (extend_num_tokens,), dtype=torch.int64, device=self.device
                     )
-                    alloc_extend_kernel[(bs,)](
-                        prefix_lens,
-                        seq_lens,
-                        last_loc,
-                        free_pages,
-                        out_indices,
-                        next_power_of_2(bs),
-                        self.page_size,
-                        self.seen_max_num_extend_tokens_next_power_of_2,
-                    )
+                    kernel_kwargs: dict[str, Any] = {
+                        "pre_lens_ptr": prefix_lens,
+                        "seq_lens_ptr": seq_lens,
+                        "last_loc_ptr": last_loc,
+                        "free_page_ptr": free_pages,
+                        "out_indices": out_indices,
+                        "bs_upper": next_power_of_2(bs),
+                        "page_size": self.page_size,
+                    }
+                    if "ret_values" in alloc_extend_param_names:
+                        kernel_kwargs["ret_values"] = torch.empty(
+                            (), dtype=torch.int64, device=self.device
+                        )
+                    if "max_num_extend_tokens" in alloc_extend_param_names:
+                        kernel_kwargs["max_num_extend_tokens"] = (
+                            self.seen_max_num_extend_tokens_next_power_of_2
+                        )
+
+                    alloc_extend_kernel[(bs,)](**kernel_kwargs)
                     return out_indices
 
                 def alloc_decode(
@@ -412,6 +552,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
+                        pool_name="mha",
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
@@ -653,6 +794,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         size + page_size, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
+                        pool_name="mla",
                     )
 
                     kv_size = self.get_kv_size_bytes()
@@ -846,8 +988,23 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     mamba_layer_ids: Optional[List[int]] = None,
                     enable_memory_saver: bool = False,
                     speculative_num_draft_tokens: Optional[int] = None,
+                    speculative_eagle_topk: Optional[int] = None,
+                    enable_linear_replayssm: bool = False,
+                    linear_replayssm_cache_len: int = 16,
+                    envelope_layout: bool = False,
                 ) -> None:
                     import kvcached.integration.sglang.interfaces as kvi
+
+                    if enable_linear_replayssm:
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support SGLang "
+                            "linear ReplaySSM buffers yet."
+                        )
+                    if envelope_layout:
+                        raise NotImplementedError(
+                            "ElasticMambaPool uses the kvcached mamba state "
+                            "layout and does not support SGLang envelope_layout."
+                        )
 
                     # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
                     # does so the IPC socket naming matches.
@@ -883,6 +1040,10 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.size = size
                     self.device = device
+                    self.enable_linear_replayssm = False
+                    self.linear_replayssm_cache_len = linear_replayssm_cache_len
+                    self.replayssm_is_kda = False
+                    self.replayssm_write_pos = None
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
@@ -982,6 +1143,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         reserve_null_block=True,
                         num_kv_buffers=1,
                         group_id=self._group_id,
+                        pool_name="mamba",
                     )
 
                     # Placeholder so code that touches self.free_slots in
@@ -1234,8 +1396,8 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
 
         Older SGLang keeps the whole check in a single Scheduler method whose
         source mentions ``token_to_kv_pool_allocator``.  Newer SGLang
-        (>=0.5.11) moved it into ``SchedulerRuntimeCheckerMixin`` and split it
-        across several small methods (e.g. ``_check_req_pool`` raises directly,
+        moved it into helpers such as ``SchedulerRuntimeCheckerMixin`` or
+        ``SchedulerInvariantChecker`` (e.g. ``_check_req_pool`` raises directly,
         ``_report_leak`` is the generic choke point for *token/KV* pool leaks).
 
         We suppress only the leak checks for pools kvcached actually manages
@@ -1251,23 +1413,31 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
         if Scheduler is None:
             return False
 
-        target_method_names: List[str] = []
-        for name, fn in inspect.getmembers(Scheduler, predicate=inspect.isfunction):
-            try:
-                src = inspect.getsource(fn)
-            except Exception:
-                continue
-            if "memory leak detected" not in src:
-                continue
-            # Skip a check that is specific to the request pool, which kvcached
-            # does not manage.  The generic reporter names no pool (so it is not
-            # excluded) and the legacy combined check names the KV allocator.
-            if "req_to_token_pool" in src and "token_to_kv_pool" not in src:
-                continue
-            target_method_names.append(name)
+        target_classes: List[Tuple[str, Any]] = [("Scheduler", Scheduler)]
+        InvariantChecker = getattr(sched_mod, "SchedulerInvariantChecker", None)
+        if InvariantChecker is not None:
+            target_classes.append(("SchedulerInvariantChecker", InvariantChecker))
 
-        if not target_method_names:
-            self.logger.debug("No memory leak detection method found in Scheduler")
+        target_methods: List[Tuple[str, Any, str]] = []
+        for class_name, cls in target_classes:
+            for name, fn in inspect.getmembers(cls, predicate=inspect.isfunction):
+                try:
+                    src = inspect.getsource(fn)
+                except Exception:
+                    continue
+                if "memory leak detected" not in src:
+                    continue
+                # Skip a check that is specific to the request pool, which kvcached
+                # does not manage.  The generic reporter names no pool (so it is not
+                # excluded) and the legacy combined check names the KV allocator.
+                if "req_to_token_pool" in src and "token_to_kv_pool" not in src:
+                    continue
+                target_methods.append((class_name, cls, name))
+
+        if not target_methods:
+            self.logger.debug(
+                "No memory leak detection method found in SGLang scheduler"
+            )
             return False
 
         def _make_wrapped(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -1283,17 +1453,18 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
             return _wrapped
 
         patched_any = False
-        for target_method_name in target_method_names:
-            original = getattr(Scheduler, target_method_name)
+        for class_name, cls, target_method_name in target_methods:
+            original = getattr(cls, target_method_name)
             if self._is_already_patched(original):
                 self.logger.debug(
-                    f"Scheduler.{target_method_name} leak check already patched")
+                    f"{class_name}.{target_method_name} leak check already patched"
+                )
                 patched_any = True
                 continue
 
             wrapped = _make_wrapped(original)
             self._mark_as_patched(wrapped)
-            setattr(Scheduler, target_method_name, wrapped)
+            setattr(cls, target_method_name, wrapped)
             patched_any = True
 
         return patched_any

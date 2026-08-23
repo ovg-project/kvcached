@@ -133,6 +133,21 @@ int64_t page_allocator_get_num_reserved_pages(
   return allocator->get_num_reserved_pages();
 }
 
+py::dict
+page_allocator_get_page_state(std::shared_ptr<PageAllocator> allocator) {
+  PageState state;
+  {
+    py::gil_scoped_release release;
+    state = allocator->get_page_state();
+  }
+  py::dict result;
+  result["total_pages"] = state.total_pages;
+  result["free_pages"] = state.free_pages;
+  result["inuse_pages"] = state.inuse_pages;
+  result["reserved_pages"] = state.reserved_pages;
+  return result;
+}
+
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
@@ -158,10 +173,9 @@ void page_allocator_set_broadcast_unmap_callback(
   allocator->set_broadcast_unmap_callback(callback);
 }
 
-void page_allocator_set_should_use_worker_ipc_callback(
-    std::shared_ptr<PageAllocator> allocator,
-    ShouldUseWorkerIpcCallback callback) {
-  allocator->set_should_use_worker_ipc_callback(callback);
+void page_allocator_set_use_worker_ipc(std::shared_ptr<PageAllocator> allocator,
+                                       bool use_worker_ipc) {
+  allocator->set_use_worker_ipc(use_worker_ipc);
 }
 
 page_id_t page_allocator_get_page_id(std::shared_ptr<PageAllocator> allocator,
@@ -209,13 +223,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("ipc_name") = "")
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
+      // The bindings below can block inside the allocator (alloc_page waits on
+      // a condition variable for the prealloc worker; free/resize/trim unmap
+      // pages; stop joins the worker). They must not hold the GIL while
+      // blocked: the prealloc worker needs the GIL to run the Python broadcast
+      // callback, and a caller parked in here with the GIL held deadlocks the
+      // whole process (issue #371).
       .def("stop_prealloc_thread",
-           &kvcached::page_allocator_stop_prealloc_thread)
-      .def("alloc_page", &kvcached::page_allocator_alloc_page)
-      .def("free_page", &kvcached::page_allocator_free_page)
-      .def("free_pages", &kvcached::page_allocator_free_pages)
-      .def("resize", &kvcached::page_allocator_resize)
-      .def("trim", &kvcached::page_allocator_trim)
+           &kvcached::page_allocator_stop_prealloc_thread,
+           py::call_guard<py::gil_scoped_release>())
+      .def("alloc_page", &kvcached::page_allocator_alloc_page,
+           py::call_guard<py::gil_scoped_release>())
+      .def("free_page", &kvcached::page_allocator_free_page,
+           py::call_guard<py::gil_scoped_release>())
+      .def("free_pages", &kvcached::page_allocator_free_pages,
+           py::call_guard<py::gil_scoped_release>())
+      .def("resize", &kvcached::page_allocator_resize,
+           py::call_guard<py::gil_scoped_release>())
+      .def("trim", &kvcached::page_allocator_trim,
+           py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
            &kvcached::page_allocator_reset_free_page_order)
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
@@ -223,6 +249,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
       .def("check_and_get_resize_target",
@@ -235,8 +262,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_set_broadcast_map_callback)
       .def("set_broadcast_unmap_callback",
            &kvcached::page_allocator_set_broadcast_unmap_callback)
-      .def("set_should_use_worker_ipc_callback",
-           &kvcached::page_allocator_set_should_use_worker_ipc_callback);
+      .def("set_use_worker_ipc", &kvcached::page_allocator_set_use_worker_ipc);
 
   // InternalPage bindings (now as independent class)
   py::class_<kvcached::InternalPage, std::shared_ptr<kvcached::InternalPage>>(

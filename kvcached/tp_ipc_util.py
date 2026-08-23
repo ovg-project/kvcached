@@ -145,29 +145,57 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     t.start()
 
 
+# How long one worker-IPC exchange may take before it is treated as a failure.
+# Without a bound, a worker that is alive but not answering (its serial
+# listener stuck on an earlier operation) parks the caller in readexactly()
+# forever. For the C++ prealloc thread that wait is fatal: alloc_page() blocks
+# indefinitely on the reserve it will never receive (issue #371). A timeout
+# converts the silent hang into an exception, which the callers already handle
+# (the prealloc worker returns the in-flight pages and logs; a foreground
+# caller propagates the error). <= 0 disables the bound.
+IPC_TIMEOUT_S: float = float(os.getenv("KVCACHED_IPC_TIMEOUT", "60"))
+
+
 async def _send_and_receive_message(rank: int, message: Message, pp_rank: int = 0) -> Message:
     """
     Send a message to the worker and receive a response asynchronously.
+
+    Raises RuntimeError naming the worker rank if the exchange does not
+    complete within IPC_TIMEOUT_S.
     """
-    socket_path = get_worker_socket_path(rank, pp_rank)
-    reader, writer = await asyncio.open_unix_connection(socket_path)
 
+    async def exchange() -> Message:
+        socket_path = get_worker_socket_path(rank, pp_rank)
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+
+        try:
+            # Send map command
+            data = pickle.dumps(message)
+            writer.write(len(data).to_bytes(4, 'big') + data)
+            await writer.drain()
+
+            # Read the length of the response from worker
+            length_bytes = await reader.readexactly(4)
+            length = int.from_bytes(length_bytes, 'big')
+
+            # Read the actual response data
+            data = await reader.readexactly(length)
+            return cast(Message, pickle.loads(data))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    if IPC_TIMEOUT_S <= 0:
+        return await exchange()
     try:
-        # Send map command
-        data = pickle.dumps(message)
-        writer.write(len(data).to_bytes(4, 'big') + data)
-        await writer.drain()
-
-        # Read the length of the response from worker
-        length_bytes = await reader.readexactly(4)
-        length = int.from_bytes(length_bytes, 'big')
-
-        # Read the actual response data
-        data = await reader.readexactly(length)
-        return cast(Message, pickle.loads(data))
-    finally:
-        writer.close()
-        await writer.wait_closed()
+        return await asyncio.wait_for(exchange(), timeout=IPC_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"worker {rank} (pp_rank={pp_rank}) did not answer "
+            f"{message.get('cmd', '?')} within {IPC_TIMEOUT_S:g}s "
+            "(KVCACHED_IPC_TIMEOUT); the worker process is alive but its "
+            "IPC listener is not responding"
+        ) from None
 
 
 async def _broadcast_map_to_kv_tensors(tp_size: int,

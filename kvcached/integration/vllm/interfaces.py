@@ -2,11 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.observability import (
+    build_runtime_snapshot,
+    get_registered_kv_cache_pool_snapshot_dicts,
+    get_registered_kv_cache_pool_snapshots,
+)
+from kvcached.pool_registry import (
+    clear_registered_kv_cache_pools,
+    register_kv_cache_pool,
+)
 from kvcached.tp_ipc_util import start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
@@ -28,6 +37,16 @@ _is_worker: bool = False
 
 def should_use_worker_ipc() -> bool:
     return _kvcached_initialized and not _is_worker
+
+
+def get_world_size() -> int:
+    """Return the TP world size recorded by the latest initialization."""
+    if not _kvcached_initialized:
+        raise RuntimeError(
+            "kvcached is not initialized. Please call init_kvcached() first."
+        )
+    return _world_size
+
 
 def init_kvcached(
     tp_rank: int = 0,
@@ -77,9 +96,11 @@ def init_kvcached(
 def shutdown_kvcached() -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
+        clear_registered_kv_cache_pools(integration="vllm")
         return
 
     _shutdown_kvcached_impl()
+    clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
@@ -104,8 +125,15 @@ def build_kv_views(
     heterogeneous hybrid model (e.g. Gemma: sliding-window + full-attention
     groups with different ``(block_size, num_kv_heads, head_size)`` but identical
     ``block_mem_size``) build a DIFFERENT view per group over the SAME physical
-    pools. Returns ``(kv_tensors, page_size_bytes)``. Non-contiguous layout only
-    for heterogeneous callers.
+    pools. Returns ``(kv_tensors, page_size_bytes)``.
+
+    Both layouts are supported for heterogeneous callers: the shared
+    ``block_mem_size`` means block N occupies the same bytes whichever group's
+    view addresses it, so each branch below only has to re-derive the per-group
+    shape/stride from that one uniform block stride. The one exception is
+    ``contiguous`` + ``kernel_block_size != block_size``, which raises: that
+    branch reshapes at virtual-block granularity and has no kernel-block form
+    yet.
     """
     is_mla = attention_type == "MLA"
     unified_pool = attention_type == "HYBRID_LINEAR"
@@ -176,11 +204,23 @@ def build_kv_views(
             for t in raw_kv_tensors:
                 kv_tensors.append(
                     torch.as_strided(t.view(dtype=dtype), shape, strides))
-    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views today
-    # (heterogeneous grouping requires the non-contiguous layout and
-    # excludes hybrid-linear); the kernel-block-granular contiguous view
-    # for the unified pool lives in alloc_kv_cache.
+    # NOTE: contiguous + HYBRID_LINEAR never reaches build_kv_views (hybrid-linear
+    # is excluded from heterogeneous grouping); the kernel-block-granular
+    # contiguous view for the unified pool lives in alloc_kv_cache.
     else:
+        if ratio > 1:
+            # The branch below reshapes at VIRTUAL block granularity: it never
+            # consults kernel_kvcache_shape, so with ratio > 1 the views would
+            # disagree with the kernel's kernel_bs-token indexing and read
+            # silently wrong KV. The non-contiguous branch above does handle
+            # this. No engine config has produced ratio > 1 here yet (Gemma 3/4
+            # report kernel_block_size == block_size for every group), so rather
+            # than ship an unexercised stride derivation, fail loud.
+            raise NotImplementedError(
+                "kvcached: heterogeneous attention KV groups on the contiguous "
+                f"layout do not support kernel_block_size ({kernel_block_size}) "
+                f"!= block_size ({block_size}). Re-launch with "
+                "KVCACHED_CONTIGUOUS_LAYOUT=false.")
         layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
         contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
         num_eles = math.prod(contiguous_shape)
@@ -190,6 +230,35 @@ def build_kv_views(
         ]
 
     return kv_tensors, page_size_bytes
+
+
+def observability_snapshot():
+    """Return a read-only snapshot of the vLLM integration state."""
+    return build_runtime_snapshot(
+        engine="vllm",
+        initialized=_kvcached_initialized,
+        device=_kvcached_device,
+        world_size=_world_size,
+        pp_rank=_pp_rank,
+        async_sched=_async_sched,
+        contiguous_layout=_contiguous_layout,
+        is_worker=_is_worker,
+    )
+
+
+def observability_snapshot_dict() -> Dict[str, Any]:
+    """Return a JSON-serializable snapshot of the vLLM integration state."""
+    return observability_snapshot().to_dict()
+
+
+def kv_cache_pool_snapshots():
+    """Return read-only snapshots for all live vLLM KV pools."""
+    return get_registered_kv_cache_pool_snapshots(integration="vllm")
+
+
+def kv_cache_pool_snapshot_dicts() -> List[Dict[str, Any]]:
+    """Return JSON-serializable snapshots for all live vLLM KV pools."""
+    return get_registered_kv_cache_pool_snapshot_dicts(integration="vllm")
 
 
 def alloc_kv_cache(
@@ -506,11 +575,12 @@ def get_kv_cache_manager(
     num_layers: int,
     num_kv_buffers: int = 2,
     group_id: int = 0,
+    pool_name: Optional[str] = None,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    return KVCacheManager(
+    manager = KVCacheManager(
         num_blocks,
         block_size,
         cell_size,
@@ -521,4 +591,10 @@ def get_kv_cache_manager(
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
         reserve_null_block=True,
+        pool_name=pool_name,
     )
+    register_kv_cache_pool(
+        manager,
+        integration="vllm",
+    )
+    return manager
