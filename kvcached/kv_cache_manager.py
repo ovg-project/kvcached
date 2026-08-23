@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.locks import NoOpLock
@@ -99,6 +99,7 @@ class KVCacheManager:
         num_kv_buffers: int = 2,
         group_id: int = 0,
         pool_name: Optional[str] = None,
+        defer_physical_release: bool = False,
     ):
         """
         Args:
@@ -117,6 +118,8 @@ class KVCacheManager:
                 Different groups have independent FTensors and page spaces.
             pool_name: Stable, low-cardinality name assigned by the engine
                 integration when this pool is created.
+            defer_physical_release: Retire empty pages until the engine confirms
+                that previously submitted worker batches have completed.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -125,6 +128,10 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
+        self.defer_physical_release = defer_physical_release
+        self.physical_release_barrier: Optional[Callable[[], None]] = None
+        self._physical_release_epoch = 0
+        self._retired_pages: List[tuple[int, List[int]]] = []
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -565,8 +572,26 @@ class KVCacheManager:
                 self.avail_pages[page_id] = page
 
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            if getattr(self, "defer_physical_release", False):
+                self._physical_release_epoch = (
+                    getattr(self, "_physical_release_epoch", 0) + 1
+                )
+                retired_pages = getattr(self, "_retired_pages", None)
+                if retired_pages is None:
+                    retired_pages = self._retired_pages = []
+                retired_pages.append(
+                    (self._physical_release_epoch, pages_to_free)
+                )
+            else:
+                self.page_allocator.free_pages(pages_to_free)
 
+        self._maybe_finish_shrink()
+
+    def _maybe_finish_shrink(self) -> None:
+        if getattr(self, "_retired_pages", None):
+            # PageAllocator.resize() cannot shrink past pages that are still
+            # physically mapped for an in-flight worker batch.
+            return
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
@@ -588,6 +613,30 @@ class KVCacheManager:
                             "shrink to %d blocks refused by allocator "
                             "(in-use pages above target); keeping shrink pending",
                             self.target_num_blocks)
+
+    @synchronized
+    def capture_physical_release_marker(self) -> int:
+        """Return the latest page-retirement epoch."""
+        return getattr(self, "_physical_release_epoch", 0)
+
+    @synchronized
+    def release_retired_pages_through(self, marker: int) -> None:
+        """Physically release retired pages up to an acknowledged batch."""
+        pages_to_free: List[int] = []
+        still_retired: List[tuple[int, List[int]]] = []
+        for epoch, page_ids in getattr(self, "_retired_pages", []):
+            if epoch <= marker:
+                pages_to_free.extend(page_ids)
+            else:
+                still_retired.append((epoch, page_ids))
+
+        if pages_to_free:
+            barrier = getattr(self, "physical_release_barrier", None)
+            if barrier is not None:
+                barrier()
+            self.page_allocator.free_pages(pages_to_free)
+        self._retired_pages = still_retired
+        self._maybe_finish_shrink()
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -844,7 +893,12 @@ class KVCacheManager:
         self.free_reserved()
 
         # Free all blocks from avail_pages and full_pages
-        pages_to_free: List[int] = []
+        pages_to_free: List[int] = [
+            page_id
+            for _, page_ids in getattr(self, "_retired_pages", [])
+            for page_id in page_ids
+        ]
+        self._retired_pages = []
         for page in self.avail_pages.values():
             pages_to_free.append(page.page_id)
         for page in self.full_pages.values():

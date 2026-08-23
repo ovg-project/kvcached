@@ -262,6 +262,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs.get(
+                "defer_physical_release", False
+            )
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -301,6 +304,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -314,6 +318,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     assert manager.group_id == 4
     assert manager.pool_name == "mha"
+    assert manager.defer_physical_release is False
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "sglang"
     assert snapshots[0]["pool_name"] == "mha"
@@ -321,6 +326,8 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+
+
 def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     clear_registered_kv_cache_pools()
 
@@ -347,6 +354,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs["defer_physical_release"]
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -387,6 +395,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -401,6 +410,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     assert manager.group_id == 5
     assert manager.pool_name == "unified"
     assert manager.world_size == 1
+    assert manager.defer_physical_release is True
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "vllm"
     assert snapshots[0]["pool_name"] == "unified"
