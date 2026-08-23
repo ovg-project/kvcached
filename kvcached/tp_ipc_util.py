@@ -35,6 +35,14 @@ def _sync_before_unmap() -> None:
         torch.cuda.synchronize()
 
 
+def _synchronize_completed_worker_batch() -> None:
+    """Wait for kernels launched by an acknowledged worker batch."""
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _get_socket_dir_name() -> str:
     """
     Build a human-readable, IPC-name-based directory with a short hash suffix.
@@ -184,7 +192,7 @@ def start_worker_listener_thread(
                         },
                     )
                 elif msg["cmd"] == "unmap_from_kv_tensors":
-                    _sync_before_unmap()
+                    _synchronize_completed_worker_batch()
                     if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
                         raise RuntimeError(f"Failed to unmap KV tensors for group_id={group_id}")
                     send_msg(conn, {"status": "success"})
