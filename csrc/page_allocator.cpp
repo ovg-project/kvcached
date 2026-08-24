@@ -249,6 +249,12 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 void PageAllocator::free_page(page_id_t page_id) {
   {
     std::lock_guard<std::mutex> lock(lock_);
+    if (offloaded_page_ids_.count(page_id) != 0 ||
+        transitioning_page_ids_.count(page_id) != 0) {
+      throw std::runtime_error("Restore a CPU-offloaded page before returning "
+                               "it to the free list: " +
+                               std::to_string(page_id));
+    }
     num_free_pages_.fetch_add(1, std::memory_order_relaxed);
 
     if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
@@ -278,6 +284,13 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
 
   {
     std::lock_guard<std::mutex> lock(lock_);
+    for (page_id_t page_id : page_ids) {
+      if (offloaded_page_ids_.count(page_id) != 0 ||
+          transitioning_page_ids_.count(page_id) != 0) {
+        throw std::runtime_error("Restore CPU-offloaded pages before returning "
+                                 "them to the free list");
+      }
+    }
     num_free_pages_.fetch_add(static_cast<int64_t>(page_ids.size()),
                               std::memory_order_relaxed);
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
@@ -320,6 +333,76 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
          duration.count());
 }
 
+void PageAllocator::offload_page(page_id_t page_id) {
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (page_id < 0 || page_id >= num_total_pages_) {
+      throw std::out_of_range("Invalid page id for CPU offload: " +
+                              std::to_string(page_id));
+    }
+    if (offloaded_page_ids_.count(page_id) != 0) {
+      throw std::runtime_error("Page is already CPU-offloaded: " +
+                               std::to_string(page_id));
+    }
+    auto is_listed = [page_id](const std::deque<page_id_t> &pages) {
+      return std::find(pages.begin(), pages.end(), page_id) != pages.end();
+    };
+    if (is_listed(free_page_list_) || is_listed(reserved_page_list_) ||
+        is_listed(reclaimed_page_list_)) {
+      throw std::runtime_error("Only an in-use page can be CPU-offloaded: " +
+                               std::to_string(page_id));
+    }
+    if (!transitioning_page_ids_.insert(page_id).second) {
+      throw std::runtime_error("Page already has a mapping transition: " +
+                               std::to_string(page_id));
+    }
+  }
+
+  try {
+    unmap_pages({page_id});
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(lock_);
+    transitioning_page_ids_.erase(page_id);
+    throw;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    transitioning_page_ids_.erase(page_id);
+    offloaded_page_ids_.insert(page_id);
+    update_memory_usage_unlocked();
+  }
+}
+
+void PageAllocator::restore_page(page_id_t page_id) {
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (offloaded_page_ids_.count(page_id) == 0) {
+      throw std::runtime_error("Page is not CPU-offloaded: " +
+                               std::to_string(page_id));
+    }
+    if (!transitioning_page_ids_.insert(page_id).second) {
+      throw std::runtime_error("Page already has a mapping transition: " +
+                               std::to_string(page_id));
+    }
+  }
+
+  try {
+    map_pages({page_id});
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(lock_);
+    transitioning_page_ids_.erase(page_id);
+    throw;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    transitioning_page_ids_.erase(page_id);
+    offloaded_page_ids_.erase(page_id);
+    update_memory_usage_unlocked();
+  }
+}
+
 bool PageAllocator::resize(int64_t new_mem_size) {
   int64_t new_num_pages = new_mem_size / page_size_;
 
@@ -327,6 +410,11 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 
   {
     std::lock_guard<std::mutex> lock(lock_);
+
+    if (!offloaded_page_ids_.empty() || !transitioning_page_ids_.empty()) {
+      throw std::runtime_error(
+          "Cannot resize while pages are CPU-offloaded or transitioning");
+    }
 
     if (new_num_pages < get_num_inuse_pages_unlocked()) {
       return false;
@@ -457,6 +545,16 @@ int64_t PageAllocator::get_num_total_pages() const {
 int64_t PageAllocator::get_num_reserved_pages() const {
   std::lock_guard<std::mutex> lock(lock_);
   return reserved_page_list_.size();
+}
+
+int64_t PageAllocator::get_num_offloaded_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return offloaded_page_ids_.size();
+}
+
+bool PageAllocator::is_page_offloaded(page_id_t page_id) const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return offloaded_page_ids_.count(page_id) != 0;
 }
 
 PageState PageAllocator::get_page_state() const {
@@ -738,9 +836,13 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 void PageAllocator::update_memory_usage_unlocked() {
-  // Calculate currently used physical memory (excluding preallocated pages)
-  int64_t used_phy_mem_size = get_num_inuse_pages_unlocked() * num_layers_ *
-                              page_size_ * num_kv_buffers_;
+  // Offloaded pages keep their virtual id and cache metadata, but their
+  // private physical mappings have been replaced by the shared zero page.
+  int64_t resident_inuse_pages =
+      get_num_inuse_pages_unlocked() -
+      static_cast<int64_t>(offloaded_page_ids_.size());
+  int64_t used_phy_mem_size =
+      resident_inuse_pages * num_layers_ * page_size_ * num_kv_buffers_;
   // Calculate physical memory occupied by preallocated pages
   int64_t prealloc_phy_mem_size =
       static_cast<int64_t>(reserved_page_list_.size()) * num_layers_ *
