@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +35,11 @@ public:
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  // Split of map_to_kv_tensors(): prepare_ allocates physical pages only (safe
+  // off the main thread); commit_ does the VA edits (must be GPU-idle). See
+  // FTensor::prepare/commit.
+  bool prepare_kv_tensors(const std::vector<offset_t> &offsets);
+  bool commit_kv_tensors(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -59,6 +65,10 @@ private:
   at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
                              const std::string &dev_str, std::string name = "");
   void free_ftensor_(at::Tensor &ftensor);
+  // Apply `op` (FTensor::prepare/commit) to every (ftensor, offset) slot
+  // implied by the current layout. Must be called with mtx_ held.
+  bool for_each_mapping_(const std::vector<offset_t> &offsets,
+                         const std::function<bool(FTensor *, offset_t)> &op);
 
   // GPU VMM util functions.
   void init_gpu_();
