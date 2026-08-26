@@ -23,6 +23,14 @@ public:
           size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
+  // Split of map() into a create half and a VA-edit half, so the two can run
+  // on different threads. prepare() does only the physical allocation
+  // (cuMemCreate) and stashes the page; it touches no mapped VA and is safe to
+  // run concurrently with in-flight kernels. commit() does the VA page-table
+  // edit (unmap zero page -> map the prepared page) and must run at a GPU-idle
+  // point. map() = prepare() + commit().
+  bool prepare(offset_t offset);
+  bool commit(offset_t offset);
   bool unmap(offset_t offset);
 
   inline at::Tensor get_tensor() noexcept { return tensor_; }
@@ -42,6 +50,10 @@ private:
 
   at::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
+  // Pages created by prepare() but not yet committed (VA still on the zero
+  // page). commit() moves an entry from here to mapping_; unmap() discards one
+  // from here if the page was never committed.
+  std::unordered_map<page_id_t, std::unique_ptr<Page>> prepared_;
 };
 
 } // namespace kvcached

@@ -256,6 +256,57 @@ bool FTensorAllocator::unmap_from_kv_tensors(
   return true;
 }
 
+bool FTensorAllocator::for_each_mapping_(
+    const std::vector<offset_t> &offsets,
+    const std::function<bool(FTensor *, offset_t)> &op) {
+  if (num_layers_ == 0) {
+    LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
+    return false;
+  }
+
+  if (contiguous_layout_) {
+    // Single contiguous tensor; each offset covers all layers.
+    auto ftensor = contiguous_kv_tensor_.get();
+    for (auto offset : offsets) {
+      op(ftensor, offset);
+    }
+  } else if (unified_pool_) {
+    // Unified pool: one block-interleaved FTensor per layer, one page per pid.
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      for (auto offset : offsets) {
+        op(ftensor, offset);
+      }
+    }
+  } else {
+    // Original per-layer layout: K and V are stacked at the 1st dim.
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+      for (auto offset : offsets) {
+        op(ftensor, offset);
+        op(ftensor, offset + v_base_offset);
+      }
+    }
+  }
+  return true;
+}
+
+bool FTensorAllocator::prepare_kv_tensors(
+    const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  return for_each_mapping_(
+      offsets, [](FTensor *ft, offset_t off) { return ft->prepare(off); });
+}
+
+bool FTensorAllocator::commit_kv_tensors(const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  return for_each_mapping_(
+      offsets, [](FTensor *ft, offset_t off) { return ft->commit(off); });
+}
+
 std::string FTensorAllocator::get_anon_tensor_name_() {
   static constexpr std::string_view prefix = "anon_tensor_";
   static std::atomic<int> counter(0);

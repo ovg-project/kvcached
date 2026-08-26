@@ -93,11 +93,14 @@ FTensor::~FTensor() {
       ASSERT(munmap(vaddr_, size_) == 0, "munmap failed.");
     }
   }
-  mapping_.clear(); // Free physical page handles after their mappings are gone.
+  mapping_.clear();  // Free physical page handles after their mappings are gone.
+  prepared_.clear(); // Free prepared-but-uncommitted handles (no VA to undo).
   zero_page_.reset();
 }
 
-bool FTensor::map(offset_t offset) {
+bool FTensor::map(offset_t offset) { return prepare(offset) && commit(offset); }
+
+bool FTensor::prepare(offset_t offset) {
   assert(offset % page_size_ == 0); // Ensure alignment.
 
   page_id_t page_id = offset / page_size_;
@@ -105,15 +108,46 @@ bool FTensor::map(offset_t offset) {
     LOGGER(ERROR, "Page %ld is already mapped.", page_id);
     return false;
   }
+  if (prepared_.find(page_id) != prepared_.end()) {
+    return true; // Already prepared; nothing to do.
+  }
+
+  // Physical page allocation only (cuMemCreate). Touches no mapped VA, so this
+  // is safe to run on the background prealloc thread while kernels are running.
+  prepared_[page_id] = make_unique_page(dev_, page_id, page_size_);
+  return true;
+}
+
+bool FTensor::commit(offset_t offset) {
+  assert(offset % page_size_ == 0); // Ensure alignment.
+
+  page_id_t page_id = offset / page_size_;
+  if (mapping_.find(page_id) != mapping_.end()) {
+    // Already committed. Happens when a freed page is kept in the reserved pool
+    // while still mapped (free fast-path) and then handed back out: no VA edit
+    // is needed. commit() is idempotent for such pages.
+    return true;
+  }
+  auto it = prepared_.find(page_id);
+  if (it == prepared_.end()) {
+    // No prior prepare() (on-demand path): create the page now.
+    if (!prepare(offset)) {
+      return false;
+    }
+    it = prepared_.find(page_id);
+  }
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  // VA page-table edit: unmap the shared zero page, then map the real page.
+  // The caller must ensure the GPU is idle here (device_synchronize) so this
+  // edit never overlaps an in-flight kernel.
   if (dev_.is_cuda()) {
     CHECK_GPU(gpu_vmm::mem_unmap(vaddr, page_size_));
   }
-
-  mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
-  mapping_[page_id]->map(vaddr);
+  it->second->map(vaddr);
+  mapping_[page_id] = std::move(it->second);
+  prepared_.erase(it);
   return true;
 }
 
@@ -121,6 +155,13 @@ bool FTensor::unmap(offset_t offset) {
   assert(offset % page_size_ == 0); // Ensure alignment.
 
   page_id_t page_id = offset / page_size_;
+  // A page prepared but never committed still has its VA on the zero page;
+  // just drop the physical handle, no VA edit needed.
+  auto pit = prepared_.find(page_id);
+  if (pit != prepared_.end()) {
+    prepared_.erase(pit);
+    return true;
+  }
   if (mapping_.find(page_id) == mapping_.end()) {
     LOGGER(ERROR, "Page %ld is not mapped.", page_id);
     return false;

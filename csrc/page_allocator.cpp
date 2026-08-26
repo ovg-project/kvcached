@@ -170,13 +170,16 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
+  bool from_reserved = false;
 
   while (page_id == -1) {
-    // Fast path: allocate from reserved pages
+    // Fast path: allocate from reserved pages (already physically allocated by
+    // the background prealloc thread; only the VA edit remains).
     if (!reserved_page_list_.empty()) {
       page_id = reserved_page_list_.front();
       reserved_page_list_.pop_front();
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
+      from_reserved = true;
 
       // Trigger preallocation to refill reserved pool if getting low
       if (reserved_page_list_.size() <
@@ -184,16 +187,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
         prealloc_needed_ = true;
         cond_.notify_all();
       }
-
-      update_memory_usage_unlocked();
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-          end_time - start_time);
-      LOGGER(DEBUG, "alloc 1 page fast path cost %lu us", duration.count());
-      // std::cout << "alloc 1 page fast path cost " << duration.count() << "
-      // us" << std::endl;
-
-      return std::make_shared<InternalPage>(page_id, page_size_);
+      break;
     }
 
     // Slow path: allocate from free pages
@@ -220,7 +214,13 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   lock.unlock();
 
   try {
-    map_pages({page_id});
+    // A reserved page was already prepared (cuMemCreate) in the background; a
+    // free page has not been, so prepare it here. The VA edit (commit) always
+    // runs on this main thread at a GPU-idle point, so it never races a kernel.
+    if (!from_reserved) {
+      prepare_pages({page_id});
+    }
+    commit_pages({page_id});
   } catch (const std::exception &e) {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
@@ -230,7 +230,9 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
                              ": " + e.what());
   }
 
-  if (enable_page_prealloc_) {
+  // Refill the reserved pool after draining a free page on the slow path; the
+  // fast path already signalled above when the pool ran low.
+  if (enable_page_prealloc_ && !from_reserved) {
     trigger_preallocation();
   }
 
@@ -640,7 +642,9 @@ void PageAllocator::prealloc_worker() {
 
     if (!pages_to_reserve.empty()) {
       try {
-        map_pages(pages_to_reserve);
+        // Background thread does the physical allocation only; the VA edit is
+        // deferred to commit_pages() on the main thread (see alloc_page).
+        prepare_pages(pages_to_reserve);
         lock.lock();
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
@@ -668,50 +672,68 @@ void PageAllocator::prealloc_worker() {
   }
 }
 
-void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+std::vector<offset_t>
+PageAllocator::page_offsets_(const std::vector<page_id_t> &page_ids) const {
   std::vector<offset_t> offsets;
   offsets.reserve(page_ids.size());
-
-  if (contiguous_layout_) {
-    for (page_id_t pid : page_ids) {
-      offsets.push_back(pid * page_size_ * num_layers_ * num_kv_buffers_);
-    }
-  } else {
-    for (page_id_t pid : page_ids) {
-      offsets.push_back(pid * page_size_);
-    }
+  const int64_t stride =
+      contiguous_layout_ ? page_size_ * num_layers_ * num_kv_buffers_
+                         : page_size_;
+  for (page_id_t pid : page_ids) {
+    offsets.push_back(pid * stride);
   }
+  return offsets;
+}
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) && broadcast_map_callback_) {
-    // Multi-process mode: execute map on all TP workers via broadcast callback
+bool PageAllocator::uses_broadcast_() const {
+  return (world_size_ > 1 || should_use_worker_ipc()) && broadcast_map_callback_;
+}
+
+void PageAllocator::prepare_pages(const std::vector<page_id_t> &page_ids) {
+  auto offsets = page_offsets_(page_ids);
+
+  if (uses_broadcast_()) {
+    // Multi-process mode has no prepare/commit split over IPC, so do the full
+    // map here (commit_pages() is then a no-op). This still maps from whatever
+    // thread calls prepare_pages(); the create/map split is single-process
+    // only for now.
     broadcast_map_callback_(world_size_, offsets);
   } else {
-    // Single-process mode: directly call FTensorAllocator
+    // Single-process mode: physical allocation only (no VA edit yet).
     auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->map_to_kv_tensors(offsets);
-    if (!success) {
-      throw std::runtime_error("Failed to map pages to KV tensors");
+    if (!allocator->prepare_kv_tensors(offsets)) {
+      throw std::runtime_error("Failed to prepare pages for KV tensors");
     }
   }
 
-  LOGGER(INFO, "Mapped %zu pages to KV tensors", page_ids.size());
+  LOGGER(INFO, "Prepared %zu pages for KV tensors", page_ids.size());
+}
+
+void PageAllocator::commit_pages(const std::vector<page_id_t> &page_ids) {
+  if (uses_broadcast_()) {
+    // Already mapped in prepare_pages() for the broadcast path.
+    return;
+  }
+
+  auto offsets = page_offsets_(page_ids);
+  // The VA page-table edit must not overlap an in-flight kernel. Callers reach
+  // here on the main thread at a GPU-idle point, but synchronize to guarantee
+  // it in async scheduling mode.
+  if (async_sched_) {
+    CHECK_GPU(gpu_vmm::device_synchronize());
+  }
+  auto allocator = FTensorAllocator::global_allocator(group_id_);
+  if (!allocator->commit_kv_tensors(offsets)) {
+    throw std::runtime_error("Failed to commit pages to KV tensors");
+  }
+
+  LOGGER(INFO, "Committed %zu pages to KV tensors", page_ids.size());
 }
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
   auto start_time = std::chrono::steady_clock::now();
 
-  std::vector<offset_t> offsets;
-  offsets.reserve(page_ids.size());
-
-  if (contiguous_layout_) {
-    for (page_id_t pid : page_ids) {
-      offsets.push_back(pid * page_size_ * num_layers_ * num_kv_buffers_);
-    }
-  } else {
-    for (page_id_t pid : page_ids) {
-      offsets.push_back(pid * page_size_);
-    }
-  }
+  auto offsets = page_offsets_(page_ids);
 
   if ((world_size_ > 1 || should_use_worker_ipc()) &&
       broadcast_unmap_callback_) {
