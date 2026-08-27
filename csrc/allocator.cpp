@@ -53,8 +53,9 @@ static inline size_t get_v_base_offset(const at::Tensor &tensor) {
 
 FTensorAllocator::FTensorAllocator(const c10::Device &device,
                                    bool contiguous_layout)
-    : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
-      unified_pool_(false), kv_tensor_size_per_layer_(0) {
+    : dev_(device), num_layers_(0), num_kv_buffers_(2),
+      contiguous_layout_(contiguous_layout), unified_pool_(false),
+      kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
     init_gpu_();
   }
@@ -125,6 +126,7 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
+  num_kv_buffers_ = num_kv_buffers;
   unified_pool_ = unified_pool;
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
@@ -175,9 +177,10 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       // Map K and V regions for this block (covers all layers)
       ftensor->map(offset);
     }
-  } else if (unified_pool_) {
-    // Unified pool: K and V share a single block-interleaved FTensor per
-    // layer. Each page id maps exactly one VMM page at pid * page_size.
+  } else if (unified_pool_ || num_kv_buffers_ == 1) {
+    // Unified pool or MLA (num_kv_buffers==1): single map per offset per layer.
+    // - unified_pool: K and V share a single block-interleaved FTensor.
+    // - MLA: combined KV buffer, no separate V region.
     for (int64_t i = 0; i < num_layers_; i++) {
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
@@ -186,7 +189,7 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
       }
     }
   } else {
-    // Original per-layer mapping
+    // MHA/GQA per-layer mapping: K and V are stacked, map both regions.
     for (int64_t i = 0; i < num_layers_; i++) {
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
@@ -226,8 +229,9 @@ bool FTensorAllocator::unmap_from_kv_tensors(
       // Unmap K and V regions for this block (covers all layers)
       ftensor->unmap(offset);
     }
-  } else if (unified_pool_) {
-    // Unified pool: single unmap per pid.
+  } else if (unified_pool_ || num_kv_buffers_ == 1) {
+    // Unified pool or MLA (num_kv_buffers==1): single unmap per offset per
+    // layer.
     for (int64_t i = 0; i < num_layers_; i++) {
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
@@ -236,7 +240,7 @@ bool FTensorAllocator::unmap_from_kv_tensors(
       }
     }
   } else {
-    // Original per-layer unmapping
+    // MHA/GQA per-layer unmapping: K and V are stacked, unmap both regions.
     for (int64_t i = 0; i < num_layers_; i++) {
       auto kv_name = std::string(kv_prefix) + std::to_string(i);
       auto ftensor = ftensors_[kv_name].get();
