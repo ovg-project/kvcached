@@ -33,6 +33,12 @@ _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
+# Actual per-layer capacity of the KV cache tensors created by
+# alloc_kv_cache() in this process, keyed by group_id.
+# get_kv_cache_manager() validates (or derives) the manager's capacity
+# against this record so a manager can never expose page ids beyond the
+# FTensor's reserved virtual range (issue #437).
+_created_kv_tensor_capacity: Dict[int, Dict[str, int]] = {}
 
 
 def should_use_worker_ipc() -> bool:
@@ -104,6 +110,7 @@ def init_kvcached(
 
 def shutdown_kvcached() -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched
+    _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
         return
@@ -437,6 +444,15 @@ def alloc_kv_cache(
         unified_pool=unified_pool,
     )
 
+    # Record the capacity actually reserved for this group so that
+    # get_kv_cache_manager() can refuse (or derive) a manager configuration
+    # that exceeds it (issue #437).
+    _created_kv_tensor_capacity[group_id] = {
+        "num_blocks": num_blocks_per_layer,
+        "ftensor_bytes_per_layer": ftensor_bytes_per_layer,
+        "num_layers": num_layers,
+    }
+
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
 
@@ -577,8 +593,68 @@ def alloc_kv_cache(
     return kv_tensors, raw_info  # type: ignore[return-value]
 
 
+def _resolve_manager_num_blocks(
+    num_blocks: Optional[int],
+    block_size: int,
+    cell_size: int,
+    num_kv_buffers: int,
+    group_id: int,
+) -> int:
+    """Validate or derive the manager's block capacity for ``group_id``.
+
+    ``alloc_kv_cache`` sizes the KV cache tensors from device memory and can
+    create fewer blocks than requested (it warns and clamps). A
+    ``KVCacheManager`` configured with the original, larger ``num_blocks``
+    exposes page ids beyond the FTensor's reserved virtual range; the first
+    map past the reservation fails ``cuMemUnmap``/``cuMemMap`` and aborts the
+    process inside ``FTensor::map`` (issue #437, diagnosed by @rob-9).
+
+    The page-id space of a manager covers
+    ``num_blocks * block_size * cell_size`` bytes per layer per KV buffer,
+    while each created FTensor reserves ``ftensor_bytes_per_layer`` bytes for
+    all ``num_kv_buffers`` of a layer, so the per-layer capacity in the
+    caller's block geometry is
+    ``ftensor_bytes_per_layer // num_kv_buffers // (block_size * cell_size)``.
+
+    ``num_blocks=None`` derives that capacity directly. When no allocation
+    was recorded for ``group_id`` in this process (e.g. the manager lives in
+    the engine process while ``alloc_kv_cache`` runs in the worker process,
+    as in the vLLM integration), an explicit ``num_blocks`` is returned
+    unchanged and ``None`` is rejected.
+    """
+    record = _created_kv_tensor_capacity.get(group_id)
+    if record is None:
+        if num_blocks is None:
+            raise ValueError(
+                "num_blocks=None requires KV cache tensors created by "
+                f"alloc_kv_cache() in this process for group {group_id}; "
+                "no allocation is recorded to derive the capacity from."
+            )
+        return num_blocks
+
+    block_mem_size = block_size * cell_size
+    capacity_num_blocks = (
+        record["ftensor_bytes_per_layer"] // num_kv_buffers // block_mem_size
+    )
+    if num_blocks is None:
+        return capacity_num_blocks
+    if num_blocks > capacity_num_blocks:
+        raise ValueError(
+            f"num_blocks={num_blocks} exceeds the capacity of the KV cache "
+            f"tensors created by alloc_kv_cache() for group {group_id}: "
+            f"{capacity_num_blocks} blocks of {block_mem_size} bytes "
+            f"({record['ftensor_bytes_per_layer']} reserved bytes per layer, "
+            f"{num_kv_buffers} KV buffers). A manager configured beyond the "
+            "created tensors maps pages outside the reserved virtual range "
+            "and aborts in FTensor::map (issue #437). Pass num_blocks=None "
+            "to derive the capacity, or pass the clamped block count logged "
+            "by alloc_kv_cache()."
+        )
+    return num_blocks
+
+
 def get_kv_cache_manager(
-    num_blocks: int,
+    num_blocks: Optional[int],
     block_size: int,
     cell_size: int,
     num_layers: int,
@@ -586,8 +662,18 @@ def get_kv_cache_manager(
     group_id: int = 0,
     pool_name: Optional[str] = None,
 ) -> KVCacheManager:
+    """Create and register the KVCacheManager for one KV cache group.
+
+    ``num_blocks`` is validated against the capacity of the KV cache tensors
+    created by ``alloc_kv_cache`` in this process (when recorded), and may be
+    ``None`` to derive that capacity instead of passing a number.
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+
+    num_blocks = _resolve_manager_num_blocks(
+        num_blocks, block_size, cell_size, num_kv_buffers, group_id
+    )
 
     manager = KVCacheManager(
         num_blocks,
