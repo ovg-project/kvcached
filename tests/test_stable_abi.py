@@ -28,6 +28,14 @@ _UNSTABLE_SYMBOL = re.compile(
     re.VERBOSE,
 )
 
+# The one allowed exception, and only for XPU builds: csrc/xpu_runtime.cpp
+# borrows PyTorch's SYCL context and stream pool through c10::xpu, which the
+# stable ABI exposes no equivalent for (that file explains why it has to). The
+# allowance is deliberately this narrow -- any other unstable symbol still
+# fails, so a new dependency on the unstable API is still caught. The cost is
+# that XPU wheels need a rebuild per PyTorch version; CUDA and HIP do not.
+_XPU_RUNTIME_SYMBOL = re.compile(r"^_ZN[rVK]*3c103xpu")
+
 # Stable-ABI C shims added after the target version (setup.py STABLE_ABI_TARGET
 # = 2.10). extern "C", so unmangled. Importing any means the binary won't load
 # on 2.10. Canaries, not exhaustive; see torch/csrc/stable/c/shim.h.
@@ -82,7 +90,11 @@ def test_c_extension_exposes_pybind_classes(extension_so):
 
 
 def test_extension_uses_only_stable_torch_abi(imported_symbols):
-    offenders = sorted(s for s in imported_symbols if _UNSTABLE_SYMBOL.search(s))
+    offenders = sorted(
+        s
+        for s in imported_symbols
+        if _UNSTABLE_SYMBOL.search(s) and not _XPU_RUNTIME_SYMBOL.match(s)
+    )
     assert not offenders, "unstable libtorch symbols: " + ", ".join(offenders)
 
 

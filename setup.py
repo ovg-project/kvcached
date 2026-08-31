@@ -68,18 +68,41 @@ def get_extensions():
     # Get the C++ ABI flag from PyTorch
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
-    is_hip_build = bool(getattr(torch.version, "hip", None))
-    is_cuda_build = bool(getattr(torch.version, "cuda", None))
+    # KVCACHED_BACKEND forces a backend for cross-builds; otherwise infer it
+    # from the installed PyTorch. Only one of torch.version.{hip,cuda,xpu} is
+    # ever set, so the order below is not load-bearing.
+    forced_backend = os.getenv("KVCACHED_BACKEND", "").strip().lower()
+    if forced_backend not in ("", "hip", "cuda", "xpu"):
+        raise RuntimeError(
+            f"Invalid KVCACHED_BACKEND={forced_backend!r}. "
+            "Expected one of: hip, cuda, xpu."
+        )
+
+    is_hip_build = forced_backend == "hip" or (
+        not forced_backend and bool(getattr(torch.version, "hip", None))
+    )
+    is_cuda_build = not is_hip_build and (
+        forced_backend == "cuda"
+        or (not forced_backend and bool(getattr(torch.version, "cuda", None)))
+    )
+    is_xpu_build = not is_hip_build and not is_cuda_build and (
+        forced_backend == "xpu"
+        or (not forced_backend and bool(getattr(torch.version, "xpu", None)))
+    )
     if is_hip_build:
         backend_define = "-DKVCACHED_USE_HIP"
         backend_name = "HIP/ROCm"
     elif is_cuda_build:
         backend_define = "-DKVCACHED_USE_CUDA"
         backend_name = "CUDA"
+    elif is_xpu_build:
+        backend_define = "-DKVCACHED_USE_XPU"
+        backend_name = "Intel XPU (Level Zero via SYCL)"
     else:
         raise RuntimeError(
             "Unable to determine GPU backend from PyTorch. "
-            "Expected either torch.version.hip or torch.version.cuda."
+            "Expected one of torch.version.hip, torch.version.cuda or "
+            "torch.version.xpu, or an explicit KVCACHED_BACKEND."
         )
 
     extra_compile_args = [
@@ -92,12 +115,34 @@ def get_extensions():
     # Makes any at::/c10:: usage a compile error.
     extra_compile_args.append("-DTORCH_STABLE_ONLY")
 
-    ext_include_dirs = include_paths(device_type="cuda") + [
+    # HIP resolves its headers through the CUDA device type, matching how
+    # PyTorch-ROCm presents itself; XPU has its own include/library roots.
+    torch_device_type = "xpu" if is_xpu_build else "cuda"
+    ext_include_dirs = include_paths(device_type=torch_device_type) + [
         os.path.join(CSRC_PATH, "inc")
     ]
-    ext_library_dirs = library_paths(device_type="cuda")
+    ext_library_dirs = library_paths(device_type=torch_device_type)
 
-    if is_hip_build:
+    if is_xpu_build:
+        # XPU builds use CppExtension with a plain host compiler for the same
+        # reason HIP does: kvcached emits no device kernels, so there is nothing
+        # for icpx/hipcc to compile. gpu_vmm.hpp reaches Level Zero through the
+        # sycl_ext_oneapi_virtual_mem extension, which is host-side library code.
+        extra_compile_args.append("-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING=1")
+        # sycl: the virtual-memory extension entry points.
+        # c10_xpu: PyTorch's SYCL context/device accessors (see xpu_runtime.cpp),
+        #          which is what keeps kvcached mappings addressable by engine
+        #          kernels.
+        ext_libraries = ["sycl", "c10_xpu"]
+        ext_module = CppExtension(
+            "kvcached._C",
+            csrc_files,
+            include_dirs=ext_include_dirs,
+            library_dirs=ext_library_dirs,
+            libraries=ext_libraries,
+            extra_compile_args={"cxx": extra_compile_args},
+        )
+    elif is_hip_build:
         # HIP builds: use CppExtension to avoid PyTorch's hipify step.
         # Our code already handles HIP natively via gpu_vmm.hpp conditional
         # compilation, so hipify is unnecessary and breaks torch headers.
