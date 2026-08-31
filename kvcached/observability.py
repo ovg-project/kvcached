@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from kvcached.pool_registry import get_registered_kv_cache_pools
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
 
 SCHEMA_VERSION = "kvcached.observability.v1"
 
@@ -115,8 +116,81 @@ class KVCachePoolSnapshot:
         return asdict(self)
 
 
+def _get_backend_capabilities() -> Dict[str, Any]:
+    """Report allocator-level capabilities shared by every integration.
+
+    These describe the kvcached core, not a particular engine shim. Per-engine
+    differences (which attention types a shim actually accepts, for example)
+    live under ``integrations``.
+    """
+
+    return {
+        "kv_pooling": True,
+        # Physical pages are mapped and unmapped on demand under a virtual
+        # reservation, which is what makes the pool elastic.
+        "elastic_capacity": True,
+        # resize() lowers addressable capacity, draining lazily through the
+        # in_shrink state machine rather than revoking live blocks.
+        "resize": True,
+        # trim() releases pages held by the background pre-allocation thread.
+        "trim": True,
+        "page_size_bytes": PAGE_SIZE,
+        "contiguous_layout_default": CONTIGUOUS_LAYOUT,
+        # kvcached accounts for non-KV device memory but never manages it.
+        "non_kv_memory_management": False,
+    }
+
+
+def _get_integration_capabilities() -> Dict[str, Any]:
+    """Report per-engine capabilities.
+
+    Reported statically from the shim contracts in
+    ``kvcached.integration.<engine>.interfaces`` so the record can be queried
+    without importing torch or attaching to a running engine.
+    """
+
+    return {
+        "vllm": {
+            "attention_types": ["MHA", "GQA", "MLA", "HYBRID_LINEAR"],
+            "kv_layouts": ["NHD"],
+            # Hybrid attention + linear/SSM (mamba) state is carved out of the
+            # same pool via the HYBRID_LINEAR attention type.
+            "hybrid_linear_state_pooling": True,
+            # Prefix-cache blocks are evicted page-aware so eviction actually
+            # releases physical memory.
+            "prefix_caching": True,
+            "page_aware_eviction": True,
+            "worker_ipc": True,
+        },
+        "sglang": {
+            "attention_types": ["MHA", "GQA", "MLA"],
+            "kv_layouts": ["NHD"],
+            # SGLang allocates mamba/linear state through a separate
+            # alloc_mamba_states() entry point rather than the KV pool.
+            "hybrid_linear_state_pooling": True,
+            "prefix_caching": True,
+            "page_aware_eviction": False,
+            "worker_ipc": True,
+        },
+    }
+
+
 def get_capabilities() -> Dict[str, Any]:
-    """Return the stable observability surface currently exposed by kvcached."""
+    """Return the stable extension surface currently exposed by kvcached.
+
+    Consumers should feature-detect against this record rather than pinning a
+    kvcached version or inspecting private allocator/patch attributes.
+
+    Compatibility rule: new optional keys are added without bumping
+    ``schema_version``, so a consumer must treat a missing key as "unsupported"
+    rather than an error. ``schema_version`` only changes when the meaning of
+    an existing key changes incompatibly.
+
+    ``features`` reports surfaces that either exist or are known-planned; a
+    surface that has not landed yet is reported ``False`` instead of being
+    omitted, so a consumer can write the detection once and have it start
+    returning ``True`` when the surface ships.
+    """
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -126,9 +200,22 @@ def get_capabilities() -> Dict[str, Any]:
             "registered_kv_cache_pool_snapshots": True,
             "read_only": True,
             "policy_control": False,
+            # Revisioned instance memory limits. This is the one write path on
+            # the surface: the caller owns quota policy, kvcached only stores
+            # and enforces the assigned cap through the resize()/in_shrink
+            # state machine.
+            "instance_memory_limit": True,
+            # Allocator-owned operation counters. Not landed yet.
+            "operation_counters": False,
+            # Runtime reservation reporting for non-KV memory. Not landed yet.
+            "runtime_reservation_reporting": False,
         },
+        "backends": _get_backend_capabilities(),
+        "integrations": _get_integration_capabilities(),
         "pool_snapshot_fields": list(KVCachePoolSnapshot.__dataclass_fields__.keys()),
         "runtime_snapshot_fields": list(RuntimeSnapshot.__dataclass_fields__.keys()),
+        # Enumerates the counters exposed once operation observability lands.
+        "operation_counters": [],
     }
 
 

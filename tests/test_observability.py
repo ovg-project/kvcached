@@ -13,6 +13,8 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
 from kvcached.observability import (  # noqa: E402
+    KVCachePoolSnapshot,
+    RuntimeSnapshot,
     build_kv_cache_pool_snapshot,
     build_runtime_snapshot,
     get_capabilities,
@@ -408,3 +410,89 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+
+
+def test_capabilities_report_planned_surfaces_as_unsupported():
+    """Unlanded surfaces are reported False, never omitted.
+
+    A consumer writes the detection once against a build that predates the
+    surface; the same code starts returning True when it ships.
+    """
+    features = get_capabilities()["features"]
+
+    assert features["operation_counters"] is False
+    assert features["runtime_reservation_reporting"] is False
+    # Landed in #414: the one write path on the surface.
+    assert features["instance_memory_limit"] is True
+
+
+def test_capabilities_expose_backend_and_integration_records():
+    capabilities = get_capabilities()
+
+    backends = capabilities["backends"]
+    assert backends["kv_pooling"] is True
+    assert backends["elastic_capacity"] is True
+    # kvcached accounts for non-KV memory but never manages it.
+    assert backends["non_kv_memory_management"] is False
+    assert isinstance(backends["page_size_bytes"], int)
+    assert backends["page_size_bytes"] > 0
+
+    integrations = capabilities["integrations"]
+    assert set(integrations) == {"vllm", "sglang"}
+    for entry in integrations.values():
+        assert "MHA" in entry["attention_types"]
+        assert "MLA" in entry["attention_types"]
+        assert entry["kv_layouts"] == ["NHD"]
+
+    # A real, code-level distinction between the two shims: only the vLLM
+    # integration accepts HYBRID_LINEAR through alloc_kv_cache(); SGLang
+    # allocates mamba state through a separate entry point.
+    assert "HYBRID_LINEAR" in integrations["vllm"]["attention_types"]
+    assert "HYBRID_LINEAR" not in integrations["sglang"]["attention_types"]
+
+
+def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
+    """Field lists must match the dataclasses consumers actually receive."""
+    capabilities = get_capabilities()
+
+    pool_fields = capabilities["pool_snapshot_fields"]
+    runtime_fields = capabilities["runtime_snapshot_fields"]
+
+    assert pool_fields == list(KVCachePoolSnapshot.__dataclass_fields__.keys())
+    assert runtime_fields == list(RuntimeSnapshot.__dataclass_fields__.keys())
+
+    snapshot = build_kv_cache_pool_snapshot(FakeManager(), integration="vllm")
+    assert set(snapshot.to_dict()) == set(pool_fields)
+
+    # No counters until operation observability lands.
+    assert capabilities["operation_counters"] == []
+
+
+def test_capabilities_record_is_json_serializable_and_stable():
+    """The whole record must survive an exporter round-trip unchanged."""
+    capabilities = get_capabilities()
+
+    assert json.loads(json.dumps(capabilities)) == capabilities
+    assert get_capabilities() == capabilities
+
+
+def test_capabilities_need_no_private_field_access():
+    """A consumer reads the record through public keys only.
+
+    Guards the contract in #375: integrations must not have to reach into
+    allocator internals or applied-patch attributes to learn what is supported.
+    """
+    capabilities = get_capabilities()
+
+    def assert_public(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert not key.startswith("_"), f"private key exposed: {key}"
+                assert_public(value)
+        elif isinstance(node, list):
+            for item in node:
+                assert_public(item)
+
+    assert_public(capabilities)
+    for field_name in capabilities["pool_snapshot_fields"]:
+        assert not field_name.startswith("_")
