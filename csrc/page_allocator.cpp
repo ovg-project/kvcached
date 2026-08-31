@@ -648,6 +648,23 @@ void PageAllocator::start_prealloc_thread() {
 void PageAllocator::stop_prealloc_thread() { stop_prealloc_thread_internal(); }
 
 void PageAllocator::prealloc_worker() {
+  // The current device is per thread in every backend (cudaSetDevice,
+  // hipSetDevice and c10::xpu::set_device alike), so this thread starts on
+  // device 0 whatever the engine chose. get_avail_physical_pages() asks the
+  // current device, so without this a rank on device 3 would size its pool by
+  // device 0's free memory. The mappings themselves name their device and are
+  // unaffected.
+  const int dev_idx = FTensorAllocator::device_index();
+  if (dev_idx >= 0) {
+    const auto res = gpu_vmm::set_device(dev_idx);
+    if (!gpu_vmm::is_success(res)) {
+      LOGGER(ERROR,
+             "prealloc worker could not select %s device %d (%s); free-memory "
+             "queries on this thread will ask the default device.",
+             gpu_vmm::backend_name(), dev_idx, gpu_vmm::error_string(res));
+    }
+  }
+
   auto start_time = std::chrono::steady_clock::now();
 
   while (prealloc_running_) {
