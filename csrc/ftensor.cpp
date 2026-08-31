@@ -8,6 +8,7 @@
 #include <c10/core/ScalarType.h>
 
 #include "constants.hpp"
+#include "device_utils.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
 #include "page.hpp"
@@ -31,9 +32,9 @@ static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
 
   generic_ptr_t vaddr;
   size_t offset = g_vaddr_allocated_offset.fetch_add(size);
-  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
-  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
-  if (dev.is_cuda()) {
+  // is_accelerator() covers NVIDIA (CUDA), AMD (HIP/ROCm, which PyTorch
+  // masquerades as CUDA) and Intel (XPU) devices. See device_utils.hpp.
+  if (is_accelerator(dev)) {
     CHECK_GPU(gpu_vmm::address_reserve(
         reinterpret_cast<void **>(&vaddr), size, alignment_2mb,
         reinterpret_cast<void *>(kStartAddr + offset)));
@@ -49,7 +50,7 @@ static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
 static inline std::unique_ptr<Page> make_unique_page(const c10::Device &dev,
                                                      page_id_t page_id,
                                                      size_t page_size = 0) {
-  if (dev.is_cuda()) {
+  if (is_accelerator(dev)) {
     return std::make_unique<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
   } else if (dev.is_cpu()) {
@@ -77,7 +78,7 @@ FTensor::FTensor(const std::string &name, size_t size, c10::ScalarType dtype,
 
 FTensor::~FTensor() {
   if (vaddr_) {
-    if (dev_.is_cuda()) {
+    if (is_accelerator(dev_)) {
       // Tolerate stale VMM mappings during teardown: log, do not abort.
       auto res = gpu_vmm::mem_unmap(vaddr_, size_);
       if (!gpu_vmm::is_success(res)) {
@@ -108,7 +109,7 @@ bool FTensor::map(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  if (dev_.is_cuda()) {
+  if (is_accelerator(dev_)) {
     CHECK_GPU(gpu_vmm::mem_unmap(vaddr, page_size_));
   }
 
@@ -128,7 +129,7 @@ bool FTensor::unmap(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  if (dev_.is_cuda()) {
+  if (is_accelerator(dev_)) {
     CHECK_GPU(gpu_vmm::mem_unmap(vaddr, page_size_));
   }
 
@@ -148,7 +149,7 @@ bool FTensor::map_(Page *page, offset_t offset, bool set_access) {
 }
 
 bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
-  if (!dev_.is_cuda()) {
+  if (!is_accelerator(dev_)) {
     return true;
   }
   auto access_desc =

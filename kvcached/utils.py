@@ -153,24 +153,80 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
 
 
+def _detect_accelerator_backend() -> str:
+    """Return the accelerator family for this process: ``cuda``, ``hip`` or ``xpu``.
+
+    Mirrors ``setup.py``'s build-time detection so the Python layer and the
+    compiled extension always agree on the backend. ``KVCACHED_BACKEND``
+    overrides both. Note that ``hip`` is reported here but addressed as ``cuda``
+    everywhere else, because PyTorch-ROCm presents AMD GPUs as CUDA devices.
+    """
+    override = os.getenv("KVCACHED_BACKEND", "").strip().lower()
+    if override in ("cuda", "hip", "xpu"):
+        return override
+    try:
+        import torch
+        if getattr(torch.version, "hip", None):
+            return "hip"
+        if getattr(torch.version, "cuda", None):
+            return "cuda"
+        if getattr(torch.version, "xpu", None):
+            return "xpu"
+    except Exception:
+        # torch is absent (e.g. the dependency-isolated CPU test suite); the
+        # value is unused in that case.
+        pass
+    return "cuda"
+
+
+ACCELERATOR_BACKEND = _detect_accelerator_backend()
+IS_XPU_BACKEND = ACCELERATOR_BACKEND == "xpu"
+
+
+def get_device_type() -> str:
+    """PyTorch device-string prefix for this backend: ``xpu`` or ``cuda``."""
+    return "xpu" if IS_XPU_BACKEND else "cuda"
+
+
+def get_device_module():
+    """Return the ``torch`` submodule that owns this backend's devices.
+
+    ``torch.cuda`` covers both NVIDIA and AMD (ROCm) but not Intel, so every
+    device/capacity query in kvcached goes through this rather than hardcoding
+    ``torch.cuda``.
+    """
+    import torch
+    return torch.xpu if IS_XPU_BACKEND else torch.cuda
+
+
+def get_current_device_str() -> str:
+    """Device string for the calling process's current accelerator."""
+    return f"{get_device_type()}:{get_device_module().current_device()}"
+
+
 def _default_contiguous_layout() -> bool:
-    """Default KV-cache layout: contiguous on CUDA, non-contiguous on HIP/ROCm.
+    """Default KV-cache layout: contiguous on CUDA, non-contiguous on HIP and XPU.
 
     An explicit ``KVCACHED_CONTIGUOUS_LAYOUT`` always wins. Otherwise we pick
     non-contiguous on ROCm: the contiguous (compound-page) layout hands the
     attention backend strided/interleaved per-layer KV tensors, which vLLM's
     ROCm attention path (``split_kv_cache`` + paged kernels) reads incorrectly,
     whereas CUDA's FlashAttention/FlashInfer tolerate it.
+
+    XPU takes the same conservative default for now. Whether Intel's attention
+    backends tolerate the strided layout has not been measured on hardware, and
+    the per-layer layout is the one closest to what an unpatched engine
+    allocates. Flip this once ``test_hybrid_contiguous_layout.py`` and a
+    generation-parity run pass on an Intel GPU, and record the evidence here as
+    the ROCm note above does.
     """
     explicit = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT")
     if explicit is not None:
         return explicit.lower() == "true"
-    try:
-        import torch
-        if getattr(torch.version, "hip", None):
-            return False  # ROCm/HIP: non-contiguous is required for correctness
-    except Exception:
-        pass
+    if ACCELERATOR_BACKEND in ("hip", "xpu"):
+        # ROCm/HIP: non-contiguous is required for correctness.
+        # XPU: unvalidated on hardware; prefer the safer layout.
+        return False
     return True
 
 

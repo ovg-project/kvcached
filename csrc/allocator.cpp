@@ -3,10 +3,13 @@
 
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "allocator.hpp"
 #include "constants.hpp"
+#include "device_utils.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
 #include "page.hpp"
@@ -31,9 +34,9 @@ static inline std::shared_ptr<Page> make_shared_page(const c10::Device &dev,
     return gpu_vmm::current_device();
   };
 
-  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
-  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
-  if (dev.is_cuda()) {
+  // is_accelerator() covers NVIDIA (CUDA), AMD (HIP/ROCm, which PyTorch
+  // masquerades as CUDA) and Intel (XPU) devices. See device_utils.hpp.
+  if (is_accelerator(dev)) {
     return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
   } else if (dev.is_cpu()) {
@@ -55,7 +58,7 @@ FTensorAllocator::FTensorAllocator(const c10::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
       unified_pool_(false), kv_tensor_size_per_layer_(0) {
-  if (dev_.is_cuda()) {
+  if (is_accelerator(dev_)) {
     init_gpu_();
   }
 }
@@ -92,6 +95,23 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   }
 
   auto device = c10::Device(dev_str);
+  // One build serves exactly one accelerator family, plus CPU. Reject any other
+  // family here, before any global state is set, because is_accelerator() is
+  // false for it: the reservation would take the host mmap() path while
+  // at::from_blob() still labels the tensor with the requested device, handing
+  // the engine a tensor that claims to be on an accelerator but is backed by
+  // host memory -- and init_gpu_(), which is what proves the device supports
+  // VMM at all, would never run.
+  //
+  // Thrown rather than ASSERT()ed: extension builds compile with NDEBUG, so
+  // assert() is removed and ASSERT() degrades to a log line.
+  if (!is_accelerator(device) && !device.is_cpu()) {
+    std::ostringstream oss;
+    oss << "kvcached was built for " << gpu_vmm::backend_name()
+        << " and cannot allocate on device '" << dev_str
+        << "'. Rebuild kvcached for that device's backend (KVCACHED_BACKEND).";
+    throw std::runtime_error(oss.str());
+  }
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
   g_allocators_[0] =
