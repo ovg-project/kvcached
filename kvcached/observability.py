@@ -80,6 +80,12 @@ class KVCachePoolSnapshot:
     The page-count fields are captured atomically with respect to allocator
     mutations. Other fields remain best-effort and may come from marginally
     different instants.
+
+    ``lifecycle_phase`` is the pool's level-triggered lifecycle phase
+    (``kvcached.lifecycle.LifecyclePhase`` values ``initializing``,
+    ``ready``, ``degraded``, ``failed``), or ``None`` when the manager does
+    not expose one. It is poll-only; ``KVCacheManager.wait_ready()`` is the
+    blocking gate.
     """
 
     schema_version: str
@@ -111,9 +117,18 @@ class KVCachePoolSnapshot:
     in_shrink: bool
     shrink_target_blocks: Optional[int]
     resize_target_bytes: Optional[int]
+    # Added with #375 item (5); optional so older builders keep working.
+    lifecycle_phase: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _lifecycle_phase_value(obj: Any) -> Optional[str]:
+    phase = getattr(obj, "lifecycle_phase", None)
+    if phase is None:
+        return None
+    return str(getattr(phase, "value", phase))
 
 
 def _get_backend_capabilities() -> Dict[str, Any]:
@@ -223,6 +238,10 @@ def get_capabilities() -> Dict[str, Any]:
             "operation_counters": False,
             # Runtime reservation reporting for non-KV memory. Not landed yet.
             "runtime_reservation_reporting": False,
+            # Poll-only lifecycle readiness (#375, item 5): every pool exposes
+            # ``lifecycle_phase``, ``lifecycle_error`` and ``wait_ready()``,
+            # and ``KVCachePoolSnapshot.lifecycle_phase`` carries the phase.
+            "lifecycle_readiness": True,
         },
         "backends": _get_backend_capabilities(),
         "integrations": _get_integration_capabilities(),
@@ -344,6 +363,7 @@ def build_kv_cache_pool_snapshot(
         in_shrink=bool(getattr(manager, "in_shrink", False)),
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
+        lifecycle_phase=_lifecycle_phase_value(manager),
     )
 
 
