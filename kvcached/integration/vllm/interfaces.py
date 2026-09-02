@@ -17,7 +17,11 @@ from kvcached.pool_registry import (
     get_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
+from kvcached.tp_ipc_util import (
+    resolve_gpu_device_index,
+    start_worker_listener_thread,
+    stop_worker_listener_threads,
+)
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -118,17 +122,19 @@ def init_kvcached(
 
 
 def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_device, _async_sched, _is_worker
     _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
         return
 
+    stop_worker_listener_threads()
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _is_worker = False
 
 
 def build_kv_views(
