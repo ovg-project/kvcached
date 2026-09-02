@@ -80,6 +80,9 @@ class FakeManager:
         assert unit == "bytes"
         return 6 * self.num_layers * self.page_size * self.num_kv_buffers
 
+    def shutdown(self):
+        pass
+
 
 def test_capabilities_are_json_serializable():
     capabilities = get_capabilities()

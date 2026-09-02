@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,7 @@ from kvcached.utils import (
     PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
+    SHM_DIR,
     KVCachedConfigError,
     get_kvcached_logger,
 )
@@ -121,6 +123,10 @@ class KVCacheManager:
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
+        # Name of the /dev/shm segment the C++ MemInfoTracker creates for
+        # this pool; shutdown() unlinks it.
+        self.ipc_name = DEFAULT_IPC_NAME
+        self._shut_down = False
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -132,7 +138,7 @@ class KVCacheManager:
             enable_page_prealloc=PAGE_PREALLOC_ENABLED,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
-            ipc_name=DEFAULT_IPC_NAME,
+            ipc_name=self.ipc_name,
         )
         # Tell the C++ PageAllocator whether map/unmap must be broadcast to
         # worker processes over IPC, even with world_size == 1 (e.g. vLLM V1
@@ -727,6 +733,31 @@ class KVCacheManager:
         return self.observability_snapshot(
             integration=integration,
         ).to_dict()
+
+    def shutdown(self) -> None:
+        """Release the state this pool keeps outside the process.
+
+        The C++ MemInfoTracker unlinks its /dev/shm segment only from its
+        destructor, which never runs when the owning process leaves through
+        os._exit (vLLM's forked EngineCore after SIGTERM, issue #477). Stop
+        the prealloc thread, then unlink the segment here, exactly what the
+        destructor would do. Safe to call more than once.
+        """
+        if self._shut_down:
+            return
+        self._shut_down = True
+        try:
+            self.page_allocator.stop_prealloc_thread()
+        except Exception as e:
+            logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
+        segment = os.path.join(SHM_DIR, self.ipc_name)
+        try:
+            os.unlink(segment)
+            logger.info("Unlinked KV cache limit segment %s", segment)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to unlink %s on shutdown: %s", segment, e)
 
     @synchronized
     def clear(self):

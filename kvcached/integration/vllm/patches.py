@@ -940,7 +940,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
 
 class EngineCorePatch(VersionAwarePatch, BasePatch):
-    """Patch EngineCore.__init__ to initialize kvcached"""
+    """Patch EngineCore.__init__ / shutdown to initialize and release kvcached"""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core"
@@ -953,7 +953,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return False
 
         # Apply version-specific patches
-        return self.patch_engine_init(engine_mod)
+        init_patched = self.patch_engine_init(engine_mod)
+        shutdown_patched = self.patch_engine_shutdown(engine_mod)
+        return init_patched and shutdown_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -987,6 +989,48 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_engine_shutdown(self, engine_mod: types.ModuleType) -> bool:
+        """Patch EngineCore.shutdown to release kvcached state.
+
+        run_engine_core() always ends in EngineCore.shutdown(), after which
+        the forked EngineCore leaves through os._exit: no destructor runs,
+        so the /dev/shm segment created by the C++ MemInfoTracker was never
+        unlinked (issue #477). shutdown_kvcached() unlinks it while the
+        process is still alive, after vLLM's own teardown.
+        """
+        EngineCore = self._get_target_class(engine_mod)
+        if EngineCore is None:
+            return False
+
+        original_shutdown = getattr(EngineCore, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "EngineCore.shutdown not found; kvcached state is not released on engine exit")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("EngineCore.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_engine_shutdown(self, *args: Any, **kwargs: Any):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.integration.vllm.interfaces import shutdown_kvcached
+
+                        shutdown_kvcached()
+                    except Exception as e:
+                        logger.warning("Failed to shut down kvcached: %s", e)
+
+        self._mark_as_patched(_patched_engine_shutdown, "shutdown")
+        EngineCore.shutdown = _patched_engine_shutdown  # type: ignore[assignment]
         return True
 
 

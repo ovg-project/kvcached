@@ -14,6 +14,7 @@ from kvcached.observability import (
 )
 from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
+    get_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
 from kvcached.tp_ipc_util import start_worker_listener_thread
@@ -99,6 +100,14 @@ def shutdown_kvcached() -> None:
         clear_registered_kv_cache_pools(integration="vllm")
         return
 
+    # Pools first: each unlinks its /dev/shm segment while the process is
+    # still alive (issue #477), then the allocator.
+    for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
+        try:
+            manager.shutdown()
+        except Exception as e:
+            logger.warning("Failed to shut down KV cache pool %s: %s",
+                           getattr(manager, "pool_name", None), e)
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
