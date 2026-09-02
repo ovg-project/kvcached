@@ -148,6 +148,8 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["available_physical_pages"] == 4
     assert data["effective_free_pages"] == 6
     assert data["resize_target_bytes"] == 0
+    # A manager-like object without a lifecycle reports no phase.
+    assert data["lifecycle_phase"] is None
     assert FakeManager.page_allocator.page_state_calls == 1
     json.dumps(data)
 
@@ -425,6 +427,8 @@ def test_capabilities_report_planned_surfaces_as_unsupported():
     assert features["runtime_reservation_reporting"] is False
     # Landed in #414: the one write path on the surface.
     assert features["instance_memory_limit"] is True
+    # Landed with #375 item (5): poll-only lifecycle readiness.
+    assert features["lifecycle_readiness"] is True
 
 
 def test_capabilities_expose_backend_and_integration_records():
