@@ -271,6 +271,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
     setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: None)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
@@ -357,6 +358,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
     setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: None)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
