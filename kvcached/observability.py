@@ -134,7 +134,12 @@ def _get_backend_capabilities() -> Dict[str, Any]:
         "resize": True,
         # trim() releases pages held by the background pre-allocation thread.
         "trim": True,
-        "page_size_bytes": PAGE_SIZE,
+        # Both values below are read from the environment when
+        # ``kvcached.utils`` is imported, so they describe THIS process, not a
+        # live engine. A control plane importing kvcached out of process sees
+        # its own environment. For the runtime page size of a specific pool,
+        # read ``KVCachePoolSnapshot.page_size_bytes`` instead.
+        "default_page_size_bytes": PAGE_SIZE,
         "contiguous_layout_default": CONTIGUOUS_LAYOUT,
         # kvcached accounts for non-KV device memory but never manages it.
         "non_kv_memory_management": False,
@@ -146,7 +151,9 @@ def _get_integration_capabilities() -> Dict[str, Any]:
 
     Reported statically from the shim contracts in
     ``kvcached.integration.<engine>.interfaces`` so the record can be queried
-    without importing torch or attaching to a running engine.
+    without importing an engine shim or attaching to a running engine.
+    (Importing ``kvcached`` itself still requires torch; see
+    ``kvcached/__init__.py``.)
     """
 
     return {
@@ -154,8 +161,10 @@ def _get_integration_capabilities() -> Dict[str, Any]:
             "attention_types": ["MHA", "GQA", "MLA", "HYBRID_LINEAR"],
             "kv_layouts": ["NHD"],
             # Hybrid attention + linear/SSM (mamba) state is carved out of the
-            # same pool via the HYBRID_LINEAR attention type.
+            # same pool via the HYBRID_LINEAR attention type, so that state is
+            # visible in this pool's KVCachePoolSnapshot.
             "hybrid_linear_state_pooling": True,
+            "hybrid_linear_state_pooling_mode": "unified_pool",
             # Prefix-cache blocks are evicted page-aware so eviction actually
             # releases physical memory.
             "prefix_caching": True,
@@ -164,10 +173,15 @@ def _get_integration_capabilities() -> Dict[str, Any]:
         },
         "sglang": {
             "attention_types": ["MHA", "GQA", "MLA"],
+            # Validated for MHA/GQA only; the SGLang shim skips the layout
+            # check for MLA, where the argument is ignored rather than
+            # rejected.
             "kv_layouts": ["NHD"],
             # SGLang allocates mamba/linear state through a separate
-            # alloc_mamba_states() entry point rather than the KV pool.
+            # alloc_mamba_states() entry point rather than the KV pool, so
+            # that state does NOT appear in this pool's KVCachePoolSnapshot.
             "hybrid_linear_state_pooling": True,
+            "hybrid_linear_state_pooling_mode": "separate_allocation",
             "prefix_caching": True,
             "page_aware_eviction": False,
             "worker_ipc": True,
@@ -214,8 +228,10 @@ def get_capabilities() -> Dict[str, Any]:
         "integrations": _get_integration_capabilities(),
         "pool_snapshot_fields": list(KVCachePoolSnapshot.__dataclass_fields__.keys()),
         "runtime_snapshot_fields": list(RuntimeSnapshot.__dataclass_fields__.keys()),
-        # Enumerates the counters exposed once operation observability lands.
-        "operation_counters": [],
+        # Names the counters exposed once operation observability lands. Kept
+        # coupled to features["operation_counters"]: this list is non-empty if
+        # and only if that flag is True.
+        "operation_counter_names": [],
     }
 
 

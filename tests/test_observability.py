@@ -24,6 +24,7 @@ from kvcached.pool_registry import (  # noqa: E402
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
+from kvcached.utils import PAGE_SIZE  # noqa: E402
 
 
 class FakePageAllocator:
@@ -434,8 +435,11 @@ def test_capabilities_expose_backend_and_integration_records():
     assert backends["elastic_capacity"] is True
     # kvcached accounts for non-KV memory but never manages it.
     assert backends["non_kv_memory_management"] is False
-    assert isinstance(backends["page_size_bytes"], int)
-    assert backends["page_size_bytes"] > 0
+    # Named "default_" because it is this process's import-time env value, not
+    # a live engine's page size; consumers needing the runtime value read
+    # KVCachePoolSnapshot.page_size_bytes.
+    assert backends["default_page_size_bytes"] == PAGE_SIZE
+    assert "page_size_bytes" not in backends
 
     integrations = capabilities["integrations"]
     assert set(integrations) == {"vllm", "sglang"}
@@ -449,6 +453,36 @@ def test_capabilities_expose_backend_and_integration_records():
     # allocates mamba state through a separate entry point.
     assert "HYBRID_LINEAR" in integrations["vllm"]["attention_types"]
     assert "HYBRID_LINEAR" not in integrations["sglang"]["attention_types"]
+
+
+def test_hybrid_linear_pooling_mode_distinguishes_the_two_shapes():
+    """The bool alone cannot answer "is that state in the pool snapshot?".
+
+    Both shims report hybrid_linear_state_pooling True, but vLLM carves the
+    state out of the KV pool (so it shows up in KVCachePoolSnapshot) while
+    SGLang allocates it separately (so it does not). Consumers branch on the
+    mode rather than parsing comments.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for entry in integrations.values():
+        assert entry["hybrid_linear_state_pooling"] is True
+
+    assert integrations["vllm"]["hybrid_linear_state_pooling_mode"] == "unified_pool"
+    assert (
+        integrations["sglang"]["hybrid_linear_state_pooling_mode"]
+        == "separate_allocation"
+    )
+
+
+def test_operation_counter_names_stay_coupled_to_their_feature_flag():
+    """One flip when #410 lands, not two that can drift apart."""
+    capabilities = get_capabilities()
+
+    flag = capabilities["features"]["operation_counters"]
+    names = capabilities["operation_counter_names"]
+
+    assert bool(names) == flag
 
 
 def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
@@ -465,7 +499,7 @@ def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
     assert set(snapshot.to_dict()) == set(pool_fields)
 
     # No counters until operation observability lands.
-    assert capabilities["operation_counters"] == []
+    assert capabilities["operation_counter_names"] == []
 
 
 def test_capabilities_record_is_json_serializable_and_stable():
@@ -496,3 +530,4 @@ def test_capabilities_need_no_private_field_access():
     assert_public(capabilities)
     for field_name in capabilities["pool_snapshot_fields"]:
         assert not field_name.startswith("_")
+
