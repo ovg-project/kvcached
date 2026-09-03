@@ -531,3 +531,60 @@ def test_capabilities_need_no_private_field_access():
     for field_name in capabilities["pool_snapshot_fields"]:
         assert not field_name.startswith("_")
 
+
+
+def _load_shim_under_stubs(engine, monkeypatch):
+    """Import an engine shim with its heavy deps stubbed out.
+
+    Same approach as the factory tests above, reduced to what module import
+    needs: the shim's module-level constants, not a working engine.
+    """
+    torch = types.ModuleType("torch")
+    setattr(torch, "dtype", object)
+    setattr(torch, "Tensor", object)
+    setattr(torch, "cuda", types.SimpleNamespace(current_device=lambda: 0))
+
+    manager_module = types.ModuleType("kvcached.kv_cache_manager")
+    setattr(manager_module, "KVCacheManager", object)
+
+    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
+    setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+
+    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
+    setattr(vmm_ops_module, "create_kv_tensors", lambda *args, **kwargs: [])
+    setattr(vmm_ops_module, "init_kvcached", lambda *args, **kwargs: None)
+    setattr(vmm_ops_module, "shutdown_kvcached", lambda: None)
+
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "kvcached.kv_cache_manager", manager_module)
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+
+    module_path = (
+        Path(__file__).parents[1] / "kvcached" / "integration" / engine / "interfaces.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"_test_{engine}_interfaces_constants", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    return shim
+
+
+def test_reported_attention_types_match_the_shim_guards(monkeypatch):
+    """The record must not drift from the guards it claims to describe.
+
+    Both are derived from the shim's SUPPORTED_* constants, so adding an
+    attention type to a shim without updating the other side fails here
+    instead of silently shipping a stale record.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for engine in ("vllm", "sglang"):
+        shim = _load_shim_under_stubs(engine, monkeypatch)
+        assert integrations[engine]["attention_types"] == list(
+            shim.SUPPORTED_ATTENTION_TYPES
+        )
+        assert integrations[engine]["kv_layouts"] == list(shim.SUPPORTED_KV_LAYOUTS)
