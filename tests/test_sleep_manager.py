@@ -323,6 +323,56 @@ async def test_api_methods_simulation(manager):
     assert hasattr(manager, 'handle_model_wakeup_on_request')
 
 
+@pytest.mark.asyncio
+async def test_concurrent_sleep_calls_issue_one_upstream_request(manager,
+                                                                 monkeypatch):
+    manager.add_vllm_model("model")
+    release = asyncio.Event()
+    calls = 0
+
+    async def sleep_api(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_sleep_api", sleep_api)
+
+    first = asyncio.create_task(manager.put_model_to_sleep("model"))
+    second = asyncio.create_task(manager.put_model_to_sleep("model"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_wakeup_calls_issue_one_upstream_request(manager,
+                                                                  monkeypatch):
+    manager.add_vllm_model("model")
+    manager.sleeping_models["model"] = 0
+    manager.config.min_sleep_duration = 0
+    release = asyncio.Event()
+    calls = 0
+
+    async def wakeup_api(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_wakeup_api", wakeup_api)
+
+    first = asyncio.create_task(manager.wakeup_model("model"))
+    second = asyncio.create_task(manager.wakeup_model("model"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    assert calls == 1
+
+
 async def test_sglang_api_methods_simulation(manager):
     """Test SGLang-specific API method behavior"""
     print("\n=== Testing SGLang API Methods Simulation ===")

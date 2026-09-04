@@ -49,6 +49,7 @@ class SleepManager:
         }  # model_name -> sleep_start_time
         self.manual_sleep_models: Set[str] = set(
         )  # Models manually put to sleep
+        self._model_locks: Dict[str, asyncio.Lock] = {}
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         # Initialize default vLLM models config if not provided
@@ -92,6 +93,11 @@ class SleepManager:
         Returns:
             True if model was put to sleep, False if already sleeping or error
         """
+        async with self._model_locks.setdefault(model_name, asyncio.Lock()):
+            return await self._put_model_to_sleep(model_name, manual)
+
+    async def _put_model_to_sleep(self, model_name: str,
+                                  manual: bool) -> bool:
         if model_name in self.sleeping_models:
             logger.info(f"Model {model_name} is already sleeping")
             return False
@@ -147,6 +153,10 @@ class SleepManager:
         Returns:
             True if model was woken up, False if not sleeping or error
         """
+        async with self._model_locks.setdefault(model_name, asyncio.Lock()):
+            return await self._wakeup_model(model_name)
+
+    async def _wakeup_model(self, model_name: str) -> bool:
         if model_name not in self.sleeping_models:
             logger.info(f"Model {model_name} is not sleeping")
             return False
