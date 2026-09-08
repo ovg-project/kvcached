@@ -54,7 +54,8 @@ def synchronized(method):
     return synchronized_method
 
 
-def _page_capacity(page_id: int, page_size: int, block_mem_size: int) -> int:
+def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
+                   *, internal_page: Any = None) -> int:
     """Return the number of usable blocks on a page.
 
     Blocks straddling a page boundary belong to neither page (see the
@@ -72,9 +73,13 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int) -> int:
     Module-level (rather than a staticmethod) so it is unit-testable
     without the compiled ``kvcached.vmm_ops`` extension or a GPU,
     matching the ``_get_max_cached_blocks`` / ``_make_cache_key`` idiom.
+    The optional ``internal_page`` keyword lets tests inject a pure-Python
+    ``InternalPage`` stand-in without depending on import-order-sensitive
+    module-global rebinding.
     """
-    start, end = InternalPage.get_block_range(page_id, page_size,
-                                               block_mem_size)
+    ip = internal_page if internal_page is not None else InternalPage
+    start, end = ip.get_block_range(page_id, page_size,
+                                    block_mem_size)
     return end - start
 
 

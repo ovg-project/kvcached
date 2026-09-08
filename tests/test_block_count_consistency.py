@@ -116,14 +116,15 @@ def test_page_capacity_mirrors_get_block_range_not_get_num_blocks():
     usable blocks — while get_num_blocks reports 1 for every page id. This
     is the 0-block page that _alloc parks in full_pages.
     """
-    # Imported lazily so the bug-reproduction tests below collect and run on
-    # master (where _page_capacity does not exist yet) instead of failing at
-    # import time.
+    # Pass RichInternalPage explicitly so the test does not depend on
+    # import-order-sensitive module-global rebinding by the autouse
+    # fixture — other cpu-manifest tests install stubs with empty
+    # FakeInternalPage classes that can race the fixture on CI.
     from kvcached.kv_cache_manager import _page_capacity
 
-    assert _page_capacity(0, 4, 3) == 1  # range [0, 1)
-    assert _page_capacity(1, 4, 3) == 0  # range [2, 2) — parked 0-block page
-    assert _page_capacity(2, 4, 3) == 1  # range [3, 4)
+    assert _page_capacity(0, 4, 3, internal_page=RichInternalPage) == 1  # range [0, 1)
+    assert _page_capacity(1, 4, 3, internal_page=RichInternalPage) == 0  # range [2, 2) — parked 0-block page
+    assert _page_capacity(2, 4, 3, internal_page=RichInternalPage) == 1  # range [3, 4)
     # The theoretical get_num_blocks reports 1 for every page id, so counting
     # page_id=1 with it inflates capacity by 1.
     assert RichInternalPage.get_num_blocks(4, 3) == 1
