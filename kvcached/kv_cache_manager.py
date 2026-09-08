@@ -202,8 +202,10 @@ class KVCacheManager:
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
         # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
-        # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated on resize() and
-        # when in_shrink toggles so a resize/shrink is never served stale.
+        # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated after every
+        # physical-pool mutation the manager drives (alloc, free, resize,
+        # trim, clear) and the in_shrink completion toggle, so a mutation is
+        # never served stale.
         self._avail_physical_pages_cache: Optional[int] = None
         self._avail_physical_pages_ts: float = 0.0
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
@@ -600,6 +602,11 @@ class KVCacheManager:
         """
         self._wait_post_init()
         self.page_allocator.trim()
+        # trim() unmaps reserved pages, returning them to the driver free
+        # pool; drop the cached count so available_size() re-reads instead
+        # of serving a pre-trim value for one TTL window. free() invalidates
+        # for the same grow-direction mutation, so trim() does too.
+        self._avail_physical_pages_cache = None
 
     @synchronized
     def set_memory_limit(
@@ -704,8 +711,16 @@ class KVCacheManager:
         on every available_size(), which runs per alloc
         (kvcached/integration/vllm/patches.py:792) and per scheduler step
         (:927); the TTL window collapses those to one driver read. The cache
-        is invalidated on resize() and when in_shrink toggles, so a
-        resize/shrink is never served stale physical-free data.
+        is invalidated after every physical-pool mutation the manager drives
+        -- alloc mapping a page, free(), resize(), trim(), and clear() --
+        plus the in_shrink completion toggle, so a mutation is never served
+        stale physical-free data. The TTL window also bounds two same-process
+        sources the manager cannot invalidate: the C++ prealloc thread mapping
+        reserved pages in the background (a stale avail plus live reserved
+        double-counts them for up to one window), and a sibling pool in a
+        multi-manager process whose invalidation does not reach this cache;
+        both are absorbed by the alloc_page miss path the way cross-process
+        races already are.
         get_num_free_pages() and get_num_reserved_pages() stay uncached (cheap
         / atomic). Called under available_size()'s @synchronized lock, so the
         cache read/write here is already serialized.
