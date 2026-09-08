@@ -9,6 +9,8 @@ can consume kvcached status without depending on private patch details.
 """
 
 from __future__ import annotations
+from collections import deque
+import time as time_module
 
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
@@ -16,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from kvcached.pool_registry import get_registered_kv_cache_pools
 
 SCHEMA_VERSION = "kvcached.observability.v1"
+_HISTORY_MAXLEN = 120
 
 def _call_int(obj: Any, name: str) -> Optional[int]:
     method = getattr(obj, name, None)
@@ -114,6 +117,7 @@ class KVCachePoolSnapshot:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+_pool_snapshot_history: Dict[int, deque[tuple[float, KVCachePoolSnapshot]]] = {}
 
 def get_capabilities() -> Dict[str, Any]:
     """Return the stable observability surface currently exposed by kvcached."""
@@ -124,6 +128,7 @@ def get_capabilities() -> Dict[str, Any]:
             "runtime_snapshot": True,
             "kv_cache_pool_snapshot": True,
             "registered_kv_cache_pool_snapshots": True,
+            "pool_snapshot_history": True,
             "read_only": True,
             "policy_control": False,
         },
@@ -211,7 +216,7 @@ def build_kv_cache_pool_snapshot(
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
 
-    return KVCachePoolSnapshot(
+    snapshot = KVCachePoolSnapshot(
         schema_version=SCHEMA_VERSION,
         pool_type="kv_cache",
         integration=integration,
@@ -242,6 +247,29 @@ def build_kv_cache_pool_snapshot(
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
     )
+
+    history = _pool_snapshot_history.setdefault(
+        snapshot.group_id,
+        deque(maxlen=_HISTORY_MAXLEN),
+    )
+
+    history.append((time_module.time(), snapshot))
+    return snapshot
+
+
+def get_kv_cache_pool_snapshot_history(
+        group_id: int,
+) -> List[Dict[str, Any]]:
+    history = _pool_snapshot_history.get(group_id, [])
+
+    return [
+        {"timestamp": timestamp, **snapshot.to_dict()}
+        for timestamp, snapshot in history
+    ]
+
+
+def clear_kv_cache_pool_history() -> None:
+    _pool_snapshot_history.clear()
 
 
 def _snapshot_one_pool(
