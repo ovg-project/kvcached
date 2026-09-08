@@ -214,3 +214,47 @@ def test_available_size_refetches_after_alloc():
     assert after == initial - BLOCKS_PER_PAGE
     # alloc invalidated the cache, so available_size re-read the driver.
     assert allocator.get_avail_call_count == 2
+
+
+class TrimFreeingPageAllocator(CountingPageAllocator):
+    """Adds trim(): unmapping reserved pages grows the driver free pool, which
+    available_size()'s cache must reflect. Mirrors the C++ PageAllocator side
+    of trim() so the staleness regression is exercisable without a GPU."""
+
+    def __init__(self, physical_free: int = 100, freed_by_trim: int = 50) -> None:
+        super().__init__()
+        self.physical_free = physical_free
+        self.freed_by_trim = freed_by_trim
+
+    def get_avail_physical_pages(self) -> int:
+        self.get_avail_call_count += 1
+        return self.physical_free
+
+    def get_num_free_pages(self) -> int:
+        return self.physical_free
+
+    def trim(self) -> None:
+        # Unmapping reserved pages returns them to the driver free pool, so
+        # the next available_size() must re-read.
+        self.physical_free += self.freed_by_trim
+
+
+def test_available_size_refetches_after_trim():
+    """trim() unmaps reserved pages, growing the driver free pool;
+    available_size() must re-read instead of serving a pre-trim cached count
+    for one TTL window (regression for the trim staleness nit on #456)."""
+    allocator = TrimFreeingPageAllocator(physical_free=100, freed_by_trim=50)
+    manager = make_manager()
+    manager.page_allocator = allocator
+
+    initial = manager.available_size()
+    assert allocator.get_avail_call_count == 1  # cached on first call
+
+    manager.trim()  # unmaps reserved pages: physical_free 100 -> 150
+
+    after = manager.available_size()
+    # Capacity must rise by the freed pages' worth of blocks, not stay at
+    # the pre-trim cached value.
+    assert after == initial + 50 * BLOCKS_PER_PAGE
+    # trim invalidated the cache, so available_size re-read the driver.
+    assert allocator.get_avail_call_count == 2
