@@ -26,6 +26,7 @@ Red on master: ``_get_num_alloced_blocks`` sizes every page with
 page contributes 0.
 """
 import sys
+import threading
 import types
 
 import pytest
@@ -179,6 +180,78 @@ def test_get_num_alloced_blocks_avail_pages_uses_boundary_capacity():
     )
 
     assert manager._get_num_alloced_blocks() == 1
+
+
+class _ShrinkRefusingPageAllocator:
+    """Fake PageAllocator whose resize() refuses (returns False), mirroring
+    the C++ resize() that rejects a shrink when in-use pages sit above the
+    target. group_indices_by_page / free_pages are no-ops sufficient to drive
+    free() into the in_shrink completion path."""
+
+    def __init__(self) -> None:
+        self.resize_calls = 0
+
+    def group_indices_by_page(self, indices, block_mem_size):  # noqa: ARG002
+        # Every index lives on page 0 so free() visits one page then reaches
+        # the in_shrink block.
+        return {0: list(indices)}
+
+    def free_pages(self, page_ids):  # noqa: ARG002
+        pass
+
+    def resize(self, new_mem_size):  # noqa: ARG002
+        self.resize_calls += 1
+        return False  # refuse: target below in-use pages (parked pages)
+
+
+class _FakeFullPage:
+    """A fully-allocated page that free_batch() empties."""
+
+    def __init__(self, page_id: int) -> None:
+        self.page_id = page_id
+        self._freed = False
+
+    def free_batch(self, idxs):  # noqa: ARG002
+        self._freed = True
+
+    def empty(self) -> bool:
+        return self._freed
+
+    def num_free_blocks(self) -> int:
+        return 0
+
+
+def test_free_keeps_shrink_pending_when_allocator_refuses_resize():
+    """When the lazy-shrink gate passes but the allocator refuses the resize
+    (target below in-use pages, e.g. the parked 0-block pages this fix stops
+    counting), free() must keep in_shrink and target_num_blocks set so the
+    shrink stays pending and a later free() retries -- not silently drop it.
+
+    Red without the fix: free() clears in_shrink/target_num_blocks
+    unconditionally, so the refused shrink is dropped. Green with the fix:
+    in_shrink stays True and target_num_blocks is preserved.
+    """
+    manager = _make_manager(
+        page_size=4,
+        block_mem_size=1,
+        full_pages={0: _FakeFullPage(0)},
+        avail_pages={},
+        num_avail_blocks=0,
+    )
+    manager.page_allocator = _ShrinkRefusingPageAllocator()
+    manager.reserved_blocks = []
+    manager.null_block = None
+    manager.in_shrink = True
+    manager.target_num_blocks = 100  # gate: _get_num_alloced (0) <= 100 passes
+    manager._post_init_done = threading.Event()
+    manager._post_init_done.set()
+
+    manager.free([0])  # frees the only page; gate passes; resize refuses
+
+    assert manager.page_allocator.resize_calls == 1
+    # The shrink must stay pending, not be silently dropped.
+    assert manager.in_shrink is True
+    assert manager.target_num_blocks == 100
 
 
 if __name__ == "__main__":

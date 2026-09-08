@@ -457,10 +457,22 @@ class KVCacheManager:
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
-                self.page_allocator.resize(self.target_num_blocks *
-                                           self.block_mem_size)
-                self.in_shrink = False
-                self.target_num_blocks = None
+                if self.page_allocator.resize(self.target_num_blocks *
+                                               self.block_mem_size):
+                    self.in_shrink = False
+                    self.target_num_blocks = None
+                else:
+                    # Allocator refused: the target sits below in-use pages
+                    # (e.g. the parked 0-block pages this fix stops counting,
+                    # which alloc_page() took off the free list and nothing
+                    # returns). Leave in_shrink and target_num_blocks set so
+                    # the shrink stays pending and a later free() retries,
+                    # instead of being silently dropped -- the gate passing is
+                    # exactly what exposed this previously-unreachable path.
+                    logger.warning(
+                        "shrink to %d blocks refused by allocator "
+                        "(in-use pages above target); keeping shrink pending",
+                        self.target_num_blocks)
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
