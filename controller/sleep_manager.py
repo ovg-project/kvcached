@@ -301,7 +301,9 @@ class SleepManager:
         logger.info(
             f"Incoming request for sleeping model {model_name}, attempting to wake up"
         )
-        return await self.wakeup_model(model_name)
+        success = await self.wakeup_model(model_name)
+        # Another request may have woken the model while we waited for its lock.
+        return success or model_name not in self.sleeping_models
 
     def update_config(self, **kwargs):
         """Update sleep manager configuration"""
