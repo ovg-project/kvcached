@@ -14,6 +14,7 @@ from kvcached.integration.sglang.patches import (
     ElasticMambaPoolPatch,
     ElasticMemoryPoolPatch,
     ElasticMLAMemoryPoolPatch,
+    ElasticSWAAllocatorPatch,
     RadixCacheLimitPatch,
     SchedulerMemoryLeakPatch,
     SGLangVirtualKVCapacityPatch,
@@ -39,6 +40,9 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
     patch_manager.register_patches_with_versions(
         [
             (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
+            # SWATokenToKVPoolAllocator captures allocator classes from its
+            # implementation modules, not from the package aliases above.
+            (ElasticSWAAllocatorPatch(), ">=0.5.13"),
             (ElasticMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),

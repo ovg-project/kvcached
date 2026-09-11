@@ -477,6 +477,51 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
+    """Make SGLang's composite SWA allocator use elastic sub-allocators.
+
+    SGLang's ``allocator.swa`` module imports the token and paged allocator
+    classes directly from their implementation modules.  Replacing only the
+    re-exports on ``sglang.srt.mem_cache.allocator`` therefore does not affect
+    the classes captured by ``SWATokenToKVPoolAllocator``.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.allocator.swa"
+    patch_name = "elastic_swa_allocator"
+
+    def apply(self, swa_alloc_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.alias_swa_sub_allocators(swa_alloc_mod)
+
+    @version_range(">=0.5.13")
+    def alias_swa_sub_allocators(self, swa_alloc_mod: types.ModuleType) -> bool:
+        marker = "__kvcached_swa_sub_allocators_aliased__"
+        if self._is_already_patched(swa_alloc_mod, marker):
+            return True
+
+        try:
+            from sglang.srt.mem_cache import allocator as alloc_mod
+
+            elastic_token_allocator = getattr(
+                alloc_mod, "ElasticTokenToKVPoolAllocator"
+            )
+            elastic_paged_allocator = getattr(
+                alloc_mod, "ElasticPagedTokenToKVPoolAllocator"
+            )
+        except (ImportError, AttributeError) as exc:
+            self.logger.warning(
+                "Failed to resolve elastic allocators for SGLang SWA: %s", exc
+            )
+            return False
+
+        setattr(swa_alloc_mod, "TokenToKVPoolAllocator", elastic_token_allocator)
+        setattr(swa_alloc_mod, "PagedTokenToKVPoolAllocator", elastic_paged_allocator)
+        self._mark_as_patched(swa_alloc_mod, marker)
+        return True
+
+
 class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
     """Inject ElasticMHATokenToKVPool into SGLang's memory pool module"""
 
