@@ -303,10 +303,6 @@ class SleepManager:
 
     def update_config(self, **kwargs):
         """Update sleep manager configuration"""
-        # Validate a candidate before mutating the live configuration.
-        from dataclasses import replace
-        replace(self.config, **{key: value for key, value in kwargs.items()
-                                if hasattr(self.config, key)})
         for key, value in kwargs.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, value)

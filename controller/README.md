@@ -112,9 +112,7 @@ curl "http://localhost:8080/action/wakeup/meta-llama%2FLlama-3.2-1B" -X POST
 curl http://localhost:8080/sleep/candidates
 ```
 
-### vLLM Sleep Policy
-
-Set the sleep policy for all vLLM models managed by this controller in YAML:
+To let running vLLM requests finish before sleep, configure:
 
 ```yaml
 sleep_manager:
@@ -122,9 +120,9 @@ sleep_manager:
   vllm_sleep_timeout_seconds: 120
 ```
 
-The defaults remain `abort` and 30 seconds. `frontend.py --vllm-sleep-mode wait` overrides the YAML mode; `launch.py --config` passes the configuration file to the frontend. The controller sends the mode alongside `level=1` as query parameters. SGLang behavior is unchanged.
+These settings apply to all vLLM models in the controller; defaults are `abort` and a 30-second HTTP timeout. `frontend.py --vllm-sleep-mode wait` overrides the YAML mode.
 
-`wait` requires [vLLM v0.17.0 or later](https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/entrypoints/serve/sleep/api_router.py#L22-L30), a supported V1 multiprocessing engine, `--enable-sleep-mode`, and `VLLM_SERVER_DEV_MODE=1`. Older servers may silently ignore the mode, so verify the deployed version. It drains running requests, but does not guarantee completion of requests waiting to be scheduled, including preempted requests. The finite, positive timeout includes draining and weight offload; timing out does not cancel the remote sleep operation.
+`wait` requires vLLM >= 0.17.0 with V1 multiprocessing and [sleep mode enabled](https://docs.vllm.ai/en/latest/features/sleep_mode/#online-serving). It drains running requests, not queued ones. Allow enough timeout for draining and offload; an HTTP timeout does not cancel remote sleep.
 
 ### Note: URL Encoding for Model Names
 When using endpoints with model names containing slashes (e.g., `meta-llama/Llama-3.2-1B`), URL encode the slashes:
