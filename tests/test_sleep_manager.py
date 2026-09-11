@@ -10,6 +10,7 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Dict, List
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp import web
@@ -350,7 +351,8 @@ async def test_sglang_api_methods_simulation(manager):
         print("\n⚠ No SGLang models found in config, skipping model detection test")
 
 
-async def test_vllm_sleep_level_is_sent_as_query_parameter(manager):
+@pytest.mark.parametrize("mode", ["abort", "wait"])
+async def test_vllm_sleep_level_is_sent_as_query_parameter(manager, mode):
     """vLLM's /sleep route reads ``level`` from the query string and never
     parses the body (``raw_request.query_params.get("level", "1")``), so the
     level must travel as a query parameter or the engine always sleeps at
@@ -359,17 +361,20 @@ async def test_vllm_sleep_level_is_sent_as_query_parameter(manager):
 
     async def sleep(request: web.Request) -> web.Response:
         seen["level"] = request.query.get("level", "1")
+        seen["mode"] = request.query.get("mode")
         seen["body"] = await request.text()
         return web.Response(status=200)
 
     app = web.Application()
     app.router.add_post("/sleep", sleep)
     async with TestServer(app) as server:
+        manager.config.vllm_sleep_mode = mode
         ok = await manager._call_vllm_sleep_api(server.host, str(server.port),
                                                 level=2)
 
     assert ok is True
     assert seen["level"] == "2"
+    assert seen["mode"] == mode
     assert seen["body"] == ""
 
 
@@ -419,3 +424,71 @@ async def main():
 if __name__ == "__main__":
     success = asyncio.run(main())
     sys.exit(0 if success else 1)
+
+
+@pytest.mark.parametrize("value", ["keep", "WAIT", "", None])
+def test_invalid_sleep_mode(value):
+    with pytest.raises(ValueError, match="vllm_sleep_mode"):
+        SleepConfig(vllm_sleep_mode=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_invalid_sleep_timeout(value):
+    with pytest.raises(ValueError, match="vllm_sleep_timeout_seconds"):
+        SleepConfig(vllm_sleep_timeout_seconds=value)
+
+
+def test_sleep_mode_yaml_and_update_validation(manager):
+    from controller.frontend import _extract_sleep_config
+
+    assert SleepConfig().vllm_sleep_mode == "abort"
+    assert _extract_sleep_config({}).vllm_sleep_mode == "abort"
+    assert _extract_sleep_config({"sleep_manager": {"vllm_sleep_mode": "wait"}}).vllm_sleep_mode == "wait"
+    with pytest.raises(ValueError, match="vllm_sleep_mode"):
+        _extract_sleep_config({"sleep_manager": {"vllm_sleep_mode": "keep"}})
+    with pytest.raises(ValueError):
+        manager.update_config(vllm_sleep_mode="keep", min_sleep_duration=0)
+    assert manager.config.vllm_sleep_mode == "abort"
+    assert manager.config.min_sleep_duration == 60
+
+
+@pytest.mark.parametrize("yaml_text", ["", "sleep_manager:\n",
+                                     "sleep_manager:\n  vllm_sleep_mode: abort\n"])
+async def test_sleep_mode_cli_overrides_yaml(tmp_path, monkeypatch, yaml_text):
+    from controller import frontend
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("instances: []\n" + yaml_text)
+    factory = Mock()
+    factory.return_value.start = AsyncMock()
+    monkeypatch.setattr(frontend, "MultiLLMFrontend", factory)
+    monkeypatch.setattr(sys, "argv", ["frontend.py", "--config_path", str(config_path),
+                                     "--vllm-sleep-mode", "wait"])
+
+    await frontend.main()
+
+    assert factory.call_args.kwargs["sleep_config"].vllm_sleep_mode == "wait"
+    factory.return_value.start.assert_awaited_once()
+
+
+async def test_vllm_sleep_timeout_applies_to_http_request(manager):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def sleep(request):
+        started.set()
+        await release.wait()
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/sleep", sleep)
+    async with TestServer(app) as server:
+        manager.update_config(vllm_sleep_timeout_seconds=0.05)
+        try:
+            ok = await asyncio.wait_for(
+                manager._call_vllm_sleep_api(server.host, str(server.port)), 1)
+            assert started.is_set()
+            assert ok is False
+        finally:
+            release.set()
+        manager.update_config(vllm_sleep_timeout_seconds=1)
+        assert await manager._call_vllm_sleep_api(server.host, str(server.port)) is True
