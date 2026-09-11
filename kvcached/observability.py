@@ -9,9 +9,11 @@ can consume kvcached status without depending on private patch details.
 """
 
 from __future__ import annotations
-from collections import deque
-import time as time_module
 
+import threading
+import time as time_module
+import weakref
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -117,7 +119,9 @@ class KVCachePoolSnapshot:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-_pool_snapshot_history: Dict[int, deque[tuple[float, KVCachePoolSnapshot]]] = {}
+_pool_snapshot_history: Dict[tuple[int, int], deque[tuple[float, KVCachePoolSnapshot]]] = {}
+_pool_snapshot_history_lock = threading.RLock()
+_pool_snapshot_manager_refs: Dict[int, weakref.ReferenceType[Any]] = {}
 
 def get_capabilities() -> Dict[str, Any]:
     """Return the stable observability surface currently exposed by kvcached."""
@@ -166,7 +170,14 @@ def build_kv_cache_pool_snapshot(
     *,
     integration: Optional[str] = None,
 ) -> KVCachePoolSnapshot:
-    """Build a read-only snapshot from a ``KVCacheManager``-like object."""
+    """Build a read-only snapshot from a ``KVCacheManager``-like object.
+    Each call also records the snapshot in the bounded in-memory history.
+    History entries represent snapshot/poll calls rather than changes in
+    pool state, so repeated calls with unchanged state are still recorded.
+
+    The history is shared by all consumers observing the same pool and is
+    bounded to the most recent 120 entries.
+    """
 
     allocator = manager.page_allocator
     page_state_fn = getattr(allocator, "get_page_state", None)
@@ -248,28 +259,80 @@ def build_kv_cache_pool_snapshot(
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
     )
 
-    history = _pool_snapshot_history.setdefault(
-        snapshot.group_id,
-        deque(maxlen=_HISTORY_MAXLEN),
-    )
+    manager_id = id(manager)
 
-    history.append((time_module.time(), snapshot))
+    with _pool_snapshot_history_lock:
+        if manager_id not in _pool_snapshot_manager_refs:
+            reference = weakref.ref(
+                manager,
+                lambda reference: _remove_pool_snapshot_history(
+                    reference, manager_id
+                ),
+            )
+            _pool_snapshot_manager_refs[manager_id] = reference
+
+        history = _pool_snapshot_history.setdefault(
+                (id(manager), snapshot.group_id),
+                deque(maxlen=_HISTORY_MAXLEN),
+            )
+        history.append((time_module.time(), snapshot))
     return snapshot
 
 
 def get_kv_cache_pool_snapshot_history(
+        manager,
         group_id: int,
 ) -> List[Dict[str, Any]]:
-    history = _pool_snapshot_history.get(group_id, [])
+    """
+    Return the recorded snapshot history for a pool group.
 
+    History entries contain the timestamp at which the snapshot was recorded
+    and the corresponding pool snapshot. History records snapshot/poll calls,
+    not only changes in pool state, and is shared by consumers observing the
+    same pool.
+
+    Only the most recent 120 entries are retained.
+    """
+    
+    with _pool_snapshot_history_lock:
+        history = list(
+        _pool_snapshot_history.get((id(manager), group_id), [])
+    )
+        
     return [
-        {"timestamp": timestamp, **snapshot.to_dict()}
+        {
+            "timestamp": timestamp,
+            "snapshot": snapshot.to_dict(),
+        }
         for timestamp, snapshot in history
     ]
 
 
 def clear_kv_cache_pool_history() -> None:
+    """
+    Clear all in-memory KV cache pool snapshot history.
+
+    This clears history for all pools and groups, so the history is no longer
+    available to any consumers observing those pools.
+    """
     _pool_snapshot_history.clear()
+
+def _remove_pool_snapshot_history(reference: Any, manager_id: int) -> None:
+    with _pool_snapshot_history_lock:
+        current = _pool_snapshot_manager_refs.get(manager_id)
+        if current is not reference:
+            return
+
+        _pool_snapshot_manager_refs.pop(manager_id, None)
+
+        keys_to_remove = [
+            key
+            for key in _pool_snapshot_history
+            if key[0] == manager_id
+        ]
+
+        for key in keys_to_remove:
+            _pool_snapshot_history.pop(key, None)
 
 
 def _snapshot_one_pool(
