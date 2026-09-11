@@ -306,14 +306,19 @@ class SleepManager:
                                    host: str,
                                    port: str,
                                    level: int = 1) -> bool:
-        """Call vLLM's sleep API endpoint"""
+        """Call vLLM's sleep API endpoint.
+
+        vLLM reads ``level`` from the query string
+        (``raw_request.query_params.get("level", "1")``) and ignores the
+        request body, so the level must be sent as a query parameter.
+        """
         url = f"http://{host}:{port}/sleep"
-        payload = {"level": str(level)}
+        params = {"level": str(level)}
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                        url, json=payload,
+                        url, params=params,
                         timeout=aiohttp.ClientTimeout(total=30)) as response:
                     if response.status == 200:
                         logger.info(

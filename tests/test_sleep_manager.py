@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Dict, List
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 # Add the controller directory to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -346,6 +348,29 @@ async def test_sglang_api_methods_simulation(manager):
         assert is_sglang
     else:
         print("\n⚠ No SGLang models found in config, skipping model detection test")
+
+
+async def test_vllm_sleep_level_is_sent_as_query_parameter(manager):
+    """vLLM's /sleep route reads ``level`` from the query string and never
+    parses the body (``raw_request.query_params.get("level", "1")``), so the
+    level must travel as a query parameter or the engine always sleeps at
+    level 1 (issue #475). The fake server below mirrors the vLLM handler."""
+    seen: Dict[str, object] = {}
+
+    async def sleep(request: web.Request) -> web.Response:
+        seen["level"] = request.query.get("level", "1")
+        seen["body"] = await request.text()
+        return web.Response(status=200)
+
+    app = web.Application()
+    app.router.add_post("/sleep", sleep)
+    async with TestServer(app) as server:
+        ok = await manager._call_vllm_sleep_api(server.host, str(server.port),
+                                                level=2)
+
+    assert ok is True
+    assert seen["level"] == "2"
+    assert seen["body"] == ""
 
 
 async def main():
