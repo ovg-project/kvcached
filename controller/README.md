@@ -134,7 +134,7 @@ A separate *tmux* session (`benchmark-<name>`) is created for every model so you
 ```bash
 cd tests
 python test_sleep_manager.py
-python test_traffic_monitor.py
+python helpers/traffic_monitor.py
 ```
 
 ---

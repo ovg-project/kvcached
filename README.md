@@ -168,6 +168,11 @@ More instructions can be found [here](https://github.com/ovg-project/kvcached/bl
 
 kvcached is indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for LLM-powered documentation.
 
+For maintainers, see the
+[self-hosted GPU CI runner setup](docs/GPU_CI_RUNNER.md).
+The completed first-delivery scope is summarized in
+[GPU CI first delivery](docs/GPU_CI_DELIVERY.md).
+
 The documentation covers:
 - Core architecture and memory management system
 - Integration with vLLM and SGLang

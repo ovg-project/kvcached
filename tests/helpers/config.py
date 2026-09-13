@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Shared utilities for test files.
-"""
+"""Shared configuration loading for the tests."""
 
 from pathlib import Path
 
@@ -16,9 +14,9 @@ def load_example_config():
     Returns:
         Dict containing the parsed YAML configuration from example-config.yaml
     """
-    # Find the controller directory relative to the test file
-    test_dir = Path(__file__).parent
-    config_path = test_dir.parent / "controller" / "example-config.yaml"
+    # tests/helpers/config.py -> repository root -> controller/
+    repo_root = Path(__file__).resolve().parents[2]
+    config_path = repo_root / "controller" / "example-config.yaml"
 
     with config_path.open("r") as f:
         config = yaml.safe_load(f)
