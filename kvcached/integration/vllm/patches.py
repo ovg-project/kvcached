@@ -1912,7 +1912,51 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         memory_profile_patched = self.patch_worker_determine_available_memory(
             gpuworker_mod
         )
-        return init_device_patched and memory_profile_patched
+        shutdown_patched = self.patch_worker_shutdown(gpuworker_mod)
+        return init_device_patched and memory_profile_patched and shutdown_patched
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_worker_shutdown(self, gpuworker_mod: types.ModuleType) -> bool:
+        """Patch Worker.shutdown to stop this worker's kvcached IPC listener.
+
+        vLLM runs Worker.shutdown() on every exit path that reaches
+        EngineCore.shutdown(): in-process through UniProcExecutor.shutdown()
+        and in each WorkerProc from worker_main()'s finally block. Stopping
+        the listener there unlinks the worker socket and removes the
+        /tmp/kvcached-tp-* directory instead of leaking it (issue #476).
+        """
+        Worker = self._get_target_class(gpuworker_mod)
+        if Worker is None:
+            return False
+
+        original_shutdown = getattr(Worker, "shutdown", None)
+        if original_shutdown is None:
+            # Releases without Worker.shutdown(): cleanup is left to
+            # shutdown_kvcached() and the interpreter-exit hook.
+            self.logger.debug("Worker.shutdown not found; skipping listener cleanup patch")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("Worker.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_shutdown(self, *args: Any, **kwargs: Any):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.tp_ipc_util import stop_worker_listener_threads
+
+                        stop_worker_listener_threads()
+                    except Exception as e:
+                        logger.warning("Failed to stop the kvcached worker IPC listener: %s", e)
+
+        self._mark_as_patched(_patched_shutdown, "shutdown")
+        Worker.shutdown = _patched_shutdown  # type: ignore[assignment]
+        return True
 
     @version_range(VLLM_ALL_RANGE)
     def patch_worker_init_device(self, gpuworker_mod: types.ModuleType) -> bool:

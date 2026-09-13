@@ -2,34 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import atexit
 import os
 import pickle
 import socket
 import threading
-import uuid
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
-from kvcached.utils import DEFAULT_IPC_NAME
+from kvcached.utils import get_tp_socket_dir
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
-
-def _get_socket_dir_name() -> str:
-    """
-    Build a human-readable, IPC-name-based directory with a short hash suffix.
-
-    This keeps the original text-based IPC name visible while adding a hash
-    for extra uniqueness. The hash is deterministic so all workers in the same
-    engine instance agree on the directory.
-    """
-    # Deterministic short hash derived from the base name
-    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, DEFAULT_IPC_NAME).hex[:8]
-    return f"kvcached-tp-{DEFAULT_IPC_NAME}-{suffix}"
-
-
-# Socket directory for tensor parallel (TP) worker communication.
-# Unix domain socket paths are limited to 108 characters on Linux, so we keep
-# the directory name short and validate the final socket path length below.
-SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
+# Socket directory for tensor parallel (TP) worker communication:
+# /tmp/kvcached-tp-<ipc_name>-<hash>. Unix domain socket paths are limited to
+# 108 characters on Linux, so the name is kept short and the final socket path
+# length is validated below.
+SOCKET_DIR = get_tp_socket_dir()
 
 
 def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
@@ -93,13 +80,90 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
+class _WorkerListener:
+    """One worker's IPC listener: its bound socket, the directory holding it,
+    and the thread serving it."""
+
+    def __init__(self, rank: int, pp_rank: int, root_dir: str, socket_dir: str,
+                 socket_path: str, server_sock: socket.socket) -> None:
+        self.rank = rank
+        self.pp_rank = pp_rank
+        self.root_dir = root_dir
+        self.socket_dir = socket_dir
+        self.socket_path = socket_path
+        self.server_sock = server_sock
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def stop(self) -> None:
+        """Stop serving, unlink the socket, and remove the directory once no
+        other worker's socket is left in it."""
+        self.stop_event.set()
+        # accept() only returns on a connection, so make one to let the loop
+        # observe stop_event. If that fails the daemon thread simply dies
+        # with the process; the socket file is unlinked either way.
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                wake.settimeout(1.0)
+                wake.connect(self.socket_path)
+        except OSError:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        self.server_sock.close()
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        _remove_dir_if_empty(self.socket_dir)
+        if self.socket_dir != self.root_dir:
+            _remove_dir_if_empty(self.root_dir)
+        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+
+
+def _remove_dir_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Still holds another worker's socket, or already gone.
+        pass
+
+
+_listeners: Dict[Tuple[int, int], _WorkerListener] = {}
+_listeners_lock = threading.Lock()
+_atexit_registered = False
+
+
+def stop_worker_listener_threads() -> None:
+    """Stop every worker IPC listener started in this process: close its
+    socket, unlink it, and remove the per-instance socket directory
+    (issue #476). Safe to call repeatedly and when nothing was started.
+    """
+    with _listeners_lock:
+        listeners = list(_listeners.values())
+        _listeners.clear()
+    for listener in listeners:
+        listener.stop()
+
+
 def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     """
     Start a thread that listens for messages on the worker socket.
     pp_rank is used to create a PP-stage-specific subdirectory so that
     concurrent SGLang PP stages do not bind the same socket path.
+
+    The listener is registered so that stop_worker_listener_threads() (called
+    from the integrations' shutdown paths and at interpreter exit) can unlink
+    the socket and remove the directory again.
     """
-    socket_dir = os.path.join(SOCKET_DIR, f"pp{pp_rank}") if pp_rank > 0 else SOCKET_DIR
+    global _atexit_registered
+    with _listeners_lock:
+        previous = _listeners.pop((rank, pp_rank), None)
+    if previous is not None:
+        previous.stop()
+
+    root_dir = SOCKET_DIR
+    socket_dir = os.path.join(root_dir, f"pp{pp_rank}") if pp_rank > 0 else root_dir
     os.makedirs(socket_dir, exist_ok=True)
     socket_path = get_worker_socket_path(rank, pp_rank)
 
@@ -112,11 +176,19 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.bind(socket_path)
     server_sock.listen()
+    listener = _WorkerListener(rank, pp_rank, root_dir, socket_dir, socket_path,
+                               server_sock)
 
     def listen_loop():
         print(f"Worker {rank} IPC listener started at {socket_path}")
         while True:
-            conn, _ = server_sock.accept()
+            try:
+                conn, _ = server_sock.accept()
+            except OSError:
+                break  # socket closed by stop()
+            if listener.stop_event.is_set():
+                conn.close()
+                break
             try:
                 msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
@@ -142,7 +214,13 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 conn.close()
 
     t = threading.Thread(target=listen_loop, daemon=True)
+    listener.thread = t
     t.start()
+    with _listeners_lock:
+        _listeners[(rank, pp_rank)] = listener
+        if not _atexit_registered:
+            atexit.register(stop_worker_listener_threads)
+            _atexit_registered = True
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.

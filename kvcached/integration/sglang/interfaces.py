@@ -16,7 +16,7 @@ from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import start_worker_listener_thread
+from kvcached.tp_ipc_util import start_worker_listener_thread, stop_worker_listener_threads
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -67,6 +67,7 @@ def shutdown_kvcached() -> None:
         clear_registered_kv_cache_pools(integration="sglang")
         return
 
+    stop_worker_listener_threads()
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")
     _kvcached_initialized = False
