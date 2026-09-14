@@ -13,6 +13,14 @@ from kvcached.utils import DEFAULT_IPC_NAME, normalize_gpu_device
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
 
+def _synchronize_completed_worker_batch() -> None:
+    """Wait for kernels launched by an acknowledged worker batch."""
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _get_socket_dir_name() -> str:
     """
     Build a human-readable, IPC-name-based directory with a short hash suffix.
@@ -158,6 +166,7 @@ def start_worker_listener_thread(
                         )
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "unmap_from_kv_tensors":
+                    _synchronize_completed_worker_batch()
                     if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
                         raise RuntimeError(
                             f"Failed to unmap KV tensors for group_id={group_id}"
