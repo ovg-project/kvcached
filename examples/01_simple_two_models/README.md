@@ -22,6 +22,19 @@ vllm serve "${MODEL}" \
   --port "${PORT}"
 ```
 
+To avoid creating an additional CUDA context in the vLLM EngineCore process,
+enable the worker-owned physical-admission path explicitly:
+
+```bash
+export KVCACHED_ENGINECORE_NO_CUDA=true
+```
+
+This mode is disabled by default. When enabled, EngineCore manages logical KV
+capacity while the existing CUDA-owning TP workers perform final physical page
+mapping. It does not add a separate synchronous memory-info query to the
+scheduler path, and page preallocation is disabled for the control-only
+EngineCore. Unset the variable to restore the original behavior for A/B tests.
+
 For SGLang:
 
 ```bash

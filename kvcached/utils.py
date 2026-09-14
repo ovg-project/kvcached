@@ -136,6 +136,8 @@ PAGE_SIZE = _get_page_size()
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
 PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
                                   "true").lower() == "true"
+ENGINECORE_NO_CUDA = os.getenv("KVCACHED_ENGINECORE_NO_CUDA",
+                               "false").lower() == "true"
 MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
 MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 MAX_CACHED_BLOCKS = int(os.getenv("KVCACHED_MAX_CACHED_BLOCKS", "1000"))

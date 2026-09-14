@@ -27,7 +27,8 @@ from kvcached.vmm_ops import (
 logger = get_kvcached_logger()
 
 _kvcached_initialized: bool = False
-_kvcached_device = None
+_kvcached_gpu_initialized: bool = False
+_kvcached_device: Optional[str] = None
 _async_sched = False
 _world_size: int = 1
 _pp_rank: int = 0
@@ -48,6 +49,16 @@ def get_world_size() -> int:
     return _world_size
 
 
+def _cuda_device_index(device: str) -> int:
+    normalized = normalize_gpu_device(device)
+    device_type, separator, index = normalized.partition(":")
+    if device_type.lower() != "cuda":
+        raise ValueError(f"Expected a CUDA device, got {device}")
+    if separator and index:
+        return int(index)
+    return int(torch.cuda.current_device())
+
+
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,
@@ -55,8 +66,12 @@ def init_kvcached(
     is_worker: bool = False,
     device: Optional[str] = None,
     async_sched: bool = False,
+    control_only: bool = False,
 ) -> None:
-    global _kvcached_initialized, _kvcached_device, _world_size, _async_sched, _pp_rank, _is_worker
+    global _kvcached_initialized, _kvcached_gpu_initialized, _kvcached_device
+    global _world_size, _async_sched, _pp_rank, _is_worker
+    if control_only and is_worker:
+        raise ValueError("control_only mode is only valid in the engine process")
     if _kvcached_initialized:
         # EngineCore call init_kvcached(is_worker=False) first. When TP=1 GPUModelRunner
         # then calls init_kvcached(is_worker=True) in the same process; without this branch
@@ -64,7 +79,17 @@ def init_kvcached(
         # (broadcast_kv_tensors_created) and fail with ENOENT on the socket path.
         if is_worker and not _is_worker:
             _is_worker = True
-            start_worker_listener_thread(tp_rank, pp_rank)
+            if not _kvcached_gpu_initialized:
+                if device is None:
+                    device = f"cuda:{torch.cuda.current_device()}"
+                device = normalize_gpu_device(device)
+                _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
+                _kvcached_gpu_initialized = True
+                _kvcached_device = device
+            assert _kvcached_device is not None
+            start_worker_listener_thread(
+                tp_rank, pp_rank,
+                device_index=_cuda_device_index(_kvcached_device))
         if async_sched and not _async_sched:
             _async_sched = True
             logger.info("kvcached async scheduler enabled")
@@ -72,13 +97,23 @@ def init_kvcached(
         _world_size = world_size
         return
 
+    if control_only:
+        _kvcached_initialized = True
+        _world_size = world_size
+        _pp_rank = pp_rank
+        _async_sched = async_sched
+        _is_worker = False
+        logger.info("kvcached initialized in control-only mode")
+        return
+
     if device is None:
         device = f"cuda:{torch.cuda.current_device()}"
-    device = normalize_gpu_device(device)
+    normalized_device = normalize_gpu_device(device)
 
-    _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
+    _init_kvcached_impl(normalized_device, PAGE_SIZE, _contiguous_layout)
     _kvcached_initialized = True
-    _kvcached_device = device
+    _kvcached_gpu_initialized = True
+    _kvcached_device = normalized_device
     _world_size = world_size
     _pp_rank = pp_rank
     _async_sched = async_sched
@@ -90,20 +125,28 @@ def init_kvcached(
     if is_worker:
         # start the listener thread for kv cache management regardless of TP size
         # because the vLLM EngineCore might need to reach this worker if PP > 1
-        start_worker_listener_thread(tp_rank, pp_rank)
+        start_worker_listener_thread(
+            tp_rank, pp_rank,
+            device_index=_cuda_device_index(normalized_device))
 
 
 def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+    global _kvcached_initialized, _kvcached_gpu_initialized, _kvcached_device
+    global _async_sched, _world_size, _pp_rank, _is_worker
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
         return
 
-    _shutdown_kvcached_impl()
+    if _kvcached_gpu_initialized:
+        _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
+    _kvcached_gpu_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _world_size = 1
+    _pp_rank = 0
+    _is_worker = False
 
 
 def build_kv_views(
@@ -592,6 +635,7 @@ def get_kv_cache_manager(
         group_id=group_id,
         reserve_null_block=True,
         pool_name=pool_name,
+        worker_physical_admission=not _kvcached_gpu_initialized,
     )
     register_kv_cache_pool(
         manager,
