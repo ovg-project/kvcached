@@ -29,10 +29,16 @@ This test suite pins the two invariants that make the *contiguous* layout work:
 Plus kernel-block-granular view tests for contiguous + ratio>1 (supported
 since the kernel-outermost per-block layout landed).
 
-These run CPU-only: ``create_kv_tensors`` is intercepted and
-``torch.cuda.get_device_properties`` is stubbed, so no GPU / VMM is exercised.
-The end-to-end token-parity check against vanilla vLLM still requires a GPU and
-a real hybrid model.
+These run CPU-only: ``create_kv_tensors`` is intercepted and the interface's
+device module is stubbed, so no GPU / VMM is exercised. The end-to-end
+token-parity check against vanilla vLLM still requires a GPU and a real hybrid
+model.
+
+The stub replaces ``get_device_module`` rather than ``torch.cuda``, because
+``interfaces.py`` resolves the module at call time -- it is ``torch.xpu`` on an
+XPU build. Patching ``torch.cuda`` only works on a CUDA/HIP build and silently
+reaches real hardware otherwise. The device string below is arbitrary for the
+same reason: nothing ever looks at it once the device module is fake.
 """
 import importlib
 
@@ -53,6 +59,19 @@ class _FakeProps:
         self.total_memory = total_memory
 
 
+class _FakeDeviceModule:
+    """Stands in for whatever ``get_device_module()`` would return."""
+
+    def __init__(self, total_memory):
+        self._total_memory = total_memory
+
+    def is_available(self):
+        return True
+
+    def get_device_properties(self, device=None):
+        return _FakeProps(self._total_memory)
+
+
 class _CapturedCall(Exception):
     """Raised by the create_kv_tensors stub to surface its call arguments."""
 
@@ -67,9 +86,8 @@ def ifc(monkeypatch):
     """The vLLM interfaces module with a fake GPU + intercepted allocator."""
     mod = importlib.import_module("kvcached.integration.vllm.interfaces")
     monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
-    monkeypatch.setattr(torch.cuda, "get_device_properties",
-                        lambda dev=None: _FakeProps(80 * (1024 ** 3)))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mod, "get_device_module",
+                        lambda device=None: _FakeDeviceModule(80 * (1024 ** 3)))
 
     def _stub(*args, **kwargs):
         raise _CapturedCall(args, kwargs)
@@ -155,9 +173,8 @@ def ifc_real(monkeypatch):
     mod = importlib.import_module("kvcached.integration.vllm.interfaces")
     monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
     monkeypatch.setattr(mod, "_contiguous_layout", True)
-    monkeypatch.setattr(torch.cuda, "get_device_properties",
-                        lambda dev=None: _FakeProps(64 * (1024 ** 2)))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mod, "get_device_module",
+                        lambda device=None: _FakeDeviceModule(64 * (1024 ** 2)))
 
     def _cpu_create(ftensor_bytes_per_layer, itemsize, device, num_layers,
                     **kwargs):

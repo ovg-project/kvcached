@@ -211,6 +211,11 @@ def _load_interfaces_under_stubs(monkeypatch):
     setattr(utils_module, "get_kvcached_logger",
             lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
+    # Imported for device-agnostic sizing; the zero-layer guard rejects before
+    # any of them is called.
+    setattr(utils_module, "get_current_device_str", lambda: "cuda:0")
+    setattr(utils_module, "get_device_module", lambda device=None: fake_torch.cuda)
+    setattr(utils_module, "get_device_type", lambda device=None: "cuda")
 
     vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
     setattr(
