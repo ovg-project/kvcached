@@ -72,6 +72,9 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page();
+  // Reuse reserved pages first; map all new pages in one callback. On failure,
+  // restore ID ownership and propagate the map protocol's original exception.
+  std::vector<std::shared_ptr<InternalPage>> alloc_pages(int64_t num_pages);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
 
@@ -129,6 +132,7 @@ public:
 private:
   // Preallocation thread worker
   void prealloc_worker();
+  void check_prealloc_failure() const;
 
   // Resize watcher thread worker
   void resize_watcher();
@@ -175,6 +179,8 @@ private:
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
+  std::atomic<bool> prealloc_failed_{false};
+  std::string prealloc_failure_;
   // Serializes start/stop of the background threads. Before the blocking
   // bindings released the GIL, concurrent start and stop callers were
   // accidentally serialized by the GIL itself; they no longer are, so the

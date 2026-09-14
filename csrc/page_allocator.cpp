@@ -166,68 +166,75 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  return alloc_pages(1).front();
+}
+
+std::vector<std::shared_ptr<InternalPage>>
+PageAllocator::alloc_pages(int64_t num_pages) {
+  if (num_pages < 0) {
+    throw std::invalid_argument("num_pages must be non-negative");
+  }
+  if (num_pages == 0) {
+    return {};
+  }
   auto start_time = std::chrono::steady_clock::now();
-
   std::unique_lock<std::mutex> lock(lock_);
-  page_id_t page_id = -1;
-
-  while (page_id == -1) {
-    // Fast path: allocate from reserved pages
-    if (!reserved_page_list_.empty()) {
-      page_id = reserved_page_list_.front();
-      reserved_page_list_.pop_front();
-      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
-
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
-        prealloc_needed_ = true;
-        cond_.notify_all();
-      }
-
-      update_memory_usage_unlocked();
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-          end_time - start_time);
-      LOGGER(DEBUG, "alloc 1 page fast path cost %lu us", duration.count());
-      // std::cout << "alloc 1 page fast path cost " << duration.count() << "
-      // us" << std::endl;
-
-      return std::make_shared<InternalPage>(page_id, page_size_);
+  while (true) {
+    check_prealloc_failure();
+    if (num_free_pages_.load(std::memory_order_relaxed) < num_pages) {
+      throw std::runtime_error("Not enough free pages left");
     }
-
-    // Slow path: allocate from free pages
-    if (!free_page_list_.empty()) {
-      page_id = free_page_list_.front();
-      free_page_list_.pop_front();
-      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
+    if (reserved_page_list_.size() + free_page_list_.size() >=
+        static_cast<size_t>(num_pages)) {
       break;
     }
-
-    if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
-      throw std::runtime_error("No free pages left");
-    }
-
     if (!enable_page_prealloc_) {
       throw std::runtime_error(
           "Inconsistent page allocator state: no free pages available");
     }
-
-    // Wait for background preallocation
+    // Some free pages are currently being mapped by the prealloc worker.
     cond_.wait(lock);
   }
 
+  const auto num_reserved =
+      std::min(static_cast<size_t>(num_pages), reserved_page_list_.size());
+  std::vector<page_id_t> reserved_ids(
+      reserved_page_list_.begin(), reserved_page_list_.begin() + num_reserved);
+  std::vector<page_id_t> pages_to_map(free_page_list_.begin(),
+                                      free_page_list_.begin() +
+                                          (num_pages - num_reserved));
+  // Allocate the result objects before removing any IDs from the free lists.
+  std::vector<std::shared_ptr<InternalPage>> pages;
+  pages.reserve(num_pages);
+  for (auto id : reserved_ids) {
+    pages.push_back(std::make_shared<InternalPage>(id, page_size_));
+  }
+  for (auto id : pages_to_map) {
+    pages.push_back(std::make_shared<InternalPage>(id, page_size_));
+  }
+  reserved_page_list_.erase(reserved_page_list_.begin(),
+                            reserved_page_list_.begin() + num_reserved);
+  free_page_list_.erase(free_page_list_.begin(),
+                        free_page_list_.begin() + pages_to_map.size());
+  num_free_pages_.fetch_sub(num_pages, std::memory_order_relaxed);
   lock.unlock();
 
   try {
-    map_pages({page_id});
-  } catch (const std::exception &e) {
+    if (!pages_to_map.empty()) {
+      map_pages(pages_to_map);
+    }
+  } catch (...) {
     std::lock_guard<std::mutex> guard(lock_);
-    free_page_list_.push_front(page_id);
-    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
+    reserved_page_list_.insert(reserved_page_list_.begin(),
+                               reserved_ids.begin(), reserved_ids.end());
+    free_page_list_.insert(free_page_list_.begin(), pages_to_map.begin(),
+                           pages_to_map.end());
+    num_free_pages_.fetch_add(num_pages, std::memory_order_relaxed);
     cond_.notify_all();
-    throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
-                             ": " + e.what());
+    // Preserve Python callback exception types across the binding. An
+    // unknown distributed outcome must not become a recoverable miss. The
+    // map protocol owns partial mappings; do not unmap them speculatively.
+    throw;
   }
 
   if (enable_page_prealloc_) {
@@ -241,9 +248,8 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
-  LOGGER(DEBUG, "alloc 1 page slow path cost %lu us", duration.count());
-
-  return std::make_shared<InternalPage>(page_id, page_size_);
+  LOGGER(DEBUG, "alloc %ld pages cost %lu us", num_pages, duration.count());
+  return pages;
 }
 
 void PageAllocator::free_page(page_id_t page_id) {
@@ -477,6 +483,7 @@ PageState PageAllocator::get_page_state_unlocked() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
+  check_prealloc_failure();
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
@@ -654,6 +661,11 @@ void PageAllocator::prealloc_worker() {
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
+        if (dynamic_cast<const KVMappingStateError *>(&e) != nullptr) {
+          prealloc_failure_ = e.what();
+          prealloc_failed_.store(true, std::memory_order_release);
+          prealloc_running_ = false;
+        }
         cond_.notify_all();
         LOGGER(ERROR, "Failed to preallocate %ld pages: %s",
                pages_to_reserve.size(), e.what());
@@ -767,6 +779,7 @@ void PageAllocator::trigger_preallocation() {
 }
 
 void PageAllocator::start_prealloc_thread_internal() {
+  check_prealloc_failure();
   std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (!prealloc_thread_) {
     prealloc_running_ = true;
@@ -830,6 +843,12 @@ bool PageAllocator::should_use_worker_ipc() const {
   // this. The decision is fixed once Python calls set_use_worker_ipc() during
   // KVCacheManager init, before the prealloc thread starts.
   return use_worker_ipc_.load(std::memory_order_acquire);
+}
+
+void PageAllocator::check_prealloc_failure() const {
+  if (prealloc_failed_.load(std::memory_order_acquire)) {
+    throw KVMappingStateError(prealloc_failure_);
+  }
 }
 
 void PageAllocator::resize_watcher() {
