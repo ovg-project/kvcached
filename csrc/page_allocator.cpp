@@ -502,8 +502,20 @@ PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
   if (!mem_info_tracker_) {
     return -1;
   }
-  return mem_info_tracker_->check_and_get_resize_target(
+  const int64_t target = mem_info_tracker_->check_and_get_resize_target(
       current_mem_size, num_layers_, num_kv_buffers_);
+  if (target < 0) {
+    return -1;
+  }
+
+  const int64_t current_num_pages =
+      num_total_pages_.load(std::memory_order_relaxed);
+  // resize() floors byte targets to whole pages, so an unaligned target is
+  // satisfied once its page count matches the allocator's live capacity.
+  if (target / page_size_ == current_num_pages) {
+    return -1;
+  }
+  return target;
 }
 
 std::unordered_map<page_id_t, std::vector<int64_t>>
@@ -840,8 +852,9 @@ void PageAllocator::resize_watcher() {
       break;
     }
     if (mem_info_tracker_) {
-      int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
+      const int64_t current_mem_size =
+          num_total_pages_.load(std::memory_order_relaxed) * page_size_;
+      int64_t target = check_and_get_resize_target(current_mem_size);
       resize_target_.store(target, std::memory_order_relaxed);
     }
   }
