@@ -158,11 +158,21 @@ class KVCacheManager:
                 )
 
                 # Wrap Python functions to match C++ callback signature
-                def map_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                def map_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
 
-                def unmap_callback(world_size: int, offsets: List[int]) -> None:
+                def unmap_callback(
+                    world_size: int,
+                    offsets: List[int],
+                    pp_rank: int = self.pp_rank,
+                    group_id: int = self.group_id,
+                ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
 
@@ -186,6 +196,9 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._memory_limit_bytes: Optional[int] = None
+        self._memory_limit_effective_bytes: Optional[int] = None
+        self._memory_limit_revision = -1
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -216,10 +229,19 @@ class KVCacheManager:
 
         try:
             total_wait = 0.0
-            while not _check_kv_tensors_created():
+            last_error: Exception | None = None
+            while True:
+                try:
+                    if _check_kv_tensors_created():
+                        break
+                except Exception as e:
+                    last_error = e
                 if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
-                    raise TimeoutError("KV tensors not created after "
-                                       f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    message = ("KV tensors not created after "
+                               f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    if last_error is not None:
+                        message = f"{message}; last error: {last_error}"
+                    raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
             # KV tensors created now
@@ -243,13 +265,87 @@ class KVCacheManager:
         """
         Reserve the first block as null block for padding tokens.
         """
-        if self.reserve_null_block:
-            self.null_block = self._alloc(1, _skip_wait=True)
-            if self.null_block != [0]:
-                logger.error(f"Failed to reserve null block, got {self.null_block}")
-                raise RuntimeError("Failed to reserve null block at index 0")
-        else:
+        if not self.reserve_null_block:
             self.null_block = None
+            return
+
+        wait_started = time.monotonic()
+        last_log_at = 0.0
+        last_reason: Optional[str] = None
+        loop_count = 0
+        alloc_attempts = 0
+
+        def _log_wait(reason: str, available_before: int) -> None:
+            nonlocal last_log_at, last_reason
+
+            now = time.monotonic()
+            if reason == last_reason and now - last_log_at < 10.0:
+                return
+
+            last_log_at = now
+            last_reason = reason
+            try:
+                allocator = self.page_allocator
+                allocator_state = (
+                    f"available_before={available_before}, "
+                    f"available_now={self.available_size()}, "
+                    f"num_avail_blocks={self.num_avail_blocks}, "
+                    f"reserved_blocks={len(self.reserved_blocks)}, "
+                    f"avail_pages={len(self.avail_pages)}, "
+                    "virtual_free_pages="
+                    f"{allocator.get_num_free_pages()}, "
+                    "physical_free_pages="
+                    f"{allocator.get_avail_physical_pages()}, "
+                    "reserved_physical_pages="
+                    f"{allocator.get_num_reserved_pages()}"
+                )
+            except Exception as exc:
+                # Diagnostics must never turn a recoverable capacity wait into
+                # a startup failure.
+                allocator_state = (
+                    f"available_before={available_before}, "
+                    f"state_snapshot_error={exc!r}"
+                )
+
+            logger.warning(
+                "Waiting for physical KV capacity to reserve null block: "
+                f"reason={reason}, elapsed={now - wait_started:.1f}s, "
+                f"loops={loop_count}, alloc_attempts={alloc_attempts}, "
+                f"group_id={getattr(self, 'group_id', None)}, "
+                f"pp_rank={getattr(self, 'pp_rank', None)}, "
+                f"{allocator_state}")
+
+        while True:
+            loop_count += 1
+            available_before = self.available_size()
+            if available_before < 1:
+                _log_wait("no_effective_capacity", available_before)
+                time.sleep(0.01)
+                continue
+
+            alloc_attempts += 1
+            null_block = self._alloc(1, _skip_wait=True)
+            if null_block is None:
+                # Another colocated engine may consume the last physical page
+                # between available_size() and alloc_page(), or alloc_page()
+                # may fail after the capacity check. Keep the engine alive and
+                # make the stalled startup state visible in pod logs.
+                _log_wait("alloc_returned_none_after_capacity_check",
+                          available_before)
+                time.sleep(0.01)
+                continue
+            if null_block != [0]:
+                logger.error(f"Failed to reserve null block, got {null_block}")
+                raise RuntimeError("Failed to reserve null block at index 0")
+
+            self.null_block = null_block
+            elapsed = time.monotonic() - wait_started
+            if loop_count > 1:
+                logger.info(
+                    "Reserved null block after waiting for physical KV "
+                    f"capacity: elapsed={elapsed:.1f}s, loops={loop_count}, "
+                    f"alloc_attempts={alloc_attempts}")
+            return
 
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
@@ -467,7 +563,7 @@ class KVCacheManager:
         new_mem_size: the memory size of the K or V tensor in one layer
         """
         self._wait_post_init()
-        assert new_mem_size > 0, "new_mem_size must be positive"
+        assert new_mem_size >= 0, "new_mem_size must be non-negative"
         if self.page_allocator.resize(new_mem_size):
             if self.in_shrink:
                 self.in_shrink = False
@@ -491,6 +587,87 @@ class KVCacheManager:
         """
         self._wait_post_init()
         self.page_allocator.trim()
+
+    @synchronized
+    def set_memory_limit(
+        self,
+        limit_bytes: int,
+        *,
+        revision: int,
+    ) -> Dict[str, Any]:
+        """Apply a revisioned memory limit through the existing resize path."""
+        limit_bytes = int(limit_bytes)
+        revision = int(revision)
+        if limit_bytes < 0:
+            raise ValueError("limit_bytes must be non-negative")
+        if revision < 0:
+            raise ValueError("revision must be non-negative")
+
+        current_revision = self._memory_limit_revision
+        current_limit = self._memory_limit_bytes
+        if revision < current_revision:
+            return self._memory_limit_state(status="stale")
+        if revision == current_revision and current_limit == limit_bytes:
+            return self._memory_limit_state()
+        if revision == current_revision:
+            return self._memory_limit_state(status="conflict")
+
+        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
+        max_pages = self.mem_size // self.page_size
+        target_pages = min(limit_bytes // page_bundle_bytes, max_pages)
+        effective_limit_bytes = target_pages * page_bundle_bytes
+
+        self.resize(target_pages * self.page_size)
+        self._memory_limit_bytes = limit_bytes
+        self._memory_limit_effective_bytes = effective_limit_bytes
+        self._memory_limit_revision = revision
+        return self._memory_limit_state()
+
+    def _memory_limit_page_bundle_bytes(self) -> int:
+        return self.page_size * self.num_layers * self.num_kv_buffers
+
+    def _memory_limit_state(
+        self,
+        *,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        page_state = self.page_allocator.get_page_state()
+        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
+        mapped_pages = (int(page_state["inuse_pages"])
+                        + int(page_state["reserved_pages"]))
+        mapped_bytes = mapped_pages * page_bundle_bytes
+        effective_limit_bytes = self._memory_limit_effective_bytes
+        if status is None:
+            status = "deferred" if self.in_shrink else "applied"
+        return {
+            "status": status,
+            "pool_name": str(self.pool_name or ""),
+            "group_id": self.group_id,
+            "limit_bytes": self._memory_limit_bytes,
+            "effective_limit_bytes": effective_limit_bytes,
+            "current_capacity_bytes": (
+                int(page_state["total_pages"]) * page_bundle_bytes
+            ),
+            "revision": self._memory_limit_revision,
+            "mapped_bytes": mapped_bytes,
+            "remaining_bytes": (
+                None if effective_limit_bytes is None else
+                max(0, effective_limit_bytes - mapped_bytes)
+            ),
+            "overage_bytes": (
+                0 if effective_limit_bytes is None else
+                max(0, mapped_bytes - effective_limit_bytes)
+            ),
+            "reason": {
+                "deferred": "inuse_capacity_above_limit",
+                "conflict": "revision_reused_with_different_limit",
+            }.get(status, ""),
+        }
+
+    @synchronized
+    def memory_limit_state(self) -> Dict[str, Any]:
+        """Return the current revisioned resize limit and apply state."""
+        return self._memory_limit_state()
 
     @synchronized
     def available_size(self) -> int:
