@@ -8,7 +8,9 @@ from unittest import mock
 sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 
 
-def test_completed_worker_batch_is_synchronized_before_unmap(monkeypatch):
+def test_completed_worker_batch_is_synchronized_on_its_device_before_unmap(
+    monkeypatch,
+):
     synchronize = mock.Mock()
     torch = SimpleNamespace(
         cuda=SimpleNamespace(
@@ -18,8 +20,8 @@ def test_completed_worker_batch_is_synchronized_before_unmap(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
 
-    from kvcached.tp_ipc_util import _synchronize_completed_worker_batch
+    from kvcached.tp_ipc_util import _sync_before_unmap
 
-    _synchronize_completed_worker_batch()
+    _sync_before_unmap(2)
 
-    synchronize.assert_called_once_with()
+    synchronize.assert_called_once_with(2)

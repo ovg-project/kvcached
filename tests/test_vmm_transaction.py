@@ -4,6 +4,147 @@
 import pytest
 
 
+@pytest.mark.parametrize(("rollback_failure", "background"), [(False, False), (True, False), (False, True)])
+def test_native_map_exception_is_terminal_and_rolls_back_prior_targets(tmp_path, rollback_failure, background):
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    if sys.platform != "linux":
+        pytest.skip("CUDA driver fault injection uses Linux LD_PRELOAD")
+    source = tmp_path / "map_fault.c"
+    library = tmp_path / "map_fault.so"
+    source.write_text(r'''
+#include <dlfcn.h>
+#include <stddef.h>
+static int remaining = -1, fail_rollback = 0, map_failed = 0;
+void arm_map_failure(int rollback) {
+    remaining = 1; fail_rollback = rollback; map_failed = 0;
+}
+int cuMemMap(unsigned long long ptr, size_t size, size_t offset,
+             unsigned long long handle, unsigned long long flags) {
+    if (remaining == 0) { remaining = -1; map_failed = 1; return 2; }
+    if (remaining > 0) --remaining;
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    int (*real_map)(unsigned long long, size_t, size_t, unsigned long long,
+                    unsigned long long) = dlsym(cuda, "cuMemMap");
+    return real_map(ptr, size, offset, handle, flags);
+}
+int cuMemUnmap(unsigned long long ptr, size_t size) {
+    if (map_failed && fail_rollback) { fail_rollback = 0; return 1; }
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    int (*real_unmap)(unsigned long long, size_t) = dlsym(cuda, "cuMemUnmap");
+    return real_unmap(ptr, size);
+}
+''', encoding="utf-8")
+    subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl", "-o", str(library)], check=True)
+    scenario = r'''
+import ctypes, sys, time, uuid
+from kvcached import vmm_ops as v
+page = 2 * 1024 * 1024
+v.init_kvcached("cuda:0", page, False)
+v.create_kv_tensors(8 * page, 2, "cuda:0", 2, 2, 0, False)
+a = v.PageAllocator(2, 4 * page, page, 1, pp_rank=0, async_sched=False,
+    contiguous_layout=False, enable_page_prealloc=bool(int(sys.argv[2])), num_kv_buffers=2,
+    group_id=0, ipc_name="NATIVE_" + uuid.uuid4().hex[:8])
+before = a.get_num_free_pages()
+ctypes.CDLL(None).arm_map_failure(int(sys.argv[1]))
+try:
+    if int(sys.argv[2]):
+        a.start_prealloc_thread()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            a.get_avail_physical_pages()
+            time.sleep(0.01)
+    else:
+        a.alloc_page()
+except v.KVMappingStateError as error:
+    assert not isinstance(error, RuntimeError)
+    if int(sys.argv[1]):
+        assert "rollback failed" in str(error), str(error)
+else:
+    raise AssertionError("native mapping failure was downgraded")
+a.stop_prealloc_thread()
+assert a.get_num_free_pages() == before
+if not int(sys.argv[1]):
+    assert v.map_to_kv_tensors_with_result([0], 0) == (True, [0])
+del a
+v.shutdown_kvcached()
+print("NATIVE_MAP_FAILURE_OK", flush=True)
+'''
+    env = dict(os.environ, LD_PRELOAD=str(library))
+    result = subprocess.run(
+        [sys.executable, "-c", scenario, str(int(rollback_failure)), str(int(background))],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NATIVE_MAP_FAILURE_OK" in result.stdout
+
+
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase):
+    """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+
+    vmm_ops = _compiled_vmm_ops()
+    offsets, _ = _create_layout(vmm_ops, False, False)
+    allocator = vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=8 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=2, group_id=0, ipc_name="UNKNOWN_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+    allocator.set_broadcast_map_callback(ipc.broadcast_map_to_kv_tensors)
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", {})
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {(0, 0): "gpu-0"})
+    transactions = []
+    commands = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        commands.append(command)
+        transaction = message["transaction_id"]
+        if command == "prepare_map_to_kv_tensors":
+            transactions.append(transaction)
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction, message["offsets"], 0)["success"]
+            if phase == "prepare":
+                raise ConnectionError("lost prepare response")
+            return {"status": "success", "transaction_state": "reserved"}
+        if command == "commit_prepared_map":
+            assert vmm_ops.commit_prepared_map(transaction, 0)["success"]
+            raise ConnectionError("lost commit response")
+        if command == "get_map_transaction_state":
+            raise ConnectionError("lost state query response")
+        pytest.fail(f"unexpected cleanup or retry: {command}")
+
+    monkeypatch.setattr(ipc, "_send_and_receive_message", exchange)
+    try:
+        before = allocator.get_num_free_pages()
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="restart"):
+            allocator.alloc_page()
+        assert allocator.get_num_free_pages() == before
+        assert allocator.get_num_inuse_pages() == 0
+        assert len(transactions) == 1
+        assert commands.count("get_map_transaction_state") == 2
+        calls = len(commands)
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+            allocator.alloc_page()
+        assert len(commands) == calls
+        if phase == "prepare":
+            assert vmm_ops.has_prepared_map(transactions[0], 0)
+        else:
+            # Idempotent native map reports no newly mapped offsets: the
+            # original mapping was retained, not silently rolled back.
+            assert vmm_ops.map_to_kv_tensors_with_result([offsets[0]], 0) == (True, [])
+    finally:
+        del allocator
+        vmm_ops.shutdown_kvcached()
+
+
 def test_native_allocator_preserves_recoverable_callback_error():
     import uuid
 
@@ -25,6 +166,43 @@ def test_native_allocator_preserves_recoverable_callback_error():
         allocator.alloc_page()
     assert allocator.get_num_free_pages() == before
     assert allocator.get_num_inuse_pages() == 0
+
+
+def test_background_unknown_outcome_reaches_manager_capacity_check(monkeypatch):
+    import threading
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.kv_cache_manager import KVCacheManager
+    from kvcached.locks import NoOpLock
+
+    vmm_ops = _compiled_vmm_ops()
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", {})
+    entered = threading.Event()
+    allocator = vmm_ops.PageAllocator(
+        num_layers=1, mem_size_per_layer=16 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=True,
+        num_kv_buffers=2, group_id=0, ipc_name="BACKGROUND_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+
+    def fail(*args):
+        try:
+            ipc._fail_unresolved_map_transaction("background", [0], 0, "prepare", ["lost"])
+        finally:
+            entered.set()
+
+    allocator.set_broadcast_map_callback(fail)
+    manager = object.__new__(KVCacheManager)
+    manager._lock = NoOpLock()
+    try:
+        allocator.start_prealloc_thread()
+        assert entered.wait(10), "preallocator did not exercise the callback"
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="background"):
+            manager.available_size()
+    finally:
+        allocator.stop_prealloc_thread()
 
 
 def _compiled_vmm_ops():
@@ -72,6 +250,52 @@ def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     )
     stride = page_size * num_layers * num_kv_buffers if contiguous_layout else page_size
     return [0, stride], 32 * 1024 * 1024
+
+
+def test_unified_direct_mapping_uses_actual_physical_bytes(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    if sys.platform != "linux":
+        pytest.skip("driver memory-query injection requires Linux")
+    source = tmp_path / "capacity.c"
+    library = tmp_path / "capacity.so"
+    source.write_text(r'''
+#include <stddef.h>
+#include <dlfcn.h>
+static int enabled = 0;
+void enable_capacity_limit(void) { enabled = 1; }
+int cuMemGetInfo_v2(size_t *free_bytes, size_t *total_bytes) {
+    if (enabled) {
+        *free_bytes = 6 * 1024 * 1024;
+        *total_bytes = 100 * 1024 * 1024;
+        return 0;
+    }
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    int (*original)(size_t *, size_t *) = dlsym(cuda, "cuMemGetInfo_v2");
+    return original(free_bytes, total_bytes);
+}
+''', encoding="utf-8")
+    subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl", "-o", str(library)], check=True)
+    scenario = r'''
+import ctypes
+from kvcached import vmm_ops as v
+page = 2 * 1024 * 1024
+v.init_kvcached("cuda:0", page, False)
+v.create_kv_tensors(4 * page, 2, "cuda:0", 2, 2, 0, True)
+ctypes.CDLL(None).enable_capacity_limit()
+assert v.map_to_kv_tensors_with_result([0], 0) == (True, [0])
+assert v.unmap_from_kv_tensors([0], 0)
+assert v.map_to_kv_tensors([page], 0)
+assert v.unmap_from_kv_tensors([page], 0)
+v.shutdown_kvcached()
+'''
+    env = dict(os.environ, LD_PRELOAD=str(library), KVCACHED_GPU_UTILIZATION="0.99")
+    result = subprocess.run([sys.executable, "-c", scenario], env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -653,75 +654,55 @@ FTensorAllocator::map_to_kv_tensors_with_result(
 
   std::vector<MappingGroup> groups;
   groups.reserve(offsets.size());
-  for (auto offset : offsets) {
-    MappingGroup group{offset, {}};
+  std::unordered_set<offset_t> seen;
+  for (auto logical_offset : offsets) {
+    if (!seen.insert(logical_offset).second) {
+      continue;
+    }
+    MappingGroup group{logical_offset, {}};
     if (contiguous_layout_) {
-      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
+      group.targets.emplace_back(contiguous_kv_tensor_.get(), logical_offset);
     } else {
-      for (int64_t i = 0; i < num_layers_; i++) {
-        auto kv_name = std::string(kv_prefix) + std::to_string(i);
-        auto ftensor = ftensors_[kv_name].get();
-        group.targets.emplace_back(ftensor, offset);
+      for (int64_t i = 0; i < num_layers_; ++i) {
+        auto *ftensor =
+            ftensors_[std::string(kv_prefix) + std::to_string(i)].get();
+        group.targets.emplace_back(ftensor, logical_offset);
         if (!unified_pool_) {
-          auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
-          group.targets.emplace_back(ftensor, offset + v_base_offset);
+          group.targets.emplace_back(
+              ftensor,
+              logical_offset + get_v_base_offset(ftensor->get_tensor()));
         }
       }
     }
     groups.push_back(std::move(group));
   }
 
-  std::vector<MappingTarget> mapped;
+  std::vector<MappingTarget> targets_to_map;
   std::vector<offset_t> newly_mapped_offsets;
-  try {
-    for (const auto &group : groups) {
-      size_t existing = 0;
-      for (const auto &[ftensor, offset] : group.targets) {
-        existing += ftensor->is_mapped_(offset) ? 1 : 0;
-      }
-      if (existing == group.targets.size()) {
-        continue;
-      }
-      if (existing != 0) {
-        throw std::runtime_error("state_inconsistency: logical KV offset is "
-                                 "only partially mapped: " +
-                                 std::to_string(group.logical_offset));
-      }
+  for (const auto &group : groups) {
+    size_t existing = 0;
+    for (const auto &[ftensor, target_offset] : group.targets) {
+      existing += ftensor->is_mapped_(target_offset) ? 1 : 0;
+    }
+    if (existing == group.targets.size()) {
+      continue;
+    }
+    if (existing != 0) {
+      throw std::runtime_error("state_inconsistency: logical KV offset is "
+                               "only partially mapped: " +
+                               std::to_string(group.logical_offset));
+    }
+    targets_to_map.insert(targets_to_map.end(), group.targets.begin(),
+                          group.targets.end());
+    newly_mapped_offsets.push_back(group.logical_offset);
+  }
 
-      for (const auto &[ftensor, offset] : group.targets) {
-        if (!ftensor->map(offset)) {
-          throw std::runtime_error("physical page map returned false");
-        }
-        mapped.emplace_back(ftensor, offset);
-      }
-      newly_mapped_offsets.push_back(group.logical_offset);
+  if (!targets_to_map.empty()) {
+    auto reserved =
+        reserve_targets_(targets_to_map, newly_mapped_offsets, nullptr, false);
+    if (!map_reserved_targets_(std::move(reserved), nullptr, true)) {
+      throw std::runtime_error("KV map transaction failed");
     }
-  } catch (const std::exception &error) {
-    std::vector<std::string> rollback_errors;
-    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
-      try {
-        if (!it->first->unmap(it->second)) {
-          rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                       " returned false");
-        }
-      } catch (const std::exception &rollback_error) {
-        rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                     ": " + rollback_error.what());
-      }
-    }
-    if (!rollback_errors.empty()) {
-      std::string message =
-          std::string("state_inconsistency: KV map failed: ") + error.what() +
-          "; rollback failed: ";
-      for (size_t i = 0; i < rollback_errors.size(); ++i) {
-        if (i != 0) {
-          message += "; ";
-        }
-        message += rollback_errors[i];
-      }
-      throw std::runtime_error(message);
-    }
-    throw;
   }
   return {true, std::move(newly_mapped_offsets)};
 }

@@ -32,6 +32,27 @@ class FakeKVCachedAllocator:
         return list(range(num_pages))
 
 
+def test_paged_allocator_propagates_unknown_map_outcome(monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    module = _make_allocator_module(FakeTritonKernel(FakeKernelFn(())))
+    patch = ElasticAllocatorPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    assert patch.inject_elastic_paged_allocator(module)
+    allocator = module.ElasticPagedTokenToKVPoolAllocator(
+        size=128, page_size=4, dtype="int64", device="cuda:0", kvcache=FakeKVCache()
+    )
+
+    def fail(*args):
+        raise MapTransactionOutcomeUnknownError("unresolved transaction")
+
+    monkeypatch.setattr(allocator.kvcached_allocator, "alloc", fail)
+    with pytest.raises(MapTransactionOutcomeUnknownError):
+        allocator.alloc(4)
+
+
 class FakeKVCache:
     def __init__(self):
         self.kvcached_allocator = FakeKVCachedAllocator()

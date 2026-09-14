@@ -34,12 +34,19 @@ class _FakeServerSocket:
         raise RuntimeError("test listener stopped")
 
 
-@pytest.mark.parametrize("command", ["map_to_kv_tensors", "unmap_from_kv_tensors"])
+@pytest.mark.parametrize(
+    "command", ["prepare_map_to_kv_tensors", "prepare_unmap_from_kv_tensors"]
+)
 def test_worker_reports_vmm_boolean_failures(monkeypatch, command):
     torch: Any = types.ModuleType("torch")
     torch.cuda = types.SimpleNamespace(
         is_available=lambda: False,
         synchronize=lambda: None,
+        current_device=lambda: 0,
+        set_device=lambda _: None,
+        get_device_properties=lambda _: types.SimpleNamespace(
+            pci_bus_id="0000:00:00.0"
+        ),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
 
@@ -50,6 +57,13 @@ def test_worker_reports_vmm_boolean_failures(monkeypatch, command):
         lambda offsets, group_id=0: (False, [])
     )
     vmm_ops.unmap_from_kv_tensors = lambda offsets, group_id=0: False
+    vmm_ops.prepare_unmap_from_kv_tensors = lambda *args, **kwargs: False
+    vmm_ops.prepare_map_to_kv_tensors = (
+        lambda *args, **kwargs: {"success": False}
+    )
+    vmm_ops.commit_prepared_map = lambda *args, **kwargs: {"success": True}
+    vmm_ops.abort_prepared_map = lambda *args, **kwargs: True
+    vmm_ops.current_device_pci_bus_id = lambda: "0000:00:00.0"
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops)
     import kvcached
 
@@ -70,7 +84,12 @@ def test_worker_reports_vmm_boolean_failures(monkeypatch, command):
     monkeypatch.setattr(
         tp_ipc_util,
         "recv_msg",
-        lambda conn: {"cmd": command, "offsets": [7], "group_id": 3},
+        lambda conn: {
+            "cmd": command,
+            "offsets": [7],
+            "group_id": 3,
+            "transaction_id": "failed-prepare",
+        },
     )
 
     def capture_response(conn, message):
@@ -98,6 +117,11 @@ def test_worker_executes_unmap_transaction_phases(monkeypatch, command, expected
     torch.cuda = types.SimpleNamespace(
         is_available=lambda: False,
         synchronize=lambda: None,
+        current_device=lambda: 0,
+        set_device=lambda _: None,
+        get_device_properties=lambda _: types.SimpleNamespace(
+            pci_bus_id="0000:00:00.0"
+        ),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
 

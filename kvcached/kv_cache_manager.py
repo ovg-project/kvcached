@@ -17,7 +17,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+from kvcached.tp_ipc_util import (
+    broadcast_kv_tensors_created,
+    raise_if_physical_growth_unresolved,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
@@ -243,6 +246,7 @@ class KVCacheManager:
 
         # Event used to signal that _post_init() has finished.
         self._post_init_done = threading.Event()
+        self._post_init_error: Optional[Exception] = None
         # Launch _post_init in the background; it will block until KV tensors
         # exist, then complete the remaining setup (reserve null block, start
         # pre-alloc thread) and finally set the event.
@@ -252,7 +256,7 @@ class KVCacheManager:
         if self.null_block is not None:
             return
 
-        def _check_kv_tensors_created():
+        def _check_kv_tensors_created(remaining: float):
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
                 vllm_remote = should_use_worker_ipc()
@@ -262,33 +266,34 @@ class KVCacheManager:
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(
                     self.world_size, self.pp_rank,
-                    group_id=self.group_id)
+                    group_id=self.group_id, timeout_s=remaining)
             else:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
-            total_wait = 0.0
+            deadline = time.monotonic() + KV_TENSOR_WAIT_TIMEOUT
             last_error: Exception | None = None
             while True:
+                remaining = deadline - time.monotonic()
                 try:
-                    if _check_kv_tensors_created():
+                    if remaining > 0 and _check_kv_tensors_created(remaining):
                         break
                 except Exception as e:
                     last_error = e
-                if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
+                if time.monotonic() >= deadline:
                     message = ("KV tensors not created after "
                                f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
                     if last_error is not None:
                         message = f"{message}; last error: {last_error}"
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
-                total_wait += 0.001
             # KV tensors created now
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
             self.page_allocator.start_prealloc_thread()
         except Exception as e:
+            self._post_init_error = e
             self._record_operation_error(
                 "post_init_failed",
                 "post_init_errors_total",
@@ -303,6 +308,9 @@ class KVCacheManager:
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+        error = getattr(self, "_post_init_error", None)
+        if error is not None:
+            raise error
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
         operation_lock = getattr(self, "_operation_lock", None)
@@ -482,37 +490,64 @@ class KVCacheManager:
 
         while remaining_need > 0:  # Allocate the remaining blocks from pages
             if not self.avail_pages:
-                # Only alloc_page() is recoverable here. available_size() saw
-                # enough logical capacity, but another instance sharing the
-                # physical pool consumed pages before we reached this call, so
-                # roll back and report an allocation miss instead of leaking
-                # blocks or crashing. Anything else raising in this loop is an
-                # invariant failure (e.g. InternalPage.alloc()'s "Not enough
-                # free blocks in page", raised after _pick_avail_page() has
-                # already removed the page from avail_pages and before its
-                # blocks reach ret_index, which rollback therefore cannot
-                # restore) and must stay fail-loud.
                 try:
-                    page = self.page_allocator.alloc_page()
-                except RuntimeError as e:
+                    new_pages = [self.page_allocator.alloc_page()]
+                except RuntimeError as exc:
+                    # Older native extensions erase the callback's exception type.
+                    raise_if_physical_growth_unresolved()
                     self._increment_operation_counter(
                         "physical_page_allocation_failures_total"
                     )
-                    self._rollback_partial_alloc(ret_index, num_from_reserved)
-                    logger.warning(
-                        f"alloc_page() failed after partially allocating "
-                        f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+                    failure_count = self._get_operation_counter(
+                        "physical_page_allocation_failures_total"
+                    )
+                    if failure_count & (failure_count - 1) == 0:
+                        logger.warning(
+                            "Physical KV page allocation remains unavailable; "
+                            "returning a recoverable allocation miss "
+                            "(failures=%d): %s",
+                            failure_count,
+                            exc,
+                        )
+                    self._rollback_partial_alloc(
+                        ret_index,
+                        num_from_reserved,
+                        # A partial request must not retain empty pages forever.
+                        # Keep release ordered behind in-flight worker batches.
+                        release_empty_pages=True,
+                    )
                     return None
-                self._increment_operation_counter("physical_page_allocations_total")
-                page.init(self.block_mem_size)
-                # A page may have zero usable blocks when block_mem_size is
-                # large (e.g. HYBRID_LINEAR) and every aligned block would
-                # straddle the page boundary. Park it in full_pages so it's
-                # not re-handed-out but stays lookupable by free().
-                if page.num_free_blocks() == 0:
-                    self.full_pages[page.page_id] = page
+                except Exception:
+                    self._increment_operation_counter(
+                        "physical_page_allocation_failures_total"
+                    )
+                    raise
+
+                try:
+                    for new_page in new_pages:
+                        new_page.init(self.block_mem_size)
+                except Exception:
+                    self._increment_operation_counter(
+                        "physical_page_allocation_failures_total"
+                    )
+                    self.page_allocator.free_pages(
+                        [new_page.page_id for new_page in new_pages]
+                    )
+                    raise
+
+                self._increment_operation_counter(
+                    "physical_page_allocations_total",
+                    len(new_pages),
+                )
+                for new_page in new_pages:
+                    if new_page.num_free_blocks() == 0:
+                        self.full_pages[new_page.page_id] = new_page
+                        continue
+                    self.num_avail_blocks += new_page.num_free_blocks()
+                    self.avail_pages[new_page.page_id] = new_page
+                if not self.avail_pages:
                     continue
-                self.num_avail_blocks += page.num_free_blocks()
+                page = self._pick_avail_page(remaining_need)
             else:
                 page = self._pick_avail_page(remaining_need)
             num_from_page = min(page.num_free_blocks(), remaining_need)
@@ -528,8 +563,13 @@ class KVCacheManager:
 
         return ret_index
 
-    def _rollback_partial_alloc(self, ret_index: List[int],
-                                num_from_reserved: int) -> None:
+    def _rollback_partial_alloc(
+        self,
+        ret_index: List[int],
+        num_from_reserved: int,
+        *,
+        release_empty_pages: bool = True,
+    ) -> None:
         """Return partially allocated blocks after a mid-alloc failure.
 
         The first ``num_from_reserved`` entries of ``ret_index`` came off the
@@ -541,7 +581,10 @@ class KVCacheManager:
         """
         page_blocks = ret_index[num_from_reserved:]
         if page_blocks:
-            self._free(page_blocks)
+            self._free(
+                page_blocks,
+                release_empty_pages=release_empty_pages,
+            )
         reserved_blocks = ret_index[:num_from_reserved]
         if reserved_blocks:
             self.reserved_blocks = reserved_blocks + self.reserved_blocks
@@ -603,7 +646,12 @@ class KVCacheManager:
             self._increment_operation_counter("free_successes_total")
         self._increment_operation_counter("freed_blocks_total", freed_blocks)
 
-    def _free(self, indices: List[int]) -> tuple[int, bool]:
+    def _free(
+        self,
+        indices: List[int],
+        *,
+        release_empty_pages: bool = True,
+    ) -> tuple[int, bool]:
         self._wait_post_init()
 
         if len(indices) == 0:
@@ -649,7 +697,7 @@ class KVCacheManager:
             page.free_batch(idxs)
             freed_blocks += len(idxs)
 
-            if page.empty():
+            if page.empty() and release_empty_pages:
                 pages_to_free.append(page.page_id)
                 self.num_avail_blocks -= page.num_free_blocks()
             else:
@@ -879,6 +927,8 @@ class KVCacheManager:
 
     @synchronized
     def available_size(self) -> int:
+        # A background preallocator cannot raise on the engine's thread.
+        raise_if_physical_growth_unresolved()
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
             blocks_from_free_pages = 0
