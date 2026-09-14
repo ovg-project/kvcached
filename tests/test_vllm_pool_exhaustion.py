@@ -38,7 +38,18 @@ def vllm_patches(monkeypatch):
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
     monkeypatch.delitem(sys.modules, "kvcached.integration.vllm.patches",
                         raising=False)
-    return importlib.import_module("kvcached.integration.vllm.patches")
+    # monkeypatch.delitem records nothing when the key is already absent, so the
+    # module imported below outlives this fixture with the mock torch still in its
+    # globals. Drop whatever the import created, so a later test importing the
+    # same modules gets them built against the real torch.
+    imported_before = set(sys.modules)
+    patches = importlib.import_module("kvcached.integration.vllm.patches")
+    try:
+        yield patches
+    finally:
+        for name in set(sys.modules) - imported_before:
+            if name.startswith("kvcached"):
+                sys.modules.pop(name, None)
 
 
 def _module_with_manager(raises: BaseException | None):

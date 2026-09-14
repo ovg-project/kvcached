@@ -15,15 +15,34 @@ import sys
 import types
 from unittest import mock
 
-_torch_mock = mock.MagicMock()
-_torch_mock.__version__ = "2.6.0"
-_torch_mock.cuda.mem_get_info.return_value = (8 * 1024**3, 16 * 1024**3)
-sys.modules.setdefault("torch", _torch_mock)
-sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
-sys.modules.setdefault("torch.utils", _torch_mock.utils)
-sys.modules.setdefault("torch.utils.cpp_extension", _torch_mock.utils.cpp_extension)
+# Stub torch only when it is genuinely missing, for the same reason the C
+# extension below is stubbed conditionally: these entries are process-wide and
+# outlive this module. Importing cpp_extension is what settles it -- torch itself
+# does not pull that submodule in, so on a machine that has torch a setdefault
+# would install the mock anyway and hand the later-collected
+# test_vmm_failure_policy.py a MagicMock where it expects CUDA_HOME.
+try:
+    import torch.utils.cpp_extension  # noqa: F401
+except Exception:
+    _torch_mock = mock.MagicMock()
+    _torch_mock.__version__ = "2.6.0"
+    _torch_mock.cuda.mem_get_info.return_value = (8 * 1024**3, 16 * 1024**3)
+    sys.modules.setdefault("torch", _torch_mock)
+    sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
+    sys.modules.setdefault("torch.utils", _torch_mock.utils)
+    sys.modules.setdefault("torch.utils.cpp_extension",
+                           _torch_mock.utils.cpp_extension)
 sys.modules.setdefault("posix_ipc", mock.MagicMock())
-sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
+
+# Stub the compiled extension only when it cannot be loaded. The mock is
+# process-wide and outlives this module, so on a machine where kvcached is built
+# it would follow into every later-collected test file and break the ones that
+# import vmm_ops for real.
+try:
+    import kvcached.vmm_ops  # noqa: F401
+except Exception:
+    sys.modules["kvcached.vmm_ops"] = mock.MagicMock()
+
 sys.modules.setdefault("kvcached.integration.vllm.interfaces", mock.MagicMock())
 import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
 

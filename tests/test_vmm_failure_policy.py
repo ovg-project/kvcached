@@ -21,12 +21,18 @@ def fault_library(tmp_path_factory):
         pytest.skip("CUDA required")
     from torch.utils.cpp_extension import CUDA_HOME
 
-    if CUDA_HOME is None:
-        pytest.skip("CUDA headers required for the test-only driver shim")
+    # cuda.h decides it, not CUDA_HOME: a driver-only install has the toolkit
+    # root without headers, and a mock torch.utils.cpp_extension left in
+    # sys.modules by an earlier test file has a CUDA_HOME that is not a path at
+    # all. Either way the skip reason beats the compiler's.
+    include_dir = None if CUDA_HOME is None else Path(str(CUDA_HOME)) / "include"
+    if include_dir is None or not (include_dir / "cuda.h").is_file():
+        pytest.skip(f"CUDA headers required for the test-only driver shim "
+                    f"(no cuda.h under {include_dir})")
     library = tmp_path_factory.mktemp("vmm-faults") / "faults.so"
     subprocess.run([
         "c++", "-std=c++17", "-shared", "-fPIC", "-O2",
-        "-I", str(Path(CUDA_HOME) / "include"),
+        "-I", str(include_dir),
         str(Path(__file__).parent / "native" / "vmm_faults.cpp"),
         "-ldl", "-o", str(library),
     ], check=True)
