@@ -476,7 +476,6 @@ class KVCacheManager:
             return None
 
         ret_index = []
-        page: Optional[InternalPage] = None
 
         remaining_need = need_size
 
@@ -491,7 +490,17 @@ class KVCacheManager:
         while remaining_need > 0:  # Allocate the remaining blocks from pages
             if not self.avail_pages:
                 try:
-                    new_pages = [self.page_allocator.alloc_page()]
+                    # Alignment may leave fewer blocks in an individual page;
+                    # consume this batch first, then grow again if necessary.
+                    blocks_per_page = max(1, InternalPage.get_num_blocks(
+                        self.page_size, self.block_mem_size))
+                    pages_needed = (
+                        remaining_need + blocks_per_page - 1
+                    ) // blocks_per_page
+                    if pages_needed == 1:
+                        new_pages = [self.page_allocator.alloc_page()]
+                    else:
+                        new_pages = self.page_allocator.alloc_pages(pages_needed)
                 except RuntimeError as exc:
                     # Older native extensions erase the callback's exception type.
                     raise_if_physical_growth_unresolved()
@@ -539,27 +548,25 @@ class KVCacheManager:
                     "physical_page_allocations_total",
                     len(new_pages),
                 )
-                for new_page in new_pages:
-                    if new_page.num_free_blocks() == 0:
-                        self.full_pages[new_page.page_id] = new_page
-                        continue
-                    self.num_avail_blocks += new_page.num_free_blocks()
-                    self.avail_pages[new_page.page_id] = new_page
-                if not self.avail_pages:
-                    continue
-                page = self._pick_avail_page(remaining_need)
+                self.num_avail_blocks += sum(
+                    new_page.num_free_blocks() for new_page in new_pages
+                )
+                # Fresh pages do not need best-fit selection. Scanning the
+                # entire remaining batch for each page would be quadratic.
+                pages_to_consume = new_pages
             else:
-                page = self._pick_avail_page(remaining_need)
-            num_from_page = min(page.num_free_blocks(), remaining_need)
-            alloced_index = page.alloc(num_from_page)
-            ret_index.extend(alloced_index)
-            if page.full():
-                self.full_pages[page.page_id] = page
-            else:
-                self.avail_pages[page.page_id] = page
+                pages_to_consume = [self._pick_avail_page(remaining_need)]
+            for page in pages_to_consume:
+                num_from_page = min(page.num_free_blocks(), remaining_need)
+                if num_from_page:
+                    ret_index.extend(page.alloc(num_from_page))
+                if page.full():
+                    self.full_pages[page.page_id] = page
+                else:
+                    self.avail_pages[page.page_id] = page
 
-            self.num_avail_blocks -= num_from_page
-            remaining_need -= num_from_page
+                self.num_avail_blocks -= num_from_page
+                remaining_need -= num_from_page
 
         return ret_index
 

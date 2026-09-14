@@ -197,6 +197,12 @@ page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
   return allocator->alloc_page();
 }
 
+std::vector<std::shared_ptr<InternalPage>>
+page_allocator_alloc_pages(std::shared_ptr<PageAllocator> allocator,
+                           int64_t num_pages) {
+  return allocator->alloc_pages(num_pages);
+}
+
 void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
                               page_id_t page_id) {
   allocator->free_page(page_id);
@@ -371,6 +377,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("alloc_page", &kvcached::page_allocator_alloc_page,
            py::call_guard<py::gil_scoped_release>())
+      .def("alloc_pages", &kvcached::page_allocator_alloc_pages,
+           py::arg("num_pages"), py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,

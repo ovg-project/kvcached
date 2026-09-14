@@ -83,7 +83,8 @@ print("NATIVE_MAP_FAILURE_OK", flush=True)
 
 
 @pytest.mark.parametrize("phase", ["prepare", "commit"])
-def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase):
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase, num_pages):
     """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
     import uuid
 
@@ -125,14 +126,14 @@ def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch,
     try:
         before = allocator.get_num_free_pages()
         with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="restart"):
-            allocator.alloc_page()
+            allocator.alloc_pages(num_pages)
         assert allocator.get_num_free_pages() == before
         assert allocator.get_num_inuse_pages() == 0
         assert len(transactions) == 1
         assert commands.count("get_map_transaction_state") == 2
         calls = len(commands)
         with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
-            allocator.alloc_page()
+            allocator.alloc_pages(num_pages)
         assert len(commands) == calls
         if phase == "prepare":
             assert vmm_ops.has_prepared_map(transactions[0], 0)
@@ -166,6 +167,107 @@ def test_native_allocator_preserves_recoverable_callback_error():
         allocator.alloc_page()
     assert allocator.get_num_free_pages() == before
     assert allocator.get_num_inuse_pages() == 0
+
+
+def _batch_allocator(vmm_ops, *, contiguous_layout=False):
+    import uuid
+
+    page_size = 2 * 1024 * 1024
+    return vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=4 * page_size,
+        page_size=page_size, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=contiguous_layout,
+        enable_page_prealloc=False, num_kv_buffers=2,
+        group_id=0, ipc_name="BATCH_" + uuid.uuid4().hex[:8],
+    )
+
+
+@pytest.mark.parametrize("contiguous_layout", [False, True])
+def test_native_batch_maps_all_new_offsets_once_and_reuses_reserved(contiguous_layout):
+    v = _compiled_vmm_ops()
+    page_size = 2 * 1024 * 1024
+    v.init_kvcached("cuda:0", page_size, contiguous_layout)
+    # create_kv_tensors takes the per-layer K+V size, whereas PageAllocator
+    # takes the size of one buffer. Reserve four pages for each K/V buffer.
+    v.create_kv_tensors(8 * page_size, 2, "cuda:0", 2, 2, 0, False)
+    allocator = _batch_allocator(v, contiguous_layout=contiguous_layout)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    stride = 2 * 1024 * 1024 * (4 if contiguous_layout else 1)
+
+    def map_batch(world_size, offsets):
+        calls.append(list(offsets))
+        assert v.map_to_kv_tensors_with_result(offsets, 0) == (True, list(offsets))
+
+    allocator.set_broadcast_map_callback(map_batch)
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: v.unmap_from_kv_tensors(offsets, 0))
+    try:
+        pages = allocator.alloc_pages(2)
+        assert [p.page_id for p in pages] == [0, 1]
+        assert calls == [[0, stride]]
+        allocator.free_page(0)
+        assert allocator.get_num_reserved_pages() == 1
+        pages = allocator.alloc_pages(3)
+        assert [p.page_id for p in pages] == [0, 2, 3]
+        assert calls == [[0, stride], [2 * stride, 3 * stride]]
+        assert allocator.get_num_free_pages() == 0
+        # Every offset is already mapped, including the reused reserved page.
+        assert v.map_to_kv_tensors_with_result([i * stride for i in range(4)], 0) == (True, [])
+        allocator.free_pages([0, 1, 2, 3])
+        allocator.trim()
+        assert allocator.get_num_free_pages() == 4
+    finally:
+        del allocator
+        v.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_native_batch_failure_restores_mixed_page_lists_without_unmap(unknown):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls, unmaps = [], []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: unmaps.append(list(offsets)))
+    allocator.alloc_pages(2)
+    allocator.free_page(0)
+    error_type = MapTransactionOutcomeUnknownError if unknown else RuntimeError
+
+    def fail(ws, offsets):
+        raise error_type("injected batch failure")
+
+    allocator.set_broadcast_map_callback(fail)
+    with pytest.raises(error_type, match="injected batch failure"):
+        allocator.alloc_pages(3)
+    assert allocator.get_num_free_pages() == 3
+    assert allocator.get_num_reserved_pages() == 1
+    assert allocator.get_num_inuse_pages() == 1
+    assert unmaps == []
+    # The unknown-outcome latch is covered by the real protocol test above;
+    # this callback-only test checks native ID ownership/order after failure.
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    assert [p.page_id for p in allocator.alloc_pages(3)] == [0, 2, 3]
+    assert len(calls[-1]) == 2  # the reserved page was not mapped again
+
+
+def test_native_batch_invalid_or_exhausted_request_does_not_mutate_state():
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    assert allocator.alloc_pages(0) == []
+    with pytest.raises(ValueError, match="non-negative"):
+        allocator.alloc_pages(-1)
+    with pytest.raises(RuntimeError, match="free pages"):
+        allocator.alloc_pages(5)
+    assert allocator.get_num_free_pages() == 4
+    assert allocator.get_num_reserved_pages() == 0
+    assert calls == []
+    assert [p.page_id for p in allocator.alloc_pages(4)] == list(range(4))
+    assert len(calls) == 1
 
 
 def test_background_unknown_outcome_reaches_manager_capacity_check(monkeypatch):
