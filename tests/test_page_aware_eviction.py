@@ -23,7 +23,16 @@ sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
 sys.modules.setdefault("torch.utils", _torch_mock.utils)
 sys.modules.setdefault("torch.utils.cpp_extension", _torch_mock.utils.cpp_extension)
 sys.modules.setdefault("posix_ipc", mock.MagicMock())
-sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
+
+# Stub the compiled extension only when it cannot be loaded. The mock is
+# process-wide and outlives this module, so on a machine where kvcached is built
+# it would follow into every later-collected test file and break the ones that
+# import vmm_ops for real.
+try:
+    import kvcached.vmm_ops  # noqa: F401
+except Exception:
+    sys.modules["kvcached.vmm_ops"] = mock.MagicMock()
+
 sys.modules.setdefault("kvcached.integration.vllm.interfaces", mock.MagicMock())
 import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
 
