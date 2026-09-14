@@ -7,9 +7,9 @@ import pickle
 import socket
 import threading
 import uuid
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, cast
 
-from kvcached.utils import DEFAULT_IPC_NAME
+from kvcached.utils import DEFAULT_IPC_NAME, normalize_gpu_device
 from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
 
 
@@ -100,11 +100,29 @@ def recv_msg(sock: socket.socket) -> Message:
     return cast(Message, pickle.loads(data))
 
 
-def start_worker_listener_thread(rank: int, pp_rank: int = 0):
-    """
-    Start a thread that listens for messages on the worker socket.
-    pp_rank is used to create a PP-stage-specific subdirectory so that
-    concurrent SGLang PP stages do not bind the same socket path.
+def resolve_gpu_device_index(device: Optional[str]) -> int:
+    """Resolve an integration device string to the CUDA runtime device index."""
+    import torch
+
+    if device is not None:
+        device_index = torch.device(normalize_gpu_device(device)).index
+        if device_index is not None:
+            return int(device_index)
+    return int(torch.cuda.current_device())
+
+
+def start_worker_listener_thread(
+    rank: int,
+    pp_rank: int = 0,
+    device_index: Optional[int] = None,
+):
+    """Start a thread that listens for messages on the worker socket.
+
+    ``pp_rank`` selects a PP-stage-specific socket directory so concurrent
+    stages do not bind the same path. When ``device_index`` is provided, the
+    listener restores that CUDA device inside the new thread before executing
+    CUDA-backed map or unmap operations because CUDA's current device is
+    thread-local.
     """
     socket_dir = os.path.join(SOCKET_DIR, f"pp{pp_rank}") if pp_rank > 0 else SOCKET_DIR
     os.makedirs(socket_dir, exist_ok=True)
@@ -121,6 +139,11 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
     server_sock.listen()
 
     def listen_loop():
+        if device_index is not None:
+            import torch
+
+            # CUDA's current device is thread-local, so restore the worker device.
+            torch.cuda.set_device(device_index)
         print(f"Worker {rank} IPC listener started at {socket_path}")
         while True:
             conn, _ = server_sock.accept()
