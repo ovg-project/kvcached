@@ -474,6 +474,9 @@ def test_legacy_determine_available_memory_runs_profile_without_device_delta(
 
     class Worker:
         def __init__(self):
+            # A real vLLM Worker always carries .device; the patch reads it to
+            # pick the accelerator module, so the fake has to as well.
+            self.device = "cuda:0"
             self.cache_config = types.SimpleNamespace(gpu_memory_utilization=0.75)
             self.model_runner = types.SimpleNamespace(
                 model_memory_usage=100, profile_run=profile_run

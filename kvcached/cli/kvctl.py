@@ -251,12 +251,14 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
             print(_clr(line, clr))
 
 
-def cmd_limit(ipc: str, size_str: str):
+def cmd_limit(ipc: str, size_str: str) -> int:
     """Set an absolute limit for an existing IPC segment.
 
     We first validate that the supplied ``ipc`` name corresponds to a running
     segment; otherwise we refuse the operation to avoid accidentally creating
     a new (wrong-case) shared-memory file.
+
+    Returns a process exit code, so a script can tell a refusal from a change.
     """
     if get_kv_cache_limit(ipc) is None:
         print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
@@ -264,28 +266,41 @@ def cmd_limit(ipc: str, size_str: str):
         avail = _detect_kvcache_ipc_names()
         if avail:
             print("Active IPC names:", ", ".join(avail), file=sys.stderr)
-        return
+        return 1
 
     size_bytes = _parse_size(size_str)
-    update_kv_cache_limit(ipc, size_bytes)
+    if update_kv_cache_limit(ipc, size_bytes) is None:
+        # The segment went away between the check above and the write.
+        print(_clr(f"Error: IPC '{ipc}' disappeared.", 'red', bold=True),
+              file=sys.stderr)
+        return 1
+    return 0
 
 
-def cmd_limit_percent(ipc: str, percent: float):
+def cmd_limit_percent(ipc: str, percent: float) -> int:
     """Set limit as percentage of total GPU RAM for an existing IPC."""
     if get_kv_cache_limit(ipc) is None:
         print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
               file=sys.stderr)
-        return
+        return 1
 
     from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        print("CUDA unavailable; cannot compute size from percentage",
-              file=sys.stderr)
-        sys.exit(1)
+        # get_total_gpu_memory() asks torch.cuda or torch.xpu, whichever the
+        # build has, so naming CUDA here misreports the failure on the others.
+        print(
+            "No accelerator visible (cuda/hip/xpu); cannot compute size from "
+            "percentage. Use `limit` with an absolute size.",
+            file=sys.stderr)
+        return 1
     size_bytes = int(total_mem * percent / 100.0)
-    update_kv_cache_limit(ipc, size_bytes)
+    if update_kv_cache_limit(ipc, size_bytes) is None:
+        print(_clr(f"Error: IPC '{ipc}' disappeared.", 'red', bold=True),
+              file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
@@ -308,14 +323,14 @@ def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
 # ---------------------------------------------------------------------------
 
 
-def cmd_delete(ipc: str):
+def cmd_delete(ipc: str) -> int:
     from kvcached.cli.utils import delete_kv_cache_segment
 
     if delete_kv_cache_segment(ipc):
         print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
-    else:
-        print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
+        return 0
+    print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True), file=sys.stderr)
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -459,22 +474,26 @@ def main():
 
     args = parser.parse_args()
 
+    # The commands that can refuse the request report it in their exit code.
+    rc = 0
     if args.command == 'list':
         cmd_list(args.ipc if args.ipc else None, json_out=args.json)
     elif args.command == 'limit':
-        cmd_limit(args.ipc, args.size)
+        rc = cmd_limit(args.ipc, args.size)
     elif args.command == 'limit-percent':
-        cmd_limit_percent(args.ipc, args.percent)
+        rc = cmd_limit_percent(args.ipc, args.percent)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
     elif args.command == 'delete':
-        cmd_delete(args.ipc)
+        rc = cmd_delete(args.ipc)
     elif args.command == 'shell' or args.command is None:
         interactive_shell()
     else:
         parser.print_help()
+        rc = 2
+    sys.exit(rc)
 
 
 if __name__ == '__main__':

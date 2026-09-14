@@ -21,6 +21,7 @@ import torch
 
 from kvcached.integration.vllm.interfaces import alloc_kv_cache, init_kvcached, shutdown_kvcached
 from kvcached.integration.vllm.patches import ElasticBlockPoolPatch
+from kvcached.utils import get_device_module, get_device_type
 from kvcached.vmm_ops import kv_tensors_created
 
 TP_RANK, TP_SIZE = 0, 1
@@ -29,7 +30,7 @@ BLOCK_SIZE = 16
 CELL_SIZE = 1024
 NUM_BLOCKS = 8192
 DTYPE = torch.float16
-DEVICE = f"cuda:{TP_RANK}"
+DEVICE = f"{get_device_type()}:{TP_RANK}"
 KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
 
 CACHED = 4096  # blocks cached before eviction
@@ -51,11 +52,14 @@ class _Request:
 
 
 def build_pool():
-    torch.cuda.set_device(TP_RANK)
+    get_device_module().set_device(TP_RANK)
     init_kvcached(tp_rank=TP_RANK, world_size=TP_SIZE, is_worker=True,
                   async_sched=False)
-    alloc_kv_cache(kvcache_shape=KV_SHAPE, block_size=BLOCK_SIZE, dtype=DTYPE,
-                   device=DEVICE, num_layers=NUM_LAYERS)
+    # NUM_BLOCKS is a request; cap the pool at what alloc_kv_cache could actually
+    # reserve on this card (see bench_frag.py).
+    _, meta = alloc_kv_cache(kvcache_shape=KV_SHAPE, block_size=BLOCK_SIZE,
+                             dtype=DTYPE, device=DEVICE,
+                             num_layers=NUM_LAYERS, return_meta=True)
     t0 = time.time()
     while not kv_tensors_created():
         if time.time() - t0 > 10.0:
@@ -67,7 +71,7 @@ def build_pool():
     mod.KVCacheBlock = _Block
     ElasticBlockPoolPatch().inject_elastic_block_pool(mod)
     return mod.ElasticBlockPool(
-        num_gpu_blocks=NUM_BLOCKS,
+        num_gpu_blocks=min(NUM_BLOCKS, meta["num_blocks_per_layer"]),
         block_size=BLOCK_SIZE,
         cell_size=CELL_SIZE,
         num_layers=NUM_LAYERS,

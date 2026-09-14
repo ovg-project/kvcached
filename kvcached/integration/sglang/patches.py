@@ -13,7 +13,13 @@ from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
-from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
+from kvcached.utils import (
+    MAX_CACHED_TOKENS,
+    get_device_module,
+    get_device_type,
+    get_kvcached_logger,
+    is_gpu_device_str,
+)
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
@@ -25,8 +31,10 @@ logger = get_kvcached_logger()
 
 
 def _is_supported_gpu_device(device: str) -> bool:
-    device_str = str(device).lower()
-    return device_str.startswith("cuda") or device_str.startswith("hip")
+    # Must accept every backend kvcached can build for (cuda/hip/xpu); an
+    # unrecognized prefix makes the patch decline silently and SGLang falls back
+    # to its own non-elastic allocator.
+    return is_gpu_device_str(device)
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -81,15 +89,17 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
 
             import torch
 
+            device_module = get_device_module(runner.device)
+
             query_error = None
             try:
                 total_memory = int(
-                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                    device_module.get_device_properties(runner.gpu_id).total_memory
                 )
                 mem_fraction_static = float(runner.mem_fraction_static)
                 logical_budget = math.ceil(total_memory * mem_fraction_static)
                 process_local_reserved = int(
-                    torch.cuda.memory_reserved(runner.gpu_id)
+                    device_module.memory_reserved(runner.gpu_id)
                 )
                 local_available_bytes = logical_budget - process_local_reserved
             except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
@@ -195,7 +205,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticTokenToKVPoolAllocator only supports GPU "
-                            "devices (cuda/hip)"
+                            "devices (cuda/hip/xpu)"
                         )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     logger.info(
@@ -298,7 +308,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticPagedTokenToKVPoolAllocator only supports GPU "
-                            "devices (cuda/hip)"
+                            "devices (cuda/hip/xpu)"
                         )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
@@ -647,7 +657,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(self.device):
                         raise ValueError(
                             "ElasticMHATokenToKVPool only supports GPU devices "
-                            "(cuda/hip)")
+                            "(cuda/hip/xpu)")
                     _kv_mha: Tuple[List[Any], List[Any]] = cast(
                         Tuple[List[Any], List[Any]],
                         kvi.alloc_kv_cache(
@@ -812,7 +822,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticMLATokenToKVPool only supports GPU devices "
-                            "(cuda/hip)")
+                            "(cuda/hip/xpu)")
                     self.kv_buffer = cast(
                         List[torch.Tensor],
                         kvi.alloc_kv_cache(
@@ -1078,7 +1088,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
-                            "ElasticMambaPool only supports GPU devices (cuda/hip)")
+                            "ElasticMambaPool only supports GPU devices (cuda/hip/xpu)")
 
                     self._group_id = ElasticMambaPool._next_group_id
                     ElasticMambaPool._next_group_id += 1
@@ -1143,7 +1153,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                     temporal_state_shape[2],
                                 ),
                                 dtype=cache_params.dtype.temporal,
-                                device="cuda",
+                                device=get_device_type(),
                             )
                             intermediate_conv_window_cache = [
                                 torch.zeros(
@@ -1155,7 +1165,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                         conv_shape[1],
                                     ),
                                     dtype=cache_params.dtype.conv,
-                                    device="cuda",
+                                    device=get_device_type(),
                                 )
                                 for conv_shape in conv_state_shape
                             ]

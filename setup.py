@@ -47,8 +47,11 @@ def get_extensions():
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
     # KVCACHED_BACKEND forces a backend for cross-builds; otherwise infer it
-    # from the installed PyTorch. Only one of torch.version.{hip,cuda,xpu} is
-    # ever set, so the order below is not load-bearing.
+    # from the installed PyTorch, in the order hip > cuda > xpu. That precedence
+    # is intentional: torch.version.hip and torch.version.cuda are both set on
+    # PyTorch-ROCm, which presents AMD GPUs as CUDA devices. kvcached/utils.py's
+    # _detect_accelerator_backend() repeats the same order so the runtime and
+    # the build agree.
     forced_backend = os.getenv("KVCACHED_BACKEND", "").strip().lower()
     if forced_backend not in ("", "hip", "cuda", "xpu"):
         raise RuntimeError(

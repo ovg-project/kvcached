@@ -19,6 +19,7 @@ import torch
 
 from kvcached.integration.vllm.interfaces import alloc_kv_cache, init_kvcached, shutdown_kvcached
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.utils import get_device_module, get_device_type
 from kvcached.vmm_ops import kv_tensors_created
 
 TP_RANK, TP_SIZE = 0, 1
@@ -27,7 +28,7 @@ BLOCK_SIZE = 16
 NUM_BLOCKS = 65536
 CELL_SIZE = 1024
 DTYPE = torch.float16
-DEVICE = f"cuda:{TP_RANK}"
+DEVICE = f"{get_device_type()}:{TP_RANK}"
 KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
 
 # Blocks to allocate before thinning, and how many to keep. KEEP is the residue
@@ -37,19 +38,27 @@ KEEP = 1024
 
 
 def setup():
-    torch.cuda.set_device(TP_RANK)
+    get_device_module().set_device(TP_RANK)
     init_kvcached(tp_rank=TP_RANK, world_size=TP_SIZE, is_worker=True,
                   async_sched=False)
-    alloc_kv_cache(kvcache_shape=KV_SHAPE, block_size=BLOCK_SIZE, dtype=DTYPE,
-                   device=DEVICE, num_layers=NUM_LAYERS)
+    # NUM_BLOCKS is a request: alloc_kv_cache sizes the reservations from device
+    # memory and hands back how many blocks actually fit. Where the request does
+    # not fit -- a card smaller than NUM_BLOCKS * block * layers * 2 -- the
+    # manager has to be capped to what was reserved, or it hands out blocks whose
+    # pages lie past the end of the reservation and the map aborts the process.
+    # On a card large enough for the request the cap does nothing.
+    _, meta = alloc_kv_cache(kvcache_shape=KV_SHAPE, block_size=BLOCK_SIZE,
+                             dtype=DTYPE, device=DEVICE, num_layers=NUM_LAYERS,
+                             return_meta=True)
     t0 = time.time()
     while not kv_tensors_created():
         if time.time() - t0 > 10.0:
             raise RuntimeError("KV tensors not created within 10s")
         time.sleep(0.05)
-    return KVCacheManager(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE,
-                          cell_size=CELL_SIZE, num_layers=NUM_LAYERS,
-                          world_size=TP_SIZE)
+    return KVCacheManager(num_blocks=min(NUM_BLOCKS,
+                                         meta["num_blocks_per_layer"]),
+                          block_size=BLOCK_SIZE, cell_size=CELL_SIZE,
+                          num_layers=NUM_LAYERS, world_size=TP_SIZE)
 
 
 def measure(manager, keep_stride):
@@ -60,8 +69,9 @@ def measure(manager, keep_stride):
     retained blocks over more pages, which is what a real prefix cache looks like
     after mixed-length requests come and go.
     """
-    blocks = manager.alloc(ALLOC)
-    assert blocks is not None and len(blocks) == ALLOC
+    alloc = min(ALLOC, manager.num_blocks)
+    blocks = manager.alloc(alloc)
+    assert blocks is not None and len(blocks) == alloc
 
     kept = blocks[::keep_stride][:KEEP]
     kept_set = set(kept)
@@ -77,7 +87,7 @@ def measure(manager, keep_stride):
 
 if __name__ == "__main__":
     manager = setup()
-    print(f"kept={KEEP} blocks of {ALLOC} allocated, "
+    print(f"kept={KEEP} blocks of {min(ALLOC, manager.num_blocks)} allocated, "
           f"page={manager.page_size // (1024 * 1024)}MB, "
           f"block={manager.block_mem_size}B\n")
     print(f"{'stride':>7} {'kept':>6} {'held GB':>9} {'pinned GB':>10} {'waste':>7}")

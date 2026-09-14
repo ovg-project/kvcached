@@ -69,10 +69,15 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
     stdscr.refresh()
 
     try:
-        import torch  # Heavy import occurs once here
-        torch_available = torch.cuda.is_available()
+        import torch  # noqa: F401  # Heavy import occurs once here
+
+        from kvcached.utils import get_device_module
+
+        # torch.cuda on NVIDIA/ROCm, torch.xpu on Intel.
+        device_module = get_device_module()
+        torch_available = device_module.is_available()
     except Exception:
-        torch = None  # type: ignore
+        device_module = None  # type: ignore
         torch_available = False
 
     while True:
@@ -80,11 +85,11 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
         names_to_show = ipc_names if ipc_names else _detect_kvcache_ipc_names()
 
         # ------------------------------------------------------------------
-        # GPU physical memory usage (if CUDA available) – compute once
+        # GPU physical memory usage (if an accelerator is available) – compute once
         # ------------------------------------------------------------------
         if torch_available:
             try:
-                avail_gpu, total_gpu = torch.cuda.mem_get_info()
+                avail_gpu, total_gpu = device_module.mem_get_info()
                 gpu_used = total_gpu - avail_gpu
                 gpu_percent = (gpu_used / total_gpu * 100) if total_gpu else 0
             except Exception:

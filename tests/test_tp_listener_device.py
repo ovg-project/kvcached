@@ -26,11 +26,30 @@ def _mock_torch(monkeypatch, current_device=0):
     return torch
 
 
-def test_listener_thread_restores_cuda_device(monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["cuda", "xpu"])
+def test_listener_thread_restores_its_own_device(monkeypatch, tmp_path, backend):
+    """The listener must set its device through get_device_module(), not
+    torch.cuda.
+
+    On a +xpu build torch.cuda.set_device raises AttributeError, and the
+    listener runs in a daemon thread, so that kills the listener without
+    failing anything: it just never answers, and the caller waits on a reply
+    that will not come. Mocking torch wholesale hides this, so the xpu case
+    below gives torch.cuda the AttributeError a real +xpu build raises.
+    """
     torch = _mock_torch(monkeypatch)
+    if backend == "xpu":
+        torch.cuda.set_device.side_effect = AttributeError(
+            "module 'torch._C' has no attribute '_cuda_setDevice'"
+        )
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
 
     import kvcached.tp_ipc_util as tp_ipc_util
+
+    device_module = torch.xpu if backend == "xpu" else torch.cuda
+    monkeypatch.setattr(
+        tp_ipc_util, "get_device_module", lambda device=None: device_module
+    )
 
     thread_target = None
 
@@ -62,9 +81,10 @@ def test_listener_thread_restores_cuda_device(monkeypatch, tmp_path):
     tp_ipc_util.start_worker_listener_thread(2, 0, device_index=3)
 
     assert thread_target is not None
+    # Reaching accept() means the device was restored without raising.
     with pytest.raises(RuntimeError, match="stop listener"):
         thread_target()
-    torch.cuda.set_device.assert_called_once_with(3)
+    device_module.set_device.assert_called_once_with(3)
 
 
 @pytest.mark.parametrize("integration", ["vllm", "sglang"])
