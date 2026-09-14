@@ -11,6 +11,18 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.utils import CONTIGUOUS_LAYOUT
 
 
+def _import_vllm_module(module_name: str):
+    """Import vLLM module from v1 or fallback to v2 layout."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        if module_name.startswith("vllm.v1."):
+            return importlib.import_module(module_name.replace("vllm.v1.", "vllm.v2."))
+        if module_name.startswith("vllm.v2."):
+            return importlib.import_module(module_name.replace("vllm.v2.", "vllm.v1."))
+        raise
+
+
 class NixlConnectorPatch(BasePatch):
     """Eager NixlConnector compatibility patch.
 
@@ -72,9 +84,7 @@ class NixlConnectorPatch(BasePatch):
         """
         nixl_classes = self._import_nixl_connector_classes()
         if nixl_classes is None:
-            self.logger.debug(
-                "Skipping NixlConnector patch: NIXL connector not installed"
-            )
+            self.logger.debug("Skipping NixlConnector patch: NIXL connector not installed")
             return True
 
         NixlConnector, NixlConnectorWorker = nixl_classes
@@ -94,9 +104,7 @@ class NixlConnectorPatch(BasePatch):
         # override; guard with hasattr so the patch does not AttributeError.
         if hasattr(NixlConnector, "get_required_kvcache_layout"):
             if not hasattr(NixlConnector, "_original_get_layout"):
-                NixlConnector._original_get_layout = (
-                    NixlConnector.get_required_kvcache_layout
-                )
+                NixlConnector._original_get_layout = NixlConnector.get_required_kvcache_layout
             NixlConnector.get_required_kvcache_layout = _kvcached_layout
         else:
             self.logger.debug(
@@ -128,13 +136,11 @@ class NixlConnectorPatch(BasePatch):
             patch._ensure_supported_kvcached_layout()
 
             kvcached_num_blocks = patch._infer_registered_num_blocks(worker, kv_caches)
-            if (
-                kvcached_num_blocks is not None
-                and kvcached_num_blocks != worker.num_blocks
-            ):
+            if kvcached_num_blocks is not None and kvcached_num_blocks != worker.num_blocks:
                 patch.logger.info(
                     "kvcached: NixlConnector num_blocks %d -> %d",
-                    worker.num_blocks, kvcached_num_blocks,
+                    worker.num_blocks,
+                    kvcached_num_blocks,
                 )
                 worker.num_blocks = kvcached_num_blocks
 
@@ -209,8 +215,8 @@ class NixlConnectorPatch(BasePatch):
     def _import_nixl_connector_classes(self) -> Optional[Tuple[Any, Any]]:
         for connector_module_name, worker_module_name in self._CONNECTOR_MODULES:
             try:
-                connector_module = importlib.import_module(connector_module_name)
-                worker_module = importlib.import_module(worker_module_name)
+                connector_module = _import_vllm_module(connector_module_name)
+                worker_module = _import_vllm_module(worker_module_name)
             except ImportError:
                 continue
 
@@ -366,8 +372,7 @@ class NixlConnectorPatch(BasePatch):
         unique_counts = set(counts)
         if len(unique_counts) != 1:
             raise RuntimeError(
-                "kvcached: NixlConnector saw inconsistent KV block counts: "
-                f"{sorted(unique_counts)}"
+                f"kvcached: NixlConnector saw inconsistent KV block counts: {sorted(unique_counts)}"
             )
         return counts[0]
 
