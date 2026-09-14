@@ -41,6 +41,12 @@ using access_desc_t = hipMemAccessDesc;
 
 inline const char *backend_name() { return "HIP"; }
 
+// See the CUDA arm for what this guarantees; hipMemMap matches cuMemMap here.
+inline constexpr bool supports_shared_page_mapping() { return true; }
+
+// See the CUDA arm; hipMemRelease fails for the same reasons.
+inline constexpr bool release_failure_is_fatal() { return true; }
+
 inline const char *error_string(status_t status) {
   return hipGetErrorString(status);
 }
@@ -121,7 +127,10 @@ inline status_t address_free(void *ptr, size_t size) {
 }
 
 inline status_t mem_map(void *ptr, size_t size, size_t offset,
-                        allocation_handle_t handle) {
+                        allocation_handle_t handle, bool accessible = true) {
+  // hipMemMap never grants access on its own; set_access() does that, so the
+  // range is already inaccessible when the caller defers it.
+  (void)accessible;
   return hipMemMap(ptr, size, offset, handle, 0ULL);
 }
 
@@ -143,6 +152,19 @@ using allocation_prop_t = CUmemAllocationProp;
 using access_desc_t = CUmemAccessDesc;
 
 inline const char *backend_name() { return "CUDA"; }
+
+// True when one physical allocation may be mapped into several virtual ranges
+// at once. cuMemMap supports it, which is what lets FTensor back every virtual
+// page of a reservation with a single shared zero page (see
+// FTensor::init_with_zero_) so that reads of never-allocated regions return
+// zeros instead of faulting.
+inline constexpr bool supports_shared_page_mapping() { return true; }
+
+// True when a failed mem_release indicates a real driver fault, so ~GPUPage
+// aborts instead of logging. cuMemRelease fails only on an invalid handle or a
+// broken context; tolerating either would leak physical pages and carry a
+// corrupt VMM state into the next init.
+inline constexpr bool release_failure_is_fatal() { return true; }
 
 inline const char *error_string(drv_status_t status) {
   const char *err = nullptr;
@@ -248,7 +270,11 @@ inline drv_status_t address_free(void *ptr, size_t size) {
 }
 
 inline drv_status_t mem_map(void *ptr, size_t size, size_t offset,
-                            allocation_handle_t handle) {
+                            allocation_handle_t handle,
+                            bool accessible = true) {
+  // cuMemMap never grants access on its own; cuMemSetAccess does that, so the
+  // range is already inaccessible when the caller defers it.
+  (void)accessible;
   return cuMemMap(reinterpret_cast<CUdeviceptr>(ptr), size, offset, handle,
                   0ULL);
 }
@@ -369,15 +395,64 @@ private:
   std::unordered_map<allocation_handle_t, se::physical_mem> pages_;
 };
 
+// Deliberately leaked. The registry is created on the first mem_create(), so
+// necessarily after FTensorAllocator's namespace-scope singletons; a
+// function-local static would therefore be destroyed *before* them, and any
+// GPUPage still alive at exit would run ~GPUPage -> mem_release() ->
+// registry().destroy() against a destroyed mutex and map. Leaking also keeps
+// se::physical_mem destructors out of static teardown, where the SYCL runtime
+// may already be gone. The pages it holds are freed by the driver at exit.
 inline PhysicalMemRegistry &registry() {
-  static PhysicalMemRegistry reg;
-  return reg;
+  static PhysicalMemRegistry *reg = new PhysicalMemRegistry();
+  return *reg;
 }
 
 } // namespace detail
 
 inline const char *backend_name() { return "XPU"; }
 
+// False, unlike CUDA and HIP: mapping one physical page into a second virtual
+// range silently does not work here. zeVirtualMemMap accepts the second range
+// and returns ZE_RESULT_SUCCESS, but the range is not aliased to the first --
+// reading it does not observe the first range's writes. From there the device
+// is lost either way:
+//
+//   write through the second range -> ZE_RESULT_ERROR_DEVICE_LOST
+//   or just unmap it again         -> reports SUCCESS, but the device is gone
+//                                     regardless: the next read of the *first*
+//                                     range fails with DEVICE_LOST, a write to
+//                                     it fails with OUT_OF_DEVICE_MEMORY, and
+//                                     unmapping it segfaults in the driver
+//
+// So a read-only second mapping is no safer than a written one -- creating it
+// at all is enough, and the unmap that reports success is what loses the
+// device.
+//
+// Verified against the Level Zero API directly (no SYCL, no UR): same failure
+// whether the two ranges come from one reservation or two, on three separate
+// cards; the identical sequence with one physical page per range completes
+// cleanly, so it is the sharing and not the call sequence. Arc Pro B60,
+// level-zero 1.28.0 / intel-opencl-icd 26.18.38308.1. The spec neither permits
+// nor forbids the sharing, so this is driver behavior and could change; the
+// flag is the single place to flip if it does.
+//
+// FTensor therefore leaves XPU reservations unbacked instead of installing a
+// shared zero page.
+inline constexpr bool supports_shared_page_mapping() { return false; }
+
+// False, unlike CUDA and HIP. ~GPUPage can run during static teardown, after
+// the SYCL runtime has begun shutting down -- detail::registry() below is
+// leaked for that same reason. No mem_release failure has actually been
+// observed there, but Level Zero teardown is order-sensitive enough (see the
+// unbacked-unmap fault above) that a page leaked at exit should not become a
+// crash. ~FTensor has tolerated teardown unmap failures on every backend since
+// before this arm.
+inline constexpr bool release_failure_is_fatal() { return false; }
+
+// Unlike the CUDA and HIP arms, this is not a pure function of `status`: SYCL
+// reports failures as exception messages, not codes, so the text comes from the
+// calling thread's last_error(). The returned pointer is only valid until the
+// next failing seam call on this thread -- copy it if you need to keep it.
 inline const char *error_string(status_t status) {
   if (status == detail::kOk)
     return "success";
@@ -434,8 +509,7 @@ inline status_t get_allocation_granularity(size_t *granularity,
                                            const allocation_prop_t *prop) {
   return detail::guard("get_allocation_granularity", [&] {
     // granularity_mode::minimum is the counterpart of
-    // CU_MEM_ALLOC_GRANULARITY_MINIMUM. Note this is a genuine query, unlike
-    // zeVirtualMemQueryPageSize which answers for one specific allocation size.
+    // CU_MEM_ALLOC_GRANULARITY_MINIMUM.
     *granularity = se::get_mem_granularity(xpu_runtime::device(prop->dev_idx),
                                            xpu_runtime::context(),
                                            se::granularity_mode::minimum);
@@ -465,18 +539,27 @@ inline status_t get_vmm_support(int *supports_vmm, int dev_idx) {
       phys.map(vaddr, size, se::address_access_mode::read_write, 0);
       se::unmap(reinterpret_cast<void *>(vaddr), size, ctx);
     } catch (...) {
-      // Never leak the probe reservation, whichever step failed.
-      se::free_virtual_mem(vaddr, size, ctx);
+      // Never leak the probe reservation, whichever step failed -- but do not
+      // let cleanup replace the exception that explains why the probe failed.
+      try {
+        se::free_virtual_mem(vaddr, size, ctx);
+      } catch (...) {
+      }
       throw;
     }
     se::free_virtual_mem(vaddr, size, ctx);
     *supports_vmm = 1;
   });
 
-  // A throwing probe means "this device cannot do VMM", not "the query
-  // failed". Report success either way so FTensorAllocator::init_gpu_() can
-  // emit its own diagnostic, matching how CUDA's attribute query behaves.
-  (void)probe;
+  // A throwing probe means "this device cannot do VMM", not "the query failed".
+  // Report success either way so FTensorAllocator::init_gpu_() can emit its own
+  // diagnostic, matching how CUDA's attribute query behaves. But the probe
+  // allocates real memory, so "no VMM", "bad device index" and "transient OOM"
+  // all reach the caller as the same bare "not supported" -- print the SYCL
+  // message here, because error_string() is unreachable once we return kOk.
+  if (!is_success(probe))
+    std::cerr << "kvcached: XPU VMM probe failed on device " << dev_idx << ": "
+              << detail::last_error() << std::endl;
   return detail::kOk;
 }
 
@@ -535,13 +618,21 @@ inline status_t address_free(void *ptr, size_t size) {
 }
 
 inline status_t mem_map(void *ptr, size_t size, size_t offset,
-                        allocation_handle_t handle) {
+                        allocation_handle_t handle, bool accessible = true) {
   return detail::guard("mem_map", [&] {
-    // Access mode is part of the mapping call here; set_access() below is still
-    // honored for callers that pass set_access=false and configure it later.
-    detail::registry().get(handle).map(reinterpret_cast<uintptr_t>(ptr), size,
-                                       se::address_access_mode::read_write,
-                                       offset);
+    // Access mode is an argument to map() here rather than a separate step, so
+    // `accessible` has to be honored at map time to match cuMemMap, which
+    // leaves a range faulting until cuMemSetAccess runs. A later set_access()
+    // call still overrides whatever is chosen here.
+    const auto mode = accessible ? se::address_access_mode::read_write
+                                 : se::address_access_mode::none;
+    void *mapped = detail::registry().get(handle).map(
+        reinterpret_cast<uintptr_t>(ptr), size, mode, offset);
+    if (mapped != ptr) {
+      std::ostringstream oss;
+      oss << "mapped at " << mapped << ", not the requested " << ptr;
+      throw std::runtime_error(oss.str());
+    }
   });
 }
 

@@ -68,11 +68,17 @@ void mem_get_info(int dev_idx, size_t *free_bytes, size_t *total_bytes) {
   if (!dev.has(sycl::aspect::ext_intel_free_memory)) {
     // Reporting total-as-free would make PageAllocator believe the whole device
     // is available and OOM under load; host memory statistics would be worse
-    // still. Fail with an actionable message instead.
+    // still. Report the failure instead. FTensorAllocator::init_gpu_() calls
+    // this once at startup, so an unsupported device fails there rather than
+    // mid-serving.
+    //
+    // The aspect is present without ZES_ENABLE_SYSMAN on the drivers tested
+    // here, so this is not advice to set it -- if the aspect is missing, the
+    // driver or device genuinely does not expose the query.
     throw std::runtime_error(
-        "XPU device does not report free memory (sycl::aspect::"
-        "ext_intel_free_memory unavailable). Export ZES_ENABLE_SYSMAN=1 before "
-        "starting the process so the Level Zero sysman layer is enabled.");
+        "XPU device does not report free memory "
+        "(sycl::aspect::ext_intel_free_memory unavailable); kvcached cannot "
+        "size the KV pool on this device or driver.");
   }
 
   const size_t free = static_cast<size_t>(
