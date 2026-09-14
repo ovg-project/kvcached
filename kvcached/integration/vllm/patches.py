@@ -867,9 +867,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list[KVCacheBlock]:
-                if num_blocks > self.get_num_free_blocks():
-                    raise ValueError(
-                        f"Cannot get {num_blocks} free blocks from the pool")
+                free_blocks = self.get_num_free_blocks()
+                if num_blocks > free_blocks:
+                    raise KVCachePoolExhausted(
+                        "Unable to allocate KV cache blocks from physical pool; "
+                        f"requested={num_blocks}, available={free_blocks}"
+                    )
 
                 block_ids: Optional[list[int]] = None
                 for _ in range(2):

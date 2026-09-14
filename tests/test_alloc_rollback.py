@@ -472,6 +472,22 @@ def test_failed_allocation_rollback_does_not_count_caller_free_progress(monkeypa
     assert data["manager_page_releases_total"] == 0
 
 
+def test_failed_legacy_growth_retires_empty_pages_until_safe_epoch():
+    manager = make_manager(fail_after=1)
+    manager.defer_physical_release = True
+    manager._retired_pages = []
+    manager._physical_release_epoch = 8
+    assert manager.alloc(6) is None
+    assert list(manager.avail_pages) == [0]
+    assert manager.avail_pages[0].empty()
+    assert manager.page_allocator.freed_pages == []
+    assert manager._retired_pages == [(9, [0])]
+    manager.release_retired_pages_through(8)
+    assert manager.page_allocator.freed_pages == []
+    manager.release_retired_pages_through(9)
+    assert manager.page_allocator.freed_pages == [0]
+
+
 def test_reserved_blocks_restored_on_miss():
     manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
     assert manager.alloc(4) is None
@@ -512,7 +528,8 @@ def test_mixed_reserved_and_page_blocks_restored():
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.
     assert manager.alloc(8) is None
     assert manager.reserved_blocks == [10, 11]
-    # Page 0 went fully free again, so it was returned to the page allocator.
+    # A failed legacy single-page allocation must not pin an idle partial
+    # request while another instance is waiting for the same capacity.
     assert manager.page_allocator.freed_pages == [0]
     assert manager.num_avail_blocks == 0
     assert manager.avail_pages == {}
@@ -580,3 +597,46 @@ def test_page_init_failure_is_not_a_physical_allocation_miss(monkeypatch):
     assert counters["allocation_failures_total"] == 1
     assert counters["allocation_errors_total"] == 1
     assert counters.get("capacity_exhausted_total", 0) == 0
+
+
+def test_unknown_outcome_is_not_an_allocation_miss(monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0)
+
+    def fail():
+        raise MapTransactionOutcomeUnknownError("unconfirmed map")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="unconfirmed map"):
+        manager.alloc(1)
+
+
+@pytest.mark.parametrize("legacy_native_wrapper", [False, True])
+def test_latched_failure_surfaces_before_capacity_or_miss(monkeypatch, legacy_native_wrapper):
+    # Model a background callback failure, and an older extension that wraps
+    # the Python exception in std::runtime_error on the foreground path.
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0, reserved_blocks=[10])
+    failed = not legacy_native_wrapper
+
+    def check():
+        if failed:
+            raise MapTransactionOutcomeUnknownError("restart the engine")
+
+    def fail():
+        nonlocal failed
+        failed = True
+        raise RuntimeError("wrapped callback failure")
+
+    monkeypatch.setitem(
+        KVCacheManager.available_size.__wrapped__.__globals__,
+        "raise_if_physical_growth_unresolved", check,
+    )
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    if not legacy_native_wrapper:
+        with pytest.raises(MapTransactionOutcomeUnknownError):
+            manager.available_size()
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
+        manager.alloc(2)

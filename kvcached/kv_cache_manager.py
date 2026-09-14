@@ -18,7 +18,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.locks import NoOpLock
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+from kvcached.tp_ipc_util import (
+    broadcast_kv_tensors_created,
+    raise_if_physical_growth_unresolved,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
@@ -309,13 +312,14 @@ class KVCacheManager:
 
         # Event used to signal that _post_init() has finished.
         self._post_init_done = threading.Event()
+        self._post_init_error: Optional[Exception] = None
         # Launch _post_init in the background; it will block until KV tensors
         # exist, then complete the remaining setup (reserve null block, start
         # pre-alloc thread) and finally set the event.
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
-        def _check_kv_tensors_created():
+        def _check_kv_tensors_created(remaining: float):
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
                 vllm_remote = should_use_worker_ipc()
@@ -325,29 +329,29 @@ class KVCacheManager:
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(
                     self.world_size, self.pp_rank,
-                    group_id=self.group_id)
+                    group_id=self.group_id, timeout_s=remaining)
             else:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
             if self.null_block is not None:
                 return
-            total_wait = 0.0
+            deadline = time.monotonic() + KV_TENSOR_WAIT_TIMEOUT
             last_error: Exception | None = None
             while not self._shutdown_requested.is_set():
+                remaining = deadline - time.monotonic()
                 try:
-                    if _check_kv_tensors_created():
+                    if remaining > 0 and _check_kv_tensors_created(remaining):
                         break
                 except Exception as e:
                     last_error = e
-                if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
+                if time.monotonic() >= deadline:
                     message = ("KV tensors not created after "
                                f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
                     if last_error is not None:
                         message = f"{message}; last error: {last_error}"
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
-                total_wait += 0.001
             if self._shutdown_requested.is_set():
                 return
             # KV tensors created now
@@ -357,6 +361,7 @@ class KVCacheManager:
             if not self._shutdown_requested.is_set():
                 self.page_allocator.start_prealloc_thread()
         except Exception as e:
+            self._post_init_error = e
             self._record_operation_error(
                 "post_init_failed",
                 "post_init_errors_total",
@@ -371,6 +376,9 @@ class KVCacheManager:
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+        error = getattr(self, "_post_init_error", None)
+        if error is not None:
+            raise error
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
         operation_lock = getattr(self, "_operation_lock", None)
@@ -579,13 +587,21 @@ class KVCacheManager:
                     )
                     raise
                 except RuntimeError as e:
+                    # Older native extensions erase the callback's exception type.
+                    raise_if_physical_growth_unresolved()
                     self._increment_operation_counter(
                         "manager_page_allocation_failures_total"
                     )
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
-                    logger.warning(
-                        f"alloc_page() failed after partially allocating "
-                        f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+                    failure_count = self._get_operation_counter(
+                        "manager_page_allocation_failures_total"
+                    )
+                    if failure_count & (failure_count - 1) == 0:
+                        logger.warning(
+                            "Physical KV page allocation remains unavailable; "
+                            "returning a recoverable allocation miss "
+                            "(failures=%d): %s", failure_count, e,
+                        )
                     return None
                 self._increment_operation_counter("manager_page_allocations_total")
                 page.init(self.block_mem_size)
@@ -1028,6 +1044,8 @@ class KVCacheManager:
 
     @synchronized
     def available_size(self) -> int:
+        # A background preallocator cannot raise on the engine's thread.
+        raise_if_physical_growth_unresolved()
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         # Also surfaces a fatal background-preallocation failure during shrink.
         virtual_free_pages = self.page_allocator.get_num_free_pages()

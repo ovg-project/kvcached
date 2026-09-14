@@ -91,3 +91,12 @@ def test_contract_violations_still_terminate(vllm_patches, monkeypatch):
 
     with pytest.raises(ValueError, match="Cannot get 999 free blocks"):
         manager.allocate_slots("request", 8)
+
+
+def test_unknown_map_outcome_is_not_downgraded(vllm_patches, monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = _apply(vllm_patches, monkeypatch, _module_with_manager(
+        MapTransactionOutcomeUnknownError("restart after unresolved map")))
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
+        manager.allocate_slots("request", 8)

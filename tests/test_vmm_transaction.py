@@ -4,6 +4,72 @@
 import pytest
 
 
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase):
+    """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.errors import StateConsistencyError
+
+    vmm_ops = _compiled_vmm_ops()
+    offsets, _ = _create_layout(vmm_ops, False, False)
+    allocator = vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=8 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=2, group_id=0, ipc_name="UNKNOWN_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+    allocator.set_broadcast_map_callback(ipc.broadcast_map_to_kv_tensors)
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", {})
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {(0, 0): "gpu-0"})
+    transactions = []
+    commands = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        commands.append(command)
+        transaction = message["transaction_id"]
+        if command == "prepare_map_to_kv_tensors":
+            transactions.append(transaction)
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction, message["offsets"], 0)["success"]
+            if phase == "prepare":
+                raise ConnectionError("lost prepare response")
+            return {"status": "success", "transaction_state": "reserved"}
+        if command == "commit_prepared_map":
+            assert vmm_ops.commit_prepared_map(transaction, 0)["success"]
+            raise ConnectionError("lost commit response")
+        if command == "get_map_transaction_state":
+            raise ConnectionError("lost state query response")
+        pytest.fail(f"unexpected cleanup or retry: {command}")
+
+    monkeypatch.setattr(ipc, "_send_and_receive_message", exchange)
+    try:
+        with pytest.raises(StateConsistencyError, match="restart"):
+            allocator.alloc_page()
+        state = allocator.get_transaction_state()
+        assert state["state"] == "FAILED"
+        assert state["quarantined_page_ids"] == [0]
+        with pytest.raises(StateConsistencyError):
+            allocator.get_num_free_pages()
+        assert len(transactions) == 1
+        assert commands.count("get_map_transaction_state") == 2
+        calls = len(commands)
+        with pytest.raises(StateConsistencyError):
+            allocator.alloc_page()
+        assert len(commands) == calls
+        if phase == "prepare":
+            assert vmm_ops.has_prepared_map(transactions[0], 0)
+        else:
+            # Idempotent native map reports no newly mapped offsets: the
+            # original mapping was retained, not silently rolled back.
+            assert vmm_ops.map_to_kv_tensors_with_result([offsets[0]], 0) == (True, [])
+    finally:
+        del allocator
+        vmm_ops.shutdown_kvcached()
+
+
 def test_native_allocator_preserves_recoverable_callback_error():
     import uuid
 
@@ -25,6 +91,58 @@ def test_native_allocator_preserves_recoverable_callback_error():
         allocator.alloc_page()
     assert allocator.get_num_free_pages() == before
     assert allocator.get_num_inuse_pages() == 0
+
+
+def test_background_unknown_outcome_reaches_manager_capacity_check():
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserved-page settings are captured when the extension loads.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES="1", KVCACHED_MAX_RESERVED_PAGES="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import runpy, sys; "
+         "runpy.run_path(sys.argv[1])['_check_background_unknown_outcome']()", __file__],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_background_unknown_outcome():
+    import threading
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.kv_cache_manager import KVCacheManager
+    from kvcached.locks import NoOpLock
+
+    vmm_ops = _compiled_vmm_ops()
+    entered = threading.Event()
+    allocator = vmm_ops.PageAllocator(
+        num_layers=1, mem_size_per_layer=16 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=True,
+        num_kv_buffers=2, group_id=0, ipc_name="BACKGROUND_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+
+    def fail(*args):
+        try:
+            ipc._fail_unresolved_map_transaction("background", [0], 0, "prepare", ["lost"])
+        finally:
+            entered.set()
+
+    allocator.set_broadcast_map_callback(fail)
+    manager = object.__new__(KVCacheManager)
+    manager._lock = NoOpLock()
+    try:
+        allocator.start_prealloc_thread()
+        assert entered.wait(10), "preallocator did not exercise the callback"
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="background"):
+            manager.available_size()
+    finally:
+        allocator.stop_prealloc_thread()
 
 
 def _compiled_vmm_ops():
