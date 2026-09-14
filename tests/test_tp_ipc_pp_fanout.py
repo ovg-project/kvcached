@@ -31,14 +31,14 @@ def test_target_pp_ranks_uses_single_explicit_stage(monkeypatch):
     tp_ipc_util = _import_tp_ipc_util(monkeypatch)
     monkeypatch.setenv("KVCACHED_PP_SIZE", "4")
 
-    assert list(tp_ipc_util._target_pp_ranks(2)) == [2]
+    assert tp_ipc_util._target_pp_ranks(2) == [2]
 
 
 def test_target_pp_ranks_expands_coordinator_marker(monkeypatch):
     tp_ipc_util = _import_tp_ipc_util(monkeypatch)
     monkeypatch.setenv("KVCACHED_PP_SIZE", "3")
 
-    assert list(tp_ipc_util._target_pp_ranks(-1)) == [0, 1, 2]
+    assert tp_ipc_util._target_pp_ranks(-1) == [0, 1, 2]
 
 
 def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
@@ -47,16 +47,31 @@ def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
 
     async def fake_send(rank, message, pp_rank=0):
         calls.append((pp_rank, rank, message))
-        return {"status": "success"}
+        states = {
+            "prepare_map_to_kv_tensors": "reserved",
+            "commit_prepared_map": "prepared",
+            "finalize_map_to_kv_tensors": "committed",
+        }
+        return {
+            "status": "success",
+            "transaction_state": states.get(message["cmd"]),
+        }
 
     monkeypatch.setenv("KVCACHED_PP_SIZE", "2")
+    tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update(
+        {(pp, rank): f"gpu-{rank}" for pp in range(2) for rank in range(3)}
+    )
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", fake_send)
 
-    asyncio.run(
-        tp_ipc_util._broadcast_map_to_kv_tensors(3, [7, 11], pp_rank=-1)
-    )
+    asyncio.run(tp_ipc_util._broadcast_map_to_kv_tensors(3, [7, 11], pp_rank=-1))
 
-    assert [(pp_rank, rank) for pp_rank, rank, _ in calls] == [
+    prepare_calls = [
+        call
+        for call in calls
+        if call[2].get("cmd") == "prepare_map_to_kv_tensors"
+        and call[2].get("offsets") == [7, 11]
+    ]
+    assert [(pp_rank, rank) for pp_rank, rank, _ in prepare_calls] == [
         (0, 0),
         (0, 1),
         (0, 2),
@@ -64,7 +79,8 @@ def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
         (1, 1),
         (1, 2),
     ]
-    assert all(call[2]["group_id"] == 0 for call in calls)
+    assert all(call[2]["group_id"] == 0 for call in prepare_calls)
+    assert sum(call[2].get("cmd") == "commit_prepared_map" for call in calls) == 6
 
 
 def test_broadcast_error_reports_pp_and_rank(monkeypatch):
@@ -79,6 +95,4 @@ def test_broadcast_error_reports_pp_and_rank(monkeypatch):
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", fake_send)
 
     with pytest.raises(RuntimeError, match="pp1/rank0"):
-        asyncio.run(
-            tp_ipc_util._broadcast_kv_tensors_created(2, pp_rank=-1)
-        )
+        asyncio.run(tp_ipc_util._broadcast_kv_tensors_created(2, pp_rank=-1))
