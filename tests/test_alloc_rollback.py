@@ -478,6 +478,35 @@ def test_reserved_blocks_restored_on_miss():
     assert manager.reserved_blocks == [10, 11]
 
 
+def test_deferred_release_counts_only_acknowledged_physical_release(monkeypatch):
+    manager = make_manager(fail_after=2)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    manager.free(blocks)
+    marker = manager.capture_physical_release_marker()
+    assert marker > 0
+    assert manager.page_allocator.freed_pages == []
+    assert manager._get_operation_counter("manager_page_releases_total") == 0
+
+    def fail(_page_ids):
+        raise RuntimeError("release not acknowledged")
+
+    release = manager.page_allocator.free_pages
+    monkeypatch.setattr(manager.page_allocator, "free_pages", fail)
+    with pytest.raises(RuntimeError, match="release not acknowledged"):
+        manager.release_retired_pages_through(marker)
+    assert manager._get_operation_counter("manager_page_releases_total") == 0
+    assert manager._retired_pages
+
+    monkeypatch.setattr(manager.page_allocator, "free_pages", release)
+    manager.release_retired_pages_through(marker)
+    assert manager.page_allocator.freed_pages == [0]
+    assert manager._get_operation_counter("manager_page_releases_total") == 1
+    manager.release_retired_pages_through(marker)
+    assert manager._get_operation_counter("manager_page_releases_total") == 1
+
+
 def test_mixed_reserved_and_page_blocks_restored():
     manager = make_manager(fail_after=1, reserved_blocks=[10, 11])
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.

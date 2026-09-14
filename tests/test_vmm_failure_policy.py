@@ -33,7 +33,7 @@ def fault_library(tmp_path_factory):
     return library
 
 
-@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release"])
+@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup"])
 def test_native_failure_policy(fault_library, case):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
                KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="0",
@@ -67,7 +67,93 @@ def _native_case(case):
     driver.kvcached_fault_arm.argtypes = [ctypes.c_int] * 3
     driver.kvcached_fault_hits.restype = ctypes.c_int
     driver.kvcached_fault_release.argtypes = [ctypes.c_int]
-    if case.startswith("ipc-"):
+    if case.startswith("abort-reserved-") or case in ("reserve-cleanup", "commit-cleanup"):
+        driver.kvcached_fault_release_calls.restype = ctypes.c_int
+        transaction_id = "cleanup-owner"
+        if case.startswith("abort-reserved-"):
+            position = int(case.rsplit("-", 1)[1])
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction_id, [0], 0)["success"]
+            driver.kvcached_fault_release(position)
+            with pytest.raises(StateConsistencyError, match="physical page release"):
+                vmm_ops.abort_prepared_map(transaction_id, 0)
+            remaining = 5 - position
+        elif case == "reserve-cleanup":
+            # Two handles exist when the third reservation fails.
+            driver.kvcached_fault_arm(3, 0, 0)
+            driver.kvcached_fault_release(2)
+            with pytest.raises(StateConsistencyError, match="physical page release"):
+                vmm_ops.prepare_map_to_kv_tensors(transaction_id, [0], 0)
+            remaining = 1
+        else:
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction_id, [0], 0)["success"]
+            driver.kvcached_fault_arm(0, 2, 0)
+            driver.kvcached_fault_release(2)
+            with pytest.raises(StateConsistencyError, match="physical page release"):
+                vmm_ops.commit_prepared_map(transaction_id, 0)
+            remaining = 2
+            tensors[0][:128].fill_(7)
+            torch.cuda.synchronize(device)
+
+        hits = driver.kvcached_fault_hits()
+        assert hits == (1 if case.startswith("abort-reserved-") else 2)
+        assert vmm_ops.has_prepared_map(transaction_id, 0)
+        with pytest.raises(StateConsistencyError, match="cleanup pending"):
+            vmm_ops.commit_prepared_map(transaction_id, 0)
+        with pytest.raises(StateConsistencyError, match="cleanup pending"):
+            vmm_ops.prepare_map_to_kv_tensors(transaction_id, [0], 0)
+        with pytest.raises(RuntimeError, match="prepared map"):
+            vmm_ops.prepare_map_to_kv_tensors("competitor", [0], 0)
+
+        # A second release failure must retain the same owner, without retrying
+        # handles whose releases already succeeded.
+        driver.kvcached_fault_arm(0, 0, 0)
+        driver.kvcached_fault_release(1)
+        with pytest.raises(StateConsistencyError, match="physical page release"):
+            vmm_ops.abort_prepared_map(transaction_id, 0)
+        assert driver.kvcached_fault_hits() == 1
+        assert vmm_ops.has_prepared_map(transaction_id, 0)
+        driver.kvcached_fault_arm(0, 0, 0)
+        assert vmm_ops.abort_prepared_map(transaction_id, 0)
+        assert driver.kvcached_fault_release_calls() == remaining
+        assert not vmm_ops.has_prepared_map(transaction_id, 0)
+
+        retry = vmm_ops.prepare_map_to_kv_tensors("retry", [0], 0)
+        assert retry["success"]
+        assert retry["required_bytes"] == (3 if case == "commit-cleanup" else 4) * page_size
+        assert vmm_ops.commit_prepared_map("retry", 0)["success"]
+        if case == "commit-cleanup":
+            assert bool((tensors[0][:128] == 7).all())
+        for tensor in tensors:
+            for start in (0, tensor.numel() // 2):
+                tensor[start:start + 128].fill_(9)
+                assert bool((tensor[start:start + 128] == 9).all())
+        torch.cuda.synchronize(device)
+        assert vmm_ops.unmap_from_kv_tensors([0], 0)
+        print(f"RESERVATION_CLEANUP case={case} hits={hits + 1} retained=1 recovered=1", flush=True)
+    elif case == "reserved-map":
+        assert vmm_ops.prepare_map_to_kv_tensors("partial", [0], 0)["success"]
+        # K is mapped; removing V's zero page fails before V can be mapped.
+        driver.kvcached_fault_arm(0, 2, 0)
+        with pytest.raises(RuntimeError, match="zero page unmap"):
+            vmm_ops.commit_prepared_map("partial", 0)
+        assert driver.kvcached_fault_hits() == 1
+        assert not vmm_ops.has_prepared_map("partial", 0)
+        tensors[0][:128].fill_(7)
+        torch.cuda.synchronize(device)
+        driver.kvcached_fault_arm(0, 0, 0)
+        retry = vmm_ops.prepare_map_to_kv_tensors("retry", [0], 0)
+        assert retry["success"]
+        assert retry["required_bytes"] == 3 * page_size
+        assert vmm_ops.commit_prepared_map("retry", 0)["success"]
+        assert bool((tensors[0][:128] == 7).all())
+        for tensor in tensors:
+            for start in (0, tensor.numel() // 2):
+                tensor[start:start + 128].fill_(9)
+                assert bool((tensor[start:start + 128] == 9).all())
+        torch.cuda.synchronize(device)
+        assert vmm_ops.unmap_from_kv_tensors([0], 0)
+        print("RESERVED_MAP_FAULT hits=1 adopted=1 recovered=1", flush=True)
+    elif case.startswith("ipc-"):
         from kvcached import tp_ipc_util as ipc
 
         page = allocator.alloc_page()

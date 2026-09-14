@@ -36,6 +36,7 @@ extern "C" void kvcached_fault_release(int release_at) {
 }
 
 extern "C" int kvcached_fault_hits() { return injected.load(); }
+extern "C" int kvcached_fault_release_calls() { return release_count.load(); }
 
 extern "C" CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle handle) {
   if (fail_at(release_count, fail_release)) {
