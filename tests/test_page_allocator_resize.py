@@ -4,7 +4,8 @@
 """Exercise the native resize watcher through real quota writes.
 
 Worker map/unmap callbacks are stubbed; the watcher and page accounting are
-real. A GPU is required because the prealloc worker queries free GPU memory.
+real. An accelerator is required because the prealloc worker queries free
+device memory.
 """
 
 import os
@@ -13,9 +14,13 @@ import uuid
 
 import pytest
 
-torch = pytest.importorskip("torch")
-if not torch.cuda.is_available():
-    pytest.skip("prealloc worker needs a GPU", allow_module_level=True)
+pytest.importorskip("torch")
+
+from kvcached.utils import get_device_module, get_device_type  # noqa: E402
+
+if not get_device_module().is_available():
+    pytest.skip(f"no {get_device_type()} device available",
+                allow_module_level=True)
 
 from kvcached.cli.utils import update_kv_cache_limit  # noqa: E402
 from kvcached.vmm_ops import PageAllocator  # noqa: E402

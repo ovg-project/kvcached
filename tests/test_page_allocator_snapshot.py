@@ -7,9 +7,13 @@ import time
 
 import pytest
 
-torch = pytest.importorskip("torch")
-if not torch.cuda.is_available():
-    pytest.skip("needs a CUDA build of the native extension", allow_module_level=True)
+pytest.importorskip("torch")
+
+from kvcached.utils import get_device_module, get_device_type  # noqa: E402
+
+if not get_device_module().is_available():
+    pytest.skip(f"no {get_device_type()} device available",
+                allow_module_level=True)
 
 from kvcached.vmm_ops import PageAllocator  # noqa: E402
 
