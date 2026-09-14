@@ -134,6 +134,13 @@ def make_manager(fail_after: int,
     return manager
 
 
+def enable_operation_counters(manager: KVCacheManager) -> None:
+    manager._operation_lock = threading.RLock()
+    manager._operation_counters = {}
+    manager._last_error_code = None
+    manager._last_error_timestamp_ns = None
+
+
 def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
@@ -159,6 +166,26 @@ def test_page_blocks_rolled_back_and_reusable():
     assert manager.num_avail_blocks == 2
     assert 0 in manager.avail_pages
     assert manager.alloc(2) == [2, 3]
+
+
+def test_partial_alloc_rollback_is_not_counted_as_public_free():
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+
+    # Allocates all four blocks from page 0, then fails to obtain page 1.
+    assert manager.alloc(6) is None
+
+    counters = manager._operation_counters
+    assert counters["allocation_requests_total"] == 1
+    assert counters["allocation_failures_total"] == 1
+    assert counters["capacity_exhausted_total"] == 1
+    assert counters.get("allocated_blocks_total", 0) == 0
+    assert counters.get("free_requests_total", 0) == 0
+    assert counters.get("free_successes_total", 0) == 0
+    assert counters.get("freed_blocks_total", 0) == 0
+    assert counters["physical_page_allocations_total"] == 1
+    assert counters["physical_page_allocation_failures_total"] == 1
+    assert counters["physical_page_frees_total"] == 1
 
 
 def test_reserved_blocks_restored_on_miss():

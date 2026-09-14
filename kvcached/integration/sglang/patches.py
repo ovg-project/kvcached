@@ -9,7 +9,7 @@ import functools
 import inspect
 import math
 import types
-from typing import Any, Callable, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, List, Optional, Tuple, Type, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
@@ -20,6 +20,7 @@ _CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
+SGLANG_METRICS_RANGE = ">=0.5.13"
 
 logger = get_kvcached_logger()
 
@@ -140,6 +141,47 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
         ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        return True
+
+
+class SGLangMetricsPatch(VersionAwarePatch, BasePatch):
+    """Compose kvcached metrics with SGLang's scheduler metric collector."""
+
+    library = "sglang"
+    target_module = "sglang.srt.observability.metrics_collector"
+    patch_name = "sglang_metrics"
+
+    def apply(self, metrics_mod: types.ModuleType) -> bool:
+        original_resolver = getattr(metrics_mod, "resolve_collector_class", None)
+        if original_resolver is None:
+            self.logger.warning("SGLang collector resolver is unavailable")
+            return False
+        if self._is_already_patched(original_resolver):
+            return True
+
+        scheduler_role = getattr(
+            metrics_mod,
+            "STAT_LOGGER_ROLE_SCHEDULER",
+            "scheduler",
+        )
+
+        def _resolve_collector_class(
+            server_args: Any,
+            role: str,
+            default_cls: Type[Any],
+        ) -> Type[Any]:
+            selected_cls = original_resolver(server_args, role, default_cls)
+            if role != scheduler_role or not enable_kvcached():
+                return selected_cls
+
+            from kvcached.integration.sglang.metrics import (
+                wrap_scheduler_metrics_collector,
+            )
+
+            return wrap_scheduler_metrics_collector(selected_cls)
+
+        self._mark_as_patched(_resolve_collector_class)
+        setattr(metrics_mod, "resolve_collector_class", _resolve_collector_class)
         return True
 
 

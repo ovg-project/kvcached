@@ -9,6 +9,7 @@ from wrapt.importer import when_imported
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
+    SGLANG_METRICS_RANGE,
     ElasticAllocatorPatch,
     ElasticHybridLinearKVPoolPatch,
     ElasticMambaPoolPatch,
@@ -17,6 +18,7 @@ from kvcached.integration.sglang.patches import (
     ElasticSWAAllocatorPatch,
     RadixCacheLimitPatch,
     SchedulerMemoryLeakPatch,
+    SGLangMetricsPatch,
     SGLangVirtualKVCapacityPatch,
 )
 from kvcached.utils import get_kvcached_logger
@@ -39,6 +41,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
 
     patch_manager.register_patches_with_versions(
         [
+            (SGLangMetricsPatch(), SGLANG_METRICS_RANGE),
             (ElasticAllocatorPatch(), SGLANG_ALL_RANGE),
             # SWATokenToKVPoolAllocator captures allocator classes from its
             # implementation modules, not from the package aliases above.
