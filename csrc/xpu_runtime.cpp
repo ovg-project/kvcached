@@ -89,13 +89,29 @@ void mem_get_info(int dev_idx, size_t *free_bytes, size_t *total_bytes) {
   if (!dev.has(sycl::aspect::ext_intel_free_memory)) {
     // Reporting total-as-free would make PageAllocator believe the whole device
     // is available and OOM under load; host memory statistics would be worse
-    // still. Fail with an actionable message instead.
+    // still. Report the failure instead. FTensorAllocator::init_gpu_() calls
+    // this once at startup, so an unsupported device fails there rather than
+    // mid-serving.
+    //
+    // The aspect is present without ZES_ENABLE_SYSMAN on the drivers tested
+    // here, so this is not advice to set it -- if the aspect is missing, the
+    // driver or device genuinely does not expose the query.
     throw std::runtime_error(
-        "XPU device does not report free memory (sycl::aspect::"
-        "ext_intel_free_memory unavailable). Export ZES_ENABLE_SYSMAN=1 before "
-        "starting the process so the Level Zero sysman layer is enabled.");
+        "XPU device does not report free memory "
+        "(sycl::aspect::ext_intel_free_memory unavailable); kvcached cannot "
+        "size the KV pool on this device or driver.");
   }
 
+  // Measured limitation, not a kvcached choice: on the drivers tested here
+  // (compute runtime 26.18.38308.1, with and without ZES_ENABLE_SYSMAN) this
+  // query answers with the card's whole capacity no matter what is allocated --
+  // 6 GiB of live torch tensors and 7.8 GiB mapped through kvcached's own VMM
+  // path both leave it unchanged, while xpu-smi reports the usage. So
+  // PageAllocator::get_avail_physical_pages() cannot see another process's
+  // usage on XPU and will not decline to grow on its account; exhaustion
+  // surfaces from mem_map instead. Colocating engines on one Intel GPU needs
+  // KVCACHED_GPU_UTILIZATION (or an instance memory limit) to divide the card,
+  // rather than relying on this number.
   const size_t free = static_cast<size_t>(
       dev.get_info<sycl::ext::intel::info::device::free_memory>());
 

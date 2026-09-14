@@ -26,6 +26,7 @@
 
 #include "allocator.hpp"
 #include "constants.hpp"
+#include "gpu_vmm.hpp"
 #include "page_allocator.hpp"
 #include "torch_utils.hpp"
 #include "transaction_error.hpp"
@@ -314,6 +315,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("abort_unmap_from_kv_tensors", &kvcached::abort_unmap_from_kv_tensors,
         "abort_unmap_from_kv_tensors", py::arg("transaction_id"),
         py::arg("group_id") = 0);
+  m.def(
+      "has_zero_page_safety_net",
+      [] { return kvcached::gpu_vmm::supports_shared_page_mapping(); },
+      "True when reads of never-allocated KV regions are backed by the shared "
+      "zero page and so return data instead of faulting. False on backends "
+      "whose VMM cannot map one physical page into several virtual ranges "
+      "(Level Zero), where such a read is a genuine fault.");
+  m.def("backend_name", &kvcached::gpu_vmm::backend_name,
+        "Name of the VMM backend this extension was built against.");
 
   // The stable-ABI target the extension was built for.
   m.attr("TORCH_TARGET_VERSION") =

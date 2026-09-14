@@ -38,8 +38,6 @@ make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
     return gpu_vmm::current_device();
   };
 
-  // is_accelerator() covers NVIDIA (CUDA), AMD (HIP/ROCm, which PyTorch
-  // masquerades as CUDA) and Intel (XPU) devices. See device_utils.hpp.
   if (is_accelerator(dev)) {
     return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
@@ -168,14 +166,20 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
     size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    // Left null where FTensor will never map it, rather than pinning a
+    // compound page's worth of device memory nothing reads.
+    if (uses_zero_page(dev_)) {
+      zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    }
     // We can use the aligned size directly for contiguous layout too because
     // both compound_page_size and aligned_size are already/will be multiplied
     // by num_layers.
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    if (uses_zero_page(dev_)) {
+      zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    }
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
@@ -619,6 +623,13 @@ void FTensorAllocator::init_gpu_() {
          "VMM is not supported on %s device %d. kvcached requires GPU VMM "
          "support.",
          gpu_vmm::backend_name(), dev_idx);
+
+  // PageAllocator::get_avail_physical_pages() queries free memory on every
+  // allocation decision and cannot abort there, so establish here -- at
+  // startup, where failing loudly is correct -- that the query works at all.
+  // On XPU it depends on a device aspect; on CUDA/HIP it cannot fail.
+  size_t free_mem = 0, total_mem = 0;
+  CHECK_GPU(gpu_vmm::mem_get_info(&free_mem, &total_mem));
 
   auto prop = gpu_vmm::make_pinned_device_allocation_prop(dev_idx);
   size_t chunk_sz = 0;
