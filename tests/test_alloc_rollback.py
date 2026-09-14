@@ -548,6 +548,29 @@ def test_alloc_after_rollback_succeeds_when_pool_recovers():
     assert len(result) == 5
 
 
+def test_growth_backoff_does_not_complete_a_nonexistent_shrink(monkeypatch):
+    manager = make_manager(fail_after=1)
+    manager.defer_physical_release = False
+    assert manager.alloc(2) == [0, 1]
+    monkeypatch.setattr(manager, "_physical_growth_retry_is_blocked", lambda: True)
+    manager.free([0])
+    assert manager.target_num_blocks is None
+    assert not manager.in_shrink
+    assert manager.num_avail_blocks == 3
+
+
+def test_growth_backoff_still_counts_resident_reserve_pages(monkeypatch):
+    manager = make_manager(fail_after=1, reserved_blocks=[90])
+    manager.num_avail_blocks = 2
+    monkeypatch.setattr(manager, "_physical_growth_retry_is_blocked", lambda: True)
+    monkeypatch.setattr(manager.page_allocator, "get_num_reserved_pages", lambda: 3)
+    monkeypatch.setattr(manager.page_allocator, "get_avail_physical_pages",
+                        lambda: pytest.fail("backoff must not probe physical capacity"))
+    assert manager.available_size() == 2 + 1 + 3 * BLOCKS_PER_PAGE
+    manager.in_shrink = True
+    assert manager.available_size() == 3
+
+
 def _explode_alloc(num: int) -> List[int]:
     """Stand-in for InternalPage.alloc()'s "Not enough free blocks in page"
     invariant failure (csrc/page_allocator.cpp)."""

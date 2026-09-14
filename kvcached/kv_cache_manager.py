@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
@@ -43,6 +44,10 @@ except ImportError as e:
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+PHYSICAL_GROWTH_RETRY_INITIAL_S: float = 0.01
+PHYSICAL_GROWTH_RETRY_MAX_S: float = 1.0
+PHYSICAL_GROWTH_NOTIFIED_RETRY_MAX_S: float = 5.0
+PHYSICAL_GROWTH_EPOCH_CHECK_INTERVAL_S: float = 0.01
 
 # TTL for the cached get_avail_physical_pages() result in available_size().
 # Matches the C++ resize_watcher poll interval (csrc/page_allocator.cpp:838),
@@ -154,6 +159,9 @@ class KVCacheManager:
         self.physical_release_barrier: Optional[Callable[[], None]] = None
         self._physical_release_epoch = 0
         self._retired_pages: List[tuple[int, List[int]]] = []
+        self._physical_growth_capacity_epoch_provider: Optional[Callable[[], Any]] = None
+        self._physical_growth_capacity_epoch: Any = None
+        self._physical_growth_epoch_next_check = 0.0
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -221,6 +229,20 @@ class KVCacheManager:
                 from kvcached.tp_ipc_util import (
                     broadcast_map_to_kv_tensors,
                     broadcast_unmap_from_kv_tensors,
+                    notify_physical_growth_capacity_changed,
+                    physical_growth_capacity_epoch,
+                )
+
+                manager_ref = weakref.ref(self)
+                self._physical_growth_capacity_epoch_provider = functools.partial(
+                    physical_growth_capacity_epoch, self.world_size, self.pp_rank
+                )
+                blocks_per_offset = max(
+                    1,
+                    InternalPage.get_num_blocks(
+                        self.page_size,
+                        self.block_mem_size,
+                    ),
                 )
 
                 # Wrap Python functions to match C++ callback signature
@@ -231,7 +253,40 @@ class KVCacheManager:
                     group_id: int = self.group_id,
                 ) -> None:
                     """Wrapper for Python broadcast function"""
-                    broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    capacity_epoch = physical_growth_capacity_epoch(world_size, pp_rank)
+
+                    def record_growth_stats(counters: Dict[str, int]) -> None:
+                        updates = dict(counters)
+                        logical_blocks = len(offsets) * blocks_per_offset
+                        updates["physical_growth_logical_blocks_total"] = (
+                            logical_blocks
+                        )
+                        updates["physical_growth_logical_blocks_max"] = (
+                            logical_blocks
+                        )
+                        if updates.get(
+                            "physical_growth_capacity_rejections_total", 0
+                        ):
+                            updates["physical_growth_rejected_transactions_total"] = 1
+                            updates[
+                                "physical_growth_rejected_logical_blocks_total"
+                            ] = logical_blocks
+                            updates[
+                                "physical_growth_rejected_logical_blocks_max"
+                            ] = logical_blocks
+                        manager = manager_ref()
+                        if manager is not None:
+                            manager._record_physical_growth_result(
+                                updates, capacity_epoch=capacity_epoch)
+                            manager._merge_operation_counters(updates)
+
+                    broadcast_map_to_kv_tensors(
+                        world_size,
+                        offsets,
+                        pp_rank,
+                        group_id,
+                        record_growth_stats,
+                    )
 
                 def unmap_callback(
                     world_size: int,
@@ -241,6 +296,12 @@ class KVCacheManager:
                 ) -> None:
                     """Wrapper for Python broadcast function"""
                     broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    if notify_physical_growth_capacity_changed(world_size, pp_rank):
+                        manager = manager_ref()
+                        if manager is not None:
+                            manager._increment_operation_counter(
+                                "physical_growth_capacity_notifications_total"
+                            )
 
                 # Set the callbacks in the PageAllocator
                 self.page_allocator.set_broadcast_map_callback(map_callback)
@@ -307,6 +368,8 @@ class KVCacheManager:
         }
         self._last_error_code: Optional[str] = None
         self._last_error_timestamp_ns: Optional[int] = None
+        self._physical_growth_rejection_streak = 0
+        self._physical_growth_retry_after = 0.0
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -397,6 +460,117 @@ class KVCacheManager:
             return 0
         with operation_lock:
             return getattr(self, "_operation_counters", {}).get(name, 0)
+
+    def _merge_operation_counters(self, updates: Dict[str, int]) -> None:
+        operation_lock = getattr(self, "_operation_lock", None)
+        if operation_lock is None:
+            return
+        with operation_lock:
+            counters = getattr(self, "_operation_counters", None)
+            if counters is None:
+                counters = {}
+                self._operation_counters = counters
+            for name, value in updates.items():
+                value = int(value)
+                if name.endswith("_max"):
+                    counters[name] = max(counters.get(name, 0), value)
+                else:
+                    counters[name] = counters.get(name, 0) + value
+
+    def _reset_physical_growth_retry_backoff(self) -> None:
+        self._physical_growth_rejection_streak = 0
+        self._physical_growth_retry_after = 0.0
+        self._physical_growth_capacity_epoch = None
+        self._physical_growth_epoch_next_check = 0.0
+
+    def _read_physical_growth_capacity_epoch(self) -> Any:
+        provider = getattr(
+            self,
+            "_physical_growth_capacity_epoch_provider",
+            None,
+        )
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:
+            return None
+
+    def _record_physical_growth_result(
+        self, counters: Dict[str, int], *, capacity_epoch: Any = None,
+    ) -> None:
+        if counters.get("physical_growth_capacity_rejections_total", 0) <= 0:
+            self._reset_physical_growth_retry_backoff()
+            return
+
+        streak = getattr(self, "_physical_growth_rejection_streak", 0) + 1
+        self._physical_growth_rejection_streak = streak
+        max_delay_s = (
+            PHYSICAL_GROWTH_NOTIFIED_RETRY_MAX_S
+            if self._physical_growth_capacity_epoch_provider is not None
+            else PHYSICAL_GROWTH_RETRY_MAX_S
+        )
+        delay_s = min(
+            max_delay_s,
+            PHYSICAL_GROWTH_RETRY_INITIAL_S * (2 ** min(streak - 1, 16)),
+        )
+        self._physical_growth_retry_after = max(
+            getattr(self, "_physical_growth_retry_after", 0.0),
+            time.monotonic() + delay_s,
+        )
+        # Preserve the pre-attempt epoch: releases during IPC or reconciliation
+        # must wake this rejection, not become its new baseline.
+        self._physical_growth_capacity_epoch = capacity_epoch
+        self._physical_growth_epoch_next_check = (
+            time.monotonic() + PHYSICAL_GROWTH_EPOCH_CHECK_INTERVAL_S
+        )
+        self._increment_operation_counter(
+            "physical_growth_retry_backoff_activations_total"
+        )
+        self._merge_operation_counters(
+            {"physical_growth_retry_backoff_us_max": int(delay_s * 1_000_000)}
+        )
+
+    def _physical_growth_retry_is_blocked(self) -> bool:
+        retry_after = getattr(self, "_physical_growth_retry_after", 0.0)
+        if retry_after <= 0:
+            return False
+
+        now = time.monotonic()
+        next_epoch_check = getattr(
+            self,
+            "_physical_growth_epoch_next_check",
+            0.0,
+        )
+        if now >= next_epoch_check:
+            self._physical_growth_epoch_next_check = (
+                now + PHYSICAL_GROWTH_EPOCH_CHECK_INTERVAL_S
+            )
+            self._increment_operation_counter(
+                "physical_growth_capacity_epoch_checks_total"
+            )
+            current_epoch = self._read_physical_growth_capacity_epoch()
+            rejected_epoch = getattr(
+                self,
+                "_physical_growth_capacity_epoch",
+                None,
+            )
+            if current_epoch is not None and current_epoch != rejected_epoch:
+                self._reset_physical_growth_retry_backoff()
+                self._increment_operation_counter(
+                    "physical_growth_capacity_wakeups_total"
+                )
+                return False
+
+        if now < retry_after:
+            self._increment_operation_counter(
+                "physical_growth_retry_suppressed_total"
+            )
+            return True
+
+        self._physical_growth_retry_after = 0.0
+        self._increment_operation_counter("physical_growth_retry_probes_total")
+        return False
 
     def _record_operation_error(self, code: str, counter_name: str) -> None:
         operation_lock = getattr(self, "_operation_lock", None)
@@ -1051,6 +1225,14 @@ class KVCacheManager:
         virtual_free_pages = self.page_allocator.get_num_free_pages()
         if self.in_shrink:
             blocks_from_free_pages = 0
+        elif self._physical_growth_retry_is_blocked():
+            # Backoff applies to new growth, not already mapped reserve pages.
+            resident_pages = min(
+                self.page_allocator.get_num_free_pages(),
+                self.page_allocator.get_num_reserved_pages(),
+            )
+            blocks_from_free_pages = resident_pages * InternalPage.get_num_blocks(
+                self.page_size, self.block_mem_size)
         else:
             physical_free_pages = (
                 self._get_cached_avail_physical_pages()
