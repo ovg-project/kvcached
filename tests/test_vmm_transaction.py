@@ -13,10 +13,10 @@ def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguo
     page = page_mib * 1024 * 1024
     layers = 2
     # The per-pool page can differ from the process default (#529/#540).
-    vmm.init_kvcached("cuda:0", 2 * 1024 * 1024, contiguous)
+    vmm.init_kvcached(_device_str(), 2 * 1024 * 1024, contiguous)
     try:
         tensors = vmm.create_kv_tensors(
-            8 * page, 1, "cuda:0", layers, buffers, page_size=page)
+            8 * page, 1, _device_str(), layers, buffers, page_size=page)
         # Non-contiguous MLA's upper half is usable, not a mirrored V region.
         offset = 4 * page if not contiguous and buffers == 1 else 0
         prepared = vmm.prepare_map_to_kv_tensors("geometry-abort", [offset], 0)
@@ -30,7 +30,7 @@ def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguo
                  for start in ([offset] if contiguous or buffers == 1 else [0, 4 * page])]
         for index, view in enumerate(views):
             view.fill_(index + 9)
-        torch.cuda.synchronize()
+        _device_module().synchronize()
         adopted = vmm.prepare_map_to_kv_tensors("geometry-adopt", [offset], 0)
         assert adopted["success"] and adopted["required_bytes"] == 0
         assert vmm.commit_prepared_map("geometry-adopt", 0)["success"]
@@ -38,7 +38,7 @@ def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguo
         assert vmm.abort_unmap_from_kv_tensors("geometry-release", 0)
         for index, view in enumerate(views):
             assert torch.all(view == index + 9).item()
-        torch.cuda.synchronize()
+        _device_module().synchronize()
         assert vmm.unmap_from_kv_tensors([offset], 0)
     finally:
         vmm.shutdown_kvcached()
@@ -67,10 +67,24 @@ def test_native_allocator_preserves_recoverable_callback_error():
     assert allocator.get_num_inuse_pages() == 0
 
 
+def _device_str(index=0):
+    from kvcached.utils import get_device_type
+
+    return f"{get_device_type()}:{index}"
+
+
+def _device_module():
+    from kvcached.utils import get_device_module
+
+    return get_device_module()
+
+
 def _compiled_vmm_ops():
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for VMM transaction validation")
+    pytest.importorskip("torch")
+    from kvcached.utils import get_device_module, get_device_type
+
+    if not get_device_module().is_available():
+        pytest.skip(f"{get_device_type()} is required for VMM transaction validation")
 
     try:
         from kvcached import vmm_ops
@@ -101,45 +115,46 @@ def test_prepared_growth_preserves_callers_cuda_device(monkeypatch, tmp_path, ou
     import torch
 
     native = _compiled_vmm_ops()
-    if torch.cuda.device_count() < 2:
-        pytest.skip("two CUDA devices are required for cross-device admission")
-    original_device = torch.cuda.current_device()
+    if _device_module().device_count() < 2:
+        pytest.skip("two devices are required for cross-device admission")
+    original_device = _device_module().current_device()
     page = 2 * 1024 * 1024
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
-    native.init_kvcached("cuda:1", page, False)
+    native.init_kvcached(_device_str(1), page, False)
     try:
-        tensors = native.create_kv_tensors(4 * page, 1, "cuda:1", 1, 1, page_size=page)
-        torch.cuda.set_device(0)
+        tensors = native.create_kv_tensors(4 * page, 1, _device_str(1), 1, 1, page_size=page)
+        _device_module().set_device(0)
         utilization = {"success": "1", "capacity": "1e-20", "invalid-utilization": "invalid"}
         monkeypatch.setenv("KVCACHED_GPU_UTILIZATION", utilization[outcome])
         if outcome == "success":
             assert native.prepare_map_to_kv_tensors("device-scope", [0], 0)["success"]
-            assert torch.cuda.current_device() == 0
+            assert _device_module().current_device() == 0
             assert native.commit_prepared_map("device-scope", 0)["success"]
             tensors[0][:128].fill_(19)
-            torch.cuda.synchronize(1)
+            _device_module().synchronize(1)
             assert torch.all(tensors[0][:128] == 19).item()
         else:
             result = native.prepare_map_to_kv_tensors("device-scope", [0], 0)
             assert not result["success"]
             assert result["capacity_rejections"] == (1 if outcome == "capacity" else 0)
             assert not native.has_prepared_map("device-scope", 0)
-        assert torch.cuda.current_device() == 0
+        assert _device_module().current_device() == 0
     finally:
-        torch.cuda.set_device(1)
+        _device_module().set_device(1)
         native.shutdown_kvcached()
-        torch.cuda.set_device(original_device)
+        _device_module().set_device(original_device)
 
 
 def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     page_size = 2 * 1024 * 1024
     num_layers = 2
     num_kv_buffers = 2
-    vmm_ops.init_kvcached("cuda:0", page_size, contiguous_layout)
+    device = _device_str()
+    vmm_ops.init_kvcached(device, page_size, contiguous_layout)
     vmm_ops.create_kv_tensors(
         8 * 1024 * 1024,
         2,
-        "cuda:0",
+        device,
         num_layers,
         num_kv_buffers,
         0,
@@ -155,7 +170,7 @@ def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     ids=["contiguous", "unified", "per-layer-kv"],
 )
 @pytest.mark.parametrize("failure_position", [0, 1, 2])
-def test_cuda_map_batch_rolls_back_at_each_operation_position(
+def test_map_batch_rolls_back_at_each_operation_position(
     contiguous_layout, unified_pool, failure_position
 ):
     vmm_ops = _compiled_vmm_ops()
@@ -390,16 +405,15 @@ def test_physical_growth_lock_rejects_symlink(monkeypatch, tmp_path):
 
 
 def test_shared_budget_covers_local_prepared_growth_and_multiple_pools(monkeypatch, tmp_path):
-    import torch
 
     native = _compiled_vmm_ops()
     page = 2 * 1024 * 1024
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
     monkeypatch.setenv("KVCACHED_IPC_NAME", "shared-budget-two-pools")
-    native.init_kvcached("cuda:0", page, False)
+    native.init_kvcached(_device_str(), page, False)
     try:
-        first = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, 0)
-        second = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, 1000)
+        first = native.create_kv_tensors(4 * page, 1, _device_str(), 1, 1, 0)
+        second = native.create_kv_tensors(4 * page, 1, _device_str(), 1, 1, 1000)
         assert native.set_instance_budget_limit(2 * page, 1, 0) == "applied"
         assert native.physical_budget_state(1000)["instance_limit_bytes"] == 2 * page
         assert native.map_to_kv_tensors_with_result([0, 0], 0) == (True, [0])
@@ -416,7 +430,7 @@ def test_shared_budget_covers_local_prepared_growth_and_multiple_pools(monkeypat
         assert native.map_to_kv_tensors_with_result([0], 0) == (True, [])
         for value, tensors in enumerate([first, second], 10):
             tensors[0][:128].fill_(value)
-        torch.cuda.synchronize()
+        _device_module().synchronize()
         assert (first[0][:128] == 10).all().item()
         assert (second[0][:128] == 11).all().item()
         assert native.unmap_from_kv_tensors([0], 0)
@@ -435,26 +449,32 @@ def test_shared_budget_calibration_observes_external_cuda_allocation(monkeypatch
     import torch
 
     native = _compiled_vmm_ops()
+    from kvcached.utils import get_device_type
+
+    if get_device_type() == "xpu":
+        # ext_intel_free_memory reports the card's full capacity whatever is
+        # allocated (xpu_runtime.cpp), so calibration cannot see this tensor.
+        pytest.skip("XPU free-memory query does not reflect other allocations")
     page = 2 * 1024 * 1024
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
-    native.init_kvcached("cuda:0", page, False)
+    native.init_kvcached(_device_str(), page, False)
     external = None
     try:
-        native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, 0)
+        native.create_kv_tensors(4 * page, 1, _device_str(), 1, 1, 0)
         assert native.prepare_map_to_kv_tensors("resident", [0], 0)["success"]
         before = native.physical_budget_state()
         assert before["charged_bytes"] == page
-        external = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        external = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=_device_str())
         external.fill_(1)
-        torch.cuda.synchronize()
+        _device_module().synchronize()
         assert native.recalibrate_physical_budget()
         after = native.physical_budget_state()
         assert after["budget_bytes"] < before["budget_bytes"]
         assert after["charged_bytes"] == page
         del external
         external = None
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        _device_module().empty_cache()
+        _device_module().synchronize()
         assert native.recalibrate_physical_budget()
         recovered = native.physical_budget_state()
         assert recovered["charged_bytes"] == page
@@ -463,17 +483,25 @@ def test_shared_budget_calibration_observes_external_cuda_allocation(monkeypatch
         assert native.physical_budget_state()["charged_bytes"] == 0
     finally:
         del external
-        torch.cuda.empty_cache()
+        _device_module().empty_cache()
         native.shutdown_kvcached()
 
 
 def test_shared_budget_calibration_preserves_headroom_deficit(monkeypatch, tmp_path):
     native = _compiled_vmm_ops()
+    from kvcached.utils import get_device_type
+
+    if get_device_type() == "xpu":
+        # The deficit is only observable if free memory drops by the page just
+        # mapped; ext_intel_free_memory reports the card's full capacity
+        # whatever is allocated (xpu_runtime.cpp), so free never falls below
+        # the near-total headroom.
+        pytest.skip("XPU free-memory query does not reflect kvcached's own mappings")
     page = 2 * 1024 * 1024
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
-    native.init_kvcached("cuda:0", page, False)
+    native.init_kvcached(_device_str(), page, False)
     try:
-        native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, 0)
+        native.create_kv_tensors(4 * page, 1, _device_str(), 1, 1, 0)
         assert native.prepare_map_to_kv_tensors("resident-deficit", [0], 0)["success"]
         # A near-total-device safety margin exceeds observed free memory even
         # after this small KV allocation is released; it must not be regranted.
@@ -495,10 +523,10 @@ def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
     native = _compiled_vmm_ops()
     page = 2 * 1024 * 1024
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
-    native.init_kvcached("cuda:0", page, False)
+    native.init_kvcached(_device_str(), page, False)
     allocator = None
     try:
-        native.create_kv_tensors(8 * page, 1, "cuda:0", 1, 1, 0)
+        native.create_kv_tensors(8 * page, 1, _device_str(), 1, 1, 0)
         allocator = PageAllocator(
             num_layers=1, mem_size_per_layer=8 * page, page_size=page,
             world_size=1, pp_rank=0, async_sched=False, contiguous_layout=False,

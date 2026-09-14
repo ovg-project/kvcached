@@ -1,25 +1,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real CUDA allocation, readback and reclamation with SGLang-selected pages."""
+"""Real accelerator allocation, readback and reclamation with SGLang-selected pages."""
 
 import types
 
 import pytest
 from test_vmm_transaction import _compiled_vmm_ops
 
+from kvcached.utils import get_device_module, get_device_type
+
 MIB = 1024 * 1024
+# The build serves one accelerator family and rejects the others, so the device
+# string and the torch module both follow it rather than name CUDA.
+DEVICE = f"{get_device_type()}:0"
 
 
 @pytest.fixture(params=[False, True], ids=["per-layer", "contiguous"])
 def pools(monkeypatch, request):
     _compiled_vmm_ops()
-    import torch
-
     from kvcached import kv_cache_manager
     from kvcached.integration.sglang import interfaces
 
-    torch.cuda.init()
+    device_module = get_device_module(DEVICE)
+    device_module.init()
     # Other GPU tests can initialize the shim during collection and later
     # shut down native VMM directly. Reset both before choosing the layout.
     assert interfaces.shutdown_kvcached()
@@ -28,14 +32,14 @@ def pools(monkeypatch, request):
     monkeypatch.setattr(interfaces, "_contiguous_layout", request.param)
     monkeypatch.setattr(kv_cache_manager, "CONTIGUOUS_LAYOUT", request.param)
     monkeypatch.setattr(kv_cache_manager, "PAGE_PREALLOC_ENABLED", False)
-    monkeypatch.setattr(torch.cuda, "get_device_properties",
+    monkeypatch.setattr(device_module, "get_device_properties",
                         lambda device: types.SimpleNamespace(total_memory=256 * MIB))
     managers: list[kv_cache_manager.KVCacheManager] = []
-    interfaces.init_kvcached(device="cuda:0")
+    interfaces.init_kvcached(device=DEVICE)
     try:
         yield interfaces, managers
     finally:
-        torch.cuda.synchronize()
+        device_module.synchronize()
         for manager in managers:
             assert manager.shutdown()
         assert interfaces.shutdown_kvcached()
@@ -71,10 +75,10 @@ def _exercise(manager, views):
                 view.fill_(value)
                 checks.append((view, value))
         assert len(pages) >= 3
-        torch.cuda.synchronize()
+        get_device_module(DEVICE).synchronize()
         for view, value in checks:
             assert torch.all(view == value).item()
-        torch.cuda.synchronize()
+        get_device_module(DEVICE).synchronize()
         manager.free(blocks)
         assert manager.available_size() == available
         assert manager.page_allocator.get_num_inuse_pages() == initial_pages
@@ -101,7 +105,7 @@ def test_attention_page_readback(pools, monkeypatch, attention, buffers,
     tokens = 16
     cell = block_bytes // tokens
     raw = iface.alloc_kv_cache(
-        (16 * tokens, 1, cell // 2), torch.bfloat16, "cuda:0", 2,
+        (16 * tokens, 1, cell // 2), torch.bfloat16, DEVICE, 2,
         page_size=tokens, attention_type=attention)
     if page_mb is None:
         with pytest.raises(KVCachedConfigError, match="cannot manage this KV geometry"):
@@ -126,14 +130,14 @@ def test_mamba_and_attention_keep_independent_pages(pools, monkeypatch, explicit
         shape=types.SimpleNamespace(conv=[(512, 512)], temporal=(512, 1024)),
         dtype=types.SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32))
     kwargs = dict(num_slots=16, num_mamba_layers=2, cache_params=params,
-                  device="cuda:0", group_id=1)
+                  device=DEVICE, group_id=1)
     if page_mb is None:
         with pytest.raises(RuntimeError, match="exceeds.*PAGE_SIZE"):
             iface.alloc_mamba_states(**kwargs)
         return
     conv, temporal, info = iface.alloc_mamba_states(**kwargs)
     manager = _manager(pools, 16, 1, info["cell_size"], 1, page_mb, 1)
-    k, v = iface.alloc_kv_cache((8192, 8, 128), torch.bfloat16, "cuda:0", 2,
+    k, v = iface.alloc_kv_cache((8192, 8, 128), torch.bfloat16, DEVICE, 2,
                               page_size=16, group_id=2)
     attention = _manager(pools, 512, 16, 2048, 2, explicit_mb or 2, 2)
     attention_blocks = attention.alloc(1)
@@ -153,5 +157,5 @@ def test_mamba_and_attention_keep_independent_pages(pools, monkeypatch, explicit
     _exercise(manager, views)
     for view in attention_views:
         assert torch.all(view == 42).item()
-    torch.cuda.synchronize()
+    get_device_module(DEVICE).synchronize()
     attention.free(attention_blocks)

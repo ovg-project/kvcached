@@ -16,7 +16,7 @@ while every page is in flight; then one alloc_page() from the main thread.
 It runs in a subprocess so that, on a regression, the deadlock kills the
 subprocess via timeout instead of wedging pytest itself.
 
-Needs a GPU: the prealloc worker calls cudaMemGetInfo.
+Needs an accelerator: the prealloc worker queries free device memory.
 """
 
 import subprocess
@@ -24,9 +24,12 @@ import sys
 
 import pytest
 
-torch = pytest.importorskip("torch")
-if not torch.cuda.is_available():
-    pytest.skip("needs a GPU (prealloc worker calls cudaMemGetInfo)",
+pytest.importorskip("torch")
+
+from kvcached.utils import get_device_module  # noqa: E402
+
+if not get_device_module().is_available():
+    pytest.skip("needs an accelerator (prealloc worker queries free memory)",
                 allow_module_level=True)
 
 SCENARIO = r"""
