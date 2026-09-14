@@ -5,7 +5,8 @@ import pytest
 
 
 @pytest.mark.parametrize("phase", ["prepare", "commit"])
-def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase):
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase, num_pages):
     """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
     import uuid
 
@@ -47,17 +48,17 @@ def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch,
     monkeypatch.setattr(ipc, "_send_and_receive_message", exchange)
     try:
         with pytest.raises(StateConsistencyError, match="restart"):
-            allocator.alloc_page()
+            allocator.alloc_pages(num_pages)
         state = allocator.get_transaction_state()
         assert state["state"] == "FAILED"
-        assert state["quarantined_page_ids"] == [0]
+        assert state["quarantined_page_ids"] == list(range(num_pages))
         with pytest.raises(StateConsistencyError):
             allocator.get_num_free_pages()
         assert len(transactions) == 1
         assert commands.count("get_map_transaction_state") == 2
         calls = len(commands)
         with pytest.raises(StateConsistencyError):
-            allocator.alloc_page()
+            allocator.alloc_pages(num_pages)
         assert len(commands) == calls
         if phase == "prepare":
             assert vmm_ops.has_prepared_map(transactions[0], 0)
@@ -107,6 +108,144 @@ def test_background_unknown_outcome_reaches_manager_capacity_check():
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _batch_allocator(vmm_ops, *, contiguous_layout=False):
+    import uuid
+
+    page_size = 2 * 1024 * 1024
+    return vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=4 * page_size,
+        page_size=page_size, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=contiguous_layout,
+        enable_page_prealloc=False, num_kv_buffers=2,
+        group_id=0, ipc_name="BATCH_" + uuid.uuid4().hex[:8],
+    )
+
+
+@pytest.mark.parametrize("contiguous_layout", [False, True])
+def test_native_batch_maps_all_new_offsets_once_and_reuses_reserved(contiguous_layout):
+    _run_reserved_batch_case("_check_batch_reuse", contiguous_layout)
+
+
+def _run_reserved_batch_case(name, argument):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES="0", KVCACHED_MAX_RESERVED_PAGES="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import json, runpy, sys; "
+         "runpy.run_path(sys.argv[1])[sys.argv[2]](json.loads(sys.argv[3]))",
+         __file__, name, json.dumps(argument)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_batch_reuse(contiguous_layout):
+    v = _compiled_vmm_ops()
+    page_size = 2 * 1024 * 1024
+    v.init_kvcached("cuda:0", page_size, contiguous_layout)
+    # create_kv_tensors takes the per-layer K+V size, whereas PageAllocator
+    # takes the size of one buffer. Reserve four pages for each K/V buffer.
+    v.create_kv_tensors(8 * page_size, 2, "cuda:0", 2, 2, 0, False)
+    allocator = _batch_allocator(v, contiguous_layout=contiguous_layout)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    stride = 2 * 1024 * 1024 * (4 if contiguous_layout else 1)
+
+    def map_batch(world_size, offsets):
+        calls.append(list(offsets))
+        assert v.map_to_kv_tensors_with_result(offsets, 0) == (True, list(offsets))
+
+    allocator.set_broadcast_map_callback(map_batch)
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: v.unmap_from_kv_tensors(offsets, 0))
+    try:
+        pages = allocator.alloc_pages(2)
+        assert [p.page_id for p in pages] == [0, 1]
+        assert calls == [[0, stride]]
+        allocator.free_page(0)
+        assert allocator.get_num_reserved_pages() == 1
+        pages = allocator.alloc_pages(3)
+        assert [p.page_id for p in pages] == [0, 2, 3]
+        assert calls == [[0, stride], [2 * stride, 3 * stride]]
+        assert allocator.get_num_free_pages() == 0
+        # Every offset is already mapped, including the reused reserved page.
+        assert v.map_to_kv_tensors_with_result([i * stride for i in range(4)], 0) == (True, [])
+        allocator.free_pages([0, 1, 2, 3])
+        allocator.trim()
+        assert allocator.get_num_free_pages() == 4
+    finally:
+        del allocator
+        v.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("failure", ["recoverable", "quarantined", "unknown"])
+def test_native_batch_failure_restores_only_safe_page_ids(failure):
+    _run_reserved_batch_case("_check_batch_failure", failure)
+
+
+def _check_batch_failure(failure):
+    from kvcached.errors import MapQuarantinedError, StateConsistencyError
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls, unmaps = [], []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: unmaps.append(list(offsets)))
+    allocator.alloc_pages(2)
+    allocator.free_page(0)
+    error_type = {"recoverable": RuntimeError, "quarantined": MapQuarantinedError,
+                  "unknown": MapTransactionOutcomeUnknownError}[failure]
+    expected_type = StateConsistencyError if failure == "unknown" else error_type
+
+    def fail(ws, offsets):
+        raise error_type("injected batch failure")
+
+    allocator.set_broadcast_map_callback(fail)
+    with pytest.raises(expected_type, match="injected batch failure"):
+        allocator.alloc_pages(3)
+    assert allocator.get_num_reserved_pages() == 1
+    assert unmaps == []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    if failure == "recoverable":
+        assert allocator.get_num_free_pages() == 3
+        assert allocator.get_num_inuse_pages() == 1
+        assert [p.page_id for p in allocator.alloc_pages(3)] == [0, 2, 3]
+        assert len(calls[-1]) == 2
+    else:
+        assert allocator.get_transaction_state()["quarantined_page_ids"] == [2, 3]
+        if failure == "unknown":
+            with pytest.raises(StateConsistencyError):
+                allocator.alloc_page()
+        else:
+            assert allocator.get_num_free_pages() == 1
+            assert allocator.alloc_page().page_id == 0
+            with pytest.raises(RuntimeError, match="free pages"):
+                allocator.alloc_page()
+
+
+def test_native_batch_invalid_or_exhausted_request_does_not_mutate_state():
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    assert allocator.alloc_pages(0) == []
+    with pytest.raises(ValueError, match="non-negative"):
+        allocator.alloc_pages(-1)
+    with pytest.raises(RuntimeError, match="free pages"):
+        allocator.alloc_pages(5)
+    assert allocator.get_num_free_pages() == 4
+    assert allocator.get_num_reserved_pages() == 0
+    assert calls == []
+    assert [p.page_id for p in allocator.alloc_pages(4)] == list(range(4))
+    assert len(calls) == 1
 
 
 def _check_background_unknown_outcome():
