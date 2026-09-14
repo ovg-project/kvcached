@@ -28,6 +28,56 @@ Available commands:
 kvcached>
 ```
 
+## Embedding revisioned limits in a production controller
+
+`kvctl limit` is useful for manual operation. A production control layer can
+instead apply a revisioned instance budget through the Python API:
+
+```python
+from typing import Any
+
+from kvcached.control import set_instance_memory_limit
+
+
+def apply_memory_assignment(limit_bytes: int, revision: int) -> dict[str, Any]:
+    result = set_instance_memory_limit(limit_bytes, revision=revision)
+
+    if result["status"] not in {"applied", "deferred"}:
+        raise RuntimeError(
+            "memory assignment was not accepted: "
+            f"{result['reason'] or result['status']}"
+        )
+    return result
+```
+
+This API is process-local. Call it from a control handler running in the same
+process as the vLLM EngineCore or SGLang scheduler after kvcached has registered
+its live KV pools. Calling it from a separate sidecar or controller process will
+return `unavailable` because that process has a different pool registry. The
+transport that delivers assignments to the engine process (for example, RPC or
+a Unix socket) is intentionally left to the production integration.
+
+Use a monotonically increasing, non-negative revision for each new assignment:
+
+| Status | Meaning | Controller action |
+| --- | --- | --- |
+| `applied` | The aligned limit is active. | Record the acknowledgement. |
+| `deferred` | Active mappings exceed the new limit; no active mapping was revoked. | Retry the same limit and revision to poll until it becomes `applied`. |
+| `stale` | A newer revision is already active. | Discard this response and reconcile with the newer assignment. |
+| `conflict` | The same revision was reused with a different limit. | Allocate a new revision; do not retry the conflicting tuple. |
+| `unavailable` | No live KV pool is registered in this process. | Wait for engine initialization or fix the control-handler placement. |
+
+Retries of the same `(limit_bytes, revision)` tuple are idempotent. A lower
+limit converges through the existing `resize()` / `in_shrink` path as requests
+release pages; a later higher revision can regrow the pool within its original
+reservation. The returned `pools` list reports each pool's aligned share and
+current mapped bytes. When an engine owns multiple KV pools, kvcached splits the
+instance budget deterministically in proportion to their original capacities.
+
+kvcached applies the assigned budget but does not choose it. Quota policy,
+fairness, admission, and cross-instance arbitration remain the responsibility
+of the external control layer.
+
 Use the `kvtop` command for real-time visualization of memory usage:
 
 <!-- KVCache memory monitor (muted colours) -->
