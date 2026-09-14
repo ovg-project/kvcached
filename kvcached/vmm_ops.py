@@ -44,16 +44,23 @@ abort_unmap_from_kv_tensors = _C.abort_unmap_from_kv_tensors
 PageAllocator = _C.PageAllocator
 InternalPage = _C.InternalPage
 
+# Which backend the extension was built against, and whether that backend gives
+# reads of never-allocated KV a zero page to land on.
+has_zero_page_safety_net = _C.has_zero_page_safety_net
+backend_name = _C.backend_name
+
 __all__ = [
     "InternalPage",
     "PageAllocator",
     "abort_prepared_map",
     "abort_unmap_from_kv_tensors",
+    "backend_name",
     "commit_prepared_map",
     "commit_unmap_from_kv_tensors",
     "create_kv_tensors",
     "current_device_pci_bus_id",
     "has_prepared_map",
+    "has_zero_page_safety_net",
     "init_kvcached",
     "kv_tensors_created",
     "map_to_kv_tensors",
