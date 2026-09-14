@@ -9,6 +9,9 @@ from wrapt.importer import when_imported
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
+    DeepSeekV4KVPoolPatch,
+    DeepSeekV4RuntimeReservationPatch,
+    DeepSeekV4SWAAllocatorPatch,
     ElasticAllocatorPatch,
     ElasticHybridLinearKVPoolPatch,
     ElasticMambaPoolPatch,
@@ -47,6 +50,9 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4RuntimeReservationPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4KVPoolPatch(), ">=0.5.13"),
+            (DeepSeekV4SWAAllocatorPatch(), ">=0.5.13"),
             # Importing ModelRunner captures memory-pool classes in module
             # globals, so apply this only after every pool alias is installed.
             (SGLangVirtualKVCapacityPatch(), ">=0.5.11"),
