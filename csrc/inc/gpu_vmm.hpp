@@ -54,6 +54,10 @@ inline int current_device() {
   return dev_idx;
 }
 
+inline status_t device_get_pci_bus_id(char *pci_bus_id, int len, int dev_idx) {
+  return hipDeviceGetPCIBusId(pci_bus_id, len, dev_idx);
+}
+
 inline status_t mem_get_info(size_t *free_bytes, size_t *total_bytes) {
   return hipMemGetInfo(free_bytes, total_bytes);
 }
@@ -173,6 +177,11 @@ inline int current_device() {
   int dev_idx = -1;
   check(cudaGetDevice(&dev_idx), "cudaGetDevice(&dev_idx)", __FILE__, __LINE__);
   return dev_idx;
+}
+
+inline rt_status_t device_get_pci_bus_id(char *pci_bus_id, int len,
+                                         int dev_idx) {
+  return cudaDeviceGetPCIBusId(pci_bus_id, len, dev_idx);
 }
 
 inline rt_status_t mem_get_info(size_t *free_bytes, size_t *total_bytes) {

@@ -23,6 +23,9 @@ public:
           size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
+  bool is_mapped(offset_t offset) const;
+  std::unique_ptr<Page> reserve_page(offset_t offset) const;
+  bool map_reserved(offset_t offset, std::unique_ptr<Page> page);
   bool unmap(offset_t offset);
 
   inline at::Tensor get_tensor() noexcept { return tensor_; }

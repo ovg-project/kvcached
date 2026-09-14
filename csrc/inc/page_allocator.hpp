@@ -129,6 +129,7 @@ public:
 private:
   // Preallocation thread worker
   void prealloc_worker();
+  void check_prealloc_failure() const;
 
   // Resize watcher thread worker
   void resize_watcher();
@@ -175,6 +176,8 @@ private:
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
+  std::atomic<bool> prealloc_failed_{false};
+  std::string prealloc_failure_;
   // Serializes start/stop of the background threads. Before the blocking
   // bindings released the GIL, concurrent start and stop callers were
   // accidentally serialized by the GIL itself; they no longer are, so the

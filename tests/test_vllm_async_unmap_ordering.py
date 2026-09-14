@@ -367,4 +367,3 @@ def test_ordered_unmap_raises_after_partial_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Ordered KV unmap failed"):
         page_allocator.callback(2, [64])
-

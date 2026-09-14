@@ -168,6 +168,66 @@ bool FTensor::map(offset_t offset) {
   return true;
 }
 
+bool FTensor::is_mapped(offset_t offset) const { return is_mapped_(offset); }
+
+std::unique_ptr<Page> FTensor::reserve_page(offset_t offset) const {
+  validate_offset_(offset);
+  assert(offset % page_size_ == 0);
+  if (is_mapped_(offset)) {
+    throw std::runtime_error("page is already mapped");
+  }
+  return make_unique_page(dev_, offset / page_size_, page_size_);
+}
+
+bool FTensor::map_reserved(offset_t offset, std::unique_ptr<Page> page) {
+  validate_offset_(offset);
+  assert(offset % page_size_ == 0);
+  const page_id_t page_id = offset / page_size_;
+  if (!page) {
+    throw std::invalid_argument("reserved page must not be null");
+  }
+  if (is_mapped_(offset)) {
+    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
+    return false;
+  }
+
+  auto vaddr = reinterpret_cast<generic_ptr_t>(
+      reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  if (dev_.is_cuda()) {
+    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                       "zero page unmap");
+  }
+
+  bool physical_page_mapped = false;
+  try {
+    if (!page->map(vaddr)) {
+      throw std::runtime_error("physical page map returned false");
+    }
+    physical_page_mapped = true;
+    mapping_.emplace(page_id, std::move(page));
+  } catch (const std::exception &error) {
+    const std::string original_error = error.what();
+    if (physical_page_mapped && dev_.is_cuda()) {
+      const auto status = gpu_vmm::mem_unmap(vaddr, page_size_);
+      if (!gpu_vmm::is_success(status)) {
+        throw_rollback_error("reserved physical page map", original_error,
+                             gpu_vmm::error_string(status));
+      }
+    }
+    try {
+      if (!map_(zero_page_.get(), offset)) {
+        throw std::runtime_error("zero page map returned false");
+      }
+    } catch (const std::exception &rollback_error) {
+      throw_rollback_error("reserved physical page map", original_error,
+                           rollback_error.what());
+    }
+    throw std::runtime_error("reserved physical page map failed: " +
+                             original_error);
+  }
+  return true;
+}
+
 bool FTensor::unmap(offset_t offset) {
   std::unique_ptr<Page> retained_page;
   return unmap_retain_(offset, retained_page);
