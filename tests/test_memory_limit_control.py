@@ -78,6 +78,15 @@ class FakeAllocator:
             "reserved_pages": self.reserved_pages,
         }
 
+    def get_num_free_pages(self):
+        return max(0, self.total_pages - self.inuse_pages)
+
+    def get_avail_physical_pages(self):
+        return self.get_num_free_pages()
+
+    def get_num_reserved_pages(self):
+        return self.reserved_pages
+
 
 def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager = object.__new__(KVCacheManager)
@@ -91,6 +100,13 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager._memory_limit_bytes = None
     manager._memory_limit_effective_bytes = None
     manager._memory_limit_revision = -1
+    manager._operation_lock = threading.RLock()
+    manager._operation_counters = {}
+    manager._physical_growth_rejection_streak = 0
+    manager._physical_growth_retry_after = 0.0
+    manager._physical_growth_capacity_epoch_provider = None
+    manager._physical_growth_capacity_epoch = None
+    manager._physical_growth_epoch_next_check = 0.0
     manager.page_allocator = FakeAllocator(
         page_size=manager.page_size,
         total_pages=16,
@@ -105,6 +121,45 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager.target_num_blocks = None
     manager.block_mem_size = manager.page_size
     return manager
+
+
+def test_capacity_rejection_temporarily_hides_physical_growth(monkeypatch):
+    manager = _manager()
+    manager.num_avail_blocks = 2
+    manager.page_allocator.get_avail_physical_pages = lambda: 3
+    monkeypatch.setattr("kvcached.kv_cache_manager.time.monotonic", lambda: 10.0)
+
+    manager._record_physical_growth_result(
+        {"physical_growth_capacity_rejections_total": 1}
+    )
+
+    assert manager.available_size() == 2
+    assert manager._operation_counters["physical_growth_retry_suppressed_total"] == 1
+
+
+def test_capacity_epoch_wakes_retry_before_backoff_expires(monkeypatch):
+    manager = _manager()
+    manager.num_avail_blocks = 2
+    manager.page_allocator.get_avail_physical_pages = lambda: 3
+    now = [10.0]
+    epoch = [(1, 100)]
+    manager._physical_growth_capacity_epoch_provider = lambda: epoch[0]
+    monkeypatch.setattr(
+        "kvcached.kv_cache_manager.time.monotonic", lambda: now[0]
+    )
+
+    manager._record_physical_growth_result(
+        {"physical_growth_capacity_rejections_total": 1}
+    )
+    assert manager._physical_growth_retry_after > now[0]
+
+    now[0] += 0.011
+    epoch[0] = (2, 200)
+
+    assert manager.available_size() == 5
+    assert manager._operation_counters["physical_growth_capacity_epoch_checks_total"] == 1
+    assert manager._operation_counters["physical_growth_capacity_wakeups_total"] == 1
+    assert manager._operation_counters.get("physical_growth_retry_probes_total", 0) == 0
 
 
 def test_idle_limit_applies_immediately_through_resize():

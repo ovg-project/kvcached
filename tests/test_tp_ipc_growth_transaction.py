@@ -110,6 +110,25 @@ def test_physical_device_ids_are_cached_between_transactions(monkeypatch):
         _restore_tp_ipc_util(previous)
 
 
+def test_physical_capacity_signal_changes_after_notification(monkeypatch, tmp_path):
+    tp_ipc_util, previous = _import_tp_ipc_util(monkeypatch)
+    tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update(
+        {(0, 0): "gpu-0", (0, 1): "gpu-1"}
+    )
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    try:
+        before = tp_ipc_util.physical_growth_capacity_epoch(2)
+
+        assert tp_ipc_util.notify_physical_growth_capacity_changed(2)
+
+        after = tp_ipc_util.physical_growth_capacity_epoch(2)
+        assert before == (0, 0)
+        assert after is not None
+        assert after != before
+    finally:
+        _restore_tp_ipc_util(previous)
+
+
 def test_prepare_failure_aborts_unmapped_reservations_without_commit(monkeypatch):
     tp_ipc_util, previous = _import_tp_ipc_util(monkeypatch)
     tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update({(0, 0): "gpu-0", (0, 1): "gpu-1"})

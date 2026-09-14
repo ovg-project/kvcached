@@ -267,7 +267,7 @@ def test_failed_prefix_reset_preserves_exception_without_releasing(monkeypatch):
     assert manager.released == []
 
 
-def test_engine_ordered_unmap_uses_worker_rpc(monkeypatch):
+def test_engine_ordered_unmap_publishes_capacity_change(monkeypatch):
     patches = _load_patches(monkeypatch)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
 
@@ -275,6 +275,11 @@ def test_engine_ordered_unmap_uses_worker_rpc(monkeypatch):
         "kvcached.integration.vllm.interfaces", fromlist=["init_kvcached"]
     )
     monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    tp_ipc_util = __import__("kvcached.tp_ipc_util", fromlist=["unused"])
+    notify = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        tp_ipc_util, "notify_physical_growth_capacity_changed", notify
+    )
 
     class PageAllocator:
         callback = None
@@ -320,15 +325,24 @@ def test_engine_ordered_unmap_uses_worker_rpc(monkeypatch):
     EngineCore(config)
     manager.page_allocator.callback(4, [64, 128])
 
+    notify.assert_called_once_with(4, -1)
+    manager._increment_operation_counter.assert_called_once_with(
+        "physical_growth_capacity_notifications_total"
+    )
 
 
-def test_ordered_unmap_raises_after_partial_failure(monkeypatch):
+def test_ordered_unmap_does_not_publish_after_partial_failure(monkeypatch):
     patches = _load_patches(monkeypatch)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     interfaces = __import__(
         "kvcached.integration.vllm.interfaces", fromlist=["init_kvcached"]
     )
     monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    tp_ipc_util = __import__("kvcached.tp_ipc_util", fromlist=["unused"])
+    notify = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        tp_ipc_util, "notify_physical_growth_capacity_changed", notify
+    )
 
     page_allocator = SimpleNamespace(callback=None)
     page_allocator.set_broadcast_unmap_callback = lambda callback: setattr(
@@ -367,3 +381,6 @@ def test_ordered_unmap_raises_after_partial_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Ordered KV unmap failed"):
         page_allocator.callback(2, [64])
+
+    notify.assert_not_called()
+    manager._increment_operation_counter.assert_not_called()

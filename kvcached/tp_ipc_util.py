@@ -53,6 +53,7 @@ def _get_socket_dir_name() -> str:
 SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
 IPC_TIMEOUT_S = float(os.getenv("KVCACHED_IPC_TIMEOUT", "60"))
 _MAX_TERMINAL_MAP_TRANSACTIONS = 4096
+_PHYSICAL_GROWTH_CAPACITY_SIGNAL_PREFIX = "kvcached-physical-growth-capacity"
 
 
 def _build_physical_growth_operation_counters(
@@ -159,6 +160,75 @@ def _fail_unresolved_map_transaction(
         "message": message,
     }
     raise MapTransactionOutcomeUnknownError(message)
+
+
+def _cached_physical_devices(
+    tp_size: int,
+    pp_rank: int,
+) -> Optional[list[str]]:
+    targets = [
+        (pp, rank)
+        for pp in _target_pp_ranks(pp_rank)
+        for rank in range(tp_size)
+    ]
+    if any(target not in _PHYSICAL_DEVICE_ID_CACHE for target in targets):
+        return None
+    return sorted({_PHYSICAL_DEVICE_ID_CACHE[target] for target in targets})
+
+
+def _physical_growth_capacity_signal_path(
+    physical_devices: list[str],
+) -> str:
+    device_set = "|".join(sorted(set(physical_devices)))
+    suffix = uuid.uuid5(uuid.NAMESPACE_OID, device_set).hex[:16]
+    lock_dir = os.getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", "/tmp")
+    return os.path.join(
+        lock_dir,
+        f"{_PHYSICAL_GROWTH_CAPACITY_SIGNAL_PREFIX}-{suffix}",
+    )
+
+
+def physical_growth_capacity_epoch(
+    tp_size: int,
+    pp_rank: int = 0,
+) -> Optional[tuple[int, int]]:
+    """Return a shared token that changes after group physical capacity grows."""
+    physical_devices = _cached_physical_devices(tp_size, pp_rank)
+    if not physical_devices:
+        return None
+    path = _physical_growth_capacity_signal_path(physical_devices)
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return (0, 0)
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns)
+
+
+def notify_physical_growth_capacity_changed(
+    tp_size: int,
+    pp_rank: int = 0,
+) -> bool:
+    """Publish a best-effort wakeup after physical pages are really unmapped."""
+    physical_devices = _cached_physical_devices(tp_size, pp_rank)
+    if not physical_devices:
+        return False
+    path = _physical_growth_capacity_signal_path(physical_devices)
+    directory = os.path.dirname(path)
+    temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(temporary, "wb") as signal:
+            signal.write(uuid.uuid4().bytes)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 class _MapTransactionRegistry:

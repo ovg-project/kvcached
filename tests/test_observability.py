@@ -185,12 +185,15 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
     setattr(tp_ipc_module, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
-    setattr(tp_ipc_module, "raise_if_physical_growth_unresolved", lambda *args: None)
+    setattr(tp_ipc_module, "raise_if_physical_growth_unresolved", lambda: None)
 
     vllm_interfaces_module = types.ModuleType("kvcached.integration.vllm.interfaces")
     setattr(vllm_interfaces_module, "should_use_worker_ipc", lambda: False)
 
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
     monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
     monkeypatch.setitem(
         sys.modules,

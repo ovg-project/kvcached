@@ -137,6 +137,44 @@ class KVCachePoolOperationSnapshot:
     physical_page_allocations_total: int
     physical_page_allocation_failures_total: int
     physical_page_frees_total: int
+    physical_growth_transactions_total: int
+    physical_growth_worker_operations_total: int
+    physical_growth_ticket_wait_us_total: int
+    physical_growth_ticket_wait_us_max: int
+    physical_growth_admission_us_total: int
+    physical_growth_admission_us_max: int
+    physical_growth_reserve_us_total: int
+    physical_growth_reserve_us_max: int
+    physical_growth_map_us_total: int
+    physical_growth_map_us_max: int
+    physical_growth_offsets_total: int
+    physical_growth_offsets_max: int
+    physical_growth_logical_blocks_total: int
+    physical_growth_logical_blocks_max: int
+    physical_growth_rejected_logical_blocks_total: int
+    physical_growth_rejected_logical_blocks_max: int
+    physical_growth_worker_targets_total: int
+    physical_growth_worker_targets_max: int
+    physical_growth_capacity_checks_total: int
+    physical_growth_capacity_rejections_total: int
+    physical_growth_rejected_transactions_total: int
+    physical_growth_required_bytes_total: int
+    physical_growth_required_bytes_max: int
+    physical_growth_rejected_free_bytes_total: int
+    physical_growth_rejected_free_bytes_max: int
+    physical_growth_rejected_headroom_bytes_total: int
+    physical_growth_rejected_headroom_bytes_max: int
+    physical_growth_rejected_usable_bytes_total: int
+    physical_growth_rejected_usable_bytes_max: int
+    physical_growth_rejected_shortfall_bytes_total: int
+    physical_growth_rejected_shortfall_bytes_max: int
+    physical_growth_retry_backoff_activations_total: int
+    physical_growth_retry_backoff_us_max: int
+    physical_growth_retry_suppressed_total: int
+    physical_growth_retry_probes_total: int
+    physical_growth_capacity_epoch_checks_total: int
+    physical_growth_capacity_wakeups_total: int
+    physical_growth_capacity_notifications_total: int
     resize_requests_total: int
     resize_successes_total: int
     resize_deferred_total: int
@@ -354,6 +392,112 @@ def build_kv_cache_pool_operation_snapshot(
             "physical_page_allocation_failures_total"
         ),
         physical_page_frees_total=counter("physical_page_frees_total"),
+        physical_growth_transactions_total=counter(
+            "physical_growth_transactions_total"
+        ),
+        physical_growth_worker_operations_total=counter(
+            "physical_growth_worker_operations_total"
+        ),
+        physical_growth_ticket_wait_us_total=counter(
+            "physical_growth_ticket_wait_us_total"
+        ),
+        physical_growth_ticket_wait_us_max=counter(
+            "physical_growth_ticket_wait_us_max"
+        ),
+        physical_growth_admission_us_total=counter(
+            "physical_growth_admission_us_total"
+        ),
+        physical_growth_admission_us_max=counter(
+            "physical_growth_admission_us_max"
+        ),
+        physical_growth_reserve_us_total=counter(
+            "physical_growth_reserve_us_total"
+        ),
+        physical_growth_reserve_us_max=counter(
+            "physical_growth_reserve_us_max"
+        ),
+        physical_growth_map_us_total=counter("physical_growth_map_us_total"),
+        physical_growth_map_us_max=counter("physical_growth_map_us_max"),
+        physical_growth_offsets_total=counter("physical_growth_offsets_total"),
+        physical_growth_offsets_max=counter("physical_growth_offsets_max"),
+        physical_growth_logical_blocks_total=counter(
+            "physical_growth_logical_blocks_total"
+        ),
+        physical_growth_logical_blocks_max=counter(
+            "physical_growth_logical_blocks_max"
+        ),
+        physical_growth_rejected_logical_blocks_total=counter(
+            "physical_growth_rejected_logical_blocks_total"
+        ),
+        physical_growth_rejected_logical_blocks_max=counter(
+            "physical_growth_rejected_logical_blocks_max"
+        ),
+        physical_growth_worker_targets_total=counter(
+            "physical_growth_worker_targets_total"
+        ),
+        physical_growth_worker_targets_max=counter(
+            "physical_growth_worker_targets_max"
+        ),
+        physical_growth_capacity_checks_total=counter(
+            "physical_growth_capacity_checks_total"
+        ),
+        physical_growth_capacity_rejections_total=counter(
+            "physical_growth_capacity_rejections_total"
+        ),
+        physical_growth_rejected_transactions_total=counter(
+            "physical_growth_rejected_transactions_total"
+        ),
+        physical_growth_required_bytes_total=counter(
+            "physical_growth_required_bytes_total"
+        ),
+        physical_growth_required_bytes_max=counter(
+            "physical_growth_required_bytes_max"
+        ),
+        physical_growth_rejected_free_bytes_total=counter(
+            "physical_growth_rejected_free_bytes_total"
+        ),
+        physical_growth_rejected_free_bytes_max=counter(
+            "physical_growth_rejected_free_bytes_max"
+        ),
+        physical_growth_rejected_headroom_bytes_total=counter(
+            "physical_growth_rejected_headroom_bytes_total"
+        ),
+        physical_growth_rejected_headroom_bytes_max=counter(
+            "physical_growth_rejected_headroom_bytes_max"
+        ),
+        physical_growth_rejected_usable_bytes_total=counter(
+            "physical_growth_rejected_usable_bytes_total"
+        ),
+        physical_growth_rejected_usable_bytes_max=counter(
+            "physical_growth_rejected_usable_bytes_max"
+        ),
+        physical_growth_rejected_shortfall_bytes_total=counter(
+            "physical_growth_rejected_shortfall_bytes_total"
+        ),
+        physical_growth_rejected_shortfall_bytes_max=counter(
+            "physical_growth_rejected_shortfall_bytes_max"
+        ),
+        physical_growth_retry_backoff_activations_total=counter(
+            "physical_growth_retry_backoff_activations_total"
+        ),
+        physical_growth_retry_backoff_us_max=counter(
+            "physical_growth_retry_backoff_us_max"
+        ),
+        physical_growth_retry_suppressed_total=counter(
+            "physical_growth_retry_suppressed_total"
+        ),
+        physical_growth_retry_probes_total=counter(
+            "physical_growth_retry_probes_total"
+        ),
+        physical_growth_capacity_epoch_checks_total=counter(
+            "physical_growth_capacity_epoch_checks_total"
+        ),
+        physical_growth_capacity_wakeups_total=counter(
+            "physical_growth_capacity_wakeups_total"
+        ),
+        physical_growth_capacity_notifications_total=counter(
+            "physical_growth_capacity_notifications_total"
+        ),
         resize_requests_total=counter("resize_requests_total"),
         resize_successes_total=counter("resize_successes_total"),
         resize_deferred_total=counter("resize_deferred_total"),

@@ -1030,6 +1030,8 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         patch_logger = self.logger
 
         def _kvcached_install_ordered_unmap(self) -> None:
+            from kvcached.tp_ipc_util import notify_physical_growth_capacity_changed
+
             manager = _get_vllm_kv_cache_manager(self)
             if manager is None:
                 return
@@ -1049,6 +1051,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 getattr(executor, "world_size", configured_workers)
             )
             group_id = int(manager.group_id)
+            pp_rank = int(getattr(manager, "pp_rank", 0))
 
             def ordered_unmap_callback(
                 world_size: int,
@@ -1062,6 +1065,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     raise RuntimeError(
                         "Ordered KV unmap failed on one or more vLLM workers: "
                         f"expected={expected_workers}, responses={responses}"
+                    )
+                if notify_physical_growth_capacity_changed(world_size, pp_rank):
+                    manager._increment_operation_counter(
+                        "physical_growth_capacity_notifications_total"
                     )
 
             manager.page_allocator.set_broadcast_unmap_callback(
