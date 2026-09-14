@@ -35,6 +35,39 @@ if TYPE_CHECKING:
 logger = get_kvcached_logger()
 
 
+def _worker_ordered_unmap(
+    worker: Any,
+    offsets: list[int],
+    group_id: int,
+) -> bool:
+    """Unmap after earlier worker RPCs and CUDA work have completed."""
+    import torch
+
+    from kvcached.vmm_ops import unmap_from_kv_tensors
+
+    device = getattr(worker, "device", None)
+    if device is None:
+        device = getattr(worker, "local_rank", None)
+    if device is None:
+        raise RuntimeError("Cannot determine the vLLM worker CUDA device")
+
+    with torch.cuda.device(device):
+        torch.cuda.synchronize()
+        return bool(
+            unmap_from_kv_tensors(
+                offsets,
+                group_id=group_id,
+            )
+        )
+
+
+def _get_vllm_kv_cache_manager(engine_core: Any) -> Any:
+    scheduler = getattr(engine_core, "scheduler", None)
+    vllm_manager = getattr(scheduler, "kv_cache_manager", None)
+    block_pool = getattr(vllm_manager, "block_pool", None)
+    return getattr(block_pool, "kv_cache_manager", None)
+
+
 def _is_attention_spec(spec: Any) -> bool:
     """Check if a KV cache spec is an attention-type spec.
 
@@ -784,9 +817,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list[KVCacheBlock]:
-                if num_blocks > self.get_num_free_blocks():
-                    raise ValueError(
-                        f"Cannot get {num_blocks} free blocks from the pool")
+                free_blocks = self.get_num_free_blocks()
+                if num_blocks > free_blocks:
+                    raise KVCachePoolExhausted(
+                        "Unable to allocate KV cache blocks from physical pool; "
+                        f"requested={num_blocks}, available={free_blocks}"
+                    )
 
                 block_ids: Optional[list[int]] = None
                 for _ in range(2):
@@ -941,7 +977,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
 
 class EngineCorePatch(VersionAwarePatch, BasePatch):
-    """Patch EngineCore.__init__ to initialize kvcached"""
+    """Patch EngineCore initialization and async batch lifetime ordering."""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core"
@@ -953,8 +989,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if not self.initialize_version_info():
             return False
 
-        # Apply version-specific patches
-        return self.patch_engine_init(engine_mod)
+        init_patched = self.patch_engine_init(engine_mod)
+        lifetime_patched = self.patch_async_batch_lifetime(engine_mod)
+        return init_patched and lifetime_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -985,10 +1022,166 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     is_worker=False,
                     async_sched=_should_enable_async_sched(vllm_config),
                 )
-            return original_init(self, vllm_config, *args, **kwargs)
+            result = original_init(self, vllm_config, *args, **kwargs)
+            if enable_kvcached() and _should_enable_async_sched(vllm_config):
+                self._kvcached_install_ordered_unmap()
+            return result
+
+        patch_logger = self.logger
+
+        def _kvcached_install_ordered_unmap(self) -> None:
+            from kvcached.tp_ipc_util import notify_physical_growth_capacity_changed
+
+            manager = _get_vllm_kv_cache_manager(self)
+            if manager is None:
+                return
+            executor = getattr(self, "model_executor", None)
+            collective_rpc = getattr(executor, "collective_rpc", None)
+            if not callable(collective_rpc):
+                raise RuntimeError(
+                    "Cannot install ordered KVCached unmap without the vLLM "
+                    "worker collective RPC"
+                )
+
+            parallel_config = self.vllm_config.parallel_config
+            configured_workers = int(parallel_config.tensor_parallel_size) * int(
+                parallel_config.pipeline_parallel_size
+            )
+            expected_workers = int(
+                getattr(executor, "world_size", configured_workers)
+            )
+            group_id = int(manager.group_id)
+            pp_rank = int(getattr(manager, "pp_rank", 0))
+
+            def ordered_unmap_callback(
+                world_size: int,
+                offsets: list[int],
+            ) -> None:
+                responses = collective_rpc(
+                    _worker_ordered_unmap,
+                    args=(list(offsets), group_id),
+                )
+                if len(responses) != expected_workers or not all(responses):
+                    raise RuntimeError(
+                        "Ordered KV unmap failed on one or more vLLM workers: "
+                        f"expected={expected_workers}, responses={responses}"
+                    )
+                if notify_physical_growth_capacity_changed(world_size, pp_rank):
+                    manager._increment_operation_counter(
+                        "physical_growth_capacity_notifications_total"
+                    )
+
+            manager.page_allocator.set_broadcast_unmap_callback(
+                ordered_unmap_callback
+            )
+            patch_logger.info(
+                "Installed worker-RPC ordered physical unmap for %d vLLM workers",
+                expected_workers,
+            )
 
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+        EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_async_batch_lifetime(self, engine_mod: types.ModuleType) -> bool:
+        """Order physical page release after prior async worker batches."""
+        EngineCore = self._get_target_class(engine_mod)
+        if EngineCore is None:
+            return False
+
+        original_step = getattr(EngineCore, "step_with_batch_queue", None)
+        if original_step is None:
+            return True
+        if self._is_already_patched(original_step, "async_batch_lifetime"):
+            self.logger.debug("EngineCore.step_with_batch_queue already patched")
+            return True
+
+        def _fence_new_retirements(
+            engine_core: Any,
+            marker: int,
+            in_flight_batches: int,
+        ) -> None:
+            last_marker = getattr(
+                engine_core, "_kvcached_last_fenced_release_marker", 0
+            )
+            if marker <= last_marker:
+                return
+            fences = getattr(engine_core, "_kvcached_release_fences", None)
+            if fences is None:
+                fences = engine_core._kvcached_release_fences = []
+            fences.append([marker, in_flight_batches])
+            engine_core._kvcached_last_fenced_release_marker = marker
+
+        def _patched_step_with_batch_queue(self, *args: Any, **kwargs: Any):
+            manager = _get_vllm_kv_cache_manager(self)
+            if manager is None or not getattr(manager, "defer_physical_release", False):
+                return original_step(self, *args, **kwargs)
+
+            batch_queue = getattr(self, "batch_queue", None)
+            marker_before = manager.capture_physical_release_marker()
+            _fence_new_retirements(
+                self,
+                marker_before,
+                len(batch_queue) if batch_queue is not None else 0,
+            )
+            result = original_step(self, *args, **kwargs)
+
+            completed_batch = (
+                isinstance(result, tuple) and result and result[0] is not None
+            )
+            fences = getattr(self, "_kvcached_release_fences", [])
+            if completed_batch:
+                for fence in fences:
+                    fence[1] -= 1
+
+            marker_after = manager.capture_physical_release_marker()
+            _fence_new_retirements(
+                self,
+                marker_after,
+                len(batch_queue) if batch_queue is not None else 0,
+            )
+
+            if batch_queue is not None and not batch_queue:
+                # No worker batch remains in flight, so pages retired while
+                # processing the final result are safe to release as well.
+                manager.release_retired_pages_through(marker_after)
+                fences.clear()
+            else:
+                release_marker = None
+                while fences and fences[0][1] <= 0:
+                    release_marker = fences.pop(0)[0]
+                if release_marker is not None:
+                    manager.release_retired_pages_through(release_marker)
+
+            return result
+
+        self._mark_as_patched(
+            _patched_step_with_batch_queue, "async_batch_lifetime"
+        )
+        EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
+
+        original_reset = getattr(EngineCore, "reset_prefix_cache", None)
+        if original_reset is not None:
+
+            def _patched_reset_prefix_cache(self, *args: Any, **kwargs: Any):
+                result = original_reset(self, *args, **kwargs)
+                manager = _get_vllm_kv_cache_manager(self)
+                if manager is None or not getattr(manager, "defer_physical_release", False):
+                    return result
+
+                batch_queue = getattr(self, "batch_queue", None)
+                if batch_queue is not None and not batch_queue:
+                    # Idle control operations have no subsequent batch step to
+                    # drain retirements. A nonempty queue must keep its fences.
+                    marker = manager.capture_physical_release_marker()
+                    manager.release_retired_pages_through(marker)
+                    getattr(self, "_kvcached_release_fences", []).clear()
+                return result
+
+            self._mark_as_patched(_patched_reset_prefix_cache, "async_batch_lifetime")
+            EngineCore.reset_prefix_cache = _patched_reset_prefix_cache
         return True
 
 

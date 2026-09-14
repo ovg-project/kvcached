@@ -134,6 +134,13 @@ def make_manager(fail_after: int,
     return manager
 
 
+def enable_operation_counters(manager: KVCacheManager) -> None:
+    manager._operation_lock = threading.RLock()
+    manager._operation_counters = {}
+    manager._last_error_code = None
+    manager._last_error_timestamp_ns = None
+
+
 def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
@@ -161,6 +168,44 @@ def test_page_blocks_rolled_back_and_reusable():
     assert manager.alloc(2) == [2, 3]
 
 
+def test_partial_alloc_rollback_is_not_counted_as_public_free():
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+
+    # Allocates all four blocks from page 0, then fails to obtain page 1.
+    assert manager.alloc(6) is None
+
+    counters = manager._operation_counters
+    assert counters["allocation_requests_total"] == 1
+    assert counters["allocation_failures_total"] == 1
+    assert counters["capacity_exhausted_total"] == 1
+    assert counters.get("allocated_blocks_total", 0) == 0
+    assert counters.get("free_requests_total", 0) == 0
+    assert counters.get("free_successes_total", 0) == 0
+    assert counters.get("freed_blocks_total", 0) == 0
+    assert counters["physical_page_allocations_total"] == 1
+    assert counters["physical_page_allocation_failures_total"] == 1
+    assert counters.get("physical_page_frees_total", 0) == 1
+    assert manager.num_avail_blocks == 0
+    assert manager.avail_pages == {}
+    assert manager.page_allocator.freed_pages == [0]
+
+
+def test_failed_legacy_growth_retires_empty_pages_until_safe_epoch():
+    manager = make_manager(fail_after=1)
+    manager.defer_physical_release = True
+    manager._retired_pages = []
+    manager._physical_release_epoch = 8
+    assert manager.alloc(6) is None
+    assert manager.avail_pages == {}
+    assert manager.page_allocator.freed_pages == []
+    assert manager._retired_pages == [(9, [0])]
+    manager.release_retired_pages_through(8)
+    assert manager.page_allocator.freed_pages == []
+    manager.release_retired_pages_through(9)
+    assert manager.page_allocator.freed_pages == [0]
+
+
 def test_reserved_blocks_restored_on_miss():
     manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
     assert manager.alloc(4) is None
@@ -172,7 +217,8 @@ def test_mixed_reserved_and_page_blocks_restored():
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.
     assert manager.alloc(8) is None
     assert manager.reserved_blocks == [10, 11]
-    # Page 0 went fully free again, so it was returned to the page allocator.
+    # A failed legacy single-page allocation must not pin an idle partial
+    # request while another instance is waiting for the same capacity.
     assert manager.page_allocator.freed_pages == [0]
     assert manager.num_avail_blocks == 0
     assert manager.avail_pages == {}
@@ -189,6 +235,29 @@ def test_alloc_after_rollback_succeeds_when_pool_recovers():
     assert result is not None
     assert result[0] == 10  # reserved block reused first
     assert len(result) == 5
+
+
+def test_growth_backoff_does_not_complete_a_nonexistent_shrink(monkeypatch):
+    manager = make_manager(fail_after=1)
+    manager.defer_physical_release = False
+    assert manager.alloc(2) == [0, 1]
+    monkeypatch.setattr(manager, "_physical_growth_retry_is_blocked", lambda: True)
+    manager.free([0])
+    assert manager.target_num_blocks is None
+    assert not manager.in_shrink
+    assert manager.num_avail_blocks == 3
+
+
+def test_growth_backoff_still_counts_resident_reserve_pages(monkeypatch):
+    manager = make_manager(fail_after=1, reserved_blocks=[90])
+    manager.num_avail_blocks = 2
+    monkeypatch.setattr(manager, "_physical_growth_retry_is_blocked", lambda: True)
+    monkeypatch.setattr(manager.page_allocator, "get_num_reserved_pages", lambda: 3)
+    monkeypatch.setattr(manager.page_allocator, "get_avail_physical_pages",
+                        lambda: pytest.fail("backoff must not probe physical capacity"))
+    assert manager.available_size() == 2 + 1 + 3 * BLOCKS_PER_PAGE
+    manager.in_shrink = True
+    assert manager.available_size() == 3
 
 
 def _explode_alloc(num: int) -> List[int]:
@@ -215,4 +284,47 @@ def test_page_alloc_failure_on_fresh_page_stays_fail_loud(monkeypatch):
     manager = make_manager(fail_after=10)
     monkeypatch.setattr(FakePage, "alloc", lambda self, num: _explode_alloc(num))
     with pytest.raises(RuntimeError, match="Not enough free blocks in page"):
+        manager.alloc(2)
+
+
+def test_unknown_outcome_is_not_an_allocation_miss(monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0)
+
+    def fail():
+        raise MapTransactionOutcomeUnknownError("unconfirmed map")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="unconfirmed map"):
+        manager.alloc(1)
+
+
+@pytest.mark.parametrize("legacy_native_wrapper", [False, True])
+def test_latched_failure_surfaces_before_capacity_or_miss(monkeypatch, legacy_native_wrapper):
+    # Model a background callback failure, and an older extension that wraps
+    # the Python exception in std::runtime_error on the foreground path.
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0, reserved_blocks=[10])
+    failed = not legacy_native_wrapper
+
+    def check():
+        if failed:
+            raise MapTransactionOutcomeUnknownError("restart the engine")
+
+    def fail():
+        nonlocal failed
+        failed = True
+        raise RuntimeError("wrapped callback failure")
+
+    monkeypatch.setitem(
+        KVCacheManager.available_size.__wrapped__.__globals__,
+        "raise_if_physical_growth_unresolved", check,
+    )
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    if not legacy_native_wrapper:
+        with pytest.raises(MapTransactionOutcomeUnknownError):
+            manager.available_size()
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
         manager.alloc(2)

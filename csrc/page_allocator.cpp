@@ -172,6 +172,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   page_id_t page_id = -1;
 
   while (page_id == -1) {
+    check_prealloc_failure();
     // Fast path: allocate from reserved pages
     if (!reserved_page_list_.empty()) {
       page_id = reserved_page_list_.front();
@@ -221,13 +222,14 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   try {
     map_pages({page_id});
-  } catch (const std::exception &e) {
+  } catch (...) {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
     num_free_pages_.fetch_add(1, std::memory_order_relaxed);
     cond_.notify_all();
-    throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
-                             ": " + e.what());
+    // Preserve Python callback exception types across the binding. An
+    // unknown distributed outcome must not become a recoverable miss.
+    throw;
   }
 
   if (enable_page_prealloc_) {
@@ -477,6 +479,7 @@ PageState PageAllocator::get_page_state_unlocked() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
+  check_prealloc_failure();
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
@@ -654,6 +657,11 @@ void PageAllocator::prealloc_worker() {
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
+        if (dynamic_cast<const KVMappingStateError *>(&e) != nullptr) {
+          prealloc_failure_ = e.what();
+          prealloc_failed_.store(true, std::memory_order_release);
+          prealloc_running_ = false;
+        }
         cond_.notify_all();
         LOGGER(ERROR, "Failed to preallocate %ld pages: %s",
                pages_to_reserve.size(), e.what());
@@ -767,6 +775,7 @@ void PageAllocator::trigger_preallocation() {
 }
 
 void PageAllocator::start_prealloc_thread_internal() {
+  check_prealloc_failure();
   std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (!prealloc_thread_) {
     prealloc_running_ = true;
@@ -830,6 +839,12 @@ bool PageAllocator::should_use_worker_ipc() const {
   // this. The decision is fixed once Python calls set_use_worker_ipc() during
   // KVCacheManager init, before the prealloc thread starts.
   return use_worker_ipc_.load(std::memory_order_acquire);
+}
+
+void PageAllocator::check_prealloc_failure() const {
+  if (prealloc_failed_.load(std::memory_order_acquire)) {
+    throw KVMappingStateError(prealloc_failure_);
+  }
 }
 
 void PageAllocator::resize_watcher() {

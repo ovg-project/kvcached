@@ -4,10 +4,15 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ATen/core/Tensor.h>
@@ -19,6 +24,29 @@
 #include "page.hpp"
 
 namespace kvcached {
+
+// Mapping/rollback failures cannot be treated as ordinary capacity rejection.
+class KVMappingStateError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+struct PhysicalGrowthOperationStats {
+  uint64_t ticket_wait_us = 0;
+  uint64_t admission_us = 0;
+  uint64_t reserve_us = 0;
+  uint64_t map_us = 0;
+  uint64_t offsets_count = 0;
+  uint64_t targets_count = 0;
+  uint64_t capacity_checks = 0;
+  uint64_t capacity_rejections = 0;
+  uint64_t required_bytes = 0;
+  uint64_t free_bytes = 0;
+  uint64_t total_bytes = 0;
+  uint64_t headroom_bytes = 0;
+  uint64_t usable_bytes = 0;
+  uint64_t shortfall_bytes = 0;
+};
 
 class FTensorAllocator {
 public:
@@ -33,7 +61,20 @@ public:
                                             bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  std::pair<bool, std::vector<offset_t>>
+  map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
+  std::pair<bool, PhysicalGrowthOperationStats>
+  prepare_map_to_kv_tensors(const std::string &transaction_id,
+                            const std::vector<offset_t> &offsets);
+  std::pair<bool, PhysicalGrowthOperationStats>
+  commit_prepared_map(const std::string &transaction_id);
+  bool abort_prepared_map(const std::string &transaction_id);
+  bool has_prepared_map(const std::string &transaction_id) const;
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                     const std::string &transaction_id);
+  bool commit_unmap_from_kv_tensors(const std::string &transaction_id);
+  bool abort_unmap_from_kv_tensors(const std::string &transaction_id);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -46,6 +87,41 @@ public:
   void destroy();
 
 private:
+  struct ReservedMapping {
+    FTensor *ftensor;
+    offset_t offset;
+    std::unique_ptr<Page> page;
+  };
+
+  struct PreparedMapTransaction {
+    std::vector<offset_t> offsets;
+    std::vector<ReservedMapping> mappings;
+  };
+
+  struct RetainedMapping {
+    FTensor *ftensor;
+    offset_t offset;
+    std::unique_ptr<Page> page;
+  };
+
+  struct PendingUnmapTransaction {
+    std::string id;
+    std::vector<RetainedMapping> retained;
+  };
+
+  enum class UnmapTransactionOutcome { COMMITTED, ABORTED };
+
+  std::vector<std::pair<FTensor *, offset_t>>
+  mapping_targets_(const std::vector<offset_t> &offsets);
+  std::vector<ReservedMapping>
+  reserve_targets_(const std::vector<std::pair<FTensor *, offset_t>> &targets,
+                   const std::vector<offset_t> &offsets,
+                   PhysicalGrowthOperationStats *stats,
+                   bool adopt_existing_mappings = false);
+  bool map_reserved_targets_(std::vector<ReservedMapping> reserved,
+                             PhysicalGrowthOperationStats *stats,
+                             bool rollback_on_failure);
+
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
   std::vector<at::Tensor>
@@ -59,6 +135,15 @@ private:
   at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
                              const std::string &dev_str, std::string name = "");
   void free_ftensor_(at::Tensor &ftensor);
+  std::vector<RetainedMapping>
+  unmap_retain_locked_(const std::vector<offset_t> &offsets);
+  void restore_retained_locked_(std::vector<RetainedMapping> &retained,
+                                const std::string &original_error);
+  void remember_unmap_outcome_locked_(const std::string &transaction_id,
+                                      UnmapTransactionOutcome outcome);
+  void reject_if_unmap_pending_locked_(const char *operation) const;
+  void
+  reject_if_map_overlaps_locked_(const std::vector<offset_t> &offsets) const;
 
   // GPU VMM util functions.
   void init_gpu_();
@@ -77,6 +162,9 @@ private:
   bool contiguous_layout_;
   bool unified_pool_;
   size_t kv_tensor_size_per_layer_;
+  size_t physical_bytes_per_offset_ = 0;
+  std::unordered_map<std::string, PreparedMapTransaction>
+      prepared_map_transactions_;
 
   mutable std::mutex mtx_;
   // For per-layer layout: one tensor per layer
@@ -84,6 +172,10 @@ private:
   // For contiguous layout: single tensor containing all layers
   std::unique_ptr<FTensor> contiguous_kv_tensor_;
   std::shared_ptr<Page> zero_page_;
+  std::optional<PendingUnmapTransaction> pending_unmap_;
+  std::unordered_map<std::string, UnmapTransactionOutcome>
+      finalized_unmap_transactions_;
+  std::deque<std::string> finalized_unmap_order_;
 };
 
 } // namespace kvcached
