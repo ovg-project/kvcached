@@ -12,7 +12,11 @@ from typing import Any, Dict, Optional, Tuple, cast
 
 from kvcached import vmm_ops
 from kvcached.errors import MapQuarantinedError, StateConsistencyError
-from kvcached.utils import get_tp_socket_dir, normalize_gpu_device
+from kvcached.utils import (
+    get_device_module,
+    get_tp_socket_dir,
+    normalize_gpu_device,
+)
 
 kv_tensors_created = vmm_ops.kv_tensors_created
 map_to_kv_tensors = vmm_ops.map_to_kv_tensors
@@ -31,10 +35,9 @@ def _map_to_kv_tensors_with_result(offsets: list[int], group_id: int) -> tuple[b
 
 
 def _sync_before_unmap() -> None:
-    import torch
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_module = get_device_module()
+    if device_module.is_available():
+        device_module.synchronize()
 
 
 # Socket directory for tensor parallel (TP) worker communication:
@@ -112,14 +115,14 @@ def recv_msg(sock: socket.socket) -> Message:
 
 
 def resolve_gpu_device_index(device: Optional[str]) -> int:
-    """Resolve an integration device string to the CUDA runtime device index."""
+    """Resolve an integration device string to the accelerator device index."""
     import torch
 
     if device is not None:
         device_index = torch.device(normalize_gpu_device(device)).index
         if device_index is not None:
             return int(device_index)
-    return int(torch.cuda.current_device())
+    return int(get_device_module(device).current_device())
 
 
 # How long stop() waits for the listener thread to finish in-flight work.
@@ -271,8 +274,8 @@ def start_worker_listener_thread(
 
     ``pp_rank`` selects a PP-stage-specific socket directory so concurrent
     stages do not bind the same path. When ``device_index`` is provided, the
-    listener restores that CUDA device inside the new thread before executing
-    CUDA-backed map or unmap operations because CUDA's current device is
+    listener restores that device inside the new thread before executing any
+    map or unmap operation, because the accelerator's current device is
     thread-local.
 
     The listener is registered so that stop_worker_listener_threads() (called
@@ -316,10 +319,11 @@ def _start_worker_listener_thread(
 
     def listen_loop():
         if device_index is not None:
-            import torch
-
-            # CUDA's current device is thread-local, so restore the worker device.
-            torch.cuda.set_device(device_index)
+            # The current device is thread-local, so restore the worker device.
+            # Routed through get_device_module() because torch.cuda does not
+            # exist on every backend, and a raise here kills this thread
+            # silently: the listener would simply never answer.
+            get_device_module().set_device(device_index)
         print(f"Worker {rank} IPC listener started at {socket_path}")
         while True:
             try:

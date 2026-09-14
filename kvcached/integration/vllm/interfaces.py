@@ -22,7 +22,15 @@ from kvcached.tp_ipc_util import (
     start_worker_listener_thread,
     stop_worker_listener_threads,
 )
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    get_current_device_str,
+    get_device_module,
+    get_device_type,
+    get_kvcached_logger,
+    normalize_gpu_device,
+)
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -97,7 +105,7 @@ def init_kvcached(
         return
 
     if device is None:
-        device = f"cuda:{torch.cuda.current_device()}"
+        device = get_current_device_str()
     device = normalize_gpu_device(device)
 
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
@@ -420,11 +428,14 @@ def alloc_kv_cache(
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
-    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    device_module = get_device_module(device)
+    assert device_module.is_available(), (
+        f"GPU backend is not available via torch.{get_device_type(device)}."
+    )
 
     # --- Compute per-layer memory budget and number of blocks ---
-    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes = device_module.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * PAGE_SIZE for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals

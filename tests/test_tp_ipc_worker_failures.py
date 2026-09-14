@@ -10,6 +10,22 @@ from typing import Any
 import pytest
 
 
+def _stub_torch_without_accelerator(monkeypatch):
+    """Install a torch stub whose accelerator reports itself unavailable.
+
+    Both submodule names are stubbed because kvcached asks for the one its build
+    targets: get_device_module() answers torch.xpu on an XPU build.
+    """
+    unavailable = types.SimpleNamespace(
+        is_available=lambda: False,
+        synchronize=lambda: None,
+    )
+    torch: Any = types.ModuleType("torch")
+    torch.cuda = unavailable
+    torch.xpu = unavailable
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
 class _FakeConnection:
     def close(self):
         pass
@@ -36,12 +52,7 @@ class _FakeServerSocket:
 
 @pytest.mark.parametrize("command", ["map_to_kv_tensors", "unmap_from_kv_tensors"])
 def test_worker_reports_vmm_boolean_failures(monkeypatch, command):
-    torch: Any = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: False,
-        synchronize=lambda: None,
-    )
-    monkeypatch.setitem(sys.modules, "torch", torch)
+    _stub_torch_without_accelerator(monkeypatch)
 
     vmm_ops: Any = types.ModuleType("kvcached.vmm_ops")
     vmm_ops.kv_tensors_created = lambda group_id=0: True
@@ -95,12 +106,7 @@ def test_worker_reports_vmm_boolean_failures(monkeypatch, command):
     ],
 )
 def test_worker_executes_unmap_transaction_phases(monkeypatch, command, expected_status, combined):
-    torch: Any = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: False,
-        synchronize=lambda: None,
-    )
-    monkeypatch.setitem(sys.modules, "torch", torch)
+    _stub_torch_without_accelerator(monkeypatch)
 
     calls: list[tuple[Any, ...]] = []
 

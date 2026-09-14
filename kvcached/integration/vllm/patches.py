@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
-from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
+from kvcached.utils import (
+    KVCachedConfigError,
+    KVCachePoolExhausted,
+    get_device_module,
+    get_device_type,
+    get_kvcached_logger,
+)
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -1413,9 +1419,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 pp_rank = 0
 
             try:
-                device_str = str(getattr(self, "device", "cuda"))
+                device_str = str(getattr(self, "device", get_device_type()))
             except Exception:
-                device_str = "cuda"
+                device_str = get_device_type()
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1642,7 +1648,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             # same pool.
             group_size = _get_group_size(kv_cache_config, runner_only_attn_layers)
             dtype = kv_cache_spec.dtype
-            device_type = getattr(self, "device", torch.device("cuda")).type
+            device_type = getattr(self, "device", torch.device(get_device_type())).type
 
             # vLLM may split a virtual block (spec.block_size tokens) into
             # ``ratio`` kernel-sized blocks; the attention zero kernel indexes
@@ -1959,13 +1965,13 @@ def _get_virtual_kv_capacity_bytes(init_snapshot: Any, cache_config: Any) -> int
 
 def _get_worker_total_memory_bytes(worker: Any) -> int:
     """Read device geometry without using mutable whole-device free memory."""
-    import torch
+    device_module = get_device_module(getattr(worker, "device", None))
 
     try:
-        properties = torch.cuda.get_device_properties(worker.device)
+        properties = device_module.get_device_properties(worker.device)
         return int(properties.total_memory)
     except (AttributeError, RuntimeError, TypeError, ValueError):
-        return int(torch.cuda.mem_get_info()[1])
+        return int(device_module.mem_get_info()[1])
 
 
 def _should_profile_cudagraph_memory(worker: Any) -> bool:
@@ -2011,7 +2017,7 @@ def _get_process_local_torch_peak_bytes(device: Any) -> int:
     memory_stats = getattr(accelerator, "memory_stats", None)
     if callable(memory_stats):
         return int(memory_stats(device).get("allocated_bytes.all.peak", 0))
-    return int(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
+    return int(get_device_module(device).memory_stats()["allocated_bytes.all.peak"])
 
 
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):
@@ -2241,14 +2247,14 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 # vLLM 0.8.x has no MemorySnapshot. Resetting peak stats after
                 # model load makes this peak process-local and includes both
                 # resident model weights and the profiling activation peak.
-                import torch
+                device_module = get_device_module(getattr(self, "device", None))
 
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
+                device_module.empty_cache()
+                device_module.reset_peak_memory_stats()
                 self.model_runner.profile_run()
                 weights_memory = 0
                 torch_peak_increase = int(
-                    torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+                    device_module.memory_stats()["allocated_bytes.all.peak"]
                 )
                 cudagraph_memory_estimate = 0
             else:
