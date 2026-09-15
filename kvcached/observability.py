@@ -177,6 +177,10 @@ def build_kv_cache_pool_snapshot(
 
     The history is shared by all consumers observing the same pool and is
     bounded to the most recent 120 entries.
+
+    History is recorded only when the manager supports weak references.
+    Manager-like adapters that do not support weak references can still be used
+    to build snapshots, but their snapshots are not recorded in history.
     """
 
     allocator = manager.page_allocator
