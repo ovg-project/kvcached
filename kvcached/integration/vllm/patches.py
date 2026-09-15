@@ -321,6 +321,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _get_kv_cache_params(
@@ -994,10 +995,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return []
 
         elastic_block_pool_cls: type = ElasticBlockPool
-        if self.detected_version and VersionRange(">=0.29.0,<0.30.0").contains(self.detected_version):
-            from kvcached.integration.vllm.block_pool_v29 import BlockPoolV29Mixin
+        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+            from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
 
-            elastic_block_pool_cls = type("ElasticBlockPool", (BlockPoolV29Mixin, ElasticBlockPool), {})
+            elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
         setattr(block_pool_mod, "ElasticBlockPool", elastic_block_pool_cls)
         return True
 
@@ -1085,7 +1086,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
         logger = self.logger  # Capture logger in closure
         use_mrv2_geometry = bool(
             self.detected_version
-            and VersionRange(">=0.29.0,<0.30.0").contains(self.detected_version)
+            and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version)
         )
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:

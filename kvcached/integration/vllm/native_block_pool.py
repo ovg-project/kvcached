@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM 0.29 hash metadata on the existing elastic physical block pool."""
+"""Native vLLM hash metadata and block lifetimes for the elastic physical pool."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 
-class BlockPoolV29Mixin:
-    """Prepend to ElasticBlockPool only on the vLLM 0.29 integration route."""
+class NativeBlockPoolMixin:
+    """Combine native hash indexing with elastic ownership and copy lifetimes."""
 
     # Members supplied by the dynamically composed ElasticBlockPool.
     kv_block_pool: list[Any]
