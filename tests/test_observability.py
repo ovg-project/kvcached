@@ -546,6 +546,7 @@ def _load_shim_under_stubs(engine, monkeypatch):
     setattr(manager_module, "KVCacheManager", object)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
 
     vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
