@@ -10,12 +10,17 @@ can consume kvcached status without depending on private patch details.
 
 from __future__ import annotations
 
+import threading
+import time as time_module
+import weakref
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from kvcached.pool_registry import get_registered_kv_cache_pools
 
 SCHEMA_VERSION = "kvcached.observability.v1"
+_HISTORY_MAXLEN = 120
 
 def _call_int(obj: Any, name: str) -> Optional[int]:
     method = getattr(obj, name, None)
@@ -114,6 +119,9 @@ class KVCachePoolSnapshot:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+_pool_snapshot_history: Dict[tuple[int, int], deque[tuple[float, KVCachePoolSnapshot]]] = {}
+_pool_snapshot_history_lock = threading.RLock()
+_pool_snapshot_manager_refs: Dict[int, weakref.ReferenceType[Any]] = {}
 
 def get_capabilities() -> Dict[str, Any]:
     """Return the stable observability surface currently exposed by kvcached."""
@@ -124,6 +132,7 @@ def get_capabilities() -> Dict[str, Any]:
             "runtime_snapshot": True,
             "kv_cache_pool_snapshot": True,
             "registered_kv_cache_pool_snapshots": True,
+            "pool_snapshot_history": True,
             "read_only": True,
             "policy_control": False,
         },
@@ -161,7 +170,18 @@ def build_kv_cache_pool_snapshot(
     *,
     integration: Optional[str] = None,
 ) -> KVCachePoolSnapshot:
-    """Build a read-only snapshot from a ``KVCacheManager``-like object."""
+    """Build a read-only snapshot from a ``KVCacheManager``-like object.
+    Each call also records the snapshot in the bounded in-memory history.
+    History entries represent snapshot/poll calls rather than changes in
+    pool state, so repeated calls with unchanged state are still recorded.
+
+    The history is shared by all consumers observing the same pool and is
+    bounded to the most recent 120 entries.
+
+    History is recorded only when the manager supports weak references.
+    Manager-like adapters that do not support weak references can still be used
+    to build snapshots, but their snapshots are not recorded in history.
+    """
 
     allocator = manager.page_allocator
     page_state_fn = getattr(allocator, "get_page_state", None)
@@ -211,7 +231,7 @@ def build_kv_cache_pool_snapshot(
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
 
-    return KVCachePoolSnapshot(
+    snapshot = KVCachePoolSnapshot(
         schema_version=SCHEMA_VERSION,
         pool_type="kv_cache",
         integration=integration,
@@ -242,6 +262,86 @@ def build_kv_cache_pool_snapshot(
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
     )
+
+    manager_id = id(manager)
+
+    with _pool_snapshot_history_lock:
+        if manager_id not in _pool_snapshot_manager_refs:
+            try:
+                reference = weakref.ref(
+                    manager,
+                    lambda reference: _remove_pool_snapshot_history(
+                        reference, manager_id
+                    ),
+                )
+            except TypeError:
+                return snapshot
+            else:
+                _pool_snapshot_manager_refs[manager_id] = reference
+
+        history = _pool_snapshot_history.setdefault(
+                (manager_id, snapshot.group_id),
+                deque(maxlen=_HISTORY_MAXLEN),
+            )
+        history.append((time_module.time(), snapshot))
+    return snapshot
+
+
+def get_kv_cache_pool_snapshot_history(
+        manager,
+        group_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Return the recorded snapshot history for a pool group.
+
+    History entries contain the timestamp at which the snapshot was recorded
+    and the corresponding pool snapshot. History records snapshot/poll calls,
+    not only changes in pool state, and is shared by consumers observing the
+    same pool.
+
+    Only the most recent 120 entries are retained.
+    """
+
+    with _pool_snapshot_history_lock:
+        history = list(
+        _pool_snapshot_history.get((id(manager), group_id), [])
+    )
+
+    return [
+        {
+            "timestamp": timestamp,
+            "snapshot": snapshot.to_dict(),
+        }
+        for timestamp, snapshot in history
+    ]
+
+
+def clear_kv_cache_pool_history() -> None:
+    """
+    Clear all in-memory KV cache pool snapshot history.
+
+    This clears history for all pools and groups, so the history is no longer
+    available to any consumers observing those pools.
+    """
+    with _pool_snapshot_history_lock:
+        _pool_snapshot_history.clear()
+
+def _remove_pool_snapshot_history(reference: Any, manager_id: int) -> None:
+    with _pool_snapshot_history_lock:
+        current = _pool_snapshot_manager_refs.get(manager_id)
+        if current is not reference:
+            return
+
+        _pool_snapshot_manager_refs.pop(manager_id, None)
+
+        keys_to_remove = [
+            key
+            for key in _pool_snapshot_history
+            if key[0] == manager_id
+        ]
+
+        for key in keys_to_remove:
+            _pool_snapshot_history.pop(key, None)
 
 
 def _snapshot_one_pool(
