@@ -15,7 +15,12 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
+from kvcached.integration.version_utils import (
+    VersionAwarePatch,
+    VersionManager,
+    VersionRange,
+    version_range,
+)
 from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
 
 if TYPE_CHECKING:
@@ -266,6 +271,21 @@ VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
 
 
+def _uses_packed_attention_kv() -> bool:
+    """Use the same physical block geometry in the engine and GPU workers."""
+    version = VersionManager.get_instance().detect_version("vllm")
+    return version is not None and VersionRange(">=0.28.0").contains(version)
+
+
+def _get_packed_kv_layout(attn_backend: Any) -> str:
+    order = tuple(attn_backend.get_kv_cache_stride_order())
+    if order == (0, 2, 1, 3):
+        return "NHD"
+    if order == (0, 1, 2, 3):
+        return "HND"
+    raise NotImplementedError(f"Unsupported packed KV stride order: {order}")
+
+
 def _get_kv_cache_params(
     kv_cache_spec: Any,
     block_size: int,
@@ -276,11 +296,13 @@ def _get_kv_cache_params(
     Returns:
         (cell_size, num_kv_buffers)
     """
-    if attention_type in ("MLA", "HYBRID_LINEAR") or _is_mla_kv_cache_spec(kv_cache_spec):
+    if (attention_type in ("MLA", "HYBRID_LINEAR")
+            or _is_mla_kv_cache_spec(kv_cache_spec) or _uses_packed_attention_kv()):
         # MLA: single combined KV buffer per layer
         # HYBRID_LINEAR (full attention + linear attention): K and V are
         # interleaved into one buffer per layer, so it shares MLA's
-        # single-buffer math.
+        # single-buffer math. vLLM 0.28 also packs ordinary attention's K/V
+        # into a single block; the worker checks its backend shape and strides.
         # page_size_bytes = block_size * num_kv_heads * head_size * dtype_size
         cell_size = kv_cache_spec.page_size_bytes // block_size
         num_kv_buffers = 1
@@ -1497,7 +1519,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     required_layout = attn_backend_cls.get_required_kv_cache_layout()
 
                 selected_layout = required_layout or "NHD"
-                if selected_layout != "NHD":
+                if selected_layout != "NHD" and not (
+                    _uses_packed_attention_kv() and selected_layout == "HND"
+                ):
                     raise RuntimeError(
                         "kvcached currently supports NHD KV layout only, but "
                         f"{backend_name} requires {selected_layout}."
@@ -1517,7 +1541,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 cache_dtype,
             )
 
-            if attention_type == "HYBRID_LINEAR":
+            packed_kv = attention_type != "MLA" and len(kv_cache_shape) == 4
+            if attention_type != "MLA" and packed_kv != _uses_packed_attention_kv():
+                raise NotImplementedError(
+                    "The attention backend KV layout does not match the "
+                    "engine's physical block geometry for this vLLM version: "
+                    f"{kv_cache_shape}"
+                )
+            kv_layout = _get_packed_kv_layout(attn_backend_cls) if packed_kv else "NHD"
+
+            if attention_type == "HYBRID_LINEAR" or packed_kv:
                 # The unified-pool layout math (both layouts; load-bearing for
                 # contiguous ratio>1 linearity) assumes the spec's page is
                 # EXACTLY the geometric K+V bytes of one block:
@@ -1530,7 +1563,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                               kv_cache_spec.dtype.itemsize)
                 if kv_cache_spec.page_size_bytes != _geom_page:
                     raise NotImplementedError(
-                        "kvcached hybrid-linear requires the attention page "
+                        "kvcached unified KV storage requires the attention page "
                         "size to equal the geometric K+V block bytes, but "
                         f"page_size_bytes={kv_cache_spec.page_size_bytes} != "
                         f"{_geom_page}. This typically means a quantized KV "
@@ -1630,7 +1663,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 device_type,
                 group_size,
                 attention_type=attention_type,
-                kv_layout="NHD",
+                kv_layout=kv_layout,
                 kernel_block_size=kernel_block_size,
                 return_meta=is_hetero,
             )
@@ -1667,6 +1700,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         attention_type, meta["num_blocks_per_layer"],
                         meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
                         kernel_block_size=gkbs,
+                        kv_layout=_get_packed_kv_layout(gbackend) if packed_kv else "NHD",
                     )
                     for pool_idx, layer_name in enumerate(grp.layer_names):
                         layer_views[layer_name] = gviews[pool_idx]
@@ -2263,6 +2297,10 @@ class TritonAttentionPatch(VersionAwarePatch, BasePatch):
     @version_range(VLLM_V9_PLUS_RANGE)
     def patch_ensure_scale_caches(self,
                                   triton_attn_mod: types.ModuleType) -> bool:
+        if _uses_packed_attention_kv():
+            # vLLM 0.28's packed implementation already uses the tensor's
+            # actual strides and storage offset. The old 5D patch is invalid.
+            return True
         impl_cls = self._get_target_class(triton_attn_mod)
         if impl_cls is None:
             return False
