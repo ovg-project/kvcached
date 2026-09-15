@@ -73,21 +73,33 @@ def _patch_worker(patches, monkeypatch, worker_cls, *, enabled=True) -> Any:
 
 
 def _install_memory_profiling(
-    monkeypatch, *, torch_peak_increase, before_torch_peak=0
+    monkeypatch, *, torch_peak_increase, before_torch_peak=0,
+    before_allocated=None, after_allocated=None, events=None,
+    modern_accounting=False,
 ):
     calls = []
 
     @contextlib.contextmanager
     def memory_profiling(init_snapshot, *, weights_memory):
         calls.append((init_snapshot, weights_memory))
-        yield types.SimpleNamespace(
+        if events is not None:
+            events.append("profile_enter")
+        result = types.SimpleNamespace(
             weights_memory=weights_memory,
             torch_peak_increase=torch_peak_increase,
             non_torch_increase=10_000,
+            total_consumed=20_000,
             before_profile=types.SimpleNamespace(
-                torch_peak=before_torch_peak
+                torch_peak=before_torch_peak,
+                torch_allocated=before_allocated,
             ),
+            after_profile=types.SimpleNamespace(torch_allocated=after_allocated),
         )
+        if modern_accounting:
+            result.transient_peak_headroom = 9999
+        yield result
+        if events is not None:
+            events.append("profile_exit")
 
     module = types.ModuleType("vllm.utils.mem_utils")
     setattr(module, "memory_profiling", memory_profiling)
@@ -302,6 +314,8 @@ def test_determine_available_memory_injects_automatic_virtual_budget(
     assert worker.cache_config.kv_cache_memory_bytes is None
     assert getattr(worker, "available_kv_cache_memory_bytes") == 550
     assert worker.non_torch_memory == 0
+    assert worker.total_consumed == 200
+    assert worker.peak_activation_memory == 50
     assert profile_modes == [(False, True)]
     capacity.assert_not_called()
 
@@ -311,8 +325,10 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
 ):
     torch = sys.modules["torch"]
     profile_modes = []
+    events = []
 
     def record_profile_mode(result=None):
+        events.append("graph" if result is not None else "forward")
         profile_modes.append(
             (
                 torch.is_grad_enabled(),
@@ -325,8 +341,9 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     profile_cudagraph = mock.Mock(side_effect=lambda: record_profile_mode(30))
     _install_memory_profiling(
         monkeypatch,
-        torch_peak_increase=999,
+        torch_peak_increase=70,
         before_torch_peak=10,
+        events=events,
     )
     torch = sys.modules["torch"]
     torch.accelerator.memory_stats.return_value = {
@@ -383,9 +400,50 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     # The 0.29 warmup consumer reconstructs non-KV usage from these fields.
     assert worker.total_consumed + worker.peak_activation_memory == 270
     assert worker.cudagraph_memory_estimate == 30
+    assert worker.total_consumed == 200
     profile_run.assert_called_once_with()
     profile_cudagraph.assert_called_once_with()
     assert profile_modes == [(False, True), (False, True)]
+    assert events == ["profile_enter", "forward", "profile_exit", "graph"]
+
+
+@pytest.mark.parametrize(
+    "before,after,modern,persistent,transient",
+    [(200, 220, True, 20, 50), (200, 200, True, 0, 70),
+     (200, 180, True, 0, 70), (200, 300, True, 70, 0),
+     (None, None, True, 0, 70), (200, 220, False, 0, 70)],
+)
+def test_warmup_accounting_preserves_process_local_capacity(
+    monkeypatch, patches, before, after, modern, persistent, transient
+):
+    _install_memory_profiling(
+        monkeypatch, torch_peak_increase=70,
+        before_allocated=before, after_allocated=after,
+        modern_accounting=modern,
+    )
+
+    class Worker:
+        def __init__(self):
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.cache_config = _worker_config()
+            self.requested_memory = 800
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    worker = _patch_worker(patches, monkeypatch, Worker)()
+    assert worker.determine_available_memory() == 530
+    assert worker.total_consumed == 200 + persistent
+    assert worker.peak_activation_memory == transient
+    assert (worker.requested_memory - worker.total_consumed
+            - worker.peak_activation_memory) == 530
+    assert worker.non_torch_memory == 0
 
 
 def test_cudagraph_profile_respects_none_mode(patches):
@@ -400,6 +458,33 @@ def test_cudagraph_profile_respects_none_mode(patches):
     )
 
     assert patches._should_profile_cudagraph_memory(worker) is False
+
+
+def test_cudagraph_failure_is_not_hidden(monkeypatch, patches):
+    _install_memory_profiling(monkeypatch, torch_peak_increase=70)
+    monkeypatch.setattr(patches, "_should_profile_cudagraph_memory", lambda _: True)
+
+    class Worker:
+        def __init__(self):
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.cache_config = _worker_config()
+            self.requested_memory = 800
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+                profile_cudagraph_memory=mock.Mock(
+                    side_effect=RuntimeError("graph capture failed")),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    worker = _patch_worker(patches, monkeypatch, Worker)()
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        worker.determine_available_memory()
+    assert not hasattr(worker, "available_kv_cache_memory_bytes")
 
 
 def test_determine_available_memory_preserves_explicit_user_budget(
