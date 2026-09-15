@@ -67,7 +67,7 @@ is_sleeping = sleep_manager.is_model_sleeping("meta-llama/Llama-3.2-1B-Instruct"
 
 ```bash
 cd /kvcached/tests
-python test_traffic_monitor.py
+python helpers/traffic_monitor.py
 # Testing traffic monitoring...
 # ✓ Test idle detection passed
 # ✓ Test traffic stats passed

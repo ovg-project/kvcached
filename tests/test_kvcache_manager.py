@@ -114,12 +114,6 @@ def test_over_allocation_fails(setup_kvcache):
     assert handle is None
 
 
-@pytest.mark.skip(
-    reason="kvctl-driven resize flow is broken in this PR: "
-    "(a) check_and_get_resize_target is not bound on C++ PageAllocator, "
-    "(b) C++ MemInfoTracker uses a different shm name than Python's "
-    "DEFAULT_IPC_NAME, so update_kv_cache_limit writes to a segment the "
-    "engine never reads. Re-enable once those are restored.")
 def test_resize_smaller_and_larger(setup_kvcache):
     # instantiate a kv cache manager with known size
     # Terminology:

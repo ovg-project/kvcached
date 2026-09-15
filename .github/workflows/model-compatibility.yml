@@ -1,0 +1,98 @@
+name: Model Compatibility Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: Engine cells to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - vllm
+          - sglang
+      model:
+        description: Model architecture to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - qwen3
+          - gpt-oss
+          - qwen3.5
+          - gemma-4-e2b
+          - gemma-4-12b
+      model_override:
+        description: Optional smaller model ID from the selected family
+        required: false
+        type: string
+      layout:
+        description: KV layout cells to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - contiguous
+          - non-contiguous
+      devices:
+        description: One physical GPU index or UUID
+        required: false
+        type: string
+      fail_on_non_pass:
+        description: Fail the workflow when any selected cell does not pass
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: ${{ inputs.engine }} / ${{ inputs.model }} / ${{ inputs.layout }}
+    runs-on: [self-hosted, linux, x64, gpu, kvcached]
+    timeout-minutes: 720
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run model compatibility matrix
+        env:
+          PYTHON: ${{ vars.KVCACHED_GPU_PYTHON || 'python' }}
+          VLLM_PYTHON: >-
+            ${{ vars.KVCACHED_VLLM_PYTHON || vars.KVCACHED_GPU_PYTHON || 'python' }}
+          SGLANG_PYTHON: >-
+            ${{ vars.KVCACHED_SGLANG_PYTHON || vars.KVCACHED_GPU_PYTHON || 'python' }}
+          GPU_CI_PROFILE: compat
+          GPU_CI_SKIP_CORE: 1
+          GPU_CI_REPEAT: 1
+          GPU_CI_REQUIRE_IDLE: ${{ vars.KVCACHED_GPU_REQUIRE_IDLE || 1 }}
+          GPU_CI_ARTIFACT_DIR: >-
+            gpu-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}
+          KVCACHED_GPU_VISIBLE_DEVICES: >-
+            ${{ inputs.devices || vars.KVCACHED_GPU_VISIBLE_DEVICES }}
+          MODEL_COMPAT_ENGINE: ${{ inputs.engine }}
+          MODEL_COMPAT_MODEL: ${{ inputs.model }}
+          MODEL_COMPAT_MODEL_OVERRIDE: ${{ inputs.model_override }}
+          MODEL_COMPAT_LAYOUT: ${{ inputs.layout }}
+          MODEL_COMPAT_FAIL_ON_NON_PASS: ${{ inputs.fail_on_non_pass && '1' || '0' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: bash tools/run_gpu_ci.sh
+
+      - name: Upload compatibility results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gpu-ci-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
