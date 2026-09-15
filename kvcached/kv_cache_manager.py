@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
+import weakref
 from typing import Any, Dict, List, Optional
 
 from kvcached.lifecycle import LifecyclePhase, LifecycleState
@@ -162,8 +163,9 @@ class KVCacheManager:
                     broadcast_unmap_from_kv_tensors,
                 )
 
-                # The unmap wrapper captures the lifecycle holder, not self,
-                # so the C++ PageAllocator never keeps this manager alive.
+                # The native callback must not own the lifecycle holder:
+                # a recorded error's traceback can lead back to this manager,
+                # forming a cycle hidden from Python's garbage collector.
                 # Both wrappers re-raise unchanged, so alloc_page() and the
                 # prealloc thread see exactly the error they saw before. Only
                 # unmap failures change lifecycle state in phase 1:
@@ -192,7 +194,7 @@ class KVCacheManager:
                 #   reaches the broadcast, so ranks may still hold mappings
                 #   the ledger dropped. That is an unknown cross-rank outcome
                 #   and degrades the pool per the #375 rule.
-                lifecycle = self._lifecycle
+                lifecycle_ref = weakref.ref(self._lifecycle)
 
                 # Wrap Python functions to match C++ callback signature
                 def map_callback(
@@ -214,7 +216,9 @@ class KVCacheManager:
                     try:
                         broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
                     except Exception as exc:
-                        lifecycle.record_broadcast_failure("unmap", exc)
+                        lifecycle = lifecycle_ref()
+                        if lifecycle is not None:
+                            lifecycle.record_broadcast_failure("unmap", exc)
                         raise
 
                 # Set the callbacks in the PageAllocator

@@ -20,6 +20,7 @@ run the real ``__init__``.
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import os
 import shutil
@@ -27,8 +28,10 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import types
+import weakref
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import pytest
@@ -429,6 +432,65 @@ def test_unmap_broadcast_failure_degrades(monkeypatch):
     assert manager.lifecycle_phase is LifecyclePhase.DEGRADED
     assert manager.lifecycle_error is excinfo.value
     manager.wait_ready()  # still serving
+
+
+def _wait_collected(ref):
+    # The post-init thread may still be returning after it opened the gate.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        gc.collect()
+        if ref() is None:
+            return
+        time.sleep(0.01)
+    assert ref() is None
+
+
+def test_retained_unmap_callback_does_not_own_failed_manager(monkeypatch):
+    def invoke(manager):
+        # Keep the manager in a frame reached by the saved error traceback.
+        manager.page_allocator.unmap_callback(2, [0])
+
+    def make_failed_manager():
+        manager = _make_manager(
+            monkeypatch, broadcast_unmap=_raise_broadcast("unmap lifetime fault"))
+        manager.wait_ready(timeout=5)
+        try:
+            invoke(manager)
+        except RuntimeError:
+            pass
+        assert manager.lifecycle_phase is LifecyclePhase.DEGRADED
+        error = manager.lifecycle_error
+        assert error is not None and error.__traceback__ is not None
+        return (weakref.ref(manager), weakref.ref(manager._lifecycle),
+                manager.page_allocator)
+
+    manager_ref, lifecycle_ref, allocator = make_failed_manager()
+    # An external callback owner models the strong reference hidden in the
+    # native allocator. It must not root the lifecycle/error/manager cycle.
+    _wait_collected(manager_ref)
+    assert lifecycle_ref() is None
+    assert allocator.unmap_callback is not None
+
+
+def test_unmap_callback_still_propagates_after_lifecycle_is_gone(monkeypatch):
+    calls = []
+
+    def broadcast(*args):
+        calls.append(args)
+        if len(calls) > 1:
+            raise RuntimeError("unmap after lifecycle collection")
+
+    manager = _make_manager(monkeypatch, broadcast_unmap=broadcast)
+    manager.wait_ready(timeout=5)
+    callback = manager.page_allocator.unmap_callback
+    manager_ref = weakref.ref(manager)
+    del manager
+    _wait_collected(manager_ref)
+
+    callback(2, [0])
+    with pytest.raises(RuntimeError, match="unmap after lifecycle collection"):
+        callback(2, [0])
+    assert calls == [(2, [0], 0, 0), (2, [0], 0, 0)]
 
 
 def test_ipc_timeout_degrades_unmap_but_not_map(monkeypatch):
