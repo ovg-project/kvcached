@@ -8,6 +8,10 @@ from wrapt.importer import when_imported
 
 from kvcached.integration.patch_base import PatchManager, log_patch_results
 from kvcached.integration.vllm.model_runner_v2 import KVLayoutV2Patch, ModelRunnerV2Patch
+from kvcached.integration.vllm.model_runner_v2_028 import (
+    VLLM_028_MRV2_RANGE,
+    GPUModelRunnerV2Patch,
+)
 from kvcached.integration.vllm.nixl_compat import NixlConnectorPatch
 from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
@@ -52,6 +56,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             # CoreEngineProcManager lives in vllm.v1.engine.utils from 0.10
             (CoreEngineProcManagerPatch(), ">=0.10.0"),
             (GPUModelRunnerPatch(), ">=0.8.4,<0.29.0"),
+            (GPUModelRunnerV2Patch(), VLLM_028_MRV2_RANGE),
             (ModelRunnerV2Patch(), VLLM_MRV2_RANGE),
             (KVLayoutV2Patch(), VLLM_MRV2_RANGE),
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
