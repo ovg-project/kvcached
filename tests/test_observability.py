@@ -515,3 +515,27 @@ def test_pool_snapshot_history_cleanup_on_manager_gc():
         key[0] != manager_id
         for key in _pool_snapshot_history
     )
+
+def test_pool_snapshot_history_supports_non_weakrefable_adapter():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+    adapter = types.SimpleNamespace(
+        **{
+            key: getattr(manager, key)
+            for key in dir(manager)
+            if not key.startswith("__")
+        }
+    )
+
+    snapshot = build_kv_cache_pool_snapshot(adapter)
+
+    assert snapshot is not None
+
+    history = get_kv_cache_pool_snapshot_history(
+        adapter,
+        adapter.group_id,
+    )
+
+    assert len(history) == 1
+    assert history[0]["snapshot"]["group_id"] == adapter.group_id

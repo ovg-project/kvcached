@@ -263,13 +263,17 @@ def build_kv_cache_pool_snapshot(
 
     with _pool_snapshot_history_lock:
         if manager_id not in _pool_snapshot_manager_refs:
-            reference = weakref.ref(
-                manager,
-                lambda reference: _remove_pool_snapshot_history(
-                    reference, manager_id
-                ),
-            )
-            _pool_snapshot_manager_refs[manager_id] = reference
+            try:
+                reference = weakref.ref(
+                    manager,
+                    lambda reference: _remove_pool_snapshot_history(
+                        reference, manager_id
+                    ),
+                )
+            except TypeError:
+                pass
+            else:
+                _pool_snapshot_manager_refs[manager_id] = reference
 
         history = _pool_snapshot_history.setdefault(
                 (id(manager), snapshot.group_id),
@@ -293,12 +297,12 @@ def get_kv_cache_pool_snapshot_history(
 
     Only the most recent 120 entries are retained.
     """
-    
+
     with _pool_snapshot_history_lock:
         history = list(
         _pool_snapshot_history.get((id(manager), group_id), [])
     )
-        
+
     return [
         {
             "timestamp": timestamp,
@@ -315,7 +319,8 @@ def clear_kv_cache_pool_history() -> None:
     This clears history for all pools and groups, so the history is no longer
     available to any consumers observing those pools.
     """
-    _pool_snapshot_history.clear()
+    with _pool_snapshot_history_lock:
+        _pool_snapshot_history.clear()
 
 def _remove_pool_snapshot_history(reference: Any, manager_id: int) -> None:
     with _pool_snapshot_history_lock:
