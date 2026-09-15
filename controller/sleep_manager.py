@@ -17,7 +17,11 @@ logger = get_kvcached_logger()
 
 @dataclass
 class SleepConfig:
-    """Configuration for sleep mode management"""
+    """Configuration for sleep mode management.
+
+    `keep` is excluded because resuming unfinished requests across
+    sleep/wake has not been validated through this controller.
+    """
     idle_threshold_seconds: int = 300  # 5 minutes
     check_interval_seconds: int = 60  # Check every minute
     auto_sleep_enabled: bool = False  # Whether to automatically put models to sleep
