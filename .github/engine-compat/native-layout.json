@@ -1,0 +1,8 @@
+{
+  "task": "Adapt the native MRV2 storage/view contract. Reuse native shape, stride and owner/borrower binding; do not replace it with V1 reshape logic or count cross-layer borrowers as additional physical pools. Keep unsupported configurations explicit. Passing this profile does not qualify a Gemma or hybrid model.",
+  "allow": ["kvcached/integration/vllm/model_runner_v2.py", "tests/test_vllm_model_runner_v2.py"],
+  "cpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "gpu_tests": ["tests/test_vllm_model_runner_v2.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.29"]
+}
