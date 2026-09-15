@@ -1,0 +1,261 @@
+name: vLLM release compatibility
+
+on:
+  schedule:
+    - cron: '19 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable upstream release to replay (empty selects the oldest unseen release)
+        type: string
+      retry:
+        description: Explicitly retry this recorded release, with a new bounded attempt budget
+        type: boolean
+        default: false
+
+# Cross-repository releases do not trigger this repository's `release` event.
+# Poll all unseen releases; no upstream webhook or token is required.
+concurrency:
+  group: vllm-release-compat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    if: vars.VLLM_RELEASE_COMPAT_ENABLED == 'true' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      status: ${{ steps.plan.outputs.status }}
+      tag: ${{ steps.plan.outputs.tag }}
+      engine_sha: ${{ steps.plan.outputs.engine_sha }}
+      base_repository: ${{ steps.baseline.outputs.base_repository }}
+      base_branch: ${{ steps.baseline.outputs.base_branch }}
+      base_sha: ${{ steps.baseline.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pin the PR target default branch
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_REPO: ${{ vars.VLLM_COMPAT_PR_REPOSITORY || github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import quote
+
+          def api(endpoint):
+              return json.loads(subprocess.check_output(
+                  ["gh", "api", "--hostname", "github.com", endpoint], text=True
+              ))
+
+          repository = os.environ["PR_REPO"]
+          pattern = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+"
+          if not re.fullmatch(pattern, repository) or repository.split("/")[1] in {".", ".."}:
+              raise SystemExit("Invalid PR target repository")
+          metadata = api(f"repos/{repository}")
+          repository = metadata["full_name"]
+          branch = metadata["default_branch"]
+          if (
+              not isinstance(repository, str)
+              or repository.casefold() != os.environ["PR_REPO"].casefold()
+              or not isinstance(branch, str)
+              or not branch
+              or any(ord(char) < 33 or ord(char) == 127 for char in branch)
+          ):
+              raise SystemExit("Invalid PR target default branch")
+          ref = api(f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}")
+          commit = ref.get("object", {})
+          sha = commit.get("sha")
+          if (
+              ref.get("ref") != f"refs/heads/{branch}"
+              or commit.get("type") != "commit"
+              or not isinstance(sha, str)
+              or not re.fullmatch(r"[0-9a-f]{40}", sha)
+          ):
+              raise SystemExit("Invalid PR target branch commit")
+          baseline = dict(base_repository=repository, base_branch=branch, base_sha=sha)
+          Path("baseline.json").write_text(json.dumps(baseline) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              for key, value in baseline.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+      - name: Discover and claim one stable release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER: ${{ vars.VLLM_RELEASE_TRACKER_ISSUE }}
+          FIRST_VERSION: ${{ vars.VLLM_COMPAT_FIRST_VERSION || '0.28.0' }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RETRY: ${{ inputs.retry }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          if [[ "$RETRY" == true ]]; then args+=(--retry); fi
+          python tools/engine_release_discovery.py discover --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --first-version "$FIRST_VERSION" \
+            --output plan.json "${args[@]}"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("plan.json")
+          plan = json.loads(path.read_text(encoding="utf-8"))
+          plan.update(json.loads(Path("baseline.json").read_text(encoding="utf-8")))
+          path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
+          PY
+          python tools/engine_release_discovery.py claim --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --plan plan.json --run-url "$RUN_URL"
+          python -c 'import json,os; p=json.load(open("plan.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.writelines(f"{k}={p[k]}\n" for k in ("status","tag","engine_sha") if p.get(k) is not None)'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-plan
+          path: plan.json
+
+  first:
+    needs: discover
+    if: needs.discover.outputs.status == 'running' && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-attempt.yml
+    with:
+      tag: ${{ needs.discover.outputs.tag }}
+      engine_sha: ${{ needs.discover.outputs.engine_sha }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+      attempt: first
+    secrets:
+      CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
+
+  second:
+    needs: [discover, first]
+    if: needs.first.outputs.status == 'failed' && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-attempt.yml
+    with:
+      tag: ${{ needs.discover.outputs.tag }}
+      engine_sha: ${{ needs.discover.outputs.engine_sha }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+      attempt: second
+      prior: ${{ needs.first.outputs.artifact }}
+    secrets:
+      CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
+
+  select:
+    needs: [discover, first, second]
+    if: always() && needs.discover.outputs.status == 'running' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.select.outputs.artifact }}
+    steps:
+      - id: select
+        env:
+          FIRST_STATUS: ${{ needs.first.outputs.status }}
+          SECOND_STATUS: ${{ needs.second.outputs.status }}
+        run: |
+          if [[ "$FIRST_STATUS" == passed ]]; then
+            echo 'artifact=gpu-first' >> "$GITHUB_OUTPUT"
+          elif [[ "$SECOND_STATUS" == passed ]]; then
+            echo 'artifact=gpu-second' >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    needs: [discover, select]
+    if: always() && needs.select.outputs.artifact != '' && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-ci.yml
+    with:
+      artifact: ${{ needs.select.outputs.artifact }}
+      tag: ${{ needs.discover.outputs.tag }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+
+  publish:
+    needs: [discover, select, verify]
+    if: always() && needs.verify.result == 'success' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ needs.discover.outputs.base_repository }}
+          ref: ${{ needs.discover.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.select.outputs.artifact }}
+          path: handoff
+      - name: Publish the independently verified commit
+        env:
+          GH_TOKEN: ${{ secrets.ENGINE_COMPAT_PUBLISH_TOKEN }}
+          PUBLISH_REPO: ${{ vars.VLLM_COMPAT_PUBLISH_REPOSITORY || github.repository }}
+          PR_REPO: ${{ needs.discover.outputs.base_repository }}
+          BASE_BRANCH: ${{ needs.discover.outputs.base_branch }}
+          BASE_SHA: ${{ needs.discover.outputs.base_sha }}
+          RELEASE_TAG: ${{ needs.discover.outputs.tag }}
+          ENGINE_SHA: ${{ needs.discover.outputs.engine_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh auth setup-git
+          python controller/tools/engine_compat_stage.py publish \
+            --source candidate --prior handoff --output publication \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --publish-repository "$PUBLISH_REPO" --pr-repository "$PR_REPO" \
+            --base-branch "$BASE_BRANCH" --run-url "$RUN_URL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publication
+          path: publication/
+
+  finish:
+    needs: [discover, first, second, verify, publish]
+    if: always() && needs.discover.outputs.status == 'running' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: handoff
+      - name: Record terminal disposition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER: ${{ vars.VLLM_RELEASE_TRACKER_ISSUE }}
+          PUBLISHED: ${{ needs.publish.result }}
+          LAST_GPU_STATUS: ${{ needs.second.outputs.status || needs.first.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          status=blocked
+          if [[ "$LAST_GPU_STATUS" == failed ]]; then status=failed; fi
+          if [[ "$PUBLISHED" == success ]]; then status=passed; fi
+          python tools/engine_release_discovery.py finish --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --plan handoff/plan.json --status "$status" \
+            --run-url "$RUN_URL"
+          printf 'Compatibility result: **%s**\n' "$status" >> "$GITHUB_STEP_SUMMARY"
+          test "$status" = passed

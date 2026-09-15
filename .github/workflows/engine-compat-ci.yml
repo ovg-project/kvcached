@@ -1,0 +1,90 @@
+name: Independent candidate CI
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        type: string
+        required: true
+      tag:
+        type: string
+        required: true
+      base_repository:
+        type: string
+        required: true
+      base_branch:
+        type: string
+        required: true
+      base_sha:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ inputs.base_repository }}
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: handoff
+      - name: Reconstruct the GPU-tested candidate
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python controller/tools/engine_compat_artifact.py materialize \
+            --source candidate --base "$BASE_SHA" --tag "$RELEASE_TAG" \
+            --allow-list controller/.github/engine-compat/vllm-allow.json \
+            --artifact handoff/candidate.json
+      - name: Install the same dependencies as CPU CI
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'pytest>=8,<9' packaging pre-commit
+          python -m pip install -r candidate/requirements.txt pyyaml numpy aiohttp
+      - name: Full CPU suite and MyPy
+        working-directory: candidate
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          python tools/check_test_classification.py
+          bash tools/run_cpu_tests.sh
+          pre-commit run --all-files --hook-stage manual "mypy-$PYTHON_VERSION"
+      - name: Full formatting and C++ suite
+        if: matrix.python == '3.11'
+        working-directory: candidate
+        run: |
+          bash tests/cpp/run_tests.sh
+          pre-commit run --all-files
+      - name: Reject checks that changed the candidate
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python controller/tools/engine_compat_artifact.py verify \
+            --source candidate --base "$BASE_SHA" --tag "$RELEASE_TAG" \
+            --allow-list controller/.github/engine-compat/vllm-allow.json \
+            --artifact handoff/candidate.json
