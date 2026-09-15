@@ -11,6 +11,7 @@ from kvcached.integration.vllm.model_runner_v2 import KVLayoutV2Patch, ModelRunn
 from kvcached.integration.vllm.nixl_compat import NixlConnectorPatch
 from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
+    VLLM_MRV2_RANGE,
     VLLM_V8_RANGE,
     VLLM_V9_PLUS_RANGE,
     ElasticBlockPoolPatch,
@@ -46,8 +47,8 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
             (EngineCorePatch(), VLLM_ALL_RANGE),
             (GPUModelRunnerPatch(), ">=0.8.4,<0.29.0"),
-            (ModelRunnerV2Patch(), ">=0.29.0,<0.30.0"),
-            (KVLayoutV2Patch(), ">=0.29.0,<0.30.0"),
+            (ModelRunnerV2Patch(), VLLM_MRV2_RANGE),
+            (KVLayoutV2Patch(), VLLM_MRV2_RANGE),
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
