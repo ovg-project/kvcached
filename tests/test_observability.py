@@ -528,14 +528,18 @@ def test_pool_snapshot_history_supports_non_weakrefable_adapter():
         }
     )
 
+    manager_id = id(adapter)
+    group_id = adapter.group_id
+
     snapshot = build_kv_cache_pool_snapshot(adapter)
 
     assert snapshot is not None
+    assert (manager_id, group_id) not in _pool_snapshot_history
 
-    history = get_kv_cache_pool_snapshot_history(
-        adapter,
-        adapter.group_id,
+    del adapter
+    gc.collect()
+
+    assert all(
+        key[0] != manager_id
+        for key in _pool_snapshot_history
     )
-
-    assert len(history) == 1
-    assert history[0]["snapshot"]["group_id"] == adapter.group_id

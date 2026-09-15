@@ -271,12 +271,12 @@ def build_kv_cache_pool_snapshot(
                     ),
                 )
             except TypeError:
-                pass
+                return snapshot
             else:
                 _pool_snapshot_manager_refs[manager_id] = reference
 
         history = _pool_snapshot_history.setdefault(
-                (id(manager), snapshot.group_id),
+                (manager_id, snapshot.group_id),
                 deque(maxlen=_HISTORY_MAXLEN),
             )
         history.append((time_module.time(), snapshot))
