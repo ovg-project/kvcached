@@ -140,6 +140,88 @@ def test_successful_alloc_unchanged():
     assert manager.num_avail_blocks == 2
 
 
+def test_consistency_error_is_not_an_allocation_miss(monkeypatch):
+    from kvcached.errors import StateConsistencyError
+
+    manager = make_manager(fail_after=0)
+
+    def fail():
+        raise StateConsistencyError("unmap commit unconfirmed")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    with pytest.raises(StateConsistencyError, match="commit unconfirmed"):
+        manager.alloc(1)
+    assert manager.page_allocator.freed_pages == []
+
+
+def test_quarantined_map_returns_miss_without_handing_out_blocks(monkeypatch):
+    from kvcached.errors import MapQuarantinedError
+
+    manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
+
+    def fail():
+        raise MapQuarantinedError("unpublished page quarantined")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    assert manager.alloc(4) is None
+    assert manager.reserved_blocks == [10, 11]
+
+
+@pytest.mark.parametrize("rejected", [False, True])
+def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager = make_manager(fail_after=2)
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    manager.in_shrink = True
+    manager.target_num_blocks = BLOCKS_PER_PAGE
+
+    def resize(_size):
+        if rejected:
+            raise QuarantinedResizeError("quarantined pages")
+        return False
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    manager.free(blocks)
+    if rejected:
+        assert manager._resize_rejected
+        assert not manager.in_shrink
+        assert manager.target_num_blocks is None
+        assert manager.alloc(1) is not None
+    else:
+        assert manager.in_shrink
+        assert manager.target_num_blocks == BLOCKS_PER_PAGE
+
+
+@pytest.mark.parametrize("pending_shrink", [False, True])
+def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatch, pending_shrink):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager = make_manager(fail_after=4)
+    manager.in_shrink = pending_shrink
+    manager.target_num_blocks = BLOCKS_PER_PAGE if pending_shrink else None
+    target = [1000]
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        raise QuarantinedResizeError("quarantined pages")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: target[0])
+    assert manager.alloc(1) is not None
+    assert manager.alloc(1) is not None
+    assert calls == [1000]
+    assert manager._resize_rejected
+    target[0] = 2000
+    assert manager.alloc(1) is not None
+    assert calls == [1000, 2000]
+    assert not manager.in_shrink
+    assert manager.target_num_blocks is None
+    with pytest.raises(QuarantinedResizeError):
+        manager.resize(2000)
+
+
 def test_miss_with_no_partial_state_is_clean():
     manager = make_manager(fail_after=1)
     assert manager.alloc(BLOCKS_PER_PAGE) == [0, 1, 2, 3]
