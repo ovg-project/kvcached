@@ -21,11 +21,13 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
 )
 from vllm.v1.kv_cache_interface import (
+    CrossAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    SinkFullAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -256,3 +258,17 @@ def test_layout_negotiation_respects_backend_support(monkeypatch, contiguous):
     assert Worker().get_supported_kv_cache_layouts() == expected
     monkeypatch.setenv("ENABLE_KVCACHED", "false")
     assert Worker().get_supported_kv_cache_layouts() == ["LBNHC", "BLHNC", "BLNHC"]
+
+
+@pytest.mark.parametrize("spec_type", [CrossAttentionSpec, SinkFullAttentionSpec])
+def test_rejects_unqualified_attention_types_before_native_allocation(monkeypatch, spec_type):
+    captured = mock_native_allocator(monkeypatch, True)
+    config = uniform_config(True)
+    spec = spec_type(block_size=2, num_kv_heads=2, head_size=4, dtype=torch.bfloat16)
+    # Exercise expansion as well as subclasses of supported attention types.
+    config.kv_cache_groups[0].kv_cache_spec = UniformTypeKVCacheSpecs(
+        block_size=2, kv_cache_specs={"a": spec, "b": spec},
+    )
+    with pytest.raises(adapter.KVCachedConfigError):
+        adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLNHC, [2, 2])
+    assert not captured
