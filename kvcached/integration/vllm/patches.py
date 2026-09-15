@@ -264,6 +264,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _get_kv_cache_params(
@@ -936,7 +937,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> list["KVCacheEvent"]:
                 return []
 
-        setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
+        elastic_block_pool_cls: type = ElasticBlockPool
+        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+            from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
+
+            elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
+        setattr(block_pool_mod, "ElasticBlockPool", elastic_block_pool_cls)
         return True
 
 
@@ -968,9 +974,23 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = EngineCore.__init__
+        detected_version = self.detected_version
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # Reject a partial integration before either allocator or the
+                # native executor starts. vLLM can select V1 automatically.
+                if detected_version and VersionRange(">=0.29.0").contains(detected_version):
+                    if not VersionRange(VLLM_MRV2_RANGE).contains(detected_version):
+                        raise KVCachedConfigError(
+                            f"kvcached has no runner adapter for vLLM {detected_version}; "
+                            "use a supported engine version or disable kvcached"
+                        )
+                    if not vllm_config.use_v2_model_runner:
+                        raise KVCachedConfigError(
+                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            "use a supported configuration or disable kvcached"
+                        )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
@@ -1021,6 +1041,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
         original_init = KVCacheCoordinator.__init__
         logger = self.logger  # Capture logger in closure
+        use_mrv2_geometry = bool(
+            self.detected_version
+            and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version)
+        )
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
             original_init(self, *args, **kwargs)
@@ -1049,22 +1073,28 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             kv_cache_config = getattr(self, "kv_cache_config")
 
-            _validate_kv_cache_groups(kv_cache_config)
+            if use_mrv2_geometry:
+                from kvcached.integration.vllm.model_runner_v2 import cache_geometry
 
-            first_attn_group = _get_first_attention_group(kv_cache_config)
-            if first_attn_group is None:
-                raise RuntimeError(
-                    "kvcached is enabled but the KV cache config contains no "
-                    "attention groups; nothing to manage."
-                )
-
-            kv_cache_spec = first_attn_group.kv_cache_spec
-            block_size = kv_cache_spec.block_size
-
-            attention_type = _infer_attention_type(kv_cache_config)
-
-            cell_size, num_kv_buffers = _get_kv_cache_params(
-                kv_cache_spec, block_size, attention_type=attention_type)
+                geometry = cache_geometry(kv_cache_config)
+                block_size = geometry.block_size
+                cell_size = geometry.cell_size
+                num_kv_buffers = 1
+                group_size = geometry.num_pools
+            else:
+                _validate_kv_cache_groups(kv_cache_config)
+                first_attn_group = _get_first_attention_group(kv_cache_config)
+                if first_attn_group is None:
+                    raise RuntimeError(
+                        "kvcached is enabled but the KV cache config contains no "
+                        "attention groups; nothing to manage."
+                    )
+                kv_cache_spec = first_attn_group.kv_cache_spec
+                block_size = kv_cache_spec.block_size
+                attention_type = _infer_attention_type(kv_cache_config)
+                cell_size, num_kv_buffers = _get_kv_cache_params(
+                    kv_cache_spec, block_size, attention_type=attention_type)
+                group_size = _get_group_size(kv_cache_config)
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1097,7 +1127,6 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             block_pool_mod = importlib.import_module("vllm.v1.core.block_pool")
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
-            group_size = _get_group_size(kv_cache_config)
             # vLLM computes Request.block_hashes at a shared fine-grained size
             # (normally the GCD of heterogeneous group block sizes). Preserve
             # the value from the native pool before replacing it.
@@ -2132,10 +2161,11 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             )
 
             self.available_kv_cache_memory_bytes = available_memory
-            # vLLM 0.24 reads this field during compile_or_warm_up_model().
-            # Keep the worker contract without reintroducing the device-wide
-            # non-torch delta that colocated processes can corrupt.
+            # Warmup reads non_torch_memory in 0.24 and total_consumed in
+            # 0.29. Retain process-local accounting for both contracts;
+            # colocated processes can corrupt the device-wide delta.
             self.non_torch_memory = 0
+            self.total_consumed = weights_memory
             self.peak_activation_memory = torch_peak_increase
             self.cudagraph_memory_estimate = cudagraph_memory_estimate
             logger.warning(
