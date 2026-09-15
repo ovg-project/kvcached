@@ -23,12 +23,21 @@ public:
           size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
+  bool is_mapped(offset_t offset) const;
+  std::unique_ptr<Page> reserve_page(offset_t offset) const;
+  bool map_reserved(offset_t offset, std::unique_ptr<Page> page);
   bool unmap(offset_t offset);
 
   inline at::Tensor get_tensor() noexcept { return tensor_; }
 
 private:
+  friend class FTensorAllocator;
+
+  bool is_mapped_(offset_t offset) const;
+  bool unmap_retain_(offset_t offset, std::unique_ptr<Page> &retained_page);
+  bool restore_mapping_(offset_t offset, std::unique_ptr<Page> &retained_page);
   bool map_(Page *page, offset_t offset, bool set_access = true);
+  void validate_offset_(offset_t offset) const;
   bool set_access_(generic_ptr_t addr, size_t size);
   bool init_with_zero_();
 
