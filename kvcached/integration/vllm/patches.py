@@ -974,9 +974,23 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = EngineCore.__init__
+        detected_version = self.detected_version
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # Reject a partial integration before either allocator or the
+                # native executor starts. vLLM can select V1 automatically.
+                if detected_version and VersionRange(">=0.29.0").contains(detected_version):
+                    if not VersionRange(VLLM_MRV2_RANGE).contains(detected_version):
+                        raise KVCachedConfigError(
+                            f"kvcached has no runner adapter for vLLM {detected_version}; "
+                            "use a supported engine version or disable kvcached"
+                        )
+                    if not vllm_config.use_v2_model_runner:
+                        raise KVCachedConfigError(
+                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            "use a supported configuration or disable kvcached"
+                        )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)

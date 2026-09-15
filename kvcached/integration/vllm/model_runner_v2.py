@@ -31,7 +31,10 @@ def cache_geometry(config: Any) -> CacheGeometry:
     """Derive the same physical block units in coordinator and worker."""
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
+        FullAttentionSpec,
         MambaSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
         UniformTypeKVCacheSpecs,
     )
 
@@ -41,8 +44,14 @@ def cache_geometry(config: Any) -> CacheGeometry:
             specs.extend(group.kv_cache_spec.kv_cache_specs.values())
         else:
             specs.append(group.kv_cache_spec)
-    if not specs or any(not isinstance(spec, (AttentionSpec, MambaSpec)) for spec in specs):
-        raise KVCachedConfigError("kvcached MRV2 requires attention or recurrent-state KV groups")
+    # Specialized subclasses can have different manager ownership semantics;
+    # inheritance alone does not qualify them for the elastic block pool.
+    supported_specs = (FullAttentionSpec, SlidingWindowSpec, MLAAttentionSpec, MambaSpec)
+    if not specs or any(type(spec) not in supported_specs for spec in specs):
+        raise KVCachedConfigError(
+            "kvcached MRV2 supports FullAttentionSpec, SlidingWindowSpec, "
+            "MLAAttentionSpec and MambaSpec only"
+        )
     first_attention = next((spec for spec in specs if isinstance(spec, AttentionSpec)), None)
     if first_attention is None:
         raise KVCachedConfigError("kvcached MRV2 requires an attention group")
