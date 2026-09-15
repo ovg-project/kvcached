@@ -22,13 +22,13 @@ import pytest
 # The helper itself is dependency-free until initialization; load it without the
 # package's torch requirement so its lifetime checks also run on a plain CPU host.
 _spec = importlib.util.spec_from_file_location(
-    "_block_pool_v29_under_test",
-    Path(__file__).parents[1] / "kvcached/integration/vllm/block_pool_v29.py",
+    "_native_block_pool_under_test",
+    Path(__file__).parents[1] / "kvcached/integration/vllm/native_block_pool.py",
 )
 assert _spec is not None and _spec.loader is not None
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
-Mixin = _module.BlockPoolV29Mixin
+Mixin = _module.NativeBlockPoolMixin
 
 
 class Block:
@@ -131,7 +131,7 @@ def native_pool_factory(monkeypatch):
     if not isinstance(getattr(native, "__file__", None), str):
         pytest.skip("Run this file separately: other tests installed a vLLM stub")
 
-    from kvcached.integration.vllm.block_pool_v29 import BlockPoolV29Mixin
+    from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
     from kvcached.integration.vllm.patches import ElasticBlockPoolPatch
 
     interface = types.ModuleType("kvcached.integration.vllm.interfaces")
@@ -147,7 +147,7 @@ def native_pool_factory(monkeypatch):
         setattr(target, "KVCacheBlock", native.KVCacheBlock)
         assert ElasticBlockPoolPatch().apply(target)
         cls = target.ElasticBlockPool
-        assert issubclass(cls, BlockPoolV29Mixin)
+        assert issubclass(cls, NativeBlockPoolMixin)
         pool = cls(
             num_gpu_blocks=size,
             block_size=16,
