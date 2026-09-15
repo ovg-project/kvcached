@@ -1271,6 +1271,38 @@ class KVCacheManagerPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _initialize_kvcached_worker(runner: Any) -> None:
+    from kvcached.integration.vllm import interfaces as kvi
+
+    try:
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        tp_rank = int(get_tensor_model_parallel_rank())
+        tp_size = int(get_tensor_model_parallel_world_size())
+    except (ImportError, AttributeError):
+        tp_rank, tp_size = 0, 1
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+        pp_rank = int(get_pp_group().rank_in_group)
+    except Exception:
+        pp_rank = 0
+    try:
+        device_str = str(getattr(runner, "device", "cuda"))
+    except Exception:
+        device_str = "cuda"
+
+    kvi.init_kvcached(
+        tp_rank=tp_rank,
+        world_size=tp_size,
+        pp_rank=pp_rank,
+        is_worker=True,
+        device=device_str,
+        async_sched=_should_enable_async_sched(runner.vllm_config),
+    )
+
+
 class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
     """Patch GPUModelRunner for kvcached integration"""
 
@@ -1327,44 +1359,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 logger.warning("Failed to initialize kvcached, disabling: %s", e)
 
         def _init_kvcached(self) -> None:
-            # Get TP rank/size: these are always available at model runner init time.
-            try:
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_rank,
-                    get_tensor_model_parallel_world_size,
-                )
-                tp_rank = int(get_tensor_model_parallel_rank())
-                tp_size = int(get_tensor_model_parallel_world_size())
-            except (ImportError, AttributeError):
-                tp_rank, tp_size = 0, 1
-
-            # Try to get PP rank; it may not be available if PP process groups
-            # initialise later, so default to 0 (works for PP=1 and PP stage 0).
-            try:
-                from vllm.distributed.parallel_state import (
-                    get_pp_group,
-                )
-                pp_rank = int(get_pp_group().rank_in_group)
-            except Exception:
-                pp_rank = 0
-
-            try:
-                device_str = str(getattr(self, "device", "cuda"))
-            except Exception:
-                device_str = "cuda"
-
-            from kvcached.integration.vllm import interfaces as kvi
-
-            # Register this worker's IPC socket using tp_rank so all TP workers
-            # within this PP stage listen on w0.sock … w(tp_size-1).sock.
-            kvi.init_kvcached(
-                tp_rank=tp_rank,
-                world_size=tp_size,
-                pp_rank=pp_rank,
-                is_worker=True,
-                device=device_str,
-                async_sched=_should_enable_async_sched(self.vllm_config),
-            )
+            _initialize_kvcached_worker(self)
 
         # Add helper methods to the class
         GPUModelRunner._init_kvcached = _init_kvcached

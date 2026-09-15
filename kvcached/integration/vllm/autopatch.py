@@ -7,6 +7,7 @@ import types
 from wrapt.importer import when_imported
 
 from kvcached.integration.patch_base import PatchManager, log_patch_results
+from kvcached.integration.vllm.model_runner_v2 import GPUModelRunnerV2Patch
 from kvcached.integration.vllm.nixl_compat import NixlConnectorPatch
 from kvcached.integration.vllm.patches import (
     VLLM_ALL_RANGE,
@@ -45,6 +46,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
             (EngineCorePatch(), VLLM_ALL_RANGE),
             (GPUModelRunnerPatch(), VLLM_ALL_RANGE),
+            (GPUModelRunnerV2Patch(), ">=0.28.0"),
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
