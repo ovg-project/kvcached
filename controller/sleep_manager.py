@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
@@ -16,12 +17,18 @@ logger = get_kvcached_logger()
 
 @dataclass
 class SleepConfig:
-    """Configuration for sleep mode management"""
+    """Configuration for sleep mode management.
+
+    `keep` is excluded because resuming unfinished requests across
+    sleep/wake has not been validated through this controller.
+    """
     idle_threshold_seconds: int = 300  # 5 minutes
     check_interval_seconds: int = 60  # Check every minute
     auto_sleep_enabled: bool = False  # Whether to automatically put models to sleep
     wakeup_on_request: bool = True  # Whether to automatically wake models on request
     min_sleep_duration: int = 60  # Minimum time to keep model asleep (seconds)
+    vllm_sleep_mode: str = "abort"
+    vllm_sleep_timeout_seconds: float = 30
     vllm_models_config: Dict[str, Dict[
         str,
         str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
@@ -31,6 +38,11 @@ class SleepConfig:
 
     def __post_init__(self):
         """Initialize default model configs if None"""
+        if self.vllm_sleep_mode not in ("abort", "wait"):
+            raise ValueError("vllm_sleep_mode must be 'abort' or 'wait'")
+        if (not math.isfinite(self.vllm_sleep_timeout_seconds)
+                or self.vllm_sleep_timeout_seconds <= 0):
+            raise ValueError("vllm_sleep_timeout_seconds must be finite and positive")
         if self.vllm_models_config is None:
             self.vllm_models_config = {}
         if self.sglang_models_config is None:
@@ -313,13 +325,14 @@ class SleepManager:
         request body, so the level must be sent as a query parameter.
         """
         url = f"http://{host}:{port}/sleep"
-        params = {"level": str(level)}
+        params = {"level": str(level), "mode": self.config.vllm_sleep_mode}
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                         url, params=params,
-                        timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        timeout=aiohttp.ClientTimeout(
+                            total=self.config.vllm_sleep_timeout_seconds)) as response:
                     if response.status == 200:
                         logger.info(
                             f"Successfully called vLLM sleep API at {url} with level {level}"
