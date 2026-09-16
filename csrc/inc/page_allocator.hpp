@@ -146,7 +146,8 @@ private:
 
   // Configuration
   int64_t num_layers_;
-  int64_t mem_size_per_layer_;
+  // Last controller quota, read and updated only by the resize watcher.
+  int64_t last_observed_mem_size_;
   int64_t page_size_;
   int64_t world_size_;
   int64_t pp_rank_;
