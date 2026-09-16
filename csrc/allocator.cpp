@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -21,13 +22,13 @@ size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
     FTensorAllocator::g_allocators_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
-c10::Device FTensorAllocator::g_device_(c10::kCPU);
+torch::stable::Device FTensorAllocator::g_device_(torch::headeronly::kCPU);
 bool FTensorAllocator::g_contiguous_layout_ = false;
 
-static inline std::shared_ptr<Page> make_shared_page(const c10::Device &dev,
-                                                     page_id_t page_id,
-                                                     size_t page_size = 0) {
-  auto resolve_device_index = [](const c10::Device &device) -> int {
+static inline std::shared_ptr<Page>
+make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
+                 size_t page_size = 0) {
+  auto resolve_device_index = [](const torch::stable::Device &device) -> int {
     if (device.index() >= 0) {
       return device.index();
     }
@@ -46,7 +47,7 @@ static inline std::shared_ptr<Page> make_shared_page(const c10::Device &dev,
   return nullptr;
 }
 
-static inline size_t get_v_base_offset(const at::Tensor &tensor) {
+static inline size_t get_v_base_offset(const torch::stable::Tensor &tensor) {
   size_t num_eles = tensor.numel() * tensor.element_size();
   ASSERT(num_eles % (2 * kPageSize) == 0,
          "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
@@ -54,7 +55,7 @@ static inline size_t get_v_base_offset(const at::Tensor &tensor) {
   return num_eles / 2;
 }
 
-FTensorAllocator::FTensorAllocator(const c10::Device &device,
+FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
       unified_pool_(false), kv_tensor_size_per_layer_(0) {
@@ -97,7 +98,7 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
     kPageSize = page_size;
   }
 
-  auto device = c10::Device(dev_str);
+  torch::stable::Device device(dev_str);
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
   g_allocators_[0] =
@@ -124,9 +125,10 @@ void FTensorAllocator::shutdown() {
   g_allocators_.clear();
 }
 
-std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
-    size_t size, c10::ScalarType dtype, const std::string &dev_str,
-    int64_t num_layers, int64_t num_kv_buffers, bool unified_pool) {
+std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, int64_t num_layers, int64_t num_kv_buffers,
+    bool unified_pool) {
   std::lock_guard<std::mutex> lock(mtx_);
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
@@ -533,10 +535,11 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
   return std::string(prefix) + std::to_string(counter++);
 }
 
-std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
-    std::string_view prefix, size_t size, c10::ScalarType dtype,
+std::vector<torch::stable::Tensor>
+FTensorAllocator::create_kv_tensors_per_layer_(
+    std::string_view prefix, size_t size, torch::headeronly::ScalarType dtype,
     const std::string &dev_str, int64_t num_layers) {
-  std::vector<at::Tensor> ftensors;
+  std::vector<torch::stable::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
     auto tensor = create_ftensor_(size, dtype, dev_str, name);
@@ -545,9 +548,10 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
   return ftensors;
 }
 
-std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
-    size_t size, c10::ScalarType dtype, const std::string &dev_str,
-    int64_t num_layers, size_t compound_page_size) {
+std::vector<torch::stable::Tensor>
+FTensorAllocator::create_kv_tensors_contiguous_(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, int64_t num_layers, size_t compound_page_size) {
   // In contiguous layout, Python passes per-layer size, and we multiply by
   // num_layers to get total size
   size_t total_kv_size = size * num_layers;
@@ -564,16 +568,16 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 }
 
 /** this function is not thread-safe */
-at::Tensor FTensorAllocator::create_ftensor_(size_t size, c10::ScalarType dtype,
-                                             const std::string &dev_str,
-                                             std::string name) {
+torch::stable::Tensor FTensorAllocator::create_ftensor_(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, std::string name) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
   if (ftensors_.find(name) != ftensors_.end()) {
     auto tensor = ftensors_[name].get()->get_tensor();
-    assert(tensor.numel() * tensor.element_size() == size);
-    assert(tensor.device() == c10::Device(dev_str));
+    assert(static_cast<size_t>(tensor.numel()) * tensor.element_size() == size);
+    assert(tensor.device() == torch::stable::Device(dev_str));
     return tensor;
   }
 
@@ -581,15 +585,6 @@ at::Tensor FTensorAllocator::create_ftensor_(size_t size, c10::ScalarType dtype,
   ftensors_[name] =
       std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
   return ftensors_[name]->get_tensor();
-}
-
-/** this function is not thread-safe */
-void FTensorAllocator::free_ftensor_(at::Tensor &ftensor) {
-  auto name = ftensor.name();
-  if (ftensors_.find(name) == ftensors_.end()) {
-    return;
-  }
-  ftensors_.erase(name);
 }
 
 void FTensorAllocator::init_gpu_() {

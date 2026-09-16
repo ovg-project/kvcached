@@ -22,7 +22,7 @@ try:
         library_paths,
     )
 except ImportError:
-    raise ImportError("Torch not found, please install torch>=2.6.0 first.")
+    raise ImportError("Torch not found, please install torch>=2.10.0 first.")
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH
@@ -64,6 +64,9 @@ def get_extensions():
         "-std=c++17",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
         backend_define,
+        # Target the PyTorch 2.10 stable ABI for the KV tensor ops registered
+        # via STABLE_TORCH_LIBRARY in csrc/torch_bindings.cpp.
+        "-DTORCH_TARGET_VERSION=0x0210000000000000",
     ]
 
     ext_include_dirs = include_paths(device_type="cuda") + [
@@ -80,8 +83,8 @@ def get_extensions():
             "-DUSE_ROCM=1",
         ])
         ext_libraries = ["amdhip64"]
-        vmm_ops_module = CppExtension(
-            "kvcached.vmm_ops",
+        ext_module = CppExtension(
+            "kvcached._C",
             csrc_files,
             include_dirs=ext_include_dirs,
             library_dirs=ext_library_dirs,
@@ -91,8 +94,8 @@ def get_extensions():
     else:
         # CUDA driver APIs require libcuda for cuMem* symbols.
         ext_libraries = ["cuda"]
-        vmm_ops_module = CUDAExtension(
-            "kvcached.vmm_ops",
+        ext_module = CUDAExtension(
+            "kvcached._C",
             csrc_files,
             include_dirs=ext_include_dirs,
             library_dirs=ext_library_dirs,
@@ -102,8 +105,8 @@ def get_extensions():
                 "nvcc": extra_compile_args,
             },
         )
-    print(f"Building kvcached.vmm_ops with backend: {backend_name}")
-    return [vmm_ops_module], {"build_ext": BuildExtension}
+    print(f"Building kvcached._C with backend: {backend_name}")
+    return [ext_module], {"build_ext": BuildExtension}
 
 
 ext_modules, cmdclass = get_extensions()
