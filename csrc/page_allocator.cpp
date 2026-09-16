@@ -109,7 +109,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              bool contiguous_layout, bool enable_page_prealloc,
                              int64_t num_kv_buffers, int64_t group_id,
                              const std::string &ipc_name)
-    : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
+    : num_layers_(num_layers), last_observed_mem_size_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
@@ -841,8 +841,14 @@ void PageAllocator::resize_watcher() {
     }
     if (mem_info_tracker_) {
       int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
-      resize_target_.store(target, std::memory_order_relaxed);
+          last_observed_mem_size_, num_layers_, num_kv_buffers_);
+      if (target >= 0) {
+        // Observe quota changes, including a return to the startup value.
+        // Retain the latest request between polls so allocations can apply
+        // it later, including when an in-use page initially prevents shrink.
+        last_observed_mem_size_ = target;
+        resize_target_.store(target, std::memory_order_relaxed);
+      }
     }
   }
   LOGGER(INFO, "Resize watcher thread stopped");
