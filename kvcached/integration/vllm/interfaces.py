@@ -121,20 +121,24 @@ def init_kvcached(
         )
 
 
-def shutdown_kvcached() -> None:
+def shutdown_kvcached() -> bool:
+    """Release KV resources, or return False if an active listener needs a retry."""
     global _kvcached_initialized, _kvcached_device, _async_sched, _is_worker
     _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
-        return
+        return True
 
-    stop_worker_listener_threads()
+    if not stop_worker_listener_threads():
+        logger.warning("KV shutdown deferred: a worker IPC listener is still active")
+        return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
     _is_worker = False
+    return True
 
 
 def build_kv_views(

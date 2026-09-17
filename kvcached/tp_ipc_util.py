@@ -7,6 +7,7 @@ import os
 import pickle
 import socket
 import threading
+import uuid
 from typing import Any, Dict, Optional, Tuple, cast
 
 from kvcached import vmm_ops
@@ -34,6 +35,7 @@ def _sync_before_unmap() -> None:
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 # Socket directory for tensor parallel (TP) worker communication:
 # /tmp/kvcached-tp-<ipc_name>-<hash>. Unix domain socket paths are limited to
@@ -195,7 +197,9 @@ class _WorkerListener:
         except OSError:
             pass
         thread = self.thread
-        if thread is not None and thread is not threading.current_thread():
+        if thread is threading.current_thread():
+            return False  # A handler cannot drain itself.
+        if thread is not None:
             thread.join(timeout=drain_timeout_s)
             if thread.is_alive():
                 print(f"Worker {self.rank} IPC listener still busy after "
@@ -240,24 +244,22 @@ def stop_worker_listener_threads(
     case returns False.
     """
     with _listeners_lock:
-        items = list(_listeners.items())
-        _listeners.clear()
-    all_stopped = True
-    for key, listener in items:
-        try:
-            stopped = listener.stop(drain_timeout_s)
-        except Exception as e:
-            # Cleanup must not raise out of the integrations' shutdown
-            # paths or the interpreter-exit hook, and one broken listener
-            # must not keep the others from stopping.
-            print(f"Worker {listener.rank} IPC listener cleanup failed: {e}")
-            all_stopped = False
-            continue
-        if not stopped:
-            all_stopped = False
-            with _listeners_lock:
-                _listeners.setdefault(key, listener)
-    return all_stopped
+        all_stopped = True
+        # Keep entries visible until drained, including after cleanup errors.
+        # Serializing lifecycle calls also prevents another stop from seeing
+        # an empty registry while this call is still draining its handlers.
+        for key, listener in list(_listeners.items()):
+            try:
+                stopped = listener.stop(drain_timeout_s)
+            except Exception as e:
+                print(f"Worker {listener.rank} IPC listener cleanup failed: {e}")
+                all_stopped = False
+                continue
+            if stopped:
+                del _listeners[key]
+            else:
+                all_stopped = False
+        return all_stopped
 
 
 def start_worker_listener_thread(
@@ -277,11 +279,23 @@ def start_worker_listener_thread(
     from the integrations' shutdown paths and at interpreter exit) can unlink
     the socket and remove the directory again.
     """
-    global _atexit_registered
     with _listeners_lock:
-        previous = _listeners.pop((rank, pp_rank), None)
+        _start_worker_listener_thread(rank, pp_rank, device_index)
+
+
+def _start_worker_listener_thread(
+    rank: int, pp_rank: int, device_index: Optional[int],
+) -> None:
+    """Start or replace a listener while holding the lifecycle lock."""
+    global _atexit_registered
+    key = (rank, pp_rank)
+    previous = _listeners.get(key)
     if previous is not None:
-        previous.stop()
+        if not previous.stop():
+            raise RuntimeError(
+                f"Cannot replace worker {rank} IPC listener while it is still active"
+            )
+        del _listeners[key]
 
     root_dir = SOCKET_DIR
     socket_dir = os.path.join(root_dir, f"pp{pp_rank}") if pp_rank > 0 else root_dir
@@ -400,11 +414,10 @@ def start_worker_listener_thread(
     t = threading.Thread(target=listen_loop, daemon=True)
     listener.thread = t
     t.start()
-    with _listeners_lock:
-        _listeners[(rank, pp_rank)] = listener
-        if not _atexit_registered:
-            atexit.register(stop_worker_listener_threads)
-            _atexit_registered = True
+    _listeners[key] = listener
+    if not _atexit_registered:
+        atexit.register(stop_worker_listener_threads)
+        _atexit_registered = True
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.
