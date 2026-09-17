@@ -15,7 +15,12 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
+from kvcached.integration.version_utils import (
+    VersionAwarePatch,
+    VersionManager,
+    VersionRange,
+    version_range,
+)
 from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
 
 if TYPE_CHECKING:
@@ -181,6 +186,35 @@ def _should_enable_async_sched(vllm_config: Any) -> bool:
     return bool(getattr(scheduler_config, "async_scheduling", False))
 
 
+def _reshape_mamba_page_tensor(
+    mamba_info: dict, kv_cache_spec: Any, pool_idx: int,
+) -> Any:
+    """Expose raw per-block state bytes for vLLM 0.28's native Mamba binding."""
+    import torch
+
+    page_size = int(kv_cache_spec.page_size_bytes)
+    if page_size != mamba_info["page_size_bytes"] or page_size <= 0:
+        raise ValueError("Mamba page size does not match the shared KV pool")
+    if mamba_info.get("is_contiguous"):
+        raw = mamba_info["buffers"][0]
+        block_stride = mamba_info["block_stride_bytes"]
+        offset = pool_idx * page_size
+    else:
+        raw = mamba_info["buffers"][pool_idx]
+        block_stride = page_size
+        offset = 0
+    if raw.dtype != torch.int8 or raw.ndim != 1 or raw.stride(0) != 1:
+        raise ValueError("Mamba backing storage must be a flat int8 byte buffer")
+    # Interleaved layers need a strided page view, not a compact reshape.
+    # Include the backing view's offset: as_strided offsets are storage-relative.
+    return torch.as_strided(
+        raw,
+        size=(mamba_info["num_blocks"], 1, 1, page_size),
+        stride=(block_stride, page_size, page_size, 1),
+        storage_offset=raw.storage_offset() + offset,
+    )
+
+
 def _reshape_mamba_non_contiguous(
     raw_int8: Any, kv_cache_spec: Any, get_dtype_size: Any,
 ) -> list:
@@ -266,6 +300,21 @@ VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
 
 
+def _uses_packed_attention_kv() -> bool:
+    """Use the same physical block geometry in the engine and GPU workers."""
+    version = VersionManager.get_instance().detect_version("vllm")
+    return version is not None and VersionRange(">=0.28.0").contains(version)
+
+
+def _get_packed_kv_layout(attn_backend: Any) -> str:
+    order = tuple(attn_backend.get_kv_cache_stride_order())
+    if order == (0, 2, 1, 3):
+        return "NHD"
+    if order == (0, 1, 2, 3):
+        return "HND"
+    raise NotImplementedError(f"Unsupported packed KV stride order: {order}")
+
+
 def _get_kv_cache_params(
     kv_cache_spec: Any,
     block_size: int,
@@ -276,11 +325,13 @@ def _get_kv_cache_params(
     Returns:
         (cell_size, num_kv_buffers)
     """
-    if attention_type in ("MLA", "HYBRID_LINEAR") or _is_mla_kv_cache_spec(kv_cache_spec):
+    if (attention_type in ("MLA", "HYBRID_LINEAR")
+            or _is_mla_kv_cache_spec(kv_cache_spec) or _uses_packed_attention_kv()):
         # MLA: single combined KV buffer per layer
         # HYBRID_LINEAR (full attention + linear attention): K and V are
         # interleaved into one buffer per layer, so it shares MLA's
-        # single-buffer math.
+        # single-buffer math. vLLM 0.28 also packs ordinary attention's K/V
+        # into a single block; the worker checks its backend shape and strides.
         # page_size_bytes = block_size * num_kv_heads * head_size * dtype_size
         cell_size = kv_cache_spec.page_size_bytes // block_size
         num_kv_buffers = 1
@@ -492,6 +543,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
+                self.enable_caching = enable_caching
                 # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
@@ -1497,7 +1549,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     required_layout = attn_backend_cls.get_required_kv_cache_layout()
 
                 selected_layout = required_layout or "NHD"
-                if selected_layout != "NHD":
+                if selected_layout != "NHD" and not (
+                    _uses_packed_attention_kv() and selected_layout == "HND"
+                ):
                     raise RuntimeError(
                         "kvcached currently supports NHD KV layout only, but "
                         f"{backend_name} requires {selected_layout}."
@@ -1517,7 +1571,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 cache_dtype,
             )
 
-            if attention_type == "HYBRID_LINEAR":
+            packed_kv = attention_type != "MLA" and len(kv_cache_shape) == 4
+            if attention_type != "MLA" and packed_kv != _uses_packed_attention_kv():
+                raise NotImplementedError(
+                    "The attention backend KV layout does not match the "
+                    "engine's physical block geometry for this vLLM version: "
+                    f"{kv_cache_shape}"
+                )
+            kv_layout = _get_packed_kv_layout(attn_backend_cls) if packed_kv else "NHD"
+
+            if attention_type == "HYBRID_LINEAR" or packed_kv:
                 # The unified-pool layout math (both layouts; load-bearing for
                 # contiguous ratio>1 linearity) assumes the spec's page is
                 # EXACTLY the geometric K+V bytes of one block:
@@ -1530,7 +1593,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                               kv_cache_spec.dtype.itemsize)
                 if kv_cache_spec.page_size_bytes != _geom_page:
                     raise NotImplementedError(
-                        "kvcached hybrid-linear requires the attention page "
+                        "kvcached unified KV storage requires the attention page "
                         "size to equal the geometric K+V block bytes, but "
                         f"page_size_bytes={kv_cache_spec.page_size_bytes} != "
                         f"{_geom_page}. This typically means a quantized KV "
@@ -1630,7 +1693,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 device_type,
                 group_size,
                 attention_type=attention_type,
-                kv_layout="NHD",
+                kv_layout=kv_layout,
                 kernel_block_size=kernel_block_size,
                 return_meta=is_hetero,
             )
@@ -1667,6 +1730,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         attention_type, meta["num_blocks_per_layer"],
                         meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
                         kernel_block_size=gkbs,
+                        kv_layout=_get_packed_kv_layout(gbackend) if packed_kv else "NHD",
                     )
                     for pool_idx, layer_name in enumerate(grp.layer_names):
                         layer_views[layer_name] = gviews[pool_idx]
@@ -1708,6 +1772,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if hasattr(GPUModelRunner, "_reshape_kv_cache_tensors_from_kvcached"):
             return True
 
+        use_mamba_pages = VersionRange(">=0.28.0").contains(self.detected_version or "0")
+
         def _reshape_kv_cache_tensors_from_kvcached(
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
@@ -1735,6 +1801,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                        if layer_name in getattr(self, "runner_only_attn_layers", ()):
+                            continue
+                        if use_mamba_pages:
+                            kv_caches[layer_name] = _reshape_mamba_page_tensor(
+                                mamba_info, kv_cache_spec, pool_idx,
+                            )
+                            continue
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
@@ -1894,16 +1967,6 @@ def _should_profile_cudagraph_memory(worker: Any) -> bool:
     return True
 
 
-def _get_process_local_torch_peak_bytes(device: Any) -> int:
-    import torch
-
-    accelerator = getattr(torch, "accelerator", None)
-    memory_stats = getattr(accelerator, "memory_stats", None)
-    if callable(memory_stats):
-        return int(memory_stats(device).get("allocated_bytes.all.peak", 0))
-    return int(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
-
-
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     """Decouple kvcached virtual KV capacity from whole-device free memory."""
 
@@ -2052,7 +2115,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     def patch_worker_determine_available_memory(
         self, gpuworker_mod: types.ModuleType
     ) -> bool:
-        """Use vLLM's explicit-capacity branch with an automatic virtual budget."""
+        """Profile process-local memory while preserving explicit user budgets."""
         Worker = self._get_target_class(gpuworker_mod)
         if Worker is None:
             return False
@@ -2083,6 +2146,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
             virtual_budget = int(self.requested_memory)
             init_snapshot = getattr(self, "init_snapshot", None)
+            persistent_profile_memory = 0
             if init_snapshot is None:
                 # vLLM 0.8.x has no MemorySnapshot. Resetting peak stats after
                 # model load makes this peak process-local and includes both
@@ -2101,30 +2165,36 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 from vllm.utils.mem_utils import memory_profiling
 
                 weights_memory = int(self.model_runner.model_memory_usage)
-                profile_torch_peak = None
                 cudagraph_memory_estimate = 0
                 with memory_profiling(
                     init_snapshot, weights_memory=weights_memory
                 ) as profile_result:
                     self.model_runner.profile_run()
-                    if _should_profile_cudagraph_memory(self):
-                        profile_torch_peak = _get_process_local_torch_peak_bytes(
-                            self.device
-                        )
-                        cudagraph_memory_estimate = int(
-                            self.model_runner.profile_cudagraph_memory()
-                        )
 
                 torch_peak_increase = int(profile_result.torch_peak_increase)
-                if profile_torch_peak is not None:
-                    before_profile = getattr(profile_result, "before_profile", None)
-                    before_torch_peak = getattr(
-                        before_profile, "torch_peak", None
+                before_allocated = getattr(
+                    getattr(profile_result, "before_profile", None),
+                    "torch_allocated", None,
+                )
+                after_allocated = getattr(
+                    getattr(profile_result, "after_profile", None),
+                    "torch_allocated", None,
+                )
+                if (hasattr(profile_result, "transient_peak_headroom")
+                        and before_allocated is not None and after_allocated is not None):
+                    # Split the existing process-local charge into persistent
+                    # and transient parts for vLLM 0.28's warmup bookkeeping.
+                    # Their sum, and therefore the virtual KV budget, is unchanged.
+                    persistent_profile_memory = min(
+                        max(0, torch_peak_increase),
+                        max(0, int(after_allocated) - int(before_allocated)),
                     )
-                    if before_torch_peak is not None:
-                        torch_peak_increase = max(
-                            0, profile_torch_peak - int(before_torch_peak)
-                        )
+                # Complete the normal profile before creating temporary graph
+                # caches. Keep graph initialization but exclude it from that peak.
+                if _should_profile_cudagraph_memory(self):
+                    cudagraph_memory_estimate = int(
+                        self.model_runner.profile_cudagraph_memory()
+                    )
             available_memory = (
                 virtual_budget
                 - weights_memory
@@ -2136,7 +2206,10 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             # Keep the worker contract without reintroducing the device-wide
             # non-torch delta that colocated processes can corrupt.
             self.non_torch_memory = 0
-            self.peak_activation_memory = torch_peak_increase
+            # Do not copy profile_result.total_consumed: it is a whole-device
+            # free-memory delta and may include allocations by other instances.
+            self.total_consumed = weights_memory + persistent_profile_memory
+            self.peak_activation_memory = torch_peak_increase - persistent_profile_memory
             self.cudagraph_memory_estimate = cudagraph_memory_estimate
             logger.warning(
                 "Using kvcached process-local KV capacity: budget=%d bytes, "
@@ -2263,6 +2336,10 @@ class TritonAttentionPatch(VersionAwarePatch, BasePatch):
     @version_range(VLLM_V9_PLUS_RANGE)
     def patch_ensure_scale_caches(self,
                                   triton_attn_mod: types.ModuleType) -> bool:
+        if _uses_packed_attention_kv():
+            # vLLM 0.28's packed implementation already uses the tensor's
+            # actual strides and storage offset. The old 5D patch is invalid.
+            return True
         impl_cls = self._get_target_class(triton_attn_mod)
         if impl_cls is None:
             return False

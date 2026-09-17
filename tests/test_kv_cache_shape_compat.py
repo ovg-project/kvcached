@@ -13,6 +13,8 @@ import ast
 import pathlib
 from types import SimpleNamespace
 
+import pytest
+
 import kvcached.integration.vllm.patches as patches
 from kvcached.integration.vllm.patches import (
     _cache_dtype_str,
@@ -101,3 +103,41 @@ def test_no_direct_get_kv_cache_shape_calls():
     assert not direct, (
         "get_kv_cache_shape must be called via _get_kv_cache_shape_compat so "
         f"cache_dtype_str is forwarded (#424); direct calls at lines {direct}")
+
+
+@pytest.mark.parametrize("version,buffers", [("0.22.1", 2), ("0.27.0", 2),
+                                            ("0.28.0", 1), ("0.28.0+cu129", 1)])
+def test_engine_packed_geometry_matches_worker_version(monkeypatch, version, buffers):
+    manager = patches.VersionManager.get_instance()
+    monkeypatch.setattr(manager, "detect_version", lambda _: version)
+    monkeypatch.setattr(patches, "_is_mla_kv_cache_spec", lambda _: False)
+    spec = SimpleNamespace(page_size_bytes=4096)
+    cell, actual_buffers = patches._get_kv_cache_params(spec, 16, "MHA")
+    assert actual_buffers == buffers
+    assert cell * 16 * actual_buffers == 4096
+
+
+@pytest.mark.parametrize("order,layout", [((0, 2, 1, 3), "NHD"),
+                                         ((0, 1, 2, 3), "HND")])
+def test_packed_layout_comes_from_backend_stride_order(order, layout):
+    backend = SimpleNamespace(get_kv_cache_stride_order=lambda: order)
+    assert patches._get_packed_kv_layout(backend) == layout
+
+
+def test_unrecognized_packed_stride_order_fails_closed():
+    backend = SimpleNamespace(get_kv_cache_stride_order=lambda: (0, 1, 3, 2))
+    with pytest.raises(NotImplementedError, match="stride order"):
+        patches._get_packed_kv_layout(backend)
+
+
+def test_packed_backend_keeps_native_scale_views(monkeypatch):
+    monkeypatch.setattr(patches, "_uses_packed_attention_kv", lambda: True)
+
+    class Impl:
+        def _ensure_scale_caches(self, kv_cache):
+            return kv_cache
+
+    original = Impl._ensure_scale_caches
+    module = SimpleNamespace(TritonAttentionImpl=Impl)
+    assert patches.TritonAttentionPatch().patch_ensure_scale_caches(module)
+    assert Impl._ensure_scale_caches is original
