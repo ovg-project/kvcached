@@ -168,6 +168,9 @@ More instructions can be found [here](https://github.com/ovg-project/kvcached/bl
 
 kvcached is indexed on [DeepWiki](https://deepwiki.com/ovg-project/kvcached) for LLM-powered documentation.
 
+See the [CPU offloading milestone](docs/CPU_OFFLOAD_DESIGN.md) for the current
+control-plane contract and the remaining GPU integration work.
+
 The documentation covers:
 - Core architecture and memory management system
 - Integration with vLLM and SGLang
