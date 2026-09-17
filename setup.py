@@ -40,6 +40,12 @@ def get_csrc_files(path) -> List[str]:
     return cpp_files
 
 
+# Minimum PyTorch version whose stable ABI the KV tensor ops target (registered
+# via STABLE_TORCH_LIBRARY in csrc/torch_bindings.cpp).
+ABI_VERSION = (2, 10)
+TORCH_TARGET_VERSION = f"0x{(ABI_VERSION[0] << 56) | (ABI_VERSION[1] << 48):016x}"
+
+
 def get_extensions():
     csrc_files = get_csrc_files(CSRC_PATH)
 
@@ -64,9 +70,7 @@ def get_extensions():
         "-std=c++17",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
         backend_define,
-        # Target the PyTorch 2.10 stable ABI for the KV tensor ops registered
-        # via STABLE_TORCH_LIBRARY in csrc/torch_bindings.cpp.
-        "-DTORCH_TARGET_VERSION=0x0210000000000000",
+        f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}",
     ]
 
     ext_include_dirs = include_paths(device_type="cuda") + [

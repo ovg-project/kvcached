@@ -263,7 +263,7 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 // Register the KV tensor ops in the "kvcached" dispatcher namespace.
 STABLE_TORCH_LIBRARY(kvcached, m) {
   m.def("init_kvcached(str dev_str, int page_size=0, bool "
-        "contiguous_layout=False) -> ()");
+        "contiguous_layout=True) -> ()");
   m.def("shutdown_kvcached() -> ()");
   m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
         "num_layers, int num_kv_buffers=2, int group_id=0, bool "
