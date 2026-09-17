@@ -1,0 +1,145 @@
+name: Engine compatibility attempt
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      engine_sha:
+        type: string
+        required: true
+      base_repository:
+        type: string
+        required: true
+      base_branch:
+        type: string
+        required: true
+      base_sha:
+        type: string
+        required: true
+      attempt:
+        type: string
+        required: true
+      prior:
+        type: string
+        default: ''
+    secrets:
+      CODEX_API_KEY:
+        required: true
+    outputs:
+      status:
+        value: ${{ jobs.gpu.outputs.status || 'blocked' }}
+      artifact:
+        value: gpu-${{ inputs.attempt }}
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      status: ${{ steps.repair.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ inputs.base_repository }}
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ inputs.engine_sha }}
+          path: engine
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install the repair toolchain
+        run: |
+          python -m pip install 'pytest>=8,<9' packaging numpy
+          npm install --global @openai/codex
+      - uses: actions/download-artifact@v4
+        if: inputs.prior != ''
+        with:
+          name: ${{ inputs.prior }}
+          path: prior
+      - name: Prepare bounded repair
+        id: repair
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PRIOR: ${{ inputs.prior }}
+        run: |
+          args=()
+          if [[ -n "$PRIOR" ]]; then args+=(--prior "$GITHUB_WORKSPACE/prior"); fi
+          python controller/tools/engine_compat_stage.py cpu \
+            --source "$GITHUB_WORKSPACE/candidate" --engine "$GITHUB_WORKSPACE/engine" \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --output "$GITHUB_WORKSPACE/repair-result" "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-${{ inputs.attempt }}
+          path: repair-result/
+          retention-days: 30
+
+  gpu:
+    needs: repair
+    if: needs.repair.outputs.status == 'candidate'
+    # Register only dedicated/ephemeral GPU workers with this label.
+    runs-on: [self-hosted, linux, x64, engine-compat-gpu]
+    timeout-minutes: 50
+    outputs:
+      status: ${{ steps.gpu.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ inputs.base_repository }}
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: cpu-${{ inputs.attempt }}
+          path: prior
+      - name: Independent GPU validation
+        id: gpu
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          RUNTIME_IMAGE: ${{ vars.VLLM_COMPAT_IMAGE }}
+        run: |
+          python3 controller/tools/engine_compat_stage.py gpu \
+            --source "$GITHUB_WORKSPACE/candidate" --prior "$GITHUB_WORKSPACE/prior" \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --image "$RUNTIME_IMAGE" --output "$GITHUB_WORKSPACE/gpu-result"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-${{ inputs.attempt }}
+          path: gpu-result/
+          retention-days: 30
