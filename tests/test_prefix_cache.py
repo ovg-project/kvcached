@@ -50,7 +50,10 @@ import pytest  # noqa: E402
 
 class MockBlockPool:
     """Minimal stand-in for vLLM's BlockPool base class."""
-    pass
+    enable_caching: bool
+
+    def native_cache_enabled(self):
+        return self.enable_caching
 
 
 class MockKVCacheBlock:
@@ -143,6 +146,13 @@ def test_set_block_hash_supports_legacy_writable_property():
     _set_block_hash(block, key)
 
     assert block.block_hash == key
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_pool_caching_attribute(pool_factory, enabled):
+    pool, _ = pool_factory(enable_caching=enabled)
+    assert pool.native_cache_enabled() is enabled
+    assert pool.enable_prefix_cache is enabled
 
 
 # ---------------------------------------------------------------------------

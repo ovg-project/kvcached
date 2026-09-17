@@ -186,6 +186,35 @@ def _should_enable_async_sched(vllm_config: Any) -> bool:
     return bool(getattr(scheduler_config, "async_scheduling", False))
 
 
+def _reshape_mamba_page_tensor(
+    mamba_info: dict, kv_cache_spec: Any, pool_idx: int,
+) -> Any:
+    """Expose raw per-block state bytes for vLLM 0.28's native Mamba binding."""
+    import torch
+
+    page_size = int(kv_cache_spec.page_size_bytes)
+    if page_size != mamba_info["page_size_bytes"] or page_size <= 0:
+        raise ValueError("Mamba page size does not match the shared KV pool")
+    if mamba_info.get("is_contiguous"):
+        raw = mamba_info["buffers"][0]
+        block_stride = mamba_info["block_stride_bytes"]
+        offset = pool_idx * page_size
+    else:
+        raw = mamba_info["buffers"][pool_idx]
+        block_stride = page_size
+        offset = 0
+    if raw.dtype != torch.int8 or raw.ndim != 1 or raw.stride(0) != 1:
+        raise ValueError("Mamba backing storage must be a flat int8 byte buffer")
+    # Interleaved layers need a strided page view, not a compact reshape.
+    # Include the backing view's offset: as_strided offsets are storage-relative.
+    return torch.as_strided(
+        raw,
+        size=(mamba_info["num_blocks"], 1, 1, page_size),
+        stride=(block_stride, page_size, page_size, 1),
+        storage_offset=raw.storage_offset() + offset,
+    )
+
+
 def _reshape_mamba_non_contiguous(
     raw_int8: Any, kv_cache_spec: Any, get_dtype_size: Any,
 ) -> list:
@@ -514,6 +543,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
+                self.enable_caching = enable_caching
                 # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
@@ -1742,6 +1772,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if hasattr(GPUModelRunner, "_reshape_kv_cache_tensors_from_kvcached"):
             return True
 
+        use_mamba_pages = VersionRange(">=0.28.0").contains(self.detected_version or "0")
+
         def _reshape_kv_cache_tensors_from_kvcached(
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
@@ -1769,6 +1801,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                        if layer_name in getattr(self, "runner_only_attn_layers", ()):
+                            continue
+                        if use_mamba_pages:
+                            kv_caches[layer_name] = _reshape_mamba_page_tensor(
+                                mamba_info, kv_cache_spec, pool_idx,
+                            )
+                            continue
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
