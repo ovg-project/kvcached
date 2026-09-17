@@ -120,9 +120,16 @@ def resolve_gpu_device_index(device: Optional[str]) -> int:
     return int(torch.cuda.current_device())
 
 
+# How long stop() waits for the listener thread to finish in-flight work.
+# Successful stop means the thread has exited, so no handler can still be
+# inside a VMM call when the integrations go on to shut the allocator down;
+# on timeout nothing is torn down and the listener is kept for a retry.
+STOP_DRAIN_TIMEOUT_S: float = 5.0
+
+
 class _WorkerListener:
     """One worker's IPC listener: its bound socket, the directory holding it,
-    and the thread serving it."""
+    the thread serving it, and the connections that thread has accepted."""
 
     def __init__(self, rank: int, pp_rank: int, root_dir: str, socket_dir: str,
                  socket_path: str, server_sock: socket.socket) -> None:
@@ -134,22 +141,66 @@ class _WorkerListener:
         self.server_sock = server_sock
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        self._conns: set[socket.socket] = set()
+        self._conn_lock = threading.Lock()
+        self._stopped = False
 
-    def stop(self) -> None:
-        """Stop serving, unlink the socket, and remove the directory once no
-        other worker's socket is left in it."""
-        self.stop_event.set()
-        # accept() only returns on a connection, so make one to let the loop
-        # observe stop_event. If that fails the daemon thread simply dies
-        # with the process; the socket file is unlinked either way.
+    def track_conn(self, conn: socket.socket) -> bool:
+        """Register an accepted connection so stop() can cancel its read.
+        Refused once stop has begun: stop() no longer sees the connection,
+        so the listener must drop it without reading."""
+        with self._conn_lock:
+            if self.stop_event.is_set():
+                return False
+            self._conns.add(conn)
+            return True
+
+    def untrack_conn(self, conn: socket.socket) -> None:
+        with self._conn_lock:
+            self._conns.discard(conn)
+        conn.close()
+
+    def stop(self, drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
+        """Stop serving, then unlink the socket and remove the directory
+        once no other worker's socket is left in it. Returns True when the
+        listener thread has exited and everything is cleaned up.
+
+        Setting stop_event first means no new dispatch can start: reads of
+        already accepted connections are cancelled below, and a connection
+        accepted from now on is dropped unread (track_conn refuses it).
+        The join then drains a handler that is already inside a VMM call,
+        so a successful stop guarantees no handler touches the allocator
+        afterwards. If the thread does not exit in time, nothing is torn
+        down and the caller keeps the listener for a retry.
+        """
+        if self._stopped:
+            return True
+        with self._conn_lock:
+            self.stop_event.set()
+            conns = list(self._conns)
+        for conn in conns:
+            # shutdown, not close: the handler owns the socket and closes it
+            # itself, so its descriptor cannot be reused under the handler.
+            # A blocked recv_msg() wakes with a connection error.
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # the handler is already past this connection
+        # accept() only returns on a connection, so make one to let an idle
+        # loop observe stop_event.
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
                 wake.settimeout(1.0)
                 wake.connect(self.socket_path)
         except OSError:
             pass
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=drain_timeout_s)
+            if thread.is_alive():
+                print(f"Worker {self.rank} IPC listener still busy after "
+                      f"{drain_timeout_s:g}s; keeping it for a retry")
+                return False
         self.server_sock.close()
         try:
             os.unlink(self.socket_path)
@@ -158,7 +209,9 @@ class _WorkerListener:
         _remove_dir_if_empty(self.socket_dir)
         if self.socket_dir != self.root_dir:
             _remove_dir_if_empty(self.root_dir)
+        self._stopped = True
         print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        return True
 
 
 def _remove_dir_if_empty(path: str) -> None:
@@ -174,16 +227,37 @@ _listeners_lock = threading.Lock()
 _atexit_registered = False
 
 
-def stop_worker_listener_threads() -> None:
-    """Stop every worker IPC listener started in this process: close its
-    socket, unlink it, and remove the per-instance socket directory
+def stop_worker_listener_threads(
+        drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
+    """Stop every worker IPC listener started in this process: cancel reads
+    on its accepted connections, drain a handler that is already executing,
+    then unlink the socket and remove the per-instance socket directory
     (issue #476). Safe to call repeatedly and when nothing was started.
+
+    Returns True when every listener fully stopped. A listener whose thread
+    is still busy after drain_timeout_s stays registered with nothing torn
+    down, so a later call (or the interpreter-exit hook) retries it; that
+    case returns False.
     """
     with _listeners_lock:
-        listeners = list(_listeners.values())
+        items = list(_listeners.items())
         _listeners.clear()
-    for listener in listeners:
-        listener.stop()
+    all_stopped = True
+    for key, listener in items:
+        try:
+            stopped = listener.stop(drain_timeout_s)
+        except Exception as e:
+            # Cleanup must not raise out of the integrations' shutdown
+            # paths or the interpreter-exit hook, and one broken listener
+            # must not keep the others from stopping.
+            print(f"Worker {listener.rank} IPC listener cleanup failed: {e}")
+            all_stopped = False
+            continue
+        if not stopped:
+            all_stopped = False
+            with _listeners_lock:
+                _listeners.setdefault(key, listener)
+    return all_stopped
 
 
 def start_worker_listener_thread(
@@ -238,13 +312,17 @@ def start_worker_listener_thread(
                 conn, _ = server_sock.accept()
             except OSError:
                 break  # socket closed by stop()
-            if listener.stop_event.is_set():
+            if not listener.track_conn(conn):
+                # stop() began after this accept and cannot see the
+                # connection any more, so drop it without reading.
                 conn.close()
                 break
             unmap_phase = None
             try:
                 msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
+                if listener.stop_event.is_set():
+                    break  # stop() is waiting; do not start a dispatch
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
                     success, newly_mapped = _map_to_kv_tensors_with_result(msg["offsets"], group_id)
@@ -301,6 +379,8 @@ def start_worker_listener_thread(
                 else:
                     send_msg(conn, {"status": "error", "message": "Unknown command"})
             except Exception as e:
+                if listener.stop_event.is_set():
+                    break  # read cancelled by stop()
                 print(f"Worker {rank} error processing message: {e}")
                 error_type = (
                     "state_consistency" if isinstance(e, StateConsistencyError) else
@@ -310,9 +390,12 @@ def start_worker_listener_thread(
                 response = {"status": "error", "message": str(e), "error_type": error_type}
                 if unmap_phase is not None:
                     response["phase"] = unmap_phase
-                send_msg(conn, response)
+                try:
+                    send_msg(conn, response)
+                except OSError:
+                    pass  # peer went away; nothing to answer any more
             finally:
-                conn.close()
+                listener.untrack_conn(conn)
 
     t = threading.Thread(target=listen_loop, daemon=True)
     listener.thread = t

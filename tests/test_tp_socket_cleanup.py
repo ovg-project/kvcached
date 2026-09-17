@@ -13,10 +13,12 @@ CPU-only: the compiled extension is stubbed if absent.
 """
 
 import os
+import pickle
 import shutil
 import socket
 import sys
 import tempfile
+import threading
 import types
 from unittest import mock
 
@@ -54,6 +56,9 @@ def socket_root(monkeypatch):
                             dir="/tmp" if os.path.isdir("/tmp") else None)
     monkeypatch.setattr(kvcached.utils, "TP_SOCKET_DIR_ROOT", root)
     monkeypatch.setattr(tp_ipc_util, "SOCKET_DIR", get_tp_socket_dir(IPC_NAME))
+    # Other test files start listeners through faked sockets and threads and
+    # never stop them; drop those so stop() here only meets this file's own.
+    tp_ipc_util._listeners.clear()
     yield root
     tp_ipc_util.stop_worker_listener_threads()
     shutil.rmtree(root, ignore_errors=True)
@@ -131,6 +136,152 @@ def test_stop_is_safe_without_listeners(socket_root):
     tp_ipc_util.stop_worker_listener_threads()
     tp_ipc_util.stop_worker_listener_threads()
     assert os.listdir(socket_root) == []
+
+
+def _delayed_map_request():
+    """A map_to_kv_tensors request split into its length header and body."""
+    body = pickle.dumps({"cmd": "map_to_kv_tensors", "offsets": [],
+                         "group_id": 0})
+    return len(body).to_bytes(4, "big"), body
+
+
+def test_stop_cancels_a_read_stalled_in_recv_msg(socket_root, monkeypatch):
+    """A connection accepted before stop() must not dispatch afterwards.
+
+    Repro from review: send the length header, withhold the body, call
+    stop_worker_listener_threads() while the listener sits in recv_msg().
+    The timed join expired, only the listening socket was closed, and
+    delivering the body then ran map_to_kv_tensors() after stop had
+    returned. Stop must instead cancel the read and reap the thread.
+    """
+    mapped = threading.Event()
+
+    def fake_map(*a, **kw):
+        mapped.set()
+        return True
+
+    monkeypatch.setattr(tp_ipc_util, "map_to_kv_tensors", fake_map)
+    in_recv = threading.Event()
+    real_recv = tp_ipc_util.recv_msg
+
+    def recv_and_signal(sock):
+        in_recv.set()
+        return real_recv(sock)
+
+    monkeypatch.setattr(tp_ipc_util, "recv_msg", recv_and_signal)
+
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    header, body = _delayed_map_request()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(path)
+        client.sendall(header)  # recv_msg() now blocks waiting for the body
+        assert in_recv.wait(5)
+
+        tp_ipc_util.stop_worker_listener_threads()
+
+        try:
+            client.sendall(body)
+        except OSError:
+            pass  # stop already shut this connection down
+        thread = listener.thread
+        assert thread is not None
+        thread.join(2)
+        assert not mapped.is_set(), \
+            "map_to_kv_tensors dispatched after stop returned"
+        assert not thread.is_alive(), \
+            "stop returned while the listener was still alive"
+    assert not os.path.exists(path)
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+
+
+def test_stop_drains_a_handler_executing_a_backend_operation(
+        socket_root, monkeypatch):
+    """stop() must not return while a handler is inside a VMM operation.
+
+    The old stop joined for one second and then tore down unconditionally,
+    so an operation slower than that was still touching the allocator when
+    the integrations moved on to _shutdown_kvcached_impl().
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_map(*a, **kw):
+        entered.set()
+        release.wait(10)
+        finished.set()
+        return True
+
+    monkeypatch.setattr(tp_ipc_util, "map_to_kv_tensors", slow_map)
+
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    header, body = _delayed_map_request()
+    outcome = {}
+
+    def call_stop():
+        tp_ipc_util.stop_worker_listener_threads()
+        outcome["map_finished_first"] = finished.is_set()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(path)
+        client.sendall(header + body)
+        assert entered.wait(5)
+
+        stopper = threading.Thread(target=call_stop)
+        stopper.start()
+        # Longer than the old 1.0 s join timeout: the old stop had already
+        # returned by now, the draining stop is still waiting.
+        stopper.join(1.5)
+        assert stopper.is_alive(), \
+            "stop returned while a handler was still executing"
+
+        release.set()
+        stopper.join(5)
+        assert not stopper.is_alive()
+        assert outcome["map_finished_first"] is True
+    assert not os.path.exists(path)
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+
+
+def test_incomplete_stop_retains_the_listener_and_a_retry_finishes(
+        socket_root, monkeypatch):
+    """If draining times out, stop must keep the listener state for a retry
+    instead of unlinking the socket under a still-running handler."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def stuck_map(*a, **kw):
+        entered.set()
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(tp_ipc_util, "map_to_kv_tensors", stuck_map)
+
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    header, body = _delayed_map_request()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(path)
+        client.sendall(header + body)
+        assert entered.wait(5)
+
+        assert tp_ipc_util.stop_worker_listener_threads(
+            drain_timeout_s=0.1) is False
+        assert tp_ipc_util._listeners[(0, 0)] is listener
+        assert os.path.exists(path)  # no teardown under a live handler
+
+        release.set()
+        assert tp_ipc_util.stop_worker_listener_threads() is True
+    assert listener.thread is not None and not listener.thread.is_alive()
+    assert not os.path.exists(path)
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+    assert tp_ipc_util._listeners == {}
 
 
 def test_worker_shutdown_stops_the_listener(monkeypatch):
