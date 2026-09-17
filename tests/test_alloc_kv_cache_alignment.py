@@ -15,8 +15,14 @@ half for the K/V regions and asserts the ftensor byte size is a multiple of
   automatically ``2 * PAGE_SIZE``-aligned.
 
 This pins the invariant for both the vLLM and SGLang integrations without a
-GPU: it stubs ``torch.cuda.get_device_properties`` and intercepts the ``size``
+GPU: it stubs the interface's device module and intercepts the ``size``
 argument passed to ``create_kv_tensors`` (== ftensor_bytes_per_layer).
+
+The stub replaces ``get_device_module`` rather than ``torch.cuda``, because
+``interfaces.py`` resolves the module at call time -- it is ``torch.xpu`` on an
+XPU build. Patching ``torch.cuda`` only works on a CUDA/HIP build and silently
+reaches real hardware otherwise. The device string below is arbitrary for the
+same reason: nothing ever looks at it once the device module is fake.
 """
 import importlib
 
@@ -49,6 +55,19 @@ class _FakeProps:
         self.total_memory = total_memory
 
 
+class _FakeDeviceModule:
+    """Stands in for whatever ``get_device_module()`` would return."""
+
+    def __init__(self, total_memory):
+        self._total_memory = total_memory
+
+    def is_available(self):
+        return True
+
+    def get_device_properties(self, device=None):
+        return _FakeProps(self._total_memory)
+
+
 def _kvcache_shape(integration, attention_type):
     """A shape valid enough to reach the create_kv_tensors call."""
     if attention_type == "MLA":
@@ -78,8 +97,8 @@ def test_ftensor_bytes_aligned_to_2x_page_size(monkeypatch, integration,
     gpu_mem_bytes = gpu_gb * (1024 ** 3)
 
     monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
-    monkeypatch.setattr(torch.cuda, "get_device_properties",
-                        lambda dev=None: _FakeProps(gpu_mem_bytes))
+    monkeypatch.setattr(mod, "get_device_module",
+                        lambda device=None: _FakeDeviceModule(gpu_mem_bytes))
 
     def _fake_create_kv_tensors(size, *args, **kwargs):
         raise _CapturedSize(size)

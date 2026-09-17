@@ -19,6 +19,7 @@ static constexpr size_t kStartAddr = 0x1f0'000'000'000;
 
 static constexpr page_id_t INV_PAGE_ID = -1;
 static constexpr page_id_t ZERO_PAGE_ID = INV_PAGE_ID - 1;
+static constexpr page_id_t ANCHOR_PAGE_ID = ZERO_PAGE_ID - 1;
 
 static constexpr std::string_view k_prefix = "k_";
 static constexpr std::string_view v_prefix = "v_";

@@ -186,12 +186,17 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
 
 
 def get_total_gpu_memory() -> int:
-    """Return total memory of CUDA device 0 or 0 if CUDA unavailable."""
-    try:
-        import torch  # imported lazily to avoid heavy import cost when not needed
+    """Return total memory of GPU 0, or 0 if no accelerator is available.
 
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_memory
+    Resolves to ``torch.cuda`` on NVIDIA/ROCm and ``torch.xpu`` on Intel.
+    """
+    try:
+        # imported lazily to avoid heavy import cost when not needed
+        from kvcached.utils import get_device_module
+
+        device_module = get_device_module()
+        if device_module.is_available():
+            return device_module.get_device_properties(0).total_memory
     except Exception:  # pragma: no cover – best-effort helper
         pass
     return 0

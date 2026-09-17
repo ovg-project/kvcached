@@ -4,6 +4,7 @@
 import importlib.util
 import logging
 import os
+from typing import Optional
 
 
 class KVCachedConfigError(RuntimeError):
@@ -153,24 +154,129 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
 
 
+def _detect_process_backend() -> str:
+    """Return the accelerator family this process was built for.
+
+    Mirrors ``setup.py``'s build-time detection so the Python layer and the
+    compiled extension always agree on the backend. ``KVCACHED_BACKEND``
+    overrides both. Note that ``hip`` is reported here but addressed as ``cuda``
+    everywhere else, because PyTorch-ROCm presents AMD GPUs as CUDA devices.
+    """
+    override = os.getenv("KVCACHED_BACKEND", "").strip().lower()
+    if override in ("cuda", "hip", "xpu"):
+        return override
+    try:
+        import torch
+        if getattr(torch.version, "hip", None):
+            return "hip"
+        if getattr(torch.version, "cuda", None):
+            return "cuda"
+        if getattr(torch.version, "xpu", None):
+            return "xpu"
+    except Exception:
+        # torch is absent (e.g. the dependency-isolated CPU test suite); the
+        # value is unused in that case.
+        pass
+    return "cuda"
+
+
+_PROCESS_BACKEND = _detect_process_backend()
+
+
+def _device_type_of(device) -> Optional[str]:
+    """Extract the PyTorch device-type prefix from a device-ish value.
+
+    Returns ``None`` when the value carries no type information -- ``None``
+    itself, or a bare integer index, both of which PyTorch accepts wherever a
+    device is expected.
+    """
+    if device is None:
+        return None
+    # torch.device and anything else exposing .type (never a plain int).
+    device_type = getattr(device, "type", None)
+    if isinstance(device_type, str):
+        return device_type.lower() or None
+    if isinstance(device, str):
+        return device.split(":", 1)[0].strip().lower() or None
+    return None
+
+
+def _detect_accelerator_backend(device=None) -> str:
+    """Return the accelerator family to use: ``cuda``, ``hip`` or ``xpu``.
+
+    Without ``device`` this answers for the process as a whole, from the build
+    (see ``_detect_process_backend``). Pass ``device`` -- a device string,
+    ``torch.device`` or index -- to ask about a specific device instead, so a
+    caller that already knows where it is allocating is not at the mercy of the
+    process-wide guess.
+
+    A device only overrides what is genuinely a property of the device. It
+    cannot decide CUDA vs ROCm: PyTorch-ROCm spells AMD devices ``cuda`` too, so
+    for a ``cuda`` device the process answer is kept when it is one of the two.
+    A ``cpu`` device, or anything with no type information, likewise falls back
+    to the process answer -- kvcached is being asked about an accelerator it was
+    not handed.
+    """
+    device_type = _device_type_of(device)
+    if device_type == "xpu":
+        return "xpu"
+    if device_type == "hip":
+        return "hip"
+    if device_type == "cuda":
+        return _PROCESS_BACKEND if _PROCESS_BACKEND in ("cuda", "hip") else "cuda"
+    return _PROCESS_BACKEND
+
+
+ACCELERATOR_BACKEND = _detect_accelerator_backend()
+IS_XPU_BACKEND = ACCELERATOR_BACKEND == "xpu"
+
+
+def get_device_type(device=None) -> str:
+    """PyTorch device-string prefix for ``device``'s backend: ``xpu`` or ``cuda``."""
+    return "xpu" if _detect_accelerator_backend(device) == "xpu" else "cuda"
+
+
+def get_device_module(device=None):
+    """Return the ``torch`` submodule that owns ``device``.
+
+    ``torch.cuda`` covers both NVIDIA and AMD (ROCm) but not Intel, so every
+    device/capacity query in kvcached goes through this rather than hardcoding
+    ``torch.cuda``. Pass the device you are about to query whenever you have
+    one: without it the module comes from the process-wide backend, which is a
+    guess about a machine that may host more than one accelerator family.
+    """
+    import torch
+    return torch.xpu if get_device_type(device) == "xpu" else torch.cuda
+
+
+def get_current_device_str() -> str:
+    """Device string for the calling process's current accelerator."""
+    return f"{get_device_type()}:{get_device_module().current_device()}"
+
+
 def _default_contiguous_layout() -> bool:
-    """Default KV-cache layout: contiguous on CUDA, non-contiguous on HIP/ROCm.
+    """Default KV-cache layout: contiguous on CUDA, non-contiguous on HIP and XPU.
 
     An explicit ``KVCACHED_CONTIGUOUS_LAYOUT`` always wins. Otherwise we pick
     non-contiguous on ROCm: the contiguous (compound-page) layout hands the
     attention backend strided/interleaved per-layer KV tensors, which vLLM's
     ROCm attention path (``split_kv_cache`` + paged kernels) reads incorrectly,
     whereas CUDA's FlashAttention/FlashInfer tolerate it.
+
+    XPU takes the same conservative default for now. Whether Intel's attention
+    backends tolerate the strided layout has not been measured on hardware, and
+    the per-layer layout is the one closest to what an unpatched engine
+    allocates. Flip this once ``test_hybrid_contiguous_layout.py`` and a
+    generation-parity run pass on an Intel GPU, and record the evidence here as
+    the ROCm note above does.
     """
     explicit = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT")
     if explicit is not None:
         return explicit.lower() == "true"
-    try:
-        import torch
-        if getattr(torch.version, "hip", None):
-            return False  # ROCm/HIP: non-contiguous is required for correctness
-    except Exception:
-        pass
+    if ACCELERATOR_BACKEND in ("hip", "xpu"):
+        # ROCm/HIP: non-contiguous is required for correctness.
+        # XPU: unvalidated on hardware; prefer the safer layout.
+        return False
     return True
 
 
@@ -192,17 +298,44 @@ _LEVEL_TO_COLOR = {
 _COLOR_RESET = "\033[0m"
 
 
+# Device types kvcached can back with VMM. ``hip`` is accepted as an alias for
+# ``cuda`` (see normalize_gpu_device).
+GPU_DEVICE_TYPES = ("cuda", "hip", "xpu")
+
+
 def normalize_gpu_device(device: str) -> str:
-    """Map a ``hip[:N]`` device string to ``cuda[:N]``.
+    """Map a ``hip[:N]`` device string to ``cuda[:N]``; pass others through.
 
     PyTorch-ROCm and the C++ extension (``c10::Device``) address AMD GPUs as
     ``cuda``; kvcached's integration accepts ``hip`` strings, so normalize them
-    before handing the device to any ``torch.cuda`` API or ``create_kv_tensors``.
+    before handing the device to ``get_device_module()`` or
+    ``create_kv_tensors``.
+
+    ``xpu[:N]`` is returned unchanged: Intel GPUs are a distinct PyTorch device
+    type (``c10::DeviceType::XPU``), addressed by ``torch.xpu`` and parsed as-is
+    by ``c10::Device``. Rewriting it to ``cuda`` would misroute the allocation.
     """
     dev = str(device)
     if dev.lower().startswith("hip"):
         return "cuda" + dev[3:]
     return dev
+
+
+def is_gpu_device_str(device) -> bool:
+    """Return True if ``device`` names an accelerator kvcached can back with VMM.
+
+    Accepts ``cuda``, ``hip`` and ``xpu``, bare or with a ``:N`` index, and
+    tolerates ``torch.device`` objects via ``str()``.
+
+    The device type is matched exactly rather than as a prefix: on ``cudafoo``
+    the SGLang patch would otherwise install the elastic allocator for a device
+    it cannot serve and fail later, instead of declining here and leaving SGLang
+    its own allocator.
+    """
+    dev_type, sep, index = str(device).lower().partition(":")
+    if dev_type not in GPU_DEVICE_TYPES:
+        return False
+    return not sep or index.isdigit()
 
 
 def align_to(x: int, a: int) -> int:
