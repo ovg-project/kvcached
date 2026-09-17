@@ -134,8 +134,15 @@ private:
   void resize_watcher();
 
   // Internal methods
-  void map_pages(const std::vector<page_id_t> &page_ids);
+  // Page mapping is split so the expensive physical allocation can run on the
+  // background prealloc thread while the cheap VA edit runs on the main thread
+  // at a GPU-idle point. prepare_pages() allocates; commit_pages() maps.
+  void prepare_pages(const std::vector<page_id_t> &page_ids);
+  void commit_pages(const std::vector<page_id_t> &page_ids);
   void unmap_pages(const std::vector<page_id_t> &page_ids);
+  std::vector<offset_t> page_offsets_(const std::vector<page_id_t> &page_ids)
+      const;
+  bool uses_broadcast_() const;
   int64_t get_num_inuse_pages_unlocked() const;
   PageState get_page_state_unlocked() const;
   void update_memory_usage_unlocked();
