@@ -1,16 +1,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import types
+
 import pytest
+import torch
 
 from kvcached.integration.sglang.patches import ElasticMambaPoolPatch
 
-torch = pytest.importorskip("torch")
-memory_pool = pytest.importorskip("sglang.srt.mem_cache.memory_pool")
+
+class MambaSlotAllocator:
+    """Stand-in used to make the SGLang 0.5.13 split detectable."""
 
 
 class FakeManager:
     def __init__(self, size):
+        self.size = size
         self.free_ids = list(range(1, size + 1))
         self.alloc_calls = []
         self.free_calls = []
@@ -32,8 +37,7 @@ class FakeManager:
 
     def clear(self):
         self.clear_calls += 1
-        size = len(self.free_ids) + sum(self.alloc_calls) - sum(map(len, self.free_calls))
-        self.free_ids = list(range(1, size + 1))
+        self.free_ids = list(range(1, self.size + 1))
 
 
 class FakePool:
@@ -63,10 +67,33 @@ class FakePool:
 
 
 @pytest.fixture
-def allocator_cls():
+def allocator_cls(monkeypatch):
+    class FakeMambaPool:
+        State = object
+
+    class FakeHybridReqToTokenPool:
+        def _init_mamba_pool(self):
+            # The production patch detects the allocator split through this
+            # function's globals, matching SGLang 0.5.13 and newer.
+            self.mamba_allocator = MambaSlotAllocator()
+
+    memory_pool = types.ModuleType("sglang.srt.mem_cache.memory_pool")
+    setattr(memory_pool, "MambaPool", FakeMambaPool)
+    setattr(memory_pool, "HybridReqToTokenPool", FakeHybridReqToTokenPool)
+
     patch = ElasticMambaPoolPatch()
+    monkeypatch.setattr(
+        patch.version_manager, "detect_version", lambda library: "0.5.13"
+    )
     assert patch.apply(memory_pool)
     return memory_pool.ElasticMambaSlotAllocator
+
+
+def assert_free_slot_ownership(allocator, pool):
+    pool_free_ids = pool.kvcached_allocator.free_ids
+    assert len(pool_free_ids) == len(set(pool_free_ids))
+    assert allocator.free_slots.tolist() == sorted(pool_free_ids)
+    assert allocator.available_size() == len(pool_free_ids)
 
 
 def test_alloc_and_free_delegate_to_kvcached(allocator_cls):
@@ -126,3 +153,51 @@ def test_free_slots_debug_view_matches_manager_ownership(allocator_cls):
 
     allocator.free(slots[:1])
     assert allocator.free_slots.tolist() == [1, 3, 4]
+
+
+def test_failed_group_allocation_preserves_ownership_and_recovers(allocator_cls):
+    pool = FakePool(2)
+    allocator = allocator_cls(2, "cpu", pool)
+    held = allocator.alloc(2)
+
+    allocator.alloc_group_begin(1)
+
+    assert allocator._alloc_iter is None
+    assert pool.kvcached_allocator.alloc_calls == [2, 1]
+    assert pool.kvcached_allocator.free_ids == []
+    assert_free_slot_ownership(allocator, pool)
+
+    allocator.free(held[:1])
+    recovered = allocator.alloc(1)
+    allocator.alloc_group_end()
+
+    assert recovered.tolist() == [1]
+    assert pool.kvcached_allocator.alloc_calls == [2, 1, 1]
+    assert allocator._alloc_iter is None
+    assert_free_slot_ownership(allocator, pool)
+
+    allocator.free(torch.cat((recovered, held[1:])))
+    assert_free_slot_ownership(allocator, pool)
+
+
+def test_clear_discards_partial_group_before_fresh_allocation(allocator_cls):
+    pool = FakePool(4)
+    allocator = allocator_cls(4, "cpu", pool)
+
+    allocator.alloc_group_begin(3)
+    assert allocator.alloc(1).tolist() == [1]
+    assert allocator.free_slots.tolist() == [4]
+
+    allocator.clear()
+
+    assert pool.clear_calls == 1
+    assert allocator._alloc_iter is None
+    assert_free_slot_ownership(allocator, pool)
+
+    fresh = torch.cat([allocator.alloc(1) for _ in range(4)])
+    assert fresh.tolist() == [1, 2, 3, 4]
+    assert len(set(fresh.tolist())) == 4
+    assert_free_slot_ownership(allocator, pool)
+
+    allocator.free(fresh)
+    assert_free_slot_ownership(allocator, pool)
