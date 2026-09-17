@@ -11,6 +11,13 @@ down the fix: EngineCore.shutdown() now ends in shutdown_kvcached(), which
 shuts down every registered pool, and KVCacheManager.shutdown() stops the
 prealloc thread and unlinks the segment itself.
 
+A server-level SIGTERM usually kills the engine before that unlink runs:
+run_engine_core() restores SIGTERM to SIG_DFL before EngineCore.shutdown(),
+so the terminate() from MPClient.shutdown()'s process manager ends the
+engine mid-teardown (with --shutdown-timeout 0 a SIGKILL follows). The
+client outlives the engines, so MPClient.shutdown() now also removes
+whatever segment they left behind, through unlink_default_ipc_segment().
+
 CPU-only: torch, posix_ipc and the compiled extension are stubbed.
 """
 
@@ -22,6 +29,7 @@ from unittest import mock
 
 import pytest
 
+from kvcached import utils as kv_utils
 from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     get_registered_kv_cache_pools,
@@ -142,6 +150,93 @@ def test_engine_core_without_shutdown_is_left_alone(vllm_modules):
 
     assert patches.EngineCorePatch().patch_engine_shutdown(engine_mod)
     assert not hasattr(engine_mod.EngineCore, "shutdown")
+
+
+def _fake_client_module(shutdown=None):
+    client_mod = types.ModuleType("mock_client_mod")
+
+    class FakeMPClient:
+        pass
+
+    if shutdown is not None:
+        FakeMPClient.shutdown = shutdown  # type: ignore[attr-defined]
+    setattr(client_mod, "MPClient", FakeMPClient)
+    return client_mod
+
+
+def test_mp_client_shutdown_unlinks_the_segment_once_the_engines_are_stopped(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "unlink_default_ipc_segment", lambda: calls.append("unlink")
+    )
+    client_mod = _fake_client_module(lambda self: calls.append("vllm"))
+
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)  # idempotent
+    client_mod.MPClient().shutdown()
+
+    assert calls == ["vllm", "unlink"]
+
+
+def test_mp_client_shutdown_unlinks_even_if_vllm_shutdown_raises(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    unlink = mock.Mock()
+    monkeypatch.setattr(kv_utils, "unlink_default_ipc_segment", unlink)
+
+    def failing_shutdown(self):
+        raise RuntimeError("engine manager close failed")
+
+    client_mod = _fake_client_module(failing_shutdown)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+
+    with pytest.raises(RuntimeError, match="engine manager"):
+        client_mod.MPClient().shutdown()
+    unlink.assert_called_once_with()
+
+
+def test_mp_client_shutdown_does_not_mask_vllm_result_when_the_unlink_fails(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(
+        kv_utils, "unlink_default_ipc_segment",
+        mock.Mock(side_effect=RuntimeError("segment busy")),
+    )
+    client_mod = _fake_client_module(lambda self: "done")
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+
+    assert client_mod.MPClient().shutdown() == "done"
+
+
+def test_mp_client_shutdown_patch_is_inert_when_kvcached_is_disabled(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: False)
+    unlink = mock.Mock()
+    monkeypatch.setattr(kv_utils, "unlink_default_ipc_segment", unlink)
+    client_mod = _fake_client_module(lambda self: None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+
+    client_mod.MPClient().shutdown()
+
+    unlink.assert_not_called()
+
+
+def test_mp_client_without_shutdown_is_left_alone(vllm_modules):
+    _, patches = vllm_modules
+    client_mod = _fake_client_module()
+
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    assert not hasattr(client_mod.MPClient, "shutdown")
 
 
 def test_shutdown_kvcached_shuts_down_registered_pools_before_the_allocator(
@@ -271,6 +366,29 @@ def test_manager_shutdown_unlinks_even_if_the_prealloc_thread_will_not_stop(shm_
     manager.shutdown()
 
     assert not segment.exists()
+
+
+def test_unlink_default_ipc_segment_removes_the_segment(monkeypatch, tmp_path):
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "kvcached_test_477")
+    segment = tmp_path / "kvcached_test_477"
+    segment.write_bytes(b"\0" * 24)
+
+    assert kv_utils.unlink_default_ipc_segment() is True
+    assert not segment.exists()
+    assert kv_utils.unlink_default_ipc_segment() is False  # already gone
+
+
+def test_unlink_default_ipc_segment_warns_but_does_not_raise_on_os_error(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "kvcached_test_477")
+    monkeypatch.setattr(
+        kv_utils.os, "unlink", mock.Mock(side_effect=OSError("permission denied"))
+    )
+
+    assert kv_utils.unlink_default_ipc_segment() is False
 
 
 if __name__ == "__main__":

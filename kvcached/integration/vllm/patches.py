@@ -1036,6 +1036,69 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         return True
 
 
+class MPClientPatch(VersionAwarePatch, BasePatch):
+    """Patch MPClient.shutdown to remove the segment killed engines leave"""
+
+    library = "vllm"
+    target_module = "vllm.v1.engine.core_client"
+    target_class = "MPClient"
+    patch_name = "mp_client"
+
+    def apply(self, client_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_client_shutdown(client_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_client_shutdown(self, client_mod: types.ModuleType) -> bool:
+        """Patch MPClient.shutdown.
+
+        The EngineCore-side unlink (EngineCorePatch) only runs when
+        EngineCore.shutdown() completes, and on a server-level SIGTERM it
+        usually cannot: run_engine_core() restores SIGTERM to SIG_DFL
+        before calling EngineCore.shutdown(), and MPClient.shutdown()'s
+        process manager terminate()s the engine during that teardown (with
+        --shutdown-timeout 0 a SIGKILL follows immediately), killing it
+        before the unlink runs (issue #477). The client outlives the
+        engines, so once the original shutdown has stopped them, remove
+        whatever segment they left behind.
+        """
+        MPClient = self._get_target_class(client_mod)
+        if MPClient is None:
+            return False
+
+        original_shutdown = getattr(MPClient, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "MPClient.shutdown not found; segments left by killed engines are not removed")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("MPClient.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.utils import unlink_default_ipc_segment
+
+                        unlink_default_ipc_segment()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to remove the KV cache limit segment: %s", e)
+
+        self._mark_as_patched(_patched_client_shutdown, "shutdown")
+        MPClient.shutdown = _patched_client_shutdown  # type: ignore[assignment]
+        return True
+
+
 class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
     """Patch KVCacheCoordinator to use ElasticBlockPool"""
 
