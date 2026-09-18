@@ -380,6 +380,8 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     assert worker.determine_available_memory() == 530
     assert worker.non_torch_memory == 0
     assert worker.peak_activation_memory == 70
+    # The 0.29 warmup consumer reconstructs non-KV usage from these fields.
+    assert worker.total_consumed + worker.peak_activation_memory == 270
     assert worker.cudagraph_memory_estimate == 30
     profile_run.assert_called_once_with()
     profile_cudagraph.assert_called_once_with()
