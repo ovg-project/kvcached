@@ -2,16 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import atexit
 import os
 import pickle
 import socket
 import threading
 import uuid
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Tuple, cast
 
 from kvcached import vmm_ops
 from kvcached.errors import MapQuarantinedError, StateConsistencyError
-from kvcached.utils import DEFAULT_IPC_NAME, normalize_gpu_device
+from kvcached.utils import get_tp_socket_dir, normalize_gpu_device
 
 kv_tensors_created = vmm_ops.kv_tensors_created
 map_to_kv_tensors = vmm_ops.map_to_kv_tensors
@@ -36,23 +37,11 @@ def _sync_before_unmap() -> None:
         torch.cuda.synchronize()
 
 
-def _get_socket_dir_name() -> str:
-    """
-    Build a human-readable, IPC-name-based directory with a short hash suffix.
-
-    This keeps the original text-based IPC name visible while adding a hash
-    for extra uniqueness. The hash is deterministic so all workers in the same
-    engine instance agree on the directory.
-    """
-    # Deterministic short hash derived from the base name
-    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, DEFAULT_IPC_NAME).hex[:8]
-    return f"kvcached-tp-{DEFAULT_IPC_NAME}-{suffix}"
-
-
-# Socket directory for tensor parallel (TP) worker communication.
-# Unix domain socket paths are limited to 108 characters on Linux, so we keep
-# the directory name short and validate the final socket path length below.
-SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
+# Socket directory for tensor parallel (TP) worker communication:
+# /tmp/kvcached-tp-<ipc_name>-<hash>. Unix domain socket paths are limited to
+# 108 characters on Linux, so the name is kept short and the final socket path
+# length is validated below.
+SOCKET_DIR = get_tp_socket_dir()
 
 
 def _target_pp_ranks(pp_rank: int) -> list[int]:
@@ -133,6 +122,146 @@ def resolve_gpu_device_index(device: Optional[str]) -> int:
     return int(torch.cuda.current_device())
 
 
+# How long stop() waits for the listener thread to finish in-flight work.
+# Successful stop means the thread has exited, so no handler can still be
+# inside a VMM call when the integrations go on to shut the allocator down;
+# on timeout nothing is torn down and the listener is kept for a retry.
+STOP_DRAIN_TIMEOUT_S: float = 5.0
+
+
+class _WorkerListener:
+    """One worker's IPC listener: its bound socket, the directory holding it,
+    the thread serving it, and the connections that thread has accepted."""
+
+    def __init__(self, rank: int, pp_rank: int, root_dir: str, socket_dir: str,
+                 socket_path: str, server_sock: socket.socket) -> None:
+        self.rank = rank
+        self.pp_rank = pp_rank
+        self.root_dir = root_dir
+        self.socket_dir = socket_dir
+        self.socket_path = socket_path
+        self.server_sock = server_sock
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self._conns: set[socket.socket] = set()
+        self._conn_lock = threading.Lock()
+        self._stopped = False
+
+    def track_conn(self, conn: socket.socket) -> bool:
+        """Register an accepted connection so stop() can cancel its read.
+        Refused once stop has begun: stop() no longer sees the connection,
+        so the listener must drop it without reading."""
+        with self._conn_lock:
+            if self.stop_event.is_set():
+                return False
+            self._conns.add(conn)
+            return True
+
+    def untrack_conn(self, conn: socket.socket) -> None:
+        with self._conn_lock:
+            self._conns.discard(conn)
+        conn.close()
+
+    def stop(self, drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
+        """Stop serving, then unlink the socket and remove the directory
+        once no other worker's socket is left in it. Returns True when the
+        listener thread has exited and everything is cleaned up.
+
+        Setting stop_event first means no new dispatch can start: reads of
+        already accepted connections are cancelled below, and a connection
+        accepted from now on is dropped unread (track_conn refuses it).
+        The join then drains a handler that is already inside a VMM call,
+        so a successful stop guarantees no handler touches the allocator
+        afterwards. If the thread does not exit in time, nothing is torn
+        down and the caller keeps the listener for a retry.
+        """
+        if self._stopped:
+            return True
+        with self._conn_lock:
+            self.stop_event.set()
+            conns = list(self._conns)
+        for conn in conns:
+            # shutdown, not close: the handler owns the socket and closes it
+            # itself, so its descriptor cannot be reused under the handler.
+            # A blocked recv_msg() wakes with a connection error.
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # the handler is already past this connection
+        # accept() only returns on a connection, so make one to let an idle
+        # loop observe stop_event.
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                wake.settimeout(1.0)
+                wake.connect(self.socket_path)
+        except OSError:
+            pass
+        thread = self.thread
+        if thread is threading.current_thread():
+            return False  # A handler cannot drain itself.
+        if thread is not None:
+            thread.join(timeout=drain_timeout_s)
+            if thread.is_alive():
+                print(f"Worker {self.rank} IPC listener still busy after "
+                      f"{drain_timeout_s:g}s; keeping it for a retry")
+                return False
+        self.server_sock.close()
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        _remove_dir_if_empty(self.socket_dir)
+        if self.socket_dir != self.root_dir:
+            _remove_dir_if_empty(self.root_dir)
+        self._stopped = True
+        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        return True
+
+
+def _remove_dir_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Still holds another worker's socket, or already gone.
+        pass
+
+
+_listeners: Dict[Tuple[int, int], _WorkerListener] = {}
+_listeners_lock = threading.Lock()
+_atexit_registered = False
+
+
+def stop_worker_listener_threads(
+        drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
+    """Stop every worker IPC listener started in this process: cancel reads
+    on its accepted connections, drain a handler that is already executing,
+    then unlink the socket and remove the per-instance socket directory
+    (issue #476). Safe to call repeatedly and when nothing was started.
+
+    Returns True when every listener fully stopped. A listener whose thread
+    is still busy after drain_timeout_s stays registered with nothing torn
+    down, so a later call (or the interpreter-exit hook) retries it; that
+    case returns False.
+    """
+    with _listeners_lock:
+        all_stopped = True
+        # Keep entries visible until drained, including after cleanup errors.
+        # Serializing lifecycle calls also prevents another stop from seeing
+        # an empty registry while this call is still draining its handlers.
+        for key, listener in list(_listeners.items()):
+            try:
+                stopped = listener.stop(drain_timeout_s)
+            except Exception as e:
+                print(f"Worker {listener.rank} IPC listener cleanup failed: {e}")
+                all_stopped = False
+                continue
+            if stopped:
+                del _listeners[key]
+            else:
+                all_stopped = False
+        return all_stopped
+
+
 def start_worker_listener_thread(
     rank: int,
     pp_rank: int = 0,
@@ -145,8 +274,31 @@ def start_worker_listener_thread(
     listener restores that CUDA device inside the new thread before executing
     CUDA-backed map or unmap operations because CUDA's current device is
     thread-local.
+
+    The listener is registered so that stop_worker_listener_threads() (called
+    from the integrations' shutdown paths and at interpreter exit) can unlink
+    the socket and remove the directory again.
     """
-    socket_dir = os.path.join(SOCKET_DIR, f"pp{pp_rank}") if pp_rank > 0 else SOCKET_DIR
+    with _listeners_lock:
+        _start_worker_listener_thread(rank, pp_rank, device_index)
+
+
+def _start_worker_listener_thread(
+    rank: int, pp_rank: int, device_index: Optional[int],
+) -> None:
+    """Start or replace a listener while holding the lifecycle lock."""
+    global _atexit_registered
+    key = (rank, pp_rank)
+    previous = _listeners.get(key)
+    if previous is not None:
+        if not previous.stop():
+            raise RuntimeError(
+                f"Cannot replace worker {rank} IPC listener while it is still active"
+            )
+        del _listeners[key]
+
+    root_dir = SOCKET_DIR
+    socket_dir = os.path.join(root_dir, f"pp{pp_rank}") if pp_rank > 0 else root_dir
     os.makedirs(socket_dir, exist_ok=True)
     socket_path = get_worker_socket_path(rank, pp_rank)
 
@@ -159,6 +311,8 @@ def start_worker_listener_thread(
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.bind(socket_path)
     server_sock.listen()
+    listener = _WorkerListener(rank, pp_rank, root_dir, socket_dir, socket_path,
+                               server_sock)
 
     def listen_loop():
         if device_index is not None:
@@ -168,11 +322,21 @@ def start_worker_listener_thread(
             torch.cuda.set_device(device_index)
         print(f"Worker {rank} IPC listener started at {socket_path}")
         while True:
-            conn, _ = server_sock.accept()
+            try:
+                conn, _ = server_sock.accept()
+            except OSError:
+                break  # socket closed by stop()
+            if not listener.track_conn(conn):
+                # stop() began after this accept and cannot see the
+                # connection any more, so drop it without reading.
+                conn.close()
+                break
             unmap_phase = None
             try:
                 msg: Message = recv_msg(conn)
                 # print(f"Worker {rank} received message: {msg}")
+                if listener.stop_event.is_set():
+                    break  # stop() is waiting; do not start a dispatch
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
                     success, newly_mapped = _map_to_kv_tensors_with_result(msg["offsets"], group_id)
@@ -229,6 +393,8 @@ def start_worker_listener_thread(
                 else:
                     send_msg(conn, {"status": "error", "message": "Unknown command"})
             except Exception as e:
+                if listener.stop_event.is_set():
+                    break  # read cancelled by stop()
                 print(f"Worker {rank} error processing message: {e}")
                 error_type = (
                     "state_consistency" if isinstance(e, StateConsistencyError) else
@@ -238,12 +404,20 @@ def start_worker_listener_thread(
                 response = {"status": "error", "message": str(e), "error_type": error_type}
                 if unmap_phase is not None:
                     response["phase"] = unmap_phase
-                send_msg(conn, response)
+                try:
+                    send_msg(conn, response)
+                except OSError:
+                    pass  # peer went away; nothing to answer any more
             finally:
-                conn.close()
+                listener.untrack_conn(conn)
 
     t = threading.Thread(target=listen_loop, daemon=True)
+    listener.thread = t
     t.start()
+    _listeners[key] = listener
+    if not _atexit_registered:
+        atexit.register(stop_worker_listener_threads)
+        _atexit_registered = True
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.
