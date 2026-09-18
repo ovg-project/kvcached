@@ -1,15 +1,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import hashlib
 import os
 import shutil
 import sys
+import zipfile
 from pathlib import Path
 from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
+from setuptools.command.editable_wheel import editable_wheel
 from setuptools.command.install import install
 
 try:
@@ -156,9 +160,51 @@ class DevelopWithPth(develop):
         print(f"Installed {PTH_FILE} for editable install to: {pth_dst}")
 
 
+def add_pth_to_wheel(wheel_path: str) -> None:
+    """Append the .pth (and its RECORD entry) to the root of a built wheel.
+
+    Files at the root of a wheel are installed into site-packages, which is
+    the only place the interpreter executes .pth files.
+    """
+    pth_src = os.path.join(SCRIPT_PATH, PTH_FILE)
+    with open(pth_src, "rb") as f:
+        data = f.read()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+    record_line = f"{PTH_FILE},sha256={digest.rstrip(b'=').decode()},{len(data)}\n"
+
+    tmp_path = wheel_path + ".tmp"
+    with zipfile.ZipFile(wheel_path) as src, zipfile.ZipFile(
+            tmp_path, "w", zipfile.ZIP_DEFLATED) as dst:
+        record_found = False
+        for item in src.infolist():
+            payload = src.read(item.filename)
+            if item.filename.endswith(".dist-info/RECORD"):
+                record_found = True
+                payload += record_line.encode()
+            dst.writestr(item, payload)
+        if not record_found:
+            raise RuntimeError(f"no RECORD in {wheel_path}")
+        dst.writestr(PTH_FILE, data)
+    os.replace(tmp_path, wheel_path)
+
+
+# PEP 660 editable installs (pip install -e . with setuptools>=64) build an
+# editable wheel and never run the legacy develop command, so DevelopWithPth
+# does not fire for them. Ship the .pth inside the editable wheel instead.
+class EditableWheelWithPth(editable_wheel):
+    def run(self):
+        editable_wheel.run(self)
+        wheels = sorted(Path(self.dist_dir).glob("*.whl"), key=os.path.getmtime)
+        if not wheels:
+            raise RuntimeError(f"no editable wheel found in {self.dist_dir}")
+        add_pth_to_wheel(str(wheels[-1]))
+        print(f"Added {PTH_FILE} to editable wheel: {wheels[-1]}")
+
+
 cmdclass["build_py"] = BuildPyWithPth
 cmdclass["install"] = InstallWithPth
 cmdclass["develop"] = DevelopWithPth
+cmdclass["editable_wheel"] = EditableWheelWithPth
 
 setup(
     packages=find_packages(),
