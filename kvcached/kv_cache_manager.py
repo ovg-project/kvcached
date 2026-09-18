@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
@@ -196,6 +197,8 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._resize_rejected: bool = False
+        self._rejected_resize_target: Optional[int] = None
         self._memory_limit_bytes: Optional[int] = None
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
@@ -361,8 +364,14 @@ class KVCacheManager:
             self._wait_post_init()
 
         new_mem_size = self.page_allocator.get_resize_target()
-        if new_mem_size > 0:
-            self.resize(new_mem_size)
+        if (new_mem_size > 0 and
+                new_mem_size != getattr(self, "_rejected_resize_target", None)):
+            try:
+                self.resize(new_mem_size)
+            except QuarantinedResizeError:
+                self._rejected_resize_target = new_mem_size
+                self._resize_rejected = True
+                logger.warning("Automatic resize rejected: pool has quarantined pages")
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -397,6 +406,9 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
+                except StateConsistencyError:
+                    # Do not run further free/unmap operations on an unsafe pool.
+                    raise
                 except RuntimeError as e:
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
@@ -529,10 +541,19 @@ class KVCacheManager:
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
-                self.page_allocator.resize(self.target_num_blocks *
-                                           self.block_mem_size)
-                self.in_shrink = False
-                self.target_num_blocks = None
+                try:
+                    resized = self.page_allocator.resize(
+                        self.target_num_blocks * self.block_mem_size)
+                except QuarantinedResizeError:
+                    # Reject the pending limit without blocking healthy pages.
+                    self._resize_rejected = True
+                    self.in_shrink = False
+                    self.target_num_blocks = None
+                    logger.warning("Deferred resize rejected: pool has quarantined pages")
+                else:
+                    if resized:
+                        self.in_shrink = False
+                        self.target_num_blocks = None
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -564,7 +585,17 @@ class KVCacheManager:
         """
         self._wait_post_init()
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
-        if self.page_allocator.resize(new_mem_size):
+        try:
+            resized = self.page_allocator.resize(new_mem_size)
+        except QuarantinedResizeError:
+            if self.in_shrink:
+                self.in_shrink = False
+                self.target_num_blocks = None
+                self._resize_rejected = True
+            raise
+        self._resize_rejected = False
+        self._rejected_resize_target = None
+        if resized:
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_blocks = None
@@ -638,7 +669,8 @@ class KVCacheManager:
         mapped_bytes = mapped_pages * page_bundle_bytes
         effective_limit_bytes = self._memory_limit_effective_bytes
         if status is None:
-            status = "deferred" if self.in_shrink else "applied"
+            status = ("rejected" if getattr(self, "_resize_rejected", False) else
+                      "deferred" if self.in_shrink else "applied")
         return {
             "status": status,
             "pool_name": str(self.pool_name or ""),
@@ -660,6 +692,7 @@ class KVCacheManager:
             ),
             "reason": {
                 "deferred": "inuse_capacity_above_limit",
+                "rejected": "quarantined_pages_prevent_resize",
                 "conflict": "revision_reused_with_different_limit",
             }.get(status, ""),
         }
@@ -672,10 +705,11 @@ class KVCacheManager:
     @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
+        # Also surfaces a fatal background-preallocation failure during shrink.
+        virtual_free_pages = self.page_allocator.get_num_free_pages()
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            virtual_free_pages = self.page_allocator.get_num_free_pages()
             physical_free_pages = self.page_allocator.get_avail_physical_pages(
             ) + self.page_allocator.get_num_reserved_pages()
             free_pages = min(virtual_free_pages, physical_free_pages)
