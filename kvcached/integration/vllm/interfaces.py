@@ -601,6 +601,7 @@ def get_kv_cache_manager(
         group_id=group_id,
         reserve_null_block=True,
         pool_name=pool_name,
+        defer_physical_release=_async_sched,
     )
     register_kv_cache_pool(
         manager,
