@@ -19,6 +19,7 @@ from kvcached.integration.vllm.patches import (
     KVCacheCoordinatorPatch,
     KVCacheManagerAllocateSlotsPatch,
     KVCacheManagerPatch,
+    MPClientPatch,
     TritonAttentionPatch,
 )
 from kvcached.utils import get_kvcached_logger
@@ -44,6 +45,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (NixlConnectorPatch(), VLLM_ALL_RANGE),
             (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
             (EngineCorePatch(), VLLM_ALL_RANGE),
+            (MPClientPatch(), VLLM_ALL_RANGE),
             (GPUModelRunnerPatch(), VLLM_ALL_RANGE),
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),

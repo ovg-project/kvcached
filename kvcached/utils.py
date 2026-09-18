@@ -179,6 +179,31 @@ CONTIGUOUS_LAYOUT = _default_contiguous_layout()
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
 
+
+def unlink_default_ipc_segment() -> bool:
+    """Best-effort unlink of this instance's KV cache limit segment.
+
+    The engine-side unlink in ``KVCacheManager.shutdown()`` only runs when
+    the engine process survives long enough to finish its teardown. A
+    client that stops engine processes (vLLM's ``MPClient.shutdown()``,
+    issue #477) calls this afterwards to remove whatever segment they left
+    behind. Returns True when a segment was actually removed; a missing
+    segment (the engine already unlinked it) is a silent no-op.
+    """
+    segment = os.path.join(SHM_DIR, DEFAULT_IPC_NAME)
+    try:
+        os.unlink(segment)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        get_kvcached_logger().warning(
+            "Failed to unlink %s on client shutdown: %s", segment, e)
+        return False
+    get_kvcached_logger().info(
+        "Unlinked KV cache limit segment %s left by the engine process",
+        segment)
+    return True
+
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")
 
