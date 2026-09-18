@@ -123,14 +123,14 @@ def recv_msg(sock: socket.socket) -> Message:
 
 
 def resolve_gpu_device_index(device: Optional[str]) -> int:
-    """Resolve an integration device string to the CUDA runtime device index."""
+    """Resolve an explicitly indexed GPU device without consulting thread state."""
     import torch
 
     if device is not None:
-        device_index = torch.device(normalize_gpu_device(device)).index
-        if device_index is not None:
-            return int(device_index)
-    return int(torch.cuda.current_device())
+        parsed_device = torch.device(normalize_gpu_device(device))
+        if parsed_device.type == "cuda" and parsed_device.index is not None:
+            return int(parsed_device.index)
+    raise ValueError(f"Expected an explicitly indexed GPU device, got {device!r}")
 
 
 def start_worker_listener_thread(

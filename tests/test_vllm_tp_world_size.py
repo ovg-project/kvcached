@@ -46,6 +46,53 @@ def test_get_world_size_returns_engine_core_recorded_value(
     assert interfaces.get_world_size() == 4
 
 
+@pytest.mark.parametrize("device", [None, "cuda", "cpu:0"])
+def test_model_runner_rejects_invalid_device_before_initializing(
+    monkeypatch, vllm_modules, device
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    torch = sys.modules["torch"]
+    torch.device.side_effect = lambda value: types.SimpleNamespace(
+        type=value.split(":")[0],
+        index=int(value.split(":")[1]) if ":" in value else None,
+    )
+    init = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", init)
+
+    class Runner:
+        def __init__(self):
+            if device is not None:
+                self.device = device
+
+    assert patches.GPUModelRunnerPatch().patch_model_runner_init(Runner)
+    with pytest.raises((AttributeError, ValueError)):
+        Runner()
+    init.assert_not_called()
+    torch.cuda.current_device.assert_not_called()
+
+
+def test_model_runner_passes_initialized_device(monkeypatch, vllm_modules):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    torch = sys.modules["torch"]
+    torch.device.return_value = types.SimpleNamespace(type="cuda", index=3)
+    init = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", init)
+
+    class Runner:
+        def __init__(self):
+            self.device = "cuda:3"
+            self.vllm_config = object()
+
+    assert patches.GPUModelRunnerPatch().patch_model_runner_init(Runner)
+    Runner()
+    init.assert_called_once()
+    assert init.call_args.kwargs["device"] == "cuda:3"
+    torch.cuda.current_device.assert_not_called()
+
+
 def test_get_world_size_rejects_uninitialized_state(monkeypatch, vllm_modules):
     interfaces, _ = vllm_modules
     monkeypatch.setattr(interfaces, "_kvcached_initialized", False)
