@@ -33,6 +33,13 @@ _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
 
+# Single source of truth for what this shim accepts. The capability record
+# in kvcached.observability reports these, so the guards below and the
+# reported record cannot drift apart. SUPPORTED_KV_LAYOUTS is enforced for
+# MHA/GQA only; the MLA path ignores the layout argument.
+SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA")
+SUPPORTED_KV_LAYOUTS = ("NHD",)
+
 
 def init_kvcached(
     tp_rank: int = 0,
@@ -124,11 +131,11 @@ def alloc_kv_cache(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA"]:
+    if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
     is_mla = attention_type == "MLA"
-    if not is_mla and kv_layout != "NHD":
+    if not is_mla and kv_layout not in SUPPORTED_KV_LAYOUTS:
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     num_k_or_v = 1 if is_mla else 2
