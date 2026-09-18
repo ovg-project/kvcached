@@ -4,29 +4,27 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <ATen/core/Tensor.h>
-#include <c10/core/Device.h>
-#include <c10/core/ScalarType.h>
-
 #include "constants.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 
 namespace kvcached {
 
 /* NOTE: FTensorAllocator is thread-safe but FTensor is not. */
-class FTensor {
+class KVCACHED_HIDDEN FTensor {
 public:
-  FTensor(const std::string &name, size_t size, c10::ScalarType dtype,
-          c10::Device dev, std::shared_ptr<Page> zero_page,
-          size_t page_size = 0);
+  FTensor(const std::string &name, size_t size,
+          torch::headeronly::ScalarType dtype, torch::stable::Device dev,
+          std::shared_ptr<Page> zero_page, size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
   bool unmap(offset_t offset);
 
-  inline at::Tensor get_tensor() noexcept { return tensor_; }
+  inline torch::stable::Tensor get_tensor() noexcept { return tensor_; }
 
 private:
   friend class FTensorAllocator;
@@ -43,11 +41,11 @@ private:
   generic_ptr_t vaddr_;
   size_t size_;
   size_t page_size_;
-  c10::ScalarType dtype_;
-  c10::Device dev_;
+  torch::headeronly::ScalarType dtype_;
+  torch::stable::Device dev_;
   std::shared_ptr<Page> zero_page_;
 
-  at::Tensor tensor_;
+  torch::stable::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
   std::vector<std::unique_ptr<Page>> failed_pages_;
 };

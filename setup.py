@@ -22,7 +22,7 @@ try:
         library_paths,
     )
 except ImportError:
-    raise ImportError("Torch not found, please install torch>=2.6.0 first.")
+    raise ImportError("Torch not found, please install torch>=2.10.0 first.")
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH
@@ -40,7 +40,29 @@ def get_csrc_files(path) -> List[str]:
     return cpp_files
 
 
+# kvcached builds against libtorch stable ABI. Wheels are compatible with
+# Torch >= 2.10.
+# https://docs.pytorch.org/docs/2.10/notes/libtorch_stable_abi.html
+STABLE_ABI_TARGET = (2, 10)
+
+TORCH_TARGET_VERSION = (
+    f"0x{(STABLE_ABI_TARGET[0] << 56) | (STABLE_ABI_TARGET[1] << 48):016x}"
+)
+
+
+def torch_version() -> tuple:
+    base = torch.__version__.split("+", 1)[0]
+    major, minor = (int(part) for part in base.split(".")[:2])
+    return (major, minor)
+
+
 def get_extensions():
+    if torch_version() < STABLE_ABI_TARGET:
+        raise RuntimeError(
+            f"kvcached requires torch>=2.10.0, "
+            f"found {torch.__version__}."
+        )
+
     csrc_files = get_csrc_files(CSRC_PATH)
 
     # Get the C++ ABI flag from PyTorch
@@ -65,6 +87,8 @@ def get_extensions():
         f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
         backend_define,
     ]
+    # Target the stable ABI; csrc keys on TORCH_TARGET_VERSION being defined.
+    extra_compile_args.append(f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}")
 
     ext_include_dirs = include_paths(device_type="cuda") + [
         os.path.join(CSRC_PATH, "inc")
@@ -80,8 +104,8 @@ def get_extensions():
             "-DUSE_ROCM=1",
         ])
         ext_libraries = ["amdhip64"]
-        vmm_ops_module = CppExtension(
-            "kvcached.vmm_ops",
+        ext_module = CppExtension(
+            "kvcached._C",
             csrc_files,
             include_dirs=ext_include_dirs,
             library_dirs=ext_library_dirs,
@@ -91,8 +115,8 @@ def get_extensions():
     else:
         # CUDA driver APIs require libcuda for cuMem* symbols.
         ext_libraries = ["cuda"]
-        vmm_ops_module = CUDAExtension(
-            "kvcached.vmm_ops",
+        ext_module = CUDAExtension(
+            "kvcached._C",
             csrc_files,
             include_dirs=ext_include_dirs,
             library_dirs=ext_library_dirs,
@@ -102,8 +126,8 @@ def get_extensions():
                 "nvcc": extra_compile_args,
             },
         )
-    print(f"Building kvcached.vmm_ops with backend: {backend_name}")
-    return [vmm_ops_module], {"build_ext": BuildExtension}
+    print(f"Building kvcached._C with backend: {backend_name} (stable ABI)")
+    return [ext_module], {"build_ext": BuildExtension}
 
 
 ext_modules, cmdclass = get_extensions()
