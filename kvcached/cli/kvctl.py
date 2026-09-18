@@ -432,7 +432,7 @@ def main():
     p_limit.add_argument('size', help="Size, e.g. 512M, 2G")
 
     # limit-percent
-    p_lp = sub.add_parser('limit-percent', help='Set limit as % of total GPU')
+    p_lp = sub.add_parser('limit-percent', help='Set limit as %% of total GPU')
     p_lp.add_argument('ipc')
     p_lp.add_argument('percent', type=float)
 
