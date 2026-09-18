@@ -5,11 +5,10 @@
 
 import torch
 
-# Importing _C registers the KV tensor ops (torch.ops.kvcached.*) and defines
-# the PageAllocator / InternalPage classes.
+# Importing _C defines the PageAllocator / InternalPage classes and registers
+# the KV tensor ops as torch.ops.kvcached.*.
 from kvcached import _C  # type: ignore[attr-defined]
 
-# KV tensor ops (stable ABI).
 init_kvcached = torch.ops.kvcached.init_kvcached.default
 shutdown_kvcached = torch.ops.kvcached.shutdown_kvcached.default
 create_kv_tensors = torch.ops.kvcached.create_kv_tensors.default

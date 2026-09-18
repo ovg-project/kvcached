@@ -13,13 +13,10 @@
 #include <utility>
 #include <vector>
 
-#include <torch/csrc/stable/device.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
-
 #include "constants.hpp"
 #include "ftensor.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 
 namespace kvcached {
 

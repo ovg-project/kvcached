@@ -28,8 +28,20 @@ _UNSTABLE_SYMBOL = re.compile(
     re.VERBOSE,
 )
 
+# Stable-ABI C shims added after the target version (setup.py STABLE_ABI_TARGET
+# = 2.10). extern "C", so unmangled. Importing any means the binary won't load
+# on 2.10. Canaries, not exhaustive; see torch/csrc/stable/c/shim.h.
+_POST_MIN_STABLE_SHIMS = frozenset({
+    "torch_from_blob",              # 2.11
+    "torch_library_def_with_tags",  # 2.12
+    "torch_exception_get_what",     # 2.13
+    "torch_new_stable_ivalue",      # 2.13
+    "torch_tensor_from_pyobject",   # 2.14
+    "torch_tensor_to_pyobject",     # 2.14
+})
 
-@pytest.fixture
+
+@pytest.fixture(scope="session")
 def extension_so() -> Path:
     """Locate kvcached/_C*.so without importing it; skip if not built."""
     matches = sorted((Path(__file__).resolve().parent.parent / "kvcached").glob("_C*.so"))
@@ -44,25 +56,42 @@ def extension_so() -> Path:
     raise pytest.skip.Exception("kvcached._C extension is not built")
 
 
-def test_c_extension_exposes_pybind_classes(extension_so):
-    pytest.importorskip("torch")
-    from kvcached._C import InternalPage, PageAllocator  # noqa: F401
+@pytest.fixture(scope="session")
+def imported_symbols(extension_so) -> frozenset[str]:
+    """Dynamic symbols the extension imports (nm -D -u), left mangled.
 
-
-@pytest.mark.skipif(shutil.which("nm") is None, reason="nm (binutils) not available")
-def test_extension_uses_only_stable_torch_abi(extension_so):
-    # -D dynamic, -u undefined only (imported); names left mangled for portability.
+    Skips when nm is unavailable.
+    """
+    if shutil.which("nm") is None:
+        pytest.skip("nm (binutils) not available")
     result = subprocess.run(
         ["nm", "-D", "-u", str(extension_so)],
         check=True,
         capture_output=True,
         text=True,
     )
+    # Undefined line: "<blank addr> U <symbol>"; take the symbol.
+    return frozenset(
+        line.split()[-1] for line in result.stdout.splitlines() if line.split()
+    )
 
-    offenders = []
-    for line in result.stdout.splitlines():
-        tokens = line.split()  # undefined line: "<blank addr> U <symbol>"
-        if tokens and _UNSTABLE_SYMBOL.search(tokens[-1]):
-            offenders.append(tokens[-1])
 
+def test_c_extension_exposes_pybind_classes(extension_so):
+    pytest.importorskip("torch")
+    from kvcached._C import InternalPage, PageAllocator  # noqa: F401
+
+
+def test_extension_uses_only_stable_torch_abi(imported_symbols):
+    offenders = sorted(s for s in imported_symbols if _UNSTABLE_SYMBOL.search(s))
     assert not offenders, "unstable libtorch symbols: " + ", ".join(offenders)
+
+
+def test_extension_targets_minimum_torch_abi(imported_symbols):
+    # A binary built with newer torch headers must not silently require stable
+    # ABI symbols newer than the minimum targeted by TORCH_TARGET_VERSION.
+    newer = sorted(imported_symbols & _POST_MIN_STABLE_SHIMS)
+    assert not newer, (
+        "extension imports stable-ABI symbols newer than the targeted minimum "
+        "(setup.py STABLE_ABI_TARGET); rebuild with a matching "
+        "TORCH_TARGET_VERSION: " + ", ".join(newer)
+    )

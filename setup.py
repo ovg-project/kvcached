@@ -40,13 +40,29 @@ def get_csrc_files(path) -> List[str]:
     return cpp_files
 
 
-# Minimum PyTorch version whose stable ABI the KV tensor ops target (registered
-# via STABLE_TORCH_LIBRARY in csrc/torch_bindings.cpp).
-ABI_VERSION = (2, 10)
-TORCH_TARGET_VERSION = f"0x{(ABI_VERSION[0] << 56) | (ABI_VERSION[1] << 48):016x}"
+# kvcached builds against libtorch stable ABI. Wheels are compatible with
+# Torch >= 2.10.
+# https://docs.pytorch.org/docs/2.10/notes/libtorch_stable_abi.html
+STABLE_ABI_TARGET = (2, 10)
+
+TORCH_TARGET_VERSION = (
+    f"0x{(STABLE_ABI_TARGET[0] << 56) | (STABLE_ABI_TARGET[1] << 48):016x}"
+)
+
+
+def torch_version() -> tuple:
+    base = torch.__version__.split("+", 1)[0]
+    major, minor = (int(part) for part in base.split(".")[:2])
+    return (major, minor)
 
 
 def get_extensions():
+    if torch_version() < STABLE_ABI_TARGET:
+        raise RuntimeError(
+            f"kvcached requires torch>=2.10.0, "
+            f"found {torch.__version__}."
+        )
+
     csrc_files = get_csrc_files(CSRC_PATH)
 
     # Get the C++ ABI flag from PyTorch
@@ -70,8 +86,9 @@ def get_extensions():
         "-std=c++17",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
         backend_define,
-        f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}",
     ]
+    # Target the stable ABI; csrc keys on TORCH_TARGET_VERSION being defined.
+    extra_compile_args.append(f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}")
 
     ext_include_dirs = include_paths(device_type="cuda") + [
         os.path.join(CSRC_PATH, "inc")
@@ -109,7 +126,7 @@ def get_extensions():
                 "nvcc": extra_compile_args,
             },
         )
-    print(f"Building kvcached._C with backend: {backend_name}")
+    print(f"Building kvcached._C with backend: {backend_name} (stable ABI)")
     return [ext_module], {"build_ext": BuildExtension}
 
 

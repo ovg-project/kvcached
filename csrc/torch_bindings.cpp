@@ -1,13 +1,22 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdint>
 #include <memory>
-#include <pybind11/functional.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 #include <string>
 #include <utility>
 #include <vector>
+
+// pybind11 ships inside torch and trips the TORCH_STABLE_ONLY guard that the
+// target macro implies, though it is header-only and torch-ABI-independent.
+// See pytorch/pytorch#174372, meta-pytorch/torchcodec#1260.
+// TODO: drop torch>=2.13, workaround is no longer needed.
+#pragma push_macro("TORCH_TARGET_VERSION")
+#undef TORCH_TARGET_VERSION
+#include <pybind11/functional.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#pragma pop_macro("TORCH_TARGET_VERSION")
 
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
@@ -23,15 +32,10 @@ namespace py = pybind11;
 namespace kvcached {
 
 // ---------------------------------------------------------------------------
-// KV tensor ops.
-//
-// These are the only bindings that touch torch::Tensor, so they are registered
-// through the PyTorch stable ABI (STABLE_TORCH_LIBRARY) instead of pybind11.
-// This decouples them from libtorch's unstable C++ ABI. They are reached from
-// Python via torch.ops.kvcached.* (re-exported by kvcached/vmm_ops.py).
-//
-// The dispatcher schema uses int64_t/bool/str/int[]/Tensor[]; sizes that are
-// logically size_t are passed as int64_t and cast at the boundary.
+// KV tensor ops -- the only bindings that touch the tensor type. Registered via
+// STABLE_TORCH_LIBRARY and reached as torch.ops.kvcached.* (see vmm_ops.py).
+// size_t values cross the boundary as int64_t. The dispatcher runs these
+// GIL-free, so no explicit release is needed (issue #371).
 // ---------------------------------------------------------------------------
 
 void init_kvcached(std::string dev_str, int64_t page_size,
@@ -105,11 +109,8 @@ bool abort_unmap_from_kv_tensors(const std::string &transaction_id,
 }
 
 // ---------------------------------------------------------------------------
-// PageAllocator / InternalPage bindings.
-//
-// These classes contain no torch types (only ints, vectors, dicts, callbacks),
-// so they do not couple to libtorch's C++ ABI and stay on pybind11, which keeps
-// their class-based API, Python callbacks, and dict returns intact.
+// PageAllocator / InternalPage bindings -- no torch types, so they stay on
+// pybind11.
 // ---------------------------------------------------------------------------
 std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t num_layers, int64_t mem_size_per_layer, int64_t page_size,
@@ -282,10 +283,8 @@ STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
   m.impl("unmap_from_kv_tensors", TORCH_BOX(&kvcached::unmap_from_kv_tensors));
 }
 
-// The pybind11 module hosts only the torch-free PageAllocator / InternalPage
-// classes. TORCH_EXTENSION_NAME resolves to the compiled extension name (_C);
-// importing it also runs the STABLE_TORCH_LIBRARY static initializers above,
-// registering the KV tensor ops.
+// Hosts the torch-free PageAllocator / InternalPage classes; the KV tensor ops
+// are registered via the dispatcher above.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
   auto errors = py::module_::import("kvcached.errors");
@@ -312,6 +311,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("abort_unmap_from_kv_tensors", &kvcached::abort_unmap_from_kv_tensors,
         "abort_unmap_from_kv_tensors", py::arg("transaction_id"),
         py::arg("group_id") = 0);
+
+  // The stable-ABI target the extension was built for.
+  m.attr("TORCH_TARGET_VERSION") =
+      py::int_(static_cast<uint64_t>(TORCH_TARGET_VERSION));
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
