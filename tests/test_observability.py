@@ -269,6 +269,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
 
     utils_module = types.ModuleType("kvcached.utils")
@@ -354,6 +355,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
 
     utils_module = types.ModuleType("kvcached.utils")

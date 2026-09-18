@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <torch/csrc/utils/pybind.h>
@@ -14,6 +15,7 @@
 #include "constants.hpp"
 #include "page_allocator.hpp"
 #include "torch_utils.hpp"
+#include "transaction_error.hpp"
 
 namespace kvcached {
 
@@ -52,11 +54,41 @@ bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
   return allocator->map_to_kv_tensors(offsets);
 }
 
+std::pair<bool, std::vector<offset_t>>
+map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
+                              int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->map_to_kv_tensors_with_result(offsets);
+}
+
 bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
                            int64_t group_id = 0) {
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->unmap_from_kv_tensors(offsets);
+}
+
+bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                   const std::string &transaction_id,
+                                   int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->prepare_unmap_from_kv_tensors(offsets, transaction_id);
+}
+
+bool commit_unmap_from_kv_tensors(const std::string &transaction_id,
+                                  int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->commit_unmap_from_kv_tensors(transaction_id);
+}
+
+bool abort_unmap_from_kv_tensors(const std::string &transaction_id,
+                                 int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->abort_unmap_from_kv_tensors(transaction_id);
 }
 
 // PageAllocator bindings
@@ -165,7 +197,23 @@ page_allocator_get_resize_target(std::shared_ptr<PageAllocator> allocator) {
 
 void page_allocator_set_broadcast_map_callback(
     std::shared_ptr<PageAllocator> allocator, BroadcastMapCallback callback) {
-  allocator->set_broadcast_map_callback(callback);
+  allocator->set_broadcast_map_callback(
+      [callback = std::move(callback)](int64_t size,
+                                       const std::vector<offset_t> &offsets) {
+        try {
+          callback(size, offsets);
+        } catch (py::error_already_set &error) {
+          py::gil_scoped_acquire acquire;
+          auto errors = py::module_::import("kvcached.errors");
+          if (error.matches(errors.attr("StateConsistencyError").ptr())) {
+            throw StateConsistencyError(error.what());
+          }
+          if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
+            throw MapQuarantinedError(error.what());
+          }
+          throw;
+        }
+      });
 }
 
 void page_allocator_set_broadcast_unmap_callback(
@@ -195,6 +243,13 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
+  auto errors = py::module_::import("kvcached.errors");
+  py::register_exception<kvcached::MapQuarantinedError>(
+      m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
+  py::register_exception<kvcached::StateConsistencyError>(
+      m, "StateConsistencyError", errors.attr("StateConsistencyError").ptr());
+  py::register_exception<kvcached::QuarantinedResizeError>(
+      m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
 
   m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
         py::arg("dev_str"), py::arg("page_size") = 0,
@@ -208,8 +263,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "kv_tensors_created", py::arg("group_id") = 0);
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
         py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("map_to_kv_tensors_with_result",
+        &kvcached::map_to_kv_tensors_with_result,
+        "map_to_kv_tensors_with_result", py::arg("offsets"),
+        py::arg("group_id") = 0);
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("prepare_unmap_from_kv_tensors",
+        &kvcached::prepare_unmap_from_kv_tensors,
+        "prepare_unmap_from_kv_tensors", py::arg("offsets"),
+        py::arg("transaction_id"), py::arg("group_id") = 0);
+  m.def("commit_unmap_from_kv_tensors", &kvcached::commit_unmap_from_kv_tensors,
+        "commit_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("abort_unmap_from_kv_tensors", &kvcached::abort_unmap_from_kv_tensors,
+        "abort_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
@@ -221,6 +290,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enable_page_prealloc") = true,
            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
            py::arg("ipc_name") = "")
+      .def("get_transaction_state",
+           [](const kvcached::PageAllocator &allocator) {
+             auto state = [&allocator] {
+               py::gil_scoped_release release;
+               return allocator.get_transaction_state();
+             }();
+             py::dict result;
+             result["state"] =
+                 state.failed
+                     ? "FAILED"
+                     : (state.quarantined_page_ids.empty() ? "HEALTHY"
+                                                           : "DEGRADED");
+             result["quarantined_page_ids"] = state.quarantined_page_ids;
+             result["quarantined_pages"] = state.quarantined_page_ids.size();
+             result["retained_bytes_upper_bound"] =
+                 state.retained_bytes_upper_bound;
+             result["last_error"] = state.last_error;
+             return result;
+           })
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
       // The bindings below can block inside the allocator (alloc_page waits on

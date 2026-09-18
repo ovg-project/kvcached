@@ -16,7 +16,7 @@ from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import start_worker_listener_thread
+from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -58,7 +58,11 @@ def init_kvcached(
 
     if world_size > 1:
         # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(tp_rank, pp_rank)
+        start_worker_listener_thread(
+            tp_rank,
+            pp_rank,
+            device_index=resolve_gpu_device_index(device),
+        )
 
 
 def shutdown_kvcached() -> None:

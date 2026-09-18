@@ -5,16 +5,21 @@
 SGLang-specific patches using unified patch infrastructure.
 """
 
+import functools
 import inspect
 import math
 import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.integration.version_utils import VersionAwarePatch, version_range
+from kvcached.integration.version_utils import (
+    VersionAwarePatch,
+    version_range,
+)
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
+_CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
 SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
@@ -25,6 +30,120 @@ logger = get_kvcached_logger()
 def _is_supported_gpu_device(device: str) -> bool:
     device_str = str(device).lower()
     return device_str.startswith("cuda") or device_str.startswith("hip")
+
+
+def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
+    """Return one capacity shared by every rank in the SGLang world group."""
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if int(world_group.world_size) <= 1:
+        return local_bytes
+
+    capacity = torch.tensor(local_bytes, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        capacity,
+        op=torch.distributed.ReduceOp.MIN,
+        group=world_group.cpu_group,
+    )
+    return int(capacity.item())
+
+
+class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
+    """Keep SGLang's logical KV capacity independent of peer processes."""
+
+    library = "sglang"
+    target_module = "sglang.srt.model_executor.model_runner"
+    target_class = "ModelRunner"
+    patch_name = "virtual_kv_capacity"
+
+    def apply(self, model_runner_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_profile_available_bytes(model_runner_mod)
+
+    @version_range(">=0.5.11")
+    def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
+        ModelRunner = self._get_target_class(model_runner_mod)
+        if ModelRunner is None:
+            return False
+
+        original_profile = getattr(ModelRunner, "_profile_available_bytes", None)
+        if original_profile is None:
+            self.logger.warning(
+                "SGLang ModelRunner does not expose _profile_available_bytes"
+            )
+            return False
+        if self._is_already_patched(original_profile, "virtual_kv_capacity"):
+            return True
+
+        @functools.wraps(original_profile)
+        def _patched_profile_available_bytes(runner, pre_model_load_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
+                return original_profile(runner, pre_model_load_memory)
+
+            import torch
+
+            query_error = None
+            try:
+                total_memory = int(
+                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                )
+                mem_fraction_static = float(runner.mem_fraction_static)
+                logical_budget = math.ceil(total_memory * mem_fraction_static)
+                process_local_reserved = int(
+                    torch.cuda.memory_reserved(runner.gpu_id)
+                )
+                local_available_bytes = logical_budget - process_local_reserved
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                query_error = exc
+                total_memory = 0
+                logical_budget = 0
+                process_local_reserved = 0
+                local_available_bytes = _CAPACITY_QUERY_FAILED
+
+            try:
+                available_bytes = _reduce_sglang_world_min_bytes(
+                    torch, local_available_bytes
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Unable to synchronize SGLang virtual KV capacity; "
+                    "falling back to SGLang profiling: %s",
+                    exc,
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if available_bytes == _CAPACITY_QUERY_FAILED:
+                logger.warning(
+                    "Unable to derive stable SGLang virtual KV capacity on "
+                    "at least one rank; falling back to SGLang profiling: %s",
+                    query_error or "peer rank query failed",
+                )
+                return original_profile(runner, pre_model_load_memory)
+
+            if runner.mambaish_config is not None:
+                available_gib = available_bytes / BYTES_PER_GB
+                available_bytes = int(
+                    runner.handle_max_mamba_cache(available_gib) * BYTES_PER_GB
+                )
+
+            logger.info(
+                "Using kvcached process-local KV capacity for SGLang: "
+                "budget=%d bytes, pytorch_reserved=%d bytes, "
+                "world_min_available=%d bytes (device_total=%d, "
+                "mem_fraction_static=%.4f)",
+                logical_budget,
+                process_local_reserved,
+                available_bytes,
+                total_memory,
+                mem_fraction_static,
+            )
+            return available_bytes
+
+        self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
+        ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        return True
 
 
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
@@ -359,6 +478,51 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
         except Exception as e:
             self.logger.warning(f"Failed to alias paged allocator to elastic one: {e}")
             return False
+
+
+class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
+    """Make SGLang's composite SWA allocator use elastic sub-allocators.
+
+    SGLang's ``allocator.swa`` module imports the token and paged allocator
+    classes directly from their implementation modules.  Replacing only the
+    re-exports on ``sglang.srt.mem_cache.allocator`` therefore does not affect
+    the classes captured by ``SWATokenToKVPoolAllocator``.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.allocator.swa"
+    patch_name = "elastic_swa_allocator"
+
+    def apply(self, swa_alloc_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.alias_swa_sub_allocators(swa_alloc_mod)
+
+    @version_range(">=0.5.13")
+    def alias_swa_sub_allocators(self, swa_alloc_mod: types.ModuleType) -> bool:
+        marker = "__kvcached_swa_sub_allocators_aliased__"
+        if self._is_already_patched(swa_alloc_mod, marker):
+            return True
+
+        try:
+            from sglang.srt.mem_cache import allocator as alloc_mod
+
+            elastic_token_allocator = getattr(
+                alloc_mod, "ElasticTokenToKVPoolAllocator"
+            )
+            elastic_paged_allocator = getattr(
+                alloc_mod, "ElasticPagedTokenToKVPoolAllocator"
+            )
+        except (ImportError, AttributeError) as exc:
+            self.logger.warning(
+                "Failed to resolve elastic allocators for SGLang SWA: %s", exc
+            )
+            return False
+
+        setattr(swa_alloc_mod, "TokenToKVPoolAllocator", elastic_token_allocator)
+        setattr(swa_alloc_mod, "PagedTokenToKVPoolAllocator", elastic_paged_allocator)
+        self._mark_as_patched(swa_alloc_mod, marker)
+        return True
 
 
 class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
@@ -753,6 +917,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
         success = self.inject_elastic_mamba_pool(mem_pool_mod)
         if success:
             success &= self.alias_mamba_pool_to_elastic(mem_pool_mod)
+        if success and self.patch_mamba_slot_allocator in self.applicable_methods:
+            success &= self.patch_mamba_slot_allocator(mem_pool_mod)
         return success
 
     @version_range(SGLANG_ALL_RANGE)
@@ -1155,6 +1321,127 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias MambaPool to elastic one: {e}")
             return False
+
+    @version_range(">=0.5.13")
+    def patch_mamba_slot_allocator(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Route SGLang's request-level Mamba slots through kvcached.
+
+        SGLang 0.5.13 split slot ownership out of ``MambaPool`` into a
+        separate ``MambaSlotAllocator``.  Merely aliasing ``MambaPool`` then
+        leaves ``ElasticMambaPool.alloc/free`` dead and never maps the VMM
+        pages for request slots.  Wrap ``HybridReqToTokenPool._init_mamba_pool``
+        so the allocator installed after pool construction owns the same IDs
+        through the pool's ``KVCacheManager``.
+        """
+        HybridReqToTokenPool = getattr(mem_pool_mod, "HybridReqToTokenPool", None)
+        if HybridReqToTokenPool is None:
+            self.logger.debug(
+                "HybridReqToTokenPool not found; skipping Mamba slot allocator patch"
+            )
+            return True
+
+        original_init = getattr(HybridReqToTokenPool, "_init_mamba_pool", None)
+        if original_init is None:
+            self.logger.debug(
+                "HybridReqToTokenPool._init_mamba_pool not found; skipping"
+            )
+            return True
+        if "MambaSlotAllocator" not in getattr(original_init, "__globals__", {}):
+            # SGLang <=0.5.12 keeps allocation on MambaPool.alloc/free, which
+            # ElasticMambaPool already overrides directly.
+            self.logger.debug(
+                "SGLang uses MambaPool-owned slots; no separate allocator patch needed"
+            )
+            return True
+        marker = "__kvcached_mamba_slot_allocator_patched__"
+        if self._is_already_patched(original_init, marker):
+            return True
+
+        import torch
+
+        class ElasticMambaSlotAllocator:
+            """SGLang Mamba-slot interface backed by ``ElasticMambaPool``."""
+
+            def __init__(self, size: int, device: str, mamba_pool: Any) -> None:
+                self.size = size
+                self.device = device
+                self.mamba_pool = mamba_pool
+                self._alloc_iter = None
+                self._free_ids = set(range(1, size + 1))
+
+            @property
+            def free_slots(self):
+                # Compatibility for SGLang's debug invariant checker. Normal
+                # scheduling uses available_size() and does not materialize it.
+                return torch.tensor(
+                    sorted(self._free_ids), dtype=torch.int64, device=self.device
+                )
+
+            def available_size(self) -> int:
+                return self.mamba_pool.available_size()
+
+            def schedulable_available_size(self) -> int:
+                return self.available_size()
+
+            def _do_alloc(self, need_size: int):
+                slots = self.mamba_pool.alloc(need_size)
+                if slots is None:
+                    return None
+                self._free_ids.difference_update(slots.tolist())
+                return slots
+
+            def alloc(self, need_size: int):
+                if self._alloc_iter is not None and need_size == 1:
+                    slot = next(self._alloc_iter, None)
+                    if slot is not None:
+                        return slot
+                return self._do_alloc(need_size)
+
+            def free(self, free_index) -> None:
+                if free_index.numel() == 0:
+                    return
+                block_ids = free_index.tolist()
+                self.mamba_pool.free(free_index)
+                self._free_ids.update(block_ids)
+
+            def alloc_group_begin(self, num_reqs: int) -> None:
+                self._alloc_iter = None
+                if num_reqs > 0:
+                    result = self._do_alloc(num_reqs)
+                    if result is not None:
+                        self._alloc_iter = iter(result.split(1))
+
+            def alloc_group_end(self) -> None:
+                if self._alloc_iter is not None:
+                    remaining = list(self._alloc_iter)
+                    if remaining:
+                        self.free(torch.cat(remaining))
+                self._alloc_iter = None
+
+            def clear(self) -> None:
+                self.mamba_pool.clear()
+                self._alloc_iter = None
+                self._free_ids = set(range(1, self.size + 1))
+
+        def _patched_init_mamba_pool(self, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            mamba_pool = getattr(self, "mamba_pool", None)
+            if mamba_pool is None or not hasattr(mamba_pool, "kvcached_allocator"):
+                return
+            self.mamba_allocator = ElasticMambaSlotAllocator(
+                size=mamba_pool.size,
+                device=mamba_pool.device,
+                mamba_pool=mamba_pool,
+            )
+            logger.info(
+                "[kvcached] ElasticMambaSlotAllocator in use: size=%d",
+                mamba_pool.size,
+            )
+
+        self._mark_as_patched(_patched_init_mamba_pool, marker)
+        HybridReqToTokenPool._init_mamba_pool = _patched_init_mamba_pool
+        setattr(mem_pool_mod, "ElasticMambaSlotAllocator", ElasticMambaSlotAllocator)
+        return True
 
 
 class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):

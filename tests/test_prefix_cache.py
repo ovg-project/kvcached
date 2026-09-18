@@ -156,8 +156,9 @@ def pool_factory(monkeypatch):
     Returns (pool, manager) so tests can inspect both.
     """
 
-    def _make(num_blocks: int = 100, enable_caching: bool = True):
-        manager = MockKVCacheManager(num_blocks)
+    def _make(num_blocks: int = 100, enable_caching: bool = True, manager=None):
+        if manager is None:
+            manager = MockKVCacheManager(num_blocks)
 
         kv_cache_utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
         setattr(
@@ -715,6 +716,33 @@ class TestEdgeCases:
         assert len(pool._evictable_blocks) == 2
         assert mgr.available_size() == initial_free - 2  # 2 held by pool
 
+    def test_free_blocks_accepts_prepend_kwarg(self, pool_and_manager):
+        """vLLM >= 0.23 calls free_blocks(..., prepend=...); must not raise
+        and must free identically for both values (#438)."""
+        pool, mgr = pool_and_manager
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=False)
+        assert mgr.available_size() == initial_free
+
+    def test_free_blocks_prepend_with_caching_disabled(self, pool_factory):
+        """The caching-disabled fast path must accept prepend too (#438)."""
+        pool, mgr = pool_factory(enable_caching=False)
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(3)
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
     def test_get_usage(self, pool_factory):
         """get_usage reflects the fraction of blocks in use."""
         pool, mgr = pool_factory(100)
@@ -724,3 +752,32 @@ class TestEdgeCases:
         pool.get_new_blocks(50)
         # 50+1(null) allocated, 0 evictable -> 49 free from kvcached
         assert pool.get_usage() == pytest.approx(0.51)
+
+
+class DrainedPoolManager(MockKVCacheManager):
+    """Leave the pool in the state a colocated peer produces.
+
+    ``available_size()`` reads device-wide free memory, so it is a snapshot of
+    state shared with every colocated engine, not a reservation: a peer can
+    take the last pages between the pool reading it and the pages being
+    claimed.
+    """
+
+    def available_size(self) -> int:
+        return 1000
+
+    def alloc(self, n: int):
+        return None
+
+
+def test_exhaustion_raises_the_type_the_integration_translates(pool_factory):
+    """The other half of this fix lives in KVCacheManagerAllocateSlotsPatch,
+    which turns exactly this exception into a scheduling miss. Widening it back
+    to a plain ValueError would silently restore the EngineCore crash."""
+    from kvcached.utils import KVCachePoolExhausted
+
+    pool, _ = pool_factory(manager=DrainedPoolManager(100))
+
+    with pytest.raises(KVCachePoolExhausted,
+                       match="Unable to allocate KV cache blocks"):
+        pool.get_new_blocks(4)

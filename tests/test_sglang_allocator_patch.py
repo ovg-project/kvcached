@@ -8,7 +8,10 @@ from typing import Any
 
 import pytest
 
-from kvcached.integration.sglang.patches import ElasticAllocatorPatch
+from kvcached.integration.sglang.patches import (
+    ElasticAllocatorPatch,
+    ElasticSWAAllocatorPatch,
+)
 
 
 class FakeTensor:
@@ -223,3 +226,37 @@ def test_alloc_extend_kernel(
     )
     if "max_num_extend_tokens" in kwargs:
         assert kwargs["max_num_extend_tokens"] == 8
+
+
+def test_swa_allocator_uses_elastic_sub_allocators(monkeypatch):
+    allocator_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+
+    class ElasticTokenAllocator:
+        pass
+
+    class ElasticPagedAllocator:
+        pass
+
+    allocator_mod.ElasticTokenToKVPoolAllocator = ElasticTokenAllocator
+    allocator_mod.ElasticPagedTokenToKVPoolAllocator = ElasticPagedAllocator
+
+    mem_cache_mod: Any = types.ModuleType("sglang.srt.mem_cache")
+    mem_cache_mod.allocator = allocator_mod
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache", mem_cache_mod)
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.mem_cache.allocator", allocator_mod
+    )
+
+    swa_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator.swa")
+    swa_mod.TokenToKVPoolAllocator = object()
+    swa_mod.PagedTokenToKVPoolAllocator = object()
+
+    patch = ElasticSWAAllocatorPatch()
+    assert patch.alias_swa_sub_allocators(swa_mod) is True
+    assert swa_mod.TokenToKVPoolAllocator is ElasticTokenAllocator
+    assert swa_mod.PagedTokenToKVPoolAllocator is ElasticPagedAllocator
+
+    # Applying the alias twice must preserve the installed classes.
+    assert patch.alias_swa_sub_allocators(swa_mod) is True
+    assert swa_mod.TokenToKVPoolAllocator is ElasticTokenAllocator
+    assert swa_mod.PagedTokenToKVPoolAllocator is ElasticPagedAllocator
