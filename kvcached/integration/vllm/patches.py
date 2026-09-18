@@ -1299,12 +1299,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             if not enable_kvcached():
                 return
 
+            from kvcached.tp_ipc_util import resolve_gpu_device_index
+
+            device_str = str(self.device)
+            resolve_gpu_device_index(device_str)
             try:
-                self._init_kvcached()
+                self._init_kvcached(device_str)
             except Exception as e:
                 logger.warning("Failed to initialize kvcached, disabling: %s", e)
 
-        def _init_kvcached(self) -> None:
+        def _init_kvcached(self, device_str: str) -> None:
             # Get TP rank/size: these are always available at model runner init time.
             try:
                 from vllm.distributed.parallel_state import (
@@ -1325,11 +1329,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 pp_rank = int(get_pp_group().rank_in_group)
             except Exception:
                 pp_rank = 0
-
-            try:
-                device_str = str(getattr(self, "device", "cuda"))
-            except Exception:
-                device_str = "cuda"
 
             from kvcached.integration.vllm import interfaces as kvi
 
