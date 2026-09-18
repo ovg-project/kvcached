@@ -36,7 +36,8 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 - **Elastic KV cache**: allocate and reclaim KV memory dynamically to match live load.
 - **GPU virtual memory**: decouple logical KV from physical GPU memory via runtime mapping.
-- **Memory control CLI**: enforce memory limits with kvcached CLI.
+- **Memory control**: enforce memory limits with the kvcached CLI or the
+  [revisioned production-control API](examples/02_memory_control#embedding-revisioned-limits-in-a-production-controller).
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
 - **Prefix caching**: support automatic prefix caching (APC) with a configurable memory bound. See [the example doc](examples/09_prefix_caching) for details.
