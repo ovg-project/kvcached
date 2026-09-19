@@ -13,9 +13,12 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
 from kvcached.observability import (  # noqa: E402
+    _pool_snapshot_history,
     build_kv_cache_pool_snapshot,
     build_runtime_snapshot,
+    clear_kv_cache_pool_history,
     get_capabilities,
+    get_kv_cache_pool_snapshot_history,
     get_registered_kv_cache_pool_snapshot_dicts,
 )
 from kvcached.pool_registry import (  # noqa: E402
@@ -87,6 +90,7 @@ def test_capabilities_are_json_serializable():
     assert capabilities["schema_version"] == "kvcached.observability.v1"
     assert capabilities["features"]["read_only"] is True
     assert capabilities["features"]["policy_control"] is False
+    assert capabilities["features"]["pool_snapshot_history"] is True
     json.dumps(capabilities)
 
 
@@ -408,3 +412,136 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+
+
+def test_pool_snapshot_history_accumulates():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+
+    snapshot_1 = build_kv_cache_pool_snapshot(manager)
+    snapshot_2 = build_kv_cache_pool_snapshot(manager)
+
+    history = get_kv_cache_pool_snapshot_history(manager, manager.group_id)
+
+    assert len(history) == 2
+    assert history[0]["snapshot"]["group_id"] == manager.group_id
+    assert history[0]["snapshot"]["schema_version"] == snapshot_1.schema_version
+    assert history[1]["snapshot"]["schema_version"] == snapshot_2.schema_version
+
+
+def test_pool_snapshot_history_contains_timestamp():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+
+    build_kv_cache_pool_snapshot(manager)
+
+    history = get_kv_cache_pool_snapshot_history(manager, manager.group_id)
+
+    assert len(history) == 1
+    assert isinstance(history[0]["timestamp"], float)
+    assert history[0]["snapshot"]["group_id"] == manager.group_id
+    assert history[0]["snapshot"]["total_blocks"] == manager.num_blocks
+
+
+def test_pool_snapshot_history_isolated_by_manager():
+    clear_kv_cache_pool_history()
+
+    manager_1 = FakeManager()
+    manager_2 = FakeManager()
+
+    manager_1.group_id = manager_2.group_id
+
+    build_kv_cache_pool_snapshot(manager_1)
+    build_kv_cache_pool_snapshot(manager_2)
+
+    history_1 = get_kv_cache_pool_snapshot_history(manager_1, manager_1.group_id)
+    history_2 = get_kv_cache_pool_snapshot_history(manager_2, manager_2.group_id)
+
+    assert len(history_1) == 1
+    assert len(history_2) == 1
+    assert history_1[0]["snapshot"]["group_id"] == manager_1.group_id
+    assert history_2[0]["snapshot"]["group_id"] == manager_2.group_id
+
+
+def test_pool_snapshot_history_is_bounded():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+
+    for _ in range(130):
+        build_kv_cache_pool_snapshot(manager)
+
+    history = get_kv_cache_pool_snapshot_history(manager, manager.group_id)
+
+    assert len(history) == 120
+
+
+def test_clear_kv_cache_pool_history():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+
+    build_kv_cache_pool_snapshot(manager)
+
+    assert get_kv_cache_pool_snapshot_history(manager, manager.group_id)
+
+    clear_kv_cache_pool_history()
+
+    assert get_kv_cache_pool_snapshot_history(manager, manager.group_id) == []
+
+
+def test_pool_snapshot_history_unknown_group_returns_empty():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+
+    assert get_kv_cache_pool_snapshot_history(manager, 999999) == []
+
+def test_pool_snapshot_history_cleanup_on_manager_gc():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+    manager_id = id(manager)
+    group_id = manager.group_id
+
+    build_kv_cache_pool_snapshot(manager)
+
+    assert (manager_id, group_id) in _pool_snapshot_history
+
+    del manager
+    gc.collect()
+
+    assert all(
+        key[0] != manager_id
+        for key in _pool_snapshot_history
+    )
+
+def test_pool_snapshot_history_supports_non_weakrefable_adapter():
+    clear_kv_cache_pool_history()
+
+    manager = FakeManager()
+    adapter = types.SimpleNamespace(
+        **{
+            key: getattr(manager, key)
+            for key in dir(manager)
+            if not key.startswith("__")
+        }
+    )
+
+    manager_id = id(adapter)
+    group_id = adapter.group_id
+
+    snapshot = build_kv_cache_pool_snapshot(adapter)
+
+    assert snapshot is not None
+    assert (manager_id, group_id) not in _pool_snapshot_history
+
+    del adapter
+    gc.collect()
+
+    assert all(
+        key[0] != manager_id
+        for key in _pool_snapshot_history
+    )
