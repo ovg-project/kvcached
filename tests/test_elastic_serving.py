@@ -17,8 +17,9 @@ Phases:
 
 Validated on AMD MI300X (ROCm/HIP) to confirm the hipMemMap (grow) and
 hipMemUnmap (shrink) paths, and on NVIDIA. vLLM selects the device, so nothing
-here names one, but the XPU path has not been run: this needs vLLM, which the
-Intel test environment does not have yet.
+here names one, but this file has never run on XPU: vLLM has no XPU build in the
+Intel test environment. ``test_elastic_serving_sglang.py`` drives the grow and
+shrink paths there through SGLang instead.
 
 Run inside the engine venv with kvcached enabled:
     ENABLE_KVCACHED=true VLLM_USE_V1=1 pytest tests/test_elastic_serving.py -s
