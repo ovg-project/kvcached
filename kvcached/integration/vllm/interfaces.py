@@ -16,7 +16,7 @@ from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import start_worker_listener_thread
+from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -33,6 +33,12 @@ _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
+
+# Single source of truth for what this shim accepts. The capability record
+# in kvcached.observability reports these, so the guards below and the
+# reported record cannot drift apart.
+SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA", "HYBRID_LINEAR")
+SUPPORTED_KV_LAYOUTS = ("NHD",)
 
 
 def should_use_worker_ipc() -> bool:
@@ -64,7 +70,12 @@ def init_kvcached(
         # (broadcast_kv_tensors_created) and fail with ENOENT on the socket path.
         if is_worker and not _is_worker:
             _is_worker = True
-            start_worker_listener_thread(tp_rank, pp_rank)
+            listener_device = _kvcached_device or device
+            start_worker_listener_thread(
+                tp_rank,
+                pp_rank,
+                device_index=resolve_gpu_device_index(listener_device),
+            )
         if async_sched and not _async_sched:
             _async_sched = True
             logger.info("kvcached async scheduler enabled")
@@ -90,7 +101,11 @@ def init_kvcached(
     if is_worker:
         # start the listener thread for kv cache management regardless of TP size
         # because the vLLM EngineCore might need to reach this worker if PP > 1
-        start_worker_listener_thread(tp_rank, pp_rank)
+        start_worker_listener_thread(
+            tp_rank,
+            pp_rank,
+            device_index=resolve_gpu_device_index(device),
+        )
 
 
 def shutdown_kvcached() -> None:
@@ -313,10 +328,10 @@ def alloc_kv_cache(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA", "HYBRID_LINEAR"]:
+    if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
-    if kv_layout != "NHD":
+    if kv_layout not in SUPPORTED_KV_LAYOUTS:
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     is_mla = attention_type == "MLA"

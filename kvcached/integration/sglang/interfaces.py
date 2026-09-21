@@ -16,7 +16,7 @@ from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import start_worker_listener_thread
+from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -32,6 +32,13 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
+
+# Single source of truth for what this shim accepts. The capability record
+# in kvcached.observability reports these, so the guards below and the
+# reported record cannot drift apart. SUPPORTED_KV_LAYOUTS is enforced for
+# MHA/GQA only; the MLA path ignores the layout argument.
+SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA")
+SUPPORTED_KV_LAYOUTS = ("NHD",)
 
 
 def init_kvcached(
@@ -58,7 +65,11 @@ def init_kvcached(
 
     if world_size > 1:
         # start the listener thread for tensor parallel kv cache management
-        start_worker_listener_thread(tp_rank, pp_rank)
+        start_worker_listener_thread(
+            tp_rank,
+            pp_rank,
+            device_index=resolve_gpu_device_index(device),
+        )
 
 
 def shutdown_kvcached() -> None:
@@ -120,11 +131,11 @@ def alloc_kv_cache(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA"]:
+    if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
     is_mla = attention_type == "MLA"
-    if not is_mla and kv_layout != "NHD":
+    if not is_mla and kv_layout not in SUPPORTED_KV_LAYOUTS:
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     num_k_or_v = 1 if is_mla else 2

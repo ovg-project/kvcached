@@ -49,6 +49,10 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
             patch_versions[patch_name] = version.value
 
     virtual_index = patch_names.index("SGLangVirtualKVCapacityPatch")
+    assert patch_names.index("ElasticAllocatorPatch") < patch_names.index(
+        "ElasticSWAAllocatorPatch"
+    )
+    assert patch_versions["ElasticSWAAllocatorPatch"] == ">=0.5.13"
     for pool_patch in (
         "ElasticMemoryPoolPatch",
         "ElasticMLAMemoryPoolPatch",
