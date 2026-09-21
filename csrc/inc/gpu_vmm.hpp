@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #elif defined(KVCACHED_USE_XPU)
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -49,6 +50,15 @@ inline const char *error_string(status_t status) {
 }
 
 inline bool is_success(status_t status) { return status == hipSuccess; }
+
+// See the XPU arm: only a backend that has to clean up after a partially
+// applied map can leave the caller unsure whether a range is mapped. This one
+// does no cleanup of its own, so a failed map is whatever hipMemMap left behind
+// and never an unconfirmed cleanup.
+inline bool is_state_uncertain(status_t status) {
+  (void)status;
+  return false;
+}
 
 inline void check(status_t status, const char *tok, const char *file,
                   unsigned line) {
@@ -170,6 +180,20 @@ inline const char *error_string(rt_status_t status) {
 inline bool is_success(drv_status_t status) { return status == CUDA_SUCCESS; }
 
 inline bool is_success(rt_status_t status) { return status == cudaSuccess; }
+
+// See the XPU arm: only a backend that has to clean up after a partially
+// applied map can leave the caller unsure whether a range is mapped. This one
+// does no cleanup of its own, so a failed map is whatever cuMemMap left behind
+// and never an unconfirmed cleanup.
+inline bool is_state_uncertain(drv_status_t status) {
+  (void)status;
+  return false;
+}
+
+inline bool is_state_uncertain(rt_status_t status) {
+  (void)status;
+  return false;
+}
 
 inline void check(drv_status_t status, const char *tok, const char *file,
                   unsigned line) {
@@ -322,6 +346,11 @@ namespace detail {
 
 constexpr status_t kOk = 0;
 constexpr status_t kErr = -1;
+// A failure whose own cleanup failed as well, so the range it was working on is
+// in an unknown state. Separate from kErr because the two demand different
+// things of the caller: kErr is a capacity miss it can retry, kUnclean means
+// the physical page may still be partly mapped and must not be reused or freed.
+constexpr status_t kUnclean = -2;
 
 // Last failure on this thread. check() aborts and DRV_CALL_RET warns
 // immediately after a non-zero status, so the message is always the one that
@@ -331,12 +360,34 @@ inline std::string &last_error() {
   return msg;
 }
 
+// Raised inside a guarded call to ask for kUnclean instead of kErr. Carries
+// both the original failure and the cleanup failure: with the range's state
+// unknown, which cleanup call failed and why is the only thing a report can
+// offer.
+class unclean_failure : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+inline std::string message_of(const std::exception_ptr &error) {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception &e) {
+    return e.what();
+  } catch (...) {
+    return "unknown XPU error";
+  }
+}
+
 // Converts the extension's exception-based failures into kvcached's
 // status-based seam, keeping the SYCL diagnostic for error_string().
 template <typename Fn> inline status_t guard(const char *op, Fn &&fn) {
   try {
     fn();
     return kOk;
+  } catch (const unclean_failure &e) {
+    last_error() = std::string(op) + ": " + e.what();
+    return kUnclean;
   } catch (const std::exception &e) {
     last_error() = std::string(op) + ": " + e.what();
     return kErr;
@@ -443,6 +494,16 @@ inline const char *error_string(status_t status) {
 }
 
 inline bool is_success(status_t status) { return status == detail::kOk; }
+
+// True when the call failed AND could not clean up after itself, so whether the
+// range it touched is mapped is unknown. The caller must keep the physical page
+// alive and never map it again: releasing memory that may still be mapped, or
+// mapping over chunks that may still be there, is how one failed page turns
+// into a broken pool. A plain failure (is_success() false, this false) has been
+// cleaned up and stays retryable.
+inline bool is_state_uncertain(status_t status) {
+  return status == detail::kUnclean;
+}
 
 inline void check(status_t status, const char *tok, const char *file,
                   unsigned line) {
@@ -608,8 +669,37 @@ inline status_t mem_map(void *ptr, size_t size, size_t offset,
     // call still overrides whatever is chosen here.
     const auto mode = accessible ? se::address_access_mode::read_write
                                  : se::address_access_mode::none;
-    void *mapped = detail::registry().get(handle).map(
-        reinterpret_cast<uintptr_t>(ptr), size, mode, offset);
+    void *mapped = nullptr;
+    try {
+      mapped = detail::registry().get(handle).map(
+          reinterpret_cast<uintptr_t>(ptr), size, mode, offset);
+    } catch (...) {
+      // A page is 32 chunks of the driver's 64 KiB granularity, and a map that
+      // fails part-way through them leaves the chunks it did map in place.
+      // Nothing above this point knows that happened -- the call threw, so the
+      // caller treats the range as unmapped -- and the leftovers make every
+      // later map of the range fail with INVALID_ARGUMENT instead of the
+      // original error. Under memory pressure that turns one transient OOM into
+      // a page range the pool can never use again.
+      //
+      // Unmapping a range with nothing mapped into it is a no-op on this
+      // driver, so this needs no knowledge of how far the map got.
+      const std::exception_ptr map_error = std::current_exception();
+      try {
+        se::unmap(ptr, size, xpu_runtime::context());
+      } catch (...) {
+        // Both calls failed, so whether the range still holds chunks of this
+        // page is now unknowable: report kUnclean rather than presenting this
+        // as an ordinary map failure the caller may retry. Both errors go into
+        // the message -- the map's says why the page could not be placed, the
+        // unmap's why that could not be undone, and neither explains the other.
+        throw detail::unclean_failure(
+            "map failed: " + detail::message_of(map_error) +
+            "; cleanup unmap failed: " +
+            detail::message_of(std::current_exception()));
+      }
+      throw;
+    }
     if (mapped != ptr) {
       std::ostringstream oss;
       oss << "mapped at " << mapped << ", not the requested " << ptr;
