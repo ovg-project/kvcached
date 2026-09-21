@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parents[1] / "tools" / "sync_engine_upstream.py"
+PYTHON = Path(sys.executable).as_posix()
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -83,7 +87,11 @@ def run_sync(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    return completed, json.loads(result_json.read_text()), report.read_text()
+    return (
+        completed,
+        json.loads(result_json.read_text(encoding="utf-8")),
+        report.read_text(encoding="utf-8"),
+    )
 
 
 def test_sync_pushes_checked_upstream_merge(tmp_path):
@@ -96,7 +104,7 @@ def test_sync_pushes_checked_upstream_merge(tmp_path):
         upstream,
         target,
         "--check",
-        f"{sys.executable} -c pass",
+        f"'{PYTHON}' -c pass",
         "--push",
     )
 
@@ -158,7 +166,7 @@ def test_failed_check_does_not_push_sync_branch(tmp_path):
         upstream,
         target,
         "--check",
-        f"{sys.executable} -c 'raise SystemExit(7)'",
+        f"'{PYTHON}' -c 'raise SystemExit(7)'",
         "--push",
     )
 
@@ -290,3 +298,156 @@ def test_sync_refuses_to_overwrite_repair_commit_on_remote_branch(tmp_path):
     assert git(target, "show", "automation/test-sync:repair.txt") == (
         "human compatibility fix"
     )
+
+
+def test_amended_marker_does_not_authorize_overwriting_repairs(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    write(upstream / "first.txt", "first\n")
+    commit(upstream, "first")
+    assert (
+        run_sync(tmp_path, upstream, target, "--push", "--update-existing-branch")[
+            0
+        ].returncode
+        == 0
+    )
+    repair = tmp_path / "repair"
+    git(tmp_path, "clone", str(target), str(repair))
+    git(repair, "checkout", "automation/test-sync")
+    write(repair / "repair.txt", "preserve\n")
+    git(repair, "add", ".")
+    git(
+        repair,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--amend",
+        "--no-edit",
+    )
+    git(repair, "push", "--force", "origin", "automation/test-sync")
+    expected = git(repair, "rev-parse", "HEAD")
+    write(upstream / "second.txt", "second\n")
+    commit(upstream, "second")
+    completed, result, _ = run_sync(
+        tmp_path, upstream, target, "--push", "--update-existing-branch"
+    )
+    assert completed.returncode == 4
+    assert result["status"] == "remote-diverged"
+    assert git(target, "rev-parse", "automation/test-sync") == expected
+
+
+def test_identical_pending_sync_reuses_checked_sha(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    write(upstream / "first.txt", "first\n")
+    commit(upstream, "first")
+    first_run, first, _ = run_sync(
+        tmp_path, upstream, target, "--push", "--update-existing-branch"
+    )
+    assert first_run.returncode == 0
+    check = f"'{PYTHON}' -c 'import subprocess; assert subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip() == \"{first['result_commit']}\"'"
+    completed, second, _ = run_sync(
+        tmp_path,
+        upstream,
+        target,
+        "--push",
+        "--update-existing-branch",
+        "--check",
+        check,
+    )
+    assert completed.returncode == 0, completed.stdout
+    assert (
+        second["status"] == "synced"
+    )  # Recover PR creation after a prior API failure.
+    assert first["result_commit"] == second["result_commit"]
+
+
+def test_merged_manual_repair_does_not_block_next_sync(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    write(upstream / "first.txt", "first\n")
+    commit(upstream, "first")
+    assert (
+        run_sync(tmp_path, upstream, target, "--push", "--update-existing-branch")[
+            0
+        ].returncode
+        == 0
+    )
+    repair = tmp_path / "repair"
+    git(tmp_path, "clone", str(target), str(repair))
+    git(repair, "checkout", "automation/test-sync")
+    write(repair / "repair.txt", "preserve\n")
+    commit(repair, "manual repair")
+    git(repair, "push", "origin", "automation/test-sync")
+    git(repair, "checkout", "main")
+    git(repair, "merge", "--ff-only", "automation/test-sync")
+    git(repair, "push", "origin", "main")
+    write(upstream / "second.txt", "second\n")
+    commit(upstream, "second")
+    completed, result, _ = run_sync(
+        tmp_path, upstream, target, "--push", "--update-existing-branch"
+    )
+    assert completed.returncode == 0, completed.stdout
+    assert result["status"] == "synced"
+    assert git(target, "show", "automation/test-sync:repair.txt") == "preserve"
+
+
+def test_merge_only_repair_survives_two_sync_cycles(tmp_path):
+    upstream, target = initialize_repositories(tmp_path)
+    repair = tmp_path / "integration"
+    git(tmp_path, "clone", str(target), str(repair))
+    git(repair, "config", "user.name", "Test")
+    git(repair, "config", "user.email", "test@example.com")
+    git(repair, "checkout", "-b", "patch")
+    write(repair / "patch.txt", "patch\n")
+    commit(repair, "patch")
+    git(repair, "checkout", "main")
+    git(repair, "merge", "--no-ff", "--no-commit", "patch")
+    write(repair / "repair.txt", "merge-only repair\n")
+    commit(repair, "merge with repair")
+    git(repair, "push", "origin", "main")
+    for i in range(2):
+        write(upstream / f"upstream{i}.txt", "new\n")
+        commit(upstream, "upstream")
+        completed, result, _ = run_sync(
+            tmp_path, upstream, target, "--push", "--update-existing-branch"
+        )
+        assert completed.returncode == 0, completed.stdout
+        assert (
+            git(target, "show", "automation/test-sync:repair.txt")
+            == "merge-only repair"
+        )
+        git(repair, "fetch", "origin")
+        git(repair, "merge", "--ff-only", "origin/automation/test-sync")
+        git(repair, "push", "origin", "main")
+    write(upstream / "last.txt", "last\n")
+    commit(upstream, "last")
+    completed, result, _ = run_sync(tmp_path, upstream, target, "--strategy", "rebase")
+    assert completed.returncode == 4
+    assert result["status"] == "merge-history"
+
+
+@pytest.mark.parametrize(
+    "existing,base,raises",
+    [
+        ([], "main", False),
+        ([{"number": 1, "baseRefName": "main"}], "main", False),
+        ([{"number": 1, "baseRefName": "old"}], "main", True),
+    ],
+)
+def test_pr_base_guard(monkeypatch, existing, base, raises):
+    spec = importlib.util.spec_from_file_location(
+        "base_guard", SCRIPT.with_name("check_sync_pr_base.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a, 0, json.dumps(existing)),
+    )
+    if raises:
+        with pytest.raises(RuntimeError, match="leave the existing branch unchanged"):
+            module.check_base("owner/repo", "automation/test", base)
+    else:
+        module.check_base("owner/repo", "automation/test", base)

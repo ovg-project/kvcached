@@ -161,9 +161,7 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
     git(repository, "fetch", "--no-tags", "upstream", args.upstream_branch)
 
     upstream_ref = f"upstream/{args.upstream_branch}"
-    result.upstream_commit = git(
-        repository, "rev-parse", upstream_ref
-    ).stdout.strip()
+    result.upstream_commit = git(repository, "rev-parse", upstream_ref).stdout.strip()
 
     ancestor = git(
         repository,
@@ -186,6 +184,8 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
         )
 
     expected_remote_tip = ""
+    base_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
+    reuse_remote = False
     if args.update_existing_branch:
         remote_sync_ref = f"refs/remotes/origin/{args.sync_branch}"
         remote_branch = git(
@@ -207,7 +207,34 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
                 "--format=%B",
                 remote_sync_ref,
             ).stdout.splitlines()
-            if SYNC_MANAGED_TRAILER not in remote_message:
+            metadata = dict(
+                line.split(": ", 1)
+                for line in remote_message
+                if line.startswith("OVG-") and ": " in line
+            )
+            remote_tree = git(
+                repository, "rev-parse", f"{remote_sync_ref}^{{tree}}"
+            ).stdout.strip()
+            parents = git(
+                repository, "show", "-s", "--format=%P", remote_sync_ref
+            ).stdout.strip()
+            integrated = git(
+                repository,
+                "merge-base",
+                "--is-ancestor",
+                expected_remote_tip,
+                base_commit,
+                check=False,
+            )
+            if integrated.returncode not in (0, 1):
+                raise CommandError(
+                    integrated.args, integrated.returncode, integrated.stdout
+                )
+            if integrated.returncode != 0 and (
+                SYNC_MANAGED_TRAILER not in remote_message
+                or metadata.get("OVG-Sync-Tree") != remote_tree
+                or metadata.get("OVG-Sync-Parent") != parents
+            ):
                 result.status = "remote-diverged"
                 result.result_commit = expected_remote_tip
                 result.message = (
@@ -217,6 +244,11 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
                     "overwritten."
                 )
                 return result
+            reuse_remote = (
+                metadata.get("OVG-Sync-Base") == base_commit
+                and metadata.get("OVG-Upstream-Commit") == result.upstream_commit
+                and metadata.get("OVG-Sync-Strategy") == args.strategy
+            )
         elif remote_branch.returncode != 1:
             raise CommandError(
                 ["git", "show-ref", "--verify", "--quiet", remote_sync_ref],
@@ -224,16 +256,34 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
                 remote_branch.stdout,
             )
 
-    git(repository, "checkout", "-b", args.sync_branch)
+    git(
+        repository,
+        "checkout",
+        "-b",
+        args.sync_branch,
+        expected_remote_tip if reuse_remote else base_commit,
+    )
     result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
     if args.strategy == "rebase":
+        # Recreating a merge does not preserve its manual conflict resolution.
+        merges = git(
+            repository, "rev-list", "--merges", f"{upstream_ref}..HEAD"
+        ).stdout.strip()
+        if merges and not reuse_remote:
+            result.status = "merge-history"
+            result.message = "Integration history contains merges; use --strategy merge to preserve their repairs. No branch was pushed."
+            return result
         integrate_command = ["rebase", upstream_ref]
         abort_command = ["rebase", "--abort"]
     else:
         integrate_command = ["merge", "--no-ff", "--no-edit", upstream_ref]
         abort_command = ["merge", "--abort"]
 
-    integration = git(repository, *integrate_command, check=False)
+    integration = (
+        git(repository, "status", "--porcelain")
+        if reuse_remote
+        else git(repository, *integrate_command, check=False)
+    )
     if integration.returncode != 0:
         conflicts = git(
             repository,
@@ -254,6 +304,28 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
             result.worktree = ""
         return result
 
+    if args.push and args.update_existing_branch and not reuse_remote:
+        parent = git(repository, "rev-parse", "HEAD").stdout.strip()
+        tree = git(repository, "rev-parse", "HEAD^{tree}").stdout.strip()
+        git(
+            repository,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "chore: record automated upstream sync",
+            "-m",
+            "\n".join(
+                [
+                    SYNC_MANAGED_TRAILER,
+                    f"OVG-Upstream-Commit: {result.upstream_commit}",
+                    f"OVG-Sync-Base: {base_commit}",
+                    f"OVG-Sync-Strategy: {args.strategy}",
+                    f"OVG-Sync-Tree: {tree}",
+                    f"OVG-Sync-Parent: {parent}",
+                ]
+            ),
+        )
+    checked_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
     for command_text in args.check:
         command = shlex.split(command_text)
         if not command:
@@ -268,35 +340,38 @@ def sync_repository(args: argparse.Namespace, workdir: Path) -> SyncResult:
         )
         if completed.returncode != 0:
             result.status = "check-failed"
-            result.result_commit = git(
-                repository, "rev-parse", "HEAD"
-            ).stdout.strip()
+            result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
             result.message = (
                 f"The upstream {args.strategy} completed, but a compatibility "
                 "check failed. No branch was pushed."
             )
             return result
 
+    if (
+        git(repository, "rev-parse", "HEAD").stdout.strip() != checked_commit
+        or git(
+            repository, "status", "--porcelain", "--untracked-files=no"
+        ).stdout.strip()
+    ):
+        result.status = "check-failed"
+        result.message = "Checks modified the candidate commit or tracked files. No branch was pushed."
+        return result
     if args.push:
-        if args.update_existing_branch:
-            git(
-                repository,
-                "commit",
-                "--allow-empty",
-                "-m",
-                "chore: record automated upstream sync",
-                "-m",
-                SYNC_MANAGED_TRAILER,
-                "-m",
-                f"OVG-Upstream-Commit: {result.upstream_commit}",
-            )
         result.result_commit = git(repository, "rev-parse", "HEAD").stdout.strip()
         push_args = ["push"]
         if args.update_existing_branch:
             lease = f"refs/heads/{args.sync_branch}:{expected_remote_tip}"
             push_args.append(f"--force-with-lease={lease}")
         push_args.extend(["origin", f"HEAD:refs/heads/{args.sync_branch}"])
-        git(repository, *push_args)
+        if not reuse_remote:
+            git(repository, *push_args)
+        remote_tip = git(
+            repository, "ls-remote", "origin", f"refs/heads/{args.sync_branch}"
+        ).stdout.split()
+        if not remote_tip or remote_tip[0] != result.result_commit:
+            raise RuntimeError(
+                "Remote sync head changed; refusing to publish an unverified result"
+            )
         result.message = (
             f"Upstream {args.strategy} completed, checks passed, and the sync "
             "branch was pushed."
@@ -390,6 +465,7 @@ def main() -> int:
         "conflict": 2,
         "check-failed": 3,
         "remote-diverged": 4,
+        "merge-history": 4,
     }.get(result.status, 1)
 
 

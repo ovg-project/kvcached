@@ -33,7 +33,10 @@ CONTRACTS: Mapping[str, Sequence[ModuleContract]] = {
         ),
         ModuleContract("v1/core/kv_cache_manager.py", ("KVCacheManager",)),
         ModuleContract("v1/worker/gpu_model_runner.py", ("GPUModelRunner",)),
-        ModuleContract("v1/worker/gpu_worker.py", ("Worker",)),
+        ModuleContract(
+            "v1/worker/gpu_worker.py", ("Worker",),
+            required_methods={"Worker": ("init_device", "determine_available_memory")},
+        ),
         ModuleContract(
             "v1/kv_cache_interface.py",
             ("FullAttentionSpec",),

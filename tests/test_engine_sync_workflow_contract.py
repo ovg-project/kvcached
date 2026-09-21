@@ -25,10 +25,10 @@ def test_fork_token_is_not_exposed_to_dry_runs():
     assert "inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || ''" in source
 
 
-def test_scheduled_sync_rebases_the_ovg_patch_stack():
+def test_scheduled_sync_preserves_merged_repairs():
     source = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "--strategy rebase" in source
+    assert "--strategy merge" in source
 
 
 def test_sync_targets_a_separate_kvcached_integration_branch():
@@ -36,7 +36,7 @@ def test_sync_targets_a_separate_kvcached_integration_branch():
 
     assert 'base="${VLLM_BASE:-kvcached-main}"' in source
     assert 'base="${SGLANG_BASE:-kvcached-main}"' in source
-    assert '--base-branch "${{ steps.config.outputs.base }}"' in source
+    assert '--base-branch "${BASE}"' in source
     assert '--base "${BASE}"' in source
 
 
@@ -51,3 +51,12 @@ def test_unconfigured_engine_repository_is_skipped_without_failing_schedule():
     assert 'echo "skip=true" >> "${GITHUB_OUTPUT}"' in missing_target
     assert "exit 0" in missing_target
     assert "::error::" not in missing_target
+
+
+def test_pr_base_is_checked_before_push_and_publication():
+    source = WORKFLOW.read_text(encoding="utf-8")
+    assert source.count("python tools/check_sync_pr_base.py") == 2
+    assert source.index("python tools/check_sync_pr_base.py") < source.index(
+        "python tools/sync_engine_upstream.py"
+    )
+    assert "cancel-in-progress: false" in source

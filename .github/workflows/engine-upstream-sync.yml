@@ -30,6 +30,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: engine-upstream-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     name: Sync ${{ matrix.engine }}
@@ -109,19 +113,26 @@ jobs:
             ${{ inputs.dry_run != true && secrets.OVG_SYNC_TOKEN || '' }}
           ENGINE: ${{ matrix.engine }}
           TARGET: ${{ steps.config.outputs.target }}
+          BASE: ${{ steps.config.outputs.base }}
           UPSTREAM: ${{ steps.config.outputs.upstream }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           mkdir -p sync-artifacts
+          if [[ "${DRY_RUN}" != "true" ]]; then
+            repository="${TARGET#https://github.com/}"
+            repository="${repository%.git}"
+            python tools/check_sync_pr_base.py --repository "${repository}" \
+              --branch "automation/upstream-${ENGINE}" --base "${BASE}"
+          fi
           compat_tool="${GITHUB_WORKSPACE}/tools/check_engine_compat.py"
           compat_report="${GITHUB_WORKSPACE}/sync-artifacts/${ENGINE}-compat.json"
           args=(
             --engine "${ENGINE}"
             --target-repository "${TARGET}"
             --upstream-repository "${UPSTREAM}"
-            --base-branch "${{ steps.config.outputs.base }}"
+            --base-branch "${BASE}"
             --sync-branch "automation/upstream-${ENGINE}"
-            --strategy rebase
+            --strategy merge
             --update-existing-branch
             --result-json "sync-artifacts/${ENGINE}.json"
             --report "sync-artifacts/${ENGINE}.md"
@@ -154,6 +165,8 @@ jobs:
           repository="${TARGET#https://github.com/}"
           repository="${repository%.git}"
           branch="automation/upstream-${ENGINE}"
+          python tools/check_sync_pr_base.py --repository "${repository}" \
+            --branch "${branch}" --base "${BASE}"
           existing="$(
             gh pr list \
               --repo "${repository}" \

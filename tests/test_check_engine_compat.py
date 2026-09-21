@@ -104,6 +104,17 @@ def test_missing_required_symbol_fails_contract(tmp_path):
     assert engine_core.missing_required == ["EngineCore"]
 
 
+def test_empty_vllm_worker_is_not_compatible(tmp_path):
+    package_root = materialize_contract(tmp_path, "vllm")
+    write_module(package_root, "v1/worker/gpu_worker.py", "class Worker:\n    pass\n")
+    result = compat.check_repository(tmp_path, "vllm")
+    assert result.status == "incompatible"
+    worker = next(m for m in result.modules if m.path.endswith("gpu_worker.py"))
+    assert set(worker.missing_required_methods) == {
+        "Worker.init_device", "Worker.determine_available_memory",
+    }
+
+
 def test_missing_required_method_fails_contract(tmp_path):
     package_root = materialize_contract(tmp_path, "sglang")
     write_module(

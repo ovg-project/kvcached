@@ -28,7 +28,7 @@ The daily workflow:
 
 1. fetches the OVG fork and official upstream;
 2. checks whether the upstream commit is already present;
-3. rebases the OVG patch stack onto the new upstream commit;
+3. merges upstream into the integration history, retaining merge-only repairs;
 4. runs compatibility checks;
 5. pushes the branch and opens a pull request;
 6. uploads JSON and Markdown reports.
@@ -36,6 +36,13 @@ The daily workflow:
 Each engine uses one stable automation-owned branch. A later daily run updates
 that branch with `force-with-lease` and refreshes the existing pull request
 body, so an unmerged update never creates duplicate pull requests.
+The workflow checks the existing PR base before pushing and again before
+publication. Runs are serialized without cancelling an in-progress update.
+An unchanged pending result keeps its SHA and can recover a failed PR creation.
+The managed marker records the tree and parent as well as the input revisions;
+appended or amended repairs stop automation without overwriting the branch.
+Markers created by the older workflow lack this metadata and also stop safely:
+merge or otherwise resolve that pending branch before starting a new sync.
 
 ## One-time repository bootstrap
 
@@ -51,10 +58,11 @@ The scheduled workflow owns only `automation/upstream-vllm` and
 `automation/upstream-sglang`. It never pushes directly to the protected
 integration branch.
 
-The automation uses `rebase` so the target branch remains the official engine
-history followed by a small OVG-owned patch stack. The command-line tool also
-supports `--strategy merge` for an existing fork whose history cannot yet be
-cleanly rebased.
+The automation uses `merge`. Plain rebase can silently discard changes made
+only while resolving a merge. The CLI retains `--strategy rebase` for linear
+patch stacks, but refuses it when the integration-only history contains merges.
+All checks run against the final marker commit; changes to that commit or tracked
+files during validation prevent publication. The remote SHA is checked after push.
 
 Conflicts and failed checks intentionally stop before push. The JSON report
 contains conflict paths, commits, commands, return codes, and log tails. That
@@ -67,10 +75,11 @@ conflicted worktree, inspect kvcached's vLLM/SGLang compatibility surfaces,
 repair only the affected integration, add regression coverage, and require
 the appropriate GPU gate before proposing a pull request.
 
-`tools/check_engine_compat.py` scans the merged engine source for every module,
-class, and required allocator method currently patched by kvcached. Its JSON
-report includes method signature fingerprints. This catches common upstream
-drift before a GPU is occupied, but does not replace runtime tests.
+`tools/check_engine_compat.py` scans selected module, class, and method contracts,
+including vLLM worker initialization and memory profiling and SGLang allocator
+methods. Its JSON report includes method signature fingerprints, but does not
+yet validate argument compatibility or every patch point. Passing this scan is
+only a preliminary structural check, not a claim of runtime compatibility.
 
 The Git operation can also be exercised locally without pushing:
 
@@ -80,7 +89,7 @@ python tools/sync_engine_upstream.py \
   --target-repository https://github.com/ovg-project/vllm.git \
   --upstream-repository https://github.com/vllm-project/vllm.git \
   --sync-branch automation/local-vllm-sync \
-  --strategy rebase \
+  --strategy merge \
   --check "python -m compileall -q ." \
   --result-json /tmp/vllm-sync.json \
   --report /tmp/vllm-sync.md
