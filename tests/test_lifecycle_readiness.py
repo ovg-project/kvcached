@@ -342,6 +342,40 @@ def test_post_init_ipc_error_is_re_raised_by_wait_ready(monkeypatch):
     assert manager._post_init_done.is_set()
 
 
+def test_repeated_wait_ready_on_a_failed_pool_keeps_the_traceback_flat(monkeypatch):
+    """A poller that keeps gating on a failed pool re-raises the same stored
+    exception every time, and every raise used to append the caller's frames
+    to its traceback (1 -> 201 frames over 100 reads), retaining those
+    frames' locals for as long as FAILED holds the error. The re-raise now
+    rewinds to the traceback recorded at failure time first."""
+    monkeypatch.setattr(kcm, "KV_TENSOR_WAIT_TIMEOUT", 0.02)
+    monkeypatch.setattr(kcm, "broadcast_kv_tensors_created",
+                        lambda *args, **kwargs: False)
+    manager = _bare_manager()
+    thread = _run_post_init(manager)
+    with pytest.raises(TimeoutError, match="KV tensors not created"):
+        manager.wait_ready(timeout=5)
+    thread.join(timeout=5)
+
+    def stored_frames() -> int:
+        error = manager.lifecycle_error
+        assert error is not None
+        return len(traceback.extract_tb(error.__traceback__))
+
+    after_first = stored_frames()
+    for _ in range(100):
+        with pytest.raises(TimeoutError) as excinfo:
+            manager.wait_ready()
+        assert excinfo.value is manager.lifecycle_error
+    assert stored_frames() == after_first
+    # The rewound traceback still names the original failure site.
+    names = [
+        frame.name
+        for frame in traceback.extract_tb(manager.lifecycle_error.__traceback__)
+    ]
+    assert "_post_init" in names
+
+
 def test_wait_ready_times_out_while_initializing():
     manager = _bare_manager()
     with pytest.raises(TimeoutError, match="still initializing"):
@@ -649,6 +683,33 @@ def test_failed_without_an_error_object_still_raises():
     state.mark_failed("no exception recorded")
     with pytest.raises(RuntimeError, match="no exception recorded"):
         state.raise_if_failed()
+
+
+def test_repeated_raise_if_failed_does_not_grow_the_stored_traceback():
+    state = LifecycleState("t")
+    try:
+        raise RuntimeError("boom during init")
+    except RuntimeError as exc:
+        state.mark_failed("init failed", exc)
+
+    def stored_frames() -> int:
+        error = state.error
+        assert error is not None
+        return len(traceback.extract_tb(error.__traceback__))
+
+    recorded = stored_frames()
+    with pytest.raises(RuntimeError, match="boom during init"):
+        state.raise_if_failed()
+    after_first = stored_frames()
+    # One read appends only its own raise and call frames on top of the
+    # recorded failure frame; without the rewind, 100 reads grew this
+    # to recorded + 200.
+    assert after_first == recorded + 2
+    for _ in range(100):
+        with pytest.raises(RuntimeError, match="boom during init") as excinfo:
+            state.raise_if_failed()
+        assert excinfo.value is state.error
+    assert stored_frames() == after_first
 
 
 def test_record_broadcast_failure_degrades_with_the_cause():

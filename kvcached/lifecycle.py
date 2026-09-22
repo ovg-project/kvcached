@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 from enum import Enum
+from types import TracebackType
 from typing import Optional, Tuple
 
 from kvcached.utils import get_kvcached_logger
@@ -72,6 +73,9 @@ class LifecycleState:
         self._phase = LifecyclePhase.INITIALIZING
         self._reason = ""
         self._error: Optional[BaseException] = None
+        # The traceback the error had when it was recorded, so every
+        # re-raise can rewind to it (see raise_if_failed()).
+        self._error_tb: Optional[TracebackType] = None
         self._pending_degraded: Optional[Tuple[str, Optional[BaseException]]] = None
 
     @property
@@ -101,6 +105,7 @@ class LifecycleState:
         self._phase = phase
         self._reason = reason
         self._error = error
+        self._error_tb = error.__traceback__ if error is not None else None
         self._cond.notify_all()
         return old
 
@@ -176,13 +181,23 @@ class LifecycleState:
                 lambda: self._phase is not LifecyclePhase.INITIALIZING, timeout)
 
     def raise_if_failed(self) -> None:
-        """Re-raise the recorded error if the pool is FAILED."""
+        """Re-raise the recorded error if the pool is FAILED.
+
+        Raising an exception grows its ``__traceback__`` with the raising
+        and calling frames, and this raises the same stored object every
+        time, so repeated failed readiness checks would accumulate every
+        caller's frames (and their locals) on the exception FAILED keeps
+        alive. Rewinding to the traceback captured when the failure was
+        recorded keeps the retained frames at the original failure site
+        only, however often the failure is read.
+        """
         with self._cond:
             phase, error, reason = self._phase, self._error, self._reason
+            tb = self._error_tb
         if phase is not LifecyclePhase.FAILED:
             return
         if error is not None:
-            raise error
+            raise error.with_traceback(tb)
         raise RuntimeError(f"kvcached pool {self.name} failed: {reason}")
 
     def record_broadcast_failure(self, op: str, exc: BaseException) -> None:
