@@ -18,6 +18,12 @@ engine mid-teardown (with --shutdown-timeout 0 a SIGKILL follows). The
 client outlives the engines, so MPClient.shutdown() now also removes
     the original segment they left behind, through IPCSegmentCleanup.
 
+Under --api-server-count > 1 no frontend's client owns the engines: the
+supervisor launches them through a CoreEngineProcManager and calls its
+shutdown directly, with no MPClient in that process at all. That manager
+is the final owner boundary, so its shutdown now removes the segment the
+killed engines leave, the same capture-then-unlink as the client patch.
+
 CPU-only: torch, posix_ipc and the compiled extension are stubbed.
 """
 
@@ -720,6 +726,179 @@ def test_interface_shutdown_retries_pool_unlink(monkeypatch, shm_dir, vllm_modul
     allocator.stop_prealloc_thread.assert_called_once_with()
     assert interfaces._kvcached_initialized is False
     assert get_registered_kv_cache_pools(integration="vllm") == []
+
+
+def _fake_engine_utils_module(shutdown=None):
+    """A mock vllm.v1.engine.utils module.
+
+    FakeCoreEngineProcManager stands in for the manager that spawned the
+    EngineCore processes. In the supervisor under --api-server-count > 1
+    and in headless mode there is no owning MPClient, and vLLM calls this
+    manager's shutdown directly on exit.
+    """
+    utils_mod = types.ModuleType("mock_engine_utils_mod")
+
+    class FakeCoreEngineProcManager:
+        pass
+
+    if shutdown is not None:
+        FakeCoreEngineProcManager.shutdown = shutdown  # type: ignore[attr-defined]
+    setattr(utils_mod, "CoreEngineProcManager", FakeCoreEngineProcManager)
+    return utils_mod
+
+
+def test_engine_manager_shutdown_unlinks_the_segment_once_the_engines_are_stopped(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
+    )
+    utils_mod = _fake_engine_utils_module(
+        lambda self, timeout=None: calls.append("vllm"))
+
+    patch = patches.CoreEngineProcManagerPatch()
+    assert patch.patch_manager_shutdown(utils_mod)
+    assert patch.patch_manager_shutdown(utils_mod)  # idempotent
+    utils_mod.CoreEngineProcManager().shutdown(timeout=0.0)
+
+    assert calls == ["vllm", "unlink"]
+
+
+def test_two_frontend_final_exit_removes_the_segment_via_the_supervisor(
+    monkeypatch, tmp_path, vllm_modules
+):
+    """The --api-server-count 2 process-group SIGTERM shape: both frontends
+    are non-owners and exit without touching the segment, and the killed
+    engines never ran their own unlink. The supervisor owns the engines
+    through its CoreEngineProcManager, so its direct shutdown call is the
+    last exit and must remove the segment."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "supervisor_segment")
+    segment = tmp_path / "supervisor_segment"
+    segment.write_bytes(b"killed engines")
+
+    client_mod = _fake_client_module(lambda self: None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    for _ in range(2):
+        frontend = client_mod.MPClient()
+        frontend.resources = types.SimpleNamespace(engine_manager=None)
+        frontend.shutdown()
+    assert segment.read_bytes() == b"killed engines"
+
+    utils_mod = _fake_engine_utils_module(lambda self, timeout=None: None)
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+    utils_mod.CoreEngineProcManager().shutdown(timeout=0.0)
+
+    assert not segment.exists()
+
+
+def test_engine_manager_shutdown_unlinks_even_if_vllm_shutdown_raises(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    unlink = mock.Mock()
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup", lambda path: types.SimpleNamespace(unlink=unlink)
+    )
+
+    def failing_shutdown(self, timeout=None):
+        raise RuntimeError("engine terminate failed")
+
+    utils_mod = _fake_engine_utils_module(failing_shutdown)
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+
+    with pytest.raises(RuntimeError, match="engine terminate"):
+        utils_mod.CoreEngineProcManager().shutdown()
+    unlink.assert_called_once_with()
+
+
+def test_engine_manager_shutdown_does_not_mask_vllm_result_when_the_unlink_fails(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(
+            unlink=mock.Mock(side_effect=RuntimeError("segment busy"))),
+    )
+    utils_mod = _fake_engine_utils_module(lambda self, timeout=None: "done")
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+
+    assert utils_mod.CoreEngineProcManager().shutdown() == "done"
+
+
+def test_engine_manager_shutdown_patch_is_inert_when_kvcached_is_disabled(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: False)
+    cleanup = mock.Mock()
+    monkeypatch.setattr(kv_utils, "IPCSegmentCleanup", cleanup)
+    utils_mod = _fake_engine_utils_module(lambda self, timeout=None: None)
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+
+    utils_mod.CoreEngineProcManager().shutdown()
+
+    cleanup.assert_not_called()
+
+
+def test_engine_manager_captures_segment_before_upstream_teardown(
+    monkeypatch, tmp_path, vllm_modules
+):
+    """Same replacement protection as the client patch: the segment is
+    captured before the original shutdown runs, so a file that replaces
+    it during teardown is preserved."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "reused_segment")
+    segment = tmp_path / "reused_segment"
+    segment.write_bytes(b"old engine")
+
+    def teardown(self, timeout=None):
+        segment.unlink()
+        segment.write_bytes(b"replacement engine")
+
+    utils_mod = _fake_engine_utils_module(teardown)
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+    utils_mod.CoreEngineProcManager().shutdown()
+
+    assert segment.read_bytes() == b"replacement engine"
+
+
+def test_engine_manager_retries_failed_unlink(monkeypatch, tmp_path, vllm_modules):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "retry_segment")
+    segment = tmp_path / "retry_segment"
+    segment.write_bytes(b"engine")
+    utils_mod = _fake_engine_utils_module(lambda self, timeout=None: None)
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+    manager = utils_mod.CoreEngineProcManager()
+
+    with mock.patch.object(kv_utils.os, "unlink", side_effect=PermissionError("injected")):
+        manager.shutdown()
+    assert segment.exists()
+
+    manager.shutdown()
+    assert not segment.exists()
+
+
+def test_engine_manager_without_shutdown_is_left_alone(vllm_modules):
+    _, patches = vllm_modules
+    utils_mod = _fake_engine_utils_module()
+
+    assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
+    assert not hasattr(utils_mod.CoreEngineProcManager, "shutdown")
 
 
 if __name__ == "__main__":

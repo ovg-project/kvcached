@@ -1172,7 +1172,9 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         engines, and unlinking from it would remove the live segment.
         Ownership is checked before the original shutdown runs, and a
         cleanup captured once is kept for unlink retries even if the
-        original shutdown clears the ownership markers.
+        original shutdown clears the ownership markers. The supervisor
+        that owns those engines has no MPClient at all;
+        CoreEngineProcManagerPatch covers that boundary.
         """
         MPClient = self._get_target_class(client_mod)
         if MPClient is None:
@@ -1214,6 +1216,84 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_client_shutdown, "shutdown")
         MPClient.shutdown = _patched_client_shutdown  # type: ignore[assignment]
+        return True
+
+
+class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
+    """Patch CoreEngineProcManager.shutdown to remove the segment its engines leave"""
+
+    library = "vllm"
+    target_module = "vllm.v1.engine.utils"
+    target_class = "CoreEngineProcManager"
+    patch_name = "core_engine_proc_manager"
+
+    def apply(self, utils_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_manager_shutdown(utils_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_manager_shutdown(self, utils_mod: types.ModuleType) -> bool:
+        """Patch CoreEngineProcManager.shutdown.
+
+        With --api-server-count > 1 (and under vllm serve --headless) the
+        EngineCore processes are launched by a CoreEngineProcManager in
+        the supervisor process, not by any MPClient: every frontend's
+        client is a non-owner, and run_multi_api_server() calls this
+        manager's shutdown directly on exit. That shutdown terminate()s
+        the engines (with --shutdown-timeout 0 a SIGKILL follows) before
+        EngineCore's own unlink can run, and no owning client exists in
+        the supervisor to remove what they leave behind (issue #477).
+        The manager spawned the engine processes itself and its shutdown
+        joins or kills them, so once the original shutdown has returned,
+        remove whatever segment they left.
+
+        The segment is captured before the original shutdown runs, the
+        same replacement-file protection as the client patch, and the
+        captured cleanup is kept on the manager for unlink retries.
+        """
+        CoreEngineProcManager = self._get_target_class(utils_mod)
+        if CoreEngineProcManager is None:
+            return False
+
+        original_shutdown = getattr(CoreEngineProcManager, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "CoreEngineProcManager.shutdown not found; segments left by killed engines are not removed")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("CoreEngineProcManager.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_manager_shutdown(self, *args: Any, **kwargs: Any):
+            cleanup = None
+            if enable_kvcached():
+                try:
+                    from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
+
+                    cleanup = getattr(self, "_kvcached_ipc_cleanup", None)
+                    if cleanup is None:
+                        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
+                        self._kvcached_ipc_cleanup = cleanup
+                except Exception as e:
+                    logger.warning("Failed to capture engine manager shutdown segment: %s", e)
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if cleanup is not None:
+                    try:
+                        cleanup.unlink()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to remove the KV cache limit segment: %s", e)
+
+        self._mark_as_patched(_patched_manager_shutdown, "shutdown")
+        CoreEngineProcManager.shutdown = _patched_manager_shutdown  # type: ignore[assignment]
         return True
 
 
