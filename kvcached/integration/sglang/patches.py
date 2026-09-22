@@ -1547,16 +1547,19 @@ def _radix_node_blocks(
     if not uncached_nodes:
         return node_blocks
 
-    # Radix nodes and allocator blocks are page-aligned. Copy one index per
-    # logical block instead of every token, and synchronize with the GPU once.
+    # Radix nodes and allocator blocks are page-aligned. Gather one index per
+    # logical block before concatenating, then synchronize with the GPU once.
     lengths: List[int] = [
         int(value.numel()) // logical_page_size for value in uncached_values
     ]
-    flattened_tensor = torch.cat(uncached_values)
     if logical_page_size > 1:
-        flattened_tensor = (
-            flattened_tensor[::logical_page_size] // logical_page_size
-        )
+        logical_block_indices = [
+            value[::logical_page_size] for value in uncached_values
+        ]
+        flattened_tensor = torch.cat(logical_block_indices)
+        flattened_tensor = flattened_tensor // logical_page_size
+    else:
+        flattened_tensor = torch.cat(uncached_values)
     flattened = cast(List[int], cast(Any, flattened_tensor).tolist())
 
     offset = 0
@@ -1699,10 +1702,9 @@ def _select_page_aware_radix_plan(
     strategy = radix_cache.eviction_strategy
     plans: Dict[FrozenSet[Any], List[int]] = {}
     for page_id, block_ids in by_page.items():
-        unique_blocks = set(block_ids)
-        if len(unique_blocks) < occupancy.get(page_id, 0):
+        if len(block_ids) < occupancy.get(page_id, 0):
             continue
-        page_nodes = {block_owners[block_id] for block_id in unique_blocks}
+        page_nodes = {block_owners[block_id] for block_id in block_ids}
         closure = _radix_eviction_closure(page_nodes)
         plans.setdefault(closure, []).append(page_id)
 
@@ -1755,10 +1757,15 @@ def _evict_radix_cache_page_aware(
     evict_params_cls: Callable[..., Any],
 ) -> Any:
     """Run SGLang's native eviction with page-aware victim priorities."""
-    selected, eviction_budget = _select_page_aware_radix_plan(
-        radix_cache,
-        token_budget=num_tokens,
-    )
+    if num_tokens >= radix_cache.evictable_size_:
+        # Evicting the entire cache cannot benefit from page-aware ordering.
+        selected: Set[Any] = set()
+        eviction_budget = num_tokens
+    else:
+        selected, eviction_budget = _select_page_aware_radix_plan(
+            radix_cache,
+            token_budget=num_tokens,
+        )
     original_strategy = radix_cache.eviction_strategy
     if selected:
 
@@ -1838,7 +1845,6 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
         evict_params_cls = getattr(radix_cache_mod, "EvictParams", None)
         # SGLang < 0.5.9 computes leaves on demand and does not expose the
         # persistent evictable_leaves set required by the page-aware planner.
-        page_aware_supported = evict_params_cls is not None
 
         def _wrapped(self_rc: Any, *args: Any, **kwargs: Any) -> None:
             original_cache_finished(self_rc, *args, **kwargs)
@@ -1861,7 +1867,7 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
         self._mark_as_patched(_wrapped)
         RadixCache.cache_finished_req = _wrapped  # type: ignore
 
-        if page_aware_supported:
+        if evict_params_cls is not None:
             original_reset = RadixCache.reset
 
             @functools.wraps(original_reset)
