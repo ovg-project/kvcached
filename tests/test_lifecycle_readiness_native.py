@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""A native callback's hidden reference must not retain a failed KV pool."""
+"""Real-VMM lifetime and readiness agreement for a failed KV pool.
+
+A native callback's hidden reference must not retain a FAILED pool, and
+after an unmap failure the Python phase must agree with the native
+transaction verdict (#478 review): the pool is FAILED, every entry stays
+fail-closed per #418, and the pool is disposed of rather than cleared
+back into service."""
 
 import os
 import subprocess
@@ -17,6 +23,7 @@ import weakref
 import torch
 from kvcached import kv_cache_manager as kcm, tp_ipc_util as ipc
 from kvcached import vmm_ops as native
+from kvcached.errors import StateConsistencyError
 from kvcached.lifecycle import LifecyclePhase
 
 PAGE = 2 * 1024 * 1024
@@ -40,6 +47,13 @@ def unmap_pages(world_size, offsets, pp_rank=0, group_id=0):
 ipc.broadcast_map_to_kv_tensors = map_pages
 ipc.broadcast_unmap_from_kv_tensors = unmap_pages
 
+def expect_fail_closed(call):
+    try:
+        call()
+    except StateConsistencyError:
+        return
+    raise AssertionError("a FAILED pool must stay fail-closed")
+
 def run_case(group_id, fail):
     global inject
     tensors = native.create_kv_tensors(PAGE * 4, 1, "cuda:0", 1, 1, group_id)
@@ -59,16 +73,31 @@ def run_case(group_id, fail):
     try:
         manager.free(blocks)
         assert not fail, "fault did not reach the native callback"
-    except RuntimeError as exc:
+    except StateConsistencyError as exc:
         assert fail and "injected native unmap failure" in str(exc)
-        assert manager.lifecycle_phase is LifecyclePhase.DEGRADED
+        # The manager records the native verdict where it propagates: the
+        # phase, the transaction state, the readiness gate, and the next
+        # alloc all agree on FAILED now.
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+        state = manager.page_allocator.get_transaction_state()
+        assert state["state"] == "FAILED", state
         assert manager.lifecycle_error is not None
         assert manager.lifecycle_error.__traceback__ is not None
+        expect_fail_closed(lambda: manager.wait_ready(timeout=5))
+        expect_fail_closed(lambda: manager.alloc(1))
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
     finally:
         inject = False
-    manager.clear()
-    expected = LifecyclePhase.DEGRADED if fail else LifecyclePhase.READY
-    assert manager.lifecycle_phase is expected
+    if fail:
+        # #418 stays fail-closed: a FAILED pool is disposed of, never
+        # cleared back into service, and clear() on it re-raises the
+        # verdict instead of reopening the readiness gate. Disposal is
+        # the weakref collection checked by the caller.
+        expect_fail_closed(manager.clear)
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    else:
+        manager.clear()
+        assert manager.lifecycle_phase is LifecyclePhase.READY
     return weakref.ref(manager), weakref.ref(manager._lifecycle), tensors
 
 for fail in (False, True):
