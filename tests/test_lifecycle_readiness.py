@@ -375,9 +375,10 @@ def test_repeated_wait_ready_on_a_failed_pool_keeps_the_traceback_flat(monkeypat
         assert excinfo.value is manager.lifecycle_error
     assert stored_frames() == after_first
     # The rewound traceback still names the original failure site.
+    error = manager.lifecycle_error
+    assert error is not None
     names = [
-        frame.name
-        for frame in traceback.extract_tb(manager.lifecycle_error.__traceback__)
+        frame.name for frame in traceback.extract_tb(error.__traceback__)
     ]
     assert "_post_init" in names
 
