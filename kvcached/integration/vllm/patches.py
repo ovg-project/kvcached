@@ -12,7 +12,7 @@ import math
 import os
 import types
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
@@ -72,13 +72,70 @@ def _get_first_attention_group(kv_cache_config: Any) -> Any:
     return None
 
 
-def _get_group_size(kv_cache_config: Any) -> int:
-    """Return the maximum number of layers across all KV cache groups.
+def _get_runner_only_attn_layers(model_runner: Any) -> frozenset:
+    """Return layer names that appear in KV cache groups without a KV tensor.
+
+    vLLM's ``maybe_add_kv_sharing_layers_to_kv_cache_groups`` appends
+    cross-layer KV sharing layers (e.g. gemma E2B) to
+    ``kv_cache_groups[*].layer_names`` and records them in the runner's
+    ``runner_only_attn_layers`` WITHOUT adding them to any
+    ``kv_cache_tensors[*].shared_by`` (issue #417). vLLM versions without
+    the attribute have no such layers; treat that as empty.
+    """
+    return frozenset(getattr(model_runner, "runner_only_attn_layers", None) or ())
+
+
+def _tensor_backed_layer_names(
+    kv_cache_group: Any, runner_only_attn_layers: Collection[str] = ()
+) -> list:
+    """Return the group layer names that own a slot in a KVCacheTensor.
+
+    Skips runner-only layers, mirroring vanilla vLLM's
+    ``_allocate_kv_cache_tensors`` / ``_reshape_kv_cache_tensors``: those
+    layers are registered for attention-metadata assignment only and are
+    aliased to their KV-sharing target's cache after allocation.
+    """
+    if not runner_only_attn_layers:
+        return list(kv_cache_group.layer_names)
+    return [
+        ln for ln in kv_cache_group.layer_names if ln not in runner_only_attn_layers
+    ]
+
+
+def _get_group_size(
+    kv_cache_config: Any, runner_only_attn_layers: Collection[str] = ()
+) -> int:
+    """Return the maximum number of tensor-backed layers across all groups.
 
     This matches vLLM's shared memory pool count: ``group_size`` pools
-    are created, each shared by one layer from every group.
+    are created, each shared by one layer from every group. Runner-only
+    layers (cross-layer KV sharing) own no pool and are excluded so the
+    worker-side pool count stays equal to the scheduler-side ``num_layers``
+    (the scheduler's config never contains the appended sharing layers).
     """
-    return max(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
+    return max(
+        len(_tensor_backed_layer_names(g, runner_only_attn_layers))
+        for g in kv_cache_config.kv_cache_groups
+    )
+
+
+def _alias_shared_kv_layers(
+    kv_caches: dict, shared_kv_cache_layers: Mapping[str, str]
+) -> None:
+    """Bind cross-layer KV sharing layers to their target layer's cache.
+
+    Mirrors the aliasing loop in vanilla vLLM's
+    ``initialize_kv_cache_tensors``. On vLLM versions where that loop also
+    runs after the patched reshape returns, it re-assigns the same objects,
+    which is harmless.
+    """
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        if target_layer_name not in kv_caches:
+            raise RuntimeError(
+                f"KV sharing target layer {target_layer_name!r} (shared by "
+                f"{layer_name!r}) has no allocated KV cache to alias."
+            )
+        kv_caches[layer_name] = kv_caches[target_layer_name]
 
 
 def _validate_kv_cache_groups(kv_cache_config: Any) -> None:
@@ -264,6 +321,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _get_kv_cache_params(
@@ -936,7 +994,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> list["KVCacheEvent"]:
                 return []
 
-        setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
+        elastic_block_pool_cls: type = ElasticBlockPool
+        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+            from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
+
+            elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
+        setattr(block_pool_mod, "ElasticBlockPool", elastic_block_pool_cls)
         return True
 
 
@@ -970,9 +1033,23 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = EngineCore.__init__
+        detected_version = self.detected_version
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # Reject a partial integration before either allocator or the
+                # native executor starts. vLLM can select V1 automatically.
+                if detected_version and VersionRange(">=0.29.0").contains(detected_version):
+                    if not VersionRange(VLLM_MRV2_RANGE).contains(detected_version):
+                        raise KVCachedConfigError(
+                            f"kvcached has no runner adapter for vLLM {detected_version}; "
+                            "use a supported engine version or disable kvcached"
+                        )
+                    if not vllm_config.use_v2_model_runner:
+                        raise KVCachedConfigError(
+                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            "use a supported configuration or disable kvcached"
+                        )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
@@ -1137,6 +1214,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
         original_init = KVCacheCoordinator.__init__
         logger = self.logger  # Capture logger in closure
+        use_mrv2_geometry = bool(
+            self.detected_version
+            and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version)
+        )
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
             original_init(self, *args, **kwargs)
@@ -1165,22 +1246,28 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             kv_cache_config = getattr(self, "kv_cache_config")
 
-            _validate_kv_cache_groups(kv_cache_config)
+            if use_mrv2_geometry:
+                from kvcached.integration.vllm.model_runner_v2 import cache_geometry
 
-            first_attn_group = _get_first_attention_group(kv_cache_config)
-            if first_attn_group is None:
-                raise RuntimeError(
-                    "kvcached is enabled but the KV cache config contains no "
-                    "attention groups; nothing to manage."
-                )
-
-            kv_cache_spec = first_attn_group.kv_cache_spec
-            block_size = kv_cache_spec.block_size
-
-            attention_type = _infer_attention_type(kv_cache_config)
-
-            cell_size, num_kv_buffers = _get_kv_cache_params(
-                kv_cache_spec, block_size, attention_type=attention_type)
+                geometry = cache_geometry(kv_cache_config)
+                block_size = geometry.block_size
+                cell_size = geometry.cell_size
+                num_kv_buffers = 1
+                group_size = geometry.num_pools
+            else:
+                _validate_kv_cache_groups(kv_cache_config)
+                first_attn_group = _get_first_attention_group(kv_cache_config)
+                if first_attn_group is None:
+                    raise RuntimeError(
+                        "kvcached is enabled but the KV cache config contains no "
+                        "attention groups; nothing to manage."
+                    )
+                kv_cache_spec = first_attn_group.kv_cache_spec
+                block_size = kv_cache_spec.block_size
+                attention_type = _infer_attention_type(kv_cache_config)
+                cell_size, num_kv_buffers = _get_kv_cache_params(
+                    kv_cache_spec, block_size, attention_type=attention_type)
+                group_size = _get_group_size(kv_cache_config)
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1213,7 +1300,6 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             block_pool_mod = importlib.import_module("vllm.v1.core.block_pool")
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
-            group_size = _get_group_size(kv_cache_config)
             # vLLM computes Request.block_hashes at a shared fine-grained size
             # (normally the GCD of heterogeneous group block sizes). Preserve
             # the value from the native pool before replacing it.
@@ -1557,6 +1643,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             _validate_kv_cache_groups(kv_cache_config)
 
+            # Cross-layer KV sharing (issue #417): vLLM appends sharing
+            # layers to group layer_names without adding them to any
+            # tensor's shared_by. Resolve layers against kv_cache_tensors
+            # only for tensor-backed names, exactly like vanilla vLLM's
+            # _allocate_kv_cache_tensors; sharing layers are aliased to
+            # their target's cache in the reshape step.
+            runner_only_attn_layers = _get_runner_only_attn_layers(self)
+
             layer_to_tensor_cfg: dict[str, KVCacheTensor] = {}
             for tensor_cfg in kv_cache_config.kv_cache_tensors:
                 for ln in tensor_cfg.shared_by:
@@ -1564,7 +1658,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             for grp in kv_cache_config.kv_cache_groups:
                 layer_spec = grp.kv_cache_spec
-                for layer_name in grp.layer_names:
+                for layer_name in _tensor_backed_layer_names(
+                        grp, runner_only_attn_layers):
                     tensor_cfg = layer_to_tensor_cfg[layer_name]
                     assert tensor_cfg.size % layer_spec.page_size_bytes == 0, (
                         f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "
@@ -1580,7 +1675,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             first_attn_group_id = None
             first_attn_group = None
             for idx, grp in enumerate(kv_cache_config.kv_cache_groups):
-                if _is_attention_spec(grp.kv_cache_spec):
+                if _is_attention_spec(grp.kv_cache_spec) and _tensor_backed_layer_names(
+                        grp, runner_only_attn_layers):
                     first_attn_group_id = idx
                     first_attn_group = grp
                     break
@@ -1588,13 +1684,15 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             if first_attn_group is None or first_attn_group_id is None:
                 raise RuntimeError(
                     "kvcached is enabled but the KV cache config contains no "
-                    "attention groups; nothing to allocate."
+                    "attention groups with tensor-backed layers; nothing to "
+                    "allocate."
                 )
 
             kv_cache_spec = first_attn_group.kv_cache_spec
             attention_type = _infer_attention_type(kv_cache_config)
 
-            first_layer_name = first_attn_group.layer_names[0]
+            first_layer_name = _tensor_backed_layer_names(
+                first_attn_group, runner_only_attn_layers)[0]
             rep_tensor_cfg = layer_to_tensor_cfg[first_layer_name]
             num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes
 
@@ -1658,7 +1756,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             # KVCacheTensor sharing: pool i is shared by layer i from each
             # group, and different groups use different block IDs within the
             # same pool.
-            group_size = _get_group_size(kv_cache_config)
+            group_size = _get_group_size(kv_cache_config, runner_only_attn_layers)
             dtype = kv_cache_spec.dtype
             device_type = getattr(self, "device", torch.device("cuda")).type
 
@@ -1784,7 +1882,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
                         kernel_block_size=gkbs,
                     )
-                    for pool_idx, layer_name in enumerate(grp.layer_names):
+                    for pool_idx, layer_name in enumerate(
+                            _tensor_backed_layer_names(grp, runner_only_attn_layers)):
                         layer_views[layer_name] = gviews[pool_idx]
                 self._kvcached_attn_layer_views = layer_views
             else:
@@ -1835,6 +1934,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             kv_caches: dict[str, torch.Tensor] = {}
 
+            # Cross-layer KV sharing layers own no pool tensor: skip them in
+            # the pool-index mapping and alias them to their target's cache
+            # afterwards (issue #417), mirroring vanilla vLLM's
+            # _reshape_kv_cache_tensors / initialize_kv_cache_tensors.
+            runner_only_attn_layers = _get_runner_only_attn_layers(self)
+
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
             # Per-group attention views for heterogeneous hybrids (Gemma). None
             # for homogeneous / single-group models, which use the raw-tensor
@@ -1843,6 +1948,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
+                bound_layer_names = _tensor_backed_layer_names(
+                    kv_cache_group, runner_only_attn_layers)
 
                 if _is_mamba_spec(kv_cache_spec):
                     if mamba_info is None:
@@ -1850,7 +1957,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "Mamba layers found but no raw buffer info "
                             "available from kvcached"
                         )
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for pool_idx, layer_name in enumerate(bound_layer_names):
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
@@ -1863,11 +1970,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for pool_idx, layer_name in enumerate(bound_layer_names):
                         if attn_layer_views is not None and layer_name in attn_layer_views:
                             kv_caches[layer_name] = attn_layer_views[layer_name]
                         else:
                             kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+
+            _alias_shared_kv_layers(
+                kv_caches, getattr(self, "shared_kv_cache_layers", None) or {})
 
             return kv_caches
 
@@ -2248,10 +2358,11 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             )
 
             self.available_kv_cache_memory_bytes = available_memory
-            # vLLM 0.24 reads this field during compile_or_warm_up_model().
-            # Keep the worker contract without reintroducing the device-wide
-            # non-torch delta that colocated processes can corrupt.
+            # Warmup reads non_torch_memory in 0.24 and total_consumed in
+            # 0.29. Retain process-local accounting for both contracts;
+            # colocated processes can corrupt the device-wide delta.
             self.non_torch_memory = 0
+            self.total_consumed = weights_memory
             self.peak_activation_memory = torch_peak_increase
             self.cudagraph_memory_estimate = cudagraph_memory_estimate
             logger.warning(

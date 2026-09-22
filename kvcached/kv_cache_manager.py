@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
@@ -55,6 +56,35 @@ def synchronized(method):
             return method(self, *args, **kwargs)
 
     return synchronized_method
+
+
+def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
+                   *, internal_page: Any = None) -> int:
+    """Return the number of usable blocks on a page.
+
+    Blocks straddling a page boundary belong to neither page (see the
+    comment in ``get_page_occupancy``), so a page's capacity comes from
+    its own ``get_block_range`` rather than from the theoretical
+    ``page_size // block_mem_size`` that ``InternalPage.get_num_blocks``
+    returns. When ``block_mem_size`` does not evenly divide ``page_size``
+    (e.g. HYBRID_LINEAR / Mamba GDN per-block state — the case the
+    ``_alloc`` 0-usable-block parking comment at kv_cache_manager.py:335
+    names), some page ids yield *zero* usable blocks while
+    ``get_num_blocks`` reports one or more; counting those pages with
+    ``get_num_blocks`` inflates both ``available_size`` and the
+    lazy-shrink completion gate ``_get_num_alloced_blocks``.
+
+    Module-level (rather than a staticmethod) so it is unit-testable
+    without the compiled ``kvcached.vmm_ops`` extension or a GPU,
+    matching the ``_get_max_cached_blocks`` / ``_make_cache_key`` idiom.
+    The optional ``internal_page`` keyword lets tests inject a pure-Python
+    ``InternalPage`` stand-in without depending on import-order-sensitive
+    module-global rebinding.
+    """
+    ip = internal_page if internal_page is not None else InternalPage
+    start, end = ip.get_block_range(page_id, page_size,
+                                    block_mem_size)
+    return end - start
 
 
 class KVCacheManager:
@@ -206,6 +236,8 @@ class KVCacheManager:
 
         self.in_shrink: bool = False
         self.target_num_blocks: Optional[int] = None
+        self._resize_rejected: bool = False
+        self._rejected_resize_target: Optional[int] = None
         self._memory_limit_bytes: Optional[int] = None
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
@@ -371,8 +403,14 @@ class KVCacheManager:
             self._wait_post_init()
 
         new_mem_size = self.page_allocator.get_resize_target()
-        if new_mem_size > 0:
-            self.resize(new_mem_size)
+        if (new_mem_size > 0 and
+                new_mem_size != getattr(self, "_rejected_resize_target", None)):
+            try:
+                self.resize(new_mem_size)
+            except QuarantinedResizeError:
+                self._rejected_resize_target = new_mem_size
+                self._resize_rejected = True
+                logger.warning("Automatic resize rejected: pool has quarantined pages")
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -407,6 +445,9 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
+                except StateConsistencyError:
+                    # Do not run further free/unmap operations on an unsafe pool.
+                    raise
                 except RuntimeError as e:
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
@@ -539,10 +580,24 @@ class KVCacheManager:
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
-                self.page_allocator.resize(self.target_num_blocks *
-                                           self.block_mem_size)
-                self.in_shrink = False
-                self.target_num_blocks = None
+                try:
+                    resized = self.page_allocator.resize(
+                        self.target_num_blocks * self.block_mem_size)
+                except QuarantinedResizeError:
+                    # Reject the pending limit without blocking healthy pages.
+                    self._resize_rejected = True
+                    self.in_shrink = False
+                    self.target_num_blocks = None
+                    logger.warning("Deferred resize rejected: pool has quarantined pages")
+                else:
+                    if resized:
+                        self.in_shrink = False
+                        self.target_num_blocks = None
+                    else:
+                        logger.warning(
+                            "shrink to %d blocks refused by allocator "
+                            "(in-use pages above target); keeping shrink pending",
+                            self.target_num_blocks)
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -574,7 +629,17 @@ class KVCacheManager:
         """
         self._wait_post_init()
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
-        if self.page_allocator.resize(new_mem_size):
+        try:
+            resized = self.page_allocator.resize(new_mem_size)
+        except QuarantinedResizeError:
+            if self.in_shrink:
+                self.in_shrink = False
+                self.target_num_blocks = None
+                self._resize_rejected = True
+            raise
+        self._resize_rejected = False
+        self._rejected_resize_target = None
+        if resized:
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_blocks = None
@@ -648,7 +713,8 @@ class KVCacheManager:
         mapped_bytes = mapped_pages * page_bundle_bytes
         effective_limit_bytes = self._memory_limit_effective_bytes
         if status is None:
-            status = "deferred" if self.in_shrink else "applied"
+            status = ("rejected" if getattr(self, "_resize_rejected", False) else
+                      "deferred" if self.in_shrink else "applied")
         return {
             "status": status,
             "pool_name": str(self.pool_name or ""),
@@ -670,6 +736,7 @@ class KVCacheManager:
             ),
             "reason": {
                 "deferred": "inuse_capacity_above_limit",
+                "rejected": "quarantined_pages_prevent_resize",
                 "conflict": "revision_reused_with_different_limit",
             }.get(status, ""),
         }
@@ -682,13 +749,24 @@ class KVCacheManager:
     @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
+        # Also surfaces a fatal background-preallocation failure during shrink.
+        virtual_free_pages = self.page_allocator.get_num_free_pages()
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            virtual_free_pages = self.page_allocator.get_num_free_pages()
             physical_free_pages = self.page_allocator.get_avail_physical_pages(
             ) + self.page_allocator.get_num_reserved_pages()
             free_pages = min(virtual_free_pages, physical_free_pages)
+            # The allocator exposes only a COUNT of free pages, not their ids,
+            # so this term can't use the boundary-aware _page_capacity
+            # (capacity depends on page_id; some ids yield zero usable blocks
+            # when block_mem_size does not divide page_size — see _alloc's
+            # 0-block parking at kv_cache_manager.py:335). get_num_blocks is
+            # the theoretical page_size // block_mem_size, so this is an UPPER
+            # BOUND; the precise accounting in _get_num_alloced_blocks and
+            # get_page_occupancy uses _page_capacity / get_block_range. A
+            # precise fix here needs page-id enumeration from the allocator
+            # (a C++ change, out of scope).
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
@@ -845,13 +923,19 @@ class KVCacheManager:
         try_to_reserve() obtains them via alloc(), so they have already left
         their pages. They are deliberately NOT added a second time below.
         """
-        # Blocks from fully allocated pages
-        blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size)
+        # Blocks from fully allocated pages. Capacity is per-page-id because
+        # blocks straddling a page boundary belong to neither page (see
+        # get_page_occupancy); a parked 0-block page (the _alloc branch at
+        # kv_cache_manager.py:335) contributes nothing here, whereas the
+        # previous len(self.full_pages) * get_num_blocks(...) inflated it.
+        blocks_from_full_pages = sum(
+            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            for page_id in self.full_pages)
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
-        blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        blocks_from_avail_pages = sum(
+            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            for page_id in self.avail_pages) - self.num_avail_blocks
         return blocks_from_full_pages + blocks_from_avail_pages
