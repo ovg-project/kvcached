@@ -21,6 +21,7 @@ from enum import Enum
 from types import TracebackType
 from typing import Optional, Tuple
 
+from kvcached.errors import StateConsistencyError
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
@@ -52,6 +53,11 @@ class LifecycleState:
       rolls back and ``_alloc()`` reports as a scheduling miss (#453), and
       phase 1 cannot tell that recoverable miss from an unknown outcome
       until #373's structured per-rank results (phase 2).
+    * Any phase -> FAILED on #418's ``StateConsistencyError``, from either
+      broadcast direction. The transaction layer could not establish that
+      every affected address is contained and requires the affected engine
+      to stop, which is a definitive verdict, not an unknown outcome, so
+      the recoverable-miss ambiguity above does not apply to it.
     * READY -> INITIALIZING -> READY around ``KVCacheManager.clear()``, or
       -> FAILED if ``clear()`` raises.
     * DEGRADED -> INITIALIZING around ``clear()`` likewise: the pool is torn
@@ -209,6 +215,16 @@ class LifecycleState:
         provably reached no rank; that needs per-rank delivery tracking, so
         the manager calls this for unmap broadcasts only (see the class
         docstring for why map failures are excluded).
+
+        One typed outcome is stronger than unknown: #418's
+        ``StateConsistencyError`` means the transaction could not establish
+        that every affected address is contained, and its contract is to
+        stop the affected engine, so the pool is FAILED rather than
+        DEGRADED-but-serving.
         """
+        if isinstance(exc, StateConsistencyError):
+            self.mark_failed(
+                f"{op} transaction unsafe: state consistency lost: {exc}", exc)
+            return
         self.mark_degraded(
             f"{op} broadcast failed, outcome across ranks unknown: {exc}", exc)

@@ -54,6 +54,7 @@ except ImportError:
 
 import kvcached.kv_cache_manager as kcm  # noqa: E402
 from kvcached import tp_ipc_util  # noqa: E402
+from kvcached.errors import StateConsistencyError  # noqa: E402
 from kvcached.lifecycle import LifecyclePhase, LifecycleState  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
 from kvcached.observability import get_capabilities  # noqa: E402
@@ -150,7 +151,10 @@ class FakePage:
 class MapThroughPageAllocator(FakePageAllocator):
     """alloc_page() with the C++ contract (csrc/page_allocator.cpp): run the
     registered map broadcast callback and, when it raises, put the page back
-    and rethrow as the RuntimeError that ``_alloc()`` classifies."""
+    and rethrow as the RuntimeError that ``_alloc()`` classifies. Since #418
+    the native side passes ``StateConsistencyError`` through typed
+    (csrc/ftensor.cpp keeps the failed page and rethrows), so the fake
+    does the same."""
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -161,6 +165,8 @@ class MapThroughPageAllocator(FakePageAllocator):
         try:
             assert self.map_callback is not None
             self.map_callback(2, [page_id], 0, 0)
+        except StateConsistencyError:
+            raise
         except Exception as e:
             self.next_page_id = page_id  # the page goes back on the free list
             raise RuntimeError(f"Failed to map page {page_id}: {e}")
@@ -468,6 +474,53 @@ def test_unmap_broadcast_failure_degrades(monkeypatch):
     manager.wait_ready()  # still serving
 
 
+def test_unmap_state_consistency_error_fails_the_pool(monkeypatch):
+    """#418's transactions give the unmap broadcast one typed outcome
+    stronger than unknown: StateConsistencyError means containment could
+    not be established and the affected engine must stop, so the pool
+    records FAILED rather than the still-serving DEGRADED."""
+    error = StateConsistencyError(
+        "state_consistency_unknown: KV unmap commit could not be confirmed")
+
+    def broadcast_unmap(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    manager = _make_manager(monkeypatch, broadcast_unmap=broadcast_unmap)
+    manager.wait_ready(timeout=5)
+    callback = manager.page_allocator.unmap_callback
+    assert callback is not None
+    with pytest.raises(StateConsistencyError) as excinfo:
+        callback(2, [0])
+    assert excinfo.value is error
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is error
+    with pytest.raises(StateConsistencyError):
+        manager.wait_ready()
+
+
+def test_alloc_state_consistency_error_fails_the_pool(monkeypatch):
+    """Unlike the recoverable capacity miss above, StateConsistencyError
+    out of alloc_page() is #418's definitive unsafe verdict. _alloc() must
+    not roll it back into a scheduling miss: the pool records FAILED and
+    the error stays fail-loud to the engine."""
+
+    def broadcast_map(*args: Any, **kwargs: Any) -> None:
+        raise StateConsistencyError(
+            "state_consistency_unknown for workers with lost responses: "
+            "pp0/rank1")
+
+    manager = _make_manager(monkeypatch, broadcast_map=broadcast_map,
+                            allocator=MapThroughPageAllocator)
+    manager.wait_ready(timeout=5)
+
+    with pytest.raises(StateConsistencyError) as excinfo:
+        manager.alloc(1)
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is excinfo.value
+    with pytest.raises(StateConsistencyError):
+        manager.wait_ready()
+
+
 def _wait_collected(ref):
     # The post-init thread may still be returning after it opened the gate.
     deadline = time.monotonic() + 5
@@ -527,15 +580,18 @@ def test_unmap_callback_still_propagates_after_lifecycle_is_gone(monkeypatch):
     assert calls == [(2, [0], 0, 0), (2, [0], 0, 0)]
 
 
-def test_ipc_timeout_degrades_unmap_but_not_map(monkeypatch):
+def test_ipc_timeout_fails_unmap_but_not_map(monkeypatch):
     """The canonical rule-1 trigger, end to end: a worker that is alive but
     not answering (KVCACHED_IPC_TIMEOUT) through the real broadcast path.
-    On unmap the outcome is unknown with no recoverable caller, so the pool
-    degrades and keeps serving. On map, phase 1 deliberately records
-    nothing (indistinguishable from the #453 capacity miss); phase-2
-    per-rank classification will restore DEGRADED here once the broadcast
-    returns structured results (#373 landed still raising one flat
-    RuntimeError)."""
+    Since #418 that path is transactional, and an unmap whose outcome the
+    prepare/abort/commit exchange cannot confirm surfaces as
+    StateConsistencyError, the definitive stop-the-engine verdict, so the
+    pool records FAILED. The unknown-outcome DEGRADED classification still
+    covers untyped unmap failures (test_unmap_broadcast_failure_degrades).
+    On map, the callback deliberately records nothing (indistinguishable
+    from the #453 capacity miss at this layer); the typed verdict is
+    classified where it is caught, in _alloc()
+    (test_alloc_state_consistency_error_fails_the_pool)."""
     monkeypatch.setattr(tp_ipc_util, "IPC_TIMEOUT_S", 0.5)
     with _silent_worker() as sock_path:
         monkeypatch.setattr(tp_ipc_util, "get_worker_socket_path",
@@ -550,12 +606,14 @@ def test_ipc_timeout_degrades_unmap_but_not_map(monkeypatch):
             map_callback(1, [0], 0, 0)
         assert manager.lifecycle_phase is LifecyclePhase.READY
 
-        with pytest.raises(RuntimeError, match="did not answer") as excinfo:
+        with pytest.raises(StateConsistencyError,
+                           match="did not answer") as excinfo:
             unmap_callback(1, [0])
 
-    assert manager.lifecycle_phase is LifecyclePhase.DEGRADED
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
     assert manager.lifecycle_error is excinfo.value
-    manager.wait_ready()
+    with pytest.raises(StateConsistencyError):
+        manager.wait_ready()
 
 
 # --------------------------------------------------------------------------
@@ -720,6 +778,18 @@ def test_record_broadcast_failure_degrades_with_the_cause():
     assert state.phase is LifecyclePhase.DEGRADED
     assert state.error is error
     assert state.reason.startswith("unmap broadcast failed")
+
+
+def test_record_broadcast_failure_fails_on_state_consistency():
+    state = LifecycleState("t")
+    state.mark_ready()
+    error = StateConsistencyError("KV unmap commit could not be confirmed")
+    state.record_broadcast_failure("unmap", error)
+    assert state.phase is LifecyclePhase.FAILED
+    assert state.error is error
+    assert state.reason.startswith("unmap transaction unsafe")
+    with pytest.raises(StateConsistencyError):
+        state.raise_if_failed()
 
 
 def test_degradation_during_initializing_lands_when_init_completes():

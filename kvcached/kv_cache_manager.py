@@ -519,8 +519,14 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
-                except StateConsistencyError:
-                    # Do not run further free/unmap operations on an unsafe pool.
+                except StateConsistencyError as e:
+                    # #418's definitive verdict: mapping safety cannot be
+                    # established, so this is not the recoverable co-tenancy
+                    # miss the map-failure exclusion is about. Record FAILED
+                    # for pollers, then stay fail-loud; no further free/unmap
+                    # operations may run on an unsafe pool.
+                    self._lifecycle.mark_failed(
+                        "map transaction unsafe: state consistency lost", e)
                     raise
                 except RuntimeError as e:
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
