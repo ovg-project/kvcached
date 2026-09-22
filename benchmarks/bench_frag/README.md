@@ -12,7 +12,8 @@ occupy 128. The `waste` column is that ratio.
 ## Run
 
 ```bash
-python bench_frag.py
+python bench_frag.py --backend vllm
+python bench_frag.py --backend sglang
 ```
 
 Defaults to 16 layers and 16384 blocks of 16 KiB, i.e. 128 blocks per 2 MB page.
@@ -43,10 +44,11 @@ blocks, touches every stride-th block so an age-only policy spares it, then
 evicts down to 512 and reports the memory released.
 
 ```bash
-python bench_evict.py
+python bench_evict.py --backend vllm
+python bench_evict.py --backend sglang
 ```
 
-Measured on an RTX PRO 4000 Blackwell (24GB), 8 layers, 16 KiB blocks, 2 MB
+vllm result measured on an RTX PRO 4000 Blackwell (24GB), 8 layers, 16 KiB blocks, 2 MB
 pages (128 blocks per page). Both columns evict the same 3584 blocks:
 
 | stride | freed before (LRU) | freed after (page-aware) |
