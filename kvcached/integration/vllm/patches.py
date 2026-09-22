@@ -1082,14 +1082,23 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         logger = self.logger  # Capture logger in closure
 
         def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
+            cleanup = None
+            if enable_kvcached():
+                try:
+                    from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
+
+                    cleanup = getattr(self, "_kvcached_ipc_cleanup", None)
+                    if cleanup is None:
+                        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
+                        self._kvcached_ipc_cleanup = cleanup
+                except Exception as e:
+                    logger.warning("Failed to capture client shutdown segment: %s", e)
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
-                if enable_kvcached():
+                if cleanup is not None:
                     try:
-                        from kvcached.utils import unlink_default_ipc_segment
-
-                        unlink_default_ipc_segment()
+                        cleanup.unlink()
                     except Exception as e:
                         logger.warning(
                             "Failed to remove the KV cache limit segment: %s", e)

@@ -26,6 +26,7 @@ from kvcached.utils import (
     PAGE_SIZE,
     SANITY_CHECK,
     SHM_DIR,
+    IPCSegmentCleanup,
     KVCachedConfigError,
     get_kvcached_logger,
 )
@@ -127,6 +128,9 @@ class KVCacheManager:
         # this pool; shutdown() unlinks it.
         self.ipc_name = DEFAULT_IPC_NAME
         self._shut_down = False
+        self._shutdown_lock = threading.Lock()
+        self._prealloc_stopped = False
+        self._ipc_cleanup: Optional[IPCSegmentCleanup] = None
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -753,30 +757,35 @@ class KVCacheManager:
             integration=integration,
         ).to_dict()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Release the state this pool keeps outside the process.
 
         The C++ MemInfoTracker unlinks its /dev/shm segment only from its
         destructor, which never runs when the owning process leaves through
         os._exit (vLLM's forked EngineCore after SIGTERM, issue #477). Stop
         the prealloc thread, then unlink the segment here, exactly what the
-        destructor would do. Safe to call more than once.
+        destructor would do. Return False if a step needs another attempt.
+        Successful steps are not repeated and a replacement file is preserved.
         """
-        if self._shut_down:
-            return
-        self._shut_down = True
-        try:
-            self.page_allocator.stop_prealloc_thread()
-        except Exception as e:
-            logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
-        segment = os.path.join(SHM_DIR, self.ipc_name)
-        try:
-            os.unlink(segment)
-            logger.info("Unlinked KV cache limit segment %s", segment)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            logger.warning("Failed to unlink %s on shutdown: %s", segment, e)
+        with self._shutdown_lock:
+            if self._shut_down:
+                return True
+            if self._ipc_cleanup is None:
+                try:
+                    self._ipc_cleanup = IPCSegmentCleanup(
+                        os.path.join(SHM_DIR, self.ipc_name))
+                except OSError as e:
+                    logger.warning("Failed to capture shutdown segment: %s", e)
+                    return False
+            if not self._prealloc_stopped:
+                try:
+                    self.page_allocator.stop_prealloc_thread()
+                except Exception as e:
+                    logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
+                    return False
+                self._prealloc_stopped = True
+            self._shut_down = self._ipc_cleanup.unlink()
+            return self._shut_down
 
     @synchronized
     def clear(self):

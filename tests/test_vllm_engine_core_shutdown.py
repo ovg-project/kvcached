@@ -16,13 +16,14 @@ run_engine_core() restores SIGTERM to SIG_DFL before EngineCore.shutdown(),
 so the terminate() from MPClient.shutdown()'s process manager ends the
 engine mid-teardown (with --shutdown-timeout 0 a SIGKILL follows). The
 client outlives the engines, so MPClient.shutdown() now also removes
-whatever segment they left behind, through unlink_default_ipc_segment().
+    the original segment they left behind, through IPCSegmentCleanup.
 
 CPU-only: torch, posix_ipc and the compiled extension are stubbed.
 """
 
 import importlib
 import sys
+import threading
 import types
 from typing import Any
 from unittest import mock
@@ -171,7 +172,8 @@ def test_mp_client_shutdown_unlinks_the_segment_once_the_engines_are_stopped(
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     calls = []
     monkeypatch.setattr(
-        kv_utils, "unlink_default_ipc_segment", lambda: calls.append("unlink")
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
     )
     client_mod = _fake_client_module(lambda self: calls.append("vllm"))
 
@@ -188,7 +190,9 @@ def test_mp_client_shutdown_unlinks_even_if_vllm_shutdown_raises(
     _, patches = vllm_modules
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     unlink = mock.Mock()
-    monkeypatch.setattr(kv_utils, "unlink_default_ipc_segment", unlink)
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup", lambda path: types.SimpleNamespace(unlink=unlink)
+    )
 
     def failing_shutdown(self):
         raise RuntimeError("engine manager close failed")
@@ -207,8 +211,9 @@ def test_mp_client_shutdown_does_not_mask_vllm_result_when_the_unlink_fails(
     _, patches = vllm_modules
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(
-        kv_utils, "unlink_default_ipc_segment",
-        mock.Mock(side_effect=RuntimeError("segment busy")),
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(
+            unlink=mock.Mock(side_effect=RuntimeError("segment busy"))),
     )
     client_mod = _fake_client_module(lambda self: "done")
     assert patches.MPClientPatch().patch_client_shutdown(client_mod)
@@ -222,7 +227,7 @@ def test_mp_client_shutdown_patch_is_inert_when_kvcached_is_disabled(
     _, patches = vllm_modules
     monkeypatch.setattr(patches, "enable_kvcached", lambda: False)
     unlink = mock.Mock()
-    monkeypatch.setattr(kv_utils, "unlink_default_ipc_segment", unlink)
+    monkeypatch.setattr(kv_utils, "IPCSegmentCleanup", unlink)
     client_mod = _fake_client_module(lambda self: None)
     assert patches.MPClientPatch().patch_client_shutdown(client_mod)
 
@@ -273,9 +278,11 @@ def test_shutdown_kvcached_keeps_going_when_a_pool_fails(monkeypatch, vllm_modul
 
     class BrokenPool:
         pool_name = "broken"
+        fail = True
 
         def shutdown(self):
-            raise RuntimeError("cannot stop prealloc thread")
+            if self.fail:
+                raise RuntimeError("cannot stop prealloc thread")
 
     healthy = mock.Mock()
     broken = BrokenPool()
@@ -285,6 +292,12 @@ def test_shutdown_kvcached_keeps_going_when_a_pool_fails(monkeypatch, vllm_modul
     interfaces.shutdown_kvcached()
 
     healthy.shutdown.assert_called_once_with()
+    allocator_shutdown.assert_not_called()
+    assert interfaces._kvcached_initialized is True
+    assert len(get_registered_kv_cache_pools(integration="vllm")) == 2
+
+    broken.fail = False
+    interfaces.shutdown_kvcached()
     allocator_shutdown.assert_called_once_with()
     assert get_registered_kv_cache_pools(integration="vllm") == []
 
@@ -317,6 +330,9 @@ def _make_manager(page_allocator, ipc_name="kvcached_test_477"):
     manager.page_allocator = page_allocator
     manager.ipc_name = ipc_name
     manager._shut_down = False
+    manager._shutdown_lock = threading.Lock()
+    manager._prealloc_stopped = False
+    manager._ipc_cleanup = None
     return manager
 
 
@@ -356,39 +372,208 @@ def test_manager_shutdown_tolerates_a_missing_segment(shm_dir):
     manager.shutdown()  # nothing to unlink, nothing raised
 
 
-def test_manager_shutdown_unlinks_even_if_the_prealloc_thread_will_not_stop(shm_dir):
+def test_manager_shutdown_retries_stop_before_unlinking(shm_dir):
     allocator = mock.Mock()
-    allocator.stop_prealloc_thread.side_effect = RuntimeError("join timed out")
+    allocator.stop_prealloc_thread.side_effect = [RuntimeError("join timed out"), None]
     manager = _make_manager(allocator)
     segment = shm_dir / manager.ipc_name
     segment.write_bytes(b"\0" * 24)
 
-    manager.shutdown()
+    assert manager.shutdown() is False
+    assert segment.exists()
 
+    assert manager.shutdown() is True
     assert not segment.exists()
+    assert allocator.stop_prealloc_thread.call_count == 2
 
 
-def test_unlink_default_ipc_segment_removes_the_segment(monkeypatch, tmp_path):
-    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
-    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "kvcached_test_477")
+def test_ipc_segment_cleanup_removes_the_segment(tmp_path):
     segment = tmp_path / "kvcached_test_477"
     segment.write_bytes(b"\0" * 24)
 
-    assert kv_utils.unlink_default_ipc_segment() is True
+    cleanup = kv_utils.IPCSegmentCleanup(str(segment))
+    assert cleanup.unlink() is True
     assert not segment.exists()
-    assert kv_utils.unlink_default_ipc_segment() is False  # already gone
+    assert cleanup.unlink() is True  # already done
 
 
-def test_unlink_default_ipc_segment_warns_but_does_not_raise_on_os_error(
+def test_ipc_segment_cleanup_warns_but_does_not_raise_on_os_error(
     monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
-    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "kvcached_test_477")
+    segment = tmp_path / "kvcached_test_477"
+    segment.write_bytes(b"engine")
+    cleanup = kv_utils.IPCSegmentCleanup(str(segment))
     monkeypatch.setattr(
         kv_utils.os, "unlink", mock.Mock(side_effect=OSError("permission denied"))
     )
 
-    assert kv_utils.unlink_default_ipc_segment() is False
+    assert cleanup.unlink() is False
+
+
+def test_old_client_shutdown_preserves_replacement_segment(
+    monkeypatch, tmp_path, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "reused_segment")
+    segment = tmp_path / "reused_segment"
+    segment.write_bytes(b"old engine")
+    upstream_calls = []
+
+    def shutdown_once(self):
+        if not getattr(self, "closed", False):
+            self.closed = True
+            upstream_calls.append("shutdown")
+
+    client_mod = _fake_client_module(shutdown_once)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client = client_mod.MPClient()
+    client.shutdown()
+    assert not segment.exists()
+
+    segment.write_bytes(b"replacement engine")
+    client.shutdown()
+
+    assert upstream_calls == ["shutdown"]
+    assert segment.read_bytes() == b"replacement engine"
+
+
+def test_manager_shutdown_retries_failed_unlink_without_stopping_twice(
+    monkeypatch, shm_dir
+):
+    allocator = mock.Mock()
+    manager = _make_manager(allocator)
+    segment = shm_dir / manager.ipc_name
+    segment.write_bytes(b"engine")
+    real_unlink = kv_utils.os.unlink
+    attempts = []
+
+    def fail_once(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise PermissionError("injected unlink failure")
+        return real_unlink(path)
+
+    monkeypatch.setattr(kv_utils.os, "unlink", fail_once)
+    manager.shutdown()
+    assert segment.exists()
+    manager.shutdown()
+
+    assert not segment.exists()
+    assert len(attempts) == 2
+    allocator.stop_prealloc_thread.assert_called_once_with()
+
+
+@pytest.mark.parametrize("owner", ["client", "manager"])
+def test_cleanup_retry_preserves_a_replaced_file(
+    owner, monkeypatch, shm_dir, vllm_modules
+):
+    _, patches = vllm_modules
+    segment = shm_dir / "kvcached_test_477"
+    segment.write_bytes(b"old engine")
+    if owner == "manager":
+        instance = _make_manager(mock.Mock())
+    else:
+        monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+        monkeypatch.setattr(kv_utils, "SHM_DIR", str(shm_dir))
+        monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", segment.name)
+        client_mod = _fake_client_module(lambda self: None)
+        assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+        instance = client_mod.MPClient()
+
+    with mock.patch.object(kv_utils.os, "unlink", side_effect=PermissionError("injected")):
+        instance.shutdown()
+    assert segment.exists()
+
+    segment.unlink()
+    segment.write_bytes(b"replacement engine")
+    instance.shutdown()
+    assert segment.read_bytes() == b"replacement engine"
+
+
+def test_client_captures_segment_before_upstream_teardown(
+    monkeypatch, tmp_path, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "reused_segment")
+    segment = tmp_path / "reused_segment"
+    segment.write_bytes(b"old engine")
+
+    def teardown(self):
+        segment.unlink()
+        segment.write_bytes(b"replacement engine")
+
+    client_mod = _fake_client_module(teardown)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client_mod.MPClient().shutdown()
+
+    assert segment.read_bytes() == b"replacement engine"
+
+
+def test_client_retries_failed_unlink(monkeypatch, tmp_path, vllm_modules):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "retry_segment")
+    segment = tmp_path / "retry_segment"
+    segment.write_bytes(b"engine")
+    client_mod = _fake_client_module(lambda self: None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client = client_mod.MPClient()
+
+    with mock.patch.object(kv_utils.os, "unlink", side_effect=PermissionError("injected")):
+        client.shutdown()
+    assert segment.exists()
+
+    client.shutdown()
+    assert not segment.exists()
+
+
+def test_missing_segment_is_not_claimed_by_later_shutdown(
+    monkeypatch, tmp_path, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "absent_segment")
+    segment = tmp_path / "absent_segment"
+    client_mod = _fake_client_module(lambda self: None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client = client_mod.MPClient()
+    client.shutdown()
+
+    segment.write_bytes(b"new engine")
+    client.shutdown()
+    assert segment.read_bytes() == b"new engine"
+
+
+def test_interface_shutdown_retries_pool_unlink(monkeypatch, shm_dir, vllm_modules):
+    interfaces, _ = vllm_modules
+    monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
+    native_shutdown = mock.Mock()
+    monkeypatch.setattr(interfaces, "_shutdown_kvcached_impl", native_shutdown)
+    allocator = mock.Mock()
+    manager = _make_manager(allocator)
+    segment = shm_dir / manager.ipc_name
+    segment.write_bytes(b"engine")
+    register_kv_cache_pool(manager, integration="vllm")
+
+    with mock.patch.object(kv_utils.os, "unlink", side_effect=PermissionError("injected")):
+        interfaces.shutdown_kvcached()
+    native_shutdown.assert_not_called()
+    assert segment.exists()
+    assert interfaces._kvcached_initialized is True
+    assert get_registered_kv_cache_pools(integration="vllm") == [(manager, "vllm")]
+
+    interfaces.shutdown_kvcached()
+    assert not segment.exists()
+    native_shutdown.assert_called_once_with()
+    allocator.stop_prealloc_thread.assert_called_once_with()
+    assert interfaces._kvcached_initialized is False
+    assert get_registered_kv_cache_pools(integration="vllm") == []
 
 
 if __name__ == "__main__":

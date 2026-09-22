@@ -111,12 +111,19 @@ def shutdown_kvcached() -> None:
 
     # Pools first: each unlinks its /dev/shm segment while the process is
     # still alive (issue #477), then the allocator.
+    pools_stopped = True
     for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
         try:
-            manager.shutdown()
+            if manager.shutdown() is False:
+                pools_stopped = False
         except Exception as e:
+            pools_stopped = False
             logger.warning("Failed to shut down KV cache pool %s: %s",
                            getattr(manager, "pool_name", None), e)
+    if not pools_stopped:
+        # Keep failed pools reachable for retry, and do not release mappings
+        # while a preallocation thread may still be running.
+        return
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False

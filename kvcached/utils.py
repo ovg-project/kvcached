@@ -4,6 +4,7 @@
 import importlib.util
 import logging
 import os
+from typing import BinaryIO, Optional
 
 
 class KVCachedConfigError(RuntimeError):
@@ -180,29 +181,43 @@ DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
 
 
-def unlink_default_ipc_segment() -> bool:
-    """Best-effort unlink of this instance's KV cache limit segment.
+class IPCSegmentCleanup:
+    """Remember one segment across teardown and retry only its failed unlink.
 
-    The engine-side unlink in ``KVCacheManager.shutdown()`` only runs when
-    the engine process survives long enough to finish its teardown. A
-    client that stops engine processes (vLLM's ``MPClient.shutdown()``,
-    issue #477) calls this afterwards to remove whatever segment they left
-    behind. Returns True when a segment was actually removed; a missing
-    segment (the engine already unlinked it) is a silent no-op.
+    Capture before stopping the engine: it may remove its own segment during
+    shutdown. The open file pins the inode, so a later file at the same path
+    cannot inherit its identity. No contents are read or modified. This is
+    a replacement check, not a lock against concurrent instance startup.
     """
-    segment = os.path.join(SHM_DIR, DEFAULT_IPC_NAME)
-    try:
-        os.unlink(segment)
-    except FileNotFoundError:
-        return False
-    except OSError as e:
-        get_kvcached_logger().warning(
-            "Failed to unlink %s on client shutdown: %s", segment, e)
-        return False
-    get_kvcached_logger().info(
-        "Unlinked KV cache limit segment %s left by the engine process",
-        segment)
-    return True
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        self._file: Optional[BinaryIO]
+        try:
+            self._file = open(segment, "rb")
+        except FileNotFoundError:
+            self._file = None
+
+    def unlink(self) -> bool:
+        """Return True when done; keep the original file open on failure."""
+        if self._file is None:
+            return True
+        try:
+            current = os.stat(self.segment)
+            original = os.fstat(self._file.fileno())
+            if os.path.samestat(current, original):
+                os.unlink(self.segment)
+                get_kvcached_logger().info(
+                    "Unlinked KV cache limit segment %s", self.segment)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            get_kvcached_logger().warning(
+                "Failed to unlink %s on shutdown: %s", self.segment, e)
+            return False
+        self._file.close()
+        self._file = None
+        return True
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")
