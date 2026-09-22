@@ -35,6 +35,13 @@ struct PageState {
   int64_t reserved_pages;
 };
 
+struct TransactionState {
+  std::vector<page_id_t> quarantined_page_ids;
+  std::string last_error;
+  bool failed;
+  int64_t retained_bytes_upper_bound;
+};
+
 // Independent InternalPage class
 class InternalPage {
 public:
@@ -89,6 +96,7 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   PageState get_page_state() const;
+  TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
@@ -143,6 +151,10 @@ private:
   void start_prealloc_thread_internal();
   void stop_prealloc_thread_internal();
   bool should_use_worker_ipc() const;
+  void throw_if_failed() const;
+  void quarantine_pages_unlocked(const std::vector<page_id_t> &page_ids,
+                                 const std::string &reason);
+  void fail_pool(const std::string &reason);
 
   // Configuration
   int64_t num_layers_;
@@ -166,6 +178,9 @@ private:
   std::deque<page_id_t> free_page_list_;
   std::deque<page_id_t> reserved_page_list_;
   std::deque<page_id_t> reclaimed_page_list_;
+  std::vector<page_id_t> quarantined_page_ids_;
+  std::string transaction_error_;
+  std::atomic<bool> transaction_failed_{false};
 
   // Preallocation settings
   int64_t min_reserved_pages_;
@@ -173,6 +188,9 @@ private:
 
   // Thread management
   mutable std::mutex lock_;
+  // Serializes this pool's IPC transactions, not allocation across instances.
+  // Never acquire while holding lock_; Python callbacks may acquire the GIL.
+  std::mutex transaction_lock_;
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
