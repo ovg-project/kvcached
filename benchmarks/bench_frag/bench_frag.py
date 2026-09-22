@@ -11,13 +11,15 @@ This reproduces that without a model: allocate many blocks, then free all but a
 scattered residue and compare what is pinned against what is held.
 
 Run on each branch and compare:
-    python bench_frag.py
+    python bench_frag.py --backend vllm
+    python bench_frag.py --backend sglang
 """
+
+import argparse
 import time
 
 import torch
 
-from kvcached.integration.vllm.interfaces import alloc_kv_cache, init_kvcached, shutdown_kvcached
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.vmm_ops import kv_tensors_created
 
@@ -28,7 +30,8 @@ NUM_BLOCKS = 65536
 CELL_SIZE = 1024
 DTYPE = torch.float16
 DEVICE = f"cuda:{TP_RANK}"
-KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
+VLLM_KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
+SGLANG_KV_SHAPE = (NUM_BLOCKS * BLOCK_SIZE, 8, 64)
 
 # Blocks to allocate before thinning, and how many to keep. KEEP is the residue
 # an idle instance would retain as prefix cache.
@@ -36,20 +39,62 @@ ALLOC = 16384
 KEEP = 1024
 
 
-def setup():
+def setup(backend):
     torch.cuda.set_device(TP_RANK)
-    init_kvcached(tp_rank=TP_RANK, world_size=TP_SIZE, is_worker=True,
-                  async_sched=False)
-    alloc_kv_cache(kvcache_shape=KV_SHAPE, block_size=BLOCK_SIZE, dtype=DTYPE,
-                   device=DEVICE, num_layers=NUM_LAYERS)
+    if backend == "vllm":
+        from kvcached.integration.vllm.interfaces import (
+            alloc_kv_cache,
+            init_kvcached,
+            shutdown_kvcached,
+        )
+
+        init_kvcached(
+            tp_rank=TP_RANK,
+            world_size=TP_SIZE,
+            is_worker=True,
+            async_sched=False,
+        )
+        alloc_kv_cache(
+            kvcache_shape=VLLM_KV_SHAPE,
+            block_size=BLOCK_SIZE,
+            dtype=DTYPE,
+            device=DEVICE,
+            num_layers=NUM_LAYERS,
+        )
+    else:
+        from kvcached.integration.sglang.interfaces import (
+            alloc_kv_cache,
+            init_kvcached,
+            shutdown_kvcached,
+        )
+
+        init_kvcached(
+            tp_rank=TP_RANK,
+            world_size=TP_SIZE,
+            device=DEVICE,
+            async_sched=False,
+        )
+        alloc_kv_cache(
+            kvcache_shape=SGLANG_KV_SHAPE,
+            page_size=BLOCK_SIZE,
+            dtype=DTYPE,
+            device=DEVICE,
+            num_layers=NUM_LAYERS,
+        )
+
     t0 = time.time()
     while not kv_tensors_created():
         if time.time() - t0 > 10.0:
             raise RuntimeError("KV tensors not created within 10s")
         time.sleep(0.05)
-    return KVCacheManager(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE,
-                          cell_size=CELL_SIZE, num_layers=NUM_LAYERS,
-                          world_size=TP_SIZE)
+    manager = KVCacheManager(
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        cell_size=CELL_SIZE,
+        num_layers=NUM_LAYERS,
+        world_size=TP_SIZE,
+    )
+    return manager, shutdown_kvcached
 
 
 def measure(manager, keep_stride):
@@ -67,7 +112,7 @@ def measure(manager, keep_stride):
     kept_set = set(kept)
     manager.free([b for b in blocks if b not in kept_set])
 
-    pinned_gb = manager.get_mapped_memory_size(unit='gb')
+    pinned_gb = manager.get_mapped_memory_size(unit="gb")
     held_bytes = len(kept) * manager.block_mem_size * NUM_LAYERS * 2
     held_gb = held_bytes / (1024**3)
 
@@ -75,15 +120,26 @@ def measure(manager, keep_stride):
     return len(kept), held_gb, pinned_gb
 
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("vllm", "sglang"), default="vllm")
+    args = parser.parse_args()
+
+    manager, shutdown_kvcached = setup(args.backend)
+    try:
+        print(
+            f"backend={args.backend} kept={KEEP} blocks of {ALLOC} allocated, "
+            f"page={manager.page_size // (1024 * 1024)}MB, "
+            f"block={manager.block_mem_size}B\n"
+        )
+        print(f"{'stride':>7} {'kept':>6} {'held GB':>9} {'pinned GB':>10} {'waste':>7}")
+        for stride in (1, 2, 4, 8, 16):
+            kept, held_gb, pinned_gb = measure(manager, stride)
+            ratio = pinned_gb / held_gb if held_gb else 0.0
+            print(f"{stride:>7} {kept:>6} {held_gb:>9.2f} {pinned_gb:>10.2f} {ratio:>6.1f}x")
+    finally:
+        shutdown_kvcached()
+
+
 if __name__ == "__main__":
-    manager = setup()
-    print(f"kept={KEEP} blocks of {ALLOC} allocated, "
-          f"page={manager.page_size // (1024 * 1024)}MB, "
-          f"block={manager.block_mem_size}B\n")
-    print(f"{'stride':>7} {'kept':>6} {'held GB':>9} {'pinned GB':>10} {'waste':>7}")
-    for stride in (1, 2, 4, 8, 16):
-        kept, held_gb, pinned_gb = measure(manager, stride)
-        ratio = pinned_gb / held_gb if held_gb else 0.0
-        print(f"{stride:>7} {kept:>6} {held_gb:>9.2f} {pinned_gb:>10.2f} "
-              f"{ratio:>6.1f}x")
-    shutdown_kvcached()
+    main()
