@@ -130,6 +130,10 @@ def site_dirs(monkeypatch, tmp_path):
     user.mkdir()
     monkeypatch.setattr(kvcached.site, "getsitepackages", lambda: [str(system)])
     monkeypatch.setattr(kvcached.site, "getusersitepackages", lambda: str(user))
+    # Pin the user site to enabled: the real value depends on how the test
+    # interpreter was launched (False inside most venvs), and the disabled
+    # case has its own test below.
+    monkeypatch.setattr(kvcached.site, "ENABLE_USER_SITE", True)
     monkeypatch.delenv("ENABLE_KVCACHED", raising=False)
     monkeypatch.delenv("KVCACHED_AUTOPATCH", raising=False)
     return system, user
@@ -163,6 +167,21 @@ def test_no_warning_when_pth_is_in_user_site(site_dirs, monkeypatch):
     monkeypatch.setenv("KVCACHED_AUTOPATCH", "1")
 
     _assert_no_warning()
+
+
+@pytest.mark.parametrize("enable_user_site", [False, None])
+def test_import_warns_when_pth_is_only_in_a_disabled_user_site(
+        site_dirs, monkeypatch, enable_user_site):
+    """python -s / PYTHONNOUSERSITE=1 set ENABLE_USER_SITE to False (None when
+    site skips it for safety) and the interpreter then never executes user-site
+    .pth files, so a leftover file there must not suppress the warning."""
+    _, user = site_dirs
+    (user / PTH_FILE).write_text("")
+    monkeypatch.setattr(kvcached.site, "ENABLE_USER_SITE", enable_user_site)
+    monkeypatch.setenv("ENABLE_KVCACHED", "1")
+
+    with pytest.warns(RuntimeWarning, match="kvcached_autopatch.pth is not installed"):
+        kvcached._warn_if_autopatch_pth_missing()
 
 
 def test_no_warning_when_autopatch_is_not_requested(site_dirs, monkeypatch):

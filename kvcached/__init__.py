@@ -43,7 +43,12 @@ def _autopatch_pth_installed() -> bool:
     except Exception:
         pass
     try:
-        site_dirs.append(site.getusersitepackages())
+        # Only count the user site while it is enabled: under python -s,
+        # PYTHONNOUSERSITE=1, or a venv that excludes user packages the
+        # interpreter never executes .pth files there, so a leftover copy
+        # must not suppress the warning.
+        if site.ENABLE_USER_SITE:
+            site_dirs.append(site.getusersitepackages())
     except Exception:
         pass
     return any(os.path.isfile(os.path.join(d, AUTOPATCH_PTH)) for d in site_dirs)
