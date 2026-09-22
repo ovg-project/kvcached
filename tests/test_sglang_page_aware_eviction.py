@@ -78,9 +78,9 @@ class FakeManager:
 
 class FakeAllocator:
 
-    def __init__(self, manager):
+    def __init__(self, manager, page_size=1):
         self.kvcached_allocator = manager
-        self.page_size = 1
+        self.page_size = page_size
 
 
 class FakeEvictParams:
@@ -89,7 +89,7 @@ class FakeEvictParams:
         self.num_tokens = num_tokens
 
 
-def _make_cache(block_ids, priorities=None, allocated=None):
+def _make_cache(block_ids, priorities=None, allocated=None, logical_page_size=1):
     if priorities is None:
         priorities = list(range(len(block_ids)))
     if allocated is None:
@@ -109,8 +109,9 @@ def _make_cache(block_ids, priorities=None, allocated=None):
     cache = types.SimpleNamespace(
         root_node=root,
         evictable_leaves=set(nodes),
+        evictable_size_=sum(int(node.value.numel()) for node in nodes),
         eviction_strategy=FakeStrategy(),
-        token_to_kv_pool_allocator=FakeAllocator(manager),
+        token_to_kv_pool_allocator=FakeAllocator(manager, logical_page_size),
     )
     return cache, manager, nodes
 
@@ -253,6 +254,37 @@ def test_selector_prefers_fewer_tokens_even_when_it_requires_more_nodes():
     assert eviction_budget == 4
 
 
+def test_selector_converts_multi_token_logical_pages_to_block_ids(monkeypatch):
+    logical_page_size = 2
+    block_ids = [4, 8, 5, 9, 6, 10, 7, 11]
+    token_indices = [
+        range(block_id * logical_page_size, (block_id + 1) * logical_page_size)
+        for block_id in block_ids
+    ]
+    cache, _manager, nodes = _make_cache(
+        token_indices,
+        allocated=block_ids,
+        logical_page_size=logical_page_size,
+    )
+    original_cat = torch.cat
+    concatenated_elements = []
+
+    def record_cat(tensors, *args, **kwargs):
+        concatenated_elements.append(sum(int(tensor.numel()) for tensor in tensors))
+        return original_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", record_cat)
+
+    selected, eviction_budget = _select_page_aware_radix_plan(
+        cache,
+        token_budget=8,
+    )
+
+    assert selected == {nodes[0], nodes[2], nodes[4], nodes[6]}
+    assert eviction_budget == 8
+    assert concatenated_elements == [len(block_ids)]
+
+
 def test_selector_caches_block_ids_on_node_values(monkeypatch):
     cache, manager, nodes = _make_cache([4, 5, 6, 7])
     original_cat = torch.cat
@@ -301,8 +333,10 @@ def test_selector_removes_nodes_from_persistent_index():
 def test_page_aware_evict_uses_native_radix_eviction():
     cache, manager, nodes = _make_cache([4, 8, 5, 9, 6, 10, 7, 11])
     cache.evicted = []
+    cache.eviction_budgets = []
 
     def evict(params):
+        cache.eviction_budgets.append(params.num_tokens)
         count = params.num_tokens
         heap = [
             (cache.eviction_strategy.get_priority(node), index, node)
@@ -321,119 +355,62 @@ def test_page_aware_evict_uses_native_radix_eviction():
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=4,
+        num_tokens=1,
         evict_params_cls=FakeEvictParams,
     )
 
+    assert cache.eviction_budgets == [4]
     assert set(cache.evicted) == {4, 5, 6, 7}
     assert manager.allocated == {8, 9, 10, 11}
     index = cache._kvcached_radix_block_index
     assert set(index.block_owners) == {8, 9, 10, 11}
 
 
-def test_page_aware_evict_expands_budget_to_complete_node():
-    cache, manager, nodes = _make_cache(
-        [range(4, 8)],
-        allocated=range(4, 8),
+def test_page_aware_evict_falls_back_when_no_page_is_reclaimable():
+    cache, _manager, _nodes = _make_cache(
+        [5, 6, 7],
+        allocated=[4, 5, 6, 7],
     )
-    cache.evicted = []
-    cache.eviction_budgets = []
+    original_strategy = cache.eviction_strategy
+    eviction_calls = []
 
     def evict(params):
-        cache.eviction_budgets.append(params.num_tokens)
-        count = params.num_tokens
-        heap = [
-            (cache.eviction_strategy.get_priority(node), index, node)
-            for index, node in enumerate(nodes)
-        ]
-        heapq.heapify(heap)
-        while count > 0 and heap:
-            _priority, _index, node = heapq.heappop(heap)
-            block_ids = [int(block_id) for block_id in node.value]
-            cache.evicted.append(node)
-            manager.free(block_ids)
-            count -= len(node.value)
-            cache.evictable_leaves.remove(node)
-            del cache.root_node.children[block_ids[0]]
+        eviction_calls.append((params.num_tokens, cache.eviction_strategy))
 
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=1,
+        num_tokens=2,
         evict_params_cls=FakeEvictParams,
     )
 
-    assert cache.eviction_budgets == [4]
-    assert cache.evicted == nodes
-    assert manager.allocated == set()
+    assert eviction_calls == [(2, original_strategy)]
 
 
-def test_page_aware_evict_reaches_internal_node():
-    manager = FakeManager(range(4, 12))
-    parent = FakeNode([4, 5], priority=10)
-    leaf = FakeNode([6, 7], priority=10)
-    old_a = FakeNode(8, priority=0)
-    old_b = FakeNode(9, priority=1)
-    root = types.SimpleNamespace(children={}, lock_ref=1, parent=None)
-    root.children = {4: parent, 8: old_a, 9: old_b}
-    parent.parent = root
-    parent.children = {6: leaf}
-    leaf.parent = parent
-    old_a.parent = root
-    old_b.parent = root
+def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
+    cache, _manager, _nodes = _make_cache([4, 5, 6, 7])
+    eviction_calls = []
 
-    cache = types.SimpleNamespace(
-        root_node=root,
-        evictable_leaves={leaf, old_a, old_b},
-        eviction_strategy=FakeStrategy(),
-        token_to_kv_pool_allocator=FakeAllocator(manager),
-        evicted=[],
-    )
+    def fail_if_planned(*args, **kwargs):
+        raise AssertionError("full eviction should not build a page-aware plan")
 
     def evict(params):
-        heap = [
-            (cache.eviction_strategy.get_priority(node), index, node)
-            for index, node in enumerate(cache.evictable_leaves)
-        ]
-        heapq.heapify(heap)
-        next_index = len(heap)
-        num_evicted = 0
-        while num_evicted < params.num_tokens and heap:
-            _priority, _index, node = heapq.heappop(heap)
-            block_ids = [int(block_id) for block_id in node.value]
-            cache.evicted.append(node)
-            manager.free(block_ids)
-            num_evicted += len(block_ids)
+        eviction_calls.append(params.num_tokens)
 
-            parent_node = node.parent
-            for key, child in list(parent_node.children.items()):
-                if child is node:
-                    del parent_node.children[key]
-                    break
-            if (
-                parent_node is not root
-                and not parent_node.children
-                and parent_node.lock_ref == 0
-            ):
-                heapq.heappush(
-                    heap,
-                    (
-                        cache.eviction_strategy.get_priority(parent_node),
-                        next_index,
-                        parent_node,
-                    ),
-                )
-                next_index += 1
-
+    monkeypatch.setattr(
+        cache.token_to_kv_pool_allocator.kvcached_allocator.page_allocator,
+        "group_indices_by_page",
+        fail_if_planned,
+    )
     cache.evict = evict
+
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=4,
+        num_tokens=cache.evictable_size_,
         evict_params_cls=FakeEvictParams,
     )
 
-    assert cache.evicted == [leaf, parent]
-    assert manager.allocated == {8, 9, 10, 11}
+    assert eviction_calls == [cache.evictable_size_]
 
 
 def test_radix_patch_uses_page_aware_order_for_cache_cap(monkeypatch):
