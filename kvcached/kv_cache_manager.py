@@ -127,8 +127,10 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
-        # Poll-only lifecycle phase (#375): set by _post_init(), clear(), and
-        # the broadcast callbacks below; read via lifecycle_phase/wait_ready().
+        # Poll-only lifecycle phase (#375): set by _post_init(), clear(), the
+        # broadcast callbacks below, and _record_native_fatal() where a fatal
+        # native verdict propagates out of an allocator call; read via
+        # lifecycle_phase/wait_ready().
         self._lifecycle = LifecycleState(
             f"{pool_name}:group{group_id}" if pool_name else f"group{group_id}")
 
@@ -377,6 +379,33 @@ class KVCacheManager:
         """The error behind a DEGRADED or FAILED phase, if any."""
         return self._lifecycle.error
 
+    def _record_native_fatal(self, op: str, exc: BaseException) -> bool:
+        """Record #418's fatal verdict where it propagates out of a native call.
+
+        The unmap callback sees only the error raised inside Python.
+        ``PageAllocator::unmap_pages()`` then converts any unmap failure into
+        ``fail_pool()`` plus a raised ``StateConsistencyError`` after the
+        callback has returned, and the background prealloc thread can fail
+        the pool with no Python frame on the stack at all. Both leave the
+        native verdict FAILED while the phase here still says DEGRADED or
+        READY, so ``wait_ready()`` would pass an unusable pool.
+
+        The exception type alone is not the signal either way: a
+        confirmed-aborted unmap prepare surfaces as a plain ``RuntimeError``
+        (tp_ipc_util), while a recoverable co-tenancy miss is untyped too.
+        ``StateConsistencyError`` is definitive by contract; any other
+        exception defers to the allocator's own transaction state. Returns
+        True when the outcome is fatal and the caller must stay fail-loud.
+        """
+        if not isinstance(exc, StateConsistencyError):
+            get_state = getattr(self.page_allocator, "get_transaction_state",
+                                None)
+            if get_state is None or get_state().get("state") != "FAILED":
+                return False
+        self._lifecycle.mark_failed(
+            f"{op} transaction unsafe: state consistency lost", exc)
+        return True
+
     def _reserve_null_block(self) -> None:
         """
         Reserve the first block as null block for padding tokens.
@@ -529,6 +558,14 @@ class KVCacheManager:
                         "map transaction unsafe: state consistency lost", e)
                     raise
                 except RuntimeError as e:
+                    # The recoverable-miss classification only holds while
+                    # the native pool is healthy. An untyped failure that
+                    # left the transaction state FAILED (e.g. one racing in
+                    # from the prealloc thread) must not be rolled back into
+                    # a scheduling miss, and rollback itself would touch the
+                    # dead pool.
+                    if self._record_native_fatal("alloc", e):
+                        raise
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
                         f"alloc_page() failed after partially allocating "
@@ -655,7 +692,16 @@ class KVCacheManager:
                 self.avail_pages[page_id] = page
 
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            try:
+                self.page_allocator.free_pages(pages_to_free)
+            except Exception as e:
+                # The native side converts an unmap failure into its fatal
+                # verdict after the callback has recorded (at most) DEGRADED,
+                # so the propagated exception is the only place this manager
+                # sees the verdict. Record it or wait_ready() keeps passing
+                # a pool whose native state is FAILED.
+                self._record_native_fatal("free", e)
+                raise
 
         if self.in_shrink:
             assert self.target_num_blocks is not None
@@ -669,6 +715,11 @@ class KVCacheManager:
                     self.in_shrink = False
                     self.target_num_blocks = None
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
+                except Exception as e:
+                    # The lazy-shrink completion unmaps pages, so it can
+                    # carry the same fatal verdict as free_pages() above.
+                    self._record_native_fatal("free", e)
+                    raise
                 else:
                     if resized:
                         self.in_shrink = False
@@ -717,6 +768,11 @@ class KVCacheManager:
                 self.target_num_blocks = None
                 self._resize_rejected = True
             raise
+        except Exception as e:
+            # resize() unmaps reclaimed pages, so the fatal verdict can
+            # propagate here too.
+            self._record_native_fatal("resize", e)
+            raise
         self._resize_rejected = False
         self._rejected_resize_target = None
         if resized:
@@ -741,7 +797,11 @@ class KVCacheManager:
         Trim the reserved pages to free up physical memory.
         """
         self._wait_post_init()
-        self.page_allocator.trim()
+        try:
+            self.page_allocator.trim()
+        except Exception as e:
+            self._record_native_fatal("trim", e)
+            raise
 
     @synchronized
     def set_memory_limit(
@@ -830,7 +890,15 @@ class KVCacheManager:
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         # Also surfaces a fatal background-preallocation failure during shrink.
-        virtual_free_pages = self.page_allocator.get_num_free_pages()
+        try:
+            virtual_free_pages = self.page_allocator.get_num_free_pages()
+        except Exception as e:
+            # This is the capacity check on the alloc path: it raises before
+            # _alloc()'s own alloc_page() classification is reached, so the
+            # verdict must be recorded here or the phase never leaves
+            # DEGRADED (the #478 review's T4 repro).
+            self._record_native_fatal("available_size", e)
+            raise
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:

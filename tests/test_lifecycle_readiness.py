@@ -128,10 +128,12 @@ class FakeInternalPage:
 
 
 class FakePage:
-    """Just enough of the C++ InternalPage for _alloc()'s page loop."""
+    """Just enough of the C++ InternalPage for _alloc()'s page loop and
+    free()'s ledger walk."""
 
     def __init__(self, page_id: int, num_blocks: int):
         self.page_id = page_id
+        self._capacity = num_blocks
         self._free = [page_id * num_blocks + i for i in range(num_blocks)]
 
     def init(self, block_mem_size: int) -> None:
@@ -146,6 +148,12 @@ class FakePage:
 
     def full(self) -> bool:
         return not self._free
+
+    def free_batch(self, idxs: List[int]) -> None:
+        self._free.extend(idxs)
+
+    def empty(self) -> bool:
+        return len(self._free) == self._capacity
 
 
 class MapThroughPageAllocator(FakePageAllocator):
@@ -171,6 +179,103 @@ class MapThroughPageAllocator(FakePageAllocator):
             self.next_page_id = page_id  # the page goes back on the free list
             raise RuntimeError(f"Failed to map page {page_id}: {e}")
         return FakePage(page_id, num_blocks=2)
+
+
+class FailClosedPageAllocator(MapThroughPageAllocator):
+    """The C++ fail-closed contract around unmap (csrc/page_allocator.cpp):
+    ``unmap_pages()`` converts any callback failure into ``fail_pool()``
+    plus a raised ``StateConsistencyError``, and every later native entry
+    re-raises the recorded verdict (``throw_if_failed``), which is also
+    what ``get_transaction_state()`` reports. This is the shape the #478
+    review reproduced on real VMM: native FAILED while the Python phase
+    stayed DEGRADED."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.transaction_failed = False
+        self.transaction_error = ""
+
+    def fail_pool(self, reason: str) -> None:
+        self.transaction_failed = True
+        self.transaction_error = reason
+
+    def _throw_if_failed(self) -> None:
+        if self.transaction_failed:
+            raise StateConsistencyError(self.transaction_error)
+
+    def get_transaction_state(self) -> Dict[str, Any]:
+        return {
+            "state": "FAILED" if self.transaction_failed else "HEALTHY",
+            "quarantined_page_ids": [],
+            "quarantined_pages": 0,
+            "retained_bytes_upper_bound": 0,
+            "last_error": self.transaction_error,
+        }
+
+    def group_indices_by_page(self, indices: List[int],
+                              block_mem_size: int) -> Dict[int, List[int]]:
+        # FakePage hands out block ids page_id * 2 + i (num_blocks=2).
+        result: Dict[int, List[int]] = {}
+        for idx in indices:
+            result.setdefault(idx // 2, []).append(idx)
+        return result
+
+    def alloc_page(self) -> FakePage:
+        self._throw_if_failed()
+        return super().alloc_page()
+
+    def get_num_free_pages(self) -> int:
+        self._throw_if_failed()
+        return super().get_num_free_pages()
+
+    def free_pages(self, page_ids: List[int]) -> None:
+        self._throw_if_failed()
+        super().free_pages(page_ids)
+        try:
+            assert self.unmap_callback is not None
+            self.unmap_callback(2, page_ids)
+        except Exception as e:
+            reason = f"KV unmap could not complete: {e}"
+            self.fail_pool(reason)
+            raise StateConsistencyError(reason)
+
+    def trim(self) -> None:
+        self._throw_if_failed()
+        super().trim()
+
+    def resize(self, new_mem_size: int) -> bool:
+        self._throw_if_failed()
+        return True
+
+
+class UntypedVerdictPageAllocator(FailClosedPageAllocator):
+    """The fatal verdict with an untyped exception on top: the boundary
+    must consult the transaction state rather than the exception type
+    alone (a confirmed-aborted unmap prepare surfaces as a plain
+    RuntimeError in tp_ipc_util, and not every raiser on the free path
+    is the typed converter)."""
+
+    def free_pages(self, page_ids: List[int]) -> None:
+        self.fail_pool("KV unmap prepare failed: pp0/rank1: aborted")
+        raise RuntimeError(self.transaction_error)
+
+
+class UntypedAllocFailurePageAllocator(FailClosedPageAllocator):
+    """A plain RuntimeError out of alloc_page() while the transaction
+    state records FAILED (a failure racing in from the prealloc thread):
+    the recoverable-miss rollback must not swallow it."""
+
+    def alloc_page(self) -> FakePage:
+        self.fail_pool("KV map failed in the prealloc worker")
+        raise RuntimeError("Failed to map page 0: worker lost")
+
+
+class TransientTrimErrorPageAllocator(FailClosedPageAllocator):
+    """An untyped native error with a HEALTHY transaction state: nothing
+    fatal was recorded, so the boundary must not fail the pool."""
+
+    def trim(self) -> None:
+        raise RuntimeError("transient trim error, pool still healthy")
 
 
 def _make_manager(
@@ -615,6 +720,144 @@ def test_ipc_timeout_fails_unmap_but_not_map(monkeypatch):
     assert manager.lifecycle_error is excinfo.value
     with pytest.raises(StateConsistencyError):
         manager.wait_ready()
+
+
+# --------------------------------------------------------------------------
+# The manager/native boundary records the propagated fatal verdict (#478)
+# --------------------------------------------------------------------------
+
+
+def _assert_phase_matches_native(manager: kcm.KVCacheManager) -> None:
+    """The poll surface and the native transaction verdict must agree on
+    FAILED (the #478 review's agreement regression)."""
+    native_failed = (
+        manager.page_allocator.get_transaction_state()["state"] == "FAILED")
+    assert (manager.lifecycle_phase is LifecyclePhase.FAILED) == native_failed
+
+
+def test_untyped_unmap_failure_through_free_fails_the_pool(monkeypatch):
+    """The #478 review's real-VMM repro: an untyped unmap callback failure
+    was recorded DEGRADED by the callback, then the native side converted
+    it to fail_pool() plus StateConsistencyError after the callback
+    returned, so native read FAILED while wait_ready() still passed and the
+    next alloc raised without ever leaving DEGRADED. The manager now
+    records the verdict where it propagates."""
+    manager = _make_manager(
+        monkeypatch,
+        broadcast_map=lambda *args, **kwargs: None,
+        broadcast_unmap=_raise_broadcast("injected native unmap failure"),
+        allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    _assert_phase_matches_native(manager)  # the healthy control agrees too
+
+    blocks = manager.alloc(1)
+    assert blocks is not None and len(blocks) == 1
+    with pytest.raises(StateConsistencyError,
+                       match="injected native unmap failure") as excinfo:
+        manager.free(blocks)
+
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is excinfo.value
+    _assert_phase_matches_native(manager)
+    with pytest.raises(StateConsistencyError):
+        manager.wait_ready()
+    # The next alloc raises from the capacity check and stays FAILED.
+    with pytest.raises(StateConsistencyError):
+        manager.alloc(1)
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    _assert_phase_matches_native(manager)
+
+
+def test_capacity_check_records_a_background_native_failure(monkeypatch):
+    """The prealloc thread can fail the pool with no Python frame observing
+    it; the first capacity check re-raises the recorded verdict, before
+    _alloc()'s own alloc_page() classification, and readiness must follow."""
+    manager = _make_manager(monkeypatch, allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    manager.page_allocator.fail_pool("KV map failed in the prealloc worker")
+
+    with pytest.raises(StateConsistencyError) as excinfo:
+        manager.alloc(1)
+
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is excinfo.value
+    _assert_phase_matches_native(manager)
+    with pytest.raises(StateConsistencyError):
+        manager.wait_ready()
+
+
+def test_trim_records_the_native_verdict(monkeypatch):
+    manager = _make_manager(monkeypatch, allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    manager.page_allocator.fail_pool("KV unmap could not complete: rank lost")
+
+    with pytest.raises(StateConsistencyError):
+        manager.trim()
+
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    _assert_phase_matches_native(manager)
+
+
+def test_resize_records_the_native_verdict(monkeypatch):
+    manager = _make_manager(monkeypatch, allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    manager.page_allocator.fail_pool("KV unmap could not complete: rank lost")
+
+    with pytest.raises(StateConsistencyError):
+        manager.resize(0)
+
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    _assert_phase_matches_native(manager)
+
+
+def test_untyped_error_with_a_failed_native_verdict_records_failed(monkeypatch):
+    """Do not rely on the exception type alone: a plain RuntimeError whose
+    native transaction state says FAILED is the fatal verdict too."""
+    manager = _make_manager(
+        monkeypatch,
+        broadcast_map=lambda *args, **kwargs: None,
+        allocator=UntypedVerdictPageAllocator)
+    manager.wait_ready(timeout=5)
+    blocks = manager.alloc(1)
+    assert blocks is not None
+
+    with pytest.raises(RuntimeError, match="prepare failed") as excinfo:
+        manager.free(blocks)
+
+    assert type(excinfo.value) is RuntimeError  # untyped, not the subclass
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is excinfo.value
+    _assert_phase_matches_native(manager)
+
+
+def test_alloc_untyped_failure_with_a_failed_verdict_stays_loud(monkeypatch):
+    """The #453 rollback-to-a-scheduling-miss only holds while the native
+    pool is healthy; with the verdict FAILED the untyped alloc_page()
+    error must propagate and the phase must follow."""
+    manager = _make_manager(monkeypatch,
+                            allocator=UntypedAllocFailurePageAllocator)
+    manager.wait_ready(timeout=5)
+
+    with pytest.raises(RuntimeError, match="worker lost"):
+        manager.alloc(1)
+
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    _assert_phase_matches_native(manager)
+
+
+def test_untyped_error_with_a_healthy_native_verdict_records_nothing(monkeypatch):
+    """The type-alone rule cuts both ways: an untyped error whose native
+    verdict is still HEALTHY is not fatal, so the pool keeps serving."""
+    manager = _make_manager(monkeypatch,
+                            allocator=TransientTrimErrorPageAllocator)
+    manager.wait_ready(timeout=5)
+
+    with pytest.raises(RuntimeError, match="still healthy"):
+        manager.trim()
+
+    assert manager.lifecycle_phase is LifecyclePhase.READY
+    assert manager.lifecycle_error is None
+    manager.wait_ready()  # nothing sticky
 
 
 # --------------------------------------------------------------------------

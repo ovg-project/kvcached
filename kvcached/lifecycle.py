@@ -57,7 +57,11 @@ class LifecycleState:
       broadcast direction. The transaction layer could not establish that
       every affected address is contained and requires the affected engine
       to stop, which is a definitive verdict, not an unknown outcome, so
-      the recoverable-miss ambiguity above does not apply to it.
+      the recoverable-miss ambiguity above does not apply to it. The
+      manager also records this where the verdict propagates out of a
+      native allocator call (``KVCacheManager._record_native_fatal``),
+      because the native side can fail the pool after the callback has
+      returned, or with no Python frame observing it at all.
     * READY -> INITIALIZING -> READY around ``KVCacheManager.clear()``, or
       -> FAILED if ``clear()`` raises.
     * DEGRADED -> INITIALIZING around ``clear()`` likewise: the pool is torn
@@ -221,6 +225,12 @@ class LifecycleState:
         that every affected address is contained, and its contract is to
         stop the affected engine, so the pool is FAILED rather than
         DEGRADED-but-serving.
+
+        This records only what the callback itself raised. The native side
+        may then convert the same failure into its fatal verdict after the
+        callback returns (``PageAllocator::unmap_pages()`` calls
+        ``fail_pool()`` and rethrows typed); the manager records that where
+        it propagates, see ``KVCacheManager._record_native_fatal``.
         """
         if isinstance(exc, StateConsistencyError):
             self.mark_failed(
