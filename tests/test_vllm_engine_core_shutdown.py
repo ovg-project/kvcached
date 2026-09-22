@@ -153,11 +153,22 @@ def test_engine_core_without_shutdown_is_left_alone(vllm_modules):
     assert not hasattr(engine_mod.EngineCore, "shutdown")
 
 
-def _fake_client_module(shutdown=None):
+def _fake_client_module(shutdown=None, resources="owner"):
+    """A mock core_client module.
+
+    The default FakeMPClient owns its engines (resources.engine_manager
+    set), like the single-API MPClient that launched them. Pass any object
+    to use it as the client's resources, or None for a client without the
+    attribute.
+    """
     client_mod = types.ModuleType("mock_client_mod")
 
     class FakeMPClient:
-        pass
+        def __init__(self):
+            if resources == "owner":
+                self.resources = types.SimpleNamespace(engine_manager=object())
+            elif resources is not None:
+                self.resources = resources
 
     if shutdown is not None:
         FakeMPClient.shutdown = shutdown  # type: ignore[attr-defined]
@@ -182,6 +193,88 @@ def test_mp_client_shutdown_unlinks_the_segment_once_the_engines_are_stopped(
     client_mod.MPClient().shutdown()
 
     assert calls == ["vllm", "unlink"]
+
+
+def test_non_owning_client_shutdown_does_not_unlink(monkeypatch, vllm_modules):
+    """The --api-server-count 2 case: a frontend's MPClient has
+    resources.engine_manager None because the supervisor owns the engines,
+    and its shutdown stops nothing, so it must not remove the segment the
+    live engines still use."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
+    )
+    client_mod = _fake_client_module(
+        lambda self: calls.append("vllm"),
+        resources=types.SimpleNamespace(engine_manager=None),
+    )
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client_mod.MPClient().shutdown()
+    assert calls == ["vllm"]
+
+
+def test_legacy_client_with_proc_handles_still_unlinks(monkeypatch, vllm_modules):
+    """Older supported vLLM has no resources.engine_manager; there the
+    owning client carries per-engine process handles on
+    resources.core_engines."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
+    )
+    client_mod = _fake_client_module(
+        lambda self: calls.append("vllm"),
+        resources=types.SimpleNamespace(
+            core_engines=[types.SimpleNamespace(proc_handle=object())]),
+    )
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client_mod.MPClient().shutdown()
+    assert calls == ["vllm", "unlink"]
+
+
+def test_legacy_client_without_proc_handles_does_not_unlink(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
+    )
+    client_mod = _fake_client_module(
+        lambda self: calls.append("vllm"),
+        resources=types.SimpleNamespace(
+            core_engines=[types.SimpleNamespace(proc_handle=None)]),
+    )
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client_mod.MPClient().shutdown()
+    assert calls == ["vllm"]
+
+
+def test_client_without_resources_is_treated_as_a_non_owner(
+    monkeypatch, vllm_modules
+):
+    """Unknown client structure: leaking a segment is recoverable with
+    kvctl delete, removing a live one is not, so no resources means no
+    unlink."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        kv_utils, "IPCSegmentCleanup",
+        lambda path: types.SimpleNamespace(unlink=lambda: calls.append("unlink")),
+    )
+    client_mod = _fake_client_module(
+        lambda self: calls.append("vllm"), resources=None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client_mod.MPClient().shutdown()
+    assert calls == ["vllm"]
 
 
 def test_mp_client_shutdown_unlinks_even_if_vllm_shutdown_raises(
@@ -548,6 +641,59 @@ def test_missing_segment_is_not_claimed_by_later_shutdown(
     segment.write_bytes(b"new engine")
     client.shutdown()
     assert segment.read_bytes() == b"new engine"
+
+
+def test_frontend_shutdown_preserves_the_segment_until_the_owner_exits(
+    monkeypatch, tmp_path, vllm_modules
+):
+    """The multi-API end-to-end shape: one frontend goes down first and the
+    segment must survive for EngineCore and the other frontend; the owning
+    client's shutdown still removes it at the end."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "shared_segment")
+    segment = tmp_path / "shared_segment"
+    segment.write_bytes(b"live engines")
+    client_mod = _fake_client_module(lambda self: None)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+
+    frontend = client_mod.MPClient()
+    frontend.resources = types.SimpleNamespace(engine_manager=None)
+    frontend.shutdown()
+    assert segment.read_bytes() == b"live engines"
+
+    owner = client_mod.MPClient()
+    owner.shutdown()
+    assert not segment.exists()
+
+
+def test_unlink_retry_survives_shutdown_clearing_ownership(
+    monkeypatch, tmp_path, vllm_modules
+):
+    """The cleanup is captured before the original shutdown runs and kept
+    on the client, so a failed unlink still retries on the next call even
+    if vLLM's teardown cleared resources.engine_manager meanwhile."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "cleared_owner_segment")
+    segment = tmp_path / "cleared_owner_segment"
+    segment.write_bytes(b"engine")
+
+    def teardown(self):
+        self.resources.engine_manager = None
+
+    client_mod = _fake_client_module(teardown)
+    assert patches.MPClientPatch().patch_client_shutdown(client_mod)
+    client = client_mod.MPClient()
+
+    with mock.patch.object(kv_utils.os, "unlink", side_effect=PermissionError("injected")):
+        client.shutdown()
+    assert segment.exists()
+
+    client.shutdown()
+    assert not segment.exists()
 
 
 def test_interface_shutdown_retries_pool_unlink(monkeypatch, shm_dir, vllm_modules):

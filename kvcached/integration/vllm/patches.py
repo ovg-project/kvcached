@@ -1113,6 +1113,31 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _client_owns_engines(client: Any) -> bool:
+    """True only for the MPClient that launched and shuts down the engines.
+
+    With --api-server-count > 1 every frontend has an MPClient, but the
+    engines belong to the supervisor: such a client's
+    ``resources.engine_manager`` is None and its shutdown only closes
+    client-side resources, so unlinking from it would remove the live
+    engines' segment while EngineCore and the other frontends still use
+    it. Current vLLM records ownership as ``resources.engine_manager``;
+    older supported versions instead carry per-engine process handles on
+    ``resources.core_engines``. A client whose resources match neither
+    is treated as a non-owner: leaking a segment is recoverable with
+    kvctl delete, removing a live one is not.
+    """
+    resources = getattr(client, "resources", None)
+    if resources is None:
+        return False
+    if getattr(resources, "engine_manager", None) is not None:
+        return True
+    core_engines = getattr(resources, "core_engines", None) or ()
+    return any(
+        getattr(engine, "proc_handle", None) is not None
+        for engine in core_engines)
+
+
 class MPClientPatch(VersionAwarePatch, BasePatch):
     """Patch MPClient.shutdown to remove the segment killed engines leave"""
 
@@ -1141,6 +1166,13 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         before the unlink runs (issue #477). The client outlives the
         engines, so once the original shutdown has stopped them, remove
         whatever segment they left behind.
+
+        Only the engine-owning client does this (_client_owns_engines):
+        under --api-server-count > 1 a frontend's shutdown stops no
+        engines, and unlinking from it would remove the live segment.
+        Ownership is checked before the original shutdown runs, and a
+        cleanup captured once is kept for unlink retries even if the
+        original shutdown clears the ownership markers.
         """
         MPClient = self._get_target_class(client_mod)
         if MPClient is None:
@@ -1165,7 +1197,7 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
                     from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
 
                     cleanup = getattr(self, "_kvcached_ipc_cleanup", None)
-                    if cleanup is None:
+                    if cleanup is None and _client_owns_engines(self):
                         cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
                         self._kvcached_ipc_cleanup = cleanup
                 except Exception as e:
