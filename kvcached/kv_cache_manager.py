@@ -42,9 +42,16 @@ logger = get_kvcached_logger()
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 
 # TTL for the cached get_avail_physical_pages() result in available_size().
-# Matches the C++ resize_watcher poll interval (csrc/page_allocator.cpp:838)
-# so physical-free-page staleness is bounded by the same 100 ms window the
-# allocator already tolerates for virtual-free-page polling.
+# Matches the C++ resize_watcher poll interval (csrc/page_allocator.cpp:838),
+# bounding the cache to one driver read per 100 ms window *between
+# invalidations*. Manager-driven mutations (alloc, free, resize, trim, clear,
+# and the in_shrink completion toggle) invalidate the cache immediately, so
+# they are never served stale; only sources the manager cannot invalidate —
+# the C++ prealloc thread and a sibling pool in a multi-manager process — can
+# be, and those are bounded by this TTL and absorbed by the alloc_page miss
+# path. This window is the allocator's existing watcher cadence, not a claim
+# that serving generally tolerates 100 ms of capacity staleness; see
+# _get_cached_avail_physical_pages for the full accounting.
 _AVAIL_PHYSICAL_PAGES_TTL_S: float = 0.1
 
 
