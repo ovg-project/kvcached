@@ -12,6 +12,7 @@ from typing import Any
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
+from kvcached.errors import StateConsistencyError  # noqa: E402
 from kvcached.observability import (  # noqa: E402
     KVCachePoolSnapshot,
     RuntimeSnapshot,
@@ -199,6 +200,30 @@ def test_pool_snapshot_clamps_negative_block_gauges():
     assert data["available_bytes"] == 0
     assert data["allocated_blocks"] == 0
     assert data["allocated_bytes"] == 0
+
+
+def test_pool_snapshot_reports_a_failed_pool_instead_of_raising():
+    """A FAILED pool fail-closes the free-page read behind available_size()
+    (``PageAllocator::throw_if_failed``), and the snapshot used to propagate
+    that raise, so the documented polling path lost the pool exactly when it
+    had to report the failure (#478 review). The gauge degrades to zero and
+    the getters a failed native pool still answers keep their values."""
+
+    class FailClosedManager(FakeManager):
+        lifecycle_phase = "failed"
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailClosedManager()).to_dict()
+
+    assert data["lifecycle_phase"] == "failed"
+    assert data["available_blocks"] == 0
+    assert data["available_bytes"] == 0
+    assert data["total_pages"] == 20
+    assert data["inuse_pages"] == 10
+    assert data["allocated_blocks"] == 16
+    json.dumps(data)
 
 
 def test_registered_pool_snapshot_uses_manager_snapshot_entrypoint():

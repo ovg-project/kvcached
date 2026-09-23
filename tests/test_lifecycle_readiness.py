@@ -1141,6 +1141,57 @@ def test_pool_snapshot_carries_lifecycle_phase(monkeypatch):
     assert manager.observability_snapshot_dict()["lifecycle_phase"] == "failed"
 
 
+def test_pool_snapshot_still_reports_a_failed_pool(monkeypatch):
+    """The #478 review's snapshot repro: after an injected unmap failure the
+    phase is FAILED, and the snapshot's available_size() read re-raised the
+    native verdict, so the documented polling path lost the pool exactly
+    when it had to report the failure. The snapshot now reports the failed
+    phase with a zero availability gauge, while the allocation-path checks
+    keep raising."""
+    manager = _make_manager(
+        monkeypatch,
+        broadcast_map=lambda *args, **kwargs: None,
+        broadcast_unmap=_raise_broadcast("injected native unmap failure"),
+        allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    blocks = manager.alloc(1)
+    assert blocks is not None
+    with pytest.raises(StateConsistencyError):
+        manager.free(blocks)
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+
+    data = manager.observability_snapshot_dict(integration="vllm")
+
+    assert data["lifecycle_phase"] == "failed"
+    assert data["available_blocks"] == 0
+    assert data["available_bytes"] == 0
+    json.dumps(data)
+    # Unweakened: the capacity check and the alloc path still raise.
+    with pytest.raises(StateConsistencyError):
+        manager.available_size()
+    with pytest.raises(StateConsistencyError):
+        manager.alloc(1)
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    _assert_phase_matches_native(manager)
+
+
+def test_pool_snapshot_records_a_background_native_failure(monkeypatch):
+    """A pool the native side failed with no Python frame observing it: the
+    snapshot's capacity read hits the recorded verdict first, and the
+    snapshot both records the discovery and reports it, instead of raising
+    at the poller."""
+    manager = _make_manager(monkeypatch, allocator=FailClosedPageAllocator)
+    manager.wait_ready(timeout=5)
+    manager.page_allocator.fail_pool("KV map failed in the prealloc worker")
+
+    data = manager.observability_snapshot_dict()
+
+    assert data["lifecycle_phase"] == "failed"
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.lifecycle_error is not None
+    _assert_phase_matches_native(manager)
+
+
 def test_capabilities_advertise_lifecycle_readiness():
     capabilities = get_capabilities()
     assert capabilities["schema_version"] == "kvcached.observability.v1"  # no bump

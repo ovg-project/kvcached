@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
+from kvcached.errors import StateConsistencyError
 from kvcached.pool_registry import get_registered_kv_cache_pools
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
 
@@ -63,7 +64,9 @@ class KVCachePoolSnapshot:
       pool's reserve ledger. ``alloc()`` drains this ledger first.
     * ``available_blocks`` -- what the next request could obtain. Because
       ``alloc()`` drains the reserve ledger first, this also includes
-      ``reserved_blocks``.
+      ``reserved_blocks``. Reported as 0 when the native allocator has
+      fail-closed (``lifecycle_phase`` ``failed``): nothing is obtainable
+      from a failed pool, and the free-page read behind it raises.
 
     ``reserved_blocks`` counts *blocks* on that ledger and is unrelated to
     ``reserved_pages``, which counts *physical pages* held by the background
@@ -329,7 +332,20 @@ def build_kv_cache_pool_snapshot(
     # total no matter which native extension is loaded. #436 also observed it
     # returning a negative value, and that cause has not been established. A
     # negative gauge is never meaningful to an exporter, so clamp at zero.
-    available_blocks = max(int(manager.available_size()), 0)
+    try:
+        available_blocks = max(int(manager.available_size()), 0)
+    except StateConsistencyError:
+        # The free-page getter behind available_size() fail-closes on a
+        # FAILED pool (PageAllocator::throw_if_failed), and the snapshot is
+        # the documented polling path, so it must keep reporting such a pool
+        # rather than raise at the poller (#478 review). Nothing is
+        # obtainable from a failed pool, so the gauge reports zero; the
+        # page-count fields above keep whatever the allocator still answers.
+        # Allocation paths call available_size() directly and keep raising.
+        # On a KVCacheManager the call has already recorded the verdict
+        # (_record_native_fatal), so the lifecycle_phase exported below
+        # reports the failure this snapshot just observed.
+        available_blocks = 0
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
 
