@@ -5,6 +5,7 @@
 
 import gc
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -122,3 +123,39 @@ def test_native_identity_fd_is_closed_and_close_on_exec(tmp_path):
     with pytest.raises(OSError):
         os.fstat(owned_fds[0])
     assert not path.exists()
+
+
+def test_shutdown_waits_for_native_pool_initialization(monkeypatch):
+    from kvcached import kv_cache_manager as module
+    from kvcached.integration.vllm import interfaces
+
+    name = f"kvcached-init-cleanup-{os.getpid()}-{uuid.uuid4().hex}"
+    path = Path("/dev/shm") / name
+    monkeypatch.setattr(module, "DEFAULT_IPC_NAME", name)
+    monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: False)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_readiness(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(module, "kv_tensors_created", hold_readiness)
+    manager = module.KVCacheManager(
+        num_blocks=2048, block_size=16, cell_size=128, num_layers=1,
+        async_sched=False, reserve_null_block=False,
+    )
+    try:
+        assert entered.wait(5)
+        assert manager.shutdown() is False
+        assert path.exists()
+        release.set()
+        assert manager._post_init_done.wait(5)
+        assert manager.shutdown() is True
+        assert not path.exists()
+    finally:
+        release.set()
+        manager._post_init_done.wait(5)
+        manager.shutdown()
+        path.unlink(missing_ok=True)

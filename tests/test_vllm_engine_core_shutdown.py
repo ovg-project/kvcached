@@ -432,6 +432,9 @@ def _make_manager(page_allocator, ipc_name="kvcached_test_477"):
     manager.ipc_name = ipc_name
     manager._shut_down = False
     manager._shutdown_lock = threading.Lock()
+    manager._shutdown_requested = threading.Event()
+    manager._post_init_done = threading.Event()
+    manager._post_init_done.set()
     manager._prealloc_stopped = False
     manager._ipc_cleanup = None
     return manager
@@ -486,6 +489,105 @@ def test_manager_shutdown_retries_stop_before_unlinking(shm_dir):
     assert manager.shutdown() is True
     assert not segment.exists()
     assert allocator.stop_prealloc_thread.call_count == 2
+
+
+@pytest.mark.parametrize("phase", ["readiness", "reservation", "thread_start"])
+def test_shutdown_waits_for_inflight_post_init(
+    phase, shm_dir, monkeypatch, vllm_modules
+):
+    interfaces, _ = vllm_modules
+    monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: False)
+    module = _manager_module()
+    allocator = mock.Mock()
+    manager = _make_manager(allocator)
+    manager._post_init_done.clear()
+    manager.null_block = None
+    manager.world_size = 1
+    manager.pp_rank = 0
+    manager.group_id = 0
+    manager._reserve_null_block = mock.Mock()
+    segment = shm_dir / manager.ipc_name
+    segment.write_bytes(b"engine")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_init(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(module, "kv_tensors_created", lambda **kwargs: True)
+    if phase == "readiness":
+        monkeypatch.setattr(module, "kv_tensors_created", hold_init)
+    elif phase == "reservation":
+        manager._reserve_null_block.side_effect = hold_init
+    else:
+        allocator.start_prealloc_thread.side_effect = hold_init
+
+    thread = threading.Thread(target=manager._post_init)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        assert manager.shutdown() is False
+        assert segment.read_bytes() == b"engine"
+        allocator.stop_prealloc_thread.assert_not_called()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert manager.shutdown() is True
+    allocator.stop_prealloc_thread.assert_called_once_with()
+    assert allocator.start_prealloc_thread.call_count == (phase == "thread_start")
+    assert not segment.exists()
+
+
+@pytest.mark.parametrize("waiting_for", ["tensors", "capacity", "allocation"])
+def test_shutdown_cancels_initialization_waits(
+    waiting_for, shm_dir, monkeypatch, vllm_modules
+):
+    interfaces, _ = vllm_modules
+    monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: False)
+    module = _manager_module()
+    allocator = mock.Mock()
+    manager = _make_manager(allocator)
+    manager._post_init_done.clear()
+    manager.null_block = None
+    manager.reserve_null_block = True
+    manager.world_size = 1
+    manager.pp_rank = 0
+    manager.group_id = 0
+    manager._alloc = mock.Mock(return_value=None)
+    manager.available_size = mock.Mock(return_value=0)
+    entered = threading.Event()
+
+    def check_tensors(**kwargs):
+        if waiting_for == "tensors":
+            entered.set()
+            return False
+        return True
+
+    def capacity():
+        entered.set()
+        return 1 if waiting_for == "allocation" else 0
+
+    monkeypatch.setattr(module, "kv_tensors_created", check_tensors)
+    manager.available_size.side_effect = capacity
+    segment = shm_dir / manager.ipc_name
+    segment.write_bytes(b"engine")
+    thread = threading.Thread(target=manager._post_init)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        assert manager.shutdown() is True
+    finally:
+        manager._shutdown_requested.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert manager._post_init_done.is_set()
+    allocator.start_prealloc_thread.assert_not_called()
+    allocator.stop_prealloc_thread.assert_called_once_with()
+    assert manager.null_block is None
+    assert not segment.exists()
 
 
 def test_ipc_segment_cleanup_removes_the_segment(tmp_path):

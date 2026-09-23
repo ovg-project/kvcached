@@ -159,6 +159,7 @@ class KVCacheManager:
         self.ipc_name = DEFAULT_IPC_NAME
         self._shut_down = False
         self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = threading.Event()
         self._prealloc_stopped = False
         self._ipc_cleanup: Optional[IPCSegmentCleanup] = None
         self.page_allocator = PageAllocator(
@@ -252,9 +253,6 @@ class KVCacheManager:
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
-        if self.null_block is not None:
-            return
-
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
@@ -270,9 +268,11 @@ class KVCacheManager:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
+            if self.null_block is not None:
+                return
             total_wait = 0.0
             last_error: Exception | None = None
-            while True:
+            while not self._shutdown_requested.is_set():
                 try:
                     if _check_kv_tensors_created():
                         break
@@ -286,11 +286,14 @@ class KVCacheManager:
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
+            if self._shutdown_requested.is_set():
+                return
             # KV tensors created now
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
-            self.page_allocator.start_prealloc_thread()
+            if not self._shutdown_requested.is_set():
+                self.page_allocator.start_prealloc_thread()
         except Exception as e:
             logger.error(
                 f"Error during KVCacheManager post-initialization: {e}")
@@ -357,7 +360,7 @@ class KVCacheManager:
                 f"pp_rank={getattr(self, 'pp_rank', None)}, "
                 f"{allocator_state}")
 
-        while True:
+        while not self._shutdown_requested.is_set():
             loop_count += 1
             available_before = self.available_size()
             if available_before < 1:
@@ -848,6 +851,13 @@ class KVCacheManager:
         with self._shutdown_lock:
             if self._shut_down:
                 return True
+            self._shutdown_requested.set()
+            # Initialization may still be polling worker IPC or reserving the
+            # null block. Do not free its resources until it has stopped.
+            if not self._post_init_done.wait(timeout=1.0):
+                logger.warning("KV cache initialization is still stopping; "
+                               "keeping its shared segment for a shutdown retry")
+                return False
             if self._ipc_cleanup is None:
                 try:
                     self._ipc_cleanup = IPCSegmentCleanup(
