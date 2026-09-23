@@ -57,6 +57,12 @@ def vllm_modules(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "posix_ipc", mock.MagicMock())
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
+    # Other test files leave never-stopped listeners registered in
+    # kvcached.tp_ipc_util (see test_tp_socket_cleanup.socket_root); import
+    # it here, under the stubs, and drop leftovers so the listener gate in
+    # shutdown_kvcached() only meets listeners these tests start.
+    tp_ipc_util = importlib.import_module("kvcached.tp_ipc_util")
+    tp_ipc_util._listeners.clear()
     monkeypatch.delitem(
         sys.modules, "kvcached.integration.vllm.interfaces", raising=False
     )

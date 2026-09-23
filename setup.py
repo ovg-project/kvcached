@@ -89,6 +89,8 @@ def get_extensions():
     ]
     # Target the stable ABI; csrc keys on TORCH_TARGET_VERSION being defined.
     extra_compile_args.append(f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}")
+    # Makes any at::/c10:: usage a compile error.
+    extra_compile_args.append("-DTORCH_STABLE_ONLY")
 
     ext_include_dirs = include_paths(device_type="cuda") + [
         os.path.join(CSRC_PATH, "inc")
