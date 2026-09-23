@@ -19,6 +19,7 @@ from kvcached.integration.version_utils import (
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
+BYTES_PER_MB = 1024**2
 _CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
@@ -49,50 +50,92 @@ def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
     return int(capacity.item())
 
 
-class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
+def _import_sglang_allocator_kernels() -> types.ModuleType:
+    try:
+        from sglang.kernels.ops.memory import allocator as allocator_kernels
+
+        return allocator_kernels
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("sglang.kernels"):
+            raise
+
+    from sglang.srt.mem_cache.triton_ops import allocator as allocator_kernels
+
+    return allocator_kernels
+
+
+def _resolve_sglang_allocator_kernels(
+    alloc_mod: types.ModuleType,
+) -> Tuple[Any, Any]:
+    try:
+        return alloc_mod.alloc_extend_kernel, alloc_mod.alloc_decode_kernel
+    except AttributeError:
+        allocator_kernels = _import_sglang_allocator_kernels()
+        return (
+            allocator_kernels.alloc_extend_kernel,
+            allocator_kernels.alloc_decode_kernel,
+        )
+
+
+class _SGLangVirtualKVCapacityPatchBase(VersionAwarePatch, BasePatch):
     """Keep SGLang's logical KV capacity independent of peer processes."""
 
     library = "sglang"
-    target_module = "sglang.srt.model_executor.model_runner"
-    target_class = "ModelRunner"
     patch_name = "virtual_kv_capacity"
 
-    def apply(self, model_runner_mod: types.ModuleType) -> bool:
+    def apply(self, target_module: types.ModuleType) -> bool:
         if not self.initialize_version_info():
             return False
-        return self.patch_profile_available_bytes(model_runner_mod)
+        return self.patch_profile_available_bytes(target_module)
 
-    @version_range(">=0.5.11")
-    def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
-        ModelRunner = self._get_target_class(model_runner_mod)
-        if ModelRunner is None:
+    def _get_mem_fraction_static(self, owner: Any) -> float:
+        raise NotImplementedError
+
+    def _handle_max_mamba_cache(self, owner: Any, capacity_gib: float) -> float:
+        raise NotImplementedError
+
+    def _adjust_logical_budget(
+        self, *, owner: Any, total_memory: int, logical_budget: int
+    ) -> int:
+        return logical_budget
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_profile_available_bytes(self, target_module: types.ModuleType) -> bool:
+        target_class = self._get_target_class(target_module)
+        if target_class is None:
             return False
 
-        original_profile = getattr(ModelRunner, "_profile_available_bytes", None)
+        original_profile = getattr(target_class, "_profile_available_bytes", None)
         if original_profile is None:
             self.logger.warning(
-                "SGLang ModelRunner does not expose _profile_available_bytes"
+                "SGLang %s does not expose _profile_available_bytes",
+                self.target_class,
             )
             return False
         if self._is_already_patched(original_profile, "virtual_kv_capacity"):
             return True
 
         @functools.wraps(original_profile)
-        def _patched_profile_available_bytes(runner, pre_model_load_memory: int) -> int:
-            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
-                return original_profile(runner, pre_model_load_memory)
+        def _patched_profile_available_bytes(owner, pre_model_load_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(owner.device):
+                return original_profile(owner, pre_model_load_memory)
 
             import torch
 
             query_error = None
             try:
                 total_memory = int(
-                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                    torch.cuda.get_device_properties(owner.gpu_id).total_memory
                 )
-                mem_fraction_static = float(runner.mem_fraction_static)
+                mem_fraction_static = self._get_mem_fraction_static(owner)
                 logical_budget = math.ceil(total_memory * mem_fraction_static)
+                logical_budget = self._adjust_logical_budget(
+                    owner=owner,
+                    total_memory=total_memory,
+                    logical_budget=logical_budget,
+                )
                 process_local_reserved = int(
-                    torch.cuda.memory_reserved(runner.gpu_id)
+                    torch.cuda.memory_reserved(owner.gpu_id)
                 )
                 local_available_bytes = logical_budget - process_local_reserved
             except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
@@ -112,7 +155,7 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
                     "falling back to SGLang profiling: %s",
                     exc,
                 )
-                return original_profile(runner, pre_model_load_memory)
+                return original_profile(owner, pre_model_load_memory)
 
             if available_bytes == _CAPACITY_QUERY_FAILED:
                 logger.warning(
@@ -120,12 +163,12 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
                     "at least one rank; falling back to SGLang profiling: %s",
                     query_error or "peer rank query failed",
                 )
-                return original_profile(runner, pre_model_load_memory)
+                return original_profile(owner, pre_model_load_memory)
 
-            if runner.mambaish_config is not None:
+            if owner.mambaish_config is not None:
                 available_gib = available_bytes / BYTES_PER_GB
                 available_bytes = int(
-                    runner.handle_max_mamba_cache(available_gib) * BYTES_PER_GB
+                    self._handle_max_mamba_cache(owner, available_gib) * BYTES_PER_GB
                 )
 
             logger.info(
@@ -142,8 +185,51 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
             return available_bytes
 
         self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
-        ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        target_class._profile_available_bytes = _patched_profile_available_bytes
         return True
+
+
+class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
+    target_module = "sglang.srt.mem_cache.kv_cache_configurator"
+    target_class = "KVCacheConfigurator"
+
+    def _get_mem_fraction_static(self, configurator: Any) -> float:
+        return float(configurator.server_args.mem_fraction_static)
+
+    def _adjust_logical_budget(
+        self, *, owner: Any, total_memory: int, logical_budget: int
+    ) -> int:
+        if (
+            owner.mambaish_config is None
+            or not owner.post_capture_kv_active
+        ):
+            return logical_budget
+
+        from sglang.srt.utils.common import get_device_memory_capacity
+
+        minimum_reserve_bytes = math.ceil(
+            owner.server_args.mamba_pre_capture_reserve_mb(
+                get_device_memory_capacity(owner.device)
+            )
+            * BYTES_PER_MB
+        )
+        return min(logical_budget, total_memory - minimum_reserve_bytes)
+
+    def _handle_max_mamba_cache(
+        self, configurator: Any, capacity_gib: float
+    ) -> float:
+        return configurator._handle_max_mamba_cache(capacity_gib)
+
+
+class SGLangLegacyVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
+    target_module = "sglang.srt.model_executor.model_runner"
+    target_class = "ModelRunner"
+
+    def _get_mem_fraction_static(self, runner: Any) -> float:
+        return float(runner.mem_fraction_static)
+
+    def _handle_max_mamba_cache(self, runner: Any, capacity_gib: float) -> float:
+        return runner.handle_max_mamba_cache(capacity_gib)
 
 
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
@@ -269,14 +355,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
-            try:
-                alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
-                alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
-            except AttributeError:
-                from sglang.srt.mem_cache.triton_ops import allocator as triton_allocator
-
-                alloc_extend_kernel = triton_allocator.alloc_extend_kernel
-                alloc_decode_kernel = triton_allocator.alloc_decode_kernel
+            alloc_extend_kernel, alloc_decode_kernel = (
+                _resolve_sglang_allocator_kernels(alloc_mod)
+            )
 
             alloc_extend_kernel_fn = getattr(
                 alloc_extend_kernel, "fn", alloc_extend_kernel
@@ -315,7 +396,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
                 def available_size(self):
-                    return self.kvcached_allocator.available_size() * self.page_size
+                    return min(
+                        self.kvcached_allocator.available_size() * self.page_size,
+                        self.size,
+                    )
 
                 def alloc(self, need_size: int):
                     num_pages = need_size // self.page_size
@@ -554,6 +638,9 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
+                size: int
+                _kvcached_reserved_num_tokens: int
+
                 # Auto-incrementing group_id so that each pool instance
                 # (e.g., full-attention pool and SWA pool in SWAKVPool)
                 # gets independent FTensors and page spaces in the C++
@@ -622,6 +709,15 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # SGLang 0.5.16 moved this non-quantized buffer metadata
+                    # setup into MHATokenToKVPool._create_buffers().  Keep the
+                    # same contract while kvcached remains the buffer owner.
+                    self.k_scale_buffer = None
+                    self.v_scale_buffer = None
+                    self.dq_k_buffer = None
+                    self.dq_v_buffer = None
+                    self._kvcached_reserved_num_tokens = self.size
+
                     # Resolve TP rank and size for IPC socket registration.
                     # SGLang workers each call _create_buffers() independently,
                     # so we query the distributed state at this point (which is
@@ -669,6 +765,37 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         ),
                     )
                     self.k_buffer, self.v_buffer = _kv_mha
+
+                    build_buffer_descs = getattr(self, "_build_kv_buffer_descs", None)
+                    if build_buffer_descs is not None:
+                        self._kv_buffer_descs = build_buffer_descs()
+
+                    init_data_ptrs = getattr(self, "_init_data_ptrs_and_strides", None)
+                    if init_data_ptrs is not None:
+                        init_data_ptrs()
+
+                def _finalize_backing_tokens(self, final_num_tokens: int) -> None:
+                    post_capture_owner = getattr(self, "_post_capture_owner", None)
+                    if post_capture_owner is not None:
+                        super()._finalize_backing_tokens(final_num_tokens)
+                        return
+
+                    final_num_tokens = int(final_num_tokens)
+                    reserved_num_tokens = getattr(
+                        self, "_kvcached_reserved_num_tokens", self.size
+                    )
+                    if not (
+                        self.page_size <= final_num_tokens <= reserved_num_tokens
+                    ):
+                        raise ValueError(
+                            f"final_num_tokens={final_num_tokens} must satisfy "
+                            f"page_size={self.page_size} <= final <= "
+                            f"reserved={reserved_num_tokens}"
+                        )
+
+                    # kvcached owns and incrementally backs these tensors, so
+                    # SGLang only needs to publish the post-capture capacity.
+                    self.size = final_num_tokens
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.

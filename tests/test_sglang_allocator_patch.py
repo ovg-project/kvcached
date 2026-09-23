@@ -28,8 +28,18 @@ class FakeTensor:
 
 
 class FakeKVCachedAllocator:
+    def __init__(self, available_size=1024):
+        self._available_size = available_size
+        self.clear_calls = 0
+
     def alloc(self, num_pages):
         return list(range(num_pages))
+
+    def available_size(self):
+        return self._available_size
+
+    def clear(self):
+        self.clear_calls += 1
 
 
 class FakeKVCache:
@@ -46,6 +56,15 @@ class FakeBaseTokenToKVPoolAllocator:
         self.kvcache = kvcache
         self.is_not_in_free_group = True
         self.free_group = []
+
+    def clear(self):
+        raise NotImplementedError
+
+    def resize(self, config):
+        self.size = config.max_total_num_tokens
+        if self.page_size > 1:
+            self.num_pages = config.max_total_num_tokens // self.page_size
+        self.clear()
 
 
 class FakeTritonKernel:
@@ -131,6 +150,99 @@ def _make_allocator_module(alloc_extend_kernel):
         )
     )
     return alloc_mod
+
+
+def _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kernel):
+    allocator_kernels: Any = types.ModuleType(module_name)
+    allocator_kernels.alloc_extend_kernel = alloc_extend_kernel
+    allocator_kernels.alloc_decode_kernel = FakeTritonKernel(
+        FakeKernelFn(
+            (
+                "seq_lens_ptr",
+                "last_loc_ptr",
+                "free_page_ptr",
+                "out_indices",
+                "bs_upper",
+                "page_size",
+            )
+        )
+    )
+
+    parent_name, child_name = module_name.rsplit(".", 1)
+    parent: Any = types.ModuleType(parent_name)
+    setattr(parent, child_name, allocator_kernels)
+    monkeypatch.setitem(sys.modules, parent_name, parent)
+    monkeypatch.setitem(sys.modules, module_name, allocator_kernels)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "sglang.kernels.ops.memory.allocator",
+        "sglang.srt.mem_cache.triton_ops.allocator",
+    ],
+    ids=["sglang-0.5.16+", "sglang-0.5.15-and-earlier"],
+)
+def test_paged_allocator_resolves_versioned_kernel_module(monkeypatch, module_name):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    alloc_extend_kernel = FakeTritonKernel(
+        FakeKernelFn(
+            (
+                "pre_lens_ptr",
+                "seq_lens_ptr",
+                "last_loc_ptr",
+                "free_page_ptr",
+                "out_indices",
+                "bs_upper",
+                "page_size",
+            )
+        )
+    )
+    _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kernel)
+    alloc_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+    alloc_mod.BaseTokenToKVPoolAllocator = FakeBaseTokenToKVPoolAllocator
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+    assert hasattr(alloc_mod, "ElasticPagedTokenToKVPoolAllocator")
+
+
+def test_paged_allocator_honors_post_capture_resize(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    alloc_extend_kernel = FakeTritonKernel(
+        FakeKernelFn(
+            (
+                "pre_lens_ptr",
+                "seq_lens_ptr",
+                "last_loc_ptr",
+                "free_page_ptr",
+                "out_indices",
+                "bs_upper",
+                "page_size",
+            )
+        )
+    )
+    alloc_mod = _make_allocator_module(alloc_extend_kernel)
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+
+    kv_cache = FakeKVCache()
+    allocator = alloc_mod.ElasticPagedTokenToKVPoolAllocator(
+        size=64,
+        page_size=4,
+        dtype=object(),
+        device="cuda:0",
+        kvcache=kv_cache,
+    )
+    assert allocator.available_size() == 64
+
+    allocator.resize(types.SimpleNamespace(max_total_num_tokens=32))
+
+    assert allocator.size == 32
+    assert allocator.num_pages == 8
+    assert allocator.available_size() == 32
+    assert kv_cache.kvcached_allocator.clear_calls == 1
 
 
 @pytest.mark.parametrize(
