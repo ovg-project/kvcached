@@ -467,18 +467,27 @@ def test_repeated_wait_ready_on_a_failed_pool_keeps_the_traceback_flat(monkeypat
     with pytest.raises(TimeoutError, match="KV tensors not created"):
         manager.wait_ready(timeout=5)
     thread.join(timeout=5)
+    assert not thread.is_alive()
 
     def stored_frames() -> int:
         error = manager.lifecycle_error
         assert error is not None
         return len(traceback.extract_tb(error.__traceback__))
 
-    after_first = stored_frames()
+    # The first raise above can interleave with the init thread still
+    # propagating the same exception object, so the traceback it leaves
+    # behind is not deterministic (observed as 4 == 2 on Python 3.10).
+    # The baseline comes from a raise performed after the thread has
+    # finished, with the same shape as the loop below.
+    with pytest.raises(TimeoutError) as excinfo:
+        manager.wait_ready()
+    assert excinfo.value is manager.lifecycle_error
+    baseline = stored_frames()
     for _ in range(100):
         with pytest.raises(TimeoutError) as excinfo:
             manager.wait_ready()
         assert excinfo.value is manager.lifecycle_error
-    assert stored_frames() == after_first
+    assert stored_frames() == baseline
     # The rewound traceback still names the original failure site.
     error = manager.lifecycle_error
     assert error is not None
