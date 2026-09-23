@@ -4,6 +4,8 @@
 import importlib.util
 import logging
 import os
+import uuid
+from typing import Optional
 
 
 class KVCachedConfigError(RuntimeError):
@@ -178,6 +180,25 @@ CONTIGUOUS_LAYOUT = _default_contiguous_layout()
 
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
+
+# Root of the per-instance TP worker socket directories (kvcached.tp_ipc_util).
+# The naming rule lives here, next to the IPC name, so tools that never load
+# the compiled extension (kvctl) can derive the directory from an IPC name.
+TP_SOCKET_DIR_ROOT = "/tmp"
+
+
+def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
+    """Return the TP worker socket directory for *ipc_name* (default: this
+    instance's DEFAULT_IPC_NAME).
+
+    The directory keeps the IPC name readable and appends a short
+    deterministic hash, so every worker of one engine instance agrees on it.
+    Unix domain socket paths are limited to 108 characters on Linux; the
+    caller validates the final socket path length.
+    """
+    name = DEFAULT_IPC_NAME if ipc_name is None else ipc_name
+    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, name).hex[:8]
+    return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")
