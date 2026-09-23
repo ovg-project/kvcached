@@ -172,7 +172,8 @@ def _fake_client_module(shutdown=None, resources="owner"):
     class FakeMPClient:
         def __init__(self):
             if resources == "owner":
-                self.resources = types.SimpleNamespace(engine_manager=object())
+                self.resources = types.SimpleNamespace(engine_manager=types.SimpleNamespace(
+                    processes=[types.SimpleNamespace(exitcode=0)]))
             elif resources is not None:
                 self.resources = resources
 
@@ -236,7 +237,8 @@ def test_legacy_client_with_proc_handles_still_unlinks(monkeypatch, vllm_modules
     client_mod = _fake_client_module(
         lambda self: calls.append("vllm"),
         resources=types.SimpleNamespace(
-            core_engines=[types.SimpleNamespace(proc_handle=object())]),
+            core_engines=[types.SimpleNamespace(
+                proc_handle=types.SimpleNamespace(exitcode=0))]),
     )
     assert patches.MPClientPatch().patch_client_shutdown(client_mod)
     client_mod.MPClient().shutdown()
@@ -283,7 +285,7 @@ def test_client_without_resources_is_treated_as_a_non_owner(
     assert calls == ["vllm"]
 
 
-def test_mp_client_shutdown_unlinks_even_if_vllm_shutdown_raises(
+def test_mp_client_shutdown_unlinks_after_exit_even_if_vllm_shutdown_raises(
     monkeypatch, vllm_modules
 ):
     _, patches = vllm_modules
@@ -739,7 +741,8 @@ def _fake_engine_utils_module(shutdown=None):
     utils_mod = types.ModuleType("mock_engine_utils_mod")
 
     class FakeCoreEngineProcManager:
-        pass
+        def __init__(self):
+            self.processes = [types.SimpleNamespace(exitcode=0)]
 
     if shutdown is not None:
         FakeCoreEngineProcManager.shutdown = shutdown  # type: ignore[attr-defined]
@@ -798,7 +801,7 @@ def test_two_frontend_final_exit_removes_the_segment_via_the_supervisor(
     assert not segment.exists()
 
 
-def test_engine_manager_shutdown_unlinks_even_if_vllm_shutdown_raises(
+def test_engine_manager_shutdown_unlinks_after_exit_even_if_vllm_shutdown_raises(
     monkeypatch, vllm_modules
 ):
     _, patches = vllm_modules
@@ -899,6 +902,127 @@ def test_engine_manager_without_shutdown_is_left_alone(vllm_modules):
 
     assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(utils_mod)
     assert not hasattr(utils_mod.CoreEngineProcManager, "shutdown")
+
+
+@pytest.mark.parametrize("boundary", ["client", "manager", "legacy_client"])
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_shutdown_preserves_live_segment_and_retries_after_engine_exit(
+    monkeypatch, tmp_path, vllm_modules, boundary, raise_error
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "live_segment")
+    segment = tmp_path / "live_segment"
+    segment.write_bytes(b"still in use")
+    process = types.SimpleNamespace(exitcode=None)
+    error = RuntimeError("injected terminate failure")
+
+    def shutdown(self):
+        # Real teardown can clear ownership even when it failed to stop a child.
+        if boundary != "manager":
+            self.resources = None
+        else:
+            self.processes = []
+        if raise_error:
+            raise error
+        return "done"
+
+    if boundary == "manager":
+        mod = _fake_engine_utils_module(shutdown)
+        assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(mod)
+        owner = mod.CoreEngineProcManager()
+        owner.processes = [types.SimpleNamespace(exitcode=0), process]
+    else:
+        if boundary == "client":
+            resources = types.SimpleNamespace(engine_manager=types.SimpleNamespace(
+                processes=[types.SimpleNamespace(exitcode=0), process]))
+        else:
+            resources = types.SimpleNamespace(core_engines=[types.SimpleNamespace(
+                proc_handle=process)])
+        mod = _fake_client_module(shutdown, resources=resources)
+        assert patches.MPClientPatch().patch_client_shutdown(mod)
+        owner = mod.MPClient()
+
+    def stop():
+        if raise_error:
+            with pytest.raises(RuntimeError) as exc:
+                owner.shutdown()
+            assert exc.value is error
+        else:
+            assert owner.shutdown() == "done"
+
+    stop()
+    assert segment.read_bytes() == b"still in use"
+    stop()  # A repeated/no-op upstream shutdown still cannot unlink a live segment.
+    assert segment.exists()
+    process.exitcode = -9
+    stop()
+    assert not segment.exists()
+
+
+@pytest.mark.parametrize("boundary", ["client", "manager"])
+@pytest.mark.parametrize("state", ["missing", "raises", "empty"])
+def test_shutdown_preserves_segment_when_engine_exit_cannot_be_checked(
+    monkeypatch, vllm_modules, boundary, state
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    unlink = mock.Mock()
+    monkeypatch.setattr(kv_utils, "IPCSegmentCleanup",
+                        lambda path: types.SimpleNamespace(unlink=unlink))
+
+    class UnknownProcess:
+        @property
+        def exitcode(self):
+            raise ValueError("process handle closed")
+
+    processes = [] if state == "empty" else [
+        UnknownProcess() if state == "raises" else object()]
+    if boundary == "manager":
+        mod = _fake_engine_utils_module(lambda self: "done")
+        assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(mod)
+        owner = mod.CoreEngineProcManager()
+        owner.processes = processes
+    else:
+        resources = types.SimpleNamespace(engine_manager=types.SimpleNamespace(
+            processes=processes))
+        mod = _fake_client_module(lambda self: "done", resources=resources)
+        assert patches.MPClientPatch().patch_client_shutdown(mod)
+        owner = mod.MPClient()
+    assert owner.shutdown() == "done"
+    unlink.assert_not_called()
+
+
+def test_segment_cleanup_reaps_exiting_children_with_one_group_deadline(
+    monkeypatch, vllm_modules
+):
+    _, patches = vllm_modules
+    cleanup = mock.Mock()
+    monkeypatch.setattr(patches.time, "monotonic", mock.Mock(side_effect=[10.0, 10.0, 10.75]))
+    children = [types.SimpleNamespace(exitcode=None) for _ in range(2)]
+    calls = []
+
+    def join(index, timeout):
+        calls.append((index, timeout))
+        cleanup.unlink.assert_not_called()
+        children[index].exitcode = -9
+
+    children[0].join = lambda timeout: join(0, timeout)
+    children[1].join = lambda timeout: join(1, timeout)
+    patches._unlink_stopped_engine_segment(cleanup, tuple(children))
+    assert calls == [(0, 1.0), (1, 0.25)]
+    cleanup.unlink.assert_called_once_with()
+
+
+def test_segment_cleanup_keeps_live_child_after_bounded_join(vllm_modules):
+    _, patches = vllm_modules
+    cleanup = mock.Mock()
+    child = types.SimpleNamespace(exitcode=None, join=mock.Mock())
+    patches._unlink_stopped_engine_segment(cleanup, (child,))
+    timeout = child.join.call_args.kwargs["timeout"]
+    assert 0 <= timeout <= 1.0
+    cleanup.unlink.assert_not_called()
 
 
 if __name__ == "__main__":
