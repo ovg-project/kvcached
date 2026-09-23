@@ -4,12 +4,15 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "allocator.hpp"
 #include "constants.hpp"
+#include "device_utils.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
 #include "page.hpp"
@@ -35,9 +38,7 @@ make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
     return gpu_vmm::current_device();
   };
 
-  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
-  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
-  if (dev.is_cuda()) {
+  if (is_accelerator(dev)) {
     return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
   } else if (dev.is_cpu()) {
@@ -59,7 +60,7 @@ FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
       unified_pool_(false), kv_tensor_size_per_layer_(0) {
-  if (dev_.is_cuda()) {
+  if (is_accelerator(dev_)) {
     init_gpu_();
   }
 }
@@ -99,6 +100,23 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   }
 
   torch::stable::Device device(dev_str);
+  // One build serves exactly one accelerator family, plus CPU. Reject any other
+  // family here, before any global state is set, because is_accelerator() is
+  // false for it: the reservation would take the host mmap() path while
+  // from_blob() still labels the tensor with the requested device, handing
+  // the engine a tensor that claims to be on an accelerator but is backed by
+  // host memory -- and init_gpu_(), which is what proves the device supports
+  // VMM at all, would never run.
+  //
+  // Thrown rather than ASSERT()ed: extension builds compile with NDEBUG, so
+  // assert() is removed and ASSERT() degrades to a log line.
+  if (!is_accelerator(device) && !device.is_cpu()) {
+    std::ostringstream oss;
+    oss << "kvcached was built for " << gpu_vmm::backend_name()
+        << " and cannot allocate on device '" << dev_str
+        << "'. Rebuild kvcached for that device's backend (KVCACHED_BACKEND).";
+    throw std::runtime_error(oss.str());
+  }
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
   g_allocators_[0] =
@@ -148,14 +166,20 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
     size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    // Left null where FTensor will never map it, rather than pinning a
+    // compound page's worth of device memory nothing reads.
+    if (uses_zero_page(dev_)) {
+      zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+    }
     // We can use the aligned size directly for contiguous layout too because
     // both compound_page_size and aligned_size are already/will be multiplied
     // by num_layers.
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    if (uses_zero_page(dev_)) {
+      zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    }
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
@@ -599,6 +623,13 @@ void FTensorAllocator::init_gpu_() {
          "VMM is not supported on %s device %d. kvcached requires GPU VMM "
          "support.",
          gpu_vmm::backend_name(), dev_idx);
+
+  // PageAllocator::get_avail_physical_pages() queries free memory on every
+  // allocation decision and cannot abort there, so establish here -- at
+  // startup, where failing loudly is correct -- that the query works at all.
+  // On XPU it depends on a device aspect; on CUDA/HIP it cannot fail.
+  size_t free_mem = 0, total_mem = 0;
+  CHECK_GPU(gpu_vmm::mem_get_info(&free_mem, &total_mem));
 
   auto prop = gpu_vmm::make_pinned_device_allocation_prop(dev_idx);
   size_t chunk_sz = 0;

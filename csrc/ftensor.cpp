@@ -12,6 +12,7 @@
 #include <torch/csrc/stable/ops.h>
 
 #include "constants.hpp"
+#include "device_utils.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
 #include "page.hpp"
@@ -58,9 +59,7 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::stable::Device &dev,
 
   generic_ptr_t vaddr;
   size_t offset = g_vaddr_allocated_offset.fetch_add(size);
-  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
-  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
-  if (dev.is_cuda()) {
+  if (is_accelerator(dev)) {
     CHECK_GPU(gpu_vmm::address_reserve(
         reinterpret_cast<void **>(&vaddr), size, alignment_2mb,
         reinterpret_cast<void *>(kStartAddr + offset)));
@@ -76,7 +75,7 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::stable::Device &dev,
 static inline std::unique_ptr<Page>
 make_unique_page(const torch::stable::Device &dev, page_id_t page_id,
                  size_t page_size = 0) {
-  if (dev.is_cuda()) {
+  if (is_accelerator(dev)) {
     return std::make_unique<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
   } else if (dev.is_cpu()) {
@@ -94,6 +93,9 @@ FTensor::FTensor(const std::string &name, size_t size,
       dev_(dev), zero_page_(zero_page) {
   vaddr_ = alloc_virtual_mem(dev_, size_);
   init_with_zero_();
+  if (!zero_page_backed_ && is_accelerator(dev_)) {
+    install_anchor_page_();
+  }
 
   auto num_elems = static_cast<int64_t>(size / element_size(dtype_));
   std::vector<int64_t> sizes = {num_elems};
@@ -104,14 +106,35 @@ FTensor::FTensor(const std::string &name, size_t size,
 
 FTensor::~FTensor() {
   if (vaddr_) {
-    if (dev_.is_cuda()) {
+    if (is_accelerator(dev_)) {
       // Tolerate stale VMM mappings during teardown: log, do not abort.
-      auto res = gpu_vmm::mem_unmap(vaddr_, size_);
-      if (!gpu_vmm::is_success(res)) {
-        LOGGER(ERROR, "mem_unmap during FTensor cleanup failed: %s",
-               gpu_vmm::error_string(res));
+      auto unmap_range = [](generic_ptr_t addr, size_t len) {
+        auto res = gpu_vmm::mem_unmap(addr, len);
+        if (!gpu_vmm::is_success(res)) {
+          LOGGER(ERROR, "mem_unmap during FTensor cleanup failed: %s",
+                 gpu_vmm::error_string(res));
+        }
+      };
+
+      if (zero_page_backed_) {
+        // Every virtual page is backed, so one range covers the reservation.
+        unmap_range(vaddr_, size_);
+      } else {
+        // Only the pages in mapping_ (plus the anchor) are backed, and a
+        // reservation-wide unmap spanning unbacked virtual pages faults inside
+        // the Level Zero driver. Release the live mappings one at a time.
+        if (anchor_mapped_) {
+          unmap_range(vaddr_, page_size_);
+        }
+        for (const auto &entry : mapping_) {
+          unmap_range(reinterpret_cast<generic_ptr_t>(
+                          reinterpret_cast<uintptr_t>(vaddr_) +
+                          entry.first * page_size_),
+                      page_size_);
+        }
       }
-      res = gpu_vmm::address_free(vaddr_, size_);
+
+      auto res = gpu_vmm::address_free(vaddr_, size_);
       if (!gpu_vmm::is_success(res)) {
         LOGGER(ERROR, "address_free during FTensor cleanup failed: %s",
                gpu_vmm::error_string(res));
@@ -136,9 +159,16 @@ bool FTensor::map(offset_t offset) {
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  if (dev_.is_cuda()) {
-    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
-                       "zero page unmap");
+  // Only evict the zero page if one is actually mapped here; without the safety
+  // net the virtual page is already free and unmapping it is an error. The lone
+  // exception is the anchor page, which does occupy virtual page 0.
+  if (is_accelerator(dev_)) {
+    if (zero_page_backed_) {
+      throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                         "zero page unmap");
+    } else if (offset == 0) {
+      release_anchor_page_();
+    }
   }
 
   bool physical_page_mapped = false;
@@ -158,7 +188,7 @@ bool FTensor::map(offset_t offset) {
       }
       throw;
     }
-    if (physical_page_mapped && dev_.is_cuda()) {
+    if (physical_page_mapped && is_accelerator(dev_)) {
       auto status = gpu_vmm::mem_unmap(vaddr, page_size_);
       if (!gpu_vmm::is_success(status)) {
         if (page) {
@@ -169,8 +199,15 @@ bool FTensor::map(offset_t offset) {
       }
     }
     try {
-      if (!map_(zero_page_.get(), offset)) {
-        throw std::runtime_error("zero page map returned false");
+      // Leave the virtual page as map() found it: under the zero page where
+      // there is one, otherwise unbacked, with the anchor put back if this was
+      // virtual page 0.
+      if (zero_page_backed_) {
+        if (!map_(zero_page_.get(), offset)) {
+          throw std::runtime_error("zero page map returned false");
+        }
+      } else if (is_accelerator(dev_) && offset == 0) {
+        install_anchor_page_();
       }
       if (page) {
         page->release();
@@ -222,26 +259,52 @@ bool FTensor::unmap_retain_(offset_t offset,
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  if (dev_.is_cuda()) {
+  if (is_accelerator(dev_)) {
     throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
                        "physical page unmap");
   }
 
-  try {
-    if (!map_(zero_page_.get(), offset)) {
-      throw std::runtime_error("zero page map returned false");
-    }
-  } catch (const std::exception &error) {
-    std::string original_error = error.what();
+  // Map the zero page instead to ensure memory integrity. Skipped where the
+  // backend has no shared-page support: the virtual page simply goes back to
+  // being unbacked, so there is no zero-page failure to roll back from.
+  if (zero_page_backed_) {
     try {
-      if (!mapping->second->map(vaddr)) {
-        throw std::runtime_error("physical page restore returned false");
+      if (!map_(zero_page_.get(), offset)) {
+        throw std::runtime_error("zero page map returned false");
       }
-    } catch (const std::exception &rollback_error) {
-      throw_rollback_error("physical page unmap", original_error,
-                           rollback_error.what());
+    } catch (const std::exception &error) {
+      std::string original_error = error.what();
+      try {
+        if (!mapping->second->map(vaddr)) {
+          throw std::runtime_error("physical page restore returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        throw_rollback_error("physical page unmap", original_error,
+                             rollback_error.what());
+      }
+      throw std::runtime_error("physical page unmap failed: " + original_error);
     }
-    throw std::runtime_error("physical page unmap failed: " + original_error);
+  } else if (is_accelerator(dev_) && offset == 0) {
+    // Virtual page 0 must stay backed for from_blob()'s device lookup.
+    // Rolled back like the zero page above: leaving this function with the
+    // range unmapped but still in mapping_ would make a later unmap retry a
+    // second unmap of an unbacked range, which faults inside the driver.
+    try {
+      if (!install_anchor_page_()) {
+        throw std::runtime_error("anchor page map returned false");
+      }
+    } catch (const std::exception &error) {
+      std::string original_error = error.what();
+      try {
+        if (!mapping->second->map(vaddr)) {
+          throw std::runtime_error("physical page restore returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        throw_rollback_error("physical page unmap", original_error,
+                             rollback_error.what());
+      }
+      throw std::runtime_error("physical page unmap failed: " + original_error);
+    }
   }
 
   retained_page = std::move(mapping->second);
@@ -265,9 +328,13 @@ bool FTensor::restore_mapping_(offset_t offset,
 
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
-  if (dev_.is_cuda()) {
-    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
-                       "rollback zero page unmap");
+  if (is_accelerator(dev_)) {
+    if (zero_page_backed_) {
+      throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                         "rollback zero page unmap");
+    } else if (offset == 0) {
+      release_anchor_page_();
+    }
   }
 
   bool physical_page_mapped = false;
@@ -279,7 +346,7 @@ bool FTensor::restore_mapping_(offset_t offset,
     mapping_.emplace(page_id, std::move(retained_page));
   } catch (const std::exception &error) {
     std::string original_error = error.what();
-    if (physical_page_mapped && dev_.is_cuda()) {
+    if (physical_page_mapped && is_accelerator(dev_)) {
       auto status = gpu_vmm::mem_unmap(vaddr, page_size_);
       if (!gpu_vmm::is_success(status)) {
         throw_rollback_error("physical page restore", original_error,
@@ -287,8 +354,12 @@ bool FTensor::restore_mapping_(offset_t offset,
       }
     }
     try {
-      if (!map_(zero_page_.get(), offset)) {
-        throw std::runtime_error("zero page restore returned false");
+      if (zero_page_backed_) {
+        if (!map_(zero_page_.get(), offset)) {
+          throw std::runtime_error("zero page restore returned false");
+        }
+      } else if (is_accelerator(dev_) && offset == 0) {
+        install_anchor_page_();
       }
     } catch (const std::exception &rollback_error) {
       throw_rollback_error("physical page restore", original_error,
@@ -317,7 +388,7 @@ void FTensor::validate_offset_(offset_t offset) const {
 }
 
 bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
-  if (!dev_.is_cuda()) {
+  if (!is_accelerator(dev_)) {
     return true;
   }
   auto access_desc =
@@ -326,10 +397,69 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
   return true;
 }
 
+// from_blob() resolves an XPU tensor's device by asking the SYCL runtime
+// what vaddr_ points at, and a reservation with nothing mapped into it answers
+// "unknown" -- from_blob then throws "ptr is not a device type pointer". Only
+// the base address is inspected, so backing the first virtual page with a page
+// of its own is enough to make the reservation recognizable. The page is handed
+// straight over to the allocator if it ever asks for offset 0, so it costs
+// nothing once the KV cache is in use.
+// The physical page is allocated at most once per FTensor and then parked
+// rather than freed, because unmap_retain_() has to put the anchor back while
+// the page it is releasing is still owned: allocating there would mean freeing
+// virtual page 0 needs one MORE physical page than are already in use, so a
+// release would fail on a full device -- exactly when the caller is freeing
+// memory to make room. Mapping a page that is already held cannot fail for lack
+// of memory. The cost is one parked page per FTensor while the allocator owns
+// virtual page 0; it is the page the anchor would hold anyway the moment that
+// page is freed.
+bool FTensor::install_anchor_page_() {
+  assert(!anchor_mapped_);
+  if (!anchor_page_) {
+    anchor_page_ = make_unique_page(dev_, ANCHOR_PAGE_ID, page_size_);
+  }
+  // anchor_mapped_ is set only once the mapping is in place: a half-installed
+  // anchor would make ~FTensor unmap virtual page 0 twice, once for the anchor
+  // and once for whatever mapping_ holds there.
+  if (!anchor_page_->map(vaddr_)) {
+    return false;
+  }
+  anchor_mapped_ = true;
+  return true;
+}
+
+bool FTensor::release_anchor_page_() {
+  if (!anchor_mapped_) {
+    return true;
+  }
+  throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr_, page_size_),
+                     "anchor page unmap");
+  // anchor_page_ deliberately kept: see install_anchor_page_().
+  anchor_mapped_ = false;
+  return true;
+}
+
 bool FTensor::init_with_zero_() {
   assert(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ ==
          0);                       // Ensure alignment.
   assert(size_ % page_size_ == 0); // Ensure alignment.
+
+  // Backends that cannot map one physical page into several virtual ranges get
+  // no zero-page safety net: the mapping calls would succeed and then fault the
+  // device on first access. Leave the reservation unbacked instead, so a stray
+  // read of a never-allocated region is a page fault rather than silent
+  // corruption or a lost context. zero_page_ is null here -- the allocator does
+  // not create one it cannot use.
+  if (!uses_zero_page(dev_)) {
+    zero_page_backed_ = false;
+    return true;
+  }
+
+  // Set before the loop, not from its result: map_() routes through CHECK_GPU,
+  // which aborts on failure, so on CUDA and HIP this is always true and every
+  // branch below keeps the behavior those backends had before the XPU arm
+  // existed.
+  zero_page_backed_ = true;
 
   bool succ = true;
   for (size_t offset = 0; offset < size_; offset += page_size_) {

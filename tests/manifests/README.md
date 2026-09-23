@@ -6,8 +6,10 @@ fails CI when a new test has not been classified.
 
 - `cpu.txt`: dependency-isolated tests that run on a hosted CPU runner without
   PyTorch, a serving engine, the compiled VMM extension, or shared services.
-- `gpu.txt`: tests whose primary boundary is CUDA/HIP hardware and the compiled
-  extension.
+- `gpu.txt`: tests whose primary boundary is accelerator hardware (CUDA, HIP or
+  XPU) and the compiled extension. Backend-specific modules skip themselves at
+  module level when the hardware or the matching build is absent, so the whole
+  manifest stays runnable on any one vendor's GPU.
 - `integration.txt`: tests that require a serving-engine or broader project
   runtime, shared memory, multiprocessing, external services, or an end-to-end
   environment. Some integration tests may also require a GPU.

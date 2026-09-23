@@ -29,11 +29,21 @@ def vllm_modules(monkeypatch):
         sys.modules, "kvcached.integration.vllm.patches", raising=False
     )
 
+    # monkeypatch.delitem records nothing when the key is already absent, so the
+    # modules imported below outlive this fixture with the mock torch still in
+    # their globals. Drop whatever the imports created, so a later test importing
+    # the same modules gets them built against the real torch.
+    imported_before = set(sys.modules)
     interfaces: Any = importlib.import_module(
         "kvcached.integration.vllm.interfaces"
     )
     patches: Any = importlib.import_module("kvcached.integration.vllm.patches")
-    return interfaces, patches
+    try:
+        yield interfaces, patches
+    finally:
+        for name in set(sys.modules) - imported_before:
+            if name.startswith("kvcached"):
+                sys.modules.pop(name, None)
 
 
 def test_get_world_size_returns_engine_core_recorded_value(

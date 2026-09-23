@@ -281,6 +281,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
+    setattr(utils_module, "get_device_type", lambda device=None: "cuda")
+    setattr(utils_module, "get_device_module", lambda device=None: torch.cuda)
+    setattr(utils_module, "get_current_device_str", lambda: "cuda:0")
 
     vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
     setattr(vmm_ops_module, "create_kv_tensors", lambda *args, **kwargs: [])
@@ -368,6 +371,9 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
+    setattr(utils_module, "get_device_type", lambda device=None: "cuda")
+    setattr(utils_module, "get_device_module", lambda device=None: torch.cuda)
+    setattr(utils_module, "get_current_device_str", lambda: "cuda:0")
 
     vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
     setattr(vmm_ops_module, "create_kv_tensors", lambda *args, **kwargs: [])

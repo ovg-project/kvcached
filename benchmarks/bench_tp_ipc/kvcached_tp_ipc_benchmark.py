@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from kvcached.tp_ipc_util import recv_msg, send_msg
+from kvcached.utils import get_device_module, get_device_type
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
 
@@ -72,7 +73,24 @@ def get_broadcast_impl(name: str):
     return fn
 
 
-def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:
+def abort_if_worker_died(workers: List[mp.Process]) -> None:
+    """Raise if a worker crashed, so its exception is not waited on forever.
+
+    The readiness loop below retries ConnectionRefusedError indefinitely, which
+    is right while a listener is still coming up and wrong once the process
+    behind it is gone. Exiting 0 never happens here -- workers sleep until the
+    parent terminates them -- so any exit code at all is a failure.
+    """
+    dead = [(p.pid, p.exitcode) for p in workers if p.exitcode is not None]
+    if dead:
+        raise RuntimeError(
+            f"worker exited before becoming ready; (pid, exitcode): {dead}. "
+            "Its traceback is above."
+        )
+
+
+def wait_for_all_worker_sockets(tp_size: int, workers: List[mp.Process],
+                                timeout_sec=10) -> None:
     """Block until all worker sockets are available."""
     deadline = time.time() + timeout_sec
     from kvcached.tp_ipc_util import get_worker_socket_path
@@ -85,6 +103,9 @@ def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:
                 break
         if ready:
             return
+        # init_kvcached opens the socket, so a worker that fails before that
+        # would otherwise burn the whole timeout and report the wrong cause.
+        abort_if_worker_died(workers)
         if time.time() > deadline:
             raise TimeoutError("Not all worker sockets became available in time.")
         time.sleep(0.1)
@@ -128,7 +149,7 @@ def _worker_entry(
     """
     os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = "true" if contiguous_layout else "false"
     try:
-        torch.cuda.set_device(rank)
+        get_device_module().set_device(rank)
         from kvcached.integration.vllm.interfaces import init_kvcached
 
         init_kvcached(
@@ -142,7 +163,7 @@ def _worker_entry(
             kvcache_shape=kvcache_shape,
             block_size=block_size,
             dtype=torch.float16,
-            device=f"cuda:{rank}",
+            device=f"{get_device_type()}:{rank}",
             num_layers=num_layers,
         )
 
@@ -206,13 +227,14 @@ def run_benchmark(
     # Wait until every worker reports its KV tensors exist
     if verbose:
         print("Waiting for workers to become ready...", flush=True)
-    wait_for_all_worker_sockets(tp_size)
+    wait_for_all_worker_sockets(tp_size, procs)
     while True:
         try:
             if broadcast_kv_tensors_created(tp_size):
                 break
         except ConnectionRefusedError:
             pass  # listener not up yet
+        abort_if_worker_died(procs)
         time.sleep(0.1)
     if verbose:
         print("All workers ready - starting benchmark.\n", flush=True)

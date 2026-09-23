@@ -55,8 +55,19 @@ void GPUPage::release() {
 
 bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
   auto access_desc = gpu_vmm::make_device_rw_access_desc(dev_idx_);
-  auto map_status = gpu_vmm::mem_map(vaddr, page_size_, 0, handle_);
+  // `set_access` also reaches mem_map: where the access mode is an argument to
+  // the mapping call, that call is the only place to defer access.
+  auto map_status = gpu_vmm::mem_map(vaddr, page_size_, 0, handle_, set_access);
   if (!gpu_vmm::is_success(map_status)) {
+    if (gpu_vmm::is_state_uncertain(map_status)) {
+      // The map failed and the backend could not undo what it had already done,
+      // so this page may still be partly mapped at vaddr. Say so with the type
+      // the caller keys on: a plain failure means "no room, try again later"
+      // and lets the page be released, which would hand mapped memory back to
+      // the driver.
+      throw StateConsistencyError(
+          gpu_error(map_status, "physical page map").what());
+    }
     throw gpu_error(map_status, "physical page map");
   }
   if (set_access) {

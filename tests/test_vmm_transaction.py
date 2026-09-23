@@ -4,10 +4,18 @@
 import pytest
 
 
+def _device_str():
+    from kvcached.utils import get_device_type
+
+    return f"{get_device_type()}:0"
+
+
 def _compiled_vmm_ops():
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for VMM transaction validation")
+    pytest.importorskip("torch")
+    from kvcached.utils import get_device_module, get_device_type
+
+    if not get_device_module().is_available():
+        pytest.skip(f"{get_device_type()} is required for VMM transaction validation")
 
     try:
         from kvcached import vmm_ops
@@ -32,11 +40,12 @@ def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     page_size = 2 * 1024 * 1024
     num_layers = 2
     num_kv_buffers = 2
-    vmm_ops.init_kvcached("cuda:0", page_size, contiguous_layout)
+    device = _device_str()
+    vmm_ops.init_kvcached(device, page_size, contiguous_layout)
     vmm_ops.create_kv_tensors(
         8 * 1024 * 1024,
         2,
-        "cuda:0",
+        device,
         num_layers,
         num_kv_buffers,
         0,
@@ -52,7 +61,7 @@ def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     ids=["contiguous", "unified", "per-layer-kv"],
 )
 @pytest.mark.parametrize("failure_position", [0, 1, 2])
-def test_cuda_map_batch_rolls_back_at_each_operation_position(
+def test_map_batch_rolls_back_at_each_operation_position(
     contiguous_layout, unified_pool, failure_position
 ):
     vmm_ops = _compiled_vmm_ops()

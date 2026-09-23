@@ -63,7 +63,13 @@ def _install_fake_vmm_ops():
     sys.modules["kvcached.vmm_ops"] = fake_module
 
 
-_install_fake_vmm_ops()
+try:
+    import kvcached.vmm_ops  # noqa: F401
+except Exception:  # noqa: BLE001 - any import failure means no GPU build
+    # The fake is process-wide and outlives this module, so install it only when
+    # the real extension is missing: the tests below bring their own stub
+    # allocator and need it purely to make kv_cache_manager importable.
+    _install_fake_vmm_ops()
 
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402

@@ -539,7 +539,23 @@ PageState PageAllocator::get_page_state_unlocked() const {
 
 int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  // Not CHECK_GPU: this runs on every allocation decision, and aborting a
+  // serving process from a routine query is worse than declining to grow.
+  // FTensorAllocator::init_gpu_() already proved the query works at startup, so
+  // a failure here means something changed under us -- report zero available
+  // pages and let the caller's own accounting bound usage.
+  const auto res =
+      gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size);
+  if (!gpu_vmm::is_success(res)) {
+    static std::once_flag warned;
+    std::call_once(warned, [&] {
+      LOGGER(ERROR,
+             "%s mem_get_info failed (%s); reporting no available physical "
+             "pages. The KV pool will not grow.",
+             gpu_vmm::backend_name(), gpu_vmm::error_string(res));
+    });
+    return 0;
+  }
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));

@@ -9,6 +9,7 @@ import functools
 import inspect
 import math
 import types
+from importlib import import_module
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -16,7 +17,13 @@ from kvcached.integration.version_utils import (
     VersionAwarePatch,
     version_range,
 )
-from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
+from kvcached.utils import (
+    MAX_CACHED_TOKENS,
+    get_device_module,
+    get_device_type,
+    get_kvcached_logger,
+    is_gpu_device_str,
+)
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
@@ -28,8 +35,34 @@ logger = get_kvcached_logger()
 
 
 def _is_supported_gpu_device(device: str) -> bool:
-    device_str = str(device).lower()
-    return device_str.startswith("cuda") or device_str.startswith("hip")
+    # Must accept every backend kvcached can build for (cuda/hip/xpu); an
+    # unrecognized prefix makes the patch decline silently and SGLang falls back
+    # to its own non-elastic allocator.
+    return is_gpu_device_str(device)
+
+
+def _free_is_deferred(allocator: Any) -> bool:
+    """Is this free() inside one of SGLang's free groups?
+
+    The representation changed: older allocators carry a bool
+    ``is_not_in_free_group`` next to an always-present ``free_group`` list, newer
+    ones drop the bool and use ``free_group is None`` to mean "free right away".
+    Reading whichever the base class provides keeps the elastic subclass working
+    against both; defaulting to immediate is the safe way to be wrong, since a
+    free that is wrongly deferred is never handed back to kvcached at all.
+    """
+    if hasattr(allocator, "is_not_in_free_group"):
+        return not allocator.is_not_in_free_group
+    return getattr(allocator, "free_group", None) is not None
+
+
+def _reset_free_group(allocator: Any) -> None:
+    """Put the allocator back in the not-deferring state clear() implies."""
+    if hasattr(allocator, "is_not_in_free_group"):
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+    else:
+        allocator.free_group = None
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -84,15 +117,17 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
 
             import torch
 
+            device_module = get_device_module(runner.device)
+
             query_error = None
             try:
                 total_memory = int(
-                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                    device_module.get_device_properties(runner.gpu_id).total_memory
                 )
                 mem_fraction_static = float(runner.mem_fraction_static)
                 logical_budget = math.ceil(total_memory * mem_fraction_static)
                 process_local_reserved = int(
-                    torch.cuda.memory_reserved(runner.gpu_id)
+                    device_module.memory_reserved(runner.gpu_id)
                 )
                 local_available_bytes = logical_budget - process_local_reserved
             except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
@@ -198,7 +233,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticTokenToKVPoolAllocator only supports GPU "
-                            "devices (cuda/hip)"
+                            "devices (cuda/hip/xpu)"
                         )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     logger.info(
@@ -222,7 +257,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def free(self, free_index):
-                    if self.is_not_in_free_group:
+                    if not _free_is_deferred(self):
                         try:
                             indices: list[int] = free_index.cpu().numpy().tolist()
                         except Exception:
@@ -273,7 +308,28 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                 alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
                 alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
             except AttributeError:
-                from sglang.srt.mem_cache.triton_ops import allocator as triton_allocator
+                # The kernels have moved twice: out of the allocator module into
+                # mem_cache.triton_ops, then out of srt entirely into
+                # sglang.kernels. Try the homes newest first and report every
+                # one that was missing, because the alternative is this patch
+                # declining and SGLang silently serving from its own allocator.
+                homes = (
+                    "sglang.kernels.ops.memory.allocator",
+                    "sglang.srt.mem_cache.triton_ops.allocator",
+                )
+                triton_allocator = None
+                errors = []
+                for home in homes:
+                    try:
+                        triton_allocator = import_module(home)
+                        break
+                    except ImportError as import_error:
+                        errors.append(f"{home}: {import_error}")
+                if triton_allocator is None:
+                    raise ImportError(
+                        "cannot locate SGLang's paged-allocator kernels (" +
+                        "; ".join(errors) + ")"
+                    )
 
                 alloc_extend_kernel = triton_allocator.alloc_extend_kernel
                 alloc_decode_kernel = triton_allocator.alloc_decode_kernel
@@ -301,7 +357,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticPagedTokenToKVPoolAllocator only supports GPU "
-                            "devices (cuda/hip)"
+                            "devices (cuda/hip/xpu)"
                         )
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
@@ -425,7 +481,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if free_index.numel() == 0:
                         return
 
-                    if self.is_not_in_free_group:
+                    if not _free_is_deferred(self):
                         page_ids = torch.unique(free_index // self.page_size)
                         try:
                             indices: list[int] = page_ids.cpu().numpy().tolist()
@@ -444,8 +500,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.release_pages = torch.empty(
                         (0,), dtype=torch.int64, device=self.device
                     )
-                    self.is_not_in_free_group = True
-                    self.free_group = []
+                    _reset_free_group(self)
 
                 def merge_and_sort_free(self):
                     pass  # No-op: kvcached manages the free list
@@ -650,7 +705,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(self.device):
                         raise ValueError(
                             "ElasticMHATokenToKVPool only supports GPU devices "
-                            "(cuda/hip)")
+                            "(cuda/hip/xpu)")
                     _kv_mha: Tuple[List[Any], List[Any]] = cast(
                         Tuple[List[Any], List[Any]],
                         kvi.alloc_kv_cache(
@@ -815,7 +870,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
                             "ElasticMLATokenToKVPool only supports GPU devices "
-                            "(cuda/hip)")
+                            "(cuda/hip/xpu)")
                     self.kv_buffer = cast(
                         List[torch.Tensor],
                         kvi.alloc_kv_cache(
@@ -1083,7 +1138,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     if not _is_supported_gpu_device(device):
                         raise ValueError(
-                            "ElasticMambaPool only supports GPU devices (cuda/hip)")
+                            "ElasticMambaPool only supports GPU devices (cuda/hip/xpu)")
 
                     self._group_id = ElasticMambaPool._next_group_id
                     ElasticMambaPool._next_group_id += 1
@@ -1148,7 +1203,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                     temporal_state_shape[2],
                                 ),
                                 dtype=cache_params.dtype.temporal,
-                                device="cuda",
+                                device=get_device_type(),
                             )
                             intermediate_conv_window_cache = [
                                 torch.zeros(
@@ -1160,7 +1215,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                         conv_shape[1],
                                     ),
                                     dtype=cache_params.dtype.conv,
-                                    device="cuda",
+                                    device=get_device_type(),
                                 )
                                 for conv_shape in conv_state_shape
                             ]

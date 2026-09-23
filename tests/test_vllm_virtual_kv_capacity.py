@@ -51,8 +51,19 @@ def patches(monkeypatch):
     monkeypatch.delitem(
         sys.modules, "kvcached.integration.vllm.patches", raising=False
     )
+    # monkeypatch.delitem records nothing when the key is already absent, so the
+    # modules imported below outlive this fixture with the mock torch still in
+    # their globals. Drop whatever the imports created, so a later test importing
+    # the same modules gets them built against the real torch.
+    imported_before = set(sys.modules)
     importlib.import_module("kvcached.integration.vllm.interfaces")
-    return importlib.import_module("kvcached.integration.vllm.patches")
+    patches_module = importlib.import_module("kvcached.integration.vllm.patches")
+    try:
+        yield patches_module
+    finally:
+        for name in set(sys.modules) - imported_before:
+            if name.startswith("kvcached"):
+                sys.modules.pop(name, None)
 
 
 def _worker_config(*, utilization=0.9, explicit_budget=None):
@@ -465,6 +476,9 @@ def test_legacy_determine_available_memory_runs_profile_without_device_delta(
 
     class Worker:
         def __init__(self):
+            # A real vLLM Worker always carries .device; the patch reads it to
+            # pick the accelerator module, so the fake has to as well.
+            self.device = "cuda:0"
             self.cache_config = types.SimpleNamespace(gpu_memory_utilization=0.75)
             self.model_runner = types.SimpleNamespace(
                 model_memory_usage=100, profile_run=profile_run
