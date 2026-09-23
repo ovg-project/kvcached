@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -110,6 +111,9 @@ public:
   void *data() { return mapped_; }
   const void *data() const { return mapped_; }
 
+  const std::string &path() const { return file_path_; }
+  int duplicate_fd() const { return ::fcntl(fd_, F_DUPFD_CLOEXEC, 0); }
+
   // Read MemInfoStruct from mmap buffer
   MemInfoStruct read_mem_info() const {
     MemInfoStruct info;
@@ -172,6 +176,9 @@ public:
 
   ~MemInfoTracker() { cleanup(); }
 
+  MemInfoTracker(const MemInfoTracker &) = delete;
+  MemInfoTracker &operator=(const MemInfoTracker &) = delete;
+
   // Update memory usage info in shared memory
   void update_memory_usage(int64_t used_size, int64_t prealloc_size) {
     RwLockedShm shm(ipc_name_, MemInfoStruct::SHM_SIZE, RwLockedShm::WLOCK);
@@ -214,14 +221,43 @@ private:
              ipc_name_.c_str());
       return;
     }
+    cleanup_path_ = shm.path();
+    // Pin the opened inode, not a second lookup of a replaceable pathname.
+    cleanup_fd_ = shm.duplicate_fd();
+    if (cleanup_fd_ < 0) {
+      LOGGER(WARNING,
+             "MemInfoTracker: cannot retain shm identity for %s: %s; "
+             "native cleanup disabled",
+             ipc_name_.c_str(), std::strerror(errno));
+    }
     MemInfoStruct info(kv_cache_limit, 0, 0);
     shm.write_mem_info(info);
   }
 
-  // Cleanup shared memory
+  // Python shutdown may have unlinked this segment before native destruction.
+  // Check identity so delayed destruction leaves a replacement segment alone.
+  // Like Python's IPCSegmentCleanup, this is not a concurrent-startup lock.
   void cleanup() {
-    std::string path = std::string(SHM_DIR) + "/" + ipc_name_;
-    ::unlink(path.c_str());
+    if (cleanup_fd_ < 0) {
+      return;
+    }
+    struct stat original;
+    struct stat current;
+    if (::fstat(cleanup_fd_, &original) < 0 ||
+        ::stat(cleanup_path_.c_str(), &current) < 0) {
+      if (errno != ENOENT) {
+        LOGGER(WARNING, "MemInfoTracker: cannot verify shm identity for %s: %s",
+               ipc_name_.c_str(), std::strerror(errno));
+      }
+    } else if (original.st_dev == current.st_dev &&
+               original.st_ino == current.st_ino) {
+      if (::unlink(cleanup_path_.c_str()) < 0 && errno != ENOENT) {
+        LOGGER(WARNING, "MemInfoTracker: failed to unlink shm %s: %s",
+               ipc_name_.c_str(), std::strerror(errno));
+      }
+    }
+    ::close(cleanup_fd_);
+    cleanup_fd_ = -1;
   }
 
   // Get default IPC name (consistent with Python version logic)
@@ -241,6 +277,8 @@ private:
 
   std::string ipc_name_;
   int64_t total_mem_size_;
+  std::string cleanup_path_;
+  int cleanup_fd_ = -1;
 };
 
 } // namespace kvcached
