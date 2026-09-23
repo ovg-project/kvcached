@@ -76,13 +76,16 @@ def test_engine_core_records_tp_world_size_before_original_init(
     assert patches.EngineCorePatch().patch_engine_init(engine_mod)
 
     config = types.SimpleNamespace(
-        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=4, pipeline_parallel_size=1
+        )
     )
     engine_mod.EngineCore(config)
 
     init_kvcached.assert_called_once_with(
         tp_rank=0,
         world_size=4,
+        pp_rank=0,
         is_worker=False,
         async_sched=True,
     )
@@ -110,7 +113,9 @@ def test_engine_core_propagates_kvcached_initialization_failure(
     assert patches.EngineCorePatch().patch_engine_init(engine_mod)
 
     config = types.SimpleNamespace(
-        parallel_config=types.SimpleNamespace(tensor_parallel_size=4)
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=4, pipeline_parallel_size=1
+        )
     )
     with pytest.raises(RuntimeError, match="failed to record TP state"):
         engine_mod.EngineCore(config)
@@ -221,3 +226,47 @@ def test_coordinator_propagates_uninitialized_world_size(
 
     with pytest.raises(RuntimeError, match="not initialized"):
         kvcoord_mod.KVCacheCoordinator()
+
+
+@pytest.mark.parametrize(
+    "version,enabled,use_v2,reject",
+    [
+        ("0.24.0", True, None, False),
+        ("0.29.0", True, True, False),
+        ("0.29.0", True, False, True),
+        ("0.30.0", True, None, True),
+        ("0.29.0", False, None, False),
+        ("0.30.0", False, None, False),
+    ],
+)
+def test_engine_core_rejects_partial_integration_before_initialization(
+    monkeypatch, vllm_modules, version, enabled, use_v2, reject
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = version
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        tensor_parallel_size=1, pipeline_parallel_size=1,
+    ))
+    # Older/disabled routes must not read a property they do not need.
+    if use_v2 is not None:
+        config.use_v2_model_runner = use_v2
+    if reject:
+        with pytest.raises(patches.KVCachedConfigError):
+            EngineCore(config)
+        initialize.assert_not_called()
+        original_init.assert_not_called()
+    else:
+        EngineCore(config)
+        assert initialize.call_count == int(enabled)
+        original_init.assert_called_once()

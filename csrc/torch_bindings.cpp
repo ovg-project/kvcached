@@ -1,65 +1,120 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+// pybind11 ships inside torch and trips the TORCH_STABLE_ONLY guard that the
+// target macro implies, though it is header-only and torch-ABI-independent.
+// See pytorch/pytorch#174372, meta-pytorch/torchcodec#1260.
+// TODO: drop torch>=2.13, workaround is no longer needed.
+#pragma push_macro("TORCH_STABLE_ONLY")
+#pragma push_macro("TORCH_TARGET_VERSION")
+#undef TORCH_STABLE_ONLY
+#undef TORCH_TARGET_VERSION
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <string>
-#include <vector>
+#pragma pop_macro("TORCH_TARGET_VERSION")
+#pragma pop_macro("TORCH_STABLE_ONLY")
 
-#include <torch/csrc/utils/pybind.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
 #include "page_allocator.hpp"
 #include "torch_utils.hpp"
+#include "transaction_error.hpp"
+
+namespace py = pybind11;
 
 namespace kvcached {
 
-void init_kvcached(const std::string &dev_str, size_t page_size = 0,
-                   bool contiguous_layout = false) {
-  py::gil_scoped_release release;
-  FTensorAllocator::init(dev_str, page_size, contiguous_layout);
+// ---------------------------------------------------------------------------
+// KV tensor ops -- the only bindings that touch the tensor type. Registered via
+// STABLE_TORCH_LIBRARY and reached as torch.ops.kvcached.* (see vmm_ops.py).
+// size_t values cross the boundary as int64_t. The dispatcher runs these
+// GIL-free, so no explicit release is needed (issue #371).
+// ---------------------------------------------------------------------------
+
+void init_kvcached(std::string dev_str, int64_t page_size,
+                   bool contiguous_layout) {
+  FTensorAllocator::init(dev_str, static_cast<size_t>(page_size),
+                         contiguous_layout);
 }
 
-void shutdown_kvcached() {
-  py::gil_scoped_release release;
-  FTensorAllocator::shutdown();
-}
+void shutdown_kvcached() { FTensorAllocator::shutdown(); }
 
-std::vector<at::Tensor>
-create_kv_tensors(size_t size, size_t dtype_size, const std::string &dev_str,
-                  int64_t num_layers, int64_t num_kv_buffers = 2,
-                  int64_t group_id = 0, bool unified_pool = false) {
-  py::gil_scoped_release release;
+std::vector<torch::stable::Tensor>
+create_kv_tensors(int64_t size, int64_t dtype_size, std::string dev_str,
+                  int64_t num_layers, int64_t num_kv_buffers, int64_t group_id,
+                  bool unified_pool) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
-  auto dtype_ = torch_dtype_from_size(dtype_size);
-  return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers,
-                                      num_kv_buffers, unified_pool);
+  auto dtype_ = torch_dtype_from_size(static_cast<size_t>(dtype_size));
+  return allocator->create_kv_tensors(static_cast<size_t>(size), dtype_,
+                                      dev_str, num_layers, num_kv_buffers,
+                                      unified_pool);
 }
 
-bool kv_tensors_created(int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool kv_tensors_created(int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->kv_tensors_created();
 }
 
-bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
-                       int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool map_to_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors(offsets);
 }
 
-bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
-                           int64_t group_id = 0) {
-  py::gil_scoped_release release;
+bool unmap_from_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->unmap_from_kv_tensors(offsets);
 }
 
-// PageAllocator bindings
+// ---------------------------------------------------------------------------
+// Transactional map/unmap ops. These are torch-free (int[]/str/bool args, and a
+// (bool, int[]) return), so they stay on pybind11 rather than the stable
+// dispatcher, and release the GIL while they block in the allocator.
+// ---------------------------------------------------------------------------
+
+std::pair<bool, std::vector<offset_t>>
+map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
+                              int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->map_to_kv_tensors_with_result(offsets);
+}
+
+bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                   const std::string &transaction_id,
+                                   int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->prepare_unmap_from_kv_tensors(offsets, transaction_id);
+}
+
+bool commit_unmap_from_kv_tensors(const std::string &transaction_id,
+                                  int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->commit_unmap_from_kv_tensors(transaction_id);
+}
+
+bool abort_unmap_from_kv_tensors(const std::string &transaction_id,
+                                 int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->abort_unmap_from_kv_tensors(transaction_id);
+}
+
+// ---------------------------------------------------------------------------
+// PageAllocator / InternalPage bindings -- no torch types, so they stay on
+// pybind11.
+// ---------------------------------------------------------------------------
 std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t num_layers, int64_t mem_size_per_layer, int64_t page_size,
     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
@@ -165,7 +220,23 @@ page_allocator_get_resize_target(std::shared_ptr<PageAllocator> allocator) {
 
 void page_allocator_set_broadcast_map_callback(
     std::shared_ptr<PageAllocator> allocator, BroadcastMapCallback callback) {
-  allocator->set_broadcast_map_callback(callback);
+  allocator->set_broadcast_map_callback(
+      [callback = std::move(callback)](int64_t size,
+                                       const std::vector<offset_t> &offsets) {
+        try {
+          callback(size, offsets);
+        } catch (py::error_already_set &error) {
+          py::gil_scoped_acquire acquire;
+          auto errors = py::module_::import("kvcached.errors");
+          if (error.matches(errors.attr("StateConsistencyError").ptr())) {
+            throw StateConsistencyError(error.what());
+          }
+          if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
+            throw MapQuarantinedError(error.what());
+          }
+          throw;
+        }
+      });
 }
 
 void page_allocator_set_broadcast_unmap_callback(
@@ -193,23 +264,60 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 
 } // namespace kvcached
 
+// Register the KV tensor ops in the "kvcached" dispatcher namespace.
+STABLE_TORCH_LIBRARY(kvcached, m) {
+  m.def("init_kvcached(str dev_str, int page_size=0, bool "
+        "contiguous_layout=True) -> ()");
+  m.def("shutdown_kvcached() -> ()");
+  m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
+        "num_layers, int num_kv_buffers=2, int group_id=0, bool "
+        "unified_pool=False) -> Tensor[]");
+  m.def("kv_tensors_created(int group_id=0) -> bool");
+  m.def("map_to_kv_tensors(int[] offsets, int group_id=0) -> bool");
+  m.def("unmap_from_kv_tensors(int[] offsets, int group_id=0) -> bool");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
+  m.impl("init_kvcached", TORCH_BOX(&kvcached::init_kvcached));
+  m.impl("shutdown_kvcached", TORCH_BOX(&kvcached::shutdown_kvcached));
+  m.impl("create_kv_tensors", TORCH_BOX(&kvcached::create_kv_tensors));
+  m.impl("kv_tensors_created", TORCH_BOX(&kvcached::kv_tensors_created));
+  m.impl("map_to_kv_tensors", TORCH_BOX(&kvcached::map_to_kv_tensors));
+  m.impl("unmap_from_kv_tensors", TORCH_BOX(&kvcached::unmap_from_kv_tensors));
+}
+
+// Hosts the torch-free PageAllocator / InternalPage classes; the KV tensor ops
+// are registered via the dispatcher above.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
+  auto errors = py::module_::import("kvcached.errors");
+  py::register_exception<kvcached::MapQuarantinedError>(
+      m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
+  py::register_exception<kvcached::StateConsistencyError>(
+      m, "StateConsistencyError", errors.attr("StateConsistencyError").ptr());
+  py::register_exception<kvcached::QuarantinedResizeError>(
+      m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
 
-  m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
-        py::arg("dev_str"), py::arg("page_size") = 0,
-        py::arg("contiguous_layout") = true);
-  m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
-  m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
-        py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
-        py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
-        py::arg("group_id") = 0, py::arg("unified_pool") = false);
-  m.def("kv_tensors_created", &kvcached::kv_tensors_created,
-        "kv_tensors_created", py::arg("group_id") = 0);
-  m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
-        py::arg("offsets"), py::arg("group_id") = 0);
-  m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
-        "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+  // Torch-free transactional ops (the six core ops are on the stable
+  // dispatcher; see STABLE_TORCH_LIBRARY above).
+  m.def("map_to_kv_tensors_with_result",
+        &kvcached::map_to_kv_tensors_with_result,
+        "map_to_kv_tensors_with_result", py::arg("offsets"),
+        py::arg("group_id") = 0);
+  m.def("prepare_unmap_from_kv_tensors",
+        &kvcached::prepare_unmap_from_kv_tensors,
+        "prepare_unmap_from_kv_tensors", py::arg("offsets"),
+        py::arg("transaction_id"), py::arg("group_id") = 0);
+  m.def("commit_unmap_from_kv_tensors", &kvcached::commit_unmap_from_kv_tensors,
+        "commit_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("abort_unmap_from_kv_tensors", &kvcached::abort_unmap_from_kv_tensors,
+        "abort_unmap_from_kv_tensors", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+
+  // The stable-ABI target the extension was built for.
+  m.attr("TORCH_TARGET_VERSION") =
+      py::int_(static_cast<uint64_t>(TORCH_TARGET_VERSION));
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
@@ -221,6 +329,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enable_page_prealloc") = true,
            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
            py::arg("ipc_name") = "")
+      .def("get_transaction_state",
+           [](const kvcached::PageAllocator &allocator) {
+             auto state = [&allocator] {
+               py::gil_scoped_release release;
+               return allocator.get_transaction_state();
+             }();
+             py::dict result;
+             result["state"] =
+                 state.failed
+                     ? "FAILED"
+                     : (state.quarantined_page_ids.empty() ? "HEALTHY"
+                                                           : "DEGRADED");
+             result["quarantined_page_ids"] = state.quarantined_page_ids;
+             result["quarantined_pages"] = state.quarantined_page_ids.size();
+             result["retained_bytes_upper_bound"] =
+                 state.retained_bytes_upper_bound;
+             result["last_error"] = state.last_error;
+             return result;
+           })
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
       // The bindings below can block inside the allocator (alloc_page waits on
