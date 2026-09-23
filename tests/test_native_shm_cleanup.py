@@ -5,6 +5,8 @@
 
 import gc
 import os
+import shutil
+import subprocess
 import threading
 import uuid
 from pathlib import Path
@@ -17,6 +19,30 @@ if not torch.cuda.is_available():
 
 from kvcached.utils import IPCSegmentCleanup  # noqa: E402
 from kvcached.vmm_ops import PageAllocator  # noqa: E402
+
+
+def test_native_identity_syscall_failures_and_retries(tmp_path):
+    from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
+
+    compiler = shutil.which("c++")
+    toolkit = ROCM_HOME if torch.version.hip else CUDA_HOME
+    if compiler is None or toolkit is None:
+        pytest.skip("native fault injection requires the extension build toolchain")
+    assert compiler is not None and toolkit is not None
+    root = Path(__file__).resolve().parents[1]
+    binary = tmp_path / "shm-cleanup-faults"
+    subprocess.run([
+        compiler, "-std=c++17", "-pthread",
+        "-DKVCACHED_USE_ROCM" if torch.version.hip else "-DKVCACHED_USE_CUDA",
+        "-I" + str(Path(toolkit) / "include"), "-I" + str(root / "csrc/inc"),
+        str(root / "tests/native/shm_cleanup_faults.cpp"),
+        "-Wl,--wrap=fcntl", "-Wl,--wrap=stat", "-Wl,--wrap=fstat", "-Wl,--wrap=unlink",
+        "-o", str(binary),
+    ], check=True, timeout=60)
+    result = subprocess.run([str(binary), str(tmp_path / "segment")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "6 native syscall faults" in result.stdout
 
 
 def _allocator(ipc_name, group_id, pages=8):
@@ -59,6 +85,40 @@ def test_native_cleanup_removes_original_segment(segment):
     assert path.exists()
     del allocator
     gc.collect()
+    assert not path.exists()
+
+
+def test_explicit_native_release_is_idempotent(segment):
+    path, ipc_name, group_id = segment
+    allocator = _allocator(ipc_name, group_id)
+    allocator.stop_prealloc_thread()
+    assert allocator.release_shared_segment() is True
+    assert not path.exists()
+    replacement = _allocator(ipc_name, group_id)
+    identity = path.stat()
+    assert allocator.release_shared_segment() is True
+    del allocator
+    gc.collect()
+    assert os.path.samestat(path.stat(), identity)
+    del replacement
+    gc.collect()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("explicit_release", [False, True])
+def test_native_shared_name_waits_for_last_pool(tmp_path, explicit_release):
+    path = tmp_path / "shared-pools"
+    first = _allocator(str(path), 0)
+    second = _allocator(str(path), 1)
+    identity = path.stat()
+    if explicit_release:
+        first.stop_prealloc_thread()
+        assert first.release_shared_segment() is True
+    del first
+    gc.collect()
+    assert os.path.samestat(path.stat(), identity)
+    second.stop_prealloc_thread()
+    assert second.release_shared_segment() is True
     assert not path.exists()
 
 

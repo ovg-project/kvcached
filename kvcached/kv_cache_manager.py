@@ -12,7 +12,6 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
-import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -26,8 +25,6 @@ from kvcached.utils import (
     PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
-    SHM_DIR,
-    IPCSegmentCleanup,
     KVCachedConfigError,
     get_kvcached_logger,
 )
@@ -161,7 +158,6 @@ class KVCacheManager:
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = threading.Event()
         self._prealloc_stopped = False
-        self._ipc_cleanup: Optional[IPCSegmentCleanup] = None
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -841,11 +837,9 @@ class KVCacheManager:
     def shutdown(self) -> bool:
         """Release the state this pool keeps outside the process.
 
-        The C++ MemInfoTracker unlinks its /dev/shm segment only from its
-        destructor, which never runs when the owning process leaves through
-        os._exit (vLLM's forked EngineCore after SIGTERM, issue #477). Stop
-        the prealloc thread, then unlink the segment here, exactly what the
-        destructor would do. Return False if a step needs another attempt.
+        os._exit bypasses the native destructor (issue #477). Stop background
+        users, then ask the native owner to release its original segment.
+        Return False if a step needs another attempt.
         Successful steps are not repeated and a replacement file is preserved.
         """
         with self._shutdown_lock:
@@ -858,13 +852,6 @@ class KVCacheManager:
                 logger.warning("KV cache initialization is still stopping; "
                                "keeping its shared segment for a shutdown retry")
                 return False
-            if self._ipc_cleanup is None:
-                try:
-                    self._ipc_cleanup = IPCSegmentCleanup(
-                        os.path.join(SHM_DIR, self.ipc_name))
-                except OSError as e:
-                    logger.warning("Failed to capture shutdown segment: %s", e)
-                    return False
             if not self._prealloc_stopped:
                 try:
                     self.page_allocator.stop_prealloc_thread()
@@ -872,7 +859,9 @@ class KVCacheManager:
                     logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
                     return False
                 self._prealloc_stopped = True
-            self._shut_down = self._ipc_cleanup.unlink()
+            # The native owner captured the inode when it created the segment.
+            # A shutdown-time pathname lookup could claim a replacement engine.
+            self._shut_down = self.page_allocator.release_shared_segment()
             return self._shut_down
 
     @synchronized

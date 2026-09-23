@@ -4,6 +4,7 @@
 import importlib.util
 import logging
 import os
+import threading
 from typing import BinaryIO, Optional
 
 
@@ -192,6 +193,7 @@ class IPCSegmentCleanup:
 
     def __init__(self, segment: str) -> None:
         self.segment = segment
+        self._lock = threading.Lock()
         self._file: Optional[BinaryIO]
         try:
             self._file = open(segment, "rb")
@@ -200,6 +202,10 @@ class IPCSegmentCleanup:
 
     def unlink(self) -> bool:
         """Return True when done; keep the original file open on failure."""
+        with self._lock:
+            return self._unlink()
+
+    def _unlink(self) -> bool:
         if self._file is None:
             return True
         try:
@@ -218,6 +224,13 @@ class IPCSegmentCleanup:
         self._file.close()
         self._file = None
         return True
+
+    def close(self) -> None:
+        """Discard an unconfirmed identity without deleting anything."""
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")

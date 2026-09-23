@@ -10,9 +10,11 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import threading
 import time
 import types
 from collections import OrderedDict
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -1139,6 +1141,36 @@ def _client_engine_processes(client: Any) -> tuple[Any, ...]:
                  if getattr(engine, "proc_handle", None) is not None)
 
 
+def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
+    """Pin a ready, live engine's segment once, never from a late shutdown."""
+    if not enable_kvcached() or hasattr(owner, "_kvcached_ipc_cleanup"):
+        return
+    owner._kvcached_ipc_cleanup = None
+    owner._kvcached_engine_processes = processes
+    cleanup = None
+    try:
+        if not processes:
+            return
+        if any(process.exitcode is not None for process in processes):
+            logger.warning("Cannot retain segment identity after an owned engine exited; "
+                           "keeping the segment for manual cleanup")
+            return
+        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
+
+        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
+        if any(process.exitcode is not None for process in processes):
+            cleanup.close()
+            logger.warning("Engine exited during segment identity capture; "
+                           "keeping the segment for manual cleanup")
+            return
+        owner._kvcached_ipc_cleanup = cleanup
+    except Exception as e:
+        if cleanup is not None:
+            cleanup.close()
+        logger.warning("Cannot retain the ready engine's segment identity: %s; "
+                       "parent cleanup is disabled for this engine", e)
+
+
 def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> None:
     """A shutdown return (or exception) does not prove the engines stopped."""
     try:
@@ -1159,6 +1191,21 @@ def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> 
         cleanup.unlink()
     except Exception as e:
         logger.warning("Failed to remove the KV cache limit segment: %s", e)
+
+
+def _stop_headless_segment_watch(manager: Any) -> None:
+    watch = getattr(manager, "_kvcached_segment_watch", None)
+    if watch is None:
+        return
+    try:
+        stop, thread = watch
+        stop.set()
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            logger.warning("Segment identity capture is still stopping; "
+                           "parent cleanup may require a retry")
+    except Exception as e:
+        logger.warning("Failed to stop segment identity capture: %s", e)
 
 
 class MPClientPatch(VersionAwarePatch, BasePatch):
@@ -1193,9 +1240,10 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         Only the engine-owning client does this (_client_engine_processes):
         under --api-server-count > 1 a frontend's shutdown stops no
         engines, and unlinking from it would remove the live segment.
-        Ownership is checked before the original shutdown runs, and a
-        cleanup captured once is kept for unlink retries even if the
-        original shutdown clears the ownership markers. The supervisor
+        Identity is captured after engine startup, not during shutdown, and
+        retained for retries even if teardown clears the ownership markers.
+        An owning client reuses its supervisor's retained identity when present.
+        The supervisor
         that owns those engines has no MPClient at all;
         CoreEngineProcManagerPatch covers that boundary.
         """
@@ -1213,23 +1261,20 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
             self.logger.debug("MPClient.shutdown already patched")
             return True
 
-        logger = self.logger  # Capture logger in closure
+        original_init = MPClient.__init__
+
+        @wraps(original_init)
+        def _patched_client_init(self, *args: Any, **kwargs: Any):
+            original_init(self, *args, **kwargs)
+            manager = getattr(getattr(self, "resources", None), "engine_manager", None)
+            if manager is not None and hasattr(manager, "_kvcached_ipc_cleanup"):
+                self._kvcached_ipc_cleanup = manager._kvcached_ipc_cleanup
+                self._kvcached_engine_processes = manager._kvcached_engine_processes
+            else:
+                _capture_engine_segment(self, _client_engine_processes(self))
 
         def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
-            cleanup = None
-            if enable_kvcached():
-                try:
-                    from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
-
-                    cleanup = getattr(self, "_kvcached_ipc_cleanup", None)
-                    if cleanup is None:
-                        processes = _client_engine_processes(self)
-                        if processes:
-                            cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
-                            self._kvcached_engine_processes = processes
-                            self._kvcached_ipc_cleanup = cleanup
-                except Exception as e:
-                    logger.warning("Failed to capture client shutdown segment: %s", e)
+            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
@@ -1237,6 +1282,7 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
                     _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
 
         self._mark_as_patched(_patched_client_shutdown, "shutdown")
+        MPClient.__init__ = _patched_client_init  # type: ignore[assignment]
         MPClient.shutdown = _patched_client_shutdown  # type: ignore[assignment]
         return True
 
@@ -1273,9 +1319,13 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
         removing the segment: shutdown can fail, swallow an error, or return
         early when another caller has already detached its finalizer.
 
-        The segment is captured before the original shutdown runs, the
-        same replacement-file protection as the client patch, and the
-        captured cleanup is kept on the manager for unlink retries.
+        The constructor only starts children, so capture is bound to the
+        completed READY handshake in wait_for_engine_startup. If startup never
+        completes, the parent has no verified identity and must not claim a
+        later file at shutdown. Native cleanup still handles graceful failures.
+        Headless has no parent READY handshake. Its startup observer can retain
+        a newly created segment while the owned children are live, provided the
+        name was absent before they started. It never claims a pre-existing name.
         """
         CoreEngineProcManager = self._get_target_class(utils_mod)
         if CoreEngineProcManager is None:
@@ -1293,20 +1343,90 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger  # Capture logger in closure
 
-        def _patched_manager_shutdown(self, *args: Any, **kwargs: Any):
-            cleanup = None
+        original_init = CoreEngineProcManager.__init__
+        init_signature = inspect.signature(original_init)
+
+        @wraps(original_init)
+        def _patched_manager_init(self, *args: Any, **kwargs: Any):
+            self._kvcached_headless_segment = None
             if enable_kvcached():
                 try:
-                    from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
+                    arguments = init_signature.bind(self, *args, **kwargs).arguments
+                    if arguments.get("local_client") is False:
+                        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
 
-                    cleanup = getattr(self, "_kvcached_ipc_cleanup", None)
-                    if cleanup is None:
-                        processes = tuple(getattr(self, "processes", ()) or ())
-                        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
-                        self._kvcached_engine_processes = processes
-                        self._kvcached_ipc_cleanup = cleanup
+                        path = os.path.join(SHM_DIR, DEFAULT_IPC_NAME)
+                        # Headless has no parent READY handshake. Only observe
+                        # a fresh name, never adopt a pre-existing generation.
+                        if not os.path.exists(path):
+                            self._kvcached_headless_segment = path
+                        else:
+                            logger.warning("Headless segment already exists; parent "
+                                           "cleanup cannot establish ownership of %s", path)
                 except Exception as e:
-                    logger.warning("Failed to capture engine manager shutdown segment: %s", e)
+                    logger.warning("Cannot prepare headless segment capture: %s", e)
+            original_init(self, *args, **kwargs)
+
+        original_monitor = getattr(CoreEngineProcManager, "monitor_engine_liveness", None)
+        if original_monitor is not None:
+            @wraps(original_monitor)
+            def _patched_monitor(self, *args: Any, **kwargs: Any):
+                path = getattr(self, "_kvcached_headless_segment", None)
+                if path is not None and not hasattr(self, "_kvcached_ipc_cleanup"):
+                    stop = threading.Event()
+                    processes = tuple(self.processes)
+
+                    def capture_when_created():
+                        try:
+                            while not stop.is_set():
+                                if not processes or any(p.exitcode is not None for p in processes):
+                                    return
+                                if os.path.exists(path):
+                                    _capture_engine_segment(self, processes)
+                                    return
+                                stop.wait(0.05)
+                        except Exception as e:
+                            logger.warning("Headless segment identity capture failed: %s", e)
+
+                    thread = threading.Thread(target=capture_when_created,
+                                              name="kvcached-segment-owner", daemon=True)
+                    try:
+                        thread.start()
+                        self._kvcached_segment_watch = (stop, thread)
+                    except Exception as e:
+                        logger.warning("Cannot start headless segment identity capture: %s", e)
+                try:
+                    return original_monitor(self, *args, **kwargs)
+                finally:
+                    _stop_headless_segment_watch(self)
+
+            CoreEngineProcManager.monitor_engine_liveness = _patched_monitor
+
+        original_wait = getattr(utils_mod, "wait_for_engine_startup", None)
+        if original_wait is not None:
+            signature = inspect.signature(original_wait)
+
+            @wraps(original_wait)
+            def _patched_wait(*args: Any, **kwargs: Any):
+                result = original_wait(*args, **kwargs)
+                try:
+                    arguments = signature.bind(*args, **kwargs).arguments
+                    manager = arguments.get("proc_manager")
+                    if manager is None:
+                        manager = getattr(arguments.get("launch"), "engine_manager", None)
+                    if isinstance(manager, CoreEngineProcManager):
+                        _capture_engine_segment(manager, tuple(manager.processes))
+                except Exception as e:
+                    logger.warning("Cannot retain startup segment identity: %s", e)
+                return result
+
+            setattr(utils_mod, "wait_for_engine_startup", _patched_wait)
+        else:
+            logger.warning("wait_for_engine_startup not found; READY-based segment capture disabled")
+
+        def _patched_manager_shutdown(self, *args: Any, **kwargs: Any):
+            _stop_headless_segment_watch(self)
+            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
@@ -1314,6 +1434,7 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                     _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
 
         self._mark_as_patched(_patched_manager_shutdown, "shutdown")
+        CoreEngineProcManager.__init__ = _patched_manager_init
         CoreEngineProcManager.shutdown = _patched_manager_shutdown  # type: ignore[assignment]
         return True
 
