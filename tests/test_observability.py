@@ -13,6 +13,8 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
 from kvcached.observability import (  # noqa: E402
+    KVCachePoolSnapshot,
+    RuntimeSnapshot,
     build_kv_cache_pool_snapshot,
     build_runtime_snapshot,
     get_capabilities,
@@ -22,6 +24,7 @@ from kvcached.pool_registry import (  # noqa: E402
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
+from kvcached.utils import PAGE_SIZE  # noqa: E402
 
 
 class FakePageAllocator:
@@ -79,6 +82,9 @@ class FakeManager:
     def get_mapped_memory_size(self, unit="bytes"):
         assert unit == "bytes"
         return 6 * self.num_layers * self.page_size * self.num_kv_buffers
+
+    def shutdown(self):
+        pass
 
 
 def test_capabilities_are_json_serializable():
@@ -269,7 +275,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
@@ -354,7 +362,9 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
@@ -406,3 +416,181 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+
+
+def test_capabilities_report_planned_surfaces_as_unsupported():
+    """Unlanded surfaces are reported False, never omitted.
+
+    A consumer writes the detection once against a build that predates the
+    surface; the same code starts returning True when it ships.
+    """
+    features = get_capabilities()["features"]
+
+    assert features["operation_counters"] is False
+    assert features["runtime_reservation_reporting"] is False
+    # Landed in #414: the one write path on the surface.
+    assert features["instance_memory_limit"] is True
+
+
+def test_capabilities_expose_backend_and_integration_records():
+    capabilities = get_capabilities()
+
+    backends = capabilities["backends"]
+    assert backends["kv_pooling"] is True
+    assert backends["elastic_capacity"] is True
+    # kvcached accounts for non-KV memory but never manages it.
+    assert backends["non_kv_memory_management"] is False
+    # Named "default_" because it is this process's import-time env value, not
+    # a live engine's page size; consumers needing the runtime value read
+    # KVCachePoolSnapshot.page_size_bytes.
+    assert backends["default_page_size_bytes"] == PAGE_SIZE
+    assert "page_size_bytes" not in backends
+
+    integrations = capabilities["integrations"]
+    assert set(integrations) == {"vllm", "sglang"}
+    for entry in integrations.values():
+        assert "MHA" in entry["attention_types"]
+        assert "MLA" in entry["attention_types"]
+        assert entry["kv_layouts"] == ["NHD"]
+
+    # A real, code-level distinction between the two shims: only the vLLM
+    # integration accepts HYBRID_LINEAR through alloc_kv_cache(); SGLang
+    # allocates mamba state through a separate entry point.
+    assert "HYBRID_LINEAR" in integrations["vllm"]["attention_types"]
+    assert "HYBRID_LINEAR" not in integrations["sglang"]["attention_types"]
+
+
+def test_hybrid_linear_pooling_mode_distinguishes_the_two_shapes():
+    """The bool alone cannot answer "is that state in the pool snapshot?".
+
+    Both shims report hybrid_linear_state_pooling True, but vLLM carves the
+    state out of the KV pool (so it shows up in KVCachePoolSnapshot) while
+    SGLang allocates it separately (so it does not). Consumers branch on the
+    mode rather than parsing comments.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for entry in integrations.values():
+        assert entry["hybrid_linear_state_pooling"] is True
+
+    assert integrations["vllm"]["hybrid_linear_state_pooling_mode"] == "unified_pool"
+    assert (
+        integrations["sglang"]["hybrid_linear_state_pooling_mode"]
+        == "separate_allocation"
+    )
+
+
+def test_operation_counter_names_stay_coupled_to_their_feature_flag():
+    """One flip when #410 lands, not two that can drift apart."""
+    capabilities = get_capabilities()
+
+    flag = capabilities["features"]["operation_counters"]
+    names = capabilities["operation_counter_names"]
+
+    assert bool(names) == flag
+
+
+def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
+    """Field lists must match the dataclasses consumers actually receive."""
+    capabilities = get_capabilities()
+
+    pool_fields = capabilities["pool_snapshot_fields"]
+    runtime_fields = capabilities["runtime_snapshot_fields"]
+
+    assert pool_fields == list(KVCachePoolSnapshot.__dataclass_fields__.keys())
+    assert runtime_fields == list(RuntimeSnapshot.__dataclass_fields__.keys())
+
+    snapshot = build_kv_cache_pool_snapshot(FakeManager(), integration="vllm")
+    assert set(snapshot.to_dict()) == set(pool_fields)
+
+    # No counters until operation observability lands.
+    assert capabilities["operation_counter_names"] == []
+
+
+def test_capabilities_record_is_json_serializable_and_stable():
+    """The whole record must survive an exporter round-trip unchanged."""
+    capabilities = get_capabilities()
+
+    assert json.loads(json.dumps(capabilities)) == capabilities
+    assert get_capabilities() == capabilities
+
+
+def test_capabilities_need_no_private_field_access():
+    """A consumer reads the record through public keys only.
+
+    Guards the contract in #375: integrations must not have to reach into
+    allocator internals or applied-patch attributes to learn what is supported.
+    """
+    capabilities = get_capabilities()
+
+    def assert_public(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert not key.startswith("_"), f"private key exposed: {key}"
+                assert_public(value)
+        elif isinstance(node, list):
+            for item in node:
+                assert_public(item)
+
+    assert_public(capabilities)
+    for field_name in capabilities["pool_snapshot_fields"]:
+        assert not field_name.startswith("_")
+
+
+
+def _load_shim_under_stubs(engine, monkeypatch):
+    """Import an engine shim with its heavy deps stubbed out.
+
+    Same approach as the factory tests above, reduced to what module import
+    needs: the shim's module-level constants, not a working engine.
+    """
+    torch = types.ModuleType("torch")
+    setattr(torch, "dtype", object)
+    setattr(torch, "Tensor", object)
+    setattr(torch, "cuda", types.SimpleNamespace(current_device=lambda: 0))
+
+    manager_module = types.ModuleType("kvcached.kv_cache_manager")
+    setattr(manager_module, "KVCacheManager", object)
+
+    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
+    setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
+
+    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
+    setattr(vmm_ops_module, "create_kv_tensors", lambda *args, **kwargs: [])
+    setattr(vmm_ops_module, "init_kvcached", lambda *args, **kwargs: None)
+    setattr(vmm_ops_module, "shutdown_kvcached", lambda: None)
+
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "kvcached.kv_cache_manager", manager_module)
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+
+    module_path = (
+        Path(__file__).parents[1] / "kvcached" / "integration" / engine / "interfaces.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"_test_{engine}_interfaces_constants", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    return shim
+
+
+def test_reported_attention_types_match_the_shim_guards(monkeypatch):
+    """The record must not drift from the guards it claims to describe.
+
+    Both are derived from the shim's SUPPORTED_* constants, so adding an
+    attention type to a shim without updating the other side fails here
+    instead of silently shipping a stale record.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for engine in ("vllm", "sglang"):
+        shim = _load_shim_under_stubs(engine, monkeypatch)
+        assert integrations[engine]["attention_types"] == list(
+            shim.SUPPORTED_ATTENTION_TYPES
+        )
+        assert integrations[engine]["kv_layouts"] == list(shim.SUPPORTED_KV_LAYOUTS)

@@ -204,6 +204,28 @@ def test_sglang_shutdown_clears_runtime_owned_reservations(monkeypatch):
 
     assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 4096
 
-    interfaces.shutdown_kvcached()
+    assert interfaces.shutdown_kvcached() is True
 
     assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 0
+
+
+def test_sglang_shutdown_preserves_reservations_until_listener_stops(monkeypatch):
+    interfaces, _patches, _torch_mock = _load_sglang_modules(monkeypatch)
+    monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
+    stop = mock.Mock(side_effect=[False, True])
+    shutdown = mock.Mock()
+    monkeypatch.setattr(interfaces, "stop_worker_listener_threads", stop)
+    monkeypatch.setattr(interfaces, "_shutdown_kvcached_impl", shutdown)
+    interfaces.register_runtime_owned_reservation(
+        "cuda:0", "dsv4.swa_kv_pool", 4096
+    )
+
+    assert interfaces.shutdown_kvcached() is False
+    assert interfaces._kvcached_initialized
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 4096
+    shutdown.assert_not_called()
+
+    assert interfaces.shutdown_kvcached() is True
+    assert not interfaces._kvcached_initialized
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 0
+    shutdown.assert_called_once_with()
