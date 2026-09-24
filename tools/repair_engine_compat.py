@@ -125,15 +125,31 @@ def run_command(
             except subprocess.TimeoutExpired:
                 timed_out = True
                 if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=output,
-                        stderr=subprocess.STDOUT,
-                        check=False,
-                    )
+                    try:
+                        terminated = subprocess.run(
+                            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                            check=False,
+                            timeout=5,
+                        ).returncode == 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        terminated = False
+                    if not terminated:
+                        # Stop the direct child, but do not claim its descendants
+                        # are gone or let the repair controller start another attempt.
+                        try:
+                            process.kill()
+                            process.wait(timeout=5)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                        raise GateError("Could not confirm timed-out process tree termination")
                 else:
                     os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    raise GateError("Timed-out process did not exit after termination") from exc
                 code = 124
         except OSError as exc:
             output.write(f"Could not run command: {exc}\n")
@@ -253,7 +269,7 @@ def repair(args: argparse.Namespace, result: Dict[str, Any]) -> None:
             record = run_command(
                 expand(check["argv"], paths),
                 checks,
-                output / f"{label}-{check['name']}.log",
+                output / f"{label}-{group}-check-{check['name']}.log",
                 args.check_timeout,
                 env,
             )
