@@ -846,7 +846,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self, num_blocks: int
             ) -> list[KVCacheBlock]:
                 if num_blocks > self.get_num_free_blocks():
-                    raise ValueError(
+                    # Scheduler preflight is a snapshot, not a reservation:
+                    # a colocated engine may have consumed physical capacity.
+                    raise KVCachePoolExhausted(
                         f"Cannot get {num_blocks} free blocks from the pool")
 
                 block_ids: Optional[list[int]] = None
@@ -2702,9 +2704,8 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
     so the exception terminates the engine and every in-flight request with
     it.
 
-    Translate only `KVCachePoolExhausted`. A plain ValueError from the pool
-    (asking for more blocks than were just reported free) is a contract
-    violation and must stay fail-loud.
+    Translate only `KVCachePoolExhausted`. Unrelated ValueError exceptions
+    remain fatal rather than being downgraded to scheduling misses.
     """
 
     library = "vllm"
