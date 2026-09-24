@@ -3,6 +3,7 @@
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -36,7 +37,7 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
-_runtime_owned_reservations: Dict[str, Dict[str, int]] = {}
+_runtime_owned_reservations: Dict[str, Dict[str, WeakKeyDictionary[Any, int]]] = {}
 
 # Single source of truth for what this shim accepts. The capability record
 # in kvcached.observability reports these, so the guards below and the
@@ -101,13 +102,16 @@ def register_runtime_owned_reservation(
     device: str,
     pool_name: str,
     num_bytes: int,
+    *,
+    owner: Any,
 ) -> None:
     """Record memory owned by the serving runtime outside kvcached.
 
     Some runtimes allocate model-specific side pools that kvcached should not
     manage directly.  The reservation is still consumed by the same GPU, so
     kvcached's later virtual KV budgets must subtract it to avoid overbooking
-    colocated pools.
+    colocated pools. Entries belong to a live pool instance; recording a draft
+    pool must not replace the target pool's allocation of the same category.
     """
     device = normalize_gpu_device(device)
     if num_bytes < 0:
@@ -115,21 +119,31 @@ def register_runtime_owned_reservation(
     if num_bytes == 0:
         device_reservations = _runtime_owned_reservations.get(device)
         if device_reservations is not None:
-            device_reservations.pop(pool_name, None)
+            owners = device_reservations.get(pool_name)
+            if owners is not None:
+                owners.pop(owner, None)
+                if not owners:
+                    device_reservations.pop(pool_name, None)
             if not device_reservations:
                 _runtime_owned_reservations.pop(device, None)
         return
-    _runtime_owned_reservations.setdefault(device, {})[pool_name] = int(num_bytes)
+    owners = _runtime_owned_reservations.setdefault(device, {}).setdefault(
+        pool_name, WeakKeyDictionary()
+    )
+    owners[owner] = int(num_bytes)
 
 
 def get_runtime_owned_reservation_bytes(device: str) -> int:
-    device = normalize_gpu_device(device)
-    return sum(_runtime_owned_reservations.get(device, {}).values())
+    return sum(get_runtime_owned_reservation_breakdown(device).values())
 
 
 def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
     device = normalize_gpu_device(device)
-    return dict(_runtime_owned_reservations.get(device, {}))
+    return {
+        name: sum(owners.values())
+        for name, owners in _runtime_owned_reservations.get(device, {}).items()
+        if owners
+    }
 
 
 def observability_snapshot():

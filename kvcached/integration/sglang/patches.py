@@ -1605,10 +1605,14 @@ def _collect_dsv4_runtime_reservations(kvcache: Any) -> dict[str, int]:
         "dsv4.c128_kv_pool": _pool_buffer_nbytes(
             getattr(kvcache, "c128_kv_pool", None), "kv_buffer"
         ),
-        "dsv4.c4_indexer_kv_pool": _pool_buffer_nbytes(
+        "dsv4.c4_indexer_kv_pool": sum(_pool_buffer_nbytes(
             getattr(kvcache, "c4_indexer_kv_pool", None),
+            buffer_name,
+        ) for buffer_name in (
             "index_k_with_scale_buffer",
-        ),
+            "index_k_payload_buffer",
+            "index_k_scale_buffer",
+        )),
         "dsv4.compress_state_pools": _sum_dsv4_state_pool_nbytes(
             getattr(kvcache, "compress_state_pools", None)
         ),
@@ -1633,6 +1637,7 @@ def _register_dsv4_runtime_reservations(
             str(device),
             pool_name,
             num_bytes,
+            owner=kvcache,
         )
 
     setattr(kvcache, "_kvcached_runtime_reservation_breakdown", dict(breakdown))

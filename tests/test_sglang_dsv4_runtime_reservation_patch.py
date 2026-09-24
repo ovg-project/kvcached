@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import importlib
 import sys
 import types
@@ -19,6 +20,44 @@ class FakeTensor:
 
     def __getitem__(self, _key):
         return self
+
+
+class PoolOwner:
+    device = "cuda:0"
+    c4_indexer_kv_pool: types.SimpleNamespace
+
+
+def test_live_pools_keep_independent_reservations(monkeypatch):
+    interfaces, patches, _ = _load_sglang_modules(monkeypatch)
+    target, draft = PoolOwner(), PoolOwner()
+    patches._register_dsv4_runtime_reservations(target, {"dsv4.swa_kv_pool": 4096})
+    patches._register_dsv4_runtime_reservations(draft, {"dsv4.swa_kv_pool": 2048})
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 6144
+    patches._register_dsv4_runtime_reservations(draft, {"dsv4.swa_kv_pool": 0})
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 4096
+    patches._register_dsv4_runtime_reservations(draft, {"dsv4.swa_kv_pool": 1024})
+    assert interfaces.get_runtime_owned_reservation_breakdown("cuda:0") == {
+        "dsv4.swa_kv_pool": 5120
+    }
+    del target
+    gc.collect()
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 1024
+    del draft
+    gc.collect()
+    assert interfaces.get_runtime_owned_reservation_breakdown("cuda:0") == {}
+
+
+def test_split_indexer_buffers_are_counted_unless_managed(monkeypatch):
+    _, patches, _ = _load_sglang_modules(monkeypatch)
+    pool = PoolOwner()
+    pool.c4_indexer_kv_pool = types.SimpleNamespace(
+        index_k_with_scale_buffer=None,
+        index_k_payload_buffer=[FakeTensor(23)],
+        index_k_scale_buffer=[FakeTensor(7)],
+    )
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.c4_indexer_kv_pool"] == 30
+    pool.c4_indexer_kv_pool._kvcached_managed = True
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.c4_indexer_kv_pool"] == 0
 
 
 def _load_sglang_modules(monkeypatch):
@@ -86,7 +125,7 @@ def test_dsv4_runtime_reservation_patch_registers_per_pool_breakdown(monkeypatch
     monkeypatch.setattr(
         interfaces,
         "register_runtime_owned_reservation",
-        lambda device, pool, num_bytes: registrations.append((device, pool, num_bytes)),
+        lambda device, pool, num_bytes, *, owner: registrations.append((device, pool, num_bytes)),
     )
 
     patch = patches.DeepSeekV4RuntimeReservationPatch()
@@ -133,7 +172,7 @@ def test_dsv4_runtime_reservation_patch_is_automatic(monkeypatch):
     monkeypatch.setattr(
         interfaces,
         "register_runtime_owned_reservation",
-        lambda device, pool, num_bytes: registrations.append(
+        lambda device, pool, num_bytes, *, owner: registrations.append(
             (device, pool, num_bytes)
         ),
     )
@@ -148,15 +187,15 @@ def test_dsv4_runtime_reservation_patch_is_automatic(monkeypatch):
 
 def test_zero_reservation_clears_stale_pool_value(monkeypatch):
     interfaces, _patches, _torch_mock = _load_sglang_modules(monkeypatch)
-
+    owner = PoolOwner()
     interfaces.register_runtime_owned_reservation(
-        "cuda:0", "dsv4.swa_kv_pool", 4096
+        "cuda:0", "dsv4.swa_kv_pool", 4096, owner=owner
     )
     interfaces.register_runtime_owned_reservation(
-        "cuda:0", "dsv4.c4_kv_pool", 8192
+        "cuda:0", "dsv4.c4_kv_pool", 8192, owner=owner
     )
     interfaces.register_runtime_owned_reservation(
-        "cuda:0", "dsv4.swa_kv_pool", 0
+        "cuda:0", "dsv4.swa_kv_pool", 0, owner=owner
     )
 
     assert interfaces.get_runtime_owned_reservation_breakdown("cuda:0") == {
@@ -181,7 +220,10 @@ def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch)
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "_contiguous_layout", False)
     interfaces._runtime_owned_reservations.clear()
-    interfaces.register_runtime_owned_reservation("cuda:0", "dsv4.swa_kv_pool", 3 * page_size)
+    owner = PoolOwner()
+    interfaces.register_runtime_owned_reservation(
+        "cuda:0", "dsv4.swa_kv_pool", 3 * page_size, owner=owner
+    )
 
     interfaces.alloc_kv_cache(
         kvcache_shape=(1, 1, 1),
@@ -198,8 +240,9 @@ def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch)
 
 def test_sglang_shutdown_clears_runtime_owned_reservations(monkeypatch):
     interfaces, _patches, _torch_mock = _load_sglang_modules(monkeypatch)
+    owner = PoolOwner()
     interfaces.register_runtime_owned_reservation(
-        "cuda:0", "dsv4.swa_kv_pool", 4096
+        "cuda:0", "dsv4.swa_kv_pool", 4096, owner=owner
     )
 
     assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 4096
@@ -216,8 +259,9 @@ def test_sglang_shutdown_preserves_reservations_until_listener_stops(monkeypatch
     shutdown = mock.Mock()
     monkeypatch.setattr(interfaces, "stop_worker_listener_threads", stop)
     monkeypatch.setattr(interfaces, "_shutdown_kvcached_impl", shutdown)
+    owner = PoolOwner()
     interfaces.register_runtime_owned_reservation(
-        "cuda:0", "dsv4.swa_kv_pool", 4096
+        "cuda:0", "dsv4.swa_kv_pool", 4096, owner=owner
     )
 
     assert interfaces.shutdown_kvcached() is False
