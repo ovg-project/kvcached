@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Discover stable vLLM releases and maintain one comment per release in a tracker issue.
+"""Discover stable vLLM releases and track each release/profile independently.
 
 Public API: discover/claim/finish return JSON plans; GhAPI is injectable as api=.
 Discovery orders numeric versions; the CLI atomically saves updated plans.
@@ -149,6 +149,13 @@ def _same_identity(left, right):
     _require(_identity(left) == _identity(right), "Release identity changed: moved or replaced")
 
 
+def _profile(data):
+    # Historical ledger entries ran only the original profiling task.
+    name = data.get("profile", "vllm")
+    _require(_matches(r"[a-z][a-z0-9-]{0,47}", name), "Invalid ledger profile")
+    return name
+
+
 def resolve_tag(api, tag: str) -> str:
     """Resolve an exact stable upstream tag, peeling annotated tags to a commit SHA."""
     _require(_matches("v" + VERSION, tag), "Expected a stable vX.Y.Z tag")
@@ -212,11 +219,12 @@ def _comment(comment, repository, issue_url):
         raise GateError("Malformed ledger JSON") from None
     _identity(record)
     _require(
-        set(record) <= {*IDENTITY, "status", "run_url", "pr_url"}
+        set(record) <= {*IDENTITY, "status", "run_url", "pr_url", "profile"}
         and isinstance(record.get("status"), str)
         and record["status"] in TERMINAL | {"running"},
         "Invalid ledger fields or status",
     )
+    _profile(record)
     _url(record.get("run_url"), repository, "run")
     if "pr_url" in record:
         _url(record["pr_url"], repository, "pr")
@@ -253,14 +261,15 @@ def _ledger(api, repository, tracker_issue):
         if entry is None:
             continue
         record = entry["record"]
+        profile = _profile(record)
         _require(
-            record["release_id"] not in ids
-            and record["tag"] not in tags
+            (record["release_id"], profile) not in ids
+            and (record["tag"], profile) not in tags
             and entry["id"] not in comments,
             "Duplicate ledger release or comment",
         )
-        ids.add(record["release_id"])
-        tags.add(record["tag"])
+        ids.add((record["release_id"], profile))
+        tags.add((record["tag"], profile))
         comments.add(entry["id"])
         entries.append(entry)
     return entries
@@ -273,6 +282,9 @@ def _entry(entries, release):
         if entry["record"]["release_id"] == release["release_id"]
         or entry["record"]["tag"] == release["tag"]
     ]
+    for entry in matches:
+        _same_identity(entry["record"], release)
+    matches = [entry for entry in matches if _profile(entry["record"]) == _profile(release)]
     _require(len(matches) <= 1, "Conflicting release identities in ledger")
     if matches:
         _same_identity(matches[0]["record"], release)
@@ -280,11 +292,13 @@ def _entry(entries, release):
     return None
 
 
-def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, retry=False, api=None):
+def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, retry=False,
+             profile="vllm", api=None):
     """Return pending/idle; only explicit tag+retry may select an existing ledger entry."""
     _require(_matches(VERSION, first_version), "Expected first-version X.Y.Z")
     _require(type(retry) is bool and (not retry or tag is not None), "Retry needs an explicit tag")
     _require(tag is None or _matches("v" + VERSION, tag), "Expected a stable vX.Y.Z tag")
+    _profile({"profile": profile})
     floor = tuple(map(int, first_version.split(".")))
     api = api if api is not None else GhAPI()
     entries = _ledger(api, repository, tracker_issue)
@@ -310,6 +324,7 @@ def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, ret
         if tag is not None and candidate["tag_name"] != tag:
             continue
         release = _release(api, candidate)
+        release["profile"] = profile
         entry = _entry(entries, release)
         if entry and not retry:
             continue
@@ -411,6 +426,7 @@ def claim(repository: str, tracker_issue: int, plan: dict, run_url: str, *, api=
         )
         _require(entry["record"]["run_url"] != run_url, "Retry requires a new run URL")
     record = {key: plan[key] for key in IDENTITY}
+    record["profile"] = _profile(plan)
     record.update(status="running", run_url=run_url)
     return _write(api, repository, tracker_issue, plan, entry, login, record)
 
@@ -430,6 +446,7 @@ def finish(repository, tracker_issue, plan, status, run_url, *, pr_url=None, api
         "Finish requires this run's existing claim",
     )
     record = {key: plan[key] for key in IDENTITY}
+    record["profile"] = _profile(plan)
     record.update(status=status, run_url=run_url)
     if pr_url is not None:
         record["pr_url"] = pr_url
@@ -469,6 +486,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if name == "discover":
             command.add_argument("--first-version", default="0.28.0")
             command.add_argument("--tag")
+            command.add_argument("--profile", default="vllm")
             command.add_argument("--retry", action="store_true")
             command.add_argument("--output", type=Path, required=True)
         else:

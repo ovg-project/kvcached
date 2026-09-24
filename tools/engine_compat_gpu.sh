@@ -37,8 +37,9 @@ docker run --name "$NAME" --gpus all --shm-size=2g --cap-drop=ALL \
     python3 -m pip install --no-build-isolation --no-deps -e . || exit 1
     python3 /controller/tools/engine_compat_profile.py "$ENGINE_COMPAT_PROFILE" \
       --source /candidate --output /results/contracts --gpu
-    python3 /checks/engine_compat_gpu_probe.py --source /candidate --output /results/probe \
-      --version "$EXPECTED_VLLM" --candidate-sha "$CANDIDATE_SHA" --mode compare
+    python3 /controller/tools/engine_compat_profile.py "$ENGINE_COMPAT_PROFILE" \
+      --source /candidate --output /results/probe --probe \
+      --tag "v$EXPECTED_VLLM" --candidate-sha "$CANDIDATE_SHA"
   '
 CODE=$?
 set -e

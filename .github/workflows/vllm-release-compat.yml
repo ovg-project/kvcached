@@ -5,11 +5,16 @@ on:
     - cron: '19 * * * *'
   workflow_dispatch:
     inputs:
+      mode:
+        description: Validate existing code, or permit a bounded repair
+        type: choice
+        default: validate
+        options: [validate, repair]
       profile:
         description: Reviewed repair and acceptance scope
         type: choice
         default: vllm
-        options: [vllm, native-layout, allocation]
+        options: [vllm, native-layout, allocation, attention-v1-028, attention-v2-028]
       tag:
         description: Stable upstream release to replay (empty selects the oldest unseen release)
         type: string
@@ -42,6 +47,7 @@ jobs:
       base_branch: ${{ steps.baseline.outputs.base_branch }}
       base_sha: ${{ steps.baseline.outputs.base_sha }}
       profile: ${{ steps.profile.outputs.profile }}
+      mode: ${{ steps.profile.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,9 +56,11 @@ jobs:
         id: profile
         env:
           PROFILE: ${{ inputs.profile || 'vllm' }}
+          MODE: ${{ inputs.mode || 'repair' }}
         run: |
-          python tools/engine_compat_profile.py "$PROFILE"
+          python tools/engine_compat_profile.py "$PROFILE" --mode "$MODE"
           printf 'profile=%s\n' "$PROFILE" >> "$GITHUB_OUTPUT"
+          printf 'mode=%s\n' "$MODE" >> "$GITHUB_OUTPUT"
       - name: Pin the PR target default branch
         id: baseline
         env:
@@ -119,7 +127,7 @@ jobs:
           if [[ "$RETRY" == true ]]; then args+=(--retry); fi
           python tools/engine_release_discovery.py discover --repository "$GITHUB_REPOSITORY" \
             --tracker-issue "$TRACKER" --first-version "$FIRST_VERSION" \
-            --output plan.json "${args[@]}"
+            --profile "$PROFILE" --output plan.json "${args[@]}"
           python - <<'PY'
           import json
           import os
@@ -155,12 +163,13 @@ jobs:
       base_sha: ${{ needs.discover.outputs.base_sha }}
       attempt: first
       profile: ${{ needs.discover.outputs.profile }}
+      mode: ${{ needs.discover.outputs.mode }}
     secrets:
       CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
 
   second:
     needs: [discover, first]
-    if: needs.first.outputs.status == 'failed' && github.run_attempt == 1
+    if: needs.discover.outputs.mode == 'repair' && needs.first.outputs.status == 'failed' && github.run_attempt == 1
     uses: ./.github/workflows/engine-compat-attempt.yml
     with:
       tag: ${{ needs.discover.outputs.tag }}
@@ -170,6 +179,7 @@ jobs:
       base_sha: ${{ needs.discover.outputs.base_sha }}
       attempt: second
       profile: ${{ needs.discover.outputs.profile }}
+      mode: ${{ needs.discover.outputs.mode }}
       prior: ${{ needs.first.outputs.artifact }}
     secrets:
       CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
@@ -206,7 +216,7 @@ jobs:
 
   publish:
     needs: [discover, select, verify]
-    if: always() && needs.verify.result == 'success' && github.run_attempt == 1
+    if: always() && needs.discover.outputs.mode == 'repair' && needs.verify.result == 'success' && github.run_attempt == 1
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -273,14 +283,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TRACKER: ${{ vars.VLLM_RELEASE_TRACKER_ISSUE }}
           PUBLISHED: ${{ needs.publish.result }}
+          MODE: ${{ needs.discover.outputs.mode }}
+          VERIFIED: ${{ needs.verify.result }}
+          PROFILE: ${{ needs.discover.outputs.profile }}
           LAST_GPU_STATUS: ${{ needs.second.outputs.status || needs.first.outputs.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
           status=blocked
           if [[ "$LAST_GPU_STATUS" == failed ]]; then status=failed; fi
           if [[ "$PUBLISHED" == success ]]; then status=passed; fi
+          if [[ "$MODE" == validate && "$LAST_GPU_STATUS" == passed && "$VERIFIED" == success ]]; then status=passed; fi
           python tools/engine_release_discovery.py finish --repository "$GITHUB_REPOSITORY" \
             --tracker-issue "$TRACKER" --plan handoff/plan.json --status "$status" \
             --run-url "$RUN_URL"
-          printf 'Compatibility result: **%s**\n' "$status" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Compatibility task %s (%s): **%s**. This is not whole-release acceptance.\n' "$PROFILE" "$MODE" "$status" >> "$GITHUB_STEP_SUMMARY"
           test "$status" = passed

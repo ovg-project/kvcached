@@ -50,7 +50,7 @@ def test_profile_and_trusted_test_changes_invalidate_evidence(tmp_path, monkeypa
     profile = profiles.load_profile("vllm")
     for name in ("vllm.json", "vllm-allow.json"):
         (policy / name).write_bytes((profiles.PROFILES / name).read_bytes())
-    for test in profile["cpu_tests"]:
+    for test in profile["cpu_tests"] + ["tools/engine_compat_gpu_probe.py"]:
         target = root / test
         target.parent.mkdir(exist_ok=True)
         target.write_bytes((ROOT / test).read_bytes())
@@ -58,6 +58,9 @@ def test_profile_and_trusted_test_changes_invalidate_evidence(tmp_path, monkeypa
     monkeypatch.setattr(profiles, "PROFILES", policy)
     before = profiles.load_profile("vllm")["policy_digest"]
     (root / profile["cpu_tests"][0]).write_text("def test_changed(): pass\n")
+    assert profiles.load_profile("vllm")["policy_digest"] != before
+    before = profiles.load_profile("vllm")["policy_digest"]
+    (root / "tools/engine_compat_gpu_probe.py").write_text("# different probe\n")
     assert profiles.load_profile("vllm")["policy_digest"] != before
 
 
@@ -87,9 +90,53 @@ def test_required_checks_record_counts_and_never_pass_skips(tmp_path, monkeypatc
 
 def test_gpu_profile_is_checked_inside_the_isolated_container():
     shell = (ROOT / "tools/engine_compat_gpu.sh").read_text()
-    assert shell.index("engine_compat_profile.py") < shell.index("engine_compat_gpu_probe.py")
+    assert shell.index("--gpu") < shell.index("--probe")
     assert '"$ENGINE_COMPAT_PROFILE"' in shell
     assert "/controller:ro" in shell
+
+
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_028_attention_matrix_is_validation_only(runner):
+    profile = profiles.load_profile(f"attention-{runner}-028")
+    assert profile["runner"] == runner
+    assert profile["layouts"] == ["non-contiguous", "contiguous"]
+    profiles.validate_release(profile, "v0.28.0")
+    profiles.validate_mode(profile, "validate")
+    with pytest.raises(ValueError, match="validation-only"):
+        profiles.validate_mode(profile, "repair")
+    with pytest.raises(ValueError, match="no trusted contracts"):
+        profiles.validate_release(profile, "v0.29.0")
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "wrong-runner", "wrong-sha", "failed", "blocked"])
+def test_probe_matrix_requires_every_cell_and_matching_identity(tmp_path, monkeypatch, fault):
+    profile = profiles.load_profile("attention-v1-028")
+    calls = []
+
+    def execute(command, **kwargs):
+        from types import SimpleNamespace
+        destination = Path(command[command.index("--output") + 1])
+        calls.append(destination.name)
+        destination.mkdir(parents=True)
+        value = dict(status="passed", comparison="passed", candidate_sha="a" * 40,
+                     expected_vllm_version="0.28.0", requested_runner="v1", layout=destination.name)
+        code = 0
+        if destination.name == "contiguous":
+            if fault == "missing":
+                return SimpleNamespace(returncode=0)
+            if fault == "wrong-runner":
+                value["requested_runner"] = "v2"
+            if fault == "wrong-sha":
+                value["candidate_sha"] = "b" * 40
+            if fault in ("failed", "blocked"):
+                code = 1 if fault == "failed" else 2
+        (destination / "result.json").write_text(json.dumps(value))
+        return SimpleNamespace(returncode=code)
+
+    monkeypatch.setattr(profiles.subprocess, "run", execute)
+    status = profiles.run_probe_matrix(profile, tmp_path, tmp_path / "matrix", "0.28.0", "a" * 40)
+    assert status == (0 if fault is None else 1 if fault == "failed" else 2)
+    assert calls == profile["layouts"]
 
 
 @pytest.mark.parametrize("candidate_state,status", [("valid", 0), ("missing", 2), ("broken", 2)])

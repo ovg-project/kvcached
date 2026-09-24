@@ -25,8 +25,29 @@ def args(tmp_path):
     source.mkdir()
     (source / "candidate.py").write_text("value = 1\n", encoding="utf-8")
     return SimpleNamespace(
-        source=source, output=tmp_path / "output", version="0.28.0", sha=SHA, timeout=1, model=None
+        source=source, output=tmp_path / "output", version="0.28.0", sha=SHA, timeout=1, model=None,
+        runner="auto", layout="contiguous",
     )
+
+
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_runner_selection_is_verified_from_the_loaded_class(runner):
+    module = "vllm.v1.worker.gpu_model_runner" if runner == "v1" else "vllm.v1.worker.gpu.model_runner"
+    model_runner = type("GPUModelRunner", (), {"__module__": module})()
+    value = SimpleNamespace(model_runner=model_runner)
+    for name in ("worker", "driver_worker", "model_executor", "engine_core", "engine_core", "llm_engine"):
+        value = SimpleNamespace(**{name: value})
+    assert probe.runner_identity(value, runner)["runner"] == runner
+    with pytest.raises(AssertionError, match="Expected"):
+        probe.runner_identity(value, "v2" if runner == "v1" else "v1")
+
+
+@pytest.mark.parametrize("runner,flag", [("v1", "0"), ("v2", "1")])
+def test_probe_pins_both_runner_and_elastic_layout(args, runner, flag):
+    args.runner, args.layout = runner, "non-contiguous"
+    env = probe.environment(args, "patched")
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == flag
+    assert env["KVCACHED_CONTIGUOUS_LAYOUT"] == "false"
 
 
 def cli(monkeypatch, args, *extra):

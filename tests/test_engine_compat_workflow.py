@@ -272,6 +272,7 @@ def case(tmp_path, monkeypatch):
         image="",
         gpu_command=None,
         profile="vllm",
+        mode="repair",
     )
 
 
@@ -287,6 +288,11 @@ def test_gpu_failure_classification_and_owned_cleanup(case, monkeypatch, code, s
         stage.write_json(case.output / "runtime/contracts/checks.json", dict(
             profile=stage.identity(profile), exit_code=0, trusted=True,
             checks=[dict(test=name) for name in profile["gpu_tests"]],
+        ))
+        stage.write_json(case.output / "runtime/probe/matrix.json", dict(
+            profile=stage.identity(profile), candidate_head="a" * 40, version="0.28.0",
+            cases=[dict(layout=layout, runner=profile["runner"], exit_code=0)
+                   for layout in profile["layouts"]], exit_code=0,
         ))
         return {"exit_code": code}
 
@@ -360,6 +366,35 @@ def test_cpu_check_reports_are_outside_protected_inputs(case, monkeypatch):
     assert len(commands) == 2
 
 
+@pytest.mark.parametrize("code,status", [(0, "candidate"), (1, "failed"), (2, "blocked")])
+def test_validation_only_never_invokes_agent_or_changes_candidate(case, monkeypatch, code, status):
+    case.mode = "validate"
+    case.prior = None
+    payload = dict(candidate_head=case.base, digest="b" * 64, files={})
+    monkeypatch.setattr(stage, "pack", lambda *args: payload)
+    checks = mock.Mock(return_value=code)
+    monkeypatch.setattr(stage, "run_checks", checks)
+    execute = mock.Mock(side_effect=AssertionError("Must not invoke Codex"))
+    monkeypatch.setattr(stage, "run_command", execute)
+    stage.cpu(case)
+    assert json.loads((case.output / "stage.json").read_text())["status"] == status
+    execute.assert_not_called()
+    assert checks.call_args.kwargs["trusted"] is True
+    assert (case.output / "candidate.json").exists() == (code == 0)
+
+
+def test_validation_only_rejects_source_mutation(case, monkeypatch):
+    case.mode = "validate"
+    case.prior = None
+    before = dict(candidate_head=case.base, digest="b" * 64, files={})
+    after = dict(before, files={"kvcached/integration/vllm/patches.py": "changed"})
+    monkeypatch.setattr(stage, "pack", mock.Mock(side_effect=[before, after]))
+    monkeypatch.setattr(stage, "run_checks", lambda *a, **k: 0)
+    with pytest.raises(ValueError, match="changed"):
+        stage.cpu(case)
+    assert not (case.output / "candidate.json").exists()
+
+
 def test_unqualified_release_stops_before_spending_a_repair_attempt(case, monkeypatch):
     case.profile = "native-layout"
     case.tag = "v0.30.0"
@@ -380,6 +415,29 @@ def test_profile_is_forwarded_to_every_candidate_stage():
     steps = jobs["publish"]["steps"]
     publish = next(step for step in steps if "PROFILE" in step.get("env", {}))
     assert '--profile "$PROFILE"' in publish["run"]
+
+
+def test_validation_only_workflow_cannot_retry_or_publish():
+    release = workflow("vllm-release-compat.yml")
+    assert release["on"]["workflow_dispatch"]["inputs"]["mode"]["default"] == "validate"
+    jobs = release["jobs"]
+    assert "mode == 'repair'" in jobs["second"]["if"]
+    assert "mode == 'repair'" in jobs["publish"]["if"]
+    for name in ("first", "second"):
+        assert jobs[name]["with"]["mode"] == "${{ needs.discover.outputs.mode }}"
+    attempt = workflow("engine-compat-attempt.yml")
+    assert attempt["on"]["workflow_call"]["secrets"]["CODEX_API_KEY"]["required"] == "false"
+    install = next(step for step in attempt["jobs"]["repair"]["steps"]
+                   if "npm install" in step.get("run", ""))
+    assert install["if"] == "inputs.mode == 'repair'"
+
+
+def test_validation_receipt_cannot_be_used_for_publication(case):
+    receipt = json.loads((case.prior / "stage.json").read_text())
+    receipt.update(status="passed", mode="validate")
+    stage.write_json(case.prior / "stage.json", receipt)
+    with pytest.raises(ValueError, match="cannot authorize publication"):
+        stage.publish(case)
 
 
 def test_publication_rejects_nonpassing_gpu_stage(case):

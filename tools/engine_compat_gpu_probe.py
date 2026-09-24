@@ -142,6 +142,18 @@ def make_model(path):
     check(not torch.cuda.is_initialized(), "CPU model generation initialized CUDA")
 
 
+def runner_identity(llm, expected):
+    runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+    module = type(runner).__module__
+    actual = {
+        "vllm.v1.worker.gpu_model_runner": "v1",
+        "vllm.v1.worker.gpu.model_runner": "v2",
+    }.get(module)
+    check(actual is not None, f"Unrecognized runner module: {module}")
+    check(expected == "auto" or actual == expected, f"Expected {expected}, loaded {actual}")
+    return dict(runner=actual, module=module)
+
+
 def worker(args, result):
     version(args.version, result)
     try:
@@ -204,6 +216,12 @@ def worker(args, result):
     model = str(args.model or args.output / "model")
     result.update(worker_patch_active=active, llm_options=OPTIONS, model=model)
     llm = vllm.LLM(model=model, tokenizer=model, **OPTIONS)
+    result["loaded_runner"] = runner_identity(llm, args.runner)
+    if patched:
+        from kvcached.integration.vllm import interfaces
+
+        check(interfaces._contiguous_layout == (args.layout == "contiguous"),
+              "Requested elastic storage layout was not activated")
     tokenizer = llm.get_tokenizer()
     prompts = [
         tokenizer.encode(f"word{i} word{i + 1} word{i + 2}", add_special_tokens=False)
@@ -289,7 +307,10 @@ def environment(args, stage):
         KVCACHED_MIN_RESERVED_PAGES="0",
         KVCACHED_MAX_RESERVED_PAGES="0",
         KVCACHED_MAX_CACHED_TOKENS="1024",
+        KVCACHED_CONTIGUOUS_LAYOUT="true" if args.layout == "contiguous" else "false",
     )
+    if args.runner != "auto":
+        env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.runner == "v2" else "0"
     env["CUDA_VISIBLE_DEVICES"] = (
         "" if stage == "prepare" else os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     )
@@ -333,6 +354,10 @@ def run(args, stage):
         stage,
         "--candidate-sha",
         args.sha,
+        "--runner",
+        args.runner,
+        "--layout",
+        args.layout,
     ]
     if args.model:
         command += ["--model", str(args.model)]
@@ -379,6 +404,8 @@ def main():
     for name in ("source", "output", "version"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--model", type=Path)
+    parser.add_argument("--runner", choices=("auto", "v1", "v2"), default="auto")
+    parser.add_argument("--layout", choices=("contiguous", "non-contiguous"), default="contiguous")
     parser.add_argument("--mode", choices=("native", "patched", "compare"), default="compare")
     parser.add_argument(
         "--timeout", type=int, default=600, help="Per-child timeout, 1..3600 seconds"
@@ -401,7 +428,8 @@ def main():
             print("BLOCKED: --output exists; refusing to overwrite evidence", file=sys.stderr)
             return 2
     result = dict(
-        status="failed", expected_vllm_version=args.version, candidate_sha=args.candidate_sha
+        status="failed", expected_vllm_version=args.version, candidate_sha=args.candidate_sha,
+        requested_runner=args.runner, layout=args.layout,
     )
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:

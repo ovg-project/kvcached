@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Any, Dict
 
 from engine_compat_artifact import load_envelope, materialize, pack
-from engine_compat_profile import identity, load_profile, run_checks, validate_release
+from engine_compat_profile import (
+    identity,
+    load_profile,
+    run_checks,
+    validate_mode,
+    validate_release,
+)
 from repair_engine_compat import run_command, tail
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,7 +63,26 @@ def checks(args) -> int:
 def cpu(args) -> None:
     profile = load_profile(args.profile)
     validate_release(profile, args.tag)
+    mode = getattr(args, "mode", "repair")
+    validate_mode(profile, mode)
     allow = profile["allow"]
+    if mode == "validate":
+        if args.prior:
+            raise ValueError("Validation-only mode does not retry a repair candidate")
+        payload = pack(args.source, args.base, args.tag, allow)
+        if payload["files"] or payload["candidate_head"] != args.base:
+            raise ValueError("Validation-only mode requires the exact clean baseline")
+        code = run_checks(profile, args.source, args.output / "contracts", trusted=True)
+        if pack(args.source, args.base, args.tag, allow) != payload:
+            raise ValueError("Candidate changed during validation-only checks")
+        if code == 0:
+            write_json(args.output / "candidate.json", payload)
+        record(args.output, dict(
+            status="candidate" if code == 0 else "failed" if code == 1 else "blocked",
+            candidate_head=payload["candidate_head"], digest=payload["digest"],
+            engine_sha=args.engine_sha, profile=identity(profile), mode=mode,
+        ))
+        return
     prior_report = None
     if args.prior:
         payload = load_envelope(args.prior / "candidate.json")
@@ -129,6 +154,7 @@ def cpu(args) -> None:
             digest=payload["digest"],
             engine_sha=args.engine_sha,
             profile=identity(profile),
+            mode=mode,
         ),
     )
 
@@ -186,6 +212,13 @@ def gpu(args) -> None:
                 or receipt.get("trusted") is not True
                 or [check.get("test") for check in receipt.get("checks", [])] != profile["gpu_tests"]):
             raise ValueError("GPU job did not run this profile's independent contracts")
+        matrix = json.loads((args.output / "runtime/probe/matrix.json").read_text())
+        expected_cases = [dict(layout=layout, runner=profile["runner"], exit_code=0)
+                          for layout in profile["layouts"]]
+        if (matrix.get("profile") != identity(profile) or matrix.get("candidate_head") != head
+                or matrix.get("version") != args.tag[1:] or matrix.get("exit_code") != 0
+                or matrix.get("cases") != expected_cases):
+            raise ValueError("GPU job did not pass the complete runner/layout matrix")
     status = "passed" if code == 0 else "failed" if code == 1 else "blocked"
     value = dict(
         status=status,
@@ -193,6 +226,7 @@ def gpu(args) -> None:
         digest=payload["digest"],
         engine_sha=args.engine_sha,
         profile=identity(profile),
+        mode=previous.get("mode", "repair"),
         exit_code=code,
     )
     if status == "failed":
@@ -209,6 +243,8 @@ def publish(args) -> None:
     validate_release(profile, args.tag)
     payload = load_envelope(args.prior / "candidate.json")
     previous = json.loads((args.prior / "stage.json").read_text())
+    if previous.get("mode", "repair") != "repair" or not profile["repair"]:
+        raise ValueError("Validation-only evidence cannot authorize publication")
     if (
         previous.get("status") != "passed"
         or previous.get("digest") != payload["digest"]
@@ -403,6 +439,7 @@ def main() -> int:
     parser.add_argument("--image", default="")
     parser.add_argument("--probes", action="store_true")
     parser.add_argument("--profile", default="vllm")
+    parser.add_argument("--mode", choices=("validate", "repair"), default="repair")
     parser.add_argument(
         "--gpu-command",
         type=Path,

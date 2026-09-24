@@ -206,6 +206,34 @@ def test_existing_states_are_idle_unless_manual_retry(api, status):
     assert not api.writes
 
 
+def test_passing_one_profile_does_not_qualify_another(api):
+    api.comments = [comment(record(status="passed"))]
+    plan = discover(api, profile="attention-v1-028")
+    assert plan["status"] == "pending"
+    assert plan["profile"] == "attention-v1-028"
+    running = claim(api, plan)
+    completed = finish(api, running)
+    assert completed["profile"] == "attention-v1-028"
+    assert len(api.comments) == 2
+    assert discover(api, profile="attention-v1-028")["status"] == "idle"
+    assert discover(api, profile="attention-v2-028")["status"] == "pending"
+    assert json.loads(api.comments[0]["body"][len(discovery.COMMENT_MARKER):-4]) == record(status="passed")
+
+
+def test_different_profiles_still_detect_replaced_upstream_release(api):
+    api.comments = [comment(record(status="passed", engine_sha="f" * 40))]
+    with pytest.raises(discovery.GateError, match="identity changed"):
+        discover(api, profile="attention-v1-028")
+
+
+def test_profile_tampering_cannot_finish_another_claim(api):
+    plan = claim(api, discover(api, profile="attention-v1-028"))
+    plan["profile"] = "attention-v2-028"
+    with pytest.raises(discovery.GateError):
+        finish(api, plan)
+    assert len(api.writes) == 1
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -368,7 +396,7 @@ def test_claim_and_finish_reuse_single_owned_comment(api):
     assert [call[1] for call in api.writes] == ["POST", "PATCH"]
     assert len(api.comments) == 1
     data = json.loads(api.comments[0]["body"][len(discovery.COMMENT_MARKER) : -4])
-    assert data == record(status="passed", pr_url=PR)
+    assert data == record(status="passed", pr_url=PR, profile="vllm")
     assert discover(api)["status"] == "idle"
 
 

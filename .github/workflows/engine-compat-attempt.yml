@@ -3,6 +3,9 @@ name: Engine compatibility attempt
 on:
   workflow_call:
     inputs:
+      mode:
+        type: string
+        required: true
       profile:
         type: string
         required: true
@@ -29,10 +32,10 @@ on:
         default: ''
     secrets:
       CODEX_API_KEY:
-        required: true
+        required: false
     outputs:
       status:
-        value: ${{ jobs.gpu.outputs.status || 'blocked' }}
+        value: ${{ jobs.gpu.outputs.status || jobs.repair.outputs.status || 'blocked' }}
       artifact:
         value: gpu-${{ inputs.attempt }}
 
@@ -69,11 +72,15 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/setup-node@v4
+        if: inputs.mode == 'repair'
         with:
           node-version: '22'
-      - name: Install the repair toolchain
+      - name: Install CPU checks
         run: |
           python -m pip install 'pytest>=8,<9' packaging numpy
+      - name: Install the repair toolchain
+        if: inputs.mode == 'repair'
+        run: |
           npm install --global @openai/codex
       - uses: actions/download-artifact@v4
         if: inputs.prior != ''
@@ -83,19 +90,20 @@ jobs:
       - name: Prepare bounded repair
         id: repair
         env:
-          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          CODEX_API_KEY: ${{ inputs.mode == 'repair' && secrets.CODEX_API_KEY || '' }}
           RELEASE_TAG: ${{ inputs.tag }}
           ENGINE_SHA: ${{ inputs.engine_sha }}
           BASE_SHA: ${{ inputs.base_sha }}
           PRIOR: ${{ inputs.prior }}
           PROFILE: ${{ inputs.profile }}
+          MODE: ${{ inputs.mode }}
         run: |
           args=()
           if [[ -n "$PRIOR" ]]; then args+=(--prior "$GITHUB_WORKSPACE/prior"); fi
           python controller/tools/engine_compat_stage.py cpu \
             --source "$GITHUB_WORKSPACE/candidate" --engine "$GITHUB_WORKSPACE/engine" \
             --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
-            --output "$GITHUB_WORKSPACE/repair-result" --profile "$PROFILE" "${args[@]}"
+            --output "$GITHUB_WORKSPACE/repair-result" --profile "$PROFILE" --mode "$MODE" "${args[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

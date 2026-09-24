@@ -8,7 +8,7 @@ It does not merge changes or certify every supported model and GPU topology.
 
 1. An hourly poll selects the oldest unseen stable release at or above the
    configured starting version. Manual dispatch can select an exact tag.
-2. The detector pins the upstream commit and claims the release in a tracker
+2. The detector pins the upstream commit and claims the release/profile pair in a tracker
    issue. Successful, failed, interrupted and no-change runs remain recorded.
    The candidate starts at the PR target's pinned default branch, not the branch
    used to dispatch the controller workflow.
@@ -28,6 +28,12 @@ It does not merge changes or certify every supported model and GPU topology.
    after the PR identity, mergeability and remote checks for that SHA are verified.
 
 Each CPU round permits one Codex attempt. There are at most two CPU/GPU rounds.
+Manual dispatch defaults to `mode=validate`: run the independent checks against
+the unchanged baseline, then GPU checks and full CI. This mode neither installs
+nor invokes Codex, does not retry a behavioral failure, and cannot publish a PR.
+Use it to qualify merged adapters without duplicating pending manual work.
+Scheduled runs retain the bounded `repair` mode; enabling schedules is a separate
+operator decision, not a side effect of running validation.
 GitHub's rerun button is deliberately disabled for this workflow: start a new
 manual dispatch with a tag and `retry=true` to obtain a new explicit budget.
 An interrupted claim is retained until that explicit retry; polling does not
@@ -90,13 +96,18 @@ controller revision, not supplied by an issue comment or the repair agent.
 | `vllm` | Worker profiling and warmup | Memory-contract tests, matched single-GPU output and CUDA OOM recovery |
 | `native-layout` | Native 0.29 MRV2 allocator and views | Installed-engine view tests, then the single-GPU probe |
 | `allocation` | 0.29 scheduling-miss translation and block lifetimes | CPU failure/ownership contracts, installed-engine block-pool tests, then the single-GPU probe |
+| `attention-v1-028` | Validation only, no repair | 0.28 worker contracts and native/patched tiny attention outputs; V1, both elastic layouts |
+| `attention-v2-028` | Validation only, no repair | Same narrow attention checks; explicitly selected and verified V2, both elastic layouts |
 
 For example, `--profile native-layout` selects the same scope in local CPU,
 GPU and publication stages. Each stage verifies the profile name and a digest
 of its policy and trusted test contents. Evidence from another task or an older
 policy cannot authorize a retry or publication. Nondefault profiles publish to
-separate task-suffixed branches. To run another profile for an already recorded
-release, use an explicit manual dispatch with `retry=true`.
+separate task-suffixed branches. The tracker keeps separate records per release
+and profile: a profiling pass must not suppress layout or allocation checks.
+Historical records without a profile belong only to `vllm`. Only rerunning the
+same release/profile requires `retry=true`; another profile gets its own claim.
+Changing the candidate baseline still requires an explicit retry of that pair.
 
 The native profiles currently require a 0.29 release. A different release is
 rejected before claiming it or spending a repair attempt; its trusted contracts
@@ -108,7 +119,10 @@ records its command, exit status, test count, failures, errors and skips. Empty
 collection, a skipped contract, or an unavailable engine is `blocked`, not a pass.
 Candidate tests are additional regression checks; they cannot replace the
 controller's tests. An exit-zero GPU command without the matching independent
-contract report is also rejected.
+contract report is also rejected. The runtime verifies the actual loaded runner,
+the activated elastic layout, and complete native/patched output token IDs.
+Every configured layout must produce a matching result in `runtime/probe/matrix.json`.
+A receipt from a different candidate, version, runner or policy cannot pass.
 
 These are single-GPU contract profiles, not full release qualifications.
 There are deliberately no selectable `hybrid`, `tp2` or `pp2` profiles yet: their
@@ -118,6 +132,28 @@ result does not qualify Qwen/Mamba, cross-layer Gemma, multimodal execution or
 distributed unmap. Add a task-specific failing regression before asking the
 agent to repair a newly discovered contract; these profiles do not infer tests
 or acceptance requirements from a prompt.
+
+### First 0.28 validation
+
+After the shared profiling, packed storage and runner adapters have landed,
+dispatch `tag=v0.28.0`, `mode=validate`, first with `attention-v1-028` and then
+with `attention-v2-028`. Each runs both contiguous and non-contiguous storage.
+For an isolated pre-merge check, the local `cpu --mode validate` stage accepts
+an explicitly pinned integration commit as `--base`; it must be clean and is
+never rewritten or published. The hosted workflow always pins the target default
+branch and does not silently compose unmerged PRs.
+
+Passing these profiles is only the attention smoke-test portion of #490/#509.
+The following release gates are still separate, not implicitly green:
+
+- Qwen V1 hybrid/Mamba, partial-prefix state copying, eviction and cancellation.
+- Real image inputs and any configured multimodal GPU reservation backend.
+- Ordered asynchronous physical release with the lifetime fix included.
+- TP=2 and PP=2 failure/recovery on two physical GPUs.
+- Matched full-model correctness and performance against native vLLM.
+
+Do not start a 0.29 repair by interpreting a 0.28 attention pass as completion
+of those gates. Record the accepted model/runner/backend/topology explicitly.
 
 ## CPU and GPU separation
 
@@ -134,6 +170,9 @@ It receives `ENGINE_COMPAT_SOURCE`, `ENGINE_COMPAT_OUTPUT` and
 `ENGINE_COMPAT_VERSION`, `ENGINE_COMPAT_PROFILE` and `ENGINE_COMPAT_POLICY_DIGEST`.
 Run the selected controller checks on the remote runtime and return their
 `checks.json` to `runtime/contracts/checks.json` beneath the output directory.
+Also run the controller's `engine_compat_profile.py PROFILE --probe --source ...
+--output ... --tag vX.Y.Z --candidate-sha SHA` and return its complete probe
+directory under `runtime/probe/`. A generic tiny-model result alone is insufficient.
 Return 0 for success, 1 for a behavioral failure, and 2
 or another nonzero code for an infrastructure failure. The command must use a
 bounded remote timeout and clean up its own processes. It is deliberately not
