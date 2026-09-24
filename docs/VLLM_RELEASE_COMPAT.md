@@ -98,10 +98,12 @@ controller revision, not supplied by an issue comment or the repair agent.
 | `allocation` | 0.29 scheduling-miss translation and block lifetimes | CPU failure/ownership contracts, installed-engine block-pool tests, then the single-GPU probe |
 | `attention-v1-028` | Validation only, no repair | 0.28 worker contracts and native/patched tiny attention outputs; V1, both elastic layouts |
 | `attention-v2-028` | Validation only, no repair | Same narrow attention checks; explicitly selected and verified V2, both elastic layouts |
+| `hybrid-v1-028` | Validation only, no repair | 0.28 V1 tiny dense hybrid, partial-prefix state copying and two real CoW allocation misses; sync and async |
+| `hybrid-v2-029` | Validation only, no repair | The same hybrid acceptance with the 0.29 MRV2 runner |
 
 For example, `--profile native-layout` selects the same scope in local CPU,
 GPU and publication stages. Each stage verifies the profile name and a digest
-of its policy and trusted test contents. Evidence from another task or an older
+of its policy, trusted tests, probe helpers and model fixture. Evidence from another task or an older
 policy cannot authorize a retry or publication. Nondefault profiles publish to
 separate task-suffixed branches. The tracker keeps separate records per release
 and profile: a profiling pass must not suppress layout or allocation checks.
@@ -125,10 +127,10 @@ Every configured layout must produce a matching result in `runtime/probe/matrix.
 A receipt from a different candidate, version, runner or policy cannot pass.
 
 These are single-GPU contract profiles, not full release qualifications.
-There are deliberately no selectable `hybrid`, `tp2` or `pp2` profiles yet: their
-model fixtures, independent fault assertions and hardware selection must be
-reviewed first. Unknown profiles stop before repair. In particular, a tiny Llama
-result does not qualify Qwen/Mamba, cross-layer Gemma, multimodal execution or
+There are no selectable `tp2` or `pp2` profiles yet: their independent fault
+assertions and hardware selection must be reviewed first. Unknown profiles stop
+before repair. In particular, a tiny Llama result does not qualify Qwen/Mamba,
+and a tiny hybrid result does not qualify full models, cross-layer Gemma, multimodal execution or
 distributed unmap. Add a task-specific failing regression before asking the
 agent to repair a newly discovered contract; these profiles do not infer tests
 or acceptance requirements from a prompt.
@@ -146,7 +148,7 @@ branch and does not silently compose unmerged PRs.
 Passing these profiles is only the attention smoke-test portion of #490/#509.
 The following release gates are still separate, not implicitly green:
 
-- Qwen V1 hybrid/Mamba, partial-prefix state copying, eviction and cancellation.
+- Full-model Qwen hybrid/Mamba, eviction and cancellation beyond the tiny profiles below.
 - Real image inputs and any configured multimodal GPU reservation backend.
 - Ordered asynchronous physical release with the lifetime fix included.
 - TP=2 and PP=2 failure/recovery on two physical GPUs.
@@ -154,6 +156,57 @@ The following release gates are still separate, not implicitly green:
 
 Do not start a 0.29 repair by interpreting a 0.28 attention pass as completion
 of those gates. Record the accepted model/runner/backend/topology explicitly.
+
+### Tiny hybrid and partial-prefix validation
+
+After composing the required adapters, use `hybrid-v1-028` with `v0.28.0`, then
+`hybrid-v2-029` with `v0.29.0`, both in `mode=validate`. These profiles reject
+repair mode, other release/runner pairs and contiguous storage. They do not
+download weights: the controller supplies a four-layer dense hybrid config,
+and vLLM initializes deterministic dummy weights. Execution is eager FP16 with
+one GPU, one worker, no image inputs and a 16-token prefix hash unit.
+
+For each scheduling mode, the probe runs fresh native, elastic and injected
+engines. Requests straddle the observed recurrent allocation-block boundary,
+which must be larger than the hash unit. Each case must finish all 24 requests
+and 768 output tokens; elastic and injected results must match every native
+token. A successful request alone is insufficient: durable markers must confirm
+a real partial-prefix hit, worker state copy, and exactly two allocation misses
+inside that partial-hit path in the injected case. The engine must explicitly
+shut down and its child process must exit within the timeout.
+The default per-child budget is ten minutes, including cold Triton/FLA kernel
+compilation; the GPU stage also retains its overall 40-minute supervisor limit.
+Timeouts are recorded as blocked, never converted into passing evidence.
+
+```mermaid
+sequenceDiagram
+    participant Controller
+    participant Native
+    participant Elastic
+    participant Fault as Elastic with CoW fault
+    loop sync, then async
+        Controller->>Native: Boundary requests, repeated prefix
+        Native-->>Controller: Complete token IDs and actual runner geometry
+        Controller->>Elastic: Identical requests and configuration
+        Elastic-->>Controller: Tokens, partial hits and worker copies
+        Controller->>Fault: Identical requests, reject two CoW allocations
+        Fault-->>Controller: Retried requests, injection markers and tokens
+        Controller->>Controller: Match native output, check evidence and shutdown
+    end
+```
+
+The hooks are loaded only in the probe's child processes through a temporary
+`sitecustomize.py`; neither the candidate nor a serving installation is edited.
+Worker evidence uses a registered string-method RPC, without enabling unsafe
+serialization. The copied model config must match the controller's fixture
+digest, and candidate source fingerprints must remain unchanged. Missing
+markers, wrong identities, unexpected tracebacks or CUDA errors cannot pass.
+
+This proves a narrow dense hybrid/partial-prefix path, not full-size FP8 model
+quality, multimodal inference, TP/PP, MPS, performance, allocator transaction
+rollback or complete asynchronous page-retirement coverage. Those remain
+separate release gates. Local replay also does not establish that a hosted
+Action's authentication or runner registration has been configured.
 
 ## CPU and GPU separation
 
@@ -205,7 +258,7 @@ Action's authentication and runner configuration have been exercised.
 - Candidate execution has no publishing credentials. The publisher does not
   execute candidate code. Allowlist checks are not an OS sandbox; dedicated
   disposable runners and normal human review remain necessary.
-- The single-GPU probe covers a small deterministic model and CUDA allocation
+- The attention single-GPU probe covers a small deterministic model and CUDA allocation
   failure/recovery, verifies a partially mapped virtual KV pool, and explicitly
   shuts down the embedded engine. It cannot establish TP/PP, MPS, hybrid/Mamba, multimodal,
   multi-instance fairness or large-model performance. Those remain explicit

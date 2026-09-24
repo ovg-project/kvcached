@@ -20,6 +20,11 @@ from engine_compat_artifact import allowed_paths, canonical
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = ROOT / ".github/engine-compat"
+PROBES = {
+    "attention": ["tools/engine_compat_gpu_probe.py"],
+    "hybrid": ["tools/engine_compat_hybrid_probe.py", "tools/engine_compat_hybrid_hooks.py",
+               "tools/engine_compat_tiny_hybrid.json", "tools/engine_compat_gpu_probe.py"],
+}
 
 
 def load_profile(name: str) -> Dict[str, Any]:
@@ -30,16 +35,24 @@ def load_profile(name: str) -> Dict[str, Any]:
         raise ValueError(f"No reviewed compatibility profile: {name}")
     value = json.loads(path.read_text(encoding="utf-8"))
     required = {"task", "allow", "cpu_tests", "gpu_tests", "qualification", "releases"}
-    if not required <= set(value) or set(value) - required - {"repair", "runner", "layouts"}:
+    if not required <= set(value) or set(value) - required - {"repair", "runner", "layouts", "probe"}:
         raise ValueError("Invalid compatibility profile schema")
     value.setdefault("repair", True)
     value.setdefault("runner", "auto")
     value.setdefault("layouts", ["contiguous"])
+    value.setdefault("probe", "attention")
+    if not isinstance(value["probe"], str) or value["probe"] not in PROBES:
+        raise ValueError("Unknown trusted probe")
     if (type(value["repair"]) is not bool or value["runner"] not in ("auto", "v1", "v2")
             or not isinstance(value["layouts"], list) or not value["layouts"]
             or any(item not in ("contiguous", "non-contiguous") for item in value["layouts"])
             or len(set(value["layouts"])) != len(value["layouts"])):
         raise ValueError("Invalid reviewed runtime matrix")
+    if value["probe"] == "hybrid" and (
+        value["repair"] or value["layouts"] != ["non-contiguous"]
+        or (value["runner"], value["releases"]) not in (("v1", ["0.28"]), ("v2", ["0.29"]))
+    ):
+        raise ValueError("Hybrid acceptance is validation-only for 0.28 V1 or 0.29 MRV2")
     if value["qualification"] != "single-gpu":
         raise ValueError("This controller has no validator for the requested qualification")
     if not isinstance(value["task"], str) or not value["task"].strip():
@@ -61,8 +74,11 @@ def load_profile(name: str) -> Dict[str, Any]:
             if check.is_symlink() or not check.is_file():
                 raise ValueError(f"Missing trusted check: {test}")
             hashes[test] = hashlib.sha256(check.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
-    probe = "tools/engine_compat_gpu_probe.py"
-    hashes[probe] = hashlib.sha256((ROOT / probe).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    for probe in PROBES[value["probe"]]:
+        target = ROOT / probe
+        if target.is_symlink() or not target.is_file():
+            raise ValueError(f"Missing trusted probe: {probe}")
+        hashes[probe] = hashlib.sha256(target.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     value["name"] = name
     value["policy_digest"] = hashlib.sha256(canonical(dict(profile=value, checks=hashes))).hexdigest()
     return value
@@ -130,7 +146,7 @@ def run_probe_matrix(profile, source, output, version, candidate_sha):
     status = 0
     for layout in profile["layouts"]:
         destination = output / layout
-        command = [sys.executable, str(ROOT / "tools/engine_compat_gpu_probe.py"),
+        command = [sys.executable, str(ROOT / PROBES[profile["probe"]][0]),
                    "--source", str(source), "--output", str(destination),
                    "--version", version, "--candidate-sha", candidate_sha,
                    "--runner", profile["runner"], "--layout", layout, "--mode", "compare"]
