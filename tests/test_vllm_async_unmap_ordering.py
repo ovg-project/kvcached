@@ -40,6 +40,24 @@ class FakeManager:
         self.released.append(marker)
 
 
+@pytest.mark.parametrize("failed_patch", [None, "init", "lifetime", "shutdown"])
+def test_engine_apply_keeps_lifetime_and_shutdown_patches(monkeypatch, failed_patch):
+    patches = _load_patches(monkeypatch)
+    patch = patches.EngineCorePatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    hooks = {}
+    for name, method in (("init", "patch_engine_init"),
+                         ("lifetime", "patch_async_batch_lifetime"),
+                         ("shutdown", "patch_engine_shutdown")):
+        hooks[name] = mock.Mock(return_value=name != failed_patch)
+        monkeypatch.setattr(patch, method, hooks[name])
+    engine_mod = types.ModuleType("vllm.v1.engine.core")
+
+    assert patch.apply(engine_mod) is (failed_patch is None)
+    for hook in hooks.values():
+        hook.assert_called_once_with(engine_mod)
+
+
 def _patch_engine(monkeypatch, original_step, original_reset=None):
     patches = _load_patches(monkeypatch)
     engine_mod = types.ModuleType("vllm.v1.engine.core")

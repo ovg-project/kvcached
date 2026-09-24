@@ -122,7 +122,8 @@ def init_kvcached(
 
 
 def shutdown_kvcached() -> bool:
-    """Release KV resources, or return False if an active listener needs a retry."""
+    """Release KV resources, or return False if an active listener or an
+    unstopped pool needs a retry."""
     global _kvcached_initialized, _kvcached_device, _async_sched, _is_worker
     _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
@@ -131,6 +132,21 @@ def shutdown_kvcached() -> bool:
 
     if not stop_worker_listener_threads():
         logger.warning("KV shutdown deferred: a worker IPC listener is still active")
+        return False
+    # Pools first: each unlinks its /dev/shm segment while the process is
+    # still alive (issue #477), then the allocator.
+    pools_stopped = True
+    for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
+        try:
+            if manager.shutdown() is False:
+                pools_stopped = False
+        except Exception as e:
+            pools_stopped = False
+            logger.warning("Failed to shut down KV cache pool %s: %s",
+                           getattr(manager, "pool_name", None), e)
+    if not pools_stopped:
+        # Keep failed pools reachable for retry, and do not release mappings
+        # while a preallocation thread may still be running.
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")

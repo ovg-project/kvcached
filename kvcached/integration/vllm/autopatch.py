@@ -14,6 +14,7 @@ from kvcached.integration.vllm.patches import (
     VLLM_MRV2_RANGE,
     VLLM_V8_RANGE,
     VLLM_V9_PLUS_RANGE,
+    CoreEngineProcManagerPatch,
     ElasticBlockPoolPatch,
     EngineCorePatch,
     GPUModelRunnerPatch,
@@ -21,6 +22,7 @@ from kvcached.integration.vllm.patches import (
     KVCacheCoordinatorPatch,
     KVCacheManagerAllocateSlotsPatch,
     KVCacheManagerPatch,
+    MPClientPatch,
     TritonAttentionPatch,
 )
 from kvcached.utils import get_kvcached_logger
@@ -46,6 +48,9 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (NixlConnectorPatch(), VLLM_ALL_RANGE),
             (ElasticBlockPoolPatch(), VLLM_ALL_RANGE),
             (EngineCorePatch(), VLLM_ALL_RANGE),
+            (MPClientPatch(), VLLM_ALL_RANGE),
+            # CoreEngineProcManager lives in vllm.v1.engine.utils from 0.10
+            (CoreEngineProcManagerPatch(), ">=0.10.0"),
             (GPUModelRunnerPatch(), ">=0.8.4,<0.29.0"),
             (ModelRunnerV2Patch(), VLLM_MRV2_RANGE),
             (KVLayoutV2Patch(), VLLM_MRV2_RANGE),
