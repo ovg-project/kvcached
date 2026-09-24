@@ -2374,16 +2374,6 @@ def _should_profile_cudagraph_memory(worker: Any) -> bool:
     return True
 
 
-def _get_process_local_torch_peak_bytes(device: Any) -> int:
-    import torch
-
-    accelerator = getattr(torch, "accelerator", None)
-    memory_stats = getattr(accelerator, "memory_stats", None)
-    if callable(memory_stats):
-        return int(memory_stats(device).get("allocated_bytes.all.peak", 0))
-    return int(torch.cuda.memory_stats()["allocated_bytes.all.peak"])
-
-
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     """Decouple kvcached virtual KV capacity from whole-device free memory."""
 
@@ -2576,7 +2566,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
     def patch_worker_determine_available_memory(
         self, gpuworker_mod: types.ModuleType
     ) -> bool:
-        """Use vLLM's explicit-capacity branch with an automatic virtual budget."""
+        """Profile process-local memory while preserving explicit user budgets."""
         Worker = self._get_target_class(gpuworker_mod)
         if Worker is None:
             return False
@@ -2607,6 +2597,7 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
             virtual_budget = int(self.requested_memory)
             init_snapshot = getattr(self, "init_snapshot", None)
+            persistent_profile_memory = 0
             if init_snapshot is None:
                 # vLLM 0.8.x has no MemorySnapshot. Resetting peak stats after
                 # model load makes this peak process-local and includes both
@@ -2625,30 +2616,36 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 from vllm.utils.mem_utils import memory_profiling
 
                 weights_memory = int(self.model_runner.model_memory_usage)
-                profile_torch_peak = None
                 cudagraph_memory_estimate = 0
                 with memory_profiling(
                     init_snapshot, weights_memory=weights_memory
                 ) as profile_result:
                     self.model_runner.profile_run()
-                    if _should_profile_cudagraph_memory(self):
-                        profile_torch_peak = _get_process_local_torch_peak_bytes(
-                            self.device
-                        )
-                        cudagraph_memory_estimate = int(
-                            self.model_runner.profile_cudagraph_memory()
-                        )
 
                 torch_peak_increase = int(profile_result.torch_peak_increase)
-                if profile_torch_peak is not None:
-                    before_profile = getattr(profile_result, "before_profile", None)
-                    before_torch_peak = getattr(
-                        before_profile, "torch_peak", None
+                before_allocated = getattr(
+                    getattr(profile_result, "before_profile", None),
+                    "torch_allocated", None,
+                )
+                after_allocated = getattr(
+                    getattr(profile_result, "after_profile", None),
+                    "torch_allocated", None,
+                )
+                if (hasattr(profile_result, "transient_peak_headroom")
+                        and before_allocated is not None and after_allocated is not None):
+                    # Split the existing process-local charge into persistent
+                    # and transient parts for vLLM 0.28's warmup bookkeeping.
+                    # Their sum, and therefore the virtual KV budget, is unchanged.
+                    persistent_profile_memory = min(
+                        max(0, torch_peak_increase),
+                        max(0, int(after_allocated) - int(before_allocated)),
                     )
-                    if before_torch_peak is not None:
-                        torch_peak_increase = max(
-                            0, profile_torch_peak - int(before_torch_peak)
-                        )
+                # Complete the normal profile before creating temporary graph
+                # caches. Keep graph initialization but exclude it from that peak.
+                if _should_profile_cudagraph_memory(self):
+                    cudagraph_memory_estimate = int(
+                        self.model_runner.profile_cudagraph_memory()
+                    )
             available_memory = (
                 virtual_budget
                 - weights_memory
@@ -2657,11 +2654,13 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
 
             self.available_kv_cache_memory_bytes = available_memory
             # Warmup reads non_torch_memory in 0.24 and total_consumed in
-            # 0.29. Retain process-local accounting for both contracts;
+            # 0.28+. Retain process-local accounting for both contracts;
             # colocated processes can corrupt the device-wide delta.
             self.non_torch_memory = 0
-            self.total_consumed = weights_memory
-            self.peak_activation_memory = torch_peak_increase
+            # Do not copy profile_result.total_consumed: it is a whole-device
+            # free-memory delta and may include allocations by other instances.
+            self.total_consumed = weights_memory + persistent_profile_memory
+            self.peak_activation_memory = torch_peak_increase - persistent_profile_memory
             self.cudagraph_memory_estimate = cudagraph_memory_estimate
             logger.warning(
                 "Using kvcached process-local KV capacity: budget=%d bytes, "
