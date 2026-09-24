@@ -14,9 +14,14 @@ from kvcached.observability import (
 )
 from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
+    get_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
+from kvcached.tp_ipc_util import (
+    resolve_gpu_device_index,
+    start_worker_listener_thread,
+    stop_worker_listener_threads,
+)
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -33,6 +38,20 @@ _world_size: int = 1
 _pp_rank: int = 0
 _contiguous_layout: bool = CONTIGUOUS_LAYOUT
 _is_worker: bool = False
+# Geometry of the KV cache tensors created by alloc_kv_cache() in this
+# process, keyed by group_id: the per-layer capacity actually reserved
+# (num_blocks, ftensor_bytes_per_layer) and the num_layers / num_kv_buffers
+# the FTensors were created with. Whichever call comes second,
+# get_kv_cache_manager() or alloc_kv_cache(), validates the manager against
+# this record so a manager can never address page ids beyond the FTensor's
+# reserved virtual range or at a different compound page stride (issue #437).
+_created_kv_tensor_capacity: Dict[int, Dict[str, int]] = {}
+
+# Single source of truth for what this shim accepts. The capability record
+# in kvcached.observability reports these, so the guards below and the
+# reported record cannot drift apart.
+SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA", "HYBRID_LINEAR")
+SUPPORTED_KV_LAYOUTS = ("NHD",)
 
 
 def should_use_worker_ipc() -> bool:
@@ -102,17 +121,40 @@ def init_kvcached(
         )
 
 
-def shutdown_kvcached() -> None:
-    global _kvcached_initialized, _kvcached_device, _async_sched
+def shutdown_kvcached() -> bool:
+    """Release KV resources, or return False if an active listener or an
+    unstopped pool needs a retry."""
+    global _kvcached_initialized, _kvcached_device, _async_sched, _is_worker
+    _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
-        return
+        return True
 
+    if not stop_worker_listener_threads():
+        logger.warning("KV shutdown deferred: a worker IPC listener is still active")
+        return False
+    # Pools first: each unlinks its /dev/shm segment while the process is
+    # still alive (issue #477), then the allocator.
+    pools_stopped = True
+    for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
+        try:
+            if manager.shutdown() is False:
+                pools_stopped = False
+        except Exception as e:
+            pools_stopped = False
+            logger.warning("Failed to shut down KV cache pool %s: %s",
+                           getattr(manager, "pool_name", None), e)
+    if not pools_stopped:
+        # Keep failed pools reachable for retry, and do not release mappings
+        # while a preallocation thread may still be running.
+        return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _is_worker = False
+    return True
 
 
 def build_kv_views(
@@ -322,10 +364,10 @@ def alloc_kv_cache(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA", "HYBRID_LINEAR"]:
+    if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
-    if kv_layout != "NHD":
+    if kv_layout not in SUPPORTED_KV_LAYOUTS:
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     is_mla = attention_type == "MLA"
@@ -431,11 +473,28 @@ def alloc_kv_cache(
     # (= gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) above, which already
     # accounts for both K and V.
     compound_num_kv_buffers = 1 if unified_pool else num_k_or_v
+    created_capacity = {
+        "num_blocks": num_blocks_per_layer,
+        "ftensor_bytes_per_layer": ftensor_bytes_per_layer,
+        "num_layers": num_layers,
+        "num_kv_buffers": compound_num_kv_buffers,
+    }
+    # Manager-first order: a KVCacheManager for this group may already exist,
+    # polling kv_tensors_created() from its _post_init thread and mapping
+    # pages as soon as it flips. Validate it against the geometry about to be
+    # created before create_kv_tensors() makes the tensors available for
+    # mapping (issue #437).
+    _validate_registered_managers(group_id, created_capacity)
     raw_kv_tensors = create_kv_tensors(
         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
         num_kv_buffers=compound_num_kv_buffers, group_id=group_id,
         unified_pool=unified_pool,
     )
+
+    # Record the geometry actually created for this group so that
+    # get_kv_cache_manager() can refuse (or derive) a manager configuration
+    # that does not match it (issue #437).
+    _created_kv_tensor_capacity[group_id] = created_capacity
 
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[blocks_dim_idx] = num_blocks_per_layer
@@ -577,8 +636,140 @@ def alloc_kv_cache(
     return kv_tensors, raw_info  # type: ignore[return-value]
 
 
-def get_kv_cache_manager(
+def _created_capacity_num_blocks(
+    record: Dict[str, int], block_mem_size: int, num_kv_buffers: int
+) -> int:
+    """Per-layer block capacity of ``record``'s tensors in a manager's geometry.
+
+    A manager's page-id space covers ``num_blocks * block_mem_size`` bytes per
+    layer per KV buffer, while each created FTensor reserves
+    ``ftensor_bytes_per_layer`` bytes for all ``num_kv_buffers`` of a layer.
+    """
+    return record["ftensor_bytes_per_layer"] // num_kv_buffers // block_mem_size
+
+
+def _validate_manager_against_created_tensors(
+    record: Dict[str, int],
     num_blocks: int,
+    block_mem_size: int,
+    num_layers: int,
+    num_kv_buffers: int,
+    group_id: int,
+) -> None:
+    """Raise ValueError unless a manager of this geometry fits ``record``.
+
+    ``record`` is the ``_created_kv_tensor_capacity`` entry of ``group_id``,
+    already created or about to be. Shared by both construction orders:
+    ``get_kv_cache_manager`` after ``alloc_kv_cache`` and ``alloc_kv_cache``
+    after ``get_kv_cache_manager``.
+
+    ``num_layers`` and ``num_kv_buffers`` must match exactly. In the
+    contiguous layout the FTensor and the PageAllocator both stride compound
+    pages by ``page_size * num_layers * num_kv_buffers``, so a manager built
+    with different values maps pages at the wrong offsets even when its block
+    count fits; in the per-layer layout they size the manager's
+    physical-memory accounting.
+
+    ``num_blocks`` must not exceed the created capacity. ``alloc_kv_cache``
+    sizes the tensors from device memory and can create fewer blocks than
+    requested (it warns and clamps); a manager configured with the original,
+    larger count exposes page ids beyond the FTensor's reserved virtual
+    range, and the first map past the reservation fails
+    ``cuMemUnmap``/``cuMemMap`` and aborts the process inside
+    ``FTensor::map`` (issue #437, diagnosed by @rob-9).
+    """
+    for name, value in (("num_layers", num_layers), ("num_kv_buffers", num_kv_buffers)):
+        if value != record[name]:
+            raise ValueError(
+                f"{name}={value} does not match {name}={record[name]} of the KV "
+                f"cache tensors alloc_kv_cache() creates for group {group_id}. "
+                "In the contiguous layout the FTensor and the PageAllocator "
+                "both stride compound pages by "
+                "page_size * num_layers * num_kv_buffers, so a manager built "
+                "with different values maps pages at the wrong offsets "
+                "(issue #437). Pass get_kv_cache_manager() the num_layers the "
+                "tensors were created with, and num_kv_buffers=2 for MHA/GQA "
+                "or 1 for MLA/HYBRID_LINEAR."
+            )
+
+    capacity_num_blocks = _created_capacity_num_blocks(record, block_mem_size, num_kv_buffers)
+    if num_blocks > capacity_num_blocks:
+        raise ValueError(
+            f"num_blocks={num_blocks} exceeds the capacity of the KV cache "
+            f"tensors alloc_kv_cache() creates for group {group_id}: "
+            f"{capacity_num_blocks} blocks of {block_mem_size} bytes "
+            f"({record['ftensor_bytes_per_layer']} reserved bytes per layer, "
+            f"{num_kv_buffers} KV buffers). A manager configured beyond the "
+            "created tensors maps pages outside the reserved virtual range "
+            "and aborts in FTensor::map (issue #437). Create the manager "
+            "after alloc_kv_cache() with num_blocks=None to derive the "
+            "capacity, or pass the clamped block count logged by "
+            "alloc_kv_cache()."
+        )
+
+
+def _validate_registered_managers(group_id: int, record: Dict[str, int]) -> None:
+    """Manager-first order: refuse tensors an existing manager cannot address.
+
+    ``get_kv_cache_manager`` registers every manager it builds in
+    ``kvcached.pool_registry`` (weak references, so a collected manager does
+    not count). A manager built for ``group_id`` before ``alloc_kv_cache``
+    ran had nothing to validate against; check it here against the geometry
+    ``record`` about to be created.
+    """
+    for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
+        if manager.group_id != group_id:
+            continue
+        _validate_manager_against_created_tensors(
+            record,
+            manager.num_blocks,
+            manager.block_mem_size,
+            manager.num_layers,
+            manager.num_kv_buffers,
+            group_id,
+        )
+
+
+def _resolve_manager_num_blocks(
+    num_blocks: Optional[int],
+    block_size: int,
+    cell_size: int,
+    num_layers: int,
+    num_kv_buffers: int,
+    group_id: int,
+) -> int:
+    """Validate or derive the manager's block capacity for ``group_id``.
+
+    When ``alloc_kv_cache`` has recorded tensors for ``group_id`` in this
+    process, the manager must fit them (see
+    ``_validate_manager_against_created_tensors``) and ``num_blocks=None``
+    derives their capacity directly. When no allocation was recorded (e.g.
+    the manager lives in the engine process while ``alloc_kv_cache`` runs in
+    the worker process, as in the vLLM integration, or the manager is created
+    first), an explicit ``num_blocks`` is returned unchanged and ``None`` is
+    rejected; a manager created first is validated by ``alloc_kv_cache``.
+    """
+    record = _created_kv_tensor_capacity.get(group_id)
+    if record is None:
+        if num_blocks is None:
+            raise ValueError(
+                "num_blocks=None requires KV cache tensors created by "
+                f"alloc_kv_cache() in this process for group {group_id}; "
+                "no allocation is recorded to derive the capacity from."
+            )
+        return num_blocks
+
+    block_mem_size = block_size * cell_size
+    if num_blocks is None:
+        num_blocks = _created_capacity_num_blocks(record, block_mem_size, num_kv_buffers)
+    _validate_manager_against_created_tensors(
+        record, num_blocks, block_mem_size, num_layers, num_kv_buffers, group_id
+    )
+    return num_blocks
+
+
+def get_kv_cache_manager(
+    num_blocks: Optional[int],
     block_size: int,
     cell_size: int,
     num_layers: int,
@@ -586,8 +777,20 @@ def get_kv_cache_manager(
     group_id: int = 0,
     pool_name: Optional[str] = None,
 ) -> KVCacheManager:
+    """Create and register the KVCacheManager for one KV cache group.
+
+    When ``alloc_kv_cache`` already created the tensors for ``group_id`` in
+    this process, ``num_layers`` and ``num_kv_buffers`` must match them and
+    ``num_blocks`` must fit their capacity (``None`` derives it). When the
+    manager is created first, ``alloc_kv_cache`` runs the same validation
+    before creating the tensors.
+    """
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+
+    num_blocks = _resolve_manager_num_blocks(
+        num_blocks, block_size, cell_size, num_layers, num_kv_buffers, group_id
+    )
 
     manager = KVCacheManager(
         num_blocks,

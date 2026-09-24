@@ -10,9 +10,12 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import threading
+import time
 import types
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
@@ -72,13 +75,70 @@ def _get_first_attention_group(kv_cache_config: Any) -> Any:
     return None
 
 
-def _get_group_size(kv_cache_config: Any) -> int:
-    """Return the maximum number of layers across all KV cache groups.
+def _get_runner_only_attn_layers(model_runner: Any) -> frozenset:
+    """Return layer names that appear in KV cache groups without a KV tensor.
+
+    vLLM's ``maybe_add_kv_sharing_layers_to_kv_cache_groups`` appends
+    cross-layer KV sharing layers (e.g. gemma E2B) to
+    ``kv_cache_groups[*].layer_names`` and records them in the runner's
+    ``runner_only_attn_layers`` WITHOUT adding them to any
+    ``kv_cache_tensors[*].shared_by`` (issue #417). vLLM versions without
+    the attribute have no such layers; treat that as empty.
+    """
+    return frozenset(getattr(model_runner, "runner_only_attn_layers", None) or ())
+
+
+def _tensor_backed_layer_names(
+    kv_cache_group: Any, runner_only_attn_layers: Collection[str] = ()
+) -> list:
+    """Return the group layer names that own a slot in a KVCacheTensor.
+
+    Skips runner-only layers, mirroring vanilla vLLM's
+    ``_allocate_kv_cache_tensors`` / ``_reshape_kv_cache_tensors``: those
+    layers are registered for attention-metadata assignment only and are
+    aliased to their KV-sharing target's cache after allocation.
+    """
+    if not runner_only_attn_layers:
+        return list(kv_cache_group.layer_names)
+    return [
+        ln for ln in kv_cache_group.layer_names if ln not in runner_only_attn_layers
+    ]
+
+
+def _get_group_size(
+    kv_cache_config: Any, runner_only_attn_layers: Collection[str] = ()
+) -> int:
+    """Return the maximum number of tensor-backed layers across all groups.
 
     This matches vLLM's shared memory pool count: ``group_size`` pools
-    are created, each shared by one layer from every group.
+    are created, each shared by one layer from every group. Runner-only
+    layers (cross-layer KV sharing) own no pool and are excluded so the
+    worker-side pool count stays equal to the scheduler-side ``num_layers``
+    (the scheduler's config never contains the appended sharing layers).
     """
-    return max(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
+    return max(
+        len(_tensor_backed_layer_names(g, runner_only_attn_layers))
+        for g in kv_cache_config.kv_cache_groups
+    )
+
+
+def _alias_shared_kv_layers(
+    kv_caches: dict, shared_kv_cache_layers: Mapping[str, str]
+) -> None:
+    """Bind cross-layer KV sharing layers to their target layer's cache.
+
+    Mirrors the aliasing loop in vanilla vLLM's
+    ``initialize_kv_cache_tensors``. On vLLM versions where that loop also
+    runs after the patched reshape returns, it re-assigns the same objects,
+    which is harmless.
+    """
+    for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        if target_layer_name not in kv_caches:
+            raise RuntimeError(
+                f"KV sharing target layer {target_layer_name!r} (shared by "
+                f"{layer_name!r}) has no allocated KV cache to alias."
+            )
+        kv_caches[layer_name] = kv_caches[target_layer_name]
 
 
 def _validate_kv_cache_groups(kv_cache_config: Any) -> None:
@@ -264,6 +324,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _get_kv_cache_params(
@@ -936,12 +997,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> list["KVCacheEvent"]:
                 return []
 
-        setattr(block_pool_mod, "ElasticBlockPool", ElasticBlockPool)
+        elastic_block_pool_cls: type = ElasticBlockPool
+        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+            from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
+
+            elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
+        setattr(block_pool_mod, "ElasticBlockPool", elastic_block_pool_cls)
         return True
 
 
 class EngineCorePatch(VersionAwarePatch, BasePatch):
-    """Patch EngineCore.__init__ to initialize kvcached"""
+    """Patch EngineCore.__init__ / shutdown to initialize and release kvcached"""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core"
@@ -954,7 +1020,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return False
 
         # Apply version-specific patches
-        return self.patch_engine_init(engine_mod)
+        init_patched = self.patch_engine_init(engine_mod)
+        shutdown_patched = self.patch_engine_shutdown(engine_mod)
+        return init_patched and shutdown_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -968,9 +1036,23 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             return True
 
         original_init = EngineCore.__init__
+        detected_version = self.detected_version
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # Reject a partial integration before either allocator or the
+                # native executor starts. vLLM can select V1 automatically.
+                if detected_version and VersionRange(">=0.29.0").contains(detected_version):
+                    if not VersionRange(VLLM_MRV2_RANGE).contains(detected_version):
+                        raise KVCachedConfigError(
+                            f"kvcached has no runner adapter for vLLM {detected_version}; "
+                            "use a supported engine version or disable kvcached"
+                        )
+                    if not vllm_config.use_v2_model_runner:
+                        raise KVCachedConfigError(
+                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            "use a supported configuration or disable kvcached"
+                        )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
@@ -989,6 +1071,371 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_engine_shutdown(self, engine_mod: types.ModuleType) -> bool:
+        """Patch EngineCore.shutdown to release kvcached state.
+
+        run_engine_core() always ends in EngineCore.shutdown(), after which
+        the forked EngineCore leaves through os._exit: no destructor runs,
+        so the /dev/shm segment created by the C++ MemInfoTracker was never
+        unlinked (issue #477). shutdown_kvcached() unlinks it while the
+        process is still alive, after vLLM's own teardown.
+        """
+        EngineCore = self._get_target_class(engine_mod)
+        if EngineCore is None:
+            return False
+
+        original_shutdown = getattr(EngineCore, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "EngineCore.shutdown not found; kvcached state is not released on engine exit")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("EngineCore.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_engine_shutdown(self, *args: Any, **kwargs: Any):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.integration.vllm.interfaces import shutdown_kvcached
+
+                        shutdown_kvcached()
+                    except Exception as e:
+                        logger.warning("Failed to shut down kvcached: %s", e)
+
+        self._mark_as_patched(_patched_engine_shutdown, "shutdown")
+        EngineCore.shutdown = _patched_engine_shutdown  # type: ignore[assignment]
+        return True
+
+
+def _client_engine_processes(client: Any) -> tuple[Any, ...]:
+    """Capture the engine processes owned by this MPClient before teardown.
+
+    With --api-server-count > 1 every frontend has an MPClient, but the
+    engines belong to the supervisor: such a client's
+    ``resources.engine_manager`` is None and its shutdown only closes
+    client-side resources, so unlinking from it would remove the live
+    engines' segment while EngineCore and the other frontends still use
+    it. Current vLLM records ownership as ``resources.engine_manager``;
+    older supported versions instead carry per-engine process handles on
+    ``resources.core_engines``. A client whose resources match neither
+    is treated as a non-owner: leaking a segment is recoverable with
+    kvctl delete, removing a live one is not.
+    """
+    resources = getattr(client, "resources", None)
+    if resources is None:
+        return ()
+    manager = getattr(resources, "engine_manager", None)
+    if manager is not None:
+        return tuple(getattr(manager, "processes", ()) or ())
+    core_engines = getattr(resources, "core_engines", None) or ()
+    return tuple(engine.proc_handle for engine in core_engines
+                 if getattr(engine, "proc_handle", None) is not None)
+
+
+def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
+    """Pin a ready, live engine's segment once, never from a late shutdown."""
+    if not enable_kvcached() or hasattr(owner, "_kvcached_ipc_cleanup"):
+        return
+    owner._kvcached_ipc_cleanup = None
+    owner._kvcached_engine_processes = processes
+    cleanup = None
+    try:
+        if not processes:
+            return
+        if any(process.exitcode is not None for process in processes):
+            logger.warning("Cannot retain segment identity after an owned engine exited; "
+                           "keeping the segment for manual cleanup")
+            return
+        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
+
+        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
+        if any(process.exitcode is not None for process in processes):
+            cleanup.close()
+            logger.warning("Engine exited during segment identity capture; "
+                           "keeping the segment for manual cleanup")
+            return
+        owner._kvcached_ipc_cleanup = cleanup
+    except Exception as e:
+        if cleanup is not None:
+            cleanup.close()
+        logger.warning("Cannot retain the ready engine's segment identity: %s; "
+                       "parent cleanup is disabled for this engine", e)
+
+
+def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> None:
+    """A shutdown return (or exception) does not prove the engines stopped."""
+    try:
+        # vLLM can return immediately after SIGKILL without reaping children.
+        # Bound the extra wait across the whole group, including error paths.
+        deadline = time.monotonic() + 1.0
+        for process in processes:
+            if process.exitcode is None:
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+        if not processes or any(
+                not isinstance(process.exitcode, int) for process in processes):
+            logger.warning("Keeping the KV cache limit segment: engine exit is unconfirmed")
+            return
+    except Exception as e:
+        logger.warning("Keeping the KV cache limit segment: cannot check engine exit: %s", e)
+        return
+    try:
+        cleanup.unlink()
+    except Exception as e:
+        logger.warning("Failed to remove the KV cache limit segment: %s", e)
+
+
+def _stop_headless_segment_watch(manager: Any) -> None:
+    watch = getattr(manager, "_kvcached_segment_watch", None)
+    if watch is None:
+        return
+    try:
+        stop, thread = watch
+        stop.set()
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            logger.warning("Segment identity capture is still stopping; "
+                           "parent cleanup may require a retry")
+    except Exception as e:
+        logger.warning("Failed to stop segment identity capture: %s", e)
+
+
+class MPClientPatch(VersionAwarePatch, BasePatch):
+    """Patch MPClient.shutdown to remove the segment killed engines leave"""
+
+    library = "vllm"
+    target_module = "vllm.v1.engine.core_client"
+    target_class = "MPClient"
+    patch_name = "mp_client"
+
+    def apply(self, client_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_client_shutdown(client_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_client_shutdown(self, client_mod: types.ModuleType) -> bool:
+        """Patch MPClient.shutdown.
+
+        The EngineCore-side unlink (EngineCorePatch) only runs when
+        EngineCore.shutdown() completes, and on a server-level SIGTERM it
+        usually cannot: run_engine_core() restores SIGTERM to SIG_DFL
+        before calling EngineCore.shutdown(), and MPClient.shutdown()'s
+        process manager terminate()s the engine during that teardown (with
+        --shutdown-timeout 0 a SIGKILL follows immediately), killing it
+        before the unlink runs (issue #477). The client outlives the
+        engines, so once the original shutdown has stopped them, remove
+        whatever segment they left behind.
+
+        Only the engine-owning client does this (_client_engine_processes):
+        under --api-server-count > 1 a frontend's shutdown stops no
+        engines, and unlinking from it would remove the live segment.
+        Identity is captured after engine startup, not during shutdown, and
+        retained for retries even if teardown clears the ownership markers.
+        An owning client reuses its supervisor's retained identity when present.
+        The supervisor
+        that owns those engines has no MPClient at all;
+        CoreEngineProcManagerPatch covers that boundary.
+        """
+        MPClient = self._get_target_class(client_mod)
+        if MPClient is None:
+            return False
+
+        original_shutdown = getattr(MPClient, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "MPClient.shutdown not found; segments left by killed engines are not removed")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("MPClient.shutdown already patched")
+            return True
+
+        original_init = MPClient.__init__
+
+        @wraps(original_init)
+        def _patched_client_init(self, *args: Any, **kwargs: Any):
+            original_init(self, *args, **kwargs)
+            manager = getattr(getattr(self, "resources", None), "engine_manager", None)
+            if manager is not None and hasattr(manager, "_kvcached_ipc_cleanup"):
+                self._kvcached_ipc_cleanup = manager._kvcached_ipc_cleanup
+                self._kvcached_engine_processes = manager._kvcached_engine_processes
+            else:
+                _capture_engine_segment(self, _client_engine_processes(self))
+
+        def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
+            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if cleanup is not None:
+                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+
+        self._mark_as_patched(_patched_client_shutdown, "shutdown")
+        MPClient.__init__ = _patched_client_init  # type: ignore[assignment]
+        MPClient.shutdown = _patched_client_shutdown  # type: ignore[assignment]
+        return True
+
+
+class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
+    """Patch CoreEngineProcManager.shutdown to remove the segment its engines leave"""
+
+    library = "vllm"
+    target_module = "vllm.v1.engine.utils"
+    target_class = "CoreEngineProcManager"
+    patch_name = "core_engine_proc_manager"
+
+    def apply(self, utils_mod: types.ModuleType) -> bool:
+        # Initialize version info
+        if not self.initialize_version_info():
+            return False
+
+        return self.patch_manager_shutdown(utils_mod)
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_manager_shutdown(self, utils_mod: types.ModuleType) -> bool:
+        """Patch CoreEngineProcManager.shutdown.
+
+        With --api-server-count > 1 (and under vllm serve --headless) the
+        EngineCore processes are launched by a CoreEngineProcManager in
+        the supervisor process, not by any MPClient: every frontend's
+        client is a non-owner, and run_multi_api_server() calls this
+        manager's shutdown directly on exit. That shutdown terminate()s
+        the engines (with --shutdown-timeout 0 a SIGKILL follows) before
+        EngineCore's own unlink can run, and no owning client exists in
+        the supervisor to remove what they leave behind (issue #477).
+        The manager spawned the engine processes itself and its shutdown
+        joins or kills them. Check their exit codes after shutdown before
+        removing the segment: shutdown can fail, swallow an error, or return
+        early when another caller has already detached its finalizer.
+
+        The constructor only starts children, so capture is bound to the
+        completed READY handshake in wait_for_engine_startup. If startup never
+        completes, the parent has no verified identity and must not claim a
+        later file at shutdown. Native cleanup still handles graceful failures.
+        Headless has no parent READY handshake. Its startup observer can retain
+        a newly created segment while the owned children are live, provided the
+        name was absent before they started. It never claims a pre-existing name.
+        """
+        CoreEngineProcManager = self._get_target_class(utils_mod)
+        if CoreEngineProcManager is None:
+            return False
+
+        original_shutdown = getattr(CoreEngineProcManager, "shutdown", None)
+        if original_shutdown is None:
+            self.logger.warning(
+                "CoreEngineProcManager.shutdown not found; segments left by killed engines are not removed")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("CoreEngineProcManager.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        original_init = CoreEngineProcManager.__init__
+        init_signature = inspect.signature(original_init)
+
+        @wraps(original_init)
+        def _patched_manager_init(self, *args: Any, **kwargs: Any):
+            self._kvcached_headless_segment = None
+            if enable_kvcached():
+                try:
+                    arguments = init_signature.bind(self, *args, **kwargs).arguments
+                    if arguments.get("local_client") is False:
+                        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
+
+                        path = os.path.join(SHM_DIR, DEFAULT_IPC_NAME)
+                        # Headless has no parent READY handshake. Only observe
+                        # a fresh name, never adopt a pre-existing generation.
+                        if not os.path.exists(path):
+                            self._kvcached_headless_segment = path
+                        else:
+                            logger.warning("Headless segment already exists; parent "
+                                           "cleanup cannot establish ownership of %s", path)
+                except Exception as e:
+                    logger.warning("Cannot prepare headless segment capture: %s", e)
+            original_init(self, *args, **kwargs)
+
+        original_monitor = getattr(CoreEngineProcManager, "monitor_engine_liveness", None)
+        if original_monitor is not None:
+            @wraps(original_monitor)
+            def _patched_monitor(self, *args: Any, **kwargs: Any):
+                path = getattr(self, "_kvcached_headless_segment", None)
+                if path is not None and not hasattr(self, "_kvcached_ipc_cleanup"):
+                    stop = threading.Event()
+                    processes = tuple(self.processes)
+
+                    def capture_when_created():
+                        try:
+                            while not stop.is_set():
+                                if not processes or any(p.exitcode is not None for p in processes):
+                                    return
+                                if os.path.exists(path):
+                                    _capture_engine_segment(self, processes)
+                                    return
+                                stop.wait(0.05)
+                        except Exception as e:
+                            logger.warning("Headless segment identity capture failed: %s", e)
+
+                    thread = threading.Thread(target=capture_when_created,
+                                              name="kvcached-segment-owner", daemon=True)
+                    try:
+                        thread.start()
+                        self._kvcached_segment_watch = (stop, thread)
+                    except Exception as e:
+                        logger.warning("Cannot start headless segment identity capture: %s", e)
+                try:
+                    return original_monitor(self, *args, **kwargs)
+                finally:
+                    _stop_headless_segment_watch(self)
+
+            CoreEngineProcManager.monitor_engine_liveness = _patched_monitor
+
+        original_wait = getattr(utils_mod, "wait_for_engine_startup", None)
+        if original_wait is not None:
+            signature = inspect.signature(original_wait)
+
+            @wraps(original_wait)
+            def _patched_wait(*args: Any, **kwargs: Any):
+                result = original_wait(*args, **kwargs)
+                try:
+                    arguments = signature.bind(*args, **kwargs).arguments
+                    manager = arguments.get("proc_manager")
+                    if manager is None:
+                        manager = getattr(arguments.get("launch"), "engine_manager", None)
+                    if isinstance(manager, CoreEngineProcManager):
+                        _capture_engine_segment(manager, tuple(manager.processes))
+                except Exception as e:
+                    logger.warning("Cannot retain startup segment identity: %s", e)
+                return result
+
+            setattr(utils_mod, "wait_for_engine_startup", _patched_wait)
+        else:
+            logger.warning("wait_for_engine_startup not found; READY-based segment capture disabled")
+
+        def _patched_manager_shutdown(self, *args: Any, **kwargs: Any):
+            _stop_headless_segment_watch(self)
+            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if cleanup is not None:
+                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+
+        self._mark_as_patched(_patched_manager_shutdown, "shutdown")
+        CoreEngineProcManager.__init__ = _patched_manager_init
+        CoreEngineProcManager.shutdown = _patched_manager_shutdown  # type: ignore[assignment]
         return True
 
 
@@ -1021,6 +1468,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
         original_init = KVCacheCoordinator.__init__
         logger = self.logger  # Capture logger in closure
+        use_mrv2_geometry = bool(
+            self.detected_version
+            and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version)
+        )
 
         def _patched_init(self, *args: Any, **kwargs: Any) -> None:
             original_init(self, *args, **kwargs)
@@ -1049,22 +1500,28 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             kv_cache_config = getattr(self, "kv_cache_config")
 
-            _validate_kv_cache_groups(kv_cache_config)
+            if use_mrv2_geometry:
+                from kvcached.integration.vllm.model_runner_v2 import cache_geometry
 
-            first_attn_group = _get_first_attention_group(kv_cache_config)
-            if first_attn_group is None:
-                raise RuntimeError(
-                    "kvcached is enabled but the KV cache config contains no "
-                    "attention groups; nothing to manage."
-                )
-
-            kv_cache_spec = first_attn_group.kv_cache_spec
-            block_size = kv_cache_spec.block_size
-
-            attention_type = _infer_attention_type(kv_cache_config)
-
-            cell_size, num_kv_buffers = _get_kv_cache_params(
-                kv_cache_spec, block_size, attention_type=attention_type)
+                geometry = cache_geometry(kv_cache_config)
+                block_size = geometry.block_size
+                cell_size = geometry.cell_size
+                num_kv_buffers = 1
+                group_size = geometry.num_pools
+            else:
+                _validate_kv_cache_groups(kv_cache_config)
+                first_attn_group = _get_first_attention_group(kv_cache_config)
+                if first_attn_group is None:
+                    raise RuntimeError(
+                        "kvcached is enabled but the KV cache config contains no "
+                        "attention groups; nothing to manage."
+                    )
+                kv_cache_spec = first_attn_group.kv_cache_spec
+                block_size = kv_cache_spec.block_size
+                attention_type = _infer_attention_type(kv_cache_config)
+                cell_size, num_kv_buffers = _get_kv_cache_params(
+                    kv_cache_spec, block_size, attention_type=attention_type)
+                group_size = _get_group_size(kv_cache_config)
 
             from kvcached.integration.vllm import interfaces as kvi
 
@@ -1097,7 +1554,6 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             block_pool_mod = importlib.import_module("vllm.v1.core.block_pool")
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
-            group_size = _get_group_size(kv_cache_config)
             # vLLM computes Request.block_hashes at a shared fine-grained size
             # (normally the GCD of heterogeneous group block sizes). Preserve
             # the value from the native pool before replacing it.
@@ -1441,6 +1897,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             _validate_kv_cache_groups(kv_cache_config)
 
+            # Cross-layer KV sharing (issue #417): vLLM appends sharing
+            # layers to group layer_names without adding them to any
+            # tensor's shared_by. Resolve layers against kv_cache_tensors
+            # only for tensor-backed names, exactly like vanilla vLLM's
+            # _allocate_kv_cache_tensors; sharing layers are aliased to
+            # their target's cache in the reshape step.
+            runner_only_attn_layers = _get_runner_only_attn_layers(self)
+
             layer_to_tensor_cfg: dict[str, KVCacheTensor] = {}
             for tensor_cfg in kv_cache_config.kv_cache_tensors:
                 for ln in tensor_cfg.shared_by:
@@ -1448,7 +1912,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             for grp in kv_cache_config.kv_cache_groups:
                 layer_spec = grp.kv_cache_spec
-                for layer_name in grp.layer_names:
+                for layer_name in _tensor_backed_layer_names(
+                        grp, runner_only_attn_layers):
                     tensor_cfg = layer_to_tensor_cfg[layer_name]
                     assert tensor_cfg.size % layer_spec.page_size_bytes == 0, (
                         f"Tensor size for layer {layer_name} ({tensor_cfg.size}) "
@@ -1464,7 +1929,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             first_attn_group_id = None
             first_attn_group = None
             for idx, grp in enumerate(kv_cache_config.kv_cache_groups):
-                if _is_attention_spec(grp.kv_cache_spec):
+                if _is_attention_spec(grp.kv_cache_spec) and _tensor_backed_layer_names(
+                        grp, runner_only_attn_layers):
                     first_attn_group_id = idx
                     first_attn_group = grp
                     break
@@ -1472,13 +1938,15 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             if first_attn_group is None or first_attn_group_id is None:
                 raise RuntimeError(
                     "kvcached is enabled but the KV cache config contains no "
-                    "attention groups; nothing to allocate."
+                    "attention groups with tensor-backed layers; nothing to "
+                    "allocate."
                 )
 
             kv_cache_spec = first_attn_group.kv_cache_spec
             attention_type = _infer_attention_type(kv_cache_config)
 
-            first_layer_name = first_attn_group.layer_names[0]
+            first_layer_name = _tensor_backed_layer_names(
+                first_attn_group, runner_only_attn_layers)[0]
             rep_tensor_cfg = layer_to_tensor_cfg[first_layer_name]
             num_blocks = rep_tensor_cfg.size // kv_cache_spec.page_size_bytes
 
@@ -1542,7 +2010,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             # KVCacheTensor sharing: pool i is shared by layer i from each
             # group, and different groups use different block IDs within the
             # same pool.
-            group_size = _get_group_size(kv_cache_config)
+            group_size = _get_group_size(kv_cache_config, runner_only_attn_layers)
             dtype = kv_cache_spec.dtype
             device_type = getattr(self, "device", torch.device("cuda")).type
 
@@ -1668,7 +2136,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                         meta["gpu_mem_bytes_per_layer_k_or_v"], meta["num_layers"],
                         kernel_block_size=gkbs,
                     )
-                    for pool_idx, layer_name in enumerate(grp.layer_names):
+                    for pool_idx, layer_name in enumerate(
+                            _tensor_backed_layer_names(grp, runner_only_attn_layers)):
                         layer_views[layer_name] = gviews[pool_idx]
                 self._kvcached_attn_layer_views = layer_views
             else:
@@ -1719,6 +2188,12 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             kv_caches: dict[str, torch.Tensor] = {}
 
+            # Cross-layer KV sharing layers own no pool tensor: skip them in
+            # the pool-index mapping and alias them to their target's cache
+            # afterwards (issue #417), mirroring vanilla vLLM's
+            # _reshape_kv_cache_tensors / initialize_kv_cache_tensors.
+            runner_only_attn_layers = _get_runner_only_attn_layers(self)
+
             mamba_info = getattr(self, "_kvcached_mamba_raw_info", None)
             # Per-group attention views for heterogeneous hybrids (Gemma). None
             # for homogeneous / single-group models, which use the raw-tensor
@@ -1727,6 +2202,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             for kv_cache_group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = kv_cache_group.kv_cache_spec
+                bound_layer_names = _tensor_backed_layer_names(
+                    kv_cache_group, runner_only_attn_layers)
 
                 if _is_mamba_spec(kv_cache_spec):
                     if mamba_info is None:
@@ -1734,7 +2211,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "Mamba layers found but no raw buffer info "
                             "available from kvcached"
                         )
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for pool_idx, layer_name in enumerate(bound_layer_names):
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
@@ -1747,11 +2224,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
-                    for pool_idx, layer_name in enumerate(kv_cache_group.layer_names):
+                    for pool_idx, layer_name in enumerate(bound_layer_names):
                         if attn_layer_views is not None and layer_name in attn_layer_views:
                             kv_caches[layer_name] = attn_layer_views[layer_name]
                         else:
                             kv_caches[layer_name] = kv_cache_raw_tensors[pool_idx]
+
+            _alias_shared_kv_layers(
+                kv_caches, getattr(self, "shared_kv_cache_layers", None) or {})
 
             return kv_caches
 
@@ -1922,7 +2402,51 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         memory_profile_patched = self.patch_worker_determine_available_memory(
             gpuworker_mod
         )
-        return init_device_patched and memory_profile_patched
+        shutdown_patched = self.patch_worker_shutdown(gpuworker_mod)
+        return init_device_patched and memory_profile_patched and shutdown_patched
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_worker_shutdown(self, gpuworker_mod: types.ModuleType) -> bool:
+        """Patch Worker.shutdown to stop this worker's kvcached IPC listener.
+
+        vLLM runs Worker.shutdown() on every exit path that reaches
+        EngineCore.shutdown(): in-process through UniProcExecutor.shutdown()
+        and in each WorkerProc from worker_main()'s finally block. Stopping
+        the listener there unlinks the worker socket and removes the
+        /tmp/kvcached-tp-* directory instead of leaking it (issue #476).
+        """
+        Worker = self._get_target_class(gpuworker_mod)
+        if Worker is None:
+            return False
+
+        original_shutdown = getattr(Worker, "shutdown", None)
+        if original_shutdown is None:
+            # Releases without Worker.shutdown(): cleanup is left to
+            # shutdown_kvcached() and the interpreter-exit hook.
+            self.logger.debug("Worker.shutdown not found; skipping listener cleanup patch")
+            return True
+
+        if self._is_already_patched(original_shutdown, "shutdown"):
+            self.logger.debug("Worker.shutdown already patched")
+            return True
+
+        logger = self.logger  # Capture logger in closure
+
+        def _patched_shutdown(self, *args: Any, **kwargs: Any):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                if enable_kvcached():
+                    try:
+                        from kvcached.tp_ipc_util import stop_worker_listener_threads
+
+                        stop_worker_listener_threads()
+                    except Exception as e:
+                        logger.warning("Failed to stop the kvcached worker IPC listener: %s", e)
+
+        self._mark_as_patched(_patched_shutdown, "shutdown")
+        Worker.shutdown = _patched_shutdown  # type: ignore[assignment]
+        return True
 
     @version_range(VLLM_ALL_RANGE)
     def patch_worker_init_device(self, gpuworker_mod: types.ModuleType) -> bool:
@@ -2132,10 +2656,11 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             )
 
             self.available_kv_cache_memory_bytes = available_memory
-            # vLLM 0.24 reads this field during compile_or_warm_up_model().
-            # Keep the worker contract without reintroducing the device-wide
-            # non-torch delta that colocated processes can corrupt.
+            # Warmup reads non_torch_memory in 0.24 and total_consumed in
+            # 0.29. Retain process-local accounting for both contracts;
+            # colocated processes can corrupt the device-wide delta.
             self.non_torch_memory = 0
+            self.total_consumed = weights_memory
             self.peak_activation_memory = torch_peak_increase
             self.cudagraph_memory_estimate = cudagraph_memory_estimate
             logger.warning(

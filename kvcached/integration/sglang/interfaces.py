@@ -16,7 +16,11 @@ from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
-from kvcached.tp_ipc_util import resolve_gpu_device_index, start_worker_listener_thread
+from kvcached.tp_ipc_util import (
+    resolve_gpu_device_index,
+    start_worker_listener_thread,
+    stop_worker_listener_threads,
+)
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
 from kvcached.vmm_ops import (
     create_kv_tensors,
@@ -32,6 +36,13 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
+
+# Single source of truth for what this shim accepts. The capability record
+# in kvcached.observability reports these, so the guards below and the
+# reported record cannot drift apart. SUPPORTED_KV_LAYOUTS is enforced for
+# MHA/GQA only; the MLA path ignores the layout argument.
+SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA")
+SUPPORTED_KV_LAYOUTS = ("NHD",)
 
 
 def init_kvcached(
@@ -65,17 +76,22 @@ def init_kvcached(
         )
 
 
-def shutdown_kvcached() -> None:
+def shutdown_kvcached() -> bool:
+    """Release KV resources, or return False if an active listener needs a retry."""
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
-        return
+        return True
 
+    if not stop_worker_listener_threads():
+        logger.warning("KV shutdown deferred: a worker IPC listener is still active")
+        return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    return True
 
 
 def observability_snapshot():
@@ -124,11 +140,11 @@ def alloc_kv_cache(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
-    if attention_type not in ["MHA", "GQA", "MLA"]:
+    if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
     is_mla = attention_type == "MLA"
-    if not is_mla and kv_layout != "NHD":
+    if not is_mla and kv_layout not in SUPPORTED_KV_LAYOUTS:
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
     num_k_or_v = 1 if is_mla else 2

@@ -8,6 +8,8 @@ import sys
 import threading
 import types
 
+import pytest
+
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
@@ -121,6 +123,31 @@ def test_idle_limit_applies_immediately_through_resize():
     assert state["effective_limit_bytes"] == page_bundle * 3
     assert state["current_capacity_bytes"] == page_bundle * 3
     assert state["revision"] == 7
+
+
+def test_quarantined_resize_rejection_does_not_accept_revision(monkeypatch):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager = _manager()
+
+    def resize(_size):
+        raise QuarantinedResizeError("quarantined pages")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    with pytest.raises(QuarantinedResizeError):
+        manager.set_memory_limit(manager.page_size, revision=1)
+    assert manager._memory_limit_revision == -1
+    assert not manager.in_shrink
+
+
+def test_rejected_deferred_limit_is_visible_until_next_resize():
+    manager = _manager()
+    manager._resize_rejected = True
+    state = manager.memory_limit_state()
+    assert state["status"] == "rejected"
+    assert state["reason"] == "quarantined_pages_prevent_resize"
+    assert manager.resize(manager.page_size * 8)
+    assert manager.memory_limit_state()["status"] == "applied"
 
 
 def test_active_limit_defers_without_revoking_and_converges_on_release():
@@ -246,3 +273,19 @@ def test_instance_limit_reports_unavailable_without_live_pools():
     assert result["status"] == "unavailable"
     assert result["reason"] == "no_registered_kv_cache_pool"
     assert result["pools"] == []
+
+
+def test_instance_limit_preserves_a_rejected_pool(monkeypatch):
+    from kvcached import control
+
+    pools = [_manager(), _manager()]
+    share = pools[0]._memory_limit_page_bundle_bytes() * 8
+    for pool in pools:
+        pool.set_memory_limit(share, revision=1)
+    pools[0]._resize_rejected = True
+    monkeypatch.setattr(control, "get_registered_kv_cache_pools",
+                        lambda: [(pool, {}) for pool in pools])
+    state = control.set_instance_memory_limit(share * 2, revision=1)
+    assert state["status"] == "rejected"
+    assert state["reason"] == "quarantined_pages_prevent_resize"
+    assert [pool["status"] for pool in state["pools"]] == ["rejected", "applied"]

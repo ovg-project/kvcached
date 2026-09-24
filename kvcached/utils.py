@@ -4,6 +4,9 @@
 import importlib.util
 import logging
 import os
+import threading
+import uuid
+from typing import BinaryIO, Optional
 
 
 class KVCachedConfigError(RuntimeError):
@@ -178,6 +181,76 @@ CONTIGUOUS_LAYOUT = _default_contiguous_layout()
 
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
+
+# Root of the per-instance TP worker socket directories (kvcached.tp_ipc_util).
+# The naming rule lives here, next to the IPC name, so tools that never load
+# the compiled extension (kvctl) can derive the directory from an IPC name.
+TP_SOCKET_DIR_ROOT = "/tmp"
+
+
+def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
+    """Return the TP worker socket directory for *ipc_name* (default: this
+    instance's DEFAULT_IPC_NAME).
+
+    The directory keeps the IPC name readable and appends a short
+    deterministic hash, so every worker of one engine instance agrees on it.
+    Unix domain socket paths are limited to 108 characters on Linux; the
+    caller validates the final socket path length.
+    """
+    name = DEFAULT_IPC_NAME if ipc_name is None else ipc_name
+    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, name).hex[:8]
+    return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
+
+
+class IPCSegmentCleanup:
+    """Remember one segment across teardown and retry only its failed unlink.
+
+    Capture before stopping the engine: it may remove its own segment during
+    shutdown. The open file pins the inode, so a later file at the same path
+    cannot inherit its identity. No contents are read or modified. This is
+    a replacement check, not a lock against concurrent instance startup.
+    """
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        self._lock = threading.Lock()
+        self._file: Optional[BinaryIO]
+        try:
+            self._file = open(segment, "rb")
+        except FileNotFoundError:
+            self._file = None
+
+    def unlink(self) -> bool:
+        """Return True when done; keep the original file open on failure."""
+        with self._lock:
+            return self._unlink()
+
+    def _unlink(self) -> bool:
+        if self._file is None:
+            return True
+        try:
+            current = os.stat(self.segment)
+            original = os.fstat(self._file.fileno())
+            if os.path.samestat(current, original):
+                os.unlink(self.segment)
+                get_kvcached_logger().info(
+                    "Unlinked KV cache limit segment %s", self.segment)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            get_kvcached_logger().warning(
+                "Failed to unlink %s on shutdown: %s", self.segment, e)
+            return False
+        self._file.close()
+        self._file = None
+        return True
+
+    def close(self) -> None:
+        """Discard an unconfirmed identity without deleting anything."""
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")

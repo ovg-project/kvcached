@@ -4,36 +4,41 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-
-#include <ATen/core/Tensor.h>
-#include <c10/core/Device.h>
-#include <c10/core/ScalarType.h>
 
 #include "constants.hpp"
 #include "ftensor.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 
 namespace kvcached {
 
-class FTensorAllocator {
+class KVCACHED_HIDDEN FTensorAllocator {
 public:
-  FTensorAllocator(const c10::Device &device, bool contiguous_layout);
+  FTensorAllocator(const torch::stable::Device &device, bool contiguous_layout);
   ~FTensorAllocator();
 
   // KV cache interfaces.
-  std::vector<at::Tensor> create_kv_tensors(size_t size, c10::ScalarType dtype,
-                                            const std::string &dev_str,
-                                            int64_t num_layers,
-                                            int64_t num_kv_buffers = 2,
-                                            bool unified_pool = false);
+  std::vector<torch::stable::Tensor>
+  create_kv_tensors(size_t size, torch::headeronly::ScalarType dtype,
+                    const std::string &dev_str, int64_t num_layers,
+                    int64_t num_kv_buffers = 2, bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  std::pair<bool, std::vector<offset_t>>
+  map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+  bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
+                                     const std::string &transaction_id);
+  bool commit_unmap_from_kv_tensors(const std::string &transaction_id);
+  bool abort_unmap_from_kv_tensors(const std::string &transaction_id);
 
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
@@ -46,19 +51,43 @@ public:
   void destroy();
 
 private:
+  struct RetainedMapping {
+    FTensor *ftensor;
+    offset_t offset;
+    std::unique_ptr<Page> page;
+  };
+
+  struct PendingUnmapTransaction {
+    std::string id;
+    std::vector<RetainedMapping> retained;
+    bool commit_started = false;
+  };
+
+  enum class UnmapTransactionOutcome { COMMITTED, ABORTED };
+
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
-  std::vector<at::Tensor>
+  std::vector<torch::stable::Tensor>
   create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
-                               c10::ScalarType dtype,
+                               torch::headeronly::ScalarType dtype,
                                const std::string &dev_str, int64_t num_layers);
-  std::vector<at::Tensor>
-  create_kv_tensors_contiguous_(size_t size, c10::ScalarType dtype,
+  std::vector<torch::stable::Tensor>
+  create_kv_tensors_contiguous_(size_t size,
+                                torch::headeronly::ScalarType dtype,
                                 const std::string &dev_str, int64_t num_layers,
                                 size_t compound_page_size);
-  at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
-                             const std::string &dev_str, std::string name = "");
-  void free_ftensor_(at::Tensor &ftensor);
+  torch::stable::Tensor create_ftensor_(size_t size,
+                                        torch::headeronly::ScalarType dtype,
+                                        const std::string &dev_str,
+                                        std::string name = "");
+  std::vector<RetainedMapping>
+  unmap_retain_locked_(const std::vector<offset_t> &offsets);
+  void restore_retained_locked_(std::vector<RetainedMapping> &retained,
+                                const std::string &original_error);
+  static void release_retained_locked_(std::vector<RetainedMapping> &retained);
+  void remember_unmap_outcome_locked_(const std::string &transaction_id,
+                                      UnmapTransactionOutcome outcome);
+  void reject_if_unmap_pending_locked_(const char *operation) const;
 
   // GPU VMM util functions.
   void init_gpu_();
@@ -68,10 +97,10 @@ private:
       g_allocators_;
   static std::mutex g_allocator_mutex_;
   // Device and layout from init(), used to create new group allocators.
-  static c10::Device g_device_;
+  static torch::stable::Device g_device_;
   static bool g_contiguous_layout_;
 
-  c10::Device dev_;
+  torch::stable::Device dev_;
 
   int64_t num_layers_;
   bool contiguous_layout_;
@@ -84,6 +113,11 @@ private:
   // For contiguous layout: single tensor containing all layers
   std::unique_ptr<FTensor> contiguous_kv_tensor_;
   std::shared_ptr<Page> zero_page_;
+  std::optional<PendingUnmapTransaction> pending_unmap_;
+  std::vector<RetainedMapping> failed_unmap_retained_;
+  std::unordered_map<std::string, UnmapTransactionOutcome>
+      finalized_unmap_transactions_;
+  std::deque<std::string> finalized_unmap_order_;
 };
 
 } // namespace kvcached

@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib
 import sys
+import threading
 import types
 from typing import Any
 from unittest import mock
@@ -380,6 +381,8 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     assert worker.determine_available_memory() == 530
     assert worker.non_torch_memory == 0
     assert worker.peak_activation_memory == 70
+    # The 0.29 warmup consumer reconstructs non-KV usage from these fields.
+    assert worker.total_consumed + worker.peak_activation_memory == 270
     assert worker.cudagraph_memory_estimate == 30
     profile_run.assert_called_once_with()
     profile_cudagraph.assert_called_once_with()
@@ -492,6 +495,7 @@ def test_null_block_reservation_waits_for_physical_capacity(monkeypatch, patches
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
     sleep = mock.Mock()
@@ -513,6 +517,7 @@ def test_null_block_reservation_retries_allocator_race(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(side_effect=[None, [0]])
     sleep = mock.Mock()
@@ -544,6 +549,7 @@ def test_null_block_wait_log_is_rate_limited(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
 
@@ -559,6 +565,7 @@ def test_null_block_reservation_keeps_wrong_id_fail_loud(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(return_value=[1])
 
