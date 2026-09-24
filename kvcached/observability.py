@@ -18,6 +18,7 @@ from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
 
 SCHEMA_VERSION = "kvcached.observability.v1"
 
+
 def _call_int(obj: Any, name: str) -> Optional[int]:
     method = getattr(obj, name, None)
     if method is None:
@@ -189,6 +190,66 @@ def _get_integration_capabilities() -> Dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class KVCachePoolOperationSnapshot:
+    """Monotonic operation counters for one kvcached-backed KV pool.
+
+    ``manager_page_allocations_total`` counts pages successfully handed to the
+    manager by ``alloc_page()``, including reuse of already-mapped reserved
+    pages. ``manager_page_allocation_failures_total`` counts its RuntimeError
+    failures, including fatal state-consistency errors.
+    ``manager_page_releases_total`` counts pages handed back by successful
+    ``free_pages()`` calls, even when the allocator retains them as mapped
+    reserved pages. These handoffs include internal allocation rollback and
+    clear operations; they are NOT physical map/unmap counters. Native
+    background preallocation, trimming, and resize map/unmap activity are not
+    counted as manager page handoffs.
+
+    ``freed_blocks_total`` counts completed ``page.free_batch()`` progress in
+    caller ``free()`` operations, even if a later page, unmap, or resize fails.
+    Internal allocation rollback is excluded from caller free counters.
+    """
+
+    schema_version: str
+    pool_type: str
+    integration: Optional[str]
+    pool_name: Optional[str]
+    group_id: int
+    allocation_requests_total: int
+    allocation_successes_total: int
+    allocation_failures_total: int
+    capacity_exhausted_total: int
+    allocated_blocks_total: int
+    free_requests_total: int
+    free_successes_total: int
+    free_failures_total: int
+    freed_blocks_total: int
+    manager_page_allocations_total: int
+    manager_page_allocation_failures_total: int
+    manager_page_releases_total: int
+    resize_requests_total: int
+    resize_successes_total: int
+    resize_deferred_total: int
+    resize_completions_total: int
+    trim_requests_total: int
+    trim_successes_total: int
+    clear_requests_total: int
+    clear_successes_total: int
+    operation_errors_total: int
+    post_init_errors_total: int
+    allocation_errors_total: int
+    free_errors_total: int
+    resize_errors_total: int
+    trim_errors_total: int
+    clear_errors_total: int
+    state_inconsistency_errors_total: int
+    last_error_code: Optional[str]
+    last_error_timestamp_ns: Optional[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def get_capabilities() -> Dict[str, Any]:
     """Return the stable extension surface currently exposed by kvcached.
 
@@ -206,12 +267,18 @@ def get_capabilities() -> Dict[str, Any]:
     returning ``True`` when the surface ships.
     """
 
+    operation_counter_names = [
+        name for name in KVCachePoolOperationSnapshot.__dataclass_fields__
+        if name.endswith("_total")
+    ]
     return {
         "schema_version": SCHEMA_VERSION,
         "features": {
             "runtime_snapshot": True,
             "kv_cache_pool_snapshot": True,
+            "kv_cache_pool_operation_snapshot": True,
             "registered_kv_cache_pool_snapshots": True,
+            "registered_kv_cache_pool_operation_snapshots": True,
             "read_only": True,
             "policy_control": False,
             # Revisioned instance memory limits. This is the one write path on
@@ -219,19 +286,18 @@ def get_capabilities() -> Dict[str, Any]:
             # and enforces the assigned cap through the resize()/in_shrink
             # state machine.
             "instance_memory_limit": True,
-            # Allocator-owned operation counters. Not landed yet.
-            "operation_counters": False,
+            "operation_counters": bool(operation_counter_names),
             # Runtime reservation reporting for non-KV memory. Not landed yet.
             "runtime_reservation_reporting": False,
         },
         "backends": _get_backend_capabilities(),
         "integrations": _get_integration_capabilities(),
         "pool_snapshot_fields": list(KVCachePoolSnapshot.__dataclass_fields__.keys()),
+        "pool_operation_snapshot_fields": list(
+            KVCachePoolOperationSnapshot.__dataclass_fields__.keys()
+        ),
         "runtime_snapshot_fields": list(RuntimeSnapshot.__dataclass_fields__.keys()),
-        # Names the counters exposed once operation observability lands. Kept
-        # coupled to features["operation_counters"]: this list is non-empty if
-        # and only if that flag is True.
-        "operation_counter_names": [],
+        "operation_counter_names": operation_counter_names,
     }
 
 
@@ -369,6 +435,67 @@ def _snapshot_one_pool(
     return take_snapshot(integration=integration)
 
 
+def build_kv_cache_pool_operation_snapshot(
+    manager: Any,
+    *,
+    integration: Optional[str] = None,
+) -> KVCachePoolOperationSnapshot:
+    """Build an exporter-neutral operation snapshot from a manager-like object."""
+
+    get_state = getattr(manager, "_get_operation_observability_state", None)
+    if get_state is None:
+        counters = dict(getattr(manager, "_operation_counters", {}))
+        last_error_code = getattr(manager, "_last_error_code", None)
+        last_error_timestamp_ns = getattr(manager, "_last_error_timestamp_ns", None)
+    else:
+        counters, last_error_code, last_error_timestamp_ns = get_state()
+
+    def counter(name: str) -> int:
+        return int(counters.get(name, 0))
+
+    return KVCachePoolOperationSnapshot(
+        schema_version=SCHEMA_VERSION,
+        pool_type="kv_cache",
+        integration=integration,
+        pool_name=getattr(manager, "pool_name", None),
+        group_id=_int_attr(manager, "group_id") or 0,
+        allocation_requests_total=counter("allocation_requests_total"),
+        allocation_successes_total=counter("allocation_successes_total"),
+        allocation_failures_total=counter("allocation_failures_total"),
+        capacity_exhausted_total=counter("capacity_exhausted_total"),
+        allocated_blocks_total=counter("allocated_blocks_total"),
+        free_requests_total=counter("free_requests_total"),
+        free_successes_total=counter("free_successes_total"),
+        free_failures_total=counter("free_failures_total"),
+        freed_blocks_total=counter("freed_blocks_total"),
+        manager_page_allocations_total=counter("manager_page_allocations_total"),
+        manager_page_allocation_failures_total=counter(
+            "manager_page_allocation_failures_total"
+        ),
+        manager_page_releases_total=counter("manager_page_releases_total"),
+        resize_requests_total=counter("resize_requests_total"),
+        resize_successes_total=counter("resize_successes_total"),
+        resize_deferred_total=counter("resize_deferred_total"),
+        resize_completions_total=counter("resize_completions_total"),
+        trim_requests_total=counter("trim_requests_total"),
+        trim_successes_total=counter("trim_successes_total"),
+        clear_requests_total=counter("clear_requests_total"),
+        clear_successes_total=counter("clear_successes_total"),
+        operation_errors_total=counter("operation_errors_total"),
+        post_init_errors_total=counter("post_init_errors_total"),
+        allocation_errors_total=counter("allocation_errors_total"),
+        free_errors_total=counter("free_errors_total"),
+        resize_errors_total=counter("resize_errors_total"),
+        trim_errors_total=counter("trim_errors_total"),
+        clear_errors_total=counter("clear_errors_total"),
+        state_inconsistency_errors_total=counter(
+            "state_inconsistency_errors_total"
+        ),
+        last_error_code=last_error_code,
+        last_error_timestamp_ns=last_error_timestamp_ns,
+    )
+
+
 def get_registered_kv_cache_pool_snapshots(
     *,
     integration: Optional[str] = None,
@@ -401,4 +528,44 @@ def get_registered_kv_cache_pool_snapshot_dicts(
     return [
         snapshot.to_dict()
         for snapshot in get_registered_kv_cache_pool_snapshots(integration=integration)
+    ]
+
+
+def get_registered_kv_cache_pool_operation_snapshots(
+    *,
+    integration: Optional[str] = None,
+) -> List[KVCachePoolOperationSnapshot]:
+    """Return operation snapshots of currently live registered KV pools."""
+
+    snapshots = []
+    for manager, registered_integration in get_registered_kv_cache_pools(
+        integration=integration
+    ):
+        snapshots.append(
+            build_kv_cache_pool_operation_snapshot(
+                manager,
+                integration=registered_integration,
+            )
+        )
+    return sorted(
+        snapshots,
+        key=lambda snapshot: (
+            snapshot.integration or "",
+            snapshot.pool_name or "",
+            snapshot.group_id,
+        ),
+    )
+
+
+def get_registered_kv_cache_pool_operation_snapshot_dicts(
+    *,
+    integration: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable operation snapshots of registered KV pools."""
+
+    return [
+        snapshot.to_dict()
+        for snapshot in get_registered_kv_cache_pool_operation_snapshots(
+            integration=integration
+        )
     ]
