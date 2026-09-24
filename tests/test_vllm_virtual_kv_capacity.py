@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib
 import sys
+import threading
 import types
 from typing import Any
 from unittest import mock
@@ -80,7 +81,7 @@ def _install_memory_profiling(
     @contextlib.contextmanager
     def memory_profiling(init_snapshot, *, weights_memory):
         calls.append((init_snapshot, weights_memory))
-        yield types.SimpleNamespace(
+        result = types.SimpleNamespace(
             weights_memory=weights_memory,
             torch_peak_increase=torch_peak_increase,
             non_torch_increase=10_000,
@@ -88,6 +89,9 @@ def _install_memory_profiling(
                 torch_peak=before_torch_peak
             ),
         )
+        yield result
+        if callable(torch_peak_increase):
+            result.torch_peak_increase = torch_peak_increase()
 
     module = types.ModuleType("vllm.utils.mem_utils")
     setattr(module, "memory_profiling", memory_profiling)
@@ -306,13 +310,18 @@ def test_determine_available_memory_injects_automatic_virtual_budget(
     capacity.assert_not_called()
 
 
+@pytest.mark.parametrize("graph_peak", [999, 9999])
 def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
-    monkeypatch, patches
+    monkeypatch, patches, graph_peak
 ):
     torch = sys.modules["torch"]
     profile_modes = []
+    graph_profiled = False
 
     def record_profile_mode(result=None):
+        nonlocal graph_profiled
+        if result is not None:
+            graph_profiled = True
         profile_modes.append(
             (
                 torch.is_grad_enabled(),
@@ -325,7 +334,9 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     profile_cudagraph = mock.Mock(side_effect=lambda: record_profile_mode(30))
     _install_memory_profiling(
         monkeypatch,
-        torch_peak_increase=999,
+        # A graph captured after the profiling context exits cannot contaminate
+        # its peak. Keep the legacy in-context path covered by the same contract.
+        torch_peak_increase=lambda: graph_peak if graph_profiled else 70,
         before_torch_peak=10,
     )
     torch = sys.modules["torch"]
@@ -494,6 +505,7 @@ def test_null_block_reservation_waits_for_physical_capacity(monkeypatch, patches
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
     sleep = mock.Mock()
@@ -515,6 +527,7 @@ def test_null_block_reservation_retries_allocator_race(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(side_effect=[None, [0]])
     sleep = mock.Mock()
@@ -546,6 +559,7 @@ def test_null_block_wait_log_is_rate_limited(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
 
@@ -561,6 +575,7 @@ def test_null_block_reservation_keeps_wrong_id_fail_loud(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(return_value=[1])
 

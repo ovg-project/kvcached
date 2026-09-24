@@ -42,6 +42,7 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     manager.pp_rank = 0
     manager.group_id = 0
     manager._post_init_done = threading.Event()
+    manager._shutdown_requested = threading.Event()
 
     calls = 0
 

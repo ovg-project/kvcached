@@ -122,6 +122,8 @@ public:
   // Thread management
   void start_prealloc_thread();
   void stop_prealloc_thread();
+  // Call only after stopping users of the shared segment.
+  bool release_shared_segment() { return mem_info_tracker_->release_segment(); }
 
   // Callback function setters for multi-process support
   void set_broadcast_map_callback(BroadcastMapCallback callback);

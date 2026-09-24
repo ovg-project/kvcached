@@ -11,6 +11,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -130,6 +132,21 @@ def test_retry_receives_failed_check(monkeypatch, case):
     assert result["status"] == "validated-candidate"
     assert len(calls) == 2
     assert "attempt-1" in calls[1][1] and "AssertionError" in calls[1][1]
+
+
+def test_check_named_agent_cannot_overwrite_transcript(monkeypatch, case):
+    config_path = case.checks / "checks.json"
+    config = json.loads(config_path.read_text())
+    config["probes"][0]["name"] = "agent"
+    config_path.write_text(json.dumps(config))
+    agent(monkeypatch, case, lambda _: fix(case))
+
+    result = execute(case)
+
+    assert result["status"] == "validated-candidate"
+    transcript = result["attempts"][0]["log"]
+    assert (case.output / transcript).read_text() == "test agent\n"
+    assert all(check["log"] != transcript for check in result["checks"])
 
 
 def test_new_test_files_are_exported(monkeypatch, case):
@@ -600,6 +617,25 @@ def test_spawn_failure_is_reported(tmp_path):
     )
     assert record["exit_code"] == 127
     assert "Could not run" in (tmp_path / "missing.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("failure", ["denied", "timeout"])
+def test_windows_tree_kill_failure_stops_repair(tmp_path, monkeypatch, failure):
+    process = mock.Mock(pid=1234)
+    process.communicate.side_effect = subprocess.TimeoutExpired("agent", 1)
+    monkeypatch.setattr(repair.subprocess, "Popen", mock.Mock(return_value=process))
+    tree_kill = mock.Mock(return_value=SimpleNamespace(returncode=5))
+    if failure == "timeout":
+        tree_kill.side_effect = subprocess.TimeoutExpired("taskkill", 5)
+    monkeypatch.setattr(repair.subprocess, "run", tree_kill)
+    monkeypatch.setattr(repair.sys, "platform", "win32")
+
+    with pytest.raises(repair.GateError, match="process tree"):
+        repair.run_command(["agent"], tmp_path, tmp_path / "timeout.log", 1, {})
+
+    process.kill.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=5)
+    assert tree_kill.call_args.kwargs["timeout"] == 5
 
 
 def test_argv_expansion_is_not_shell_interpolation(tmp_path):
