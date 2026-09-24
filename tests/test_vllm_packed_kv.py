@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Packed KV views and their physical-buffer contract for vLLM 0.28."""
+"""Packed KV views and their physical-buffer contract for vLLM 0.26+."""
 
 import importlib
 import math
@@ -115,7 +115,7 @@ def test_native_packed_scales_preserve_layer_offsets(interfaces, monkeypatch, co
     backend = pytest.importorskip("vllm.v1.attention.backends.triton_attn")
     from kvcached.integration.vllm.patches import _uses_packed_attention_kv
     if not _uses_packed_attention_kv():
-        pytest.skip("Native packed scale handling requires vLLM 0.28")
+        pytest.skip("Native packed scale handling requires vLLM 0.26+")
     monkeypatch.setattr(interfaces, "_contiguous_layout", contiguous)
     views = interfaces.alloc_kv_cache((2, 2, 16, 24), BLOCK_SIZE, torch.uint8,
                                      "cuda:0", LAYERS, kv_layout=layout)

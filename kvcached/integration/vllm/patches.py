@@ -333,9 +333,9 @@ VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility 
 
 
 def _uses_packed_attention_kv() -> bool:
-    """Whether vLLM's Triton/CUDA backends use the packed attention API."""
+    """Whether vLLM's Triton/CUDA backends use the 0.26+ packed attention API."""
     version = VersionManager.get_instance().detect_version("vllm")
-    return version is not None and VersionRange(">=0.28.0").contains(version)
+    return version is not None and VersionRange(">=0.26.0").contains(version)
 
 
 def _uses_packed_engine_geometry() -> bool:
@@ -374,7 +374,7 @@ def _get_kv_cache_params(
         # MLA: single combined KV buffer per layer
         # HYBRID_LINEAR (full attention + linear attention): K and V are
         # interleaved into one buffer per layer, so it shares MLA's
-        # single-buffer math. vLLM 0.28 on CUDA also packs ordinary attention's K/V
+        # single-buffer math. vLLM 0.26+ on CUDA also packs ordinary attention's K/V
         # into a single block; the worker checks its backend shape and strides.
         # page_size_bytes = block_size * num_kv_heads * head_size * dtype_size
         cell_size = kv_cache_spec.page_size_bytes // block_size
@@ -2835,7 +2835,7 @@ class TritonAttentionPatch(VersionAwarePatch, BasePatch):
     def patch_ensure_scale_caches(self,
                                   triton_attn_mod: types.ModuleType) -> bool:
         if _uses_packed_attention_kv():
-            # vLLM 0.28's packed implementation already uses the tensor's
+            # vLLM 0.26+'s packed implementation already uses the tensor's
             # actual strides and storage offset. The old 5D patch is invalid.
             return True
         impl_cls = self._get_target_class(triton_attn_mod)

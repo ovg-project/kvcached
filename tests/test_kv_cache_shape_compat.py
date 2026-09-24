@@ -106,8 +106,10 @@ def test_no_direct_get_kv_cache_shape_calls():
         f"cache_dtype_str is forwarded (#424); direct calls at lines {direct}")
 
 
-@pytest.mark.parametrize("version,buffers", [("0.22.1", 2), ("0.27.0", 2),
-                                            ("0.28.0", 1), ("0.28.0+cu129", 1)])
+@pytest.mark.parametrize("version,buffers", [("0.22.1", 2), ("0.25.0", 2),
+                                            ("0.26.0", 1), ("0.26.0+cu130", 1),
+                                            ("0.27.0", 1), ("0.28.0", 1),
+                                            ("0.28.0+cu129", 1)])
 def test_engine_packed_geometry_matches_worker_version(monkeypatch, version, buffers):
     monkeypatch.setattr(torch.version, "hip", None)
     manager = patches.VersionManager.get_instance()
@@ -126,7 +128,7 @@ def test_rocm_keeps_split_engine_geometry_on_028(monkeypatch):
     spec = SimpleNamespace(page_size_bytes=4096)
     assert patches._get_kv_cache_params(spec, 16) == (128, 2)
     assert not patches._uses_packed_engine_geometry()
-    # The Triton scale API still changed in 0.28, irrespective of platform.
+    # The Triton scale API changed in 0.26, irrespective of platform.
     assert patches._uses_packed_attention_kv()
 
 
@@ -160,8 +162,10 @@ def test_unimplemented_packed_stride_order_uses_logical_layout():
     assert patches._get_packed_kv_layout(backend) == "HND"
 
 
-def test_packed_backend_keeps_native_scale_views(monkeypatch):
-    monkeypatch.setattr(patches, "_uses_packed_attention_kv", lambda: True)
+@pytest.mark.parametrize("version", ["0.26.0", "0.27.0", "0.28.0"])
+def test_packed_backend_keeps_native_scale_views(monkeypatch, version):
+    manager = patches.VersionManager.get_instance()
+    monkeypatch.setattr(manager, "detect_version", lambda _: version)
 
     class Impl:
         def _ensure_scale_caches(self, kv_cache):
