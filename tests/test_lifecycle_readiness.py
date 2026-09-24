@@ -874,6 +874,75 @@ def test_untyped_error_with_a_healthy_native_verdict_records_nothing(monkeypatch
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("async_sched", [False, True])
+def test_clear_waits_for_initial_readiness_publication(monkeypatch, async_sched):
+    manager = _bare_manager()
+    manager._lock = threading.RLock() if async_sched else NoOpLock()
+    monkeypatch.setattr(kcm, "broadcast_kv_tensors_created", lambda *a, **kw: True)
+    publishing = threading.Event()
+    publish = threading.Event()
+    clear_boundary = threading.Event()
+    inside_clear = threading.Event()
+    finish_clear = threading.Event()
+    errors = []
+    mark_ready = manager._lifecycle.mark_ready
+    begin_reinit = manager._lifecycle.begin_reinit
+    wait_settled = manager._lifecycle.wait_settled
+
+    def delayed_initial_ready():
+        if not publishing.is_set():
+            publishing.set()
+            assert publish.wait(5)
+        mark_ready()
+
+    def observed_begin_reinit():
+        begin_reinit()
+        clear_boundary.set()
+
+    def observed_wait_settled(timeout=None):
+        clear_boundary.set()
+        return wait_settled(timeout)
+
+    def hold_clear():
+        inside_clear.set()
+        assert finish_clear.wait(5)
+
+    def clear():
+        try:
+            manager.clear()
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(manager._lifecycle, "mark_ready", delayed_initial_ready)
+    monkeypatch.setattr(manager._lifecycle, "begin_reinit", observed_begin_reinit)
+    monkeypatch.setattr(manager._lifecycle, "wait_settled", observed_wait_settled)
+    monkeypatch.setattr(manager, "_clear_locked", hold_clear)
+    initializer = _run_post_init(manager)
+    clearer = threading.Thread(target=clear, daemon=True)
+    try:
+        assert publishing.wait(5)
+        assert manager._post_init_done.is_set()
+        clearer.start()
+        assert clear_boundary.wait(5)
+        publish.set()
+        initializer.join(5)
+        assert not initializer.is_alive()
+        assert inside_clear.wait(5)
+        assert manager.lifecycle_phase is LifecyclePhase.INITIALIZING
+        with pytest.raises(TimeoutError):
+            manager.wait_ready(timeout=0.01)
+    finally:
+        publish.set()
+        finish_clear.set()
+        initializer.join(5)
+        if clearer.ident is not None:
+            clearer.join(5)
+    assert not errors
+    assert not clearer.is_alive()
+    manager.wait_ready(timeout=1)
+    assert manager.lifecycle_phase is LifecyclePhase.READY
+
+
 def test_clear_reenters_initializing_and_returns_to_ready(monkeypatch):
     manager = _make_manager(monkeypatch)
     manager.wait_ready(timeout=5)

@@ -83,6 +83,12 @@ def run_case(group_id, fail):
         assert state["state"] == "FAILED", state
         assert manager.lifecycle_error is not None
         assert manager.lifecycle_error.__traceback__ is not None
+        snapshot = manager.observability_snapshot()
+        assert snapshot.lifecycle_phase == "failed"
+        assert snapshot.available_blocks == 0
+        assert snapshot.available_bytes == 0
+        assert snapshot.total_pages > 0
+        expect_fail_closed(manager.available_size)
         expect_fail_closed(lambda: manager.wait_ready(timeout=5))
         expect_fail_closed(lambda: manager.alloc(1))
         assert manager.lifecycle_phase is LifecyclePhase.FAILED
