@@ -322,6 +322,7 @@ def _bare_manager() -> kcm.KVCacheManager:
     manager.page_allocator = FakePageAllocator()
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
+    manager._shutdown_requested = threading.Event()
     manager._lifecycle = LifecycleState("bare")
     return manager
 
@@ -399,6 +400,27 @@ def test_post_init_success_reaches_ready(monkeypatch):
     assert manager._post_init_done.is_set()
     assert "start_prealloc_thread" in manager.page_allocator.calls
     assert manager.page_allocator.map_callback is not None
+
+
+@pytest.mark.parametrize("cancel_during_reservation", [False, True])
+def test_cancelled_post_init_settles_readiness(monkeypatch, cancel_during_reservation):
+    manager = _bare_manager()
+    monkeypatch.setattr(kcm, "broadcast_kv_tensors_created",
+                        lambda *args, **kwargs: True)
+    if cancel_during_reservation:
+        monkeypatch.setattr(manager, "_reserve_null_block",
+                            manager._shutdown_requested.set)
+    else:
+        manager._shutdown_requested.set()
+
+    thread = _run_post_init(manager)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert manager._post_init_done.is_set()
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(RuntimeError, match="initialization cancelled by shutdown"):
+        manager.wait_ready(timeout=0)
+    assert "start_prealloc_thread" not in manager.page_allocator.calls
 
 
 def test_post_init_failure_is_re_raised_by_wait_ready(monkeypatch):

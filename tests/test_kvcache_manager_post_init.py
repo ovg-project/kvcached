@@ -45,6 +45,7 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     # _post_init() records the outcome on the lifecycle holder, normally
     # created in __init__.
     manager._lifecycle = kv_cache_manager.LifecycleState("post-init-test")
+    manager._shutdown_requested = threading.Event()
 
     calls = 0
 
