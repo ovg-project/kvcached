@@ -452,6 +452,7 @@ def _make_manager(page_allocator, ipc_name="kvcached_test_477"):
     manager._shut_down = False
     manager._shutdown_lock = threading.Lock()
     manager._shutdown_requested = threading.Event()
+    manager._lifecycle = module.LifecycleState(ipc_name)
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
     manager._prealloc_stopped = False

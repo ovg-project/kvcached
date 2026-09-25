@@ -110,6 +110,7 @@ except ImportError:
     _install_vmm_ops_stub()
 
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
+from kvcached.lifecycle import LifecycleState  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
 
 
@@ -131,6 +132,8 @@ def make_manager(fail_after: int,
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
+    manager._lifecycle = LifecycleState("rollback-test")
+    manager._lifecycle.mark_ready()
     return manager
 
 
