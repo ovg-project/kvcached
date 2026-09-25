@@ -98,7 +98,7 @@ def validate(payload: Any, base: str, tag: str, allow: List[str]) -> None:
         not isinstance(base, str)
         or not isinstance(tag, str)
         or not re.fullmatch(r"[0-9a-f]{40}", base)
-        or not re.fullmatch(r"v\d+\.\d+\.\d+", tag)
+        or not re.fullmatch(r"v\d+\.\d+\.\d+(?:\.post\d+)?", tag)
     ):
         raise ValueError("Pin a full base SHA and a stable release tag")
     if (
@@ -168,7 +168,7 @@ def commit_object(root: Path, base: str, tag: str, files: Dict[str, Any]) -> str
                 env=env,
             )
         tree = git(root, "write-tree", env=env).decode().strip()
-        message = f"fix: adapt vLLM {tag}\n\nAutomatically prepared; requires human review.\n"
+        message = f"fix: adapt engine release {tag}\n\nAutomatically prepared; requires human review.\n"
         return (
             git(
                 root,

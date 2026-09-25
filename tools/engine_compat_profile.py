@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from engine_compat_artifact import allowed_paths, canonical
+from engine_release_analysis import load_bundle
+from repair_engine_compat import check_environment, fingerprint
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = ROOT / ".github/engine-compat"
@@ -25,10 +27,36 @@ PROBES = {
     "hybrid": ["tools/engine_compat_hybrid_probe.py", "tools/engine_compat_hybrid_hooks.py",
                "tools/engine_compat_tiny_hybrid.json", "tools/engine_compat_gpu_probe.py"],
     "sharing": ["tools/engine_compat_sharing_probe.py", "tools/engine_compat_gpu_probe.py"],
+    "gptoss": ["tools/engine_compat_gptoss_probe.py", "tools/engine_compat_family_probe.py",
+               "tools/engine_compat_sharing_probe.py", "tools/engine_compat_gpu_probe.py"],
+    "mla": ["tools/engine_compat_mla_probe.py", "tools/engine_compat_family_probe.py",
+            "tools/engine_compat_sharing_probe.py", "tools/engine_compat_gpu_probe.py"],
 }
 
 
 def load_profile(name: str) -> Dict[str, Any]:
+    if name == "auto":
+        root = Path(os.environ["ENGINE_COMPAT_ANALYSIS_DIR"]).resolve()
+        manifest = load_bundle(root, os.environ.get("ENGINE_COMPAT_ANALYSIS_DIGEST"))
+        engine = manifest["engine"]
+        checks = [f"tests/test_{engine}_virtual_kv_capacity.py"]
+        def source_hash(name):
+            return hashlib.sha256((ROOT / name).read_text(encoding="utf-8").encode()).hexdigest()
+
+        hashes = {name: source_hash(name) for name in checks}
+        value = dict(name=name, task=json.dumps(manifest["plan"], indent=2),
+                     allow=allowed_paths(root / "allow.json"), cpu_tests=["test_cpu.py", *checks],
+                     gpu_tests=["test_gpu.py"], qualification="single-gpu", repair=True,
+                     runner="auto", layouts=["non-contiguous"], releases=[".".join(manifest["tag"][1:].split(".")[:2])],
+                     probe="attention" if engine == "vllm" else "runtime",
+                     engine=engine, contract_root=str(root), manifest=manifest)
+        # Bind controller-owned regressions as well as generated, reviewed contracts.
+        value["policy_digest"] = hashlib.sha256(canonical(dict(
+            bundle=manifest["digest"], checks=hashes, probe=value["probe"],
+            probe_source=source_hash("tools/engine_compat_gpu_probe.py"),
+            runtime_source=source_hash("tools/engine_compat_runtime_probe.py"),
+        ))).hexdigest()
+        return value
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", name):
         raise ValueError("Invalid compatibility profile name")
     path = PROFILES / f"{name}.json"
@@ -59,6 +87,11 @@ def load_profile(name: str) -> Dict[str, Any]:
         or value["layouts"] != ["non-contiguous", "contiguous"]
     ):
         raise ValueError("Sharing acceptance is validation-only for 0.29 MRV2 in both layouts")
+    if value["probe"] in ("gptoss", "mla") and (
+        value["repair"] or value["runner"] != "v2" or value["releases"] != ["0.29"]
+        or value["layouts"] != ["non-contiguous", "contiguous"]
+    ):
+        raise ValueError("Model-family acceptance is validation-only for 0.29 MRV2 in both layouts")
     if value["qualification"] != "single-gpu":
         raise ValueError("This controller has no validator for the requested qualification")
     if not isinstance(value["task"], str) or not value["task"].strip():
@@ -91,7 +124,7 @@ def load_profile(name: str) -> Dict[str, Any]:
 
 
 def validate_release(profile: Dict[str, Any], tag: str) -> None:
-    match = re.fullmatch(r"v(\d+\.\d+)\.\d+", tag)
+    match = re.fullmatch(r"v(\d+\.\d+)\.\d+(?:\.post\d+)?", tag)
     if not match or not isinstance(profile["releases"], list):
         raise ValueError("A stable release and reviewed release range are required")
     if "*" not in profile["releases"] and match[1] not in profile["releases"]:
@@ -114,13 +147,21 @@ def run_checks(profile: Dict[str, Any], source: Path, output: Path, *, gpu=False
     status = 0
     for index, test in enumerate(profile["gpu_tests" if gpu else "cpu_tests"]):
         xml = output / f"{index}.xml"
-        target = (ROOT if trusted else source) / test
+        if "contract_root" in profile:
+            target = (Path(profile["contract_root"]) if test.startswith("test_") else ROOT) / test
+        else:
+            target = (ROOT if trusted else source) / test
         command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                    "--confcutdir", str(target.parent), str(target), f"--junitxml={xml}"]
-        env = dict(os.environ, PYTHONPATH=str(source), ENGINE_COMPAT_SOURCE=str(source),
+        env = dict(check_environment(dict(os.environ)), PYTHONPATH=str(source), ENGINE_COMPAT_SOURCE=str(source),
                    PYTHONDONTWRITEBYTECODE="1",
                    PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0")
-        result = subprocess.run(command, cwd=source, env=env, check=False)
+        for key in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+            env.pop(key, None)
+        before = fingerprint(source) if "contract_root" in profile else None
+        result = subprocess.run(command, cwd=source, env=env, check=False, timeout=600)
+        if before is not None and fingerprint(source) != before:
+            raise ValueError("Generated acceptance changed the candidate")
         counts = dict(tests=0, failures=0, errors=0, skipped=0)
         if xml.exists():
             for suite in ET.parse(xml).getroot().iter("testsuite"):
@@ -130,7 +171,8 @@ def run_checks(profile: Dict[str, Any], source: Path, output: Path, *, gpu=False
         code = result.returncode
         if code == 0 and counts["tests"] > 0 and not any(counts[k] for k in ("skipped", "failures", "errors")):
             disposition = 0
-        elif code == 1 and counts["tests"] > 0 and counts["failures"] > 0:
+        elif (code == 1 and counts["tests"] > 0 and counts["failures"] > 0
+              and counts["errors"] == 0 and counts["skipped"] == 0):
             disposition = 1
         else:
             disposition = 2
@@ -143,6 +185,24 @@ def run_checks(profile: Dict[str, Any], source: Path, output: Path, *, gpu=False
     return status
 
 
+def validate_baseline_failures(profile, output):
+    """Require an actual failed assertion per discovered task, not unrelated red tests."""
+    report = json.loads((output / "checks.json").read_text(encoding="utf-8"))
+    checks = report["checks"]
+    if (report["exit_code"] != 1 or checks[0]["test"] != "test_cpu.py"
+            or checks[0]["disposition"] != 1
+            or any(check["disposition"] != 0 for check in checks[1:])):
+        raise ValueError("Discovered repairs need baseline-red contracts and green existing regressions")
+    cases = ET.parse(output / "0.xml").getroot().iter("testcase")
+    failed = [case.get("name", "") for case in cases
+              if any("AssertionError" in (failure.text or "")
+                     for failure in case.findall("failure"))]
+    for task in profile["manifest"]["plan"]["tasks"]:
+        prefix = "test_" + task["id"].replace("-", "_") + "__"
+        if not any(name.startswith(prefix) for name in failed):
+            raise ValueError(f"No behavioral baseline failure for {task['id']}")
+
+
 def run_probe_matrix(profile, source, output, version, candidate_sha):
     """Execute every reviewed runner/layout cell; missing evidence cannot pass."""
     if not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
@@ -152,11 +212,16 @@ def run_probe_matrix(profile, source, output, version, candidate_sha):
     status = 0
     for layout in profile["layouts"]:
         destination = output / layout
-        command = [sys.executable, str(ROOT / PROBES[profile["probe"]][0]),
+        script = ("tools/engine_compat_runtime_probe.py" if profile["probe"] == "runtime"
+                  else PROBES[profile["probe"]][0])
+        command = [sys.executable, str(ROOT / script),
                    "--source", str(source), "--output", str(destination),
                    "--version", version, "--candidate-sha", candidate_sha,
                    "--runner", profile["runner"], "--layout", layout, "--mode", "compare"]
-        code = subprocess.run(command, check=False).returncode
+        before = fingerprint(source) if "contract_root" in profile else None
+        code = subprocess.run(command, check=False, timeout=1800).returncode
+        if before is not None and fingerprint(source) != before:
+            raise ValueError("Runtime qualification changed the candidate")
         report = destination / "result.json"
         value = json.loads(report.read_text()) if report.is_file() else {}
         if (code == 0 and value.get("status") == "passed" and value.get("comparison") == "passed"

@@ -3,6 +3,12 @@ name: Independent candidate CI
 on:
   workflow_call:
     inputs:
+      engine:
+        type: string
+        default: vllm
+      analysis_digest:
+        type: string
+        default: ''
       profile:
         type: string
         required: true
@@ -29,6 +35,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      ENGINE_COMPAT_ANALYSIS_DIR: ${{ github.workspace }}/analysis/bundle
+      ENGINE_COMPAT_ANALYSIS_DIGEST: ${{ inputs.analysis_digest }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +60,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@v4
+        if: inputs.profile == 'auto'
+        with:
+          name: ${{ inputs.engine }}-release-analysis
+          path: analysis
+      - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact }}
           path: handoff
@@ -61,9 +75,11 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: |
           python controller/tools/engine_compat_profile.py "$PROFILE"
+          allow="controller/.github/engine-compat/$PROFILE-allow.json"
+          if [[ "$PROFILE" == auto ]]; then allow=analysis/bundle/allow.json; fi
           python controller/tools/engine_compat_artifact.py materialize \
             --source candidate --base "$BASE_SHA" --tag "$RELEASE_TAG" \
-            --allow-list "controller/.github/engine-compat/$PROFILE-allow.json" \
+            --allow-list "$allow" \
             --artifact handoff/candidate.json
       - name: Install the same dependencies as CPU CI
         run: |
@@ -90,7 +106,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           PROFILE: ${{ inputs.profile }}
         run: |
+          python controller/tools/engine_compat_profile.py "$PROFILE"
+          allow="controller/.github/engine-compat/$PROFILE-allow.json"
+          if [[ "$PROFILE" == auto ]]; then allow=analysis/bundle/allow.json; fi
           python controller/tools/engine_compat_artifact.py verify \
             --source candidate --base "$BASE_SHA" --tag "$RELEASE_TAG" \
-            --allow-list "controller/.github/engine-compat/$PROFILE-allow.json" \
+            --allow-list "$allow" \
             --artifact handoff/candidate.json

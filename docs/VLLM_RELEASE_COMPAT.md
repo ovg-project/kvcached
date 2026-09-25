@@ -1,6 +1,6 @@
-# vLLM release compatibility workflow
+# Engine release compatibility workflow
 
-This workflow detects stable vLLM releases, prepares a bounded compatibility
+This workflow detects stable vLLM and SGLang releases, prepares a bounded compatibility
 repair, validates it on a separate GPU host, and publishes a PR for human review.
 It does not merge changes or certify every supported model and GPU topology.
 
@@ -8,29 +8,36 @@ It does not merge changes or certify every supported model and GPU topology.
 
 1. An hourly poll selects the oldest unseen stable release at or above the
    configured starting version. Manual dispatch can select an exact tag.
-2. The detector pins the upstream commit and claims the release/profile pair in a tracker
+2. The detector pins the upstream commit and claims the engine/release/profile pair in a tracker
    issue. Successful, failed, interrupted and no-change runs remain recorded.
    The candidate starts at the PR target's pinned default branch, not the branch
    used to dispatch the controller workflow.
-3. A CPU job runs immutable behavioral probes and, when needed, invokes the
+3. For `auto`, a read-only Codex analysis compares the preceding stable release,
+   the new release, current adapters and pending adapter PRs. It produces a
+   coverage report and source-backed repair tasks. A separate invocation writes
+   CPU/GPU acceptance tests, and another reviews those tests before they are
+   frozen. No person needs to prepare a gap list or a version-specific profile.
+4. A CPU job runs immutable behavioral probes and, when needed, invokes the
    bounded repair runner. Passing CPU probes still produces a candidate for GPU
    validation; it is not a reason to skip that stage.
-4. A dedicated GPU runner independently reconstructs the candidate, builds it,
+5. A dedicated GPU runner independently reconstructs the candidate, builds it,
    and runs the GPU probe. It has no Codex credentials.
-5. A behavioral GPU failure can trigger one additional CPU/GPU round. The CPU
+6. A behavioral GPU failure can trigger one additional CPU/GPU round. The CPU
    job verifies that the report belongs to this candidate and upstream commit.
    Infrastructure failures stop the run instead of asking the agent to fix code.
-6. A passing candidate runs the complete CPU suite, MyPy on Python 3.9 through
+7. A passing candidate runs the complete CPU suite, MyPy on Python 3.9 through
    3.13, pre-commit, and GPU-free C++ tests in fresh hosted workers.
-7. A separate publisher reconstructs exactly the tested commit and creates a PR.
+8. A separate publisher reconstructs exactly the tested commit and creates a PR.
    Existing human branch changes are never overwritten. Unchanged candidates
    produce a successful report without an empty PR. Publication is complete only
    after the PR identity, mergeability and remote checks for that SHA are verified.
 
 Each CPU round permits one Codex attempt. There are at most two CPU/GPU rounds.
 Manual dispatch defaults to `mode=validate`: run the independent checks against
-the unchanged baseline, then GPU checks and full CI. This mode neither installs
-nor invokes Codex, does not retry a behavioral failure, and cannot publish a PR.
+the unchanged baseline, then GPU checks and full CI. The `auto` profile still
+uses Codex for analysis and contract design, but validate mode never invokes a
+repair agent, retries a behavioral failure or publishes a PR. Fixed profiles
+do not invoke Codex at all in validate mode.
 Use it to qualify merged adapters without duplicating pending manual work.
 Scheduled runs retain the bounded `repair` mode; enabling schedules is a separate
 operator decision, not a side effect of running validation.
@@ -41,7 +48,98 @@ silently spend another repair budget.
 
 The next hourly poll discovers releases missed while another run was executing.
 The `release` event on this repository cannot observe releases in the separate
-vLLM repository, so it is not used here.
+engine repositories, so it is not used here. Detection latency is up to one
+poll interval plus runner queue time; this is not an instantaneous webhook.
+
+```mermaid
+sequenceDiagram
+    participant Release as New engine release
+    participant Analyzer as Read-only analyzer
+    participant Checks as Contract author and reviewer
+    participant Repair as Repair agent
+    participant GPU as Independent GPU runner
+    participant CI as Full CI and publisher
+    Release->>Analyzer: Old/new SHAs, adapters, pending PRs
+    Analyzer->>Checks: Source-backed tasks and coverage gaps
+    Checks->>Checks: Write, review and freeze acceptance
+    Checks->>Repair: Exact write scope and failing baseline
+    Repair->>GPU: Candidate, frozen policy and source identity
+    GPU->>CI: Matching behavioral and failure-recovery evidence
+    CI->>CI: Validate exact candidate, open PR for human review
+```
+
+## Automatic analysis boundary
+
+`engine-release-schedule.yml` polls both engines; `vllm-release-compat.yml`
+retains its filename for existing dispatch links and runs either engine.
+Scheduled runs always select `auto`. The preceding release is a source-diff
+baseline, not a claim that the preceding release passed validation. Analysis
+also audits current adapters, so the diff is not the only evidence it receives.
+Engine reference checkouts materialize Git symlinks as inert text, without
+following them outside the pinned source tree. Local replays should likewise use
+`git -c core.symlinks=false clone ...` for their reference checkouts.
+
+The analyzer covers startup, cache layout, scheduling, distributed behavior and
+public API changes. It distinguishes adapter repairs, native upstream blockers
+and work covered by pending PRs. Each repair cites exact source lines and defines
+behavioral acceptance. At most eight tasks and sixteen exact write paths are
+accepted per run. Only Python adapter/core files and focused tests are writable;
+the controller adds the CPU test manifest when new test files need registration.
+Native/CUDA changes and multi-GPU tasks are reported as blocked instead of being
+silently reduced to a single-GPU test. Pending or blocked areas remain visible
+even if a focused repair passes; that run does not close whole-release acceptance.
+
+The contract author and reviewer see the unfixed baseline, not a repair diff.
+The repair agent cannot edit the generated contract bundle, which is kept outside
+the candidate and hash-bound through every job. A discovered repair requires a
+behavioral baseline failure: import errors, skipped tests and an already-green
+test are not evidence that the problem was reproduced. Existing controller
+regressions and full repository CI remain mandatory.
+
+### Interrupted analysis
+
+Read-only analysis, contract authoring and contract review each have a 30-minute
+work allowance, a 10-minute no-progress limit and a 45-minute absolute wall limit.
+An observed CLI reconnect can exclude at most five minutes cumulatively from the
+work/no-progress clocks. That interval ends at the next structured agent item;
+it is a conservative recovery allowance, not a measurement of network latency.
+Repeated retry messages and arbitrary stderr do not reset the progress clock.
+The CLI retries transport failures inside its existing session; the controller
+does not restart a new analysis on every disconnect.
+
+Each attempt records its log, session ID, exit status, timeout reason and activity
+accounting. The controller kills its owned process tree at a deadline. A timeout
+is an incomplete stage, not a failed adapter assertion or successful acceptance.
+
+For a stopped local run, invoke the same analysis command with `--resume` and the
+same output directory. Completed stages are reused only if the sources, upstream
+stage outputs, prompts, schemas and controller implementation still match their
+checkpoint identities. Interrupted stages continue the recorded session ID,
+never `--last`; ordinary failures and rejected reviews are not retried this way.
+The same local Codex session store must still exist. Do not copy authentication
+or restore sessions from untrusted artifacts. A fresh Actions runner does not
+automatically acquire a previous runner's sessions.
+
+Changed inputs require a fresh run. A leftover stage lock requires confirming
+the original process tree has exited before removing that specific lock; the
+controller never steals it. Every explicit resumed invocation has the same
+bounded budgets and preserves earlier attempts. Repair and GPU validation gates
+are unchanged; analysis recovery cannot turn an incomplete test bundle into a pass.
+
+Generated tests are executable code. Their independent AI review is a guard, not
+a security sandbox or a proof of coverage. Run CPU jobs on disposable workers
+and GPU checks in credential-free containers. Do not expose a developer home,
+SSH credentials or a Docker socket to candidate/test execution. Publication
+credentials are confined to the publisher. The resulting PR still needs human
+review. Native issue duplication beyond the supplied pending adapter PR snapshot
+may require a follow-up audit before submitting a separate engine-repository PR.
+
+vLLM retains the mandatory native/elastic tiny-attention comparison and CUDA
+allocation/recovery probe in addition to the generated GPU contracts. SGLang
+uses generated installed-engine contracts plus a mandatory runtime/CUDA recovery
+control; this is not an assertion that its model-serving coverage equals the
+existing vLLM profile matrix. Serving-related tasks must provide their own
+native/elastic complete-output comparisons, checked by the contract reviewer.
 
 ## Enable the workflow
 
@@ -51,13 +149,15 @@ by merging these files.
 
 | Setting | Purpose |
 | --- | --- |
-| `VLLM_RELEASE_COMPAT_ENABLED` | Set to `true` to enable discovery. Unset by default. |
-| `VLLM_RELEASE_TRACKER_ISSUE` | Number of a dedicated tracker issue in the workflow repository. |
+| `ENGINE_RELEASE_COMPAT_ENABLED` | Set to `true` to enable both engine scans. Unset by default. Legacy `VLLM_RELEASE_COMPAT_ENABLED` enables vLLM only. |
+| `ENGINE_RELEASE_TRACKER_ISSUE` | Dedicated tracker issue; falls back to `VLLM_RELEASE_TRACKER_ISSUE`. |
 | `VLLM_COMPAT_FIRST_VERSION` | Oldest release to process; defaults to `0.28.0`. |
-| `VLLM_COMPAT_PUBLISH_REPOSITORY` | Branch destination, normally an automation fork. |
-| `VLLM_COMPAT_PR_REPOSITORY` | Repository receiving the PR. Defaults to the workflow repository. |
+| `SGLANG_COMPAT_FIRST_VERSION` | Oldest SGLang release to process; defaults to `0.5.15`. |
+| `ENGINE_COMPAT_PUBLISH_REPOSITORY` | Branch destination, normally an automation fork; falls back to `VLLM_COMPAT_PUBLISH_REPOSITORY`. |
+| `ENGINE_COMPAT_PR_REPOSITORY` | PR target; falls back to `VLLM_COMPAT_PR_REPOSITORY`, then the workflow repository. |
 | `VLLM_COMPAT_IMAGE` | Optional operator-maintained runtime image; its installed vLLM version must match the selected release. |
-| `ENGINE_COMPAT_CODEX_API_KEY` | Secret used only by the CPU repair job. |
+| `SGLANG_COMPAT_IMAGE` | Optional exact-version SGLang runtime image. |
+| `ENGINE_COMPAT_CODEX_API_KEY` | Secret used only for CPU-side analysis and repair. |
 | `ENGINE_COMPAT_PUBLISH_TOKEN` | Dedicated publication credential, never supplied to candidate execution. |
 
 The tracker issue body must contain this exact marker:
@@ -80,19 +180,21 @@ Do not register a shared production inference host or a developer's everyday
 workstation under that label. A dedicated/ephemeral runner is the intended
 deployment, and it must be able to reach GitHub and obtain the runtime image.
 
-The default image is `vllm/vllm-openai:<release-tag>`; its resolved image ID is
+Default images are `vllm/vllm-openai:<release-tag>` and
+`lmsysorg/sglang:<release-tag>`; the resolved image ID is
 recorded for the run. Missing images, incompatible drivers and occupied GPUs are
 infrastructure failures. A custom image is useful for an approved CUDA variant,
 but does not allow testing one vLLM version while reporting another.
 
 ## Select a bounded task
 
-Manual dispatch accepts a reviewed `profile`; scheduled runs use `vllm`.
+Manual dispatch accepts `auto` or a reviewed fixed `profile`; scheduled runs use `auto`.
 The task text, exact write allowlist and independent checks are owned by the
 controller revision, not supplied by an issue comment or the repair agent.
 
 | Profile | Repair scope | Independent acceptance |
 | --- | --- | --- |
+| `auto` | Derived from release analysis, then independently checked | Frozen generated CPU/GPU contracts, existing regressions and the engine's mandatory runtime probe |
 | `vllm` | Worker profiling and warmup | Memory-contract tests, matched single-GPU output and CUDA OOM recovery |
 | `native-layout` | Native 0.29 MRV2 allocator and views | Installed-engine view tests, then the single-GPU probe |
 | `allocation` | 0.29 scheduling-miss translation and block lifetimes | CPU failure/ownership contracts, installed-engine block-pool tests, then the single-GPU probe |
@@ -101,6 +203,8 @@ controller revision, not supplied by an issue comment or the repair agent.
 | `hybrid-v1-028` | Validation only, no repair | 0.28 V1 tiny dense hybrid, partial-prefix state copying and two real CoW allocation misses; sync and async |
 | `hybrid-v2-029` | Validation only, no repair | The same hybrid acceptance with the 0.29 MRV2 runner |
 | `sharing-v2-029` | Validation only, no repair | Tiny Gemma4 cross-layer KV sharing with 0.29 MRV2; matched native/elastic controls in both layouts |
+| `gptoss-v2-029` | Validation only, no repair | Tiny FP16 GPT-OSS sliding/full attention and MoE on 0.29 MRV2 |
+| `mla-v2-029` | Validation only, no repair | Tiny pre-V4 DeepSeek MLA on 0.29 MRV2; requires a working native MLA prefill backend |
 
 For example, `--profile native-layout` selects the same scope in local CPU,
 GPU and publication stages. Each stage verifies the profile name and a digest
@@ -112,10 +216,30 @@ Historical records without a profile belong only to `vllm`. Only rerunning the
 same release/profile requires `retry=true`; another profile gets its own claim.
 Changing the candidate baseline still requires an explicit retry of that pair.
 
-The native profiles currently require a 0.29 release. A different release is
+The fixed native profiles currently require a 0.29 release. A different release is
 rejected before claiming it or spending a repair attempt; its trusted contracts
 must first be updated by a reviewed controller change. The repair agent cannot
 make an incompatible immutable test pass by editing the candidate's copy.
+The automatic profile has no fixed version matrix: it derives a new bounded
+task/contract bundle from the selected release instead.
+
+For local automatic replay, use clean, separate checkouts pinned to the public
+candidate base and both release tags. Supply an automatically collected JSON
+snapshot of pending adapter PRs, not a hand-written task:
+
+```bash
+python tools/engine_release_analysis.py --engine vllm \
+  --source /work/candidate --old-engine /work/vllm-old --engine-source /work/vllm-new \
+  --old-tag v0.28.0 --tag v0.29.0 --pending-prs /work/pending-prs.json \
+  --output /work/analysis
+export ENGINE_COMPAT_ANALYSIS_DIR=/work/analysis/bundle
+export ENGINE_COMPAT_ANALYSIS_DIGEST="$(python -c 'import json; print(json.load(open("/work/analysis/result.json"))["digest"])')"
+```
+
+Then use `--profile auto` with the CPU/GPU replay commands below. These environment
+variables must point to the same immutable bundle at every stage; remote paths
+may differ, but the digest must not. Local Codex authentication stays local when
+the GPU stage is transported to a separate host.
 
 Each required test file runs in an independent pytest process. The evidence
 records its command, exit status, test count, failures, errors and skips. Empty
@@ -181,6 +305,28 @@ initializer rather than dummy-loaded parameters. This is synchronous, eager, FP1
 TP=PP=1 testing, not full Gemma
 checkpoint quality, multimodal, FP8, async lifetime, distributed map/unmap chaos or
 performance qualification.
+
+### GPT-OSS and MLA model-path validation
+
+Use `gptoss-v2-029` or `mla-v2-029` with `v0.29.0` in validation mode.
+Both require matched native and elastic runs in `LBNHC` and `BLNHC`.
+The offline fixed-seed FP16 checkpoints retain four GPT-OSS MoE layers with
+alternating sliding/full attention, or two DeepSeek-V2 MLA layers with
+512 latent and 64 RoPE elements. The MLA fixture uses dense FFNs, not MoE.
+
+Each stage completes 42 requests and 1,344 tokens across block/window
+boundaries, repeated prompts and prefix reset. The last elastic round injects
+two allocator admission misses after reset; both must be hit, allocations
+must recover, and all tokens must match the native control. This is not a
+distributed TP/PP map-failure or lost-response test. Cache types, actual runner,
+backend, layout, finite logprobs and explicit shutdown are checked too.
+
+Native backend failure remains a failed gate, never a skipped success. For
+example, T4 can run the GPT-OSS FP16 Triton path, but the tested 0.29 MLA prefill
+path invokes FlashAttention, which requires Ampere or newer hardware. Do not
+disable MLA or substitute an attention backend to claim that model passed.
+These checks do not qualify full checkpoints, MXFP4/FP8, multimodal inputs,
+async scheduling, TP/PP, MPS or performance.
 
 ### Tiny hybrid and partial-prefix validation
 

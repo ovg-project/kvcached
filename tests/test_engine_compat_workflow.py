@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -32,17 +33,40 @@ def workflow(name):
     return yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
 
 
+@pytest.mark.parametrize("disposition,expected", [
+    ("unchanged", 0), ("repair", 0), ("blocked", 1), ("pending-pr", 1),
+])
+def test_terminal_disposition_executes_fixed_key_coverage(tmp_path, disposition, expected):
+    jobs = workflow("vllm-release-compat.yml")["jobs"]
+    step = next(step for job in jobs.values() for step in job.get("steps", [])
+                if step.get("name") == "Record terminal disposition")
+    line = next(line for line in step["run"].splitlines() if "if ! python -c" in line)
+    code = shlex.split(line)[4]
+    manifest = tmp_path / "analysis/bundle/manifest.json"
+    manifest.parent.mkdir(parents=True)
+    coverage = {area: {"disposition": "unchanged"} for area in
+                ("startup", "cache-layout", "scheduling", "distributed", "public-api")}
+    coverage["startup"]["disposition"] = disposition
+    manifest.write_text(json.dumps({"plan": {"coverage": coverage}}))
+    result = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, capture_output=True)
+    assert result.stderr == b""
+    assert result.returncode == expected
+
+
 def test_release_has_explicit_enable_and_bounded_replay():
     config = workflow("vllm-release-compat.yml")
-    assert set(config["on"]) == {"schedule", "workflow_dispatch"}
+    assert set(config["on"]) == {"workflow_call", "workflow_dispatch"}
+    schedule = workflow("engine-release-schedule.yml")
+    assert set(schedule["on"]) == {"schedule", "workflow_dispatch"}
+    assert schedule["jobs"]["release"]["strategy"]["matrix"]["engine"] == ["vllm", "sglang"]
     assert config["concurrency"]["cancel-in-progress"] == "false"
     jobs = config["jobs"]
     assert "VLLM_RELEASE_COMPAT_ENABLED" in jobs["discover"]["if"]
     assert "run_attempt == 1" in jobs["discover"]["if"]
-    assert jobs["second"]["needs"] == ["discover", "first"]
+    assert jobs["second"]["needs"] == ["discover", "analyze", "first"]
     assert "needs.first.outputs.status == 'failed'" in jobs["second"]["if"]
     assert "needs.verify.result == 'success'" in jobs["publish"]["if"]
-    assert jobs["publish"]["needs"] == ["discover", "select", "verify"]
+    assert jobs["publish"]["needs"] == ["discover", "analyze", "select", "verify"]
     for job in jobs.values():
         assert "run_attempt == 1" in job["if"]
     attempts = [job for job in jobs.values() if "engine-compat-attempt.yml" in job.get("uses", "")]
@@ -60,7 +84,7 @@ def test_baseline_outputs_are_pinned_before_claim_and_forwarded():
     plan = next(step for step in steps if step.get("id") == "plan")
     assert steps.index(baseline) < steps.index(plan)
     assert baseline["env"]["PR_REPO"] == (
-        "${{ vars.VLLM_COMPAT_PR_REPOSITORY || github.repository }}"
+        "${{ vars.ENGINE_COMPAT_PR_REPOSITORY || vars.VLLM_COMPAT_PR_REPOSITORY || github.repository }}"
     )
     assert "rev-parse" not in plan["run"]
     assert plan["run"].index('Path("baseline.json")') < plan["run"].index(".py claim")
@@ -183,7 +207,7 @@ def test_reusable_candidates_use_pinned_repo_and_sha_with_separate_controller(na
             if checkout.get("with", {}).get("path") == "engine"
         )
         assert engine["with"] == {
-            "repository": "vllm-project/vllm",
+            "repository": "${{ inputs.engine == 'sglang' && 'sgl-project/sglang' || 'vllm-project/vllm' }}",
             "ref": "${{ inputs.engine_sha }}",
             "path": "engine",
             "persist-credentials": "false",
@@ -229,7 +253,10 @@ def test_full_candidate_ci_is_not_just_the_repair_probe():
     assert "if" not in gate and "working-directory" not in gate
     assert gate["env"] == {"BASE_SHA": "${{ inputs.base_sha }}", "RELEASE_TAG": "${{ inputs.tag }}",
                            "PROFILE": "${{ inputs.profile }}"}
-    assert shlex.split(gate["run"].replace("\\\n", "")) == [
+    assert 'if [[ "$PROFILE" == auto ]]; then allow=analysis/bundle/allow.json; fi' in gate["run"]
+    assert "python controller/tools/engine_compat_profile.py" in gate["run"]
+    verify = gate["run"][gate["run"].index("python controller/tools/engine_compat_artifact.py"):]
+    assert shlex.split(verify.replace("\\\n", "")) == [
         "python",
         "controller/tools/engine_compat_artifact.py",
         "verify",
@@ -240,7 +267,7 @@ def test_full_candidate_ci_is_not_just_the_repair_probe():
         "--tag",
         "$RELEASE_TAG",
         "--allow-list",
-        "controller/.github/engine-compat/$PROFILE-allow.json",
+        "$allow",
         "--artifact",
         "handoff/candidate.json",
     ]
@@ -466,3 +493,80 @@ def test_expected_target_checks_match_current_repository_ci():
             versions = job.get("strategy", {}).get("matrix", {}).get("python-version", [""])
             expected.update(template.replace("${{ matrix.python-version }}", v) for v in versions)
     assert stage.EXPECTED_TARGET_CHECKS == expected
+
+
+def test_scheduled_release_analyzes_before_any_repair():
+    jobs = workflow("vllm-release-compat.yml")["jobs"]
+    assert jobs["analyze"]["needs"] == "discover"
+    assert jobs["first"]["needs"] == ["discover", "analyze"]
+    assert "needs.analyze.outputs.status == 'ready'" in jobs["first"]["if"]
+    scope = next(step for step in jobs["discover"]["steps"] if step.get("id") == "profile")
+    assert scope["env"]["PROFILE"] == "${{ inputs.profile || 'auto' }}"
+    assert "engine_release_analysis.py" in json.dumps(jobs["analyze"])
+    for name in ("first", "second", "verify"):
+        assert jobs[name]["with"]["analysis_digest"] == "${{ needs.analyze.outputs.digest }}"
+    assert "PUBLISH_TOKEN" not in json.dumps(jobs["analyze"])
+    analysis = next(step for step in jobs["analyze"]["steps"] if step.get("id") == "analysis")
+    assert "GH_TOKEN" not in analysis["env"]
+    assert "always()" in jobs["second"]["if"]  # Static profiles skip analysis.
+
+
+def test_engine_matrix_keeps_artifact_names_distinct():
+    for filename in ("engine-compat-attempt.yml", "vllm-release-compat.yml"):
+        for job in workflow(filename)["jobs"].values():
+            for step in job.get("steps", []):
+                if step.get("uses", "").startswith("actions/upload-artifact@"):
+                    assert "engine" in step["with"]["name"]
+
+
+def test_sglang_cpu_regression_has_its_import_dependencies_before_execution():
+    steps = workflow("engine-compat-attempt.yml")["jobs"]["repair"]["steps"]
+    install = next(i for i, step in enumerate(steps)
+                   if "pip install torch --index-url https://download.pytorch.org/whl/cpu"
+                   in step.get("run", ""))
+    assert steps[install]["if"] == "inputs.engine == 'sglang'"
+    execute = next(i for i, step in enumerate(steps) if step.get("id") == "repair")
+    assert install < execute
+
+
+def test_generated_contract_bundle_reaches_every_independent_job():
+    for file in ("engine-compat-attempt.yml", "engine-compat-ci.yml"):
+        for job in workflow(file)["jobs"].values():
+            step = next(step for step in job["steps"]
+                        if step.get("with", {}).get("name") == "${{ inputs.engine }}-release-analysis")
+            assert step["if"] == "inputs.profile == 'auto'"
+            assert step["with"]["path"].endswith("analysis")
+            assert "ENGINE_COMPAT_ANALYSIS_DIGEST" in json.dumps(job)
+
+
+def test_persistent_gpu_jobs_do_not_reuse_previous_attempt_evidence():
+    job = workflow("engine-compat-attempt.yml")["jobs"]["gpu"]
+    directory = job["env"]["ATTEMPT_DIR"]
+    for value in ("github.run_id", "github.run_attempt", "inputs.engine", "inputs.attempt"):
+        assert value in directory
+    steps = job["steps"]
+    for step in steps:
+        if "artifact@" in step.get("uses", ""):
+            assert step["with"]["path"].startswith("${{ env.ATTEMPT_DIR }}/")
+    execute = next(step for step in steps if step.get("id") == "gpu")
+    assert '--output "$ATTEMPT_DIR/gpu-result"' in execute["run"]
+    assert execute["env"]["ENGINE_COMPAT_ANALYSIS_DIR"] == "${{ env.ATTEMPT_DIR }}/analysis/bundle"
+
+
+def test_reference_checkouts_materialize_upstream_symlinks_without_following_them():
+    references: list[dict[str, Any]] = []
+    for filename in ("engine-compat-attempt.yml", "vllm-release-compat.yml"):
+        for job in workflow(filename)["jobs"].values():
+            steps = job.get("steps", [])
+            for index, step in enumerate(steps):
+                if (step.get("uses") != "actions/checkout@v4"
+                        or step["with"].get("path") not in ("engine", "old-engine")):
+                    continue
+                references.append(step)
+                path = step["with"]["path"]
+                assert any(f"git -C {path} config core.symlinks false" in later.get("run", "")
+                           for later in steps[index + 1:])
+    assert len(references) == 3
+    for checkout in references:
+        assert checkout["env"] == {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.symlinks",
+                                   "GIT_CONFIG_VALUE_0": "false"}

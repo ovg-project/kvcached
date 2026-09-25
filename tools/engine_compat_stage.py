@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from engine_compat_profile import (
     identity,
     load_profile,
     run_checks,
+    validate_baseline_failures,
     validate_mode,
     validate_release,
 )
@@ -66,6 +68,15 @@ def cpu(args) -> None:
     mode = getattr(args, "mode", "repair")
     validate_mode(profile, mode)
     allow = profile["allow"]
+    if "manifest" in profile:
+        manifest = profile["manifest"]
+        if (manifest["base_sha"] != args.base or manifest["tag"] != args.tag
+                or manifest["engine_sha"] != args.engine_sha):
+            raise ValueError("Analysis belongs to a different candidate or engine release")
+        if mode == "repair" and not args.prior and manifest["plan"]["tasks"]:
+            baseline = args.output / "baseline-contracts"
+            run_checks(profile, args.source, baseline, trusted=True)
+            validate_baseline_failures(profile, baseline)
     if mode == "validate":
         if args.prior:
             raise ValueError("Validation-only mode does not retry a repair candidate")
@@ -99,6 +110,11 @@ def cpu(args) -> None:
         prior_report = args.prior / "failure.json"
     checks_root = args.output / "checks"
     checks_root.mkdir()
+    repair_env = dict(os.environ)
+    if "contract_root" in profile:
+        frozen = checks_root / "bundle"
+        shutil.copytree(profile["contract_root"], frozen)
+        repair_env["ENGINE_COMPAT_ANALYSIS_DIR"] = str(frozen)
     command = [sys.executable, str(Path(__file__).resolve()), "checks", "--profile", args.profile,
                "--output", str(args.output / "check-results")]
     write_json(
@@ -110,10 +126,11 @@ def cpu(args) -> None:
     )
     task = args.output / "task.md"
     task.write_text(
-        f"Adapt KVCached to upstream vLLM {args.tag} ({args.engine_sha}). "
+        f"Adapt KVCached to upstream {profile.get('engine', 'vllm')} {args.tag} ({args.engine_sha}). "
         + profile["task"] + " "
         "Use the supplied engine source. Preserve supported older versions, inference mode, "
         "physical allocation failure handling and asynchronous worker ordering. "
+        "Register new candidate CPU tests in tests/manifests/cpu.txt when that path is allowed. "
         "Do not disable tests or bypass GPU failures. This round only runs CPU checks; "
         "an independent GPU job must still pass before any publication.\n",
         encoding="utf-8",
@@ -140,7 +157,9 @@ def cpu(args) -> None:
         command.extend(("--allow", name))
     if prior_report:
         command.extend(("--failure-report", str(prior_report)))
-    result = run_command(command, ROOT, args.output / "repair.log", 1500, dict(os.environ))
+    result = run_command(command, ROOT, args.output / "repair.log", 1500, repair_env)
+    if identity(load_profile(args.profile)) != identity(profile):
+        raise ValueError("Analysis changed during repair")
     if result["exit_code"]:
         record(args.output, dict(status="blocked", reason="Bounded repair did not validate"))
         return
@@ -162,6 +181,11 @@ def cpu(args) -> None:
 def gpu(args) -> None:
     profile = load_profile(args.profile)
     validate_release(profile, args.tag)
+    if "manifest" in profile:
+        manifest = profile["manifest"]
+        if (manifest["base_sha"] != args.base or manifest["tag"] != args.tag
+                or manifest["engine_sha"] != args.engine_sha):
+            raise ValueError("GPU analysis identity does not match this release")
     payload = load_envelope(args.prior / "candidate.json")
     previous = json.loads((args.prior / "stage.json").read_text())
     if (
@@ -176,7 +200,8 @@ def gpu(args) -> None:
     write_json(args.output / "candidate.json", payload)
     container_name = "kvcached-compat-" + uuid.uuid4().hex
     env = dict(os.environ, COMPAT_CONTAINER_NAME=container_name, ENGINE_COMPAT_PROFILE=args.profile,
-               ENGINE_COMPAT_POLICY_DIGEST=profile["policy_digest"])
+               ENGINE_COMPAT_POLICY_DIGEST=profile["policy_digest"],
+               ENGINE_COMPAT_ENGINE=profile.get("engine", "vllm"))
     command = [
         "bash",
         str(ROOT / "tools/engine_compat_gpu.sh"),
@@ -257,7 +282,8 @@ def publish(args) -> None:
     if not payload["files"]:
         record(args.output, dict(status="passed", candidate_head=head, digest=payload["digest"]))
         return
-    branch = f"automation/vllm-{args.tag}"
+    engine = profile.get("engine", "vllm")
+    branch = f"automation/{engine}-{args.tag}"
     if args.profile != "vllm":
         branch += f"-{args.profile}"
     remote = f"https://github.com/{args.publish_repository}.git"
@@ -352,9 +378,14 @@ def publish(args) -> None:
     if remote_head(args.publish_repository, f"refs/heads/{branch}") != head:
         raise ValueError("Published branch SHA mismatch")
     if not pulls:
+        task_description = profile["task"]
+        if "manifest" in profile:
+            plan = profile["manifest"]["plan"]
+            task_description = plan["summary"] + "\n\n" + "\n".join(
+                f"- **{task['title']}**: {task['problem']}" for task in plan["tasks"])
         body = (
-            f"## Summary\n\nAdapt to vLLM {args.tag} ({args.profile}).\n\n"
-            f"{profile['task']}\n\n"
+            f"## Summary\n\nAdapt to {engine} {args.tag} ({args.profile}).\n\n"
+            f"{task_description}\n\n"
             f"## Validation\n\nCandidate `{head}` passed independent GPU checks and the full "
             f"CPU CI matrix before publication. [Run and evidence]({args.run_url}).\n\n"
             "Single-GPU validation is not TP/PP, MPS or model-family certification. "
@@ -366,7 +397,7 @@ def publish(args) -> None:
                 f"head={selector}",
                 f"head_repo={args.publish_repository.split('/')[1]}",
                 f"base={args.base_branch}",
-                f"title=fix: adapt vLLM {args.tag}",
+                f"title=fix: adapt {engine} {args.tag}",
                 f"body={body}",
                 method="POST",
             )

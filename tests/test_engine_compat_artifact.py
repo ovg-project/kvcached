@@ -243,7 +243,7 @@ def test_candidate_has_deterministic_exact_commit(source, base, clone, monkeypat
     )
     commit = (
         f"tree {tree}\nparent {base}\nauthor {identity}\ncommitter {identity}\n\n"
-        f"fix: adapt vLLM {TAG}\n\nAutomatically prepared; requires human review.\n"
+        f"fix: adapt engine release {TAG}\n\nAutomatically prepared; requires human review.\n"
     ).encode("utf-8")
     expected = hashlib.sha1(
         b"commit " + str(len(commit)).encode("ascii") + b"\0" + commit

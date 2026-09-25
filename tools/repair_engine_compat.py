@@ -107,10 +107,14 @@ def run_command(
     timeout: int,
     env: Dict[str, str],
     prompt: Optional[str] = None,
+    watch=None,
 ) -> Dict[str, Any]:
     started = time.monotonic()
     code = 127
     timed_out = False
+    timeout_reason = None
+    if watch is not None:
+        watch.start(started)
     with log.open("w", encoding="utf-8") as output:
         try:
             process = subprocess.Popen(
@@ -126,10 +130,30 @@ def run_command(
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             try:
-                process.communicate(prompt, timeout=timeout)
+                if watch is None:
+                    process.communicate(prompt, timeout=timeout)
+                else:
+                    first = True
+                    while True:
+                        try:
+                            process.communicate(prompt if first else None, timeout=0.25)
+                            watch.poll(log, time.monotonic())
+                            break
+                        except subprocess.TimeoutExpired:
+                            first = False
+                            now = time.monotonic()
+                            try:
+                                watch.poll(log, now)
+                            except ValueError:
+                                timeout_reason = "protocol_error"
+                                raise subprocess.TimeoutExpired(argv, timeout)
+                            timeout_reason = watch.reason(now)
+                            if timeout_reason or now - started >= timeout:
+                                timeout_reason = timeout_reason or "wall_timeout"
+                                raise
                 code = process.returncode
             except subprocess.TimeoutExpired:
-                timed_out = True
+                timed_out = timeout_reason != "protocol_error"
                 if sys.platform == "win32":
                     try:
                         terminated = subprocess.run(
@@ -156,7 +180,7 @@ def run_command(
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired as exc:
                     raise GateError("Timed-out process did not exit after termination") from exc
-                code = 124
+                code = 124 if timed_out else 2
         except OSError as exc:
             output.write(f"Could not run command: {exc}\n")
     return {
@@ -164,6 +188,8 @@ def run_command(
         "timeout": timed_out,
         "seconds": round(time.monotonic() - started, 3),
         "log": log.name,
+        "timeout_reason": timeout_reason,
+        "activity": watch.report(time.monotonic()) if watch is not None else None,
     }
 
 

@@ -155,3 +155,44 @@ def test_ownership_contract_loads_candidate_not_controller(tmp_path, candidate_s
     assert profiles.run_checks(profile, candidate, output) == status
     receipt = json.loads((output / "checks.json").read_text())
     assert receipt["checks"][0]["counts"]["tests"] > 0
+
+
+@pytest.mark.parametrize("fault", [None, "unrelated", "error", "missing-task", "legacy-red"])
+def test_baseline_requires_a_failed_assertion_for_each_discovered_task(tmp_path, fault):
+    import xml.etree.ElementTree as ET
+
+    checks = [dict(test="test_cpu.py", disposition=1), dict(test="tests/test_existing.py", disposition=0)]
+    if fault == "legacy-red":
+        checks[1]["disposition"] = 1
+    report = dict(exit_code=1, checks=checks)
+    (tmp_path / "checks.json").write_text(json.dumps(report))
+    suite = ET.Element("testsuite")
+    for task in ("alpha", "beta"):
+        name = f"test_{task}__contract"
+        if fault == "unrelated":
+            name = "test_other_failure"
+        case = ET.SubElement(suite, "testcase", name=name)
+        if fault == "missing-task" and task == "beta":
+            continue
+        ET.SubElement(case, "failure").text = "ImportError" if fault == "error" else "AssertionError"
+    ET.ElementTree(suite).write(tmp_path / "0.xml")
+    profile = dict(manifest=dict(plan=dict(tasks=[dict(id="alpha"), dict(id="beta")])))
+    if fault:
+        with pytest.raises(ValueError):
+            profiles.validate_baseline_failures(profile, tmp_path)
+    else:
+        profiles.validate_baseline_failures(profile, tmp_path)
+
+
+def test_generated_acceptance_cannot_change_candidate(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    contract = tmp_path / "test_cpu.py"
+    contract.write_text("from pathlib import Path\n"
+                        "def test_mutation():\n"
+                        "    Path('changed.py').write_text('unexpected')\n"
+                        "    assert True\n")
+    profile = dict(name="auto", policy_digest="a" * 64, contract_root=str(tmp_path),
+                   cpu_tests=["test_cpu.py"])
+    with pytest.raises(ValueError, match="changed the candidate"):
+        profiles.run_checks(profile, candidate, tmp_path / "results")

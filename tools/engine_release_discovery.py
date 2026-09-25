@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Discover stable vLLM releases and track each release/profile independently.
+"""Discover stable engine releases and track each engine/release/profile independently.
 
 Public API: discover/claim/finish return JSON plans; GhAPI is injectable as api=.
 Discovery orders numeric versions; the CLI atomically saves updated plans.
@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 UPSTREAM = "vllm-project/vllm"
+UPSTREAMS = {"vllm": UPSTREAM, "sglang": "sgl-project/sglang"}
 TRACKER_MARKER = "<!-- kvcached-vllm-release-tracker -->"
 COMMENT_MARKER = "<!-- kvcached-vllm-release "
-VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.post(0|[1-9][0-9]*))?"
 TERMINAL = {"passed", "failed", "blocked"}
 IDENTITY = ("release_id", "tag", "engine_sha")
 
@@ -114,6 +115,12 @@ def _matches(pattern, value):
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
 
+def _version(value):
+    match = re.fullmatch(VERSION, value.removeprefix("v"))
+    _require(match is not None, "Invalid stable version")
+    return tuple(int(part) if part is not None else -1 for part in match.groups())
+
+
 def _target(repository, tracker_issue):
     _require(
         _matches(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", repository)
@@ -147,6 +154,13 @@ def _identity(data):
 
 def _same_identity(left, right):
     _require(_identity(left) == _identity(right), "Release identity changed: moved or replaced")
+    _require(_engine(left) == _engine(right), "Release engine changed")
+
+
+def _engine(data):
+    name = data.get("engine", "vllm")
+    _require(isinstance(name, str) and name in UPSTREAMS, "Unsupported release engine")
+    return name
 
 
 def _profile(data):
@@ -156,10 +170,11 @@ def _profile(data):
     return name
 
 
-def resolve_tag(api, tag: str) -> str:
+def resolve_tag(api, tag: str, engine="vllm") -> str:
     """Resolve an exact stable upstream tag, peeling annotated tags to a commit SHA."""
     _require(_matches("v" + VERSION, tag), "Expected a stable vX.Y.Z tag")
-    ref = api.request(f"repos/{UPSTREAM}/git/ref/tags/{tag}")
+    upstream = UPSTREAMS[_engine({"engine": engine})]
+    ref = api.request(f"repos/{upstream}/git/ref/tags/{tag}")
     _require(isinstance(ref, dict) and ref.get("ref") == f"refs/tags/{tag}", "Invalid tag ref")
     obj, seen = ref.get("object"), set()
     for _ in range(16):
@@ -172,29 +187,30 @@ def resolve_tag(api, tag: str) -> str:
             return sha
         _require(obj.get("type") == "tag" and sha not in seen, "Invalid or cyclic annotated tag")
         seen.add(sha)
-        annotated = api.request(f"repos/{UPSTREAM}/git/tags/{sha}")
+        annotated = api.request(f"repos/{upstream}/git/tags/{sha}")
         _require(isinstance(annotated, dict) and annotated.get("sha") == sha, "Invalid tag")
         obj = annotated.get("object")
     raise GateError("Annotated tag nesting limit exceeded")
 
 
-def _release(api, release):
+def _release(api, release, engine="vllm"):
     _require(
         isinstance(release, dict)
         and _positive(release.get("id"))
         and release.get("draft") is False
         and release.get("prerelease") is False
         and _matches("v" + VERSION, release.get("tag_name")),
-        "Expected a stable published vLLM release",
+        "Expected a stable published engine release",
     )
     tag = release["tag_name"]
-    url = f"https://github.com/{UPSTREAM}/releases/tag/{tag}"
+    url = f"https://github.com/{UPSTREAMS[engine]}/releases/tag/{tag}"
     _require(release.get("html_url") == url, "Invalid upstream release URL")
     return {
         "release_id": release["id"],
         "tag": tag,
-        "engine_sha": resolve_tag(api, tag),
+        "engine_sha": resolve_tag(api, tag, engine),
         "release_url": url,
+        **({"engine": engine} if engine != "vllm" else {}),
     }
 
 
@@ -219,12 +235,13 @@ def _comment(comment, repository, issue_url):
         raise GateError("Malformed ledger JSON") from None
     _identity(record)
     _require(
-        set(record) <= {*IDENTITY, "status", "run_url", "pr_url", "profile"}
+        set(record) <= {*IDENTITY, "status", "run_url", "pr_url", "profile", "engine"}
         and isinstance(record.get("status"), str)
         and record["status"] in TERMINAL | {"running"},
         "Invalid ledger fields or status",
     )
     _profile(record)
+    _engine(record)
     _url(record.get("run_url"), repository, "run")
     if "pr_url" in record:
         _url(record["pr_url"], repository, "pr")
@@ -263,13 +280,13 @@ def _ledger(api, repository, tracker_issue):
         record = entry["record"]
         profile = _profile(record)
         _require(
-            (record["release_id"], profile) not in ids
-            and (record["tag"], profile) not in tags
+            (_engine(record), record["release_id"], profile) not in ids
+            and (_engine(record), record["tag"], profile) not in tags
             and entry["id"] not in comments,
             "Duplicate ledger release or comment",
         )
-        ids.add((record["release_id"], profile))
-        tags.add((record["tag"], profile))
+        ids.add((_engine(record), record["release_id"], profile))
+        tags.add((_engine(record), record["tag"], profile))
         comments.add(entry["id"])
         entries.append(entry)
     return entries
@@ -279,8 +296,9 @@ def _entry(entries, release):
     matches = [
         entry
         for entry in entries
-        if entry["record"]["release_id"] == release["release_id"]
-        or entry["record"]["tag"] == release["tag"]
+        if _engine(entry["record"]) == _engine(release)
+        and (entry["record"]["release_id"] == release["release_id"]
+             or entry["record"]["tag"] == release["tag"])
     ]
     for entry in matches:
         _same_identity(entry["record"], release)
@@ -293,16 +311,17 @@ def _entry(entries, release):
 
 
 def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, retry=False,
-             profile="vllm", api=None):
+             profile="vllm", engine="vllm", api=None):
     """Return pending/idle; only explicit tag+retry may select an existing ledger entry."""
     _require(_matches(VERSION, first_version), "Expected first-version X.Y.Z")
     _require(type(retry) is bool and (not retry or tag is not None), "Retry needs an explicit tag")
     _require(tag is None or _matches("v" + VERSION, tag), "Expected a stable vX.Y.Z tag")
     _profile({"profile": profile})
-    floor = tuple(map(int, first_version.split(".")))
+    _engine({"engine": engine})
+    floor = _version(first_version)
     api = api if api is not None else GhAPI()
     entries = _ledger(api, repository, tracker_issue)
-    releases = _list(api, f"repos/{UPSTREAM}/releases")
+    releases = _list(api, f"repos/{UPSTREAMS[engine]}/releases")
     candidates, ids, tags = [], set(), set()
     for release in releases:
         name = release.get("tag_name")
@@ -310,7 +329,7 @@ def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, ret
             continue
         if not _matches("v" + VERSION, name):
             continue
-        version = tuple(map(int, name[1:].split(".")))
+        version = _version(name)
         if version < floor:
             continue
         _require(_positive(release.get("id")), "Invalid release ID")
@@ -323,7 +342,7 @@ def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, ret
     for _, candidate in sorted(candidates, key=lambda item: item[0]):
         if tag is not None and candidate["tag_name"] != tag:
             continue
-        release = _release(api, candidate)
+        release = _release(api, candidate, engine)
         release["profile"] = profile
         entry = _entry(entries, release)
         if entry and not retry:
@@ -339,6 +358,15 @@ def discover(repository, tracker_issue, first_version="0.28.0", *, tag=None, ret
             plan["manual_tag"] = tag
         if entry:
             plan.update(ledger_comment_id=entry["id"], ledger_revision=entry["revision"])
+        if profile == "auto":
+            previous = [item for item in releases
+                        if item.get("draft") is False and item.get("prerelease") is False
+                        and _matches("v" + VERSION, item.get("tag_name"))
+                        and _version(item["tag_name"]) < _version(release["tag"])]
+            _require(bool(previous), "Automatic analysis needs a preceding stable release")
+            predecessor = max(previous, key=lambda item: _version(item["tag_name"]))
+            plan.update(old_tag=predecessor["tag_name"],
+                        old_engine_sha=resolve_tag(api, predecessor["tag_name"], engine))
         return plan
     return {"status": "idle", **dict.fromkeys((*IDENTITY, "release_url"))}
 
@@ -351,14 +379,15 @@ def _prepare(api, repository, tracker_issue, plan, run_url):
         "Plan belongs to another tracker",
     )
     _url(run_url, repository, "run")
-    candidate = api.request(f"repos/{UPSTREAM}/releases/{plan['release_id']}")
+    engine = _engine(plan)
+    candidate = api.request(f"repos/{UPSTREAMS[engine]}/releases/{plan['release_id']}")
     _require(
         isinstance(candidate, dict)
         and candidate.get("id") == plan["release_id"]
         and candidate.get("tag_name") == plan["tag"],
         "Release identity changed (tag move or replacement)",
     )
-    release = _release(api, candidate)
+    release = _release(api, candidate, engine)
     _same_identity(release, plan)
     _require(release["release_url"] == plan.get("release_url"), "Plan release URL changed")
     entry = _entry(_ledger(api, repository, tracker_issue), plan)
@@ -426,6 +455,8 @@ def claim(repository: str, tracker_issue: int, plan: dict, run_url: str, *, api=
         )
         _require(entry["record"]["run_url"] != run_url, "Retry requires a new run URL")
     record = {key: plan[key] for key in IDENTITY}
+    if _engine(plan) != "vllm":
+        record["engine"] = _engine(plan)
     record["profile"] = _profile(plan)
     record.update(status="running", run_url=run_url)
     return _write(api, repository, tracker_issue, plan, entry, login, record)
@@ -446,6 +477,8 @@ def finish(repository, tracker_issue, plan, status, run_url, *, pr_url=None, api
         "Finish requires this run's existing claim",
     )
     record = {key: plan[key] for key in IDENTITY}
+    if _engine(plan) != "vllm":
+        record["engine"] = _engine(plan)
     record["profile"] = _profile(plan)
     record.update(status=status, run_url=run_url)
     if pr_url is not None:
@@ -487,6 +520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             command.add_argument("--first-version", default="0.28.0")
             command.add_argument("--tag")
             command.add_argument("--profile", default="vllm")
+            command.add_argument("--engine", choices=sorted(UPSTREAMS), default="vllm")
             command.add_argument("--retry", action="store_true")
             command.add_argument("--output", type=Path, required=True)
         else:

@@ -138,6 +138,48 @@ def no_real_github(monkeypatch):
     monkeypatch.setattr(discovery.subprocess, "run", forbidden)
 
 
+def test_auto_analysis_pins_preceding_release_even_below_discovery_floor():
+    api = FakeAPI()
+    api.releases = [release(29, "v0.29.0"), release(28, "v0.28.0")]
+    plan = discovery.discover(REPOSITORY, ISSUE, "0.29.0", profile="auto", api=api)
+    assert plan["tag"] == "v0.29.0"
+    assert plan["old_tag"] == "v0.28.0"
+    assert plan["old_engine_sha"] == f"{28:040x}"
+
+
+def test_auto_first_release_without_baseline_is_blocked():
+    with pytest.raises(discovery.GateError, match="preceding stable release"):
+        discovery.discover(REPOSITORY, ISSUE, profile="auto", api=FakeAPI())
+
+
+def test_stable_post_release_is_discovered_after_its_base_version():
+    api = FakeAPI()
+    api.releases = [release(281, "v0.28.0.post1"), release(28, "v0.28.0")]
+    api.comments = [comment(record(profile="auto", status="passed"))]
+    plan = discovery.discover(REPOSITORY, ISSUE, profile="auto", api=api)
+    assert plan["tag"] == "v0.28.0.post1" and plan["old_tag"] == "v0.28.0"
+
+
+def test_sglang_release_identity_does_not_alias_vllm_ledger():
+    api = FakeAPI()
+    api.comments = [comment(record(profile="auto"))]
+    upstream = "sgl-project/sglang"
+    releases = [release(28, "v0.28.0", html_url=f"https://github.com/{upstream}/releases/tag/v0.28.0"),
+                release(27, "v0.27.0", html_url=f"https://github.com/{upstream}/releases/tag/v0.27.0")]
+    api.responses[f"repos/{upstream}/releases?per_page=100"] = releases
+    for item in releases:
+        api.responses[f"repos/{upstream}/git/ref/tags/{item['tag_name']}"] = dict(
+            ref=f"refs/tags/{item['tag_name']}", object=dict(type="commit", sha=f"{item['id']:040x}"))
+        api.responses[f"repos/{upstream}/releases/{item['id']}"] = item
+    plan = discovery.discover(REPOSITORY, ISSUE, profile="auto", engine="sglang", api=api)
+    assert plan["status"] == "pending" and plan["engine"] == "sglang"
+    running = discovery.claim(REPOSITORY, ISSUE, plan, RUN, api=api)
+    assert running["engine"] == "sglang"
+    finished = discovery.finish(REPOSITORY, ISSUE, running, "passed", RUN, api=api)
+    assert finished["status"] == "passed" and finished["engine"] == "sglang"
+    assert len(api.comments) == 2
+
+
 @pytest.fixture
 def api():
     return FakeAPI()
