@@ -144,8 +144,12 @@ pip install kvcached --no-build-isolation
 # under the project root folder
 
 pip install -e . --no-build-isolation --no-cache-dir
-python tools/dev_copy_pth.py
 ```
+
+Both install `kvcached_autopatch.pth` into site-packages. That file registers
+the vLLM/SGLang import hooks; without it the engines run without kvcached and
+`import kvcached` warns. `python tools/dev_copy_pth.py --check` shows whether
+it is present and `python tools/dev_copy_pth.py` copies it by hand if needed.
 
 ### Using Docker
 
