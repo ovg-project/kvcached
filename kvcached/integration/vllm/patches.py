@@ -1830,7 +1830,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
     def patch_block_copy(self, gpumr_mod: types.ModuleType) -> bool:
         """Keep native scheduling order, replacing only the V1 byte-copy helper."""
-        if not VersionRange(">=0.28.0").contains(self.detected_version or "0"):
+        if not VersionRange(">=0.26.0").contains(self.detected_version or "0"):
             return True
         original = getattr(gpumr_mod, "copy_kv_cache_blocks_inplace", None)
         if original is None or self._is_already_patched(original, "block_copy"):
@@ -2298,6 +2298,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return True
 
         use_mamba_pages = VersionRange(">=0.27.0").contains(self.detected_version or "0")
+        use_block_copy = VersionRange(">=0.26.0").contains(self.detected_version or "0")
 
         def _reshape_kv_cache_tensors_from_kvcached(
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
@@ -2349,6 +2350,19 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                                 mamba_info["buffers"][pool_idx],
                                 kv_cache_spec, get_dtype_size,
                             )
+                        if use_block_copy:
+                            # 0.26 binds separate state views, but copies whole
+                            # logical blocks. Point every state at the same span.
+                            from kvcached.integration.vllm.interfaces import _set_block_copy_view
+
+                            contiguous = mamba_info.get("is_contiguous")
+                            backing = mamba_info["buffers"][0 if contiguous else pool_idx]
+                            block_bytes = (mamba_info["block_stride_bytes"] if contiguous
+                                           else mamba_info["page_size_bytes"])
+                            for state in state_tensors:
+                                _set_block_copy_view(
+                                    state, backing, mamba_info["num_blocks"], block_bytes,
+                                )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
                     for pool_idx, layer_name in enumerate(bound_layer_names):

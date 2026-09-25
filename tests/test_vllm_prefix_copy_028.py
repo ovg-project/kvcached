@@ -299,13 +299,84 @@ def test_legacy_layout_copy_preserves_logical_blocks(monkeypatch, layout):
         assert torch.equal(view[1], original[0])
 
 
-def test_copy_patch_disabled_path_preserves_native_helper(monkeypatch):
+@pytest.mark.parametrize("version", ["0.26.0", "0.27.0", "0.28.0"])
+def test_copy_patch_disabled_path_preserves_native_helper(monkeypatch, version):
     native = Mock()
     module = ModuleType("runner_copy_test")
     setattr(module, "copy_kv_cache_blocks_inplace", native)
     adaptation = patches.GPUModelRunnerPatch()
-    adaptation.detected_version = "0.28.0"
+    adaptation.detected_version = version
     assert adaptation.patch_block_copy(module)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: False)
     getattr(module, "copy_kv_cache_blocks_inplace")([], 4, [(0, 1)])
     native.assert_called_once_with([], 4, [(0, 1)])
+
+
+def test_copy_patch_leaves_pre_026_runner_unchanged():
+    native = Mock()
+    module = ModuleType("runner_copy_test")
+    setattr(module, "copy_kv_cache_blocks_inplace", native)
+    adaptation = patches.GPUModelRunnerPatch()
+    adaptation.detected_version = "0.25.0"
+    assert adaptation.patch_block_copy(module)
+    assert getattr(module, "copy_kv_cache_blocks_inplace") is native
+
+
+@pytest.mark.parametrize("version", ["0.26.0", "0.26.0+cu130", "0.27.0", "0.28.0"])
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_versioned_mamba_copy_preserves_states_and_reserved_tail(monkeypatch, version, contiguous):
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    blocks, pools, page_bytes = 4, 2, 64
+    stride = page_bytes * (pools if contiguous else 1)
+    logical_bytes = blocks * stride
+    # The tensor exposes only logical blocks; its storage also contains a
+    # reserved tail. Dividing storage size by block count would copy wrong bytes.
+    backings = [torch.full((logical_bytes * 2,), 77, dtype=torch.int8)
+                for _ in range(1 if contiguous else pools)]
+    info = dict(buffers=[raw[:logical_bytes] for raw in backings],
+                num_blocks=blocks, page_size_bytes=page_bytes,
+                is_contiguous=contiguous, block_stride_bytes=stride)
+    spec = MambaSpec(block_size=16, shapes=((2, 4), (2, 4)),
+                     dtypes=(torch.float16, torch.float32), page_size_padded=page_bytes)
+    config = SimpleNamespace(kv_cache_groups=[
+        SimpleNamespace(kv_cache_spec=spec, layer_names=["m0", "m1"]),
+    ])
+
+    class Runner(SimpleNamespace):
+        pass
+
+    adaptation = patches.GPUModelRunnerPatch()
+    adaptation.detected_version = version
+    assert adaptation.add_reshape_methods(Runner)
+    runner = Runner(_kvcached_mamba_raw_info=info)
+    caches = runner._reshape_kv_cache_tensors_from_kvcached(config, [])
+    state_views: list[torch.Tensor] = []
+    for layer, entry in enumerate(caches.values()):
+        if isinstance(entry, list):
+            conv, ssm = entry
+        else:
+            pages = entry.squeeze(dim=(1, 2))
+            conv = pages[:, :16].view(torch.float16).view(blocks, 2, 4)
+            ssm = pages[:, 16:48].view(torch.float32).view(blocks, 2, 4)
+        state_views.extend((conv, ssm))
+        for block in range(blocks):
+            conv[block].fill_(layer * 10 + block + 1)
+            ssm[block].fill_(layer * 10 + block + 101)
+    before = [view.clone() for view in state_views]
+
+    module = ModuleType("runner_copy_test")
+    native = Mock(side_effect=AssertionError("Native storage-based copy must be replaced"))
+    setattr(module, "copy_kv_cache_blocks_inplace", native)
+    assert adaptation.patch_block_copy(module)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    # A swap also catches repeated copies through conv/SSM or layer aliases.
+    getattr(module, "copy_kv_cache_blocks_inplace")(list(caches.values()), blocks, [(0, 1), (1, 0)])
+    native.assert_not_called()
+    for original, view in zip(before, state_views):
+        assert torch.equal(view[0], original[1])
+        assert torch.equal(view[1], original[0])
+        assert torch.equal(view[2:], original[2:])
+    for raw in backings:
+        assert (raw[logical_bytes:] == 77).all()
+        assert (raw[:logical_bytes].view(-1, page_bytes)[:, 48:] == 77).all()
