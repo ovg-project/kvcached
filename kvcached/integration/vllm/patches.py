@@ -15,6 +15,7 @@ import time
 import types
 from collections import OrderedDict
 from functools import wraps
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -1161,6 +1162,15 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             self.logger.debug("EngineCore.step_with_batch_queue already patched")
             return True
 
+        def _batch_queue_size(batch_queue: Any) -> int:
+            if batch_queue is None:
+                return 0
+            # Older PP schedulers use Queue; newer schedulers use deque.
+            # Only the engine thread adds/removes batches on either path.
+            if isinstance(batch_queue, Queue):
+                return batch_queue.qsize()
+            return len(batch_queue)
+
         def _fence_new_retirements(
             engine_core: Any,
             marker: int,
@@ -1187,7 +1197,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             _fence_new_retirements(
                 self,
                 marker_before,
-                len(batch_queue) if batch_queue is not None else 0,
+                _batch_queue_size(batch_queue),
             )
             result = original_step(self, *args, **kwargs)
 
@@ -1203,10 +1213,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             _fence_new_retirements(
                 self,
                 marker_after,
-                len(batch_queue) if batch_queue is not None else 0,
+                _batch_queue_size(batch_queue),
             )
 
-            if batch_queue is not None and not batch_queue:
+            if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
                 # No worker batch remains in flight, so pages retired while
                 # processing the final result are safe to release as well.
                 manager.release_retired_pages_through(marker_after)
@@ -1242,7 +1252,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     return result
 
                 batch_queue = getattr(self, "batch_queue", None)
-                if batch_queue is not None and not batch_queue:
+                if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
                     # Idle control operations have no subsequent batch step to
                     # drain retirements. A nonempty queue must keep its fences.
                     marker = manager.capture_physical_release_marker()

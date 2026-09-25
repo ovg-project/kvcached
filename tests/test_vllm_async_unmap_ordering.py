@@ -5,6 +5,7 @@ import sys
 import types
 from collections import deque
 from importlib.machinery import ModuleSpec
+from queue import Queue
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -38,6 +39,63 @@ class FakeManager:
 
     def release_retired_pages_through(self, marker):
         self.released.append(marker)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_queue_api_waits_for_all_inflight_batches(monkeypatch, legacy):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+    put = queue.put_nowait if legacy else queue.appendleft
+    take = queue.get_nowait if legacy else queue.pop
+    for _ in range(3):
+        put(object())
+
+    def original_step(self):
+        take()
+        return ({}, True)
+
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, queue)
+    manager.retire()
+    engine.step_with_batch_queue()
+    engine.step_with_batch_queue()
+    assert manager.released == []
+    engine.step_with_batch_queue()
+    assert manager.released == [1]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+def test_queue_api_reset_flushes_only_when_empty(monkeypatch, legacy, pending):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+    if pending:
+        (queue.put_nowait if legacy else queue.appendleft)(object())
+
+    def original_reset(self):
+        manager.retire()
+        return True
+
+    EngineCore = _patch_engine(monkeypatch, mock.Mock(), original_reset)
+    engine = _engine(EngineCore, manager, queue)
+    assert engine.reset_prefix_cache() is True
+    assert manager.released == ([] if pending else [1])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_queue_api_submission_does_not_release_early(monkeypatch, legacy):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+
+    def original_step(self):
+        (queue.put_nowait if legacy else queue.appendleft)(object())
+        manager.retire()
+        return (None, True)
+
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, queue)
+    engine.step_with_batch_queue()
+    assert manager.released == []
 
 
 @pytest.mark.parametrize("failed_patch", [None, "init", "lifetime", "shutdown"])
