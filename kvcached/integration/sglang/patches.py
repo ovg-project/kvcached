@@ -1541,6 +1541,145 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class DeepSeekV4RuntimeReservationPatch(VersionAwarePatch, BasePatch):
+    """Account for DeepSeek-V4 pools that remain owned by SGLang."""
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
+    patch_name = "deepseek_v4_runtime_reservation"
+
+    def apply(self, dsv4_pool_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_dsv4_pool_init(dsv4_pool_mod)
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_dsv4_pool_init(self, dsv4_pool_mod: types.ModuleType) -> bool:
+        pool_class = getattr(dsv4_pool_mod, "DeepSeekV4TokenToKVPool", None)
+        if pool_class is None:
+            self.logger.debug(
+                "DeepSeekV4TokenToKVPool not found; skipping reservation patch"
+            )
+            return True
+
+        original_init = getattr(pool_class, "__init__", None)
+        if original_init is None:
+            self.logger.warning("DeepSeekV4TokenToKVPool.__init__ not found")
+            return False
+        if self._is_already_patched(original_init):
+            return True
+
+        @functools.wraps(original_init)
+        def _wrapped_init(pool_self: Any, *args: Any, **kwargs: Any) -> None:
+            original_init(pool_self, *args, **kwargs)
+            breakdown = _collect_dsv4_runtime_reservations(pool_self)
+            _register_dsv4_runtime_reservations(pool_self, breakdown)
+
+        self._mark_as_patched(_wrapped_init)
+        pool_class.__init__ = _wrapped_init
+        self.logger.info("Enabled DeepSeek-V4 runtime reservation accounting")
+        return True
+
+
+def _is_kvcached_managed_pool(pool: Any) -> bool:
+    return pool is not None and bool(getattr(pool, "_kvcached_managed", False))
+
+
+def _pool_buffer_nbytes(pool: Any, buffer_name: str) -> int:
+    if pool is None or _is_kvcached_managed_pool(pool):
+        return 0
+    return _sum_buffer_nbytes(getattr(pool, buffer_name, None))
+
+
+def _collect_dsv4_runtime_reservations(kvcache: Any) -> dict[str, int]:
+    return {
+        "dsv4.unified_kv_pool": _pool_buffer_nbytes(
+            getattr(kvcache, "unified_kv_pool", None), "kv_buffer"
+        ),
+        "dsv4.swa_kv_pool": _pool_buffer_nbytes(
+            getattr(kvcache, "swa_kv_pool", None), "kv_buffer"
+        ),
+        "dsv4.c4_kv_pool": _pool_buffer_nbytes(
+            getattr(kvcache, "c4_kv_pool", None), "kv_buffer"
+        ),
+        "dsv4.c128_kv_pool": _pool_buffer_nbytes(
+            getattr(kvcache, "c128_kv_pool", None), "kv_buffer"
+        ),
+        "dsv4.c4_indexer_kv_pool": sum(_pool_buffer_nbytes(
+            getattr(kvcache, "c4_indexer_kv_pool", None),
+            buffer_name,
+        ) for buffer_name in (
+            "index_k_with_scale_buffer",
+            "index_k_payload_buffer",
+            "index_k_scale_buffer",
+        )),
+        "dsv4.compress_state_pools": _sum_dsv4_state_pool_nbytes(
+            getattr(kvcache, "compress_state_pools", None)
+        ),
+        "dsv4.indexer_compress_state_pools": _sum_dsv4_state_pool_nbytes(
+            getattr(kvcache, "indexer_compress_state_pools", None)
+        ),
+    }
+
+
+def _register_dsv4_runtime_reservations(
+    kvcache: Any,
+    breakdown: dict[str, int],
+) -> None:
+    import kvcached.integration.sglang.interfaces as kvi
+
+    device = getattr(kvcache, "device", None)
+    if device is None:
+        raise ValueError("DeepSeek-V4 pool does not expose device")
+
+    for pool_name, num_bytes in breakdown.items():
+        kvi.register_runtime_owned_reservation(
+            str(device),
+            pool_name,
+            num_bytes,
+            owner=kvcache,
+        )
+
+    setattr(kvcache, "_kvcached_runtime_reservation_breakdown", dict(breakdown))
+    logger.info(
+        "Registered DeepSeek-V4 runtime-owned reservations on %s: "
+        "total=%.2f GB, breakdown=%s",
+        device,
+        sum(breakdown.values()) / BYTES_PER_GB,
+        {
+            key: round(value / BYTES_PER_GB, 3)
+            for key, value in breakdown.items()
+            if value > 0
+        },
+    )
+
+
+def _sum_buffer_nbytes(buffers: Any) -> int:
+    if buffers is None:
+        return 0
+    if hasattr(buffers, "nbytes"):
+        return int(buffers.nbytes)
+    return sum(
+        int(getattr(buffer, "nbytes", 0))
+        for buffer in buffers
+        if buffer is not None
+    )
+
+
+def _sum_dsv4_state_pool_nbytes(pools: Any) -> int:
+    if pools is None:
+        return 0
+
+    total = 0
+    for pool in pools:
+        if pool is None or _is_kvcached_managed_pool(pool):
+            continue
+        kv_score_buffer = getattr(pool, "kv_score_buffer", None)
+        kv_score = getattr(kv_score_buffer, "kv_score", None)
+        total += int(getattr(kv_score, "nbytes", 0))
+    return total
+
+
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
     """Patch SGLang scheduler to suppress memory leak check when kvcached is enabled"""
 
