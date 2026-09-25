@@ -1090,7 +1090,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return []
 
         elastic_block_pool_cls: type = ElasticBlockPool
-        if self.detected_version and VersionRange(">=0.28.0,<0.30.0").contains(self.detected_version):
+        if self.detected_version and VersionRange(">=0.26.0,<0.30.0").contains(self.detected_version):
             from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
 
             elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
