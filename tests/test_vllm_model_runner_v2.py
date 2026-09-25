@@ -303,7 +303,9 @@ def test_profile_and_failed_initialization_do_not_leak_persistent_scope(monkeypa
             calls.append(("bound", config))
 
     runner = Runner()
-    assert adapter.ModelRunnerV2Patch().apply(types.SimpleNamespace(GPUModelRunner=Runner))
+    assert adapter.ModelRunnerV2Patch().apply(types.SimpleNamespace(
+        GPUModelRunner=Runner, init_attn_backend=lambda *args, **kwargs: None,
+    ))
     runner.initialize_kv_cache("profile", is_profiling=True)
     runner.initialize_kv_cache("persistent")
     with pytest.raises(RuntimeError, match="binding failure"):

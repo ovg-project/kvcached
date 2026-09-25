@@ -16,6 +16,39 @@ from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, KVCachedConfigError
 _persistent_allocation: ContextVar[bool] = ContextVar("kvcached_mrv2_allocation", default=False)
 
 
+class _OwnerSpecLookup(dict):
+    """Resolve consumer indexing without including aliases in storage accounting."""
+
+    def __init__(self, specs, shared_layers):
+        super().__init__(specs)
+        self._consumer_specs = {
+            consumer: specs[owner]
+            for consumer, owner in shared_layers.items()
+            if owner in specs
+        }
+
+    def __missing__(self, name):
+        return self._consumer_specs[name]
+
+
+def _with_owner_spec_lookup(config, shared_layers):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    groups = []
+    changed = False
+    for group in config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if (isinstance(spec, UniformTypeKVCacheSpecs)
+                and any(owner in spec.kv_cache_specs for owner in shared_layers.values())):
+            spec = replace(spec, kv_cache_specs=_OwnerSpecLookup(spec.kv_cache_specs, shared_layers))
+            # Preserve native layer-list updates for subsequent binding, while
+            # keeping the owner's original spec dictionary entirely untouched.
+            group = replace(group, kv_cache_spec=spec)
+            changed = True
+        groups.append(group)
+    return replace(config, kv_cache_groups=groups) if changed else config
+
+
 @dataclass(frozen=True)
 class CacheGeometry:
     block_size: int
@@ -182,6 +215,15 @@ class ModelRunnerV2Patch(BasePatch):
         original_init = runner.__init__
         original_initialize = runner.initialize_kv_cache
         original_allocate = attn_utils.allocate_kv_cache
+        original_discovery = module.init_attn_backend
+
+        @wraps(original_discovery)
+        def discover_attention(kv_cache_config, vllm_config, *args, **kwargs):
+            if enable_kvcached():
+                shared_layers = attn_utils.get_shared_kv_cache_layers(vllm_config)
+                if shared_layers:
+                    kv_cache_config = _with_owner_spec_lookup(kv_cache_config, shared_layers)
+            return original_discovery(kv_cache_config, vllm_config, *args, **kwargs)
 
         @wraps(original_init)
         def initialize_worker(self, *args, **kwargs):
@@ -227,6 +269,7 @@ class ModelRunnerV2Patch(BasePatch):
         self._mark_as_patched(initialize_cache)
         runner.__init__ = initialize_worker
         runner.initialize_kv_cache = initialize_cache
+        module.init_attn_backend = discover_attention
         attn_utils.allocate_kv_cache = scoped_allocate
         return True
 
