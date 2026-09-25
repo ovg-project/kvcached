@@ -145,7 +145,29 @@ def _check_background_unknown_outcome():
         allocator.stop_prealloc_thread()
 
 
-def test_deferred_native_release_notifies_a_waiting_manager(monkeypatch, tmp_path, request):
+@pytest.mark.parametrize("reserved", [0, 1])
+def test_deferred_native_release_notifies_a_waiting_manager(reserved):
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserve limits are captured at extension load, not constructor time.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES=str(reserved),
+               KVCACHED_MAX_RESERVED_PAGES=str(reserved))
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import runpy, sys, tempfile; from pathlib import Path; import pytest; "
+         "check = runpy.run_path(sys.argv[1])['_check_deferred_capacity_notification']; "
+         "\nwith tempfile.TemporaryDirectory() as root, pytest.MonkeyPatch.context() as mp:\n"
+         "    check(mp, Path(root), int(sys.argv[2]))",
+         __file__, str(reserved)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_deferred_capacity_notification(monkeypatch, tmp_path, reserved):
     import tempfile
     import threading
     import time
@@ -167,7 +189,6 @@ def test_deferred_native_release_notifies_a_waiting_manager(monkeypatch, tmp_pat
     monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: True)
     monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {})
     socket_root = tempfile.TemporaryDirectory(prefix="kv-epoch-", dir="/tmp")
-    request.addfinalizer(socket_root.cleanup)
     monkeypatch.setattr(ipc, "SOCKET_DIR", socket_root.name)
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
     ipc.start_worker_listener_thread(0, device_index=0)
@@ -191,6 +212,11 @@ def test_deferred_native_release_notifies_a_waiting_manager(monkeypatch, tmp_pat
         assert ipc.physical_growth_capacity_epoch(1) == before
         assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
         manager.release_retired_pages_through(manager.capture_physical_release_marker())
+        if reserved:
+            # Retirement alone may keep an idle page mapped for reuse.
+            assert ipc.physical_growth_capacity_epoch(1) == before
+            assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
+            manager.trim()
         assert ipc.physical_growth_capacity_epoch(1) != before
         assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 1
         waiter._physical_growth_epoch_next_check = 0
@@ -203,6 +229,7 @@ def test_deferred_native_release_notifies_a_waiting_manager(monkeypatch, tmp_pat
             manager.shutdown()
         assert ipc.stop_worker_listener_threads()
         vmm_ops.shutdown_kvcached()
+        socket_root.cleanup()
 
 
 def _compiled_vmm_ops():

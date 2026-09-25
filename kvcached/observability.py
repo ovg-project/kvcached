@@ -160,7 +160,8 @@ def _get_integration_capabilities() -> Dict[str, Any]:
     return {
         "vllm": {
             "attention_types": ["MHA", "GQA", "MLA", "HYBRID_LINEAR"],
-            "kv_layouts": ["NHD"],
+            # HND applies to packed K/V; legacy split K/V remains NHD-only.
+            "kv_layouts": ["NHD", "HND"],
             # Hybrid attention + linear/SSM (mamba) state is carved out of the
             # same pool via the HYBRID_LINEAR attention type, so that state is
             # visible in this pool's KVCachePoolSnapshot.

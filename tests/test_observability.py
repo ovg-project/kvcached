@@ -726,7 +726,8 @@ def test_capabilities_expose_backend_and_integration_records():
     for entry in integrations.values():
         assert "MHA" in entry["attention_types"]
         assert "MLA" in entry["attention_types"]
-        assert entry["kv_layouts"] == ["NHD"]
+    assert integrations["vllm"]["kv_layouts"] == ["NHD", "HND"]
+    assert integrations["sglang"]["kv_layouts"] == ["NHD"]
 
     # A real, code-level distinction between the two shims: only the vLLM
     # integration accepts HYBRID_LINEAR through alloc_kv_cache(); SGLang

@@ -56,7 +56,11 @@ def cache_geometry(config: Any) -> CacheGeometry:
     if first_attention is None:
         raise KVCachedConfigError("kvcached MRV2 requires an attention group")
     block_size = first_attention.block_size
-    num_pools = max(len(group.layer_names) for group in config.kv_cache_groups)
+    # Attention discovery appends borrowers to groups without allocating storage.
+    # Count only descriptor-backed owners, across all spec regions in each
+    # group. Groups reuse the backing, so their counts must not be summed.
+    owners = {layer for tensor in config.kv_cache_tensors for layer in tensor.layers}
+    num_pools = max(len(owners.intersection(group.layer_names)) for group in config.kv_cache_groups)
     if CONTIGUOUS_LAYOUT:
         # The scheduler collapses UniformTypeKVCacheSpecs to a representative
         # layer, but retains the backing placement. Derive allocation units
