@@ -9,7 +9,19 @@ import functools
 import inspect
 import math
 import types
-from typing import Any, Callable, List, Optional, Tuple, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import (
@@ -1641,13 +1653,280 @@ class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
         return patched_any
 
 
+def _radix_node_blocks(
+    nodes: Sequence[Any], logical_page_size: int
+) -> Dict[Any, Tuple[int, ...]]:
+    """Read each radix node's logical blocks with one GPU synchronization."""
+    import torch
+
+    node_blocks: Dict[Any, Tuple[int, ...]] = {}
+    uncached_nodes: List[Any] = []
+    uncached_values: List[Any] = []
+    for node in nodes:
+        cached = getattr(node.value, "_kvcached_block_ids", None)
+        if cached is not None:
+            node_blocks[node] = cast(Tuple[int, ...], cached)
+        else:
+            uncached_nodes.append(node)
+            uncached_values.append(node.value)
+
+    if not uncached_nodes:
+        return node_blocks
+
+    # Radix nodes and allocator blocks are page-aligned. Gather one index per
+    # logical block before concatenating, then synchronize with the GPU once.
+    lengths: List[int] = [
+        int(value.numel()) // logical_page_size for value in uncached_values
+    ]
+    if logical_page_size > 1:
+        logical_block_indices = [
+            value[::logical_page_size] for value in uncached_values
+        ]
+        flattened_tensor = torch.cat(logical_block_indices)
+        flattened_tensor = flattened_tensor // logical_page_size
+    else:
+        flattened_tensor = torch.cat(uncached_values)
+    flattened = cast(List[int], cast(Any, flattened_tensor).tolist())
+
+    offset = 0
+    for node, value, length in zip(uncached_nodes, uncached_values, lengths):
+        block_ids = tuple(flattened[offset : offset + length])
+        value._kvcached_block_ids = block_ids
+        node_blocks[node] = block_ids
+        offset += length
+    return node_blocks
+
+
+class _RadixBlockIndex:
+    def __init__(self, root_node: Any, logical_page_size: int) -> None:
+        self.root_node = root_node
+        self.logical_page_size = logical_page_size
+        self.block_owners: Dict[int, Any] = {}
+        self.node_blocks: Dict[Any, Tuple[int, ...]] = {}
+        self.node_values: Dict[Any, Any] = {}
+
+    def _remove(self, node: Any) -> None:
+        for block_id in self.node_blocks.pop(node, ()):
+            if self.block_owners.get(block_id) is node:
+                del self.block_owners[block_id]
+        self.node_values.pop(node, None)
+
+    def prune(self, nodes: Set[Any]) -> None:
+        for node in self.node_blocks.keys() - nodes:
+            self._remove(node)
+
+    def sync(self, nodes: Set[Any]) -> None:
+        self.prune(nodes)
+        changed_nodes = [
+            node
+            for node in nodes
+            if self.node_values.get(node) is not node.value
+        ]
+        for node in changed_nodes:
+            self._remove(node)
+        for node, block_ids in _radix_node_blocks(
+            changed_nodes, self.logical_page_size
+        ).items():
+            self.node_blocks[node] = block_ids
+            self.node_values[node] = node.value
+            for block_id in block_ids:
+                self.block_owners[block_id] = node
+
+    def count_tokens(self, nodes: Union[Set[Any], FrozenSet[Any]]) -> int:
+        block_count = sum(len(self.node_blocks[node]) for node in nodes)
+        return block_count * self.logical_page_size
+
+
+def _evictable_radix_nodes(radix_cache: Any) -> Set[Any]:
+    """Return every node reachable by repeatedly evicting current leaves."""
+    root = radix_cache.root_node
+    nodes: Set[Any] = set()
+    for leaf in radix_cache.evictable_leaves:
+        node = leaf
+        while node is not root and node.lock_ref == 0:
+            if node in nodes:
+                break
+            nodes.add(node)
+            node = node.parent
+    return nodes
+
+
+def _radix_eviction_closure(owners: Set[Any]) -> FrozenSet[Any]:
+    """Return nodes that must be removed before all owner nodes can be evicted."""
+    # Most SGLang radix nodes are leaves. Avoid the explicit DFS and its
+    # per-node stack/set operations when the closure is already known.
+    if not any(node.children for node in owners):
+        return frozenset(owners)
+
+    closure: Set[Any] = set()
+    stack = list(owners)
+    while stack:
+        node = stack.pop()
+        if node in closure:
+            continue
+        closure.add(node)
+        stack.extend(node.children.values())
+    return frozenset(closure)
+
+
+def _radix_plan_stats(
+    index: _RadixBlockIndex,
+    strategy: Any,
+    nodes: FrozenSet[Any],
+) -> Tuple[int, Any]:
+    """Return token cost and worst eviction priority in one node pass."""
+    node_iter = iter(nodes)
+    first = next(node_iter)
+    block_count = len(index.node_blocks[first])
+    worst_priority = strategy.get_priority(first)
+    for node in node_iter:
+        block_count += len(index.node_blocks[node])
+        priority = strategy.get_priority(node)
+        if priority > worst_priority:
+            worst_priority = priority
+    return block_count * index.logical_page_size, worst_priority
+
+
+_RadixEvictionPlan = Tuple[float, int, int, Any, int, FrozenSet[Any]]
+
+
+def _select_page_aware_radix_plan(
+    radix_cache: Any,
+    token_budget: int,
+) -> Tuple[Set[Any], int]:
+    """Choose page-reclaiming nodes and a budget that completes their closures."""
+    if token_budget <= 0:
+        return set(), token_budget
+
+    allocator = getattr(radix_cache, "token_to_kv_pool_allocator", None)
+    manager = getattr(allocator, "kvcached_allocator", None)
+    page_allocator = getattr(manager, "page_allocator", None)
+    if manager is None or page_allocator is None:
+        return set(), token_budget
+
+    logical_page_size = max(1, int(getattr(allocator, "page_size", 1)))
+    evictable_nodes = _evictable_radix_nodes(radix_cache)
+    if not evictable_nodes:
+        return set(), token_budget
+
+    index = getattr(radix_cache, "_kvcached_radix_block_index", None)
+    if (
+        index is None
+        or index.root_node is not radix_cache.root_node
+        or index.logical_page_size != logical_page_size
+    ):
+        index = _RadixBlockIndex(radix_cache.root_node, logical_page_size)
+        radix_cache._kvcached_radix_block_index = index
+    index.sync(evictable_nodes)
+    block_owners = index.block_owners
+
+    by_page = page_allocator.group_indices_by_page(
+        list(block_owners), manager.block_mem_size
+    )
+    occupancy = manager.get_page_occupancy(list(by_page))
+
+    strategy = radix_cache.eviction_strategy
+    plans: Dict[FrozenSet[Any], List[int]] = {}
+    for page_id, block_ids in by_page.items():
+        if len(block_ids) < occupancy.get(page_id, 0):
+            continue
+        page_nodes = {block_owners[block_id] for block_id in block_ids}
+        closure = _radix_eviction_closure(page_nodes)
+        plans.setdefault(closure, []).append(page_id)
+
+    candidates: List[_RadixEvictionPlan] = []
+    for nodes, page_ids in plans.items():
+        cost, worst_priority = _radix_plan_stats(index, strategy, nodes)
+        # A long radix node can cover several physical pages. Amortize its
+        # eviction cost across every page released by the same node closure.
+        cost_per_page = cost / len(page_ids)
+        candidates.append(
+            (
+                cost_per_page,
+                -len(page_ids),
+                cost,
+                worst_priority,
+                min(page_ids),
+                nodes,
+            )
+        )
+    candidates.sort(key=lambda candidate: candidate[:-1])
+
+    selected: Set[Any] = set()
+    selected_tokens = 0
+    for _ratio, _page_count, cost, _priority, _page_id, nodes in candidates:
+        if selected.isdisjoint(nodes):
+            additional = nodes
+            additional_tokens = cost
+        else:
+            additional = nodes - selected
+            additional_tokens = index.count_tokens(additional)
+        selected.update(additional)
+        selected_tokens += additional_tokens
+        if selected_tokens >= token_budget:
+            break
+    return selected, max(token_budget, selected_tokens)
+
+
+def _make_sglang_evict_arg(
+    num_tokens: int, evict_params_cls: Optional[Callable[..., Any]]
+) -> Any:
+    """Build the eviction argument used by the installed SGLang version."""
+    if evict_params_cls is None:
+        return num_tokens
+    return evict_params_cls(num_tokens=num_tokens)
+
+
+def _evict_radix_cache_page_aware(
+    radix_cache: Any,
+    num_tokens: int,
+    evict_params_cls: Callable[..., Any],
+) -> Any:
+    """Run SGLang's native eviction with page-aware victim priorities."""
+    if num_tokens >= radix_cache.evictable_size_:
+        # Evicting the entire cache cannot benefit from page-aware ordering.
+        selected: Set[Any] = set()
+        eviction_budget = num_tokens
+    else:
+        selected, eviction_budget = _select_page_aware_radix_plan(
+            radix_cache,
+            token_budget=num_tokens,
+        )
+    original_strategy = radix_cache.eviction_strategy
+    if selected:
+
+        def get_priority(node: Any) -> Any:
+            priority = original_strategy.get_priority(node)
+            return (0, priority) if node in selected else (1, priority)
+
+        radix_cache.eviction_strategy = types.SimpleNamespace(
+            get_priority=get_priority
+        )
+    try:
+        return radix_cache.evict(
+            _make_sglang_evict_arg(
+                num_tokens=eviction_budget,
+                evict_params_cls=evict_params_cls,
+            )
+        )
+    finally:
+        radix_cache.eviction_strategy = original_strategy
+        index = getattr(radix_cache, "_kvcached_radix_block_index", None)
+        if index is not None:
+            index.prune(_evictable_radix_nodes(radix_cache))
+
+
 class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
-    """Enforce KVCACHED_MAX_CACHED_TOKENS limit on SGLang's RadixCache.
+    """Enforce KVCACHED_MAX_CACHED_TOKENS on SGLang's RadixCache.
 
     After each finished request is inserted into the radix cache, if the
     evictable (cached) size exceeds the configured limit, immediately evict
     down to that limit.  This prevents the cache from consuming all KV pool
-    capacity and leaves headroom for running requests.
+    capacity and leaves headroom for running requests. For a plain RadixCache,
+    physical page reclaim takes precedence over the configured eviction policy;
+    the policy breaks ties between equally reclaimable pages. Eviction may
+    exceed the requested token count when completing the cheapest closure that
+    releases a physical page.
 
     KVCACHED_MAX_CACHED_TOKENS semantics:
       < 0  → unlimited; this patch is a no-op.
@@ -1689,24 +1968,46 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             return True
 
         max_cached = MAX_CACHED_TOKENS
+        evict_params_cls = getattr(radix_cache_mod, "EvictParams", None)
+        # SGLang < 0.5.9 computes leaves on demand and does not expose the
+        # persistent evictable_leaves set required by the page-aware planner.
 
-        # SGLang >= ~0.5.9 uses EvictParams; older releases pass token count as int.
-        try:
-            from sglang.srt.mem_cache.radix_cache import EvictParams as _EvictParams
-        except ImportError:
-            _EvictParams = None  # type: ignore[misc, assignment]
-
-        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+        def _wrapped(self_rc: Any, *args: Any, **kwargs: Any) -> None:
             original_cache_finished(self_rc, *args, **kwargs)
             excess = self_rc.evictable_size_ - max_cached
             if excess > 0:
-                if _EvictParams is not None:
-                    self_rc.evict(_EvictParams(num_tokens=excess))
+                if type(self_rc) is RadixCache and evict_params_cls is not None:
+                    _evict_radix_cache_page_aware(
+                        radix_cache=self_rc,
+                        num_tokens=excess,
+                        evict_params_cls=evict_params_cls,
+                    )
                 else:
-                    self_rc.evict(excess)
+                    self_rc.evict(
+                        _make_sglang_evict_arg(
+                            num_tokens=excess,
+                            evict_params_cls=evict_params_cls,
+                        )
+                    )
 
         self._mark_as_patched(_wrapped)
         RadixCache.cache_finished_req = _wrapped  # type: ignore
+
+        if evict_params_cls is not None:
+            original_reset = RadixCache.reset
+
+            @functools.wraps(original_reset)
+            def _wrapped_reset(
+                self_rc: Any, *args: Any, **kwargs: Any
+            ) -> Any:
+                result = original_reset(self_rc, *args, **kwargs)
+                self_rc._kvcached_radix_block_index = None
+                return result
+
+            self._mark_as_patched(
+                _wrapped_reset, "__kvcached_radix_block_index_reset__"
+            )
+            RadixCache.reset = _wrapped_reset  # type: ignore
 
         logger.info(
             f"[kvcached] RadixCache evictable size capped at "
