@@ -79,6 +79,9 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page();
+  // Reuse reserved pages first; map all new pages in one callback. On failure,
+  // restore ID ownership and propagate the map protocol's original exception.
+  std::vector<std::shared_ptr<InternalPage>> alloc_pages(int64_t num_pages);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
 

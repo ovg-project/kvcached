@@ -167,97 +167,103 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  return alloc_pages(1).front();
+}
+
+std::vector<std::shared_ptr<InternalPage>>
+PageAllocator::alloc_pages(int64_t num_pages) {
   throw_if_failed();
+  if (num_pages < 0) {
+    throw std::invalid_argument("num_pages must be non-negative");
+  }
+  if (num_pages == 0) {
+    return {};
+  }
   auto start_time = std::chrono::steady_clock::now();
-
   std::unique_lock<std::mutex> lock(lock_);
-  page_id_t page_id = -1;
-
-  while (page_id == -1) {
+  while (true) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
       throw StateConsistencyError(transaction_error_);
     }
-    // Fast path: allocate from reserved pages
-    if (!reserved_page_list_.empty()) {
-      page_id = reserved_page_list_.front();
-      reserved_page_list_.pop_front();
-      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
-
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
-        prealloc_needed_ = true;
-        cond_.notify_all();
-      }
-
-      update_memory_usage_unlocked();
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-          end_time - start_time);
-      LOGGER(DEBUG, "alloc 1 page fast path cost %lu us", duration.count());
-      // std::cout << "alloc 1 page fast path cost " << duration.count() << "
-      // us" << std::endl;
-
-      return std::make_shared<InternalPage>(page_id, page_size_);
+    if (num_free_pages_.load(std::memory_order_relaxed) < num_pages) {
+      throw std::runtime_error("Not enough free pages left");
     }
-
-    // Slow path: allocate from free pages
-    if (!free_page_list_.empty()) {
-      page_id = free_page_list_.front();
-      free_page_list_.pop_front();
-      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
+    if (reserved_page_list_.size() + free_page_list_.size() >=
+        static_cast<size_t>(num_pages)) {
       break;
     }
-
-    if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
-      throw std::runtime_error("No free pages left");
-    }
-
     if (!enable_page_prealloc_) {
       throw std::runtime_error(
           "Inconsistent page allocator state: no free pages available");
     }
-
-    // Wait for background preallocation
     cond_.wait(lock);
   }
 
+  const auto num_reserved =
+      std::min(static_cast<size_t>(num_pages), reserved_page_list_.size());
+  std::vector<page_id_t> reserved_ids(
+      reserved_page_list_.begin(), reserved_page_list_.begin() + num_reserved);
+  std::vector<page_id_t> pages_to_map(free_page_list_.begin(),
+                                      free_page_list_.begin() +
+                                          (num_pages - num_reserved));
+  std::vector<std::shared_ptr<InternalPage>> pages;
+  pages.reserve(num_pages);
+  for (auto id : reserved_ids) {
+    pages.push_back(std::make_shared<InternalPage>(id, page_size_));
+  }
+  for (auto id : pages_to_map) {
+    pages.push_back(std::make_shared<InternalPage>(id, page_size_));
+  }
+  reserved_page_list_.erase(reserved_page_list_.begin(),
+                            reserved_page_list_.begin() + num_reserved);
+  free_page_list_.erase(free_page_list_.begin(),
+                        free_page_list_.begin() + pages_to_map.size());
+  num_free_pages_.fetch_sub(num_pages, std::memory_order_relaxed);
   lock.unlock();
 
+  // Reused reservations never participated in the failed mapping transaction.
+  // Return those alone; newly mapped/unknown IDs remain quarantined.
+  const auto restore_reserved = [&]() {
+    reserved_page_list_.insert(reserved_page_list_.begin(),
+                               reserved_ids.begin(), reserved_ids.end());
+    num_free_pages_.fetch_add(reserved_ids.size(), std::memory_order_relaxed);
+  };
   try {
-    map_pages({page_id});
+    if (!pages_to_map.empty()) {
+      map_pages(pages_to_map);
+    }
   } catch (const MapQuarantinedError &e) {
     std::lock_guard<std::mutex> guard(lock_);
-    quarantine_pages_unlocked({page_id}, e.what());
+    restore_reserved();
+    quarantine_pages_unlocked(pages_to_map, e.what());
     throw;
   } catch (const StateConsistencyError &e) {
     std::lock_guard<std::mutex> guard(lock_);
-    quarantine_pages_unlocked({page_id}, e.what());
+    restore_reserved();
+    quarantine_pages_unlocked(pages_to_map, e.what());
     transaction_failed_.store(true, std::memory_order_release);
     throw;
-  } catch (const std::exception &e) {
+  } catch (...) {
     std::lock_guard<std::mutex> guard(lock_);
-    free_page_list_.push_front(page_id);
-    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
+    restore_reserved();
+    free_page_list_.insert(free_page_list_.begin(), pages_to_map.begin(),
+                           pages_to_map.end());
+    num_free_pages_.fetch_add(pages_to_map.size(), std::memory_order_relaxed);
     cond_.notify_all();
-    throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
-                             ": " + e.what());
+    throw;
   }
 
   if (enable_page_prealloc_) {
     trigger_preallocation();
   }
-
   {
-    std::lock_guard<std::mutex> lock(lock_);
+    std::lock_guard<std::mutex> guard(lock_);
     update_memory_usage_unlocked();
   }
-  auto end_time = std::chrono::steady_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-      end_time - start_time);
-  LOGGER(DEBUG, "alloc 1 page slow path cost %lu us", duration.count());
-
-  return std::make_shared<InternalPage>(page_id, page_size_);
+  const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start_time);
+  LOGGER(DEBUG, "alloc %ld pages cost %lu us", num_pages, duration.count());
+  return pages;
 }
 
 void PageAllocator::free_page(page_id_t page_id) {

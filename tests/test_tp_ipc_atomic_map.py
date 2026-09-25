@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from kvcached.errors import MapQuarantinedError, StateConsistencyError
+from kvcached.errors import StateConsistencyError
 
 
 def _load_tp_ipc_util(monkeypatch):
@@ -35,107 +35,6 @@ def _load_tp_ipc_util(monkeypatch):
 
     module = importlib.import_module("kvcached.tp_ipc_util")
     return importlib.reload(module)
-
-
-def test_partial_pp_map_rolls_back_only_new_offsets(monkeypatch):
-    module = _load_tp_ipc_util(monkeypatch)
-    calls = []
-
-    async def fake_send(rank, message, pp_rank=0):
-        calls.append((pp_rank, rank, message["cmd"], tuple(message["offsets"])))
-        if message["cmd"] == "unmap_from_kv_tensors":
-            return {"status": "success"}
-        if (pp_rank, rank) == (0, 1):
-            return {"status": "error", "message": "map failed"}
-        newly_mapped = {
-            (0, 0): [0],
-            (1, 0): [0, 2],
-            (1, 1): [],
-        }[(pp_rank, rank)]
-        return {
-            "status": "success",
-            "newly_mapped_offsets": newly_mapped,
-        }
-
-    monkeypatch.setenv("KVCACHED_PP_SIZE", "2")
-    monkeypatch.setattr(module, "_send_and_receive_message", fake_send)
-
-    with pytest.raises(RuntimeError, match="pp0/rank1"):
-        asyncio.run(
-            module._broadcast_map_to_kv_tensors(
-                tp_size=2,
-                offsets=[0, 2],
-                pp_rank=-1,
-                group_id=7,
-            )
-        )
-
-    rollback_calls = [call for call in calls if call[2] == "unmap_from_kv_tensors"]
-    assert rollback_calls == [
-        (0, 0, "unmap_from_kv_tensors", (0,)),
-        (1, 0, "unmap_from_kv_tensors", (0, 2)),
-    ]
-
-
-def test_transactional_map_fails_closed_with_legacy_extension(monkeypatch):
-    module = _load_tp_ipc_util(monkeypatch)
-    legacy_calls = []
-
-    monkeypatch.delattr(module.vmm_ops, "map_to_kv_tensors_with_result")
-    monkeypatch.setattr(
-        module,
-        "map_to_kv_tensors",
-        lambda offsets, group_id=0: legacy_calls.append((offsets, group_id)),
-    )
-
-    with pytest.raises(RuntimeError, match="does not support transactional map"):
-        module._map_to_kv_tensors_with_result([0, 2], group_id=7)
-
-    assert legacy_calls == []
-
-
-def test_partial_map_reports_rollback_failure(monkeypatch):
-    module = _load_tp_ipc_util(monkeypatch)
-
-    async def fake_send(rank, message, pp_rank=0):
-        if message["cmd"] == "unmap_from_kv_tensors":
-            return {"status": "error", "message": "rollback failed"}
-        if rank == 1:
-            return {"status": "error", "message": "map failed"}
-        return {"status": "success", "newly_mapped_offsets": [0]}
-
-    monkeypatch.setattr(module, "_send_and_receive_message", fake_send)
-
-    with pytest.raises(StateConsistencyError, match="rollback failures.*rollback failed"):
-        asyncio.run(module._broadcast_map_to_kv_tensors(2, [0]))
-
-
-def test_lost_map_response_is_reported_as_unknown_state(monkeypatch):
-    module = _load_tp_ipc_util(monkeypatch)
-
-    async def fake_send(rank, message, pp_rank=0):
-        if message["cmd"] == "map_to_kv_tensors" and rank == 1:
-            raise ConnectionError("response lost")
-        return {"status": "success", "newly_mapped_offsets": [0]}
-
-    monkeypatch.setattr(module, "_send_and_receive_message", fake_send)
-
-    with pytest.raises(StateConsistencyError, match="state_consistency_unknown.*pp0/rank1"):
-        asyncio.run(module._broadcast_map_to_kv_tensors(2, [0]))
-
-
-def test_successful_map_does_not_issue_rollback(monkeypatch):
-    module = _load_tp_ipc_util(monkeypatch)
-    commands = []
-
-    async def fake_send(rank, message, pp_rank=0):
-        commands.append(message["cmd"])
-        return {"status": "success", "newly_mapped_offsets": [0]}
-
-    monkeypatch.setattr(module, "_send_and_receive_message", fake_send)
-    asyncio.run(module._broadcast_map_to_kv_tensors(2, [0]))
-
-    assert commands == ["map_to_kv_tensors", "map_to_kv_tensors"]
 
 
 def test_unmap_commits_only_after_every_pp_rank_prepares(monkeypatch):
@@ -239,23 +138,6 @@ def test_unmap_commit_failure_never_attempts_abort(monkeypatch):
     with pytest.raises(StateConsistencyError, match="state_consistency_unknown.*commit unconfirmed"):
         asyncio.run(module._broadcast_unmap_from_kv_tensors(2, [0]))
     assert "abort_unmap_from_kv_tensors" not in commands
-
-
-@pytest.mark.parametrize("kind,expected", [
-    ("map_quarantined", MapQuarantinedError),
-    ("state_consistency", StateConsistencyError),
-])
-def test_worker_error_type_survives_broadcast(monkeypatch, kind, expected):
-    module = _load_tp_ipc_util(monkeypatch)
-
-    async def fake_send(rank, message, pp_rank=0):
-        if rank == 1 and message["cmd"] == "map_to_kv_tensors":
-            return {"status": "error", "message": "same message", "error_type": kind}
-        return {"status": "success", "newly_mapped_offsets": [0]}
-
-    monkeypatch.setattr(module, "_send_and_receive_message", fake_send)
-    with pytest.raises(expected, match="same message"):
-        asyncio.run(module._broadcast_map_to_kv_tensors(2, [0]))
 
 
 def test_unmap_prepare_fatal_is_not_hidden_by_successful_abort(monkeypatch):

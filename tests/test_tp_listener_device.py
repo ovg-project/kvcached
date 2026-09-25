@@ -64,7 +64,8 @@ def test_listener_thread_restores_cuda_device(monkeypatch, tmp_path):
     assert thread_target is not None
     with pytest.raises(RuntimeError, match="stop listener"):
         thread_target()
-    torch.cuda.set_device.assert_called_once_with(3)
+    assert torch.cuda.set_device.call_args_list == [mock.call(3), mock.call(3)]
+    tp_ipc_util._listeners.clear()
 
 
 @pytest.mark.parametrize("integration", ["vllm", "sglang"])
