@@ -195,6 +195,91 @@ def _check_background_unknown_outcome():
         allocator.stop_prealloc_thread()
 
 
+@pytest.mark.parametrize("reserved", [0, 1])
+def test_deferred_native_release_notifies_a_waiting_manager(reserved):
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserve limits are captured at extension load, not constructor time.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES=str(reserved),
+               KVCACHED_MAX_RESERVED_PAGES=str(reserved))
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import runpy, sys, tempfile; from pathlib import Path; import pytest; "
+         "check = runpy.run_path(sys.argv[1])['_check_deferred_capacity_notification']; "
+         "\nwith tempfile.TemporaryDirectory() as root, pytest.MonkeyPatch.context() as mp:\n"
+         "    check(mp, Path(root), int(sys.argv[2]))",
+         __file__, str(reserved)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_deferred_capacity_notification(monkeypatch, tmp_path, reserved):
+    import tempfile
+    import time
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.integration.vllm import interfaces
+    from kvcached.kv_cache_manager import KVCacheManager
+
+    vmm_ops = _compiled_vmm_ops()
+    _create_layout(vmm_ops, False, False)
+    import kvcached.kv_cache_manager as manager_module
+
+    page_size = 2 * 1024 * 1024
+    monkeypatch.setattr(manager_module, "PAGE_SIZE", page_size)
+    monkeypatch.setattr(manager_module, "PAGE_PREALLOC_ENABLED", False)
+    monkeypatch.setattr(manager_module, "CONTIGUOUS_LAYOUT", False)
+    monkeypatch.setattr(manager_module, "DEFAULT_IPC_NAME", "epoch-" + uuid.uuid4().hex[:8])
+    monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: True)
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {})
+    socket_root = tempfile.TemporaryDirectory(prefix="kv-epoch-", dir="/tmp")
+    monkeypatch.setattr(ipc, "SOCKET_DIR", socket_root.name)
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    ipc.start_worker_listener_thread(0, device_index=0)
+    manager = None
+    try:
+        manager = KVCacheManager(4, 1, page_size, 2, defer_physical_release=True)
+        blocks = manager.alloc(1)
+        assert blocks == [0]
+        waiter = object.__new__(KVCacheManager)
+        waiter._operation_counters = {}
+        waiter._physical_growth_capacity_epoch_provider = lambda: ipc.physical_growth_capacity_epoch(1)
+        waiter._record_physical_growth_result(
+            {"physical_growth_capacity_rejections_total": 1},
+            capacity_epoch=ipc.physical_growth_capacity_epoch(1))
+        waiter._physical_growth_retry_after = time.monotonic() + 5
+        assert waiter._physical_growth_retry_is_blocked()
+
+        before = ipc.physical_growth_capacity_epoch(1)
+        manager.free(blocks)
+        assert ipc.physical_growth_capacity_epoch(1) == before
+        assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
+        manager.release_retired_pages_through(manager.capture_physical_release_marker())
+        if reserved:
+            # Retirement alone may keep an idle page mapped for reuse.
+            assert ipc.physical_growth_capacity_epoch(1) == before
+            assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
+            manager.trim()
+        assert ipc.physical_growth_capacity_epoch(1) != before
+        assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 1
+        waiter._physical_growth_epoch_next_check = 0
+        assert not waiter._physical_growth_retry_is_blocked()
+        assert waiter._get_operation_counter("physical_growth_capacity_wakeups_total") == 1
+        assert waiter._get_operation_counter("physical_growth_retry_probes_total") == 0
+        assert manager.alloc(1) is not None
+    finally:
+        if manager is not None:
+            manager.shutdown()
+        assert ipc.stop_worker_listener_threads()
+        vmm_ops.shutdown_kvcached()
+        socket_root.cleanup()
+
+
 def _compiled_vmm_ops():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

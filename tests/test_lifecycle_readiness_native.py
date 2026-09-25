@@ -35,8 +35,10 @@ kcm.broadcast_kv_tensors_created = (
 inject = False
 hits = 0
 
-def map_pages(world_size, offsets, pp_rank=0, group_id=0):
+def map_pages(world_size, offsets, pp_rank=0, group_id=0, stats_callback=None):
     assert native.map_to_kv_tensors(offsets, group_id)
+    if stats_callback is not None:
+        stats_callback({})
 
 def unmap_pages(world_size, offsets, pp_rank=0, group_id=0):
     global hits
