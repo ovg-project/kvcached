@@ -249,7 +249,7 @@ def _should_enable_async_sched(vllm_config: Any) -> bool:
 def _reshape_mamba_page_tensor(
     mamba_info: dict, kv_cache_spec: Any, pool_idx: int,
 ) -> Any:
-    """Expose raw per-block state bytes for vLLM 0.28's native Mamba binding."""
+    """Expose raw per-block state bytes for vLLM 0.27+'s native Mamba binding."""
     import torch
 
     page_size = int(kv_cache_spec.page_size_bytes)
@@ -2297,7 +2297,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if hasattr(GPUModelRunner, "_reshape_kv_cache_tensors_from_kvcached"):
             return True
 
-        use_mamba_pages = VersionRange(">=0.28.0").contains(self.detected_version or "0")
+        use_mamba_pages = VersionRange(">=0.27.0").contains(self.detected_version or "0")
 
         def _reshape_kv_cache_tensors_from_kvcached(
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any

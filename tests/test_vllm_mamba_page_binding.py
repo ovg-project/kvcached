@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Real CPU tensor views for the V1 Mamba binding contract in vLLM 0.28."""
+"""Real CPU tensor views for the V1 Mamba binding contract in vLLM 0.27+."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -67,7 +67,8 @@ def test_non_byte_backing_is_rejected(buffer):
 
 
 @pytest.mark.parametrize("contiguous", [False, True])
-@pytest.mark.parametrize("version", ["0.22.1", "0.27.0", "0.28.0", "0.28.0+cu129"])
+@pytest.mark.parametrize("version", ["0.22.1", "0.26.0", "0.27.0", "0.27.0+cu130",
+                                     "0.28.0", "0.28.0+cu129"])
 def test_v1_reshape_uses_versioned_binding_contract(monkeypatch, contiguous, version):
     class Runner(SimpleNamespace):
         pass
@@ -94,7 +95,7 @@ def test_v1_reshape_uses_versioned_binding_contract(monkeypatch, contiguous, ver
     assert set(caches) == {"m0", "m1", "attn"}
     assert caches["attn"] is attention_view
     for name in ("m0", "m1"):
-        if Version(version) >= Version("0.28.0"):
+        if Version(version) >= Version("0.27.0"):
             assert isinstance(caches[name], torch.Tensor)
             assert caches[name].shape == (4, 1, 1, 64)
         else:

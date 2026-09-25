@@ -6,6 +6,7 @@ Run separately from tests that replace torch/vLLM globally with mocks.
 """
 
 import hashlib
+import importlib.metadata
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +14,53 @@ import pytest
 import torch
 
 from kvcached.integration.vllm import interfaces, patches
+
+
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_v1_mamba_views_bind_with_installed_vllm(contiguous):
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    blocks, pools, page_bytes = 4, 2, 64
+    stride = page_bytes * (pools if contiguous else 1)
+    buffers = [torch.zeros(blocks * stride + 16, dtype=torch.int8)[16:]
+               for _ in range(1 if contiguous else pools)]
+    info = dict(buffers=buffers, num_blocks=blocks, page_size_bytes=page_bytes,
+                is_contiguous=contiguous, block_stride_bytes=stride)
+    spec = MambaSpec(block_size=16, shapes=((2, 4), (2, 4)),
+                     dtypes=(torch.float16, torch.float32), page_size_padded=page_bytes)
+    config = SimpleNamespace(kv_cache_groups=[
+        SimpleNamespace(kv_cache_spec=spec, layer_names=["m0", "m1"]),
+    ])
+
+    class Runner(SimpleNamespace):
+        pass
+
+    patch = patches.GPUModelRunnerPatch()
+    patch.detected_version = importlib.metadata.version("vllm")
+    assert patch.add_reshape_methods(Runner)
+    runner = Runner(_kvcached_mamba_raw_info=info)
+    caches = runner._reshape_kv_cache_tensors_from_kvcached(config, [])
+    for layer_index, name in enumerate(("m0", "m1")):
+        layer = SimpleNamespace(get_state_shape=lambda: spec.shapes,
+                                get_state_dtype=lambda: spec.dtypes)
+        # Use the installed engine's binding method, not a copied implementation.
+        MambaBase.bind_kv_cache(layer, caches[name])
+        conv, ssm = layer.kv_cache
+        assert conv.shape == ssm.shape == (blocks, 2, 4)
+        assert conv.dtype == torch.float16 and ssm.dtype == torch.float32
+        for block in range(blocks):
+            conv[block].fill_(layer_index * 10 + block + 1)
+            ssm[block].fill_(layer_index * 10 + block + 101)
+
+    for layer_index in range(pools):
+        raw = buffers[0 if contiguous else layer_index]
+        for block in range(blocks):
+            offset = (block * pools + layer_index if contiguous else block) * page_bytes
+            cell = raw[offset:offset + page_bytes]
+            assert (cell[:16].view(torch.float16) == layer_index * 10 + block + 1).all()
+            assert (cell[16:48].view(torch.float32) == layer_index * 10 + block + 101).all()
+            assert (cell[48:] == 0).all()
 
 
 class Slots:
