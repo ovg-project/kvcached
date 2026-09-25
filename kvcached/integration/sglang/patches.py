@@ -396,10 +396,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
                 def available_size(self):
-                    return min(
-                        self.kvcached_allocator.available_size() * self.page_size,
-                        self.size,
-                    )
+                    return self.kvcached_allocator.available_size() * self.page_size
 
                 def alloc(self, need_size: int):
                     num_pages = need_size // self.page_size
@@ -638,9 +635,6 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
-                size: int
-                _kvcached_reserved_num_tokens: int
-
                 # Auto-incrementing group_id so that each pool instance
                 # (e.g., full-attention pool and SWA pool in SWAKVPool)
                 # gets independent FTensors and page spaces in the C++
@@ -709,15 +703,6 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                 def _create_buffers(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    # SGLang 0.5.16 moved this non-quantized buffer metadata
-                    # setup into MHATokenToKVPool._create_buffers().  Keep the
-                    # same contract while kvcached remains the buffer owner.
-                    self.k_scale_buffer = None
-                    self.v_scale_buffer = None
-                    self.dq_k_buffer = None
-                    self.dq_v_buffer = None
-                    self._kvcached_reserved_num_tokens = self.size
-
                     # Resolve TP rank and size for IPC socket registration.
                     # SGLang workers each call _create_buffers() independently,
                     # so we query the distributed state at this point (which is
@@ -765,37 +750,6 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         ),
                     )
                     self.k_buffer, self.v_buffer = _kv_mha
-
-                    build_buffer_descs = getattr(self, "_build_kv_buffer_descs", None)
-                    if build_buffer_descs is not None:
-                        self._kv_buffer_descs = build_buffer_descs()
-
-                    init_data_ptrs = getattr(self, "_init_data_ptrs_and_strides", None)
-                    if init_data_ptrs is not None:
-                        init_data_ptrs()
-
-                def _finalize_backing_tokens(self, final_num_tokens: int) -> None:
-                    post_capture_owner = getattr(self, "_post_capture_owner", None)
-                    if post_capture_owner is not None:
-                        super()._finalize_backing_tokens(final_num_tokens)
-                        return
-
-                    final_num_tokens = int(final_num_tokens)
-                    reserved_num_tokens = getattr(
-                        self, "_kvcached_reserved_num_tokens", self.size
-                    )
-                    if not (
-                        self.page_size <= final_num_tokens <= reserved_num_tokens
-                    ):
-                        raise ValueError(
-                            f"final_num_tokens={final_num_tokens} must satisfy "
-                            f"page_size={self.page_size} <= final <= "
-                            f"reserved={reserved_num_tokens}"
-                        )
-
-                    # kvcached owns and incrementally backs these tensors, so
-                    # SGLang only needs to publish the post-capture capacity.
-                    self.size = final_num_tokens
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.
