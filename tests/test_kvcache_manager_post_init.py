@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
+import importlib
 import sys
 import threading
 import types
+import weakref
 from typing import Any
 
 import pytest
@@ -63,6 +66,33 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
         manager._post_init()
 
     assert manager._post_init_done.is_set()
+    with pytest.raises(TimeoutError, match="last error: kv tensor map failed"):
+        manager._wait_post_init()
+
+
+def test_readiness_deadline_includes_time_spent_in_ipc(monkeypatch):
+    module = _import_kv_cache_manager(monkeypatch)
+    manager = module.KVCacheManager.__new__(module.KVCacheManager)
+    manager.null_block = None
+    manager.world_size = 2
+    manager._shutdown_requested = threading.Event()
+    manager.pp_rank = 0
+    manager.group_id = 0
+    manager._post_init_done = threading.Event()
+    now = [0.0]
+    calls = []
+
+    def stalled(*args, timeout_s, **kwargs):
+        calls.append(timeout_s)
+        now[0] += timeout_s
+        raise TimeoutError("worker did not reply")
+
+    monkeypatch.setattr(module, "broadcast_kv_tensors_created", stalled)
+    monkeypatch.setattr(module, "KV_TENSOR_WAIT_TIMEOUT", 10.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    with pytest.raises(TimeoutError, match="worker did not reply"):
+        manager._post_init()
+    assert calls == [10.0]
 
 
 def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
@@ -97,12 +127,12 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
         lambda *args, **kwargs: types.SimpleNamespace(start=lambda: None),
     )
 
-    import kvcached.tp_ipc_util as tp_ipc_util
+    tp_ipc_util = importlib.import_module("kvcached.tp_ipc_util")
 
     monkeypatch.setattr(
         tp_ipc_util,
         "broadcast_map_to_kv_tensors",
-        lambda world_size, offsets, pp_rank=0, group_id=0: calls.append(
+        lambda world_size, offsets, pp_rank=0, group_id=0, record_stats=None: calls.append(
             ("map", world_size, offsets, pp_rank, group_id)
         ),
     )
@@ -132,3 +162,11 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
         ("map", 4, [1, 2, 3], 2, 1007),
         ("unmap", 4, [4, 5], 2, 1007),
     ]
+
+    allocator = manager.page_allocator
+    manager_ref = weakref.ref(manager)
+    del manager
+    gc.collect()
+    assert manager_ref() is None
+    assert allocator.map_callback is not None
+    assert allocator.unmap_callback is not None
