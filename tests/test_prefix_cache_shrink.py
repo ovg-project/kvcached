@@ -109,6 +109,11 @@ class ShrinkablePageAllocator:
         self.inuse.add(page_id)
         return FakePage(page_id)
 
+    def alloc_pages(self, count: int) -> List[FakePage]:
+        if count > self.get_num_free_pages():
+            raise RuntimeError("no free pages")
+        return [self.alloc_page() for _ in range(count)]
+
     def free_pages(self, page_ids: List[int]) -> None:
         self.inuse.difference_update(page_ids)
 

@@ -738,7 +738,6 @@ class KVCacheManager:
                     if getattr(self, "in_shrink", False) else frozenset())
 
         ret_index = []
-        page: Optional[InternalPage] = None
 
         remaining_need = need_size
 
@@ -750,20 +749,16 @@ class KVCacheManager:
             self.reserved_blocks = self.reserved_blocks[num_from_reserved:]
             remaining_need -= num_from_reserved
 
-        while remaining_need > 0:  # Allocate the remaining blocks from pages
+        while remaining_need > 0:
             if not self.avail_pages:
-                # Only alloc_page() is recoverable here. available_size() saw
-                # enough logical capacity, but another instance sharing the
-                # physical pool consumed pages before we reached this call, so
-                # roll back and report an allocation miss instead of leaking
-                # blocks or crashing. Anything else raising in this loop is an
-                # invariant failure (e.g. InternalPage.alloc()'s "Not enough
-                # free blocks in page", raised after _pick_avail_page() has
-                # already removed the page from avail_pages and before its
-                # blocks reach ret_index, which rollback therefore cannot
-                # restore) and must stay fail-loud.
+                blocks_per_page = max(1, InternalPage.get_num_blocks(
+                    self.page_size, self.block_mem_size))
+                pages_needed = (remaining_need + blocks_per_page - 1) // blocks_per_page
                 try:
-                    page = self.page_allocator.alloc_page()
+                    if pages_needed == 1:
+                        new_pages = [self.page_allocator.alloc_page()]
+                    else:
+                        new_pages = self.page_allocator.alloc_pages(pages_needed)
                     # A new mapping changes the driver's free capacity.
                     self._avail_physical_pages_cache = None
                 except StateConsistencyError as e:
@@ -796,8 +791,7 @@ class KVCacheManager:
                         raise
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     failure_count = self._get_operation_counter(
-                        "manager_page_allocation_failures_total"
-                    )
+                        "manager_page_allocation_failures_total")
                     if failure_count & (failure_count - 1) == 0:
                         logger.warning(
                             "Physical KV page allocation remains unavailable; "
@@ -805,41 +799,43 @@ class KVCacheManager:
                             "(failures=%d): %s", failure_count, e,
                         )
                     return None
-                self._increment_operation_counter("manager_page_allocations_total")
-                page.init(self.block_mem_size)
-                # __init__ rejects geometries where a page can hold no whole
-                # block. Parking such a page would keep it mapped forever
-                # (free() never visits a page without blocks), so fail loud.
-                if page.num_free_blocks() == 0:
-                    raise StateConsistencyError(
-                        f"page {page.page_id} holds no whole "
-                        f"{self.block_mem_size}-byte block; the page geometry "
-                        "check should have rejected this configuration")
-                self.num_avail_blocks += page.num_free_blocks()
+
+                self._increment_operation_counter(
+                    "manager_page_allocations_total", len(new_pages))
+                # Metadata failures are invariants, not capacity misses. Keep
+                # the native-owned pages mapped and propagate the error.
+                for new_page in new_pages:
+                    new_page.init(self.block_mem_size)
+                    if new_page.num_free_blocks() == 0:
+                        raise StateConsistencyError(
+                            f"page {new_page.page_id} holds no whole block")
+                self.num_avail_blocks += sum(
+                    page.num_free_blocks() for page in new_pages)
+                # Avoid a quadratic best-fit scan over a fresh batch.
+                pages_to_consume = new_pages
             else:
                 page = self._pick_avail_page(
                     1 if pack_pages else remaining_need, skip=retiring)
                 if getattr(self, "_retired_pages", None) and page.empty():
-                    # Reusing logical blocks does not revoke their mapping.
-                    # Worker queue order protects reuse; cancel the old unmap
-                    # epoch so a later free must acquire a new completion fence.
                     self._retired_pages = [
                         (epoch, remaining)
                         for epoch, page_ids in self._retired_pages
                         if (remaining := [pid for pid in page_ids if pid != page.page_id])
                     ]
-            num_from_page = min(page.num_free_blocks(), remaining_need)
-            alloced_index = page.alloc(num_from_page)
-            if getattr(self, "logical_num_blocks", None) is not None:
-                self._logical_allocated_blocks += len(alloced_index)
-            ret_index.extend(alloced_index)
-            if page.full():
-                self.full_pages[page.page_id] = page
-            else:
-                self.avail_pages[page.page_id] = page
-
-            self.num_avail_blocks -= num_from_page
-            remaining_need -= num_from_page
+                pages_to_consume = [page]
+            for page in pages_to_consume:
+                num_from_page = min(page.num_free_blocks(), remaining_need)
+                if num_from_page:
+                    allocated = page.alloc(num_from_page)
+                    if getattr(self, "logical_num_blocks", None) is not None:
+                        self._logical_allocated_blocks += len(allocated)
+                    ret_index.extend(allocated)
+                if page.full():
+                    self.full_pages[page.page_id] = page
+                else:
+                    self.avail_pages[page.page_id] = page
+                self.num_avail_blocks -= num_from_page
+                remaining_need -= num_from_page
 
         return ret_index
 

@@ -67,6 +67,13 @@ class FakePageAllocator:
         self.fail_after = fail_after
         self.num_allocated = 0
         self.freed_pages: List[int] = []
+        self.batch_calls: List[int] = []
+
+    def alloc_pages(self, num_pages: int) -> List[FakePage]:
+        self.batch_calls.append(num_pages)
+        if self.num_allocated + num_pages > self.fail_after:
+            raise RuntimeError("physical page pool exhausted")
+        return [self.alloc_page() for _ in range(num_pages)]
 
     def alloc_page(self) -> FakePage:
         if self.num_allocated >= self.fail_after:
@@ -160,6 +167,14 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+    assert manager.page_allocator.batch_calls == [2]
+
+
+def seed_empty_page(manager):
+    page = manager.page_allocator.alloc_page()
+    page.init(manager.block_mem_size)
+    manager.avail_pages[page.page_id] = page
+    manager.num_avail_blocks += page.num_free_blocks()
 
 
 def test_logical_limit_keeps_reserved_blocks_allocatable():
@@ -441,34 +456,32 @@ def test_manager_page_counters_include_retained_page_reuse():
     assert data["manager_page_releases_total"] == 2
 
 
-@pytest.mark.parametrize("fail_after", [0, 1])
-def test_consistency_error_is_not_an_allocation_miss(monkeypatch, fail_after):
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_consistency_error_is_not_an_allocation_miss(monkeypatch, num_pages):
     from kvcached.errors import StateConsistencyError
 
-    manager = make_manager(fail_after=fail_after, reserved_blocks=[10])
+    manager = make_manager(fail_after=0, reserved_blocks=[10])
     enable_operation_counters(manager)
-    alloc_page = manager.page_allocator.alloc_page
     error = StateConsistencyError("unmap commit unconfirmed")
 
-    def fail():
-        if manager.page_allocator.num_allocated >= fail_after:
-            raise error
-        return alloc_page()
+    def fail(*args):
+        raise error
 
     monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    monkeypatch.setattr(manager.page_allocator, "alloc_pages", fail)
     with pytest.raises(StateConsistencyError, match="commit unconfirmed") as exc_info:
-        manager.alloc(BLOCKS_PER_PAGE + 2)
+        manager.alloc(BLOCKS_PER_PAGE * num_pages + 1)
     assert exc_info.value is error
     assert manager.page_allocator.freed_pages == []
     assert manager.reserved_blocks == []
-    assert len(manager.full_pages) == fail_after
+    assert len(manager.full_pages) == 0
     counters = manager._operation_counters
     assert counters["allocation_requests_total"] == 1
     assert counters["allocation_failures_total"] == 1
     assert counters["allocation_errors_total"] == 1
     assert counters["operation_errors_total"] == 1
     assert counters["manager_page_allocation_failures_total"] == 1
-    assert counters.get("manager_page_allocations_total", 0) == fail_after
+    assert counters.get("manager_page_allocations_total", 0) == 0
     assert counters.get("capacity_exhausted_total", 0) == 0
     assert counters.get("allocated_blocks_total", 0) == 0
     assert counters.get("free_requests_total", 0) == 0
@@ -911,6 +924,7 @@ def test_page_blocks_rolled_back_and_reusable():
 
 def test_partial_alloc_rollback_is_not_counted_as_public_free():
     manager = make_manager(fail_after=1)
+    seed_empty_page(manager)
     enable_operation_counters(manager)
 
     # Allocates all four blocks from page 0, then fails to obtain page 1.
@@ -924,13 +938,14 @@ def test_partial_alloc_rollback_is_not_counted_as_public_free():
     assert counters.get("free_requests_total", 0) == 0
     assert counters.get("free_successes_total", 0) == 0
     assert counters.get("freed_blocks_total", 0) == 0
-    assert counters["manager_page_allocations_total"] == 1
+    assert counters.get("manager_page_allocations_total", 0) == 0
     assert counters["manager_page_allocation_failures_total"] == 1
     assert counters["manager_page_releases_total"] == 1
 
 
 def test_failed_allocation_rollback_does_not_count_caller_free_progress(monkeypatch):
     manager = make_manager(fail_after=1)
+    seed_empty_page(manager)
     enable_operation_counters(manager)
 
     def fail(_page_ids):
@@ -952,6 +967,7 @@ def test_failed_allocation_rollback_does_not_count_caller_free_progress(monkeypa
 
 def test_failed_legacy_growth_retires_empty_pages_until_safe_epoch():
     manager = make_manager(fail_after=1)
+    seed_empty_page(manager)
     manager.defer_physical_release = True
     manager._retired_pages = []
     manager._physical_release_epoch = 8
@@ -1003,6 +1019,7 @@ def test_deferred_release_counts_only_acknowledged_physical_release(monkeypatch)
 
 def test_mixed_reserved_and_page_blocks_restored():
     manager = make_manager(fail_after=1, reserved_blocks=[10, 11])
+    seed_empty_page(manager)
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.
     assert manager.alloc(8) is None
     assert manager.reserved_blocks == [10, 11]
@@ -1458,3 +1475,107 @@ def test_latched_failure_surfaces_before_capacity_or_miss(monkeypatch, legacy_na
             manager.available_size()
     with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
         manager.alloc(2)
+
+
+def test_batch_failure_restores_reserved_blocks_without_partial_pages():
+    manager = make_manager(fail_after=1, reserved_blocks=[10, 11])
+    enable_operation_counters(manager)
+    assert manager.alloc(8) is None
+    assert manager.page_allocator.batch_calls == [2]
+    assert manager.page_allocator.num_allocated == 0
+    assert manager.page_allocator.freed_pages == []
+    assert manager.reserved_blocks == [10, 11]
+    assert manager.avail_pages == manager.full_pages == {}
+    assert manager._operation_counters.get("manager_page_allocations_total", 0) == 0
+
+
+def test_batch_only_covers_remaining_need_after_mapped_blocks():
+    manager = make_manager(fail_after=10, reserved_blocks=[40, 41])
+    seed_empty_page(manager)
+    result = manager.alloc(11)
+    assert result == [40, 41] + list(range(9))
+    assert manager.page_allocator.batch_calls == [2]
+    assert manager.num_avail_blocks == 3
+
+
+def test_large_fresh_batch_is_consumed_without_best_fit_scans(monkeypatch):
+    manager = make_manager(fail_after=100)
+
+    def reject_scan(remaining_need):
+        raise AssertionError("fresh batch must not use repeated best-fit scans")
+
+    monkeypatch.setattr(manager, "_pick_avail_page", reject_scan)
+    assert manager.alloc(320) == list(range(320))
+    assert manager.page_allocator.batch_calls == [80]
+    assert manager.num_avail_blocks == 0
+
+
+def test_batch_geometry_alignment_can_require_an_extra_page(monkeypatch):
+    manager = make_manager(fail_after=10)
+    manager.page_size = 10
+    manager.block_mem_size = 3
+
+    def init(page, block_mem_size):
+        start = (page.page_id * 10 + block_mem_size - 1) // block_mem_size
+        end = (page.page_id + 1) * 10 // block_mem_size
+        page.free_list = list(range(start, end))
+
+    monkeypatch.setattr(FakePage, "init", init)
+    result = manager.alloc(6)
+    assert result == [0, 1, 2, 4, 5, 7]
+    assert manager.page_allocator.batch_calls == [2]
+    assert manager.page_allocator.num_allocated == 3
+    assert manager.num_avail_blocks == 2
+
+
+def test_batch_init_failure_remains_fatal_without_online_unmap(monkeypatch):
+    manager = make_manager(fail_after=10)
+
+    initialize = FakePage.init
+
+    def fail(page, block_mem_size):
+        if page.page_id == 1:
+            raise ValueError("invalid geometry")
+        initialize(page, block_mem_size)
+
+    monkeypatch.setattr(FakePage, "init", fail)
+    with pytest.raises(ValueError, match="invalid geometry"):
+        manager.alloc(6)
+    assert manager.page_allocator.freed_pages == []
+    assert manager.num_avail_blocks == 0
+    assert manager.avail_pages == manager.full_pages == {}
+
+
+def test_batch_unknown_outcome_propagates_without_speculative_free(monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=10)
+
+    def fail(num_pages):
+        raise MapTransactionOutcomeUnknownError("unconfirmed batch")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_pages", fail)
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="unconfirmed batch"):
+        manager.alloc(6)
+    assert manager.page_allocator.freed_pages == []
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_batched_growth_shares_logical_quota_with_existing_blocks(packed):
+    manager = make_manager(fail_after=4)
+    manager.num_blocks = manager.logical_num_blocks = 9
+    allocate = manager.alloc_packed if packed else manager.alloc
+    first = allocate(7)
+    assert first is not None and len(first) == 7
+    assert manager.page_allocator.batch_calls == [2]
+    assert manager._logical_allocated_blocks == 7
+    assert allocate(3) is None
+    assert manager._logical_allocated_blocks == 7
+    manager.free(first[:2])
+    assert manager._logical_allocated_blocks == 5
+    second = allocate(4)
+    assert second is not None and len(second) == 4
+    assert manager._logical_allocated_blocks == 9
+    assert allocate(1) is None
+    manager.free(first[2:] + second)
+    assert manager._logical_allocated_blocks == 0
