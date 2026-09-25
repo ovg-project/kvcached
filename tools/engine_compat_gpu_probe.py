@@ -343,7 +343,7 @@ def run(args, stage):
     command = [
         sys.executable,
         "-u",
-        str(Path(__file__).resolve()),
+        str(getattr(args, "probe_script", Path(__file__).resolve())),
         "--source",
         str(args.source),
         "--output",
@@ -399,8 +399,9 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt(f"Received signal {signum}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(*, worker_fn=None, script=None, description=None):
+    """Keep process isolation/provenance shared by trusted model-specific probes."""
+    parser = argparse.ArgumentParser(description=description or __doc__)
     for name in ("source", "output", "version"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--model", type=Path)
@@ -415,6 +416,7 @@ def main():
     )
     parser.add_argument("--candidate-sha", help="Trusted-host 40-hex SHA; skips runtime Git lookup")
     args = parser.parse_args()
+    args.probe_script = Path(script or __file__).resolve()
     if not 1 <= args.timeout <= 3600:
         parser.error("--timeout must be between 1 and 3600")
     if args.candidate_sha is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", args.candidate_sha):
@@ -434,10 +436,11 @@ def main():
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
         if args._stage:
-            worker(args, result)
+            (worker_fn or worker)(args, result)
             result["status"] = "passed"
         else:
-            result.update(mode=args.mode, stages={}, comparison="not_run", limitations=__doc__)
+            result.update(mode=args.mode, stages={}, comparison="not_run",
+                          limitations=description or __doc__)
             if not args.source.is_dir():
                 raise Blocked("--source must be an existing candidate directory")
             if args.candidate_sha is not None:

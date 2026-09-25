@@ -131,6 +131,7 @@ def test_fingerprint_ignores_caches_but_detects_content_names_and_deletions(args
         ("mixed", "failed"),
         ("mismatch", "failed"),
         ("mutated", "failed"),
+        ("both-failed", "failed"),
     ],
 )
 def test_supervisor_provenance_and_classification(monkeypatch, args, scenario, expected):
@@ -146,6 +147,8 @@ def test_supervisor_provenance_and_classification(monkeypatch, args, scenario, e
         status = scenario if name == "native" and scenario in ("blocked", "failed") else "passed"
         if scenario == "mixed" and name in ("native", "patched"):
             status = "blocked" if name == "native" else "failed"
+        if scenario == "both-failed" and name in ("native", "patched"):
+            status = "failed"
         if scenario == "mutated" and name == "oom":
             (args.source / "candidate.py").write_bytes(b"changed\n")
         token = 2 if scenario == "mismatch" and name == "patched" else 1
@@ -170,6 +173,10 @@ def test_supervisor_provenance_and_classification(monkeypatch, args, scenario, e
     )
     if scenario == "mismatch":
         assert result["comparison"] == "failed"
+    if scenario == "both-failed":
+        assert result["comparison"] == "not_run"
+        assert result["stages"]["native"]["status"] == "failed"
+        assert result["stages"]["patched"]["status"] == "failed"
     git.assert_not_called()
 
 
@@ -281,3 +288,26 @@ def test_environment_filters_credentials_and_isolates_modes(monkeypatch, args):
         for key in ("HOME", "TMPDIR", "HF_HOME", "VLLM_CACHE_ROOT", "TRITON_CACHE_DIR"):
             assert Path(env[key]).is_relative_to(args.output)
     assert len({env["KVCACHED_IPC_NAME"] for env in environments.values()}) == 3
+
+
+def test_model_probe_uses_its_worker_and_own_script_without_global_mutation(monkeypatch, args):
+    cli(monkeypatch, args, "--_stage", "prepare")
+    args.output.mkdir()
+    original_worker, original_file = probe.worker, probe.__file__
+    worker = Mock()
+    script = args.source / "sharing.py"
+    assert probe.main(worker_fn=worker, script=script, description="Sharing limits") == 0
+    worker.assert_called_once()
+    assert worker.call_args.args[0].probe_script == script.resolve()
+    assert probe.worker is original_worker and probe.__file__ == original_file
+
+
+def test_model_probe_launches_the_same_model_script_in_every_child(monkeypatch, args):
+    args.output.mkdir()
+    args.probe_script = args.source / "sharing.py"
+    process = Mock(returncode=1)
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(probe.subprocess, "Popen", launch)
+    monkeypatch.setattr(probe, "cleanup", Mock())
+    assert probe.run(args, "native")["status"] == "failed"
+    assert launch.call_args.args[0][2] == str(args.probe_script)

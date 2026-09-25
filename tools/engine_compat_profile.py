@@ -24,6 +24,7 @@ PROBES = {
     "attention": ["tools/engine_compat_gpu_probe.py"],
     "hybrid": ["tools/engine_compat_hybrid_probe.py", "tools/engine_compat_hybrid_hooks.py",
                "tools/engine_compat_tiny_hybrid.json", "tools/engine_compat_gpu_probe.py"],
+    "sharing": ["tools/engine_compat_sharing_probe.py", "tools/engine_compat_gpu_probe.py"],
 }
 
 
@@ -53,6 +54,11 @@ def load_profile(name: str) -> Dict[str, Any]:
         or (value["runner"], value["releases"]) not in (("v1", ["0.28"]), ("v2", ["0.29"]))
     ):
         raise ValueError("Hybrid acceptance is validation-only for 0.28 V1 or 0.29 MRV2")
+    if value["probe"] == "sharing" and (
+        value["repair"] or value["runner"] != "v2" or value["releases"] != ["0.29"]
+        or value["layouts"] != ["non-contiguous", "contiguous"]
+    ):
+        raise ValueError("Sharing acceptance is validation-only for 0.29 MRV2 in both layouts")
     if value["qualification"] != "single-gpu":
         raise ValueError("This controller has no validator for the requested qualification")
     if not isinstance(value["task"], str) or not value["task"].strip():

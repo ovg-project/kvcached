@@ -100,6 +100,7 @@ controller revision, not supplied by an issue comment or the repair agent.
 | `attention-v2-028` | Validation only, no repair | Same narrow attention checks; explicitly selected and verified V2, both elastic layouts |
 | `hybrid-v1-028` | Validation only, no repair | 0.28 V1 tiny dense hybrid, partial-prefix state copying and two real CoW allocation misses; sync and async |
 | `hybrid-v2-029` | Validation only, no repair | The same hybrid acceptance with the 0.29 MRV2 runner |
+| `sharing-v2-029` | Validation only, no repair | Tiny Gemma4 cross-layer KV sharing with 0.29 MRV2; matched native/elastic controls in both layouts |
 
 For example, `--profile native-layout` selects the same scope in local CPU,
 GPU and publication stages. Each stage verifies the profile name and a digest
@@ -156,6 +157,30 @@ The following release gates are still separate, not implicitly green:
 
 Do not start a 0.29 repair by interpreting a 0.28 attention pass as completion
 of those gates. Record the accepted model/runner/backend/topology explicitly.
+
+### Tiny cross-layer sharing validation
+
+Use `sharing-v2-029` with `v0.29.0` in `mode=validate`. The offline fixture has
+four layers: full and sliding attention owners with different head dimensions,
+and two borrowers. It checks the actual owner/borrower Tensor pointers, shapes,
+strides and dtypes after binding, then compares 28 completed requests / 896 output
+tokens between native and elastic execution. Logprobs must be finite and the fixture
+must not degenerate to the same token across every completion. Repeated prompts cross sliding-window
+and block boundaries; both modes must explicitly shut down.
+
+The native control and elastic run explicitly select the same `LBNHC` or `BLNHC`
+layout. Both cells are required: a native backend failure is not automatically a
+KVCached regression, but it cannot make the cell pass or justify silently dropping
+that layout. Keep the two stage logs/results when assigning the failure to an
+upstream task. This profile cannot authorize an agent repair.
+
+The shared supervisor also checks source fingerprints, exact version/runner,
+bounded child exits and a real oversized CUDA allocation followed by recovery.
+The fixed-seed small random checkpoint is generated locally using the model's own
+initializer rather than dummy-loaded parameters. This is synchronous, eager, FP16,
+TP=PP=1 testing, not full Gemma
+checkpoint quality, multimodal, FP8, async lifetime, distributed map/unmap chaos or
+performance qualification.
 
 ### Tiny hybrid and partial-prefix validation
 
