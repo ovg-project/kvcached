@@ -3,6 +3,7 @@
 
 """CPU tensors with actual vLLM 0.29 view helpers; no GPU or native VMM needed."""
 
+import copy
 import importlib.metadata
 import logging
 import sys
@@ -32,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.utils import add_kv_sharing_layers_to_kv_cache_groups
 
 from kvcached.integration.vllm import model_runner_v2 as adapter
 
@@ -152,6 +154,79 @@ def mixed_config(layout_name):
         prefix_cache_retention_interval=None,
     ))
     return get_kv_cache_config_from_groups(config, groups, available_memory=384)
+
+
+@pytest.mark.parametrize("layout_name", ["BLNHC", "BLHNC", "LBNHC", "LBHNC"])
+@pytest.mark.parametrize("borrower_count", [1, 4])
+def test_native_borrowers_preserve_owner_geometry(monkeypatch, layout_name, borrower_count):
+    config = uniform_config(layout_name.startswith("B"))
+    # Use native allocation descriptors: discovery must not mutate their layers.
+    native_config = types.SimpleNamespace(cache_config=types.SimpleNamespace(
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout[layout_name],
+        num_gpu_blocks_override=3,
+        prefix_cache_retention_interval=None,
+    ))
+    config = get_kv_cache_config_from_groups(
+        native_config, config.kv_cache_groups, available_memory=384,
+    )
+    _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count)
+
+
+@pytest.mark.parametrize("layout_name", ["BLNHC", "BLHNC"])
+def test_native_borrowers_preserve_mixed_owner_geometry(monkeypatch, layout_name):
+    config = mixed_config(layout_name)
+    assert len(config.kv_cache_tensors) == 3
+    _check_borrower_geometry(monkeypatch, config, layout_name, 1)
+
+
+def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
+    from vllm.v1.worker.gpu import attn_utils
+    from vllm.v1.worker.utils import allocate_kv_cache as native_allocate
+
+    captured = mock_native_allocator(monkeypatch, layout_name.startswith("B"))
+    scheduler = generate_scheduler_kv_cache_config([config])
+    backing = copy.deepcopy(config.kv_cache_tensors)
+    expected = adapter.CacheGeometry(2, 64, 2)
+    assert adapter.cache_geometry(scheduler) == expected
+    sharing = {f"borrower_{index}": "b" for index in range(borrower_count)}
+    add_kv_sharing_layers_to_kv_cache_groups(sharing, config.kv_cache_groups)
+    assert config.kv_cache_tensors == backing
+    assert adapter.cache_geometry(config) == expected
+    assert adapter.cache_geometry(generate_scheduler_kv_cache_config([config])) == expected
+
+    layout = KVCacheLayout[layout_name]
+    native = native_allocate(config, torch.device("cpu"), layout, [2, 2])
+    owners = adapter.allocate_kv_cache(config, torch.device("cpu"), layout, [2, 2])
+    assert set(owners) == {layer for tensor in backing for layer in tensor.layers}
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    for name, cache in owners.items():
+        assert cache.shape == native[name].shape
+        assert cache.stride() == native[name].stride()
+    assert owners["a"].data_ptr() != owners["b"].data_ptr()
+    owners["a"].fill_(11)
+    owners["b"].fill_(22)
+    assert torch.all(owners["a"] == 11)
+
+    # Exercise native post-allocation aliasing, capturing the binding boundary
+    # without requiring model Attention objects for these CPU tensor contracts.
+    bound = []
+    monkeypatch.setattr(attn_utils, "allocate_kv_cache", lambda *args: owners)
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: sharing)
+    monkeypatch.setattr(attn_utils, "bind_kv_cache", lambda caches, *args: bound.append(caches))
+    engine_config = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(get_resolved_kv_cache_layout=lambda: layout),
+        model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace(model_type="test")),
+    )
+    caches = attn_utils.init_kv_cache([], {}, config, torch.device("cpu"), [2, 2], engine_config)
+    assert bound == [caches]
+    for borrower in sharing:
+        assert caches[borrower] is caches["b"]
+        assert caches[borrower].data_ptr() == caches["b"].data_ptr()
+    caches["borrower_0"][1].fill_(33)
+    assert torch.all(caches["b"][1] == 33)
+    assert torch.all(caches["b"][0] == 22)
+    assert torch.all(caches["a"] == 11)
+    assert config.kv_cache_tensors == backing
 
 
 @pytest.mark.parametrize("layout_name", ["BLNHC", "BLHNC"])
