@@ -553,6 +553,18 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
         try:
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
+            # SGLang 0.5.16 split _create_buffers() into
+            # _create_buffers_normal() (the plain allocation stage) plus a
+            # tail that builds _kv_buffer_descs, which PD transfer
+            # (prefill-decode disaggregation) registers buffers from, and
+            # the data_ptrs/data_strides tensors the speculative-decode kv
+            # copy reads. Replacing _create_buffers() wholesale skips that
+            # tail, so on the split layout we override the inner stage and
+            # let the native tail run over the elastic buffers. Detect the
+            # split by presence rather than version so source builds
+            # without version metadata route the same way.
+            has_buffer_seam = hasattr(MHATokenToKVPool, "_create_buffers_normal")
+
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
                 # Auto-incrementing group_id so that each pool instance
                 # (e.g., full-attention pool and SWA pool in SWAKVPool)
@@ -619,11 +631,24 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.mem_usage = (k_size + v_size) / BYTES_PER_GB
 
-                def _create_buffers(self):
+                def _create_buffers_elastic(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # kvcached backs NHD rows, one (head_num, head_dim) row
+                    # per token slot. HND and the ROCm vectorized layouts
+                    # reshape the buffers, so refuse them instead of serving
+                    # NHD-shaped memory under another layout's label.
+                    kv_cache_layout = getattr(self, "kv_cache_layout", "nhd")
+                    if getattr(self, "use_hnd", False) or kv_cache_layout != "nhd":
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool only supports the NHD "
+                            f"KV cache layout, got {kv_cache_layout!r}. Unset "
+                            "SGLANG_USE_HND_KVCACHE or the kv_cache_layout "
+                            "override, or disable kvcached "
+                            "(ENABLE_KVCACHED=false).")
+
                     # Resolve TP rank and size for IPC socket registration.
-                    # SGLang workers each call _create_buffers() independently,
+                    # SGLang workers each call this independently,
                     # so we query the distributed state at this point (which is
                     # guaranteed to be initialised by the time buffers are created).
                     try:
@@ -669,6 +694,34 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         ),
                     )
                     self.k_buffer, self.v_buffer = _kv_mha
+
+                if has_buffer_seam:
+                    # 0.5.16+: native _create_buffers() keeps running. Its
+                    # non-quantized branch pins k/v_scale_buffer and
+                    # dq_k/dq_v_buffer to None before dispatching here, and
+                    # its tail derives the transfer descriptors and data
+                    # pointers from the elastic buffers.
+                    def _create_buffers_normal(self):
+                        self._create_buffers_elastic()
+
+                    def _create_quantized_buffers(self):
+                        # The native dispatch routes here when a quantized
+                        # KV cache recipe (quant_method) is configured. The
+                        # recipe would allocate native torch buffers outside
+                        # kvcached while the elastic allocator keeps
+                        # tracking the pool, so refuse instead of
+                        # half-running.
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool does not support "
+                            "quantized KV cache recipes (quant_method). "
+                            "Disable kvcached (ENABLE_KVCACHED=false) to "
+                            "use a quantized KV cache.")
+                else:
+                    # Before 0.5.16 _create_buffers() is a single stage
+                    # (any pointer derivation is inlined after allocation),
+                    # so it is replaced whole, as before.
+                    def _create_buffers(self):
+                        self._create_buffers_elastic()
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.
@@ -771,17 +824,29 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         end_layer,
                     )
 
-                    # MLA-specific attributes (mirroring MLATokenToKVPool)
+                    # MLA-specific attributes (mirroring MLATokenToKVPool).
+                    # SGLang 0.5.13 renamed the sparse-attention kwarg and
+                    # attributes from use_nsa/nsa_kv_cache_store_fp8 to
+                    # use_dsa/dsa_kv_cache_store_fp8 (DSA is DeepSeek sparse
+                    # attention). Inherited write paths such as
+                    # set_kv_buffer read the current spelling on every
+                    # call, so accept either kwarg and set both spellings.
+                    # The fp8 flag also requires override_kv_cache_dim,
+                    # matching the native derivation on every version since
+                    # 0.5.9.
                     self.kv_lora_rank = kv_lora_rank
                     self.qk_rope_head_dim = qk_rope_head_dim
-                    self.use_nsa = kwargs.get("use_nsa", False)
-                    self.nsa_kv_cache_store_fp8 = (
-                        self.use_nsa and dtype == torch.float8_e4m3fn
-                    )
+                    use_dsa = kwargs.get("use_dsa", kwargs.get("use_nsa", False))
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.use_dsa = self.use_nsa = use_dsa
+                    self.dsa_kv_cache_store_fp8 = self.nsa_kv_cache_store_fp8 = (
+                        use_dsa
+                        and dtype == torch.float8_e4m3fn
+                        and override_kv_cache_dim is not None
+                    )
                     self.kv_cache_dim = (
                         override_kv_cache_dim
-                        if self.use_nsa and self.nsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_fp8
                         else (kv_lora_rank + qk_rope_head_dim)
                     )
                     # Attributes from parent that we skip but inherited methods may need
