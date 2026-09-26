@@ -19,7 +19,6 @@ from kvcached.integration.version_utils import (
 from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
-BYTES_PER_MB = 1024**2
 _CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
@@ -120,6 +119,12 @@ class _SGLangVirtualKVCapacityPatchBase(VersionAwarePatch, BasePatch):
             if not enable_kvcached() or not _is_supported_gpu_device(owner.device):
                 return original_profile(owner, pre_model_load_memory)
 
+            if getattr(owner, "post_capture_kv_active", False):
+                raise RuntimeError(
+                    "SGLang post-capture KV sizing is not supported with "
+                    "kvcached elastic pools"
+                )
+
             import torch
 
             query_error = None
@@ -195,25 +200,6 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
 
     def _get_mem_fraction_static(self, configurator: Any) -> float:
         return float(configurator.server_args.mem_fraction_static)
-
-    def _adjust_logical_budget(
-        self, *, owner: Any, total_memory: int, logical_budget: int
-    ) -> int:
-        if (
-            owner.mambaish_config is None
-            or not owner.post_capture_kv_active
-        ):
-            return logical_budget
-
-        from sglang.srt.utils.common import get_device_memory_capacity
-
-        minimum_reserve_bytes = math.ceil(
-            owner.server_args.mamba_pre_capture_reserve_mb(
-                get_device_memory_capacity(owner.device)
-            )
-            * BYTES_PER_MB
-        )
-        return min(logical_budget, total_memory - minimum_reserve_bytes)
 
     def _handle_max_mamba_cache(
         self, configurator: Any, capacity_gib: float

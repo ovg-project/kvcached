@@ -6,6 +6,8 @@ import sys
 import types
 from typing import Any, Optional
 
+import pytest
+
 from kvcached.integration.sglang.patches import (
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
@@ -148,41 +150,20 @@ def test_virtual_capacity_preserves_mamba_reservation(monkeypatch):
     assert configurator._profile_available_bytes(3) == expected
 
 
-def test_virtual_capacity_preserves_post_capture_mamba_reservation(monkeypatch):
-    """Post-capture sizing retains the larger SGLang Mamba safety margin."""
+def test_virtual_capacity_rejects_post_capture_sizing(monkeypatch):
     total_memory = 80 * 1024**3
     reserved_memory = 10 * 1024**3
-    device_capacity_mb = 40 * 1024
-    mamba_reserve_mb = 1024
-    _install_fake_torch(
-        monkeypatch,
-        total_memory,
-        reserved_memory,
-        device_capacity_mb=device_capacity_mb,
-    )
+    _install_fake_torch(monkeypatch, total_memory, reserved_memory)
     module = _make_kv_cache_configurator_module()
 
     patch = SGLangVirtualKVCapacityPatch()
     assert patch.patch_profile_available_bytes(module) is True
 
     configurator = module.KVCacheConfigurator()
-    configurator.server_args.mem_fraction_static = 0.99
-
-    def mamba_pre_capture_reserve_mb(gpu_mem):
-        assert gpu_mem == device_capacity_mb
-        return mamba_reserve_mb
-
-    configurator.server_args.mamba_pre_capture_reserve_mb = mamba_pre_capture_reserve_mb
-    configurator.mambaish_config = object()
     configurator.post_capture_kv_active = True
-    configurator._handle_max_mamba_cache = lambda capacity_gib: capacity_gib
 
-    expected = total_memory - reserved_memory - mamba_reserve_mb * 1024**2
-    assert configurator._profile_available_bytes(3) == expected
-
-    configurator.server_args.mem_fraction_static = 0.75
-    expected = math.ceil(total_memory * 0.75) - reserved_memory
-    assert configurator._profile_available_bytes(3) == expected
+    with pytest.raises(RuntimeError, match="post-capture KV sizing"):
+        configurator._profile_available_bytes(3)
 
 
 def test_virtual_capacity_uses_world_group_minimum(monkeypatch):
