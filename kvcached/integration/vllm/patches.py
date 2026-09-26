@@ -2874,21 +2874,38 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger
 
+        repair_native_retry = self.detected_version is not None and VersionRange(
+            ">=0.28.0,<0.30.0").contains(self.detected_version)
+
         def _patched_allocate_slots(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():
                 return original_allocate_slots(self, *args, **kwargs)
+            attempt = None
+            coordinator = getattr(self, "coordinator", None)
+            if repair_native_retry and coordinator is not None:
+                from kvcached.integration.vllm.allocation_attempt import AllocationAttempt
+
+                attempt = getattr(self, "_kvcached_allocation_attempt", None)
+                if attempt is None:
+                    attempt = AllocationAttempt(coordinator)
+                    self._kvcached_allocation_attempt = attempt
+                request = args[0] if args else kwargs["request"]
+                attempt.begin(request.request_id)
             try:
                 return original_allocate_slots(self, *args, **kwargs)
             except KVCachePoolExhausted as exhausted:
-                # None is the scheduler's own "cannot schedule this request
-                # now" path. Partially allocated blocks are released when the
-                # scheduler preempts or frees the request, so returning here
-                # does not strand them.
+                if attempt is not None:
+                    attempt.rollback()
+                # Waiting requests remain queued on None; the scheduler does
+                # not free their partially allocated blocks for us.
                 logger.warning(
                     "Shared physical KV pool is exhausted; reporting a "
                     "scheduling miss so the engine can preempt and retry: %s",
                     exhausted)
                 return None
+            finally:
+                if attempt is not None:
+                    attempt.end()
 
         self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
         KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]
