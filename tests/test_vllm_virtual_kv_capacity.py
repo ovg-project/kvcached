@@ -99,6 +99,8 @@ def _install_memory_profiling(
         if modern_accounting:
             result.transient_peak_headroom = 9999
         yield result
+        if callable(torch_peak_increase):
+            result.torch_peak_increase = torch_peak_increase()
         if events is not None:
             events.append("profile_exit")
 
@@ -321,14 +323,19 @@ def test_determine_available_memory_injects_automatic_virtual_budget(
     capacity.assert_not_called()
 
 
+@pytest.mark.parametrize("graph_peak", [999, 9999])
 def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
-    monkeypatch, patches
+    monkeypatch, patches, graph_peak
 ):
     torch = sys.modules["torch"]
     profile_modes = []
+    graph_profiled = False
     events = []
 
     def record_profile_mode(result=None):
+        nonlocal graph_profiled
+        if result is not None:
+            graph_profiled = True
         events.append("graph" if result is not None else "forward")
         profile_modes.append(
             (
@@ -342,7 +349,9 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     profile_cudagraph = mock.Mock(side_effect=lambda: record_profile_mode(30))
     _install_memory_profiling(
         monkeypatch,
-        torch_peak_increase=70,
+        # A graph captured after the profiling context exits cannot contaminate
+        # its peak. Keep the legacy in-context path covered by the same contract.
+        torch_peak_increase=lambda: graph_peak if graph_profiled else 70,
         before_torch_peak=10,
         events=events,
     )

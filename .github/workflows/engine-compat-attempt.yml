@@ -1,0 +1,189 @@
+name: Engine compatibility attempt
+
+on:
+  workflow_call:
+    inputs:
+      engine:
+        type: string
+        default: vllm
+      analysis_digest:
+        type: string
+        default: ''
+      mode:
+        type: string
+        required: true
+      profile:
+        type: string
+        required: true
+      tag:
+        type: string
+        required: true
+      engine_sha:
+        type: string
+        required: true
+      base_repository:
+        type: string
+        required: true
+      base_branch:
+        type: string
+        required: true
+      base_sha:
+        type: string
+        required: true
+      attempt:
+        type: string
+        required: true
+      prior:
+        type: string
+        default: ''
+    secrets:
+      CODEX_API_KEY:
+        required: false
+    outputs:
+      status:
+        value: ${{ jobs.gpu.outputs.status || jobs.repair.outputs.status || 'blocked' }}
+      artifact:
+        value: gpu-${{ inputs.engine }}-${{ inputs.attempt }}
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      status: ${{ steps.repair.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ inputs.base_repository }}
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.symlinks
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: ${{ inputs.engine == 'sglang' && 'sgl-project/sglang' || 'vllm-project/vllm' }}
+          ref: ${{ inputs.engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Preserve inert source symlinks for subsequent Git checks
+        run: git -C engine config core.symlinks false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        if: inputs.mode == 'repair'
+        with:
+          node-version: '22'
+      - name: Install CPU checks
+        run: |
+          python -m pip install 'pytest>=8,<9' packaging numpy
+      - name: Install the SGLang regression import dependency
+        if: inputs.engine == 'sglang'
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install the repair toolchain
+        if: inputs.mode == 'repair'
+        run: |
+          npm install --global @openai/codex
+      - uses: actions/download-artifact@v4
+        if: inputs.profile == 'auto'
+        with:
+          name: ${{ inputs.engine }}-release-analysis
+          path: analysis
+      - uses: actions/download-artifact@v4
+        if: inputs.prior != ''
+        with:
+          name: ${{ inputs.prior }}
+          path: prior
+      - name: Prepare bounded repair
+        id: repair
+        env:
+          CODEX_API_KEY: ${{ inputs.mode == 'repair' && secrets.CODEX_API_KEY || '' }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PRIOR: ${{ inputs.prior }}
+          PROFILE: ${{ inputs.profile }}
+          MODE: ${{ inputs.mode }}
+          ENGINE_COMPAT_ANALYSIS_DIR: ${{ github.workspace }}/analysis/bundle
+          ENGINE_COMPAT_ANALYSIS_DIGEST: ${{ inputs.analysis_digest }}
+        run: |
+          args=()
+          if [[ -n "$PRIOR" ]]; then args+=(--prior "$GITHUB_WORKSPACE/prior"); fi
+          python controller/tools/engine_compat_stage.py cpu \
+            --source "$GITHUB_WORKSPACE/candidate" --engine "$GITHUB_WORKSPACE/engine" \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --output "$GITHUB_WORKSPACE/repair-result" --profile "$PROFILE" --mode "$MODE" "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-${{ inputs.engine }}-${{ inputs.attempt }}
+          path: repair-result/
+          retention-days: 30
+
+  gpu:
+    needs: repair
+    if: needs.repair.outputs.status == 'candidate'
+    # Register only dedicated/ephemeral GPU workers with this label.
+    runs-on: [self-hosted, linux, x64, engine-compat-gpu]
+    timeout-minutes: 50
+    env:
+      ATTEMPT_DIR: ${{ github.workspace }}/compat-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.engine }}-${{ inputs.attempt }}
+    outputs:
+      status: ${{ steps.gpu.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ inputs.base_repository }}
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.profile == 'auto'
+        with:
+          name: ${{ inputs.engine }}-release-analysis
+          path: ${{ env.ATTEMPT_DIR }}/analysis
+      - uses: actions/download-artifact@v4
+        with:
+          name: cpu-${{ inputs.engine }}-${{ inputs.attempt }}
+          path: ${{ env.ATTEMPT_DIR }}/prior
+      - name: Independent GPU validation
+        id: gpu
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          RUNTIME_IMAGE: ${{ (inputs.engine == 'sglang' && vars.SGLANG_COMPAT_IMAGE) || (inputs.engine == 'vllm' && vars.VLLM_COMPAT_IMAGE) || '' }}
+          PROFILE: ${{ inputs.profile }}
+          ENGINE_COMPAT_ANALYSIS_DIR: ${{ env.ATTEMPT_DIR }}/analysis/bundle
+          ENGINE_COMPAT_ANALYSIS_DIGEST: ${{ inputs.analysis_digest }}
+        run: |
+          python3 controller/tools/engine_compat_stage.py gpu \
+            --source "$GITHUB_WORKSPACE/candidate" --prior "$ATTEMPT_DIR/prior" \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --image "$RUNTIME_IMAGE" --profile "$PROFILE" --output "$ATTEMPT_DIR/gpu-result"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-${{ inputs.engine }}-${{ inputs.attempt }}
+          path: ${{ env.ATTEMPT_DIR }}/gpu-result/
+          retention-days: 30
