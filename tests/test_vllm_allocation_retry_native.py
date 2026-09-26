@@ -27,6 +27,11 @@ def manager_factory(monkeypatch, request, native_pool_factory):  # noqa: F811
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(native.KVCacheManager, "allocate_slots", native.KVCacheManager.allocate_slots)
     assert patches.KVCacheManagerAllocateSlotsPatch().apply(native)
+    from vllm.v1.core import single_type_kv_cache_manager as single_type
+
+    monkeypatch.setattr(single_type.MambaManager, "_cache_partial_tail_block",
+                        single_type.MambaManager._cache_partial_tail_block)
+    assert patches.MambaPartialTailPatch().apply(single_type)
 
     def make(*, caching=True, mamba_first=False, speculative=0):
         attention = FullAttentionSpec(
@@ -57,6 +62,7 @@ def request(status=None):
     return SimpleNamespace(request_id="retry", status=status or RequestStatus.WAITING,
                            num_computed_tokens=0, num_in_flight_tokens=0,
                            num_prompt_tokens=128, num_tokens=128,
+                           shared_prefix_boundary=0,
                            block_hashes=[bytes([i]) for i in range(32)])
 
 
@@ -214,3 +220,61 @@ def test_external_computed_blocks_survive_repeated_admission_miss(
         monkeypatch.setattr(pool, "get_new_blocks", original)
     assert manager.allocate_slots(req, 16, num_external_computed_tokens=16,
                                   delay_cache_blocks=True) is not None
+
+
+@pytest.mark.parametrize("prompt_tokens", [8, 12, 24])
+def test_async_decode_does_not_republish_producer_boundary(manager_factory, prompt_tokens):
+    from vllm.v1.request import RequestStatus
+
+    manager = manager_factory(mamba_first=True)
+    req = request()
+    req.num_prompt_tokens = req.num_tokens = prompt_tokens
+    group = manager.coordinator.single_type_managers[0]
+    assert manager.allocate_slots(req, prompt_tokens) is not None
+    req.status = RequestStatus.RUNNING
+    req.num_computed_tokens = req.num_in_flight_tokens = prompt_tokens
+    assert manager.allocate_slots(req, 1) is not None
+    [(source, checkpoint)] = group.take_pending_cow_copies()
+    assert checkpoint.block_hash_num_tokens == prompt_tokens
+    assert manager.block_pool.get_cached_block(
+        req.block_hashes[prompt_tokens // 4 - 1], [0]) == [checkpoint]
+    assert source.block_hash is None
+    assert req.request_id not in group._partial_hit_reqs
+
+    req.num_tokens = req.num_computed_tokens = prompt_tokens + 1
+    req.num_in_flight_tokens = 1
+    assert manager.allocate_slots(req, 1) is not None
+    assert group.take_pending_cow_copies() == []
+
+
+def test_remote_completion_still_registers_first_partial_boundary(manager_factory):
+    from vllm.v1.request import RequestStatus
+
+    manager = manager_factory(mamba_first=True)
+    req = request()
+    req.num_prompt_tokens = req.num_tokens = 8
+    group = manager.coordinator.single_type_managers[0]
+    assert manager.allocate_slots(req, 8, delay_cache_blocks=True) is not None
+    req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    req.num_computed_tokens = 8
+    manager.cache_blocks(req, 8)
+    source = group.req_to_blocks[req.request_id][0]
+    assert source.block_hash_num_tokens == 8
+    assert group._partial_hit_reqs[req.request_id] == (0, source)
+
+
+def test_preempted_producer_can_publish_boundary_again(manager_factory):
+    from vllm.v1.request import RequestStatus
+
+    manager = manager_factory(mamba_first=True)
+    req = request()
+    req.num_prompt_tokens = req.num_tokens = 8
+    group = manager.coordinator.single_type_managers[0]
+    assert manager.allocate_slots(req, 8) is not None
+    manager.free(req)
+    req.status = RequestStatus.PREEMPTED
+    req.num_computed_tokens = 0
+    assert manager.allocate_slots(req, 8) is not None
+    source = group.req_to_blocks[req.request_id][0]
+    assert source.block_hash_num_tokens == 8
+    assert group._partial_hit_reqs[req.request_id] == (0, source)

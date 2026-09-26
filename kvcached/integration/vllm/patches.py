@@ -2823,6 +2823,49 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
+    """Do not re-publish an old prompt boundary from a running Mamba state.
+
+    In 0.28/0.29 async decode, allocate_slots() can clamp cache publication
+    to the prompt length after the boundary's hash has moved to a CoW snapshot.
+    Registering the running source again queues another copy on the next step,
+    this time of an advanced state under the old hash. Keep the original
+    checkpoint position and skip only publication behind a running request's
+    scheduled position. Remote-KV completion and preempted replay still use
+    the native registration path.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.single_type_kv_cache_manager"
+    target_class = "MambaManager"
+    patch_name = "mamba_partial_tail"
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if not VersionRange(">=0.28.0,<0.30.0").contains(self.detected_version or "0"):
+            return False
+        manager = self._get_target_class(target_module)
+        original = getattr(manager, "_cache_partial_tail_block", None)
+        if original is None:
+            return False
+        if self._is_already_patched(original):
+            return True
+
+        from vllm.v1.request import RequestStatus
+
+        @wraps(original)
+        def cache_partial_tail(self, request, num_tokens):
+            if (enable_kvcached() and request.status == RequestStatus.RUNNING
+                    and num_tokens <= request.num_computed_tokens):
+                return None
+            return original(self, request, num_tokens)
+
+        self._mark_as_patched(cache_partial_tail)
+        manager._cache_partial_tail_block = cache_partial_tail
+        return True
+
+
 class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
     """Report an exhausted physical KV pool the way vLLM's scheduler expects.
 
