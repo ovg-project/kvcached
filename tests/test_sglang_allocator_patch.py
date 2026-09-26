@@ -31,7 +31,6 @@ class FakeKVCachedAllocator:
     def alloc(self, num_pages):
         return list(range(num_pages))
 
-
 class FakeKVCache:
     def __init__(self):
         self.kvcached_allocator = FakeKVCachedAllocator()
@@ -132,6 +131,60 @@ def _make_allocator_module(alloc_extend_kernel):
     )
     return alloc_mod
 
+
+def _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kernel):
+    allocator_kernels: Any = types.ModuleType(module_name)
+    allocator_kernels.alloc_extend_kernel = alloc_extend_kernel
+    allocator_kernels.alloc_decode_kernel = FakeTritonKernel(
+        FakeKernelFn(
+            (
+                "seq_lens_ptr",
+                "last_loc_ptr",
+                "free_page_ptr",
+                "out_indices",
+                "bs_upper",
+                "page_size",
+            )
+        )
+    )
+
+    parent_name, child_name = module_name.rsplit(".", 1)
+    parent: Any = types.ModuleType(parent_name)
+    setattr(parent, child_name, allocator_kernels)
+    monkeypatch.setitem(sys.modules, parent_name, parent)
+    monkeypatch.setitem(sys.modules, module_name, allocator_kernels)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "sglang.kernels.ops.memory.allocator",
+        "sglang.srt.mem_cache.triton_ops.allocator",
+    ],
+    ids=["sglang-0.5.16+", "sglang-0.5.15-and-earlier"],
+)
+def test_paged_allocator_resolves_versioned_kernel_module(monkeypatch, module_name):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    alloc_extend_kernel = FakeTritonKernel(
+        FakeKernelFn(
+            (
+                "pre_lens_ptr",
+                "seq_lens_ptr",
+                "last_loc_ptr",
+                "free_page_ptr",
+                "out_indices",
+                "bs_upper",
+                "page_size",
+            )
+        )
+    )
+    _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kernel)
+    alloc_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+    alloc_mod.BaseTokenToKVPoolAllocator = FakeBaseTokenToKVPoolAllocator
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+    assert hasattr(alloc_mod, "ElasticPagedTokenToKVPoolAllocator")
 
 @pytest.mark.parametrize(
     ("parameter_names", "expected_optional_kwargs"),
