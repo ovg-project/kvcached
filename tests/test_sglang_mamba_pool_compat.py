@@ -49,6 +49,27 @@ class FakeManager:
         self.clear_calls += 1
 
 
+def _install_fake_sglang_distributed(monkeypatch, tp_rank=0, tp_size=1,
+                                     pp_rank=0):
+    """Provide the three rank helpers the constructor imports, so the tests
+    stay hermetic whether or not an sglang is installed (an installed one
+    would be imported under the fake torch and fail)."""
+    modules = {
+        "sglang": {},
+        "sglang.srt": {},
+        "sglang.srt.distributed": {
+            "get_tensor_model_parallel_rank": lambda: tp_rank,
+            "get_tensor_model_parallel_world_size": lambda: tp_size,
+            "get_pipeline_model_parallel_rank": lambda: pp_rank,
+        },
+    }
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+
+
 def _install_fake_interfaces(monkeypatch, record):
     kvi: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
 
@@ -177,6 +198,7 @@ def test_mamba_pool_cls_untouched_before_0516(monkeypatch):
 @pytest.fixture
 def elastic_mamba_pool_cls(monkeypatch):
     _install_fake_torch(monkeypatch)
+    _install_fake_sglang_distributed(monkeypatch)
     record: Dict[str, Any] = {}
     _install_fake_interfaces(monkeypatch, record)
     module = _make_memory_pool_module()
@@ -234,3 +256,38 @@ def test_register_slot_state_refused(elastic_mamba_pool_cls):
 
     with pytest.raises(NotImplementedError, match="slot-sibling"):
         pool.register_slot_state(object())
+
+
+def test_ctor_is_isolated_from_installed_sglang(monkeypatch):
+    """The rank helpers must come from the test's own fakes, never from
+    whatever sglang the environment has (importing a real one under the
+    fake torch fails the constructor tests)."""
+    def _boom():
+        raise RuntimeError("ctor reached the environment's sglang")
+
+    for name in ("sglang", "sglang.srt", "sglang.srt.distributed"):
+        module = types.ModuleType(name)
+        for helper in (
+            "get_tensor_model_parallel_rank",
+            "get_tensor_model_parallel_world_size",
+            "get_pipeline_model_parallel_rank",
+        ):
+            setattr(module, helper, _boom)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_distributed(monkeypatch)
+    record: Dict[str, Any] = {}
+    _install_fake_interfaces(monkeypatch, record)
+    module = _make_memory_pool_module()
+    _apply_patch(monkeypatch, module, "0.5.20")
+
+    pool = module.ElasticMambaPool(**_mamba_pool_kwargs())
+
+    assert pool.num_mamba_layers == 2
+    assert record["init_kvcached"] == {
+        "tp_rank": 0,
+        "world_size": 1,
+        "pp_rank": 0,
+        "async_sched": True,
+    }
