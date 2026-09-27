@@ -1381,6 +1381,25 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         "slot-sibling states (register_slot_state) yet."
                     )
 
+                def clear_slots(self, indices: "torch.Tensor") -> None:
+                    # 0.5.20's deferred COW/clear on the extend path
+                    # (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear)
+                    # calls this; the native body indexes (layers, slots, *)
+                    # tensors, which on per-layer state would zero the wrong
+                    # axis of layer 0 and miss every other layer.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "clear_slots"):
+                            super().clear_slots(indices)
+                    else:
+                        # Per-layer state is (slots, *shape); index the slot
+                        # dim directly.  No _slot_siblings pass here:
+                        # register_slot_state refuses, so none can exist.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[indices] = 0
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[indices] = 0
+
                 def copy_from(
                     self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
                 ) -> None:
@@ -1394,24 +1413,56 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         for t in self.mamba_cache.temporal_per_layer:
                             t[dst_index] = t[src_index]
 
+                def _iter_transfer_state_entries(self):
+                    # The 0.5.20 PD-transfer readers (get_state_layer_ids,
+                    # get_state_slice_outer_counts,
+                    # get_state_conv_shard_groups) all walk this iterator,
+                    # whose native body expects (layers, slots, *) tensors
+                    # in vars(mamba_cache) and chokes on the nested
+                    # conv_per_layer list.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "_iter_transfer_state_entries"):
+                            yield from super()._iter_transfer_state_entries()
+                    else:
+                        # Same flattening as the contiguous iterator: conv
+                        # shape groups outer, layer inner, temporal last.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            if shape_list[0].numel() == 0:
+                                continue
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "conv",
+                                    shape_list[layer_index],
+                                    self.conv_slice_axis,
+                                    layer_id,
+                                )
+                        temporal_list = self.mamba_cache.temporal_per_layer
+                        if temporal_list[0].numel() > 0:
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "temporal",
+                                    temporal_list[layer_index],
+                                    0,
+                                    layer_id,
+                                )
+
                 def get_contiguous_buf_infos(self):
                     if self._is_contiguous:
                         if hasattr(MambaPool, "get_contiguous_buf_infos"):
                             return super().get_contiguous_buf_infos()
                     else:
-                        # Non-contiguous: per-layer pointer/length triples
-                        # in (state_kind_outer, layer_inner) order.
+                        # Non-contiguous: per-layer pointer/length triples,
+                        # aligned with the transfer iterator by sharing it.
                         data_ptrs: List[int] = []
                         data_lens: List[int] = []
                         item_lens: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            for layer_t in state_list:
-                                data_ptrs.append(layer_t.data_ptr())
-                                data_lens.append(layer_t.nbytes)
-                                item_lens.append(layer_t[0].nbytes)
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, _, _ in entries:
+                            data_ptrs.append(layer_t.data_ptr())
+                            data_lens.append(layer_t.nbytes)
+                            item_lens.append(layer_t[0].nbytes)
                         return data_ptrs, data_lens, item_lens
 
                 def get_state_dim_per_tensor(self):
@@ -1419,15 +1470,19 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         if hasattr(MambaPool, "get_state_dim_per_tensor"):
                             return super().get_state_dim_per_tensor()
                     else:
-                        # Per-layer state shape is (slots, sliceable_dim, ...);
-                        # the sliceable dimension is at index 1 (post-slot).
+                        # Per-layer state shape is (slots, ...); the native
+                        # reader takes shape[1 + slice_axis] (Kimi conv state
+                        # slices its second per-slot axis) and 0 marks a
+                        # replicated tensor that PD copies whole.
                         dim_per_tensor: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            sliceable_dim = state_list[0].shape[1]
-                            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, slice_axis, _ in entries:
+                            if slice_axis is None:
+                                dim_per_tensor.append(0)
+                                continue
+                            dim_per_tensor.append(
+                                layer_t.shape[1 + slice_axis]
+                            )
                         return dim_per_tensor
 
             setattr(mem_pool_mod, "ElasticMambaPool", ElasticMambaPool)
