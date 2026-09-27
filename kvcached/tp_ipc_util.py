@@ -5,6 +5,7 @@ import asyncio
 import atexit
 import os
 import pickle
+import signal
 import socket
 import threading
 import uuid
@@ -418,6 +419,83 @@ def _start_worker_listener_thread(
     if not _atexit_registered:
         atexit.register(stop_worker_listener_threads)
         _atexit_registered = True
+    install_signal_cleanup()
+
+
+def _drop_listener_artifacts(listener: _WorkerListener) -> None:
+    """Unlink the socket and remove its directories without draining the
+    listener thread. Only for a process that is already dying."""
+    try:
+        listener.server_sock.close()
+    except OSError:
+        pass
+    try:
+        os.unlink(listener.socket_path)
+    except OSError:
+        pass
+    _remove_dir_if_empty(listener.socket_dir)
+    if listener.socket_dir != listener.root_dir:
+        _remove_dir_if_empty(listener.root_dir)
+
+
+_previous_handlers: Dict[int, Any] = {}
+_our_handlers: Dict[int, Any] = {}
+
+
+def _on_term_or_int(signum, frame):
+    # The signal may land while the main thread holds _listeners_lock, so a
+    # blocking acquire would deadlock the dying process instead.
+    if _listeners_lock.acquire(blocking=False):
+        try:
+            listeners = list(_listeners.values())
+        finally:
+            _listeners_lock.release()
+    else:
+        listeners = []
+    for listener in listeners:
+        try:
+            _drop_listener_artifacts(listener)
+        except Exception:
+            pass
+    previous = _previous_handlers.get(signum, signal.SIG_DFL)
+    if callable(previous):
+        previous(signum, frame)
+    elif previous in (signal.SIG_DFL, None):
+        # None means a non-Python (C-level) disposition we cannot chain to —
+        # restore the default so the process still dies on the signal.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    # SIG_IGN: nothing else to do; the caller asked for this to be ignored.
+
+
+def install_signal_cleanup() -> None:
+    """Remove worker socket dirs when the process dies to SIGTERM/SIGINT.
+
+    atexit hooks never run on signal death, so /tmp/kvcached-tp-* outlives a
+    worker killed this way (issue #510). This handler drops the filesystem
+    artifacts synchronously and then delegates to the previous handler (or
+    re-raises SIG_DFL), so the process still exits with the correct signal
+    status.
+
+    The install is self-healing: engines that install their own handlers
+    later (vLLM does in run_engine_core) overwrite this one — call it again
+    once the engine's handlers are in place to re-arm with the engine's
+    handler chained behind ours. SIGKILL stays uncoverable by construction.
+    """
+    # signal.signal only works on the interpreter's main thread; worker
+    # processes that start a listener elsewhere keep the atexit path.
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            if signal.getsignal(signum) is _our_handlers.get(signum):
+                continue  # still armed
+            _previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _on_term_or_int)
+            _our_handlers[signum] = _on_term_or_int
+        except (OSError, ValueError, RuntimeError):
+            # Some platforms/interpreters disallow a signal; keep the rest.
+            continue
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.

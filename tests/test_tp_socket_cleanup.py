@@ -612,5 +612,131 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     assert "not found" in capsys.readouterr().err
 
 
+def test_sigterm_drops_socket_dir_before_process_death(socket_root):
+    """Issue #510: a bare SIGTERM kills a worker before atexit can run. The
+    listener's signal handler must drop the socket artifacts first, and the
+    process must still report a SIGTERM exit."""
+    import signal
+    import subprocess
+
+    child_src = (
+        "import sys, time, types\n"
+        "try:\n"
+        "    import kvcached.vmm_ops  # noqa: F401\n"
+        "except Exception:\n"
+        "    fake = types.ModuleType('kvcached.vmm_ops')\n"
+        "    fake.kv_tensors_created = lambda *a, **k: True\n"
+        "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
+        "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
+        "    sys.modules['kvcached.vmm_ops'] = fake\n"
+        "import kvcached.utils\n"
+        f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
+        "from kvcached import tp_ipc_util\n"
+        "tp_ipc_util.start_worker_listener_thread(0)\n"
+        # The handler is installed before the listener starts, so this marker
+        # guarantees both the socket and the handler are in place.
+        "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(
+        os.environ,
+        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        KVCACHED_IPC_NAME=IPC_NAME,
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_src],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL,
+                             text=True,
+                             start_new_session=True,
+                             env=env)
+    try:
+        socket_path = ""
+        for _ in range(50):
+            line = child.stdout.readline()
+            if not line:
+                break  # child died early; EOF
+            if line.startswith("READY "):
+                socket_path = line.split(None, 1)[1].strip()
+                break
+        assert socket_path, "child never reported its listener socket"
+        assert os.path.exists(socket_path)
+        socket_dir = os.path.dirname(socket_path)
+
+        os.kill(child.pid, signal.SIGTERM)
+        assert child.wait(timeout=30) == -signal.SIGTERM
+        assert not os.path.exists(socket_dir)
+    finally:
+        child.kill()
+
+
+def test_sigterm_cleanup_rearms_after_engine_overwrites_handler(socket_root):
+    """Issue #510: engines install their own SIGTERM handler after the
+    listener started (vLLM does in run_engine_core). Re-calling
+    install_signal_cleanup must re-arm ours in front of the engine's —
+    a group SIGTERM on a running engine drops the socket dir and still
+    runs the engine handler."""
+    import signal
+    import subprocess
+
+    child_src = (
+        "import signal, sys, time, types\n"
+        "try:\n"
+        "    import kvcached.vmm_ops  # noqa: F401\n"
+        "except Exception:\n"
+        "    fake = types.ModuleType('kvcached.vmm_ops')\n"
+        "    fake.kv_tensors_created = lambda *a, **k: True\n"
+        "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
+        "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
+        "    sys.modules['kvcached.vmm_ops'] = fake\n"
+        "import kvcached.utils\n"
+        f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
+        "from kvcached import tp_ipc_util\n"
+        "tp_ipc_util.start_worker_listener_thread(0)\n"
+        # Engine installs its own handler, overwriting ours.
+        "def engine_term(s, f):\n"
+        "    print('ENGINE_HANDLER', flush=True)\n"
+        "    signal.signal(s, signal.SIG_DFL)\n"
+        "    import os\n"
+        "    os.kill(os.getpid(), s)\n"
+        "signal.signal(signal.SIGTERM, engine_term)\n"
+        # run_busy_loop re-arm: ours goes back in front of the engine's.
+        "tp_ipc_util.install_signal_cleanup()\n"
+        "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(
+        os.environ,
+        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        KVCACHED_IPC_NAME=IPC_NAME,
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_src],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL,
+                             text=True,
+                             start_new_session=True,
+                             env=env)
+    try:
+        socket_path = ""
+        for _ in range(50):
+            line = child.stdout.readline()
+            if not line:
+                break
+            if line.startswith("READY "):
+                socket_path = line.split(None, 1)[1].strip()
+                break
+        assert socket_path, "child never reported its listener socket"
+        socket_dir = os.path.dirname(socket_path)
+
+        os.kill(child.pid, signal.SIGTERM)
+        assert child.wait(timeout=30) == -signal.SIGTERM
+        assert not os.path.exists(socket_dir)
+        rest = child.stdout.read()
+        assert "ENGINE_HANDLER" in rest, "engine handler was not chained"
+    finally:
+        child.kill()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
