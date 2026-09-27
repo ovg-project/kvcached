@@ -699,8 +699,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # 0.5.16+: native _create_buffers() keeps running. Its
                     # non-quantized branch pins k/v_scale_buffer and
                     # dq_k/dq_v_buffer to None before dispatching here, and
-                    # its tail derives the transfer descriptors and data
-                    # pointers from the elastic buffers.
+                    # its tail builds _kv_buffer_descs from the elastic
+                    # buffers. The pointer-table part of the tail is
+                    # guarded below: it is only valid when every K/V view
+                    # is independently contiguous.
                     def _create_buffers_normal(self):
                         self._create_buffers_elastic()
 
@@ -716,6 +718,78 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             "quantized KV cache recipes (quant_method). "
                             "Disable kvcached (ENABLE_KVCACHED=false) to "
                             "use a quantized KV cache.")
+
+                    def _kv_buffers_independently_contiguous(self):
+                        # The per-layer FTensor layout
+                        # (KVCACHED_CONTIGUOUS_LAYOUT=false) hands out
+                        # dense per-layer views, while the default
+                        # contiguous layout interleaves all layers and K/V
+                        # in one (tokens, layers, 2, heads, dim) buffer,
+                        # so each view's token stride spans every layer.
+                        return all(
+                            t.is_contiguous()
+                            for t in (*self.k_buffer, *self.v_buffer))
+
+                    def _init_data_ptrs_and_strides(self):
+                        # The native tables store one scalar per buffer,
+                        # prod(shape[1:]) * itemsize, and every consumer
+                        # (the Triton copy kernel in
+                        # kernels/ops/kvcache/cache_move.py) uses that
+                        # scalar both as the token-address pitch and as
+                        # the bytes to copy. That only holds when rows are
+                        # independently contiguous; publishing the tables
+                        # for interleaved views would make the kernel walk
+                        # and overwrite unrelated bytes. Leave them unset
+                        # instead so an unexpected consumer fails with
+                        # AttributeError, matching pre-0.5.16 elastic
+                        # pools, which never had them.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_data_ptrs_and_strides()
+
+                    def _init_kv_copy_and_warmup(self):
+                        # The warmup launches the copy kernel over the
+                        # pointer tables, which the interleaved layout
+                        # does not publish; move_kv_cache below covers
+                        # that layout without the kernel.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_kv_copy_and_warmup()
+                        else:
+                            self._kv_copy_config = None
+
+                    def _move_kv_cache_impl(self, tgt_loc, src_loc):
+                        # Native move strategy hook (the base
+                        # move_kv_cache already did the OOB checks). For
+                        # interleaved views, advanced indexing on the
+                        # views walks the real strides, mirroring the
+                        # native move_kv_cache_native fallback; scale
+                        # buffers cannot exist here because quantized
+                        # recipes are refused above.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._move_kv_cache_impl(tgt_loc, src_loc)
+                            return
+                        if tgt_loc.numel() == 0:
+                            return
+                        tgt = tgt_loc.view(-1).long()
+                        src = src_loc.view(-1).long()
+                        for k_cache, v_cache in zip(self.k_buffer,
+                                                    self.v_buffer):
+                            k_cache[tgt] = k_cache[src]
+                            v_cache[tgt] = v_cache[src]
+
+                    def get_contiguous_buf_infos(self):
+                        # PD transfer registers [ptr, ptr + len) per layer
+                        # and walks pages at ptr + page * item_len, which
+                        # has no valid answer when the layers interleave
+                        # within every token row.
+                        if self._kv_buffers_independently_contiguous():
+                            return super().get_contiguous_buf_infos()
+                        raise NotImplementedError(
+                            "the interleaved elastic KV layout has no "
+                            "per-layer contiguous regions, so PD transfer "
+                            "cannot register it. Use the per-layer layout "
+                            "(KVCACHED_CONTIGUOUS_LAYOUT=false) or "
+                            "disable kvcached (ENABLE_KVCACHED=false) "
+                            "for disaggregation.")
                 else:
                     # Before 0.5.16 _create_buffers() is a single stage
                     # (any pointer derivation is inlined after allocation),
