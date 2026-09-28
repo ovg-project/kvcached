@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
+from kvcached.errors import StateConsistencyError
 from kvcached.pool_registry import get_registered_kv_cache_pools
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
 
@@ -63,7 +64,9 @@ class KVCachePoolSnapshot:
       pool's reserve ledger. ``alloc()`` drains this ledger first.
     * ``available_blocks`` -- what the next request could obtain. Because
       ``alloc()`` drains the reserve ledger first, this also includes
-      ``reserved_blocks``.
+      ``reserved_blocks``. Reported as 0 when the native allocator has
+      fail-closed (``lifecycle_phase`` ``failed``): nothing is obtainable
+      from a failed pool, and the free-page read behind it raises.
 
     ``reserved_blocks`` counts *blocks* on that ledger and is unrelated to
     ``reserved_pages``, which counts *physical pages* held by the background
@@ -80,6 +83,12 @@ class KVCachePoolSnapshot:
     The page-count fields are captured atomically with respect to allocator
     mutations. Other fields remain best-effort and may come from marginally
     different instants.
+
+    ``lifecycle_phase`` is the pool's level-triggered lifecycle phase
+    (``kvcached.lifecycle.LifecyclePhase`` values ``initializing``,
+    ``ready``, ``degraded``, ``failed``), or ``None`` when the manager does
+    not expose one. It is poll-only; ``KVCacheManager.wait_ready()`` is the
+    blocking gate.
     """
 
     schema_version: str
@@ -111,9 +120,18 @@ class KVCachePoolSnapshot:
     in_shrink: bool
     shrink_target_blocks: Optional[int]
     resize_target_bytes: Optional[int]
+    # Added with #375 item (5); optional so older builders keep working.
+    lifecycle_phase: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _lifecycle_phase_value(obj: Any) -> Optional[str]:
+    phase = getattr(obj, "lifecycle_phase", None)
+    if phase is None:
+        return None
+    return str(getattr(phase, "value", phase))
 
 
 def _get_backend_capabilities() -> Dict[str, Any]:
@@ -224,6 +242,10 @@ def get_capabilities() -> Dict[str, Any]:
             "operation_counters": False,
             # Runtime reservation reporting for non-KV memory. Not landed yet.
             "runtime_reservation_reporting": False,
+            # Poll-only lifecycle readiness (#375, item 5): every pool exposes
+            # ``lifecycle_phase``, ``lifecycle_error`` and ``wait_ready()``,
+            # and ``KVCachePoolSnapshot.lifecycle_phase`` carries the phase.
+            "lifecycle_readiness": True,
         },
         "backends": _get_backend_capabilities(),
         "integrations": _get_integration_capabilities(),
@@ -311,7 +333,20 @@ def build_kv_cache_pool_snapshot(
     # total no matter which native extension is loaded. #436 also observed it
     # returning a negative value, and that cause has not been established. A
     # negative gauge is never meaningful to an exporter, so clamp at zero.
-    available_blocks = max(int(manager.available_size()), 0)
+    try:
+        available_blocks = max(int(manager.available_size()), 0)
+    except StateConsistencyError:
+        # The free-page getter behind available_size() fail-closes on a
+        # FAILED pool (PageAllocator::throw_if_failed), and the snapshot is
+        # the documented polling path, so it must keep reporting such a pool
+        # rather than raise at the poller (#478 review). Nothing is
+        # obtainable from a failed pool, so the gauge reports zero; the
+        # page-count fields above keep whatever the allocator still answers.
+        # Allocation paths call available_size() directly and keep raising.
+        # On a KVCacheManager the call has already recorded the verdict
+        # (_record_native_fatal), so the lifecycle_phase exported below
+        # reports the failure this snapshot just observed.
+        available_blocks = 0
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
 
@@ -345,6 +380,7 @@ def build_kv_cache_pool_snapshot(
         in_shrink=bool(getattr(manager, "in_shrink", False)),
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
+        lifecycle_phase=_lifecycle_phase_value(manager),
     )
 
 
