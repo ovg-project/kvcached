@@ -215,7 +215,8 @@ class _WorkerListener:
                       f"{drain_timeout_s:g}s; keeping it for a retry")
                 return False
         self.server_sock.close()
-        if self.owns_path():
+        owned = self.owns_path()
+        if owned:
             try:
                 os.unlink(self.socket_path)
             except FileNotFoundError:
@@ -224,7 +225,8 @@ class _WorkerListener:
         if self.socket_dir != self.root_dir:
             _remove_dir_if_empty(self.root_dir)
         self._stopped = True
-        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        removed = f", removed {self.socket_path}" if owned else ""
+        print(f"Worker {self.rank} IPC listener stopped{removed}")
         return True
 
     def owns_path(self) -> bool:

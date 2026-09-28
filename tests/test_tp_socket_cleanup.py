@@ -612,6 +612,36 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     assert "not found" in capsys.readouterr().err
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="shutdown() wakes a blocked accept() only on Linux")
+def test_stop_of_idle_listener_keeps_replacement_socket(socket_root):
+    """An idle old listener whose path now belongs to a replacement must stop
+    without connecting to, or unlinking, the replacement's socket."""
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    os.unlink(path)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(path)
+    replacement.listen()
+    replacement.settimeout(0.5)
+    try:
+        assert tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=2.0)
+        assert listener.thread is not None and not listener.thread.is_alive()
+        with pytest.raises(socket.timeout):
+            replacement.accept()  # stop() must not have connected to it
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
+    finally:
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypatch):
     """Same-name restart during a delayed cleanup (issue #510): the first stop
     times out behind a busy handler, a replacement then binds the same path,
