@@ -2732,6 +2732,13 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 return original_determine(self, *args, **kwargs)
 
             cache_config = self.cache_config
+            if getattr(cache_config, "kv_cache_memory_bytes", None) is None:
+                # A native startup plan can select an explicit budget. Apply it
+                # before choosing the process-local profiling path; older vLLM
+                # releases do not expose this helper.
+                apply_plan = getattr(gpuworker_mod, "maybe_apply_startup_plan", None)
+                if apply_plan is not None:
+                    apply_plan(self)
             configured_budget = getattr(cache_config, "kv_cache_memory_bytes", None)
             if configured_budget is not None:
                 return original_determine(self, *args, **kwargs)
@@ -2814,6 +2821,16 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 cudagraph_memory_estimate,
                 available_memory,
             )
+            reserve_mm_memory = getattr(
+                gpuworker_mod, "reserve_mm_ipc_gpu_memory", None)
+            if reserve_mm_memory is not None:
+                # Match native return-time reservations without changing the
+                # pre-reservation field used by compile/warmup bookkeeping.
+                return reserve_mm_memory(
+                    available_memory,
+                    self.model_config.multimodal_config,
+                    getattr(self.parallel_config, "_api_process_count", 1),
+                )
             return available_memory
 
         self._mark_as_patched(
