@@ -5,7 +5,6 @@ import asyncio
 import atexit
 import os
 import pickle
-import signal
 import socket
 import threading
 import uuid
@@ -216,17 +215,6 @@ class _WorkerListener:
                       f"{drain_timeout_s:g}s; keeping it for a retry")
                 return False
         self.server_sock.close()
-        self.remove_owned_artifacts()
-        self._stopped = True
-        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
-        return True
-
-    def owns_path(self) -> bool:
-        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
-
-    def remove_owned_artifacts(self) -> None:
-        """Unlink the socket if the path is still ours, then drop directories
-        that no other socket keeps alive."""
         if self.owns_path():
             try:
                 os.unlink(self.socket_path)
@@ -235,6 +223,12 @@ class _WorkerListener:
         _remove_dir_if_empty(self.socket_dir)
         if self.socket_dir != self.root_dir:
             _remove_dir_if_empty(self.root_dir)
+        self._stopped = True
+        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        return True
+
+    def owns_path(self) -> bool:
+        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
 
 
 def _path_identity(path: str) -> Optional[Tuple[int, int]]:
@@ -445,62 +439,6 @@ def _start_worker_listener_thread(
     if not _atexit_registered:
         atexit.register(stop_worker_listener_threads)
         _atexit_registered = True
-    install_signal_cleanup()
-
-
-def _drop_listener_artifacts(listener: _WorkerListener) -> None:
-    """Remove this listener's filesystem artifacts without draining or
-    closing it. Only for a process that is about to die to a signal."""
-    listener.remove_owned_artifacts()
-
-
-def _on_sigterm(signum, frame):
-    # Act only as the process's own disposition. A handler that saved this
-    # one and calls it has its own shutdown semantics, and the process may
-    # keep running afterwards.
-    if signal.getsignal(signum) is not _on_sigterm:
-        return
-    # The signal may land while the main thread holds _listeners_lock, so a
-    # blocking acquire would deadlock the dying process instead.
-    if _listeners_lock.acquire(blocking=False):
-        try:
-            listeners = list(_listeners.values())
-        finally:
-            _listeners_lock.release()
-    else:
-        listeners = []
-    for listener in listeners:
-        try:
-            _drop_listener_artifacts(listener)
-        except Exception:
-            pass
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
-
-
-def install_signal_cleanup() -> None:
-    """Remove worker socket dirs when the default SIGTERM action kills the
-    process.
-
-    atexit hooks never run on signal death, so /tmp/kvcached-tp-* outlives a
-    worker killed this way (issue #510). The handler is installed only while
-    SIGTERM still has its default disposition, where the signal is certain
-    to end the process: it drops the artifacts this process owns and then
-    re-raises SIGTERM with SIG_DFL, so the exit status is unchanged. An
-    ignored SIGTERM or an application handler (for example vLLM's graceful
-    shutdown) is left untouched; those paths end through the listener's
-    normal stop. SIGINT raises KeyboardInterrupt by default and unwinds
-    through atexit. SIGKILL stays uncoverable by construction.
-    """
-    # signal.signal only works on the interpreter's main thread; worker
-    # processes that start a listener elsewhere keep the atexit path.
-    if threading.current_thread() is not threading.main_thread():
-        return
-    try:
-        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
-            signal.signal(signal.SIGTERM, _on_sigterm)
-    except (OSError, ValueError, RuntimeError):
-        pass
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.

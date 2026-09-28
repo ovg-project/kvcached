@@ -612,139 +612,49 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     assert "not found" in capsys.readouterr().err
 
 
-_CHILD_PREAMBLE = (
-    "import os, signal, sys, time, types\n"
-    "try:\n"
-    "    import kvcached.vmm_ops  # noqa: F401\n"
-    "except Exception:\n"
-    "    fake = types.ModuleType('kvcached.vmm_ops')\n"
-    "    fake.kv_tensors_created = lambda *a, **k: True\n"
-    "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
-    "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
-    "    sys.modules['kvcached.vmm_ops'] = fake\n"
-    "import kvcached.utils\n"
-)
+def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypatch):
+    """Same-name restart during a delayed cleanup (issue #510): the first stop
+    times out behind a busy handler, a replacement then binds the same path,
+    and the retry after the handler finishes must not unlink the
+    replacement's socket."""
+    entered = threading.Event()
+    release = threading.Event()
 
+    def slow_map(*a, **kw):
+        entered.set()
+        release.wait(10)
+        return True, []
 
-def _spawn_listener_child(socket_root, before_start="", after_start=""):
-    """Run a listener in a child process; return (child, socket_path)."""
-    import subprocess
+    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", slow_map)
 
-    child_src = (
-        _CHILD_PREAMBLE
-        + f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
-        + "from kvcached import tp_ipc_util\n"
-        + before_start
-        + "tp_ipc_util.start_worker_listener_thread(0)\n"
-        + after_start
-        + "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
-        + "time.sleep(60)\n"
-    )
-    repo = str(Path(__file__).resolve().parents[1])
-    env = dict(
-        os.environ,
-        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
-        KVCACHED_IPC_NAME=IPC_NAME,
-    )
-    child = subprocess.Popen([sys.executable, "-c", child_src],
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL,
-                             text=True,
-                             start_new_session=True,
-                             env=env)
-    socket_path = ""
-    for _ in range(50):
-        line = child.stdout.readline()
-        if not line:
-            break  # child died early; EOF
-        if line.startswith("READY "):
-            socket_path = line.split(None, 1)[1].strip()
-            break
-    if not socket_path:
-        child.kill()
-        pytest.fail("child never reported its listener socket")
-    return child, socket_path
-
-
-def test_sigterm_drops_socket_dir_before_process_death(socket_root):
-    """Issue #510: with the default SIGTERM disposition the worker dies before
-    atexit can run. The socket artifacts must be dropped first, and the
-    process must still report a SIGTERM exit."""
-    import signal
-
-    child, socket_path = _spawn_listener_child(socket_root)
-    try:
-        assert os.path.exists(socket_path)
-        os.kill(child.pid, signal.SIGTERM)
-        assert child.wait(timeout=30) == -signal.SIGTERM
-        assert not os.path.exists(os.path.dirname(socket_path))
-    finally:
-        child.kill()
-
-
-_GRACEFUL_HANDLER = (
-    "def graceful(s, f):\n"
-    "    print('HANDLED', flush=True)\n"
-)
-_CHAINING_HANDLER = (
-    "previous = signal.getsignal(signal.SIGTERM)\n"
-    "def graceful(s, f):\n"
-    "    if callable(previous):\n"
-    "        previous(s, f)\n"
-    "    print('HANDLED', flush=True)\n"
-)
-
-
-@pytest.mark.parametrize("before_start, after_start", [
-    pytest.param("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n", "",
-                 id="ignored"),
-    pytest.param(_GRACEFUL_HANDLER + "signal.signal(signal.SIGTERM, graceful)\n",
-                 "", id="graceful-handler-installed-first"),
-    pytest.param("", _CHAINING_HANDLER + "signal.signal(signal.SIGTERM, graceful)\n",
-                 id="graceful-handler-chaining-to-listener"),
-])
-def test_sigterm_that_does_not_kill_keeps_live_socket(socket_root, before_start,
-                                                       after_start):
-    """A SIGTERM that is ignored, or handled by a handler that returns, does
-    not end the worker, so its socket must keep serving."""
-    import signal
-    import time
-
-    child, socket_path = _spawn_listener_child(socket_root, before_start, after_start)
-    try:
-        os.kill(child.pid, signal.SIGTERM)
-        if before_start.startswith("signal.signal(signal.SIGTERM, signal.SIG_IGN)"):
-            time.sleep(1.0)
-        else:
-            assert child.stdout.readline().strip() == "HANDLED"
-        assert child.poll() is None
-        assert _ask(socket_path, {"cmd": "kv_tensors_created"})["status"] == "success"
-    finally:
-        child.kill()
-        child.wait(timeout=30)
-
-
-def test_cleanup_keeps_replacement_generation_socket(socket_root):
-    """Same-name restart: the old listener's path now belongs to a replacement.
-    Neither the signal-path cleanup nor stop() of the old listener may unlink
-    it while the replacement still serves."""
     tp_ipc_util.start_worker_listener_thread(0)
     path = tp_ipc_util.get_worker_socket_path(0)
-    old = tp_ipc_util._listeners[(0, 0)]
-    os.unlink(path)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    header, body = _delayed_map_request()
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    replacement.bind(path)
-    replacement.listen()
     try:
-        tp_ipc_util._drop_listener_artifacts(old)
-        assert os.path.exists(path)
-
-        tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=1.0)
-        assert os.path.exists(path)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(5)
             client.connect(path)
+            client.sendall(header + body)
+            assert entered.wait(5)
+            assert not tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=0.2)
+
+            os.unlink(path)  # what the replacement's start does
+            replacement.bind(path)
+            replacement.listen()
+
+            release.set()
+            assert listener.thread is not None
+            listener.thread.join(5)
+            assert not listener.thread.is_alive()
+
+        assert tp_ipc_util.stop_worker_listener_threads()
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
     finally:
+        release.set()
         replacement.close()
         try:
             os.unlink(path)
