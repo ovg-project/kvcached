@@ -9,6 +9,8 @@ import torch
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
     build_runtime_snapshot,
+    get_registered_kv_cache_pool_operation_snapshot_dicts,
+    get_registered_kv_cache_pool_operation_snapshots,
     get_registered_kv_cache_pool_snapshot_dicts,
     get_registered_kv_cache_pool_snapshots,
 )
@@ -443,6 +445,16 @@ def kv_cache_pool_snapshots():
 def kv_cache_pool_snapshot_dicts() -> List[Dict[str, Any]]:
     """Return JSON-serializable snapshots for all live vLLM KV pools."""
     return get_registered_kv_cache_pool_snapshot_dicts(integration="vllm")
+
+
+def kv_cache_pool_operation_snapshots():
+    """Return operation snapshots for all live vLLM KV pools."""
+    return get_registered_kv_cache_pool_operation_snapshots(integration="vllm")
+
+
+def kv_cache_pool_operation_snapshot_dicts() -> List[Dict[str, Any]]:
+    """Return JSON-serializable operation snapshots for live vLLM KV pools."""
+    return get_registered_kv_cache_pool_operation_snapshot_dicts(integration="vllm")
 
 
 def alloc_kv_cache(
@@ -959,6 +971,7 @@ def get_kv_cache_manager(
         group_id=group_id,
         reserve_null_block=True,
         pool_name=pool_name,
+        defer_physical_release=_async_sched,
     )
     register_kv_cache_pool(
         manager,

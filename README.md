@@ -236,6 +236,12 @@ Before pushing your code, please run the following check and make sure your code
 pre-commit run --all-files
 ```
 
+## Shared Physical Admission Directory
+
+Colocated workers using physical-growth admission must share the actual filesystem configured by `KVCACHED_PHYSICAL_GROWTH_LOCK_DIR`. Equal paths in isolated container filesystems do not coordinate. Use a trusted directory on a local filesystem supporting `flock`, shared by all workers targeting the same physical GPU.
+
+The default `/tmp` setup assumes the same Unix UID. Different UIDs require administrator-provisioned access: a common group with a setgid directory and group-write-preserving umask (for example, `0007`), or equivalent default ACLs. Existing `.lock` and `.queue` files must also be writable by every participant; tickets must be readable so live owners can be identified. A directory mount or `fsGroup` alone does not override a process umask that removes group write access. Provision this before starting workers, and never remove or replace live coordination files. KVCached does not automatically chmod shared files or bypass permission errors.
+
 ## Contacts
 
 kvcached is developed by many contributors from the community. The best way to contact us for questions, issues, and contributions, is through our [Slack channel](https://join.slack.com/t/ovg-project/shared_invite/zt-3fr01t8s7-ZtDhHSJQ00hcLHgwKx3Dmw) or [GitHub Issues](https://github.com/ovg-project/kvcached/issues).
