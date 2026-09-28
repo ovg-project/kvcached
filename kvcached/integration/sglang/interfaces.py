@@ -3,6 +3,7 @@
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -36,6 +37,7 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
+_runtime_owned_reservations: Dict[str, Dict[str, WeakKeyDictionary[Any, int]]] = {}
 
 # Single source of truth for what this shim accepts. The capability record
 # in kvcached.observability reports these, so the guards below and the
@@ -81,6 +83,7 @@ def shutdown_kvcached() -> bool:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
+        _runtime_owned_reservations.clear()
         return True
 
     if not stop_worker_listener_threads():
@@ -91,7 +94,56 @@ def shutdown_kvcached() -> bool:
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _runtime_owned_reservations.clear()
     return True
+
+
+def register_runtime_owned_reservation(
+    device: str,
+    pool_name: str,
+    num_bytes: int,
+    *,
+    owner: Any,
+) -> None:
+    """Record memory owned by the serving runtime outside kvcached.
+
+    Some runtimes allocate model-specific side pools that kvcached should not
+    manage directly.  The reservation is still consumed by the same GPU, so
+    kvcached's later virtual KV budgets must subtract it to avoid overbooking
+    colocated pools. Entries belong to a live pool instance; recording a draft
+    pool must not replace the target pool's allocation of the same category.
+    """
+    device = normalize_gpu_device(device)
+    if num_bytes < 0:
+        raise ValueError(f"runtime reservation for {pool_name} is negative: {num_bytes}")
+    if num_bytes == 0:
+        device_reservations = _runtime_owned_reservations.get(device)
+        if device_reservations is not None:
+            owners = device_reservations.get(pool_name)
+            if owners is not None:
+                owners.pop(owner, None)
+                if not owners:
+                    device_reservations.pop(pool_name, None)
+            if not device_reservations:
+                _runtime_owned_reservations.pop(device, None)
+        return
+    owners = _runtime_owned_reservations.setdefault(device, {}).setdefault(
+        pool_name, WeakKeyDictionary()
+    )
+    owners[owner] = int(num_bytes)
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    return sum(get_runtime_owned_reservation_breakdown(device).values())
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    device = normalize_gpu_device(device)
+    return {
+        name: sum(owners.values())
+        for name, owners in _runtime_owned_reservations.get(device, {}).items()
+        if owners
+    }
 
 
 def observability_snapshot():
@@ -161,7 +213,17 @@ def alloc_kv_cache(
     block_size = page_size
     block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
 
+    runtime_reserved_bytes = get_runtime_owned_reservation_bytes(device)
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    if runtime_reserved_bytes:
+        gpu_mem_bytes = max(0, gpu_mem_bytes - runtime_reserved_bytes)
+        logger.info(
+            "Reserved %.2f GB for runtime-owned SGLang pools on %s; "
+            "remaining kvcached budget is %.2f GB",
+            runtime_reserved_bytes / (1024**3),
+            device,
+            gpu_mem_bytes / (1024**3),
+        )
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * PAGE_SIZE for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
