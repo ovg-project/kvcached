@@ -1114,8 +1114,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         # Apply version-specific patches
         init_patched = self.patch_engine_init(engine_mod)
         shutdown_patched = self.patch_engine_shutdown(engine_mod)
-        busy_loop_patched = self.patch_busy_loop(engine_mod)
-        return init_patched and shutdown_patched and busy_loop_patched
+        return init_patched and shutdown_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -1206,45 +1205,6 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_engine_shutdown, "shutdown")
         EngineCore.shutdown = _patched_engine_shutdown  # type: ignore[assignment]
-        return True
-
-    @version_range(VLLM_ALL_RANGE)
-    def patch_busy_loop(self, engine_mod: types.ModuleType) -> bool:
-        """Re-arm kvcached's signal cleanup once the engine enters its loop.
-
-        run_engine_core() installs vLLM's own SIGTERM/SIGINT handlers right
-        before run_busy_loop(), overwriting the cleanup handler armed when
-        the worker listener started. Re-arming here keeps socket-dir
-        removal first in the chain while still delegating to vLLM's
-        handler, so a process-group SIGTERM on a running engine cleans
-        /tmp/kvcached-tp-* even if teardown is later interrupted (issue
-        #510).
-        """
-        EngineCore = self._get_target_class(engine_mod)
-        if EngineCore is None:
-            return False
-
-        original_run_busy_loop = getattr(EngineCore, "run_busy_loop", None)
-        if original_run_busy_loop is None:
-            self.logger.debug("EngineCore.run_busy_loop not found; skipping signal re-arm")
-            return True
-
-        if self._is_already_patched(original_run_busy_loop, "busy_loop"):
-            self.logger.debug("EngineCore.run_busy_loop already patched")
-            return True
-
-        def _patched_run_busy_loop(self, *args: Any, **kwargs: Any):
-            if enable_kvcached():
-                try:
-                    from kvcached.tp_ipc_util import install_signal_cleanup
-
-                    install_signal_cleanup()
-                except Exception:
-                    pass
-            return original_run_busy_loop(self, *args, **kwargs)
-
-        self._mark_as_patched(_patched_run_busy_loop, "busy_loop")
-        EngineCore.run_busy_loop = _patched_run_busy_loop  # type: ignore[assignment]
         return True
 
 

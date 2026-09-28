@@ -612,130 +612,144 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     assert "not found" in capsys.readouterr().err
 
 
+_CHILD_PREAMBLE = (
+    "import os, signal, sys, time, types\n"
+    "try:\n"
+    "    import kvcached.vmm_ops  # noqa: F401\n"
+    "except Exception:\n"
+    "    fake = types.ModuleType('kvcached.vmm_ops')\n"
+    "    fake.kv_tensors_created = lambda *a, **k: True\n"
+    "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
+    "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
+    "    sys.modules['kvcached.vmm_ops'] = fake\n"
+    "import kvcached.utils\n"
+)
+
+
+def _spawn_listener_child(socket_root, before_start="", after_start=""):
+    """Run a listener in a child process; return (child, socket_path)."""
+    import subprocess
+
+    child_src = (
+        _CHILD_PREAMBLE
+        + f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
+        + "from kvcached import tp_ipc_util\n"
+        + before_start
+        + "tp_ipc_util.start_worker_listener_thread(0)\n"
+        + after_start
+        + "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
+        + "time.sleep(60)\n"
+    )
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(
+        os.environ,
+        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        KVCACHED_IPC_NAME=IPC_NAME,
+    )
+    child = subprocess.Popen([sys.executable, "-c", child_src],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL,
+                             text=True,
+                             start_new_session=True,
+                             env=env)
+    socket_path = ""
+    for _ in range(50):
+        line = child.stdout.readline()
+        if not line:
+            break  # child died early; EOF
+        if line.startswith("READY "):
+            socket_path = line.split(None, 1)[1].strip()
+            break
+    if not socket_path:
+        child.kill()
+        pytest.fail("child never reported its listener socket")
+    return child, socket_path
+
+
 def test_sigterm_drops_socket_dir_before_process_death(socket_root):
-    """Issue #510: a bare SIGTERM kills a worker before atexit can run. The
-    listener's signal handler must drop the socket artifacts first, and the
+    """Issue #510: with the default SIGTERM disposition the worker dies before
+    atexit can run. The socket artifacts must be dropped first, and the
     process must still report a SIGTERM exit."""
     import signal
-    import subprocess
 
-    child_src = (
-        "import sys, time, types\n"
-        "try:\n"
-        "    import kvcached.vmm_ops  # noqa: F401\n"
-        "except Exception:\n"
-        "    fake = types.ModuleType('kvcached.vmm_ops')\n"
-        "    fake.kv_tensors_created = lambda *a, **k: True\n"
-        "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
-        "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
-        "    sys.modules['kvcached.vmm_ops'] = fake\n"
-        "import kvcached.utils\n"
-        f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
-        "from kvcached import tp_ipc_util\n"
-        "tp_ipc_util.start_worker_listener_thread(0)\n"
-        # The handler is installed before the listener starts, so this marker
-        # guarantees both the socket and the handler are in place.
-        "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
-        "time.sleep(60)\n"
-    )
-    repo = str(Path(__file__).resolve().parents[1])
-    env = dict(
-        os.environ,
-        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
-        KVCACHED_IPC_NAME=IPC_NAME,
-    )
-    child = subprocess.Popen([sys.executable, "-c", child_src],
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL,
-                             text=True,
-                             start_new_session=True,
-                             env=env)
+    child, socket_path = _spawn_listener_child(socket_root)
     try:
-        socket_path = ""
-        for _ in range(50):
-            line = child.stdout.readline()
-            if not line:
-                break  # child died early; EOF
-            if line.startswith("READY "):
-                socket_path = line.split(None, 1)[1].strip()
-                break
-        assert socket_path, "child never reported its listener socket"
         assert os.path.exists(socket_path)
-        socket_dir = os.path.dirname(socket_path)
-
         os.kill(child.pid, signal.SIGTERM)
         assert child.wait(timeout=30) == -signal.SIGTERM
-        assert not os.path.exists(socket_dir)
+        assert not os.path.exists(os.path.dirname(socket_path))
     finally:
         child.kill()
 
 
-def test_sigterm_cleanup_rearms_after_engine_overwrites_handler(socket_root):
-    """Issue #510: engines install their own SIGTERM handler after the
-    listener started (vLLM does in run_engine_core). Re-calling
-    install_signal_cleanup must re-arm ours in front of the engine's —
-    a group SIGTERM on a running engine drops the socket dir and still
-    runs the engine handler."""
+_GRACEFUL_HANDLER = (
+    "def graceful(s, f):\n"
+    "    print('HANDLED', flush=True)\n"
+)
+_CHAINING_HANDLER = (
+    "previous = signal.getsignal(signal.SIGTERM)\n"
+    "def graceful(s, f):\n"
+    "    if callable(previous):\n"
+    "        previous(s, f)\n"
+    "    print('HANDLED', flush=True)\n"
+)
+
+
+@pytest.mark.parametrize("before_start, after_start", [
+    pytest.param("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n", "",
+                 id="ignored"),
+    pytest.param(_GRACEFUL_HANDLER + "signal.signal(signal.SIGTERM, graceful)\n",
+                 "", id="graceful-handler-installed-first"),
+    pytest.param("", _CHAINING_HANDLER + "signal.signal(signal.SIGTERM, graceful)\n",
+                 id="graceful-handler-chaining-to-listener"),
+])
+def test_sigterm_that_does_not_kill_keeps_live_socket(socket_root, before_start,
+                                                       after_start):
+    """A SIGTERM that is ignored, or handled by a handler that returns, does
+    not end the worker, so its socket must keep serving."""
     import signal
-    import subprocess
+    import time
 
-    child_src = (
-        "import signal, sys, time, types\n"
-        "try:\n"
-        "    import kvcached.vmm_ops  # noqa: F401\n"
-        "except Exception:\n"
-        "    fake = types.ModuleType('kvcached.vmm_ops')\n"
-        "    fake.kv_tensors_created = lambda *a, **k: True\n"
-        "    fake.map_to_kv_tensors = lambda *a, **k: None\n"
-        "    fake.unmap_from_kv_tensors = lambda *a, **k: None\n"
-        "    sys.modules['kvcached.vmm_ops'] = fake\n"
-        "import kvcached.utils\n"
-        f"kvcached.utils.TP_SOCKET_DIR_ROOT = {socket_root!r}\n"
-        "from kvcached import tp_ipc_util\n"
-        "tp_ipc_util.start_worker_listener_thread(0)\n"
-        # Engine installs its own handler, overwriting ours.
-        "def engine_term(s, f):\n"
-        "    print('ENGINE_HANDLER', flush=True)\n"
-        "    signal.signal(s, signal.SIG_DFL)\n"
-        "    import os\n"
-        "    os.kill(os.getpid(), s)\n"
-        "signal.signal(signal.SIGTERM, engine_term)\n"
-        # run_busy_loop re-arm: ours goes back in front of the engine's.
-        "tp_ipc_util.install_signal_cleanup()\n"
-        "print('READY ' + tp_ipc_util.get_worker_socket_path(0), flush=True)\n"
-        "time.sleep(60)\n"
-    )
-    repo = str(Path(__file__).resolve().parents[1])
-    env = dict(
-        os.environ,
-        PYTHONPATH=repo + os.pathsep + os.environ.get("PYTHONPATH", ""),
-        KVCACHED_IPC_NAME=IPC_NAME,
-    )
-    child = subprocess.Popen([sys.executable, "-c", child_src],
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL,
-                             text=True,
-                             start_new_session=True,
-                             env=env)
+    child, socket_path = _spawn_listener_child(socket_root, before_start, after_start)
     try:
-        socket_path = ""
-        for _ in range(50):
-            line = child.stdout.readline()
-            if not line:
-                break
-            if line.startswith("READY "):
-                socket_path = line.split(None, 1)[1].strip()
-                break
-        assert socket_path, "child never reported its listener socket"
-        socket_dir = os.path.dirname(socket_path)
-
         os.kill(child.pid, signal.SIGTERM)
-        assert child.wait(timeout=30) == -signal.SIGTERM
-        assert not os.path.exists(socket_dir)
-        rest = child.stdout.read()
-        assert "ENGINE_HANDLER" in rest, "engine handler was not chained"
+        if before_start.startswith("signal.signal(signal.SIGTERM, signal.SIG_IGN)"):
+            time.sleep(1.0)
+        else:
+            assert child.stdout.readline().strip() == "HANDLED"
+        assert child.poll() is None
+        assert _ask(socket_path, {"cmd": "kv_tensors_created"})["status"] == "success"
     finally:
         child.kill()
+        child.wait(timeout=30)
+
+
+def test_cleanup_keeps_replacement_generation_socket(socket_root):
+    """Same-name restart: the old listener's path now belongs to a replacement.
+    Neither the signal-path cleanup nor stop() of the old listener may unlink
+    it while the replacement still serves."""
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    old = tp_ipc_util._listeners[(0, 0)]
+    os.unlink(path)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(path)
+    replacement.listen()
+    try:
+        tp_ipc_util._drop_listener_artifacts(old)
+        assert os.path.exists(path)
+
+        tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=1.0)
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(path)
+    finally:
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

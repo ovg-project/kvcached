@@ -142,6 +142,10 @@ class _WorkerListener:
         self.socket_dir = socket_dir
         self.socket_path = socket_path
         self.server_sock = server_sock
+        # The pathname alone does not identify this listener: a same-name
+        # restart can bind a new socket at the same path. Unlink only while
+        # the path still refers to the inode this listener bound.
+        self.socket_id = _path_identity(socket_path)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self._conns: set[socket.socket] = set()
@@ -190,11 +194,16 @@ class _WorkerListener:
             except OSError:
                 pass  # the handler is already past this connection
         # accept() only returns on a connection, so make one to let an idle
-        # loop observe stop_event.
+        # loop observe stop_event. If the path now belongs to a replacement,
+        # connecting would reach the replacement instead; shutting down the
+        # listening socket wakes accept() on Linux.
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
-                wake.settimeout(1.0)
-                wake.connect(self.socket_path)
+            if self.owns_path():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                    wake.settimeout(1.0)
+                    wake.connect(self.socket_path)
+            else:
+                self.server_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         thread = self.thread
@@ -207,16 +216,33 @@ class _WorkerListener:
                       f"{drain_timeout_s:g}s; keeping it for a retry")
                 return False
         self.server_sock.close()
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
-        _remove_dir_if_empty(self.socket_dir)
-        if self.socket_dir != self.root_dir:
-            _remove_dir_if_empty(self.root_dir)
+        self.remove_owned_artifacts()
         self._stopped = True
         print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
         return True
+
+    def owns_path(self) -> bool:
+        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
+
+    def remove_owned_artifacts(self) -> None:
+        """Unlink the socket if the path is still ours, then drop directories
+        that no other socket keeps alive."""
+        if self.owns_path():
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
+        _remove_dir_if_empty(self.socket_dir)
+        if self.socket_dir != self.root_dir:
+            _remove_dir_if_empty(self.root_dir)
+
+
+def _path_identity(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
 
 def _remove_dir_if_empty(path: str) -> None:
@@ -423,26 +449,17 @@ def _start_worker_listener_thread(
 
 
 def _drop_listener_artifacts(listener: _WorkerListener) -> None:
-    """Unlink the socket and remove its directories without draining the
-    listener thread. Only for a process that is already dying."""
-    try:
-        listener.server_sock.close()
-    except OSError:
-        pass
-    try:
-        os.unlink(listener.socket_path)
-    except OSError:
-        pass
-    _remove_dir_if_empty(listener.socket_dir)
-    if listener.socket_dir != listener.root_dir:
-        _remove_dir_if_empty(listener.root_dir)
+    """Remove this listener's filesystem artifacts without draining or
+    closing it. Only for a process that is about to die to a signal."""
+    listener.remove_owned_artifacts()
 
 
-_previous_handlers: Dict[int, Any] = {}
-_our_handlers: Dict[int, Any] = {}
-
-
-def _on_term_or_int(signum, frame):
+def _on_sigterm(signum, frame):
+    # Act only as the process's own disposition. A handler that saved this
+    # one and calls it has its own shutdown semantics, and the process may
+    # keep running afterwards.
+    if signal.getsignal(signum) is not _on_sigterm:
+        return
     # The signal may land while the main thread holds _listeners_lock, so a
     # blocking acquire would deadlock the dying process instead.
     if _listeners_lock.acquire(blocking=False):
@@ -457,45 +474,33 @@ def _on_term_or_int(signum, frame):
             _drop_listener_artifacts(listener)
         except Exception:
             pass
-    previous = _previous_handlers.get(signum, signal.SIG_DFL)
-    if callable(previous):
-        previous(signum, frame)
-    elif previous in (signal.SIG_DFL, None):
-        # None means a non-Python (C-level) disposition we cannot chain to —
-        # restore the default so the process still dies on the signal.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-    # SIG_IGN: nothing else to do; the caller asked for this to be ignored.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 def install_signal_cleanup() -> None:
-    """Remove worker socket dirs when the process dies to SIGTERM/SIGINT.
+    """Remove worker socket dirs when the default SIGTERM action kills the
+    process.
 
     atexit hooks never run on signal death, so /tmp/kvcached-tp-* outlives a
-    worker killed this way (issue #510). This handler drops the filesystem
-    artifacts synchronously and then delegates to the previous handler (or
-    re-raises SIG_DFL), so the process still exits with the correct signal
-    status.
-
-    The install is self-healing: engines that install their own handlers
-    later (vLLM does in run_engine_core) overwrite this one — call it again
-    once the engine's handlers are in place to re-arm with the engine's
-    handler chained behind ours. SIGKILL stays uncoverable by construction.
+    worker killed this way (issue #510). The handler is installed only while
+    SIGTERM still has its default disposition, where the signal is certain
+    to end the process: it drops the artifacts this process owns and then
+    re-raises SIGTERM with SIG_DFL, so the exit status is unchanged. An
+    ignored SIGTERM or an application handler (for example vLLM's graceful
+    shutdown) is left untouched; those paths end through the listener's
+    normal stop. SIGINT raises KeyboardInterrupt by default and unwinds
+    through atexit. SIGKILL stays uncoverable by construction.
     """
     # signal.signal only works on the interpreter's main thread; worker
     # processes that start a listener elsewhere keep the atexit path.
     if threading.current_thread() is not threading.main_thread():
         return
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        try:
-            if signal.getsignal(signum) is _our_handlers.get(signum):
-                continue  # still armed
-            _previous_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, _on_term_or_int)
-            _our_handlers[signum] = _on_term_or_int
-        except (OSError, ValueError, RuntimeError):
-            # Some platforms/interpreters disallow a signal; keep the rest.
-            continue
+    try:
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+    except (OSError, ValueError, RuntimeError):
+        pass
 
 
 # How long one worker-IPC exchange may take before it is treated as a failure.
