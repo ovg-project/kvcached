@@ -157,6 +157,84 @@ def shutdown_kvcached() -> bool:
     return True
 
 
+def _set_block_copy_view(
+    tensor: torch.Tensor, backing: torch.Tensor, num_blocks: int, block_bytes: int,
+) -> None:
+    """Record logical block boundaries without using the reserved storage size."""
+    raw = backing.view(torch.uint8).view(-1)
+    pages = raw[:num_blocks * block_bytes].view(num_blocks, block_bytes)
+    setattr(tensor, "_kvcached_block_copy_view", pages)
+
+
+def _copy_kv_cache_blocks(
+    kv_caches, num_blocks: int, block_copies,
+) -> None:
+    """Copy shared backing pools once, using their actual logical page stride."""
+    if not block_copies:
+        return
+    pairs = list(block_copies)
+    if num_blocks <= 0 or any(
+        src < 0 or dst < 0 or src >= num_blocks or dst >= num_blocks
+        for src, dst in pairs
+    ):
+        raise ValueError("KV block copy index is outside the logical block pool")
+    if len({dst for _, dst in pairs}) != len(pairs):
+        raise ValueError("KV block copies must have distinct destinations")
+
+    views = []
+    seen = set()
+    for entry in kv_caches:
+        for tensor in entry if isinstance(entry, (list, tuple)) else (entry,):
+            pages = getattr(tensor, "_kvcached_block_copy_view", None)
+            if pages is None:
+                raise ValueError("KV block copy requires kvcached logical page metadata")
+            if pages.ndim < 2 or pages.dtype != torch.uint8 or pages.shape[0] < num_blocks:
+                raise ValueError("Invalid kvcached logical block copy view")
+            key = (pages.data_ptr(), tuple(pages.shape), tuple(pages.stride()))
+            if key not in seen:
+                seen.add(key)
+                views.append(pages)
+    if not views:
+        return
+    device = views[0].device
+    if any(pages.device != device for pages in views):
+        raise ValueError("KV block copy views must belong to the same device")
+    if device.type == "cuda":
+        import numpy as np
+        from vllm.v1.worker.utils import async_tensor_h2d
+
+        indices = async_tensor_h2d(np.array(pairs, dtype=np.int64), device=device)
+    else:
+        indices = torch.tensor(pairs, dtype=torch.int64, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+    for pages in views:
+        # Advanced indexing snapshots the sources, including overlapping copies.
+        pages[dst_indices] = pages[src_indices]
+
+
+def _set_legacy_block_copy_views(
+    tensors: List[torch.Tensor], raw_tensors: List[torch.Tensor],
+    num_blocks: int, page_bytes: int, num_layers: int,
+    unified: bool, split_offset: int,
+) -> None:
+    for layer, tensor in enumerate(tensors):
+        backing = raw_tensors[0 if _contiguous_layout else layer]
+        if _contiguous_layout or unified:
+            _set_block_copy_view(
+                tensor, backing, num_blocks,
+                page_bytes * (num_layers if _contiguous_layout else 1),
+            )
+        else:
+            # Preserve the reserved gap between K and V instead of copying it.
+            raw_bytes = backing.view(torch.uint8)
+            half_bytes = page_bytes // 2
+            setattr(tensor, "_kvcached_block_copy_view", torch.as_strided(
+                raw_bytes, (num_blocks, 2, half_bytes),
+                (half_bytes, split_offset, 1),
+                storage_offset=raw_bytes.storage_offset(),
+            ))
+
+
 def _build_packed_kv_views(
     raw_kv_tensors: List[torch.Tensor],
     shape: Tuple[int, ...],
@@ -183,7 +261,7 @@ def _build_packed_kv_views(
     block_stride = kernel_elements * (num_layers if _contiguous_layout else 1)
     view_shape = (num_blocks * (block_size // kernel_block_size),
                   heads, kernel_block_size, width)
-    return [
+    tensors = [
         torch.as_strided(
             raw_kv_tensors[0 if _contiguous_layout else layer].view(dtype),
             view_shape, (block_stride, *inner_strides),
@@ -191,6 +269,13 @@ def _build_packed_kv_views(
         )
         for layer in range(num_layers)
     ]
+    block_bytes = heads * block_size * width * dtype.itemsize
+    for layer, tensor in enumerate(tensors):
+        _set_block_copy_view(
+            tensor, raw_kv_tensors[0 if _contiguous_layout else layer],
+            num_blocks, block_bytes * (num_layers if _contiguous_layout else 1),
+        )
+    return tensors
 
 
 def build_kv_views(
@@ -324,6 +409,10 @@ def build_kv_views(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
+    _set_legacy_block_copy_views(
+        kv_tensors, raw_kv_tensors, num_blocks_per_layer, page_size_bytes,
+        num_layers, is_mla or unified_pool, gpu_mem_bytes_per_layer_k_or_v,
+    )
     return kv_tensors, page_size_bytes
 
 
@@ -655,6 +744,12 @@ def alloc_kv_cache(
         kv_tensors = [
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
+
+    if not packed_kv:
+        _set_legacy_block_copy_views(
+            kv_tensors, raw_kv_tensors, num_blocks_per_layer, page_size_bytes,
+            num_layers, is_mla or unified_pool, gpu_mem_bytes_per_layer_k_or_v,
+        )
 
     meta = {
         "raw_kv_tensors": raw_kv_tensors,

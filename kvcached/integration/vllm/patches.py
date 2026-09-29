@@ -269,6 +269,39 @@ def _should_enable_async_sched(vllm_config: Any) -> bool:
     return bool(getattr(scheduler_config, "async_scheduling", False))
 
 
+def _reshape_mamba_page_tensor(
+    mamba_info: dict, kv_cache_spec: Any, pool_idx: int,
+) -> Any:
+    """Expose raw per-block state bytes for vLLM 0.27+'s native Mamba binding."""
+    import torch
+
+    page_size = int(kv_cache_spec.page_size_bytes)
+    if page_size != mamba_info["page_size_bytes"] or page_size <= 0:
+        raise ValueError("Mamba page size does not match the shared KV pool")
+    if mamba_info.get("is_contiguous"):
+        raw = mamba_info["buffers"][0]
+        block_stride = mamba_info["block_stride_bytes"]
+        offset = pool_idx * page_size
+    else:
+        raw = mamba_info["buffers"][pool_idx]
+        block_stride = page_size
+        offset = 0
+    if raw.dtype != torch.int8 or raw.ndim != 1 or raw.stride(0) != 1:
+        raise ValueError("Mamba backing storage must be a flat int8 byte buffer")
+    # Interleaved layers need a strided page view, not a compact reshape.
+    # Include the backing view's offset: as_strided offsets are storage-relative.
+    result = torch.as_strided(
+        raw,
+        size=(mamba_info["num_blocks"], 1, 1, page_size),
+        stride=(block_stride, page_size, page_size, 1),
+        storage_offset=raw.storage_offset() + offset,
+    )
+    from kvcached.integration.vllm.interfaces import _set_block_copy_view
+
+    _set_block_copy_view(result, raw, mamba_info["num_blocks"], block_stride)
+    return result
+
+
 def _reshape_mamba_non_contiguous(
     raw_int8: Any, kv_cache_spec: Any, get_dtype_size: Any,
 ) -> list:
@@ -543,6 +576,28 @@ def _set_block_hash(block: Any, key: Any) -> None:
         block.block_hash = key
 
 
+def _get_native_hash_block_size(
+    block_pool: Any, block_size: int, vllm_version: Optional[str],
+) -> int:
+    """Preserve native hash granularity; only pre-0.12 uses allocation blocks."""
+    if block_pool is None:
+        raise RuntimeError("vLLM coordinator is missing its native BlockPool")
+    if hasattr(block_pool, "hash_block_size"):
+        hash_block_size = block_pool.hash_block_size
+    elif vllm_version and VersionRange(">=0.9.0,<0.12.0").contains(vllm_version):
+        # These versions require a common block size for prefix caching and
+        # do not yet store a separate hash granularity on BlockPool.
+        hash_block_size = block_size
+    else:
+        raise RuntimeError(
+            f"vLLM {vllm_version}: native BlockPool.hash_block_size is missing; "
+            "refusing to substitute the KV allocation block size"
+        )
+    if not isinstance(hash_block_size, int) or hash_block_size <= 0:
+        raise RuntimeError("vLLM BlockPool.hash_block_size must be a positive integer")
+    return hash_block_size
+
+
 def _convert_block_hashes(
     block_hashes: Any,
     hash_block_size: int,
@@ -610,6 +665,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
+                self.enable_caching = enable_caching
                 # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
@@ -1057,7 +1113,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return []
 
         elastic_block_pool_cls: type = ElasticBlockPool
-        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+        if self.detected_version and VersionRange(">=0.26.0,<0.30.0").contains(self.detected_version):
             from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
 
             elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
@@ -1659,6 +1715,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
         original_init = KVCacheCoordinator.__init__
         logger = self.logger  # Capture logger in closure
+        detected_version = self.detected_version
         use_mrv2_geometry = bool(
             self.detected_version
             and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version)
@@ -1714,6 +1771,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                     kv_cache_spec, block_size, attention_type=attention_type)
                 group_size = _get_group_size(kv_cache_config)
 
+            hash_block_size = _get_native_hash_block_size(
+                getattr(self, "block_pool", None), block_size, detected_version,
+            )
+
             from kvcached.integration.vllm import interfaces as kvi
 
             # EngineCore records tensor_parallel_size before constructing this
@@ -1745,15 +1806,6 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             block_pool_mod = importlib.import_module("vllm.v1.core.block_pool")
             ElasticBlockPool = getattr(block_pool_mod, "ElasticBlockPool")
 
-            # vLLM computes Request.block_hashes at a shared fine-grained size
-            # (normally the GCD of heterogeneous group block sizes). Preserve
-            # the value from the native pool before replacing it.
-            native_block_pool = getattr(self, "block_pool", None)
-            hash_block_size = getattr(
-                native_block_pool,
-                "hash_block_size",
-                getattr(self, "hash_block_size", block_size),
-            )
             self.block_pool = ElasticBlockPool(
                 kv_cache_config.num_blocks,
                 block_size,
@@ -1914,7 +1966,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         # Apply all applicable version-specific patches
-        success = True
+        success = self.patch_block_copy(gpumr_mod)
 
         # Execute all applicable methods for this version
         for method in self.applicable_methods:
@@ -1930,6 +1982,25 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 success = False
 
         return success
+
+    def patch_block_copy(self, gpumr_mod: types.ModuleType) -> bool:
+        """Keep native scheduling order, replacing only the V1 byte-copy helper."""
+        if not VersionRange(">=0.26.0").contains(self.detected_version or "0"):
+            return True
+        original = getattr(gpumr_mod, "copy_kv_cache_blocks_inplace", None)
+        if original is None or self._is_already_patched(original, "block_copy"):
+            return True
+
+        def _patched_copy(kv_caches, num_blocks, block_copies):
+            if not enable_kvcached():
+                return original(kv_caches, num_blocks, block_copies)
+            from kvcached.integration.vllm.interfaces import _copy_kv_cache_blocks
+
+            return _copy_kv_cache_blocks(kv_caches, num_blocks, block_copies)
+
+        self._mark_as_patched(_patched_copy, "block_copy")
+        setattr(gpumr_mod, "copy_kv_cache_blocks_inplace", _patched_copy)
+        return True
 
     @version_range(VLLM_ALL_RANGE)
     def patch_model_runner_init(self, GPUModelRunner) -> bool:
@@ -2381,6 +2452,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         if hasattr(GPUModelRunner, "_reshape_kv_cache_tensors_from_kvcached"):
             return True
 
+        use_mamba_pages = VersionRange(">=0.27.0").contains(self.detected_version or "0")
+        use_block_copy = VersionRange(">=0.26.0").contains(self.detected_version or "0")
+
         def _reshape_kv_cache_tensors_from_kvcached(
             self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any
         ):
@@ -2416,6 +2490,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                             "available from kvcached"
                         )
                     for pool_idx, layer_name in enumerate(bound_layer_names):
+                        if use_mamba_pages:
+                            kv_caches[layer_name] = _reshape_mamba_page_tensor(
+                                mamba_info, kv_cache_spec, pool_idx,
+                            )
+                            continue
                         if mamba_info.get("is_contiguous"):
                             state_tensors = _reshape_mamba_contiguous(
                                 mamba_info, kv_cache_spec, pool_idx,
@@ -2426,6 +2505,19 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                                 mamba_info["buffers"][pool_idx],
                                 kv_cache_spec, get_dtype_size,
                             )
+                        if use_block_copy:
+                            # 0.26 binds separate state views, but copies whole
+                            # logical blocks. Point every state at the same span.
+                            from kvcached.integration.vllm.interfaces import _set_block_copy_view
+
+                            contiguous = mamba_info.get("is_contiguous")
+                            backing = mamba_info["buffers"][0 if contiguous else pool_idx]
+                            block_bytes = (mamba_info["block_stride_bytes"] if contiguous
+                                           else mamba_info["page_size_bytes"])
+                            for state in state_tensors:
+                                _set_block_copy_view(
+                                    state, backing, mamba_info["num_blocks"], block_bytes,
+                                )
                         kv_caches[layer_name] = state_tensors  # type: ignore[assignment]
                 else:
                     for pool_idx, layer_name in enumerate(bound_layer_names):
@@ -2795,6 +2887,13 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 return original_determine(self, *args, **kwargs)
 
             cache_config = self.cache_config
+            if getattr(cache_config, "kv_cache_memory_bytes", None) is None:
+                # A native startup plan can select an explicit budget. Apply it
+                # before choosing the process-local profiling path; older vLLM
+                # releases do not expose this helper.
+                apply_plan = getattr(gpuworker_mod, "maybe_apply_startup_plan", None)
+                if apply_plan is not None:
+                    apply_plan(self)
             configured_budget = getattr(cache_config, "kv_cache_memory_bytes", None)
             if configured_budget is not None:
                 return original_determine(self, *args, **kwargs)
@@ -2877,12 +2976,65 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 cudagraph_memory_estimate,
                 available_memory,
             )
+            reserve_mm_memory = getattr(
+                gpuworker_mod, "reserve_mm_ipc_gpu_memory", None)
+            if reserve_mm_memory is not None:
+                # Match native return-time reservations without changing the
+                # pre-reservation field used by compile/warmup bookkeeping.
+                return reserve_mm_memory(
+                    available_memory,
+                    self.model_config.multimodal_config,
+                    getattr(self.parallel_config, "_api_process_count", 1),
+                )
             return available_memory
 
         self._mark_as_patched(
             _patched_determine_available_memory, "determine_available_memory"
         )
         Worker.determine_available_memory = _patched_determine_available_memory
+        return True
+
+
+class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
+    """Do not re-publish an old prompt boundary from a running Mamba state.
+
+    In 0.28/0.29 async decode, allocate_slots() can clamp cache publication
+    to the prompt length after the boundary's hash has moved to a CoW snapshot.
+    Registering the running source again queues another copy on the next step,
+    this time of an advanced state under the old hash. Keep the original
+    checkpoint position and skip only publication behind a running request's
+    scheduled position. Remote-KV completion and preempted replay still use
+    the native registration path.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.single_type_kv_cache_manager"
+    target_class = "MambaManager"
+    patch_name = "mamba_partial_tail"
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if not VersionRange(">=0.28.0,<0.30.0").contains(self.detected_version or "0"):
+            return False
+        manager = self._get_target_class(target_module)
+        original = getattr(manager, "_cache_partial_tail_block", None)
+        if original is None:
+            return False
+        if self._is_already_patched(original):
+            return True
+
+        from vllm.v1.request import RequestStatus
+
+        @wraps(original)
+        def cache_partial_tail(self, request, num_tokens):
+            if (enable_kvcached() and request.status == RequestStatus.RUNNING
+                    and num_tokens <= request.num_computed_tokens):
+                return None
+            return original(self, request, num_tokens)
+
+        self._mark_as_patched(cache_partial_tail)
+        manager._cache_partial_tail_block = cache_partial_tail
         return True
 
 
@@ -2937,21 +3089,38 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger
 
+        repair_native_retry = self.detected_version is not None and VersionRange(
+            ">=0.28.0,<0.30.0").contains(self.detected_version)
+
         def _patched_allocate_slots(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():
                 return original_allocate_slots(self, *args, **kwargs)
+            attempt = None
+            coordinator = getattr(self, "coordinator", None)
+            if repair_native_retry and coordinator is not None:
+                from kvcached.integration.vllm.allocation_attempt import AllocationAttempt
+
+                attempt = getattr(self, "_kvcached_allocation_attempt", None)
+                if attempt is None:
+                    attempt = AllocationAttempt(coordinator)
+                    self._kvcached_allocation_attempt = attempt
+                request = args[0] if args else kwargs["request"]
+                attempt.begin(request.request_id)
             try:
                 return original_allocate_slots(self, *args, **kwargs)
             except KVCachePoolExhausted as exhausted:
-                # None is the scheduler's own "cannot schedule this request
-                # now" path. Partially allocated blocks are released when the
-                # scheduler preempts or frees the request, so returning here
-                # does not strand them.
+                if attempt is not None:
+                    attempt.rollback()
+                # Waiting requests remain queued on None; the scheduler does
+                # not free their partially allocated blocks for us.
                 logger.warning(
                     "Shared physical KV pool is exhausted; reporting a "
                     "scheduling miss so the engine can preempt and retry: %s",
                     exhausted)
                 return None
+            finally:
+                if attempt is not None:
+                    attempt.end()
 
         self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
         KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]
