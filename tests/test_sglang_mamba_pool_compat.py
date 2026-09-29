@@ -258,6 +258,8 @@ def test_ctor_sets_attributes_inherited_methods_read(elastic_mamba_pool_cls):
     assert pool.enable_linear_replayssm_spec is False
     assert pool.replayssm_spec_fold is False
     assert pool.replayssm_write_pos is None
+    assert pool.replayssm_cache_base is None
+    assert pool.replayssm_is_flush is None
 
 
 def test_register_slot_state_refused(elastic_mamba_pool_cls):

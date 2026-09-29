@@ -1199,6 +1199,11 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     self.linear_replayssm_cache_len = linear_replayssm_cache_len
                     self.replayssm_is_kda = False
                     self.replayssm_write_pos = None
+                    # The native init leaves the spec-verify ring as None when
+                    # the feature is off, and HybridReqToTokenPool.alloc on
+                    # 0.5.16-0.5.19 reads it for every new request.
+                    self.replayssm_cache_base = None
+                    self.replayssm_is_flush = None
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
