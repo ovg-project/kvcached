@@ -26,6 +26,7 @@ from typing import Any, Dict
 import pytest
 import torch
 
+import kvcached.integration.sglang as kvcached_sglang
 from kvcached.integration.sglang.patches import ElasticMambaPoolPatch
 
 
@@ -81,6 +82,16 @@ def _install_fake_sglang_distributed(monkeypatch, tp_rank=0, tp_size=1,
         monkeypatch.setitem(sys.modules, name, module)
 
 
+def _install_interfaces_module(monkeypatch, kvi):
+    """``import kvcached.integration.sglang.interfaces as kvi`` resolves the
+    last name through the parent package's attribute, so a real module that
+    another test file imported earlier would win over a sys.modules entry."""
+    monkeypatch.setitem(
+        sys.modules, "kvcached.integration.sglang.interfaces", kvi
+    )
+    monkeypatch.setattr(kvcached_sglang, "interfaces", kvi, raising=False)
+
+
 def _install_fake_interfaces(monkeypatch, record):
     kvi: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
 
@@ -109,9 +120,7 @@ def _install_fake_interfaces(monkeypatch, record):
     kvi.init_kvcached = init_kvcached
     kvi.alloc_mamba_states = alloc_mamba_states
     kvi.get_kv_cache_manager = get_kv_cache_manager
-    monkeypatch.setitem(
-        sys.modules, "kvcached.integration.sglang.interfaces", kvi
-    )
+    _install_interfaces_module(monkeypatch, kvi)
 
 
 def _make_memory_pool_module():
@@ -306,6 +315,24 @@ def test_ctor_is_isolated_from_installed_sglang(monkeypatch):
     }
 
 
+def test_ctor_ignores_real_interfaces_left_on_parent_package(monkeypatch):
+    """A test file that imports the real interfaces module leaves it on the
+    parent package; the constructor must still reach the test's fake."""
+    stale = types.ModuleType("kvcached.integration.sglang.interfaces")
+    monkeypatch.setattr(kvcached_sglang, "interfaces", stale, raising=False)
+
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_distributed(monkeypatch)
+    record: Dict[str, Any] = {}
+    _install_fake_interfaces(monkeypatch, record)
+    module = _make_memory_pool_module()
+    _apply_patch(monkeypatch, module, "0.5.20")
+
+    module.ElasticMambaPool(**_mamba_pool_kwargs())
+
+    assert "alloc_mamba_states" in record
+
+
 class _Native0520MambaPool:
     """CPU port of the SGLang 0.5.20 native MambaPool methods the elastic
     class inherits (memory_pool.py at v0.5.20): clear_slots' non-fused
@@ -465,9 +492,7 @@ def elastic_state_pool_factory(monkeypatch):
 
         kvi.alloc_mamba_states = alloc_mamba_states
         kvi.get_kv_cache_manager = lambda **kwargs: FakeManager()
-        monkeypatch.setitem(
-            sys.modules, "kvcached.integration.sglang.interfaces", kvi
-        )
+        _install_interfaces_module(monkeypatch, kvi)
 
         module: Any = types.ModuleType("sglang.srt.mem_cache.memory_pool")
         module.MambaPool = _Native0520MambaPool
