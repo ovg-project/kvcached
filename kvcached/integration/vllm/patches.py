@@ -1168,6 +1168,15 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                             "kvcached on vLLM 0.29 requires Model Runner V2; "
                             "use a supported configuration or disable kvcached"
                         )
+                # OffloadingConnector (--kv-offloading-size) makes vLLM allocate
+                # a cross-layer KV cache that bypasses kvcached (issue #267).
+                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
+                    raise KVCachedConfigError(
+                        "kvcached does not support vLLM CPU KV offloading "
+                        "(OffloadingConnector, --kv-offloading-size); "
+                        "remove --kv-offloading-size or disable kvcached"
+                    )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)

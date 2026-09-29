@@ -359,3 +359,47 @@ def test_engine_core_rejects_partial_integration_before_initialization(
         EngineCore(config)
         assert initialize.call_count == int(enabled)
         original_init.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "connector,enabled,reject",
+    [
+        ("OffloadingConnector", True, True),
+        ("OffloadingConnector", False, False),
+        ("NixlConnector", True, False),
+        (None, True, False),
+    ],
+)
+def test_engine_core_rejects_kv_offloading_before_initialization(
+    monkeypatch, vllm_modules, connector, enabled, reject
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = "0.20.2"
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1,
+        ),
+        kv_transfer_config=(
+            None if connector is None else types.SimpleNamespace(kv_connector=connector)
+        ),
+    )
+    if reject:
+        with pytest.raises(patches.KVCachedConfigError, match="--kv-offloading-size"):
+            EngineCore(config)
+        initialize.assert_not_called()
+        original_init.assert_not_called()
+    else:
+        EngineCore(config)
+        assert initialize.call_count == int(enabled)
+        original_init.assert_called_once()
