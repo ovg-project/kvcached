@@ -279,6 +279,13 @@ def test_paged_free_page_ids_empty_is_noop(alloc_mod):
     assert manager.free_calls == []
 
 
+def test_paged_sets_debug_mode_like_native(alloc_mod, monkeypatch):
+    monkeypatch.delenv("SGLANG_DEBUG_MEMORY_POOL", raising=False)
+    assert _make_paged_allocator(alloc_mod).debug_mode is False
+    monkeypatch.setenv("SGLANG_DEBUG_MEMORY_POOL", "1")
+    assert _make_paged_allocator(alloc_mod).debug_mode is True
+
+
 def test_paged_group_defers_page_ids_and_token_indices(alloc_mod):
     allocator = _make_paged_allocator(alloc_mod)
     manager = allocator.kvcached_allocator

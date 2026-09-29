@@ -8,6 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import functools
 import inspect
 import math
+import os
 import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
@@ -350,6 +351,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    # The native PagedTokenToKVPoolAllocator init sets this, and
+                    # 0.5.20's SWA allocator reads it on every free at
+                    # page_size > 1.
+                    self.debug_mode = os.getenv(
+                        "SGLANG_DEBUG_MEMORY_POOL", "false").lower() in ("true", "1")
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
                         f"page_size={page_size}"
