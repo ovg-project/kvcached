@@ -144,7 +144,6 @@ pip install kvcached --no-build-isolation
 # under the project root folder
 
 pip install -e . --no-build-isolation --no-cache-dir
-python tools/dev_copy_pth.py
 ```
 
 ### Using Docker
