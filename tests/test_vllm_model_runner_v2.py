@@ -276,12 +276,13 @@ def test_mixed_packing_rejects_incompatible_physical_placement(monkeypatch):
         adapter.cache_geometry(config)
 
 
-def test_mixed_packing_retains_native_kernel_split_rejection(monkeypatch):
-    mock_native_allocator(monkeypatch, True)
-    with pytest.raises(ValueError, match="cannot be split"):
+def test_mixed_packing_rejects_kernel_split_before_allocating(monkeypatch):
+    captured = mock_native_allocator(monkeypatch, True)
+    with pytest.raises(adapter.KVCachedConfigError, match="KVCACHED_CONTIGUOUS_LAYOUT=false"):
         adapter.allocate_kv_cache(
             mixed_config("BLNHC"), torch.device("cpu"), KVCacheLayout.BLNHC, [1, 2],
         )
+    assert captured == []
 
 
 def test_profile_and_failed_initialization_do_not_leak_persistent_scope(monkeypatch):

@@ -146,6 +146,33 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
     allowed = ("BLNHC", "BLHNC") if CONTIGUOUS_LAYOUT else ("LBNHC", "LBHNC")
     if layout.name not in allowed:
         raise KVCachedConfigError(f"KV layout {layout.name} is incompatible with kvcached {allowed}")
+    placements = []
+    for tensor in config.kv_cache_tensors:
+        group_id, group = next(
+            (index, group)
+            for index, group in enumerate(config.kv_cache_groups)
+            if tensor.layers[0] in group.layer_names
+        )
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.kv_cache_specs[tensor.layers[0]]
+        kernel_size = kernel_block_sizes[group_id] if kernel_block_sizes is not None else None
+        # vLLM cannot split a block into kernel blocks in a block-major layout,
+        # the only kind the contiguous layout can use. Fail here instead of
+        # letting vLLM raise a layout error that never mentions kvcached and
+        # suggests fixes the contiguous layout cannot take.
+        if (CONTIGUOUS_LAYOUT and kernel_size is not None
+                and kernel_size != spec.block_size
+                and tensor.block_stride != spec.page_size_bytes):
+            raise KVCachedConfigError(
+                f"vLLM cannot split {spec.block_size}-token blocks into the "
+                f"{kernel_size}-token kernel blocks this attention backend reads when the "
+                f"KV layout is {layout.name}, and kvcached's contiguous layout requires "
+                f"{layout.name}. Set KVCACHED_CONTIGUOUS_LAYOUT=false to use a layer-compact "
+                f"layout, or pick an attention backend that accepts {spec.block_size}-token "
+                "blocks (e.g. --attention-backend TRITON_ATTN)."
+            )
+        placements.append((tensor, spec, kernel_size))
     per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
     per_pool_bytes = per_pool_bytes // PAGE_SIZE * PAGE_SIZE
     if config.num_blocks * geometry.page_bytes > per_pool_bytes:
@@ -160,16 +187,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
     )
 
     caches: dict[str, Any] = {}
-    for tensor in config.kv_cache_tensors:
-        group_id, group = next(
-            (index, group)
-            for index, group in enumerate(config.kv_cache_groups)
-            if tensor.layers[0] in group.layer_names
-        )
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.kv_cache_specs[tensor.layers[0]]
-        kernel_size = kernel_block_sizes[group_id] if kernel_block_sizes is not None else None
+    for tensor, spec, kernel_size in placements:
         if CONTIGUOUS_LAYOUT:
             views = create_kv_cache_views(
                 raw[0], spec, config.num_blocks, layout, tensor, kernel_size
