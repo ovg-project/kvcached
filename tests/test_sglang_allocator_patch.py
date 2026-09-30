@@ -26,9 +26,17 @@ class FakeTensor:
             return self.shape[0]
         return len(self.data)
 
-
 class FakeKVCachedAllocator:
+    def __init__(self):
+        self.alloc_calls = []
+        self.packed_calls = []
+
     def alloc(self, num_pages):
+        self.alloc_calls.append(num_pages)
+        return list(range(num_pages))
+
+    def alloc_packed(self, num_pages):
+        self.packed_calls.append(num_pages)
         return list(range(num_pages))
 
 class FakeKVCache:
@@ -53,7 +61,10 @@ class FakeTritonKernel:
         self.calls = []
 
     def __getitem__(self, grid):
-        def launch(**kwargs):
+        def launch(*args, **kwargs):
+            if args:
+                self.calls.append({"grid": grid, "args": args, "kwargs": kwargs})
+                return
             expected_names = tuple(inspect.signature(self.fn).parameters)
             if set(kwargs) != set(expected_names):
                 missing = set(expected_names) - set(kwargs)
@@ -279,6 +290,47 @@ def test_alloc_extend_kernel(
     )
     if "max_num_extend_tokens" in kwargs:
         assert kwargs["max_num_extend_tokens"] == 8
+
+
+def test_paged_decode_uses_packed_allocation(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    setattr(sys.modules["sglang.srt.utils"], "get_num_new_pages", lambda **kwargs: 2)
+    alloc_mod = _make_allocator_module(
+        FakeTritonKernel(
+            FakeKernelFn(
+                (
+                    "pre_lens_ptr",
+                    "seq_lens_ptr",
+                    "last_loc_ptr",
+                    "free_page_ptr",
+                    "out_indices",
+                    "bs_upper",
+                    "page_size",
+                )
+            )
+        )
+    )
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+
+    kv_cache = FakeKVCache()
+    allocator = alloc_mod.ElasticPagedTokenToKVPoolAllocator(
+        size=64,
+        page_size=4,
+        dtype=object(),
+        device="cuda:0",
+        kvcache=kv_cache,
+    )
+    seq_lens = FakeTensor(shape=(3,))
+    allocator.alloc_decode(
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        last_loc=FakeTensor(shape=(3,)),
+    )
+
+    assert kv_cache.kvcached_allocator.alloc_calls == []
+    assert kv_cache.kvcached_allocator.packed_calls == [2]
 
 
 def test_swa_allocator_uses_elastic_sub_allocators(monkeypatch):
