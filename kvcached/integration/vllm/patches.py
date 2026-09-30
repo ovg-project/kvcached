@@ -2995,6 +2995,82 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
+    """Grow a hybrid attention block so its KV unit tiles kvcached's page.
+
+    vLLM's _align_hybrid_block_size picks the smallest attention block whose
+    page covers a mamba state and pads the state to that page. The resulting
+    unit (e.g. 784 tokens x 4096 B = 3,211,264 B for Qwen3.8-27B) generally does
+    not divide kvcached's page, so blocks straddle page boundaries: straddling
+    blocks are unusable and, when the unit exceeds half a page, some pages hold
+    no block at all. vLLM keeps any block size at least as large as the one it
+    requires and pads the state to it, so choose the smallest such block whose
+    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). A block size
+    given by the user is kept; the page geometry check then reports it.
+    """
+    from kvcached.kv_geometry import aligned_block_size
+    from kvcached.utils import PAGE_SIZE
+
+    padded = getattr(cache_config, "mamba_page_size_padded", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if not padded or not block_size or padded % block_size:
+        return
+    if PAGE_SIZE % padded == 0:
+        return
+    if (getattr(cache_config, "user_specified_block_size", False)
+            or getattr(cache_config, "user_specified_mamba_block_size", False)):
+        return
+    bytes_per_token = padded // block_size
+    aligned = aligned_block_size(block_size, bytes_per_token, PAGE_SIZE)
+    if aligned is None or aligned == block_size:
+        return
+    cache_config.block_size = aligned
+    if getattr(cache_config, "mamba_cache_mode", None) in ("align", "all"):
+        cache_config.mamba_block_size = aligned
+    cache_config.mamba_page_size_padded = aligned * bytes_per_token
+    logger.info(
+        "Setting attention block size to %d tokens (was %d) so the KV unit "
+        "(%d bytes) tiles the %d-byte kvcached page",
+        aligned, block_size, aligned * bytes_per_token, PAGE_SIZE)
+
+
+class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
+    """Choose hybrid attention block sizes whose KV unit tiles kvcached pages."""
+
+    library = "vllm"
+    target_module = "vllm.platforms.interface"
+    target_class = "Platform"
+    patch_name = "hybrid_block_size_align"
+
+    def apply(self, platform_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        platform = self._get_target_class(platform_mod)
+        if platform is None:
+            return False
+        raw = platform.__dict__.get("_align_hybrid_block_size")
+        if raw is None:
+            # Releases without this hook: the page geometry check still
+            # rejects unusable geometries at startup.
+            self.logger.debug("Platform._align_hybrid_block_size not found")
+            return True
+        original = raw.__func__ if isinstance(raw, classmethod) else raw
+        if self._is_already_patched(original):
+            return True
+        logger = self.logger
+
+        @wraps(original)
+        def align_hybrid_block_size(cls, vllm_config, *args: Any, **kwargs: Any):
+            result = original(cls, vllm_config, *args, **kwargs)
+            if enable_kvcached():
+                _align_block_size_to_kvcached_page(vllm_config.cache_config, logger)
+            return result
+
+        self._mark_as_patched(align_hybrid_block_size)
+        platform._align_hybrid_block_size = classmethod(align_hybrid_block_size)
+        return True
+
+
 class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
     """Do not re-publish an old prompt boundary from a running Mamba state.
 
