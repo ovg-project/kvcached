@@ -8,6 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import functools
 import inspect
 import math
+import os
 import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
@@ -30,6 +31,39 @@ logger = get_kvcached_logger()
 def _is_supported_gpu_device(device: str) -> bool:
     device_str = str(device).lower()
     return device_str.startswith("cuda") or device_str.startswith("hip")
+
+
+def _sglang_free_immediately(allocator: Any) -> bool:
+    """True when a free should release memory now instead of joining a group.
+
+    SGLang up to 0.5.18 tracks free-group state with an
+    ``is_not_in_free_group`` flag next to an always-present ``free_group``
+    list; 0.5.19 removed the flag and made ``free_group is None`` the
+    not-in-group sentinel.
+    """
+    flag = getattr(allocator, "is_not_in_free_group", None)
+    if flag is not None:
+        return bool(flag)
+    return allocator.free_group is None
+
+
+def _sglang_free_group_copy(allocator: Any, free_index: Any) -> Any:
+    """Deferred tensors are cloned on SGLang 0.5.19+ so a caller cannot
+    mutate a queued view before the group flushes; older releases defer the
+    tensor as passed."""
+    copy_for_free_group = getattr(allocator, "_copy_for_free_group", None)
+    if copy_for_free_group is not None:
+        return copy_for_free_group(free_index)
+    return free_index
+
+
+def _sglang_reset_free_group(allocator: Any) -> None:
+    """Reset free-group state to not-in-group under either protocol."""
+    if hasattr(allocator, "is_not_in_free_group"):
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+    else:
+        allocator.free_group = None
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -294,18 +328,29 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def free(self, free_index):
-                    if self.is_not_in_free_group:
+                    if _sglang_free_immediately(self):
                         try:
                             indices: list[int] = free_index.cpu().numpy().tolist()
                         except Exception:
                             indices = list(free_index)
                         return self.kvcached_allocator.free(indices)
                     else:
-                        self.free_group.append(free_index)
+                        self.free_group.append(
+                            _sglang_free_group_copy(self, free_index)
+                        )
+
+                def free_page_ids(self, page_ids):
+                    # SGLang 0.5.20's SWA composite frees sub-allocator pages
+                    # through free_page_ids().  With page_size == 1 page ids
+                    # are token ids, mirroring the native token allocator.
+                    if page_ids.numel() == 0:
+                        return
+                    self.free(page_ids)
 
                 def clear(self):
                     if hasattr(self, "kvcached_allocator"):
                         self.kvcached_allocator.clear()
+                    _sglang_reset_free_group(self)
 
             setattr(alloc_mod, "ElasticTokenToKVPoolAllocator", ElasticTokenToKVPoolAllocator)
             return True
@@ -373,6 +418,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    # The native PagedTokenToKVPoolAllocator init sets this, and
+                    # 0.5.20's SWA allocator reads it on every free at
+                    # page_size > 1.
+                    self.debug_mode = os.getenv(
+                        "SGLANG_DEBUG_MEMORY_POOL", "false").lower() in ("true", "1")
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
                         f"page_size={page_size}"
@@ -380,6 +430,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # Base class expects these tensors for backup_state / free_group_end
                     self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+                    # SGLang 0.5.20 defers page-id frees in a group separate
+                    # from token-index frees; see free_page_ids().
+                    self.free_page_ids_group: List[Any] = []
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size() * self.page_size
@@ -492,7 +545,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if free_index.numel() == 0:
                         return
 
-                    if self.is_not_in_free_group:
+                    if _sglang_free_immediately(self):
                         page_ids = torch.unique(free_index // self.page_size)
                         try:
                             indices: list[int] = page_ids.cpu().numpy().tolist()
@@ -500,7 +553,40 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices = list(page_ids)
                         return self.kvcached_allocator.free(indices)
                     else:
-                        self.free_group.append(free_index)
+                        self.free_group.append(
+                            _sglang_free_group_copy(self, free_index)
+                        )
+
+                def free_page_ids(self, page_ids):
+                    # SGLang 0.5.20's paged allocator and SWA composite free
+                    # exact page ids through this method, with no dedup and
+                    # no index-to-page reduction.  kvcached block ids equal
+                    # SGLang page ids, so the ids release directly; inside a
+                    # free group they wait in free_page_ids_group, mirroring
+                    # the native deferral.
+                    if page_ids.numel() == 0:
+                        return
+                    if _sglang_free_immediately(self):
+                        try:
+                            ids: list[int] = page_ids.cpu().numpy().tolist()
+                        except Exception:
+                            ids = list(page_ids)
+                        return self.kvcached_allocator.free(ids)
+                    else:
+                        self.free_page_ids_group.append(
+                            _sglang_free_group_copy(self, page_ids)
+                        )
+
+                def free_group_begin(self):
+                    super().free_group_begin()
+                    self.free_page_ids_group = []
+
+                def free_group_end(self):
+                    super().free_group_end()
+                    if self.free_page_ids_group:
+                        page_ids_group = self.free_page_ids_group
+                        self.free_page_ids_group = []
+                        self.free_page_ids(torch.cat(page_ids_group))
 
                 def clear(self):
                     if hasattr(self, "kvcached_allocator"):
@@ -511,8 +597,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.release_pages = torch.empty(
                         (0,), dtype=torch.int64, device=self.device
                     )
-                    self.is_not_in_free_group = True
-                    self.free_group = []
+                    self.free_page_ids_group = []
+                    _sglang_reset_free_group(self)
 
                 def merge_and_sort_free(self):
                     pass  # No-op: kvcached manages the free list
@@ -642,6 +728,17 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     *args,
                     **kwargs,
                 ) -> None:
+                    if kwargs.get("post_capture_active"):
+                        # SGLang 0.5.16+ post-capture sizing reserves VA-only
+                        # buffers and later finalizes backing through its own
+                        # VMM owner, which the elastic buffer override never
+                        # creates.  Refuse instead of half-running.
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool does not support SGLang "
+                            "post-capture KV sizing. Unset "
+                            "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING or disable "
+                            "kvcached (ENABLE_KVCACHED=false)."
+                        )
                     # Assign group_id BEFORE super().__init__() because it
                     # calls _create_buffers() which needs self._group_id.
                     self._group_id = ElasticMHATokenToKVPool._next_group_id
@@ -984,6 +1081,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
         success = self.inject_elastic_mamba_pool(mem_pool_mod)
         if success:
             success &= self.alias_mamba_pool_to_elastic(mem_pool_mod)
+        if success and self.rebind_hybrid_mamba_pool_cls in self.applicable_methods:
+            success &= self.rebind_hybrid_mamba_pool_cls(mem_pool_mod)
         if success and self.patch_mamba_slot_allocator in self.applicable_methods:
             success &= self.patch_mamba_slot_allocator(mem_pool_mod)
         return success
@@ -1109,6 +1208,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     enable_linear_replayssm: bool = False,
                     linear_replayssm_cache_len: int = 16,
                     envelope_layout: bool = False,
+                    enable_gdn_replayssm_spec: bool = False,
+                    enable_linear_replayssm_spec: bool = False,
                 ) -> None:
                     import kvcached.integration.sglang.interfaces as kvi
 
@@ -1121,6 +1222,16 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         raise NotImplementedError(
                             "ElasticMambaPool uses the kvcached mamba state "
                             "layout and does not support SGLang envelope_layout."
+                        )
+                    # SGLang 0.5.16 passes enable_gdn_replayssm_spec and
+                    # 0.5.17 renamed it to enable_linear_replayssm_spec.  The
+                    # spec-verify replay ring is allocated by the native init
+                    # this class skips, so accept the kwargs but refuse the
+                    # feature.
+                    if enable_gdn_replayssm_spec or enable_linear_replayssm_spec:
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support SGLang "
+                            "ReplaySSM speculative verification buffers yet."
                         )
 
                     # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
@@ -1161,6 +1272,11 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     self.linear_replayssm_cache_len = linear_replayssm_cache_len
                     self.replayssm_is_kda = False
                     self.replayssm_write_pos = None
+                    # The native init leaves the spec-verify ring as None when
+                    # the feature is off, and HybridReqToTokenPool.alloc on
+                    # 0.5.16-0.5.19 reads it for every new request.
+                    self.replayssm_cache_base = None
+                    self.replayssm_is_flush = None
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
@@ -1174,6 +1290,22 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                             "count: pass mamba_layer_ids or ensure "
                             "cache_params.layers is set.")
                     self.num_mamba_layers = num_mamba_layers
+                    # Attributes the native init sets and inherited methods
+                    # read on 0.5.16+: the transfer iterator walks
+                    # mamba_layer_ids with conv_slice_axis /
+                    # conv_shard_groups, copy_from checks debug_memory_pool,
+                    # and the replayssm-spec flags mirror the refusals above.
+                    self.mamba_layer_ids = layer_ids
+                    self.debug_memory_pool = False
+                    self.enable_linear_replayssm_spec = False
+                    self.replayssm_spec_fold = False
+                    shape_params = getattr(cache_params, "shape", None)
+                    self.conv_shard_groups = getattr(
+                        shape_params, "conv_shard_groups", None
+                    )
+                    self.conv_slice_axis = getattr(
+                        shape_params, "conv_slice_axis", 0
+                    )
 
                     # Slot 0 is the padded dummy slot; kvcached reserves it
                     # via reserve_null_block.
@@ -1316,6 +1448,36 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 def clear(self) -> None:
                     self.kvcached_allocator.clear()
 
+                def register_slot_state(self, state: Any) -> None:
+                    # SGLang 0.5.20 attaches Qwen4-Exp PLE side states
+                    # (ShortConvPool / NGramPool) that must follow every slot
+                    # clear, copy, and host round-trip.  The elastic pool
+                    # does not implement that ride-along yet, so refuse
+                    # instead of dropping sibling state silently.
+                    raise NotImplementedError(
+                        "ElasticMambaPool does not support SGLang PLE "
+                        "slot-sibling states (register_slot_state) yet."
+                    )
+
+                def clear_slots(self, indices: "torch.Tensor") -> None:
+                    # 0.5.20's deferred COW/clear on the extend path
+                    # (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear)
+                    # calls this; the native body indexes (layers, slots, *)
+                    # tensors, which on per-layer state would zero the wrong
+                    # axis of layer 0 and miss every other layer.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "clear_slots"):
+                            super().clear_slots(indices)
+                    else:
+                        # Per-layer state is (slots, *shape); index the slot
+                        # dim directly.  No _slot_siblings pass here:
+                        # register_slot_state refuses, so none can exist.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[indices] = 0
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[indices] = 0
+
                 def copy_from(
                     self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
                 ) -> None:
@@ -1329,24 +1491,56 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         for t in self.mamba_cache.temporal_per_layer:
                             t[dst_index] = t[src_index]
 
+                def _iter_transfer_state_entries(self):
+                    # The 0.5.20 PD-transfer readers (get_state_layer_ids,
+                    # get_state_slice_outer_counts,
+                    # get_state_conv_shard_groups) all walk this iterator,
+                    # whose native body expects (layers, slots, *) tensors
+                    # in vars(mamba_cache) and chokes on the nested
+                    # conv_per_layer list.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "_iter_transfer_state_entries"):
+                            yield from super()._iter_transfer_state_entries()
+                    else:
+                        # Same flattening as the contiguous iterator: conv
+                        # shape groups outer, layer inner, temporal last.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            if shape_list[0].numel() == 0:
+                                continue
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "conv",
+                                    shape_list[layer_index],
+                                    self.conv_slice_axis,
+                                    layer_id,
+                                )
+                        temporal_list = self.mamba_cache.temporal_per_layer
+                        if temporal_list[0].numel() > 0:
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "temporal",
+                                    temporal_list[layer_index],
+                                    0,
+                                    layer_id,
+                                )
+
                 def get_contiguous_buf_infos(self):
                     if self._is_contiguous:
                         if hasattr(MambaPool, "get_contiguous_buf_infos"):
                             return super().get_contiguous_buf_infos()
                     else:
-                        # Non-contiguous: per-layer pointer/length triples
-                        # in (state_kind_outer, layer_inner) order.
+                        # Non-contiguous: per-layer pointer/length triples,
+                        # aligned with the transfer iterator by sharing it.
                         data_ptrs: List[int] = []
                         data_lens: List[int] = []
                         item_lens: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            for layer_t in state_list:
-                                data_ptrs.append(layer_t.data_ptr())
-                                data_lens.append(layer_t.nbytes)
-                                item_lens.append(layer_t[0].nbytes)
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, _, _ in entries:
+                            data_ptrs.append(layer_t.data_ptr())
+                            data_lens.append(layer_t.nbytes)
+                            item_lens.append(layer_t[0].nbytes)
                         return data_ptrs, data_lens, item_lens
 
                 def get_state_dim_per_tensor(self):
@@ -1354,15 +1548,19 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         if hasattr(MambaPool, "get_state_dim_per_tensor"):
                             return super().get_state_dim_per_tensor()
                     else:
-                        # Per-layer state shape is (slots, sliceable_dim, ...);
-                        # the sliceable dimension is at index 1 (post-slot).
+                        # Per-layer state shape is (slots, ...); the native
+                        # reader takes shape[1 + slice_axis] (Kimi conv state
+                        # slices its second per-slot axis) and 0 marks a
+                        # replicated tensor that PD copies whole.
                         dim_per_tensor: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            sliceable_dim = state_list[0].shape[1]
-                            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, slice_axis, _ in entries:
+                            if slice_axis is None:
+                                dim_per_tensor.append(0)
+                                continue
+                            dim_per_tensor.append(
+                                layer_t.shape[1 + slice_axis]
+                            )
                         return dim_per_tensor
 
             setattr(mem_pool_mod, "ElasticMambaPool", ElasticMambaPool)
@@ -1388,6 +1586,38 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias MambaPool to elastic one: {e}")
             return False
+
+    @version_range(">=0.5.16")
+    def rebind_hybrid_mamba_pool_cls(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Route ``HybridReqToTokenPool``'s Mamba pool construction to the
+        elastic class.
+
+        SGLang 0.5.16 made the pool class a ``mamba_pool_cls`` class
+        attribute, which captured the native ``MambaPool`` when the module
+        executed, before any aliasing ran.  The module-attribute alias no
+        longer routes construction there: without the rebind, mamba state
+        silently reverts to static native allocation and the slot-allocator
+        wrap below no-ops because the pool lacks ``kvcached_allocator``.
+        """
+        HybridReqToTokenPool = getattr(mem_pool_mod, "HybridReqToTokenPool", None)
+        if HybridReqToTokenPool is None:
+            self.logger.debug(
+                "HybridReqToTokenPool not found; skipping mamba_pool_cls rebind"
+            )
+            return True
+        if not hasattr(HybridReqToTokenPool, "mamba_pool_cls"):
+            self.logger.debug(
+                "HybridReqToTokenPool has no mamba_pool_cls; skipping rebind"
+            )
+            return True
+
+        ElasticMambaPool = getattr(mem_pool_mod, "ElasticMambaPool", None)
+        if ElasticMambaPool is None:
+            # Injection was skipped (no native MambaPool to subclass).
+            return True
+
+        HybridReqToTokenPool.mamba_pool_cls = ElasticMambaPool
+        return True
 
     @version_range(">=0.5.13")
     def patch_mamba_slot_allocator(self, mem_pool_mod: types.ModuleType) -> bool:
