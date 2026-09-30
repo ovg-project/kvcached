@@ -706,6 +706,18 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
         try:
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
+            # SGLang 0.5.16 split _create_buffers() into
+            # _create_buffers_normal() (the plain allocation stage) plus a
+            # tail that builds _kv_buffer_descs, which PD transfer
+            # (prefill-decode disaggregation) registers buffers from, and
+            # the data_ptrs/data_strides tensors the speculative-decode kv
+            # copy reads. Replacing _create_buffers() wholesale skips that
+            # tail, so on the split layout we override the inner stage and
+            # let the native tail run over the elastic buffers. Detect the
+            # split by presence rather than version so source builds
+            # without version metadata route the same way.
+            has_buffer_seam = hasattr(MHATokenToKVPool, "_create_buffers_normal")
+
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
                 # Auto-incrementing group_id so that each pool instance
                 # (e.g., full-attention pool and SWA pool in SWAKVPool)
@@ -783,11 +795,24 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.mem_usage = (k_size + v_size) / BYTES_PER_GB
 
-                def _create_buffers(self):
+                def _create_buffers_elastic(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # kvcached backs NHD rows, one (head_num, head_dim) row
+                    # per token slot. HND and the ROCm vectorized layouts
+                    # reshape the buffers, so refuse them instead of serving
+                    # NHD-shaped memory under another layout's label.
+                    kv_cache_layout = getattr(self, "kv_cache_layout", "nhd")
+                    if getattr(self, "use_hnd", False) or kv_cache_layout != "nhd":
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool only supports the NHD "
+                            f"KV cache layout, got {kv_cache_layout!r}. Unset "
+                            "SGLANG_USE_HND_KVCACHE or the kv_cache_layout "
+                            "override, or disable kvcached "
+                            "(ENABLE_KVCACHED=false).")
+
                     # Resolve TP rank and size for IPC socket registration.
-                    # SGLang workers each call _create_buffers() independently,
+                    # SGLang workers each call this independently,
                     # so we query the distributed state at this point (which is
                     # guaranteed to be initialised by the time buffers are created).
                     try:
@@ -833,6 +858,108 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         ),
                     )
                     self.k_buffer, self.v_buffer = _kv_mha
+
+                if has_buffer_seam:
+                    # 0.5.16+: native _create_buffers() keeps running. Its
+                    # non-quantized branch pins k/v_scale_buffer and
+                    # dq_k/dq_v_buffer to None before dispatching here, and
+                    # its tail builds _kv_buffer_descs from the elastic
+                    # buffers. The pointer-table part of the tail is
+                    # guarded below: it is only valid when every K/V view
+                    # is independently contiguous.
+                    def _create_buffers_normal(self):
+                        self._create_buffers_elastic()
+
+                    def _create_quantized_buffers(self):
+                        # The native dispatch routes here when a quantized
+                        # KV cache recipe (quant_method) is configured. The
+                        # recipe would allocate native torch buffers outside
+                        # kvcached while the elastic allocator keeps
+                        # tracking the pool, so refuse instead of
+                        # half-running.
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool does not support "
+                            "quantized KV cache recipes (quant_method). "
+                            "Disable kvcached (ENABLE_KVCACHED=false) to "
+                            "use a quantized KV cache.")
+
+                    def _kv_buffers_independently_contiguous(self):
+                        # The per-layer FTensor layout
+                        # (KVCACHED_CONTIGUOUS_LAYOUT=false) hands out
+                        # dense per-layer views, while the default
+                        # contiguous layout interleaves all layers and K/V
+                        # in one (tokens, layers, 2, heads, dim) buffer,
+                        # so each view's token stride spans every layer.
+                        return all(
+                            t.is_contiguous()
+                            for t in (*self.k_buffer, *self.v_buffer))
+
+                    def _init_data_ptrs_and_strides(self):
+                        # The native tables store one scalar per buffer,
+                        # prod(shape[1:]) * itemsize, and every consumer
+                        # (the Triton copy kernel in
+                        # kernels/ops/kvcache/cache_move.py) uses that
+                        # scalar both as the token-address pitch and as
+                        # the bytes to copy. That only holds when rows are
+                        # independently contiguous; publishing the tables
+                        # for interleaved views would make the kernel walk
+                        # and overwrite unrelated bytes. Leave them unset
+                        # instead so an unexpected consumer fails with
+                        # AttributeError, matching pre-0.5.16 elastic
+                        # pools, which never had them.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_data_ptrs_and_strides()
+
+                    def _init_kv_copy_and_warmup(self):
+                        # The warmup launches the copy kernel over the
+                        # pointer tables, which the interleaved layout
+                        # does not publish; move_kv_cache below covers
+                        # that layout without the kernel.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_kv_copy_and_warmup()
+                        else:
+                            self._kv_copy_config = None
+
+                    def _move_kv_cache_impl(self, tgt_loc, src_loc):
+                        # Native move strategy hook (the base
+                        # move_kv_cache already did the OOB checks). For
+                        # interleaved views, advanced indexing on the
+                        # views walks the real strides, mirroring the
+                        # native move_kv_cache_native fallback; scale
+                        # buffers cannot exist here because quantized
+                        # recipes are refused above.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._move_kv_cache_impl(tgt_loc, src_loc)
+                            return
+                        if tgt_loc.numel() == 0:
+                            return
+                        tgt = tgt_loc.view(-1).long()
+                        src = src_loc.view(-1).long()
+                        for k_cache, v_cache in zip(self.k_buffer,
+                                                    self.v_buffer):
+                            k_cache[tgt] = k_cache[src]
+                            v_cache[tgt] = v_cache[src]
+
+                    def get_contiguous_buf_infos(self):
+                        # PD transfer registers [ptr, ptr + len) per layer
+                        # and walks pages at ptr + page * item_len, which
+                        # has no valid answer when the layers interleave
+                        # within every token row.
+                        if self._kv_buffers_independently_contiguous():
+                            return super().get_contiguous_buf_infos()
+                        raise NotImplementedError(
+                            "the interleaved elastic KV layout has no "
+                            "per-layer contiguous regions, so PD transfer "
+                            "cannot register it. Use the per-layer layout "
+                            "(KVCACHED_CONTIGUOUS_LAYOUT=false) or "
+                            "disable kvcached (ENABLE_KVCACHED=false) "
+                            "for disaggregation.")
+                else:
+                    # Before 0.5.16 _create_buffers() is a single stage
+                    # (any pointer derivation is inlined after allocation),
+                    # so it is replaced whole, as before.
+                    def _create_buffers(self):
+                        self._create_buffers_elastic()
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.
@@ -935,17 +1062,29 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         end_layer,
                     )
 
-                    # MLA-specific attributes (mirroring MLATokenToKVPool)
+                    # MLA-specific attributes (mirroring MLATokenToKVPool).
+                    # SGLang 0.5.13 renamed the sparse-attention kwarg and
+                    # attributes from use_nsa/nsa_kv_cache_store_fp8 to
+                    # use_dsa/dsa_kv_cache_store_fp8 (DSA is DeepSeek sparse
+                    # attention). Inherited write paths such as
+                    # set_kv_buffer read the current spelling on every
+                    # call, so accept either kwarg and set both spellings.
+                    # The fp8 flag also requires override_kv_cache_dim,
+                    # matching the native derivation on every version since
+                    # 0.5.9.
                     self.kv_lora_rank = kv_lora_rank
                     self.qk_rope_head_dim = qk_rope_head_dim
-                    self.use_nsa = kwargs.get("use_nsa", False)
-                    self.nsa_kv_cache_store_fp8 = (
-                        self.use_nsa and dtype == torch.float8_e4m3fn
-                    )
+                    use_dsa = kwargs.get("use_dsa", kwargs.get("use_nsa", False))
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.use_dsa = self.use_nsa = use_dsa
+                    self.dsa_kv_cache_store_fp8 = self.nsa_kv_cache_store_fp8 = (
+                        use_dsa
+                        and dtype == torch.float8_e4m3fn
+                        and override_kv_cache_dim is not None
+                    )
                     self.kv_cache_dim = (
                         override_kv_cache_dim
-                        if self.use_nsa and self.nsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_fp8
                         else (kv_lora_rank + qk_rope_head_dim)
                     )
                     # Attributes from parent that we skip but inherited methods may need
