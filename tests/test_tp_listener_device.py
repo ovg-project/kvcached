@@ -19,11 +19,39 @@ def _mock_torch(monkeypatch, current_device=0):
     def parse_device(device):
         value = str(device)
         index = int(value.split(":", 1)[1]) if ":" in value else None
-        return SimpleNamespace(index=index)
+        return SimpleNamespace(type=value.split(":", 1)[0], index=index)
 
     torch.device.side_effect = parse_device
     monkeypatch.setitem(sys.modules, "torch", torch)
     return torch
+
+
+@pytest.mark.parametrize("device", [None, "cuda", "hip", "cpu:0"])
+def test_resolve_device_rejects_missing_gpu_index(monkeypatch, device):
+    torch = _mock_torch(monkeypatch, current_device=3)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
+    from kvcached.tp_ipc_util import resolve_gpu_device_index
+
+    with pytest.raises(ValueError, match="explicitly indexed GPU device"):
+        resolve_gpu_device_index(device)
+    torch.cuda.current_device.assert_not_called()
+
+
+@pytest.mark.parametrize("integration", ["vllm", "sglang"])
+def test_interface_resolves_omitted_device_before_listener(monkeypatch, integration):
+    torch = _mock_torch(monkeypatch, current_device=3)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
+    module_name = f"kvcached.integration.{integration}.interfaces"
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    interfaces = importlib.import_module(module_name)
+    listener = mock.Mock()
+    monkeypatch.setattr(interfaces, "start_worker_listener_thread", listener)
+    kwargs = {"tp_rank": 2, "world_size": 4}
+    if integration == "vllm":
+        kwargs["is_worker"] = True
+    interfaces.init_kvcached(**kwargs)
+    listener.assert_called_once_with(2, 0, device_index=3)
+    torch.cuda.current_device.assert_called_once()
 
 
 def test_listener_thread_restores_cuda_device(monkeypatch, tmp_path):
