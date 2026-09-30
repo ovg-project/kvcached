@@ -11,12 +11,15 @@
 // target macro implies, though it is header-only and torch-ABI-independent.
 // See pytorch/pytorch#174372, meta-pytorch/torchcodec#1260.
 // TODO: drop torch>=2.13, workaround is no longer needed.
+#pragma push_macro("TORCH_STABLE_ONLY")
 #pragma push_macro("TORCH_TARGET_VERSION")
+#undef TORCH_STABLE_ONLY
 #undef TORCH_TARGET_VERSION
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #pragma pop_macro("TORCH_TARGET_VERSION")
+#pragma pop_macro("TORCH_STABLE_ONLY")
 
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
@@ -347,6 +350,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            })
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
+      .def("release_shared_segment",
+           &kvcached::PageAllocator::release_shared_segment,
+           py::call_guard<py::gil_scoped_release>())
       // The bindings below can block inside the allocator (alloc_page waits on
       // a condition variable for the prealloc worker; free/resize/trim unmap
       // pages; stop joins the worker). They must not hold the GIL while

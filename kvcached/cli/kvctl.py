@@ -74,7 +74,7 @@ Available commands:
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
-  delete <ipc>                 Delete IPC segment and its limit entry
+  delete <ipc>                 Delete IPC segment and its worker socket dir
   exit | quit                  Exit the shell
 """
 
@@ -309,11 +309,15 @@ def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
 
 
 def cmd_delete(ipc: str):
-    from kvcached.cli.utils import delete_kv_cache_segment
+    from kvcached.cli.utils import delete_kv_cache_segment, delete_tp_socket_dir
 
-    if delete_kv_cache_segment(ipc):
+    removed_segment = delete_kv_cache_segment(ipc)
+    removed_socket_dir = delete_tp_socket_dir(ipc)
+    if removed_segment:
         print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
-    else:
+    if removed_socket_dir:
+        print(_clr(f"Removed worker socket dir for IPC '{ipc}'.", 'green'))
+    if not removed_segment and not removed_socket_dir:
         print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True),
               file=sys.stderr)
 
@@ -451,7 +455,8 @@ def main():
     p_kvtop.add_argument('ipc', nargs='*', help='IPC names (optional)')
 
     # delete
-    p_del = sub.add_parser('delete', help='Delete IPC segment')
+    p_del = sub.add_parser('delete',
+                           help='Delete IPC segment and its worker socket dir')
     p_del.add_argument('ipc')
 
     # shell

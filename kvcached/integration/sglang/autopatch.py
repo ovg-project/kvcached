@@ -17,6 +17,7 @@ from kvcached.integration.sglang.patches import (
     ElasticSWAAllocatorPatch,
     RadixCacheLimitPatch,
     SchedulerMemoryLeakPatch,
+    SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
 )
 from kvcached.utils import get_kvcached_logger
@@ -47,9 +48,10 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
-            # Importing ModelRunner captures memory-pool classes in module
-            # globals, so apply this only after every pool alias is installed.
-            (SGLangVirtualKVCapacityPatch(), ">=0.5.11"),
+            # Importing the capacity owner captures memory-pool classes in
+            # module globals, so apply these only after every pool alias.
+            (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
+            (SGLangVirtualKVCapacityPatch(), ">=0.5.16"),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
         ]

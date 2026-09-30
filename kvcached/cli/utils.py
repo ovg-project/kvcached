@@ -4,13 +4,14 @@
 import fcntl
 import mmap
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import posix_ipc
 
-from kvcached.utils import SHM_DIR
+from kvcached.utils import SHM_DIR, get_tp_socket_dir
 
 
 def get_ipc_path(ipc_name: str) -> str:
@@ -183,6 +184,19 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
         pass
 
     return removed
+
+
+def delete_tp_socket_dir(ipc_name: str) -> bool:
+    """Remove the TP worker socket directory an engine instance using
+    *ipc_name* created under /tmp (see kvcached.tp_ipc_util).
+
+    Returns True if the directory existed and was removed, False otherwise.
+    """
+    socket_dir = get_tp_socket_dir(get_ipc_name(ipc_name))
+    if not os.path.isdir(socket_dir):
+        return False
+    shutil.rmtree(socket_dir)
+    return True
 
 
 def get_total_gpu_memory() -> int:

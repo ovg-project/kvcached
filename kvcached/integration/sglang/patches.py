@@ -8,6 +8,7 @@ SGLang-specific patches using unified patch infrastructure.
 import functools
 import inspect
 import math
+import os
 import types
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
@@ -32,6 +33,39 @@ def _is_supported_gpu_device(device: str) -> bool:
     return device_str.startswith("cuda") or device_str.startswith("hip")
 
 
+def _sglang_free_immediately(allocator: Any) -> bool:
+    """True when a free should release memory now instead of joining a group.
+
+    SGLang up to 0.5.18 tracks free-group state with an
+    ``is_not_in_free_group`` flag next to an always-present ``free_group``
+    list; 0.5.19 removed the flag and made ``free_group is None`` the
+    not-in-group sentinel.
+    """
+    flag = getattr(allocator, "is_not_in_free_group", None)
+    if flag is not None:
+        return bool(flag)
+    return allocator.free_group is None
+
+
+def _sglang_free_group_copy(allocator: Any, free_index: Any) -> Any:
+    """Deferred tensors are cloned on SGLang 0.5.19+ so a caller cannot
+    mutate a queued view before the group flushes; older releases defer the
+    tensor as passed."""
+    copy_for_free_group = getattr(allocator, "_copy_for_free_group", None)
+    if copy_for_free_group is not None:
+        return copy_for_free_group(free_index)
+    return free_index
+
+
+def _sglang_reset_free_group(allocator: Any) -> None:
+    """Reset free-group state to not-in-group under either protocol."""
+    if hasattr(allocator, "is_not_in_free_group"):
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+    else:
+        allocator.free_group = None
+
+
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
     """Return one capacity shared by every rank in the SGLang world group."""
     from sglang.srt.distributed.parallel_state import get_world_group
@@ -49,50 +83,98 @@ def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
     return int(capacity.item())
 
 
-class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
+def _import_sglang_allocator_kernels() -> types.ModuleType:
+    try:
+        from sglang.kernels.ops.memory import allocator as allocator_kernels
+
+        return allocator_kernels
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("sglang.kernels"):
+            raise
+
+    from sglang.srt.mem_cache.triton_ops import allocator as allocator_kernels
+
+    return allocator_kernels
+
+
+def _resolve_sglang_allocator_kernels(
+    alloc_mod: types.ModuleType,
+) -> Tuple[Any, Any]:
+    try:
+        return alloc_mod.alloc_extend_kernel, alloc_mod.alloc_decode_kernel
+    except AttributeError:
+        allocator_kernels = _import_sglang_allocator_kernels()
+        return (
+            allocator_kernels.alloc_extend_kernel,
+            allocator_kernels.alloc_decode_kernel,
+        )
+
+
+class _SGLangVirtualKVCapacityPatchBase(VersionAwarePatch, BasePatch):
     """Keep SGLang's logical KV capacity independent of peer processes."""
 
     library = "sglang"
-    target_module = "sglang.srt.model_executor.model_runner"
-    target_class = "ModelRunner"
     patch_name = "virtual_kv_capacity"
 
-    def apply(self, model_runner_mod: types.ModuleType) -> bool:
+    def apply(self, target_module: types.ModuleType) -> bool:
         if not self.initialize_version_info():
             return False
-        return self.patch_profile_available_bytes(model_runner_mod)
+        return self.patch_profile_available_bytes(target_module)
 
-    @version_range(">=0.5.11")
-    def patch_profile_available_bytes(self, model_runner_mod: types.ModuleType) -> bool:
-        ModelRunner = self._get_target_class(model_runner_mod)
-        if ModelRunner is None:
+    def _get_mem_fraction_static(self, owner: Any) -> float:
+        raise NotImplementedError
+
+    def _handle_max_mamba_cache(self, owner: Any, capacity_gib: float) -> float:
+        raise NotImplementedError
+
+    def _adjust_logical_budget(
+        self, *, owner: Any, total_memory: int, logical_budget: int
+    ) -> int:
+        return logical_budget
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_profile_available_bytes(self, target_module: types.ModuleType) -> bool:
+        target_class = self._get_target_class(target_module)
+        if target_class is None:
             return False
 
-        original_profile = getattr(ModelRunner, "_profile_available_bytes", None)
+        original_profile = getattr(target_class, "_profile_available_bytes", None)
         if original_profile is None:
             self.logger.warning(
-                "SGLang ModelRunner does not expose _profile_available_bytes"
+                "SGLang %s does not expose _profile_available_bytes",
+                self.target_class,
             )
             return False
         if self._is_already_patched(original_profile, "virtual_kv_capacity"):
             return True
 
         @functools.wraps(original_profile)
-        def _patched_profile_available_bytes(runner, pre_model_load_memory: int) -> int:
-            if not enable_kvcached() or not _is_supported_gpu_device(runner.device):
-                return original_profile(runner, pre_model_load_memory)
+        def _patched_profile_available_bytes(owner, pre_model_load_memory: int) -> int:
+            if not enable_kvcached() or not _is_supported_gpu_device(owner.device):
+                return original_profile(owner, pre_model_load_memory)
+
+            if getattr(owner, "post_capture_kv_active", False):
+                raise RuntimeError(
+                    "SGLang post-capture KV sizing is not supported with "
+                    "kvcached elastic pools"
+                )
 
             import torch
 
             query_error = None
             try:
                 total_memory = int(
-                    torch.cuda.get_device_properties(runner.gpu_id).total_memory
+                    torch.cuda.get_device_properties(owner.gpu_id).total_memory
                 )
-                mem_fraction_static = float(runner.mem_fraction_static)
+                mem_fraction_static = self._get_mem_fraction_static(owner)
                 logical_budget = math.ceil(total_memory * mem_fraction_static)
+                logical_budget = self._adjust_logical_budget(
+                    owner=owner,
+                    total_memory=total_memory,
+                    logical_budget=logical_budget,
+                )
                 process_local_reserved = int(
-                    torch.cuda.memory_reserved(runner.gpu_id)
+                    torch.cuda.memory_reserved(owner.gpu_id)
                 )
                 local_available_bytes = logical_budget - process_local_reserved
             except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
@@ -112,7 +194,7 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
                     "falling back to SGLang profiling: %s",
                     exc,
                 )
-                return original_profile(runner, pre_model_load_memory)
+                return original_profile(owner, pre_model_load_memory)
 
             if available_bytes == _CAPACITY_QUERY_FAILED:
                 logger.warning(
@@ -120,12 +202,12 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
                     "at least one rank; falling back to SGLang profiling: %s",
                     query_error or "peer rank query failed",
                 )
-                return original_profile(runner, pre_model_load_memory)
+                return original_profile(owner, pre_model_load_memory)
 
-            if runner.mambaish_config is not None:
+            if owner.mambaish_config is not None:
                 available_gib = available_bytes / BYTES_PER_GB
                 available_bytes = int(
-                    runner.handle_max_mamba_cache(available_gib) * BYTES_PER_GB
+                    self._handle_max_mamba_cache(owner, available_gib) * BYTES_PER_GB
                 )
 
             logger.info(
@@ -142,8 +224,32 @@ class SGLangVirtualKVCapacityPatch(VersionAwarePatch, BasePatch):
             return available_bytes
 
         self._mark_as_patched(_patched_profile_available_bytes, "virtual_kv_capacity")
-        ModelRunner._profile_available_bytes = _patched_profile_available_bytes
+        target_class._profile_available_bytes = _patched_profile_available_bytes
         return True
+
+
+class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
+    target_module = "sglang.srt.mem_cache.kv_cache_configurator"
+    target_class = "KVCacheConfigurator"
+
+    def _get_mem_fraction_static(self, configurator: Any) -> float:
+        return float(configurator.server_args.mem_fraction_static)
+
+    def _handle_max_mamba_cache(
+        self, configurator: Any, capacity_gib: float
+    ) -> float:
+        return configurator._handle_max_mamba_cache(capacity_gib)
+
+
+class SGLangLegacyVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
+    target_module = "sglang.srt.model_executor.model_runner"
+    target_class = "ModelRunner"
+
+    def _get_mem_fraction_static(self, runner: Any) -> float:
+        return float(runner.mem_fraction_static)
+
+    def _handle_max_mamba_cache(self, runner: Any, capacity_gib: float) -> float:
+        return runner.handle_max_mamba_cache(capacity_gib)
 
 
 class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
@@ -222,18 +328,29 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def free(self, free_index):
-                    if self.is_not_in_free_group:
+                    if _sglang_free_immediately(self):
                         try:
                             indices: list[int] = free_index.cpu().numpy().tolist()
                         except Exception:
                             indices = list(free_index)
                         return self.kvcached_allocator.free(indices)
                     else:
-                        self.free_group.append(free_index)
+                        self.free_group.append(
+                            _sglang_free_group_copy(self, free_index)
+                        )
+
+                def free_page_ids(self, page_ids):
+                    # SGLang 0.5.20's SWA composite frees sub-allocator pages
+                    # through free_page_ids().  With page_size == 1 page ids
+                    # are token ids, mirroring the native token allocator.
+                    if page_ids.numel() == 0:
+                        return
+                    self.free(page_ids)
 
                 def clear(self):
                     if hasattr(self, "kvcached_allocator"):
                         self.kvcached_allocator.clear()
+                    _sglang_reset_free_group(self)
 
             setattr(alloc_mod, "ElasticTokenToKVPoolAllocator", ElasticTokenToKVPoolAllocator)
             return True
@@ -269,14 +386,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
-            try:
-                alloc_extend_kernel = getattr(alloc_mod, "alloc_extend_kernel")
-                alloc_decode_kernel = getattr(alloc_mod, "alloc_decode_kernel")
-            except AttributeError:
-                from sglang.srt.mem_cache.triton_ops import allocator as triton_allocator
-
-                alloc_extend_kernel = triton_allocator.alloc_extend_kernel
-                alloc_decode_kernel = triton_allocator.alloc_decode_kernel
+            alloc_extend_kernel, alloc_decode_kernel = (
+                _resolve_sglang_allocator_kernels(alloc_mod)
+            )
 
             alloc_extend_kernel_fn = getattr(
                 alloc_extend_kernel, "fn", alloc_extend_kernel
@@ -306,6 +418,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.kvcached_allocator = kvcache.kvcached_allocator
                     self.num_pages = size // page_size
                     self.seen_max_num_extend_tokens_next_power_of_2 = 1
+                    # The native PagedTokenToKVPoolAllocator init sets this, and
+                    # 0.5.20's SWA allocator reads it on every free at
+                    # page_size > 1.
+                    self.debug_mode = os.getenv(
+                        "SGLANG_DEBUG_MEMORY_POOL", "false").lower() in ("true", "1")
                     logger.info(
                         f"[kvcached] ElasticPagedTokenToKVPoolAllocator in use: size={size}, "
                         f"page_size={page_size}"
@@ -313,6 +430,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # Base class expects these tensors for backup_state / free_group_end
                     self.free_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
                     self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+                    # SGLang 0.5.20 defers page-id frees in a group separate
+                    # from token-index frees; see free_page_ids().
+                    self.free_page_ids_group: List[Any] = []
 
                 def available_size(self):
                     return self.kvcached_allocator.available_size() * self.page_size
@@ -425,7 +545,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if free_index.numel() == 0:
                         return
 
-                    if self.is_not_in_free_group:
+                    if _sglang_free_immediately(self):
                         page_ids = torch.unique(free_index // self.page_size)
                         try:
                             indices: list[int] = page_ids.cpu().numpy().tolist()
@@ -433,7 +553,40 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices = list(page_ids)
                         return self.kvcached_allocator.free(indices)
                     else:
-                        self.free_group.append(free_index)
+                        self.free_group.append(
+                            _sglang_free_group_copy(self, free_index)
+                        )
+
+                def free_page_ids(self, page_ids):
+                    # SGLang 0.5.20's paged allocator and SWA composite free
+                    # exact page ids through this method, with no dedup and
+                    # no index-to-page reduction.  kvcached block ids equal
+                    # SGLang page ids, so the ids release directly; inside a
+                    # free group they wait in free_page_ids_group, mirroring
+                    # the native deferral.
+                    if page_ids.numel() == 0:
+                        return
+                    if _sglang_free_immediately(self):
+                        try:
+                            ids: list[int] = page_ids.cpu().numpy().tolist()
+                        except Exception:
+                            ids = list(page_ids)
+                        return self.kvcached_allocator.free(ids)
+                    else:
+                        self.free_page_ids_group.append(
+                            _sglang_free_group_copy(self, page_ids)
+                        )
+
+                def free_group_begin(self):
+                    super().free_group_begin()
+                    self.free_page_ids_group = []
+
+                def free_group_end(self):
+                    super().free_group_end()
+                    if self.free_page_ids_group:
+                        page_ids_group = self.free_page_ids_group
+                        self.free_page_ids_group = []
+                        self.free_page_ids(torch.cat(page_ids_group))
 
                 def clear(self):
                     if hasattr(self, "kvcached_allocator"):
@@ -444,8 +597,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.release_pages = torch.empty(
                         (0,), dtype=torch.int64, device=self.device
                     )
-                    self.is_not_in_free_group = True
-                    self.free_group = []
+                    self.free_page_ids_group = []
+                    _sglang_reset_free_group(self)
 
                 def merge_and_sort_free(self):
                     pass  # No-op: kvcached manages the free list
@@ -553,6 +706,18 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
         try:
             MHATokenToKVPool = getattr(mem_pool_mod, "MHATokenToKVPool")
 
+            # SGLang 0.5.16 split _create_buffers() into
+            # _create_buffers_normal() (the plain allocation stage) plus a
+            # tail that builds _kv_buffer_descs, which PD transfer
+            # (prefill-decode disaggregation) registers buffers from, and
+            # the data_ptrs/data_strides tensors the speculative-decode kv
+            # copy reads. Replacing _create_buffers() wholesale skips that
+            # tail, so on the split layout we override the inner stage and
+            # let the native tail run over the elastic buffers. Detect the
+            # split by presence rather than version so source builds
+            # without version metadata route the same way.
+            has_buffer_seam = hasattr(MHATokenToKVPool, "_create_buffers_normal")
+
             class ElasticMHATokenToKVPool(MHATokenToKVPool):  # type: ignore
                 # Auto-incrementing group_id so that each pool instance
                 # (e.g., full-attention pool and SWA pool in SWAKVPool)
@@ -575,6 +740,17 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     *args,
                     **kwargs,
                 ) -> None:
+                    if kwargs.get("post_capture_active"):
+                        # SGLang 0.5.16+ post-capture sizing reserves VA-only
+                        # buffers and later finalizes backing through its own
+                        # VMM owner, which the elastic buffer override never
+                        # creates.  Refuse instead of half-running.
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool does not support SGLang "
+                            "post-capture KV sizing. Unset "
+                            "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING or disable "
+                            "kvcached (ENABLE_KVCACHED=false)."
+                        )
                     # Assign group_id BEFORE super().__init__() because it
                     # calls _create_buffers() which needs self._group_id.
                     self._group_id = ElasticMHATokenToKVPool._next_group_id
@@ -625,11 +801,24 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     self.mem_usage = (k_size + v_size) / BYTES_PER_GB
 
-                def _create_buffers(self):
+                def _create_buffers_elastic(self):
                     import kvcached.integration.sglang.interfaces as kvi
 
+                    # kvcached backs NHD rows, one (head_num, head_dim) row
+                    # per token slot. HND and the ROCm vectorized layouts
+                    # reshape the buffers, so refuse them instead of serving
+                    # NHD-shaped memory under another layout's label.
+                    kv_cache_layout = getattr(self, "kv_cache_layout", "nhd")
+                    if getattr(self, "use_hnd", False) or kv_cache_layout != "nhd":
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool only supports the NHD "
+                            f"KV cache layout, got {kv_cache_layout!r}. Unset "
+                            "SGLANG_USE_HND_KVCACHE or the kv_cache_layout "
+                            "override, or disable kvcached "
+                            "(ENABLE_KVCACHED=false).")
+
                     # Resolve TP rank and size for IPC socket registration.
-                    # SGLang workers each call _create_buffers() independently,
+                    # SGLang workers each call this independently,
                     # so we query the distributed state at this point (which is
                     # guaranteed to be initialised by the time buffers are created).
                     try:
@@ -675,6 +864,108 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         ),
                     )
                     self.k_buffer, self.v_buffer = _kv_mha
+
+                if has_buffer_seam:
+                    # 0.5.16+: native _create_buffers() keeps running. Its
+                    # non-quantized branch pins k/v_scale_buffer and
+                    # dq_k/dq_v_buffer to None before dispatching here, and
+                    # its tail builds _kv_buffer_descs from the elastic
+                    # buffers. The pointer-table part of the tail is
+                    # guarded below: it is only valid when every K/V view
+                    # is independently contiguous.
+                    def _create_buffers_normal(self):
+                        self._create_buffers_elastic()
+
+                    def _create_quantized_buffers(self):
+                        # The native dispatch routes here when a quantized
+                        # KV cache recipe (quant_method) is configured. The
+                        # recipe would allocate native torch buffers outside
+                        # kvcached while the elastic allocator keeps
+                        # tracking the pool, so refuse instead of
+                        # half-running.
+                        raise NotImplementedError(
+                            "ElasticMHATokenToKVPool does not support "
+                            "quantized KV cache recipes (quant_method). "
+                            "Disable kvcached (ENABLE_KVCACHED=false) to "
+                            "use a quantized KV cache.")
+
+                    def _kv_buffers_independently_contiguous(self):
+                        # The per-layer FTensor layout
+                        # (KVCACHED_CONTIGUOUS_LAYOUT=false) hands out
+                        # dense per-layer views, while the default
+                        # contiguous layout interleaves all layers and K/V
+                        # in one (tokens, layers, 2, heads, dim) buffer,
+                        # so each view's token stride spans every layer.
+                        return all(
+                            t.is_contiguous()
+                            for t in (*self.k_buffer, *self.v_buffer))
+
+                    def _init_data_ptrs_and_strides(self):
+                        # The native tables store one scalar per buffer,
+                        # prod(shape[1:]) * itemsize, and every consumer
+                        # (the Triton copy kernel in
+                        # kernels/ops/kvcache/cache_move.py) uses that
+                        # scalar both as the token-address pitch and as
+                        # the bytes to copy. That only holds when rows are
+                        # independently contiguous; publishing the tables
+                        # for interleaved views would make the kernel walk
+                        # and overwrite unrelated bytes. Leave them unset
+                        # instead so an unexpected consumer fails with
+                        # AttributeError, matching pre-0.5.16 elastic
+                        # pools, which never had them.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_data_ptrs_and_strides()
+
+                    def _init_kv_copy_and_warmup(self):
+                        # The warmup launches the copy kernel over the
+                        # pointer tables, which the interleaved layout
+                        # does not publish; move_kv_cache below covers
+                        # that layout without the kernel.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._init_kv_copy_and_warmup()
+                        else:
+                            self._kv_copy_config = None
+
+                    def _move_kv_cache_impl(self, tgt_loc, src_loc):
+                        # Native move strategy hook (the base
+                        # move_kv_cache already did the OOB checks). For
+                        # interleaved views, advanced indexing on the
+                        # views walks the real strides, mirroring the
+                        # native move_kv_cache_native fallback; scale
+                        # buffers cannot exist here because quantized
+                        # recipes are refused above.
+                        if self._kv_buffers_independently_contiguous():
+                            super()._move_kv_cache_impl(tgt_loc, src_loc)
+                            return
+                        if tgt_loc.numel() == 0:
+                            return
+                        tgt = tgt_loc.view(-1).long()
+                        src = src_loc.view(-1).long()
+                        for k_cache, v_cache in zip(self.k_buffer,
+                                                    self.v_buffer):
+                            k_cache[tgt] = k_cache[src]
+                            v_cache[tgt] = v_cache[src]
+
+                    def get_contiguous_buf_infos(self):
+                        # PD transfer registers [ptr, ptr + len) per layer
+                        # and walks pages at ptr + page * item_len, which
+                        # has no valid answer when the layers interleave
+                        # within every token row.
+                        if self._kv_buffers_independently_contiguous():
+                            return super().get_contiguous_buf_infos()
+                        raise NotImplementedError(
+                            "the interleaved elastic KV layout has no "
+                            "per-layer contiguous regions, so PD transfer "
+                            "cannot register it. Use the per-layer layout "
+                            "(KVCACHED_CONTIGUOUS_LAYOUT=false) or "
+                            "disable kvcached (ENABLE_KVCACHED=false) "
+                            "for disaggregation.")
+                else:
+                    # Before 0.5.16 _create_buffers() is a single stage
+                    # (any pointer derivation is inlined after allocation),
+                    # so it is replaced whole, as before.
+                    def _create_buffers(self):
+                        self._create_buffers_elastic()
 
                 def get_kv_size_bytes_phy(self):
                     """Return the physical memory limits of the K/V buffers.
@@ -780,17 +1071,29 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         self, "store_dtype", getattr(self, "dtype", dtype)
                     )
 
-                    # MLA-specific attributes (mirroring MLATokenToKVPool)
+                    # MLA-specific attributes (mirroring MLATokenToKVPool).
+                    # SGLang 0.5.13 renamed the sparse-attention kwarg and
+                    # attributes from use_nsa/nsa_kv_cache_store_fp8 to
+                    # use_dsa/dsa_kv_cache_store_fp8 (DSA is DeepSeek sparse
+                    # attention). Inherited write paths such as
+                    # set_kv_buffer read the current spelling on every
+                    # call, so accept either kwarg and set both spellings.
+                    # The fp8 flag also requires override_kv_cache_dim,
+                    # matching the native derivation on every version since
+                    # 0.5.9.
                     self.kv_lora_rank = kv_lora_rank
                     self.qk_rope_head_dim = qk_rope_head_dim
-                    self.use_nsa = kwargs.get("use_nsa", False)
-                    self.nsa_kv_cache_store_fp8 = (
-                        self.use_nsa and dtype == torch.float8_e4m3fn
-                    )
+                    use_dsa = kwargs.get("use_dsa", kwargs.get("use_nsa", False))
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.use_dsa = self.use_nsa = use_dsa
+                    self.dsa_kv_cache_store_fp8 = self.nsa_kv_cache_store_fp8 = (
+                        use_dsa
+                        and dtype == torch.float8_e4m3fn
+                        and override_kv_cache_dim is not None
+                    )
                     self.kv_cache_dim = (
                         override_kv_cache_dim
-                        if self.use_nsa and self.nsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_fp8
                         else (kv_lora_rank + qk_rope_head_dim)
                     )
                     # Attributes from parent that we skip but inherited methods may need
@@ -928,6 +1231,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
         success = self.inject_elastic_mamba_pool(mem_pool_mod)
         if success:
             success &= self.alias_mamba_pool_to_elastic(mem_pool_mod)
+        if success and self.rebind_hybrid_mamba_pool_cls in self.applicable_methods:
+            success &= self.rebind_hybrid_mamba_pool_cls(mem_pool_mod)
         if success and self.patch_mamba_slot_allocator in self.applicable_methods:
             success &= self.patch_mamba_slot_allocator(mem_pool_mod)
         return success
@@ -1053,6 +1358,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     enable_linear_replayssm: bool = False,
                     linear_replayssm_cache_len: int = 16,
                     envelope_layout: bool = False,
+                    enable_gdn_replayssm_spec: bool = False,
+                    enable_linear_replayssm_spec: bool = False,
                 ) -> None:
                     import kvcached.integration.sglang.interfaces as kvi
 
@@ -1065,6 +1372,16 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         raise NotImplementedError(
                             "ElasticMambaPool uses the kvcached mamba state "
                             "layout and does not support SGLang envelope_layout."
+                        )
+                    # SGLang 0.5.16 passes enable_gdn_replayssm_spec and
+                    # 0.5.17 renamed it to enable_linear_replayssm_spec.  The
+                    # spec-verify replay ring is allocated by the native init
+                    # this class skips, so accept the kwargs but refuse the
+                    # feature.
+                    if enable_gdn_replayssm_spec or enable_linear_replayssm_spec:
+                        raise NotImplementedError(
+                            "ElasticMambaPool does not support SGLang "
+                            "ReplaySSM speculative verification buffers yet."
                         )
 
                     # Resolve TP/PP rank the same way ElasticMHATokenToKVPool
@@ -1105,6 +1422,11 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     self.linear_replayssm_cache_len = linear_replayssm_cache_len
                     self.replayssm_is_kda = False
                     self.replayssm_write_pos = None
+                    # The native init leaves the spec-verify ring as None when
+                    # the feature is off, and HybridReqToTokenPool.alloc on
+                    # 0.5.16-0.5.19 reads it for every new request.
+                    self.replayssm_cache_base = None
+                    self.replayssm_is_flush = None
                     # SGLang passes the layer list as either a mamba_layer_ids
                     # kwarg or cache_params.layers, depending on version.
                     if mamba_layer_ids is not None:
@@ -1118,6 +1440,22 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                             "count: pass mamba_layer_ids or ensure "
                             "cache_params.layers is set.")
                     self.num_mamba_layers = num_mamba_layers
+                    # Attributes the native init sets and inherited methods
+                    # read on 0.5.16+: the transfer iterator walks
+                    # mamba_layer_ids with conv_slice_axis /
+                    # conv_shard_groups, copy_from checks debug_memory_pool,
+                    # and the replayssm-spec flags mirror the refusals above.
+                    self.mamba_layer_ids = layer_ids
+                    self.debug_memory_pool = False
+                    self.enable_linear_replayssm_spec = False
+                    self.replayssm_spec_fold = False
+                    shape_params = getattr(cache_params, "shape", None)
+                    self.conv_shard_groups = getattr(
+                        shape_params, "conv_shard_groups", None
+                    )
+                    self.conv_slice_axis = getattr(
+                        shape_params, "conv_slice_axis", 0
+                    )
 
                     # Slot 0 is the padded dummy slot; kvcached reserves it
                     # via reserve_null_block.
@@ -1260,6 +1598,36 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 def clear(self) -> None:
                     self.kvcached_allocator.clear()
 
+                def register_slot_state(self, state: Any) -> None:
+                    # SGLang 0.5.20 attaches Qwen4-Exp PLE side states
+                    # (ShortConvPool / NGramPool) that must follow every slot
+                    # clear, copy, and host round-trip.  The elastic pool
+                    # does not implement that ride-along yet, so refuse
+                    # instead of dropping sibling state silently.
+                    raise NotImplementedError(
+                        "ElasticMambaPool does not support SGLang PLE "
+                        "slot-sibling states (register_slot_state) yet."
+                    )
+
+                def clear_slots(self, indices: "torch.Tensor") -> None:
+                    # 0.5.20's deferred COW/clear on the extend path
+                    # (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear)
+                    # calls this; the native body indexes (layers, slots, *)
+                    # tensors, which on per-layer state would zero the wrong
+                    # axis of layer 0 and miss every other layer.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "clear_slots"):
+                            super().clear_slots(indices)
+                    else:
+                        # Per-layer state is (slots, *shape); index the slot
+                        # dim directly.  No _slot_siblings pass here:
+                        # register_slot_state refuses, so none can exist.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            for t in shape_list:
+                                t[indices] = 0
+                        for t in self.mamba_cache.temporal_per_layer:
+                            t[indices] = 0
+
                 def copy_from(
                     self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
                 ) -> None:
@@ -1273,24 +1641,56 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         for t in self.mamba_cache.temporal_per_layer:
                             t[dst_index] = t[src_index]
 
+                def _iter_transfer_state_entries(self):
+                    # The 0.5.20 PD-transfer readers (get_state_layer_ids,
+                    # get_state_slice_outer_counts,
+                    # get_state_conv_shard_groups) all walk this iterator,
+                    # whose native body expects (layers, slots, *) tensors
+                    # in vars(mamba_cache) and chokes on the nested
+                    # conv_per_layer list.
+                    if self._is_contiguous:
+                        if hasattr(MambaPool, "_iter_transfer_state_entries"):
+                            yield from super()._iter_transfer_state_entries()
+                    else:
+                        # Same flattening as the contiguous iterator: conv
+                        # shape groups outer, layer inner, temporal last.
+                        for shape_list in self.mamba_cache.conv_per_layer:
+                            if shape_list[0].numel() == 0:
+                                continue
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "conv",
+                                    shape_list[layer_index],
+                                    self.conv_slice_axis,
+                                    layer_id,
+                                )
+                        temporal_list = self.mamba_cache.temporal_per_layer
+                        if temporal_list[0].numel() > 0:
+                            for layer_index, layer_id in enumerate(
+                                    self.mamba_layer_ids):
+                                yield (
+                                    "temporal",
+                                    temporal_list[layer_index],
+                                    0,
+                                    layer_id,
+                                )
+
                 def get_contiguous_buf_infos(self):
                     if self._is_contiguous:
                         if hasattr(MambaPool, "get_contiguous_buf_infos"):
                             return super().get_contiguous_buf_infos()
                     else:
-                        # Non-contiguous: per-layer pointer/length triples
-                        # in (state_kind_outer, layer_inner) order.
+                        # Non-contiguous: per-layer pointer/length triples,
+                        # aligned with the transfer iterator by sharing it.
                         data_ptrs: List[int] = []
                         data_lens: List[int] = []
                         item_lens: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            for layer_t in state_list:
-                                data_ptrs.append(layer_t.data_ptr())
-                                data_lens.append(layer_t.nbytes)
-                                item_lens.append(layer_t[0].nbytes)
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, _, _ in entries:
+                            data_ptrs.append(layer_t.data_ptr())
+                            data_lens.append(layer_t.nbytes)
+                            item_lens.append(layer_t[0].nbytes)
                         return data_ptrs, data_lens, item_lens
 
                 def get_state_dim_per_tensor(self):
@@ -1298,15 +1698,19 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         if hasattr(MambaPool, "get_state_dim_per_tensor"):
                             return super().get_state_dim_per_tensor()
                     else:
-                        # Per-layer state shape is (slots, sliceable_dim, ...);
-                        # the sliceable dimension is at index 1 (post-slot).
+                        # Per-layer state shape is (slots, ...); the native
+                        # reader takes shape[1 + slice_axis] (Kimi conv state
+                        # slices its second per-slot axis) and 0 marks a
+                        # replicated tensor that PD copies whole.
                         dim_per_tensor: List[int] = []
-                        state_lists: List[List["torch.Tensor"]] = list(
-                            self.mamba_cache.conv_per_layer
-                        ) + [list(self.mamba_cache.temporal_per_layer)]
-                        for state_list in state_lists:
-                            sliceable_dim = state_list[0].shape[1]
-                            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                        entries = self._iter_transfer_state_entries()
+                        for _, layer_t, slice_axis, _ in entries:
+                            if slice_axis is None:
+                                dim_per_tensor.append(0)
+                                continue
+                            dim_per_tensor.append(
+                                layer_t.shape[1 + slice_axis]
+                            )
                         return dim_per_tensor
 
             setattr(mem_pool_mod, "ElasticMambaPool", ElasticMambaPool)
@@ -1332,6 +1736,38 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias MambaPool to elastic one: {e}")
             return False
+
+    @version_range(">=0.5.16")
+    def rebind_hybrid_mamba_pool_cls(self, mem_pool_mod: types.ModuleType) -> bool:
+        """Route ``HybridReqToTokenPool``'s Mamba pool construction to the
+        elastic class.
+
+        SGLang 0.5.16 made the pool class a ``mamba_pool_cls`` class
+        attribute, which captured the native ``MambaPool`` when the module
+        executed, before any aliasing ran.  The module-attribute alias no
+        longer routes construction there: without the rebind, mamba state
+        silently reverts to static native allocation and the slot-allocator
+        wrap below no-ops because the pool lacks ``kvcached_allocator``.
+        """
+        HybridReqToTokenPool = getattr(mem_pool_mod, "HybridReqToTokenPool", None)
+        if HybridReqToTokenPool is None:
+            self.logger.debug(
+                "HybridReqToTokenPool not found; skipping mamba_pool_cls rebind"
+            )
+            return True
+        if not hasattr(HybridReqToTokenPool, "mamba_pool_cls"):
+            self.logger.debug(
+                "HybridReqToTokenPool has no mamba_pool_cls; skipping rebind"
+            )
+            return True
+
+        ElasticMambaPool = getattr(mem_pool_mod, "ElasticMambaPool", None)
+        if ElasticMambaPool is None:
+            # Injection was skipped (no native MambaPool to subclass).
+            return True
+
+        HybridReqToTokenPool.mamba_pool_cls = ElasticMambaPool
+        return True
 
     @version_range(">=0.5.13")
     def patch_mamba_slot_allocator(self, mem_pool_mod: types.ModuleType) -> bool:
