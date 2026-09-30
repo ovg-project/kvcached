@@ -1121,6 +1121,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _selects_v2_model_runner(vllm_config: Any) -> bool:
+    """Whether vLLM will run Model Runner V2 for this config.
+
+    From 0.22 ``VllmConfig.use_v2_model_runner`` also resolves vLLM's default
+    choice; older releases only honour ``VLLM_USE_V2_MODEL_RUNNER``.
+    """
+    selected = getattr(vllm_config, "use_v2_model_runner", None)
+    if selected is not None:
+        return bool(selected)
+    try:
+        import vllm.envs as envs
+
+        return bool(getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False))
+    except Exception:
+        return False
+
+
 class EngineCorePatch(VersionAwarePatch, BasePatch):
     """Patch EngineCore initialization, async batch ordering, and shutdown."""
 
@@ -1168,6 +1185,17 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                             "kvcached on vLLM 0.29 requires Model Runner V2; "
                             "use a supported configuration or disable kvcached"
                         )
+                elif (detected_version and VersionRange("<0.28.0").contains(detected_version)
+                        and _selects_v2_model_runner(vllm_config)):
+                    # From 0.22 vLLM picks Model Runner V2 by default for many
+                    # models; kvcached only adapts it from 0.28. Without an
+                    # adapter the workers never create kvcached KV tensors and
+                    # the engine dies on its first request.
+                    raise KVCachedConfigError(
+                        f"kvcached does not support the vLLM {detected_version} Model Runner V2 "
+                        "yet; set VLLM_USE_V2_MODEL_RUNNER=0 to use the V1 model runner, "
+                        "or disable kvcached"
+                    )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
