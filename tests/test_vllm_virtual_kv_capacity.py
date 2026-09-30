@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib
 import sys
+import threading
 import types
 from typing import Any
 from unittest import mock
@@ -62,10 +63,14 @@ def _worker_config(*, utilization=0.9, explicit_budget=None):
     )
 
 
-def _patch_worker(patches, monkeypatch, worker_cls, *, enabled=True) -> Any:
+def _patch_worker(
+    patches, monkeypatch, worker_cls, *, enabled=True, **native_helpers
+) -> Any:
     monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
     module = types.ModuleType("mock_gpu_worker")
     setattr(module, "Worker", worker_cls)
+    for name, helper in native_helpers.items():
+        setattr(module, name, helper)
     patch = patches.GPUWorkerPatch()
     assert patch.patch_worker_init_device(module)
     assert patch.patch_worker_determine_available_memory(module)
@@ -73,21 +78,33 @@ def _patch_worker(patches, monkeypatch, worker_cls, *, enabled=True) -> Any:
 
 
 def _install_memory_profiling(
-    monkeypatch, *, torch_peak_increase, before_torch_peak=0
+    monkeypatch, *, torch_peak_increase, before_torch_peak=0,
+    before_allocated=None, after_allocated=None, events=None,
+    modern_accounting=False,
 ):
     calls = []
 
     @contextlib.contextmanager
     def memory_profiling(init_snapshot, *, weights_memory):
         calls.append((init_snapshot, weights_memory))
-        yield types.SimpleNamespace(
+        if events is not None:
+            events.append("profile_enter")
+        result = types.SimpleNamespace(
             weights_memory=weights_memory,
             torch_peak_increase=torch_peak_increase,
             non_torch_increase=10_000,
+            total_consumed=20_000,
             before_profile=types.SimpleNamespace(
-                torch_peak=before_torch_peak
+                torch_peak=before_torch_peak,
+                torch_allocated=before_allocated,
             ),
+            after_profile=types.SimpleNamespace(torch_allocated=after_allocated),
         )
+        if modern_accounting:
+            result.transient_peak_headroom = 9999
+        yield result
+        if events is not None:
+            events.append("profile_exit")
 
     module = types.ModuleType("vllm.utils.mem_utils")
     setattr(module, "memory_profiling", memory_profiling)
@@ -302,6 +319,8 @@ def test_determine_available_memory_injects_automatic_virtual_budget(
     assert worker.cache_config.kv_cache_memory_bytes is None
     assert getattr(worker, "available_kv_cache_memory_bytes") == 550
     assert worker.non_torch_memory == 0
+    assert worker.total_consumed == 200
+    assert worker.peak_activation_memory == 50
     assert profile_modes == [(False, True)]
     capacity.assert_not_called()
 
@@ -311,8 +330,10 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
 ):
     torch = sys.modules["torch"]
     profile_modes = []
+    events = []
 
     def record_profile_mode(result=None):
+        events.append("graph" if result is not None else "forward")
         profile_modes.append(
             (
                 torch.is_grad_enabled(),
@@ -325,8 +346,9 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     profile_cudagraph = mock.Mock(side_effect=lambda: record_profile_mode(30))
     _install_memory_profiling(
         monkeypatch,
-        torch_peak_increase=999,
+        torch_peak_increase=70,
         before_torch_peak=10,
+        events=events,
     )
     torch = sys.modules["torch"]
     torch.accelerator.memory_stats.return_value = {
@@ -380,10 +402,53 @@ def test_determine_available_memory_records_but_ignores_cudagraph_estimate(
     assert worker.determine_available_memory() == 530
     assert worker.non_torch_memory == 0
     assert worker.peak_activation_memory == 70
+    # The 0.29 warmup consumer reconstructs non-KV usage from these fields.
+    assert worker.total_consumed + worker.peak_activation_memory == 270
     assert worker.cudagraph_memory_estimate == 30
+    assert worker.total_consumed == 200
     profile_run.assert_called_once_with()
     profile_cudagraph.assert_called_once_with()
     assert profile_modes == [(False, True), (False, True)]
+    assert events == ["profile_enter", "forward", "profile_exit", "graph"]
+
+
+@pytest.mark.parametrize(
+    "before,after,modern,persistent,transient",
+    [(200, 220, True, 20, 50), (200, 200, True, 0, 70),
+     (200, 180, True, 0, 70), (200, 300, True, 70, 0),
+     (None, None, True, 0, 70), (200, 220, False, 0, 70)],
+)
+def test_warmup_accounting_preserves_process_local_capacity(
+    monkeypatch, patches, before, after, modern, persistent, transient
+):
+    _install_memory_profiling(
+        monkeypatch, torch_peak_increase=70,
+        before_allocated=before, after_allocated=after,
+        modern_accounting=modern,
+    )
+
+    class Worker:
+        def __init__(self):
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.cache_config = _worker_config()
+            self.requested_memory = 800
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    worker = _patch_worker(patches, monkeypatch, Worker)()
+    assert worker.determine_available_memory() == 530
+    assert worker.total_consumed == 200 + persistent
+    assert worker.peak_activation_memory == transient
+    assert (worker.requested_memory - worker.total_consumed
+            - worker.peak_activation_memory) == 530
+    assert worker.non_torch_memory == 0
 
 
 def test_cudagraph_profile_respects_none_mode(patches):
@@ -398,6 +463,33 @@ def test_cudagraph_profile_respects_none_mode(patches):
     )
 
     assert patches._should_profile_cudagraph_memory(worker) is False
+
+
+def test_cudagraph_failure_is_not_hidden(monkeypatch, patches):
+    _install_memory_profiling(monkeypatch, torch_peak_increase=70)
+    monkeypatch.setattr(patches, "_should_profile_cudagraph_memory", lambda _: True)
+
+    class Worker:
+        def __init__(self):
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.cache_config = _worker_config()
+            self.requested_memory = 800
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+                profile_cudagraph_memory=mock.Mock(
+                    side_effect=RuntimeError("graph capture failed")),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    worker = _patch_worker(patches, monkeypatch, Worker)()
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        worker.determine_available_memory()
+    assert not hasattr(worker, "available_kv_cache_memory_bytes")
 
 
 def test_determine_available_memory_preserves_explicit_user_budget(
@@ -452,6 +544,150 @@ def test_determine_available_memory_propagates_profile_failure(
     assert worker.cache_config.kv_cache_memory_bytes is None
 
 
+@pytest.fixture
+def startup_worker(monkeypatch):
+    _install_memory_profiling(monkeypatch, torch_peak_increase=50)
+
+    class Worker:
+        def __init__(self):
+            self.cache_config = _worker_config()
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.requested_memory = 800
+            self.model_config = types.SimpleNamespace(multimodal_config=object())
+            self.parallel_config = types.SimpleNamespace(_api_process_count=3)
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    return Worker
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_startup_plan_precedes_budget_selection(
+    patches, monkeypatch, startup_worker, accepted,
+):
+    effective_applications = []
+
+    def maybe_apply(worker):
+        if worker.cache_config.kv_cache_memory_bytes is None and accepted:
+            effective_applications.append(worker)
+            worker.cache_config.kv_cache_memory_bytes = 400
+
+    apply_plan = mock.Mock(side_effect=maybe_apply)
+    reserve = mock.Mock(side_effect=lambda capacity, *_: capacity - 100)
+
+    def native_determine(worker):
+        # Native vLLM rechecks the plan, but an already selected budget is
+        # authoritative: the second helper call must have no effective change.
+        apply_plan(worker)
+        assert worker.cache_config.kv_cache_memory_bytes == 400
+        worker.model_runner.profile_run()
+        return reserve(400, worker.model_config.multimodal_config, 3)
+
+    startup_worker.determine_available_memory = native_determine
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        maybe_apply_startup_plan=apply_plan,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+
+    assert worker.determine_available_memory() == (300 if accepted else 450)
+    assert effective_applications == ([worker] if accepted else [])
+    assert apply_plan.call_count == (2 if accepted else 1)
+    worker.model_runner.profile_run.assert_called_once_with()
+    reserve.assert_called_once_with(
+        400 if accepted else 550, worker.model_config.multimodal_config, 3,
+    )
+
+
+def test_startup_plan_errors_propagate(patches, monkeypatch, startup_worker):
+    apply_plan = mock.Mock(side_effect=RuntimeError("startup plan failed"))
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        maybe_apply_startup_plan=apply_plan,
+    )()
+    with pytest.raises(RuntimeError, match="startup plan failed"):
+        worker.determine_available_memory()
+    worker.model_runner.profile_run.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit,enabled", [(True, True), (False, False)])
+def test_delegated_startup_calls_helpers_only_in_native_method(
+    patches, monkeypatch, startup_worker, explicit, enabled,
+):
+    apply_plan = mock.Mock()
+    reserve = mock.Mock(return_value=321)
+
+    def native_determine(worker):
+        apply_plan(worker)
+        worker.model_runner.profile_run()
+        return reserve(400, worker.model_config.multimodal_config, 3)
+
+    startup_worker.determine_available_memory = native_determine
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker, enabled=enabled,
+        maybe_apply_startup_plan=apply_plan,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    if explicit:
+        worker.cache_config.kv_cache_memory_bytes = 400
+    assert worker.determine_available_memory() == 321
+    apply_plan.assert_called_once_with(worker)
+    reserve.assert_called_once_with(400, worker.model_config.multimodal_config, 3)
+    worker.model_runner.profile_run.assert_called_once_with()
+
+
+@pytest.mark.parametrize("frontend_count", [None, 1, 3])
+@pytest.mark.parametrize("remaining", [550, 450])
+def test_automatic_memory_reservation_preserves_warmup_accounting(
+    patches, monkeypatch, startup_worker, frontend_count, remaining,
+):
+    reserve = mock.Mock(return_value=remaining)
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    if frontend_count is None:
+        del worker.parallel_config._api_process_count
+        worker.model_config.multimodal_config = None
+    else:
+        worker.parallel_config._api_process_count = frontend_count
+
+    assert worker.determine_available_memory() == remaining
+    reserve.assert_called_once_with(
+        550, worker.model_config.multimodal_config, frontend_count or 1,
+    )
+    # Native warmup uses the pre-reservation field, not the returned budget.
+    assert worker.available_kv_cache_memory_bytes == 550
+    assert worker.total_consumed == 200
+    assert worker.peak_activation_memory == 50
+    assert worker.non_torch_memory == 0
+    worker.model_runner.profile_run.assert_called_once_with()
+
+
+def test_reservation_failure_and_retry_keep_automatic_budget(
+    patches, monkeypatch, startup_worker,
+):
+    reserve = mock.Mock(side_effect=[ValueError("no KV budget"), 450])
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    with pytest.raises(ValueError, match="no KV budget"):
+        worker.determine_available_memory()
+    assert worker.cache_config.kv_cache_memory_bytes is None
+    assert worker.determine_available_memory() == 450
+    assert worker.cache_config.kv_cache_memory_bytes is None
+    assert reserve.call_count == 2
+    assert worker.model_runner.profile_run.call_count == 2
+
+
 def test_legacy_determine_available_memory_runs_profile_without_device_delta(
     monkeypatch, patches
 ):
@@ -492,6 +728,7 @@ def test_null_block_reservation_waits_for_physical_capacity(monkeypatch, patches
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
     sleep = mock.Mock()
@@ -513,6 +750,7 @@ def test_null_block_reservation_retries_allocator_race(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(side_effect=[None, [0]])
     sleep = mock.Mock()
@@ -544,6 +782,7 @@ def test_null_block_wait_log_is_rate_limited(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(side_effect=[0, 0, 0, 1])
     manager._alloc = mock.Mock(return_value=[0])
 
@@ -559,6 +798,7 @@ def test_null_block_reservation_keeps_wrong_id_fail_loud(monkeypatch, patches):
     manager = object.__new__(manager_module.KVCacheManager)
     manager.reserve_null_block = True
     manager.null_block = None
+    manager._shutdown_requested = threading.Event()
     manager.available_size = mock.Mock(return_value=1)
     manager._alloc = mock.Mock(return_value=[1])
 

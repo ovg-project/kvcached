@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.locks import NoOpLock
@@ -41,6 +41,19 @@ logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
 
+# TTL for the cached get_avail_physical_pages() result in available_size().
+# Matches the C++ resize_watcher poll interval (csrc/page_allocator.cpp:838),
+# bounding the cache to one driver read per 100 ms window *between
+# invalidations*. Manager-driven mutations (alloc, free, resize, trim, clear,
+# and the in_shrink completion toggle) invalidate the cache immediately, so
+# they are never served stale; only sources the manager cannot invalidate —
+# the C++ prealloc thread and a sibling pool in a multi-manager process — can
+# be, and those are bounded by this TTL and absorbed by the alloc_page miss
+# path. This window is the allocator's existing watcher cadence, not a claim
+# that serving generally tolerates 100 ms of capacity staleness; see
+# _get_cached_avail_physical_pages for the full accounting.
+_AVAIL_PHYSICAL_PAGES_TTL_S: float = 0.1
+
 
 def synchronized(method):
     """
@@ -55,7 +68,42 @@ def synchronized(method):
     return synchronized_method
 
 
+def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
+                   *, internal_page: Any = None) -> int:
+    """Return the number of usable blocks on a page.
+
+    Blocks straddling a page boundary belong to neither page (see the
+    comment in ``get_page_occupancy``), so a page's capacity comes from
+    its own ``get_block_range`` rather than from the theoretical
+    ``page_size // block_mem_size`` that ``InternalPage.get_num_blocks``
+    returns. When ``block_mem_size`` does not evenly divide ``page_size``
+    (e.g. HYBRID_LINEAR / Mamba GDN per-block state — the case the
+    ``_alloc`` 0-usable-block parking comment at kv_cache_manager.py:335
+    names), some page ids yield *zero* usable blocks while
+    ``get_num_blocks`` reports one or more; counting those pages with
+    ``get_num_blocks`` inflates both ``available_size`` and the
+    lazy-shrink completion gate ``_get_num_alloced_blocks``.
+
+    Module-level (rather than a staticmethod) so it is unit-testable
+    without the compiled ``kvcached.vmm_ops`` extension or a GPU,
+    matching the ``_get_max_cached_blocks`` / ``_make_cache_key`` idiom.
+    The optional ``internal_page`` keyword lets tests inject a pure-Python
+    ``InternalPage`` stand-in without depending on import-order-sensitive
+    module-global rebinding.
+    """
+    ip = internal_page if internal_page is not None else InternalPage
+    start, end = ip.get_block_range(page_id, page_size,
+                                    block_mem_size)
+    return end - start
+
+
 class KVCacheManager:
+    # Cached get_avail_physical_pages() result + its monotonic timestamp.
+    # Class-level defaults keep the no-__init__ test-stub pattern
+    # (tests/test_alloc_rollback.py) working without each stub knowing
+    # about the cache; available_size() re-fetches when the TTL elapses.
+    _avail_physical_pages_cache: Optional[int] = None
+    _avail_physical_pages_ts: float = 0.0
 
     def __init__(
         self,
@@ -70,6 +118,7 @@ class KVCacheManager:
         num_kv_buffers: int = 2,
         group_id: int = 0,
         pool_name: Optional[str] = None,
+        defer_physical_release: bool = False,
     ):
         """
         Args:
@@ -88,6 +137,8 @@ class KVCacheManager:
                 Different groups have independent FTensors and page spaces.
             pool_name: Stable, low-cardinality name assigned by the engine
                 integration when this pool is created.
+            defer_physical_release: Retire empty pages until the engine confirms
+                that previously submitted worker batches have completed.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -96,6 +147,10 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
+        self.defer_physical_release = defer_physical_release
+        self.physical_release_barrier: Optional[Callable[[], None]] = None
+        self._physical_release_epoch = 0
+        self._retired_pages: List[tuple[int, List[int]]] = []
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
@@ -122,6 +177,13 @@ class KVCacheManager:
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
+        # Name of the /dev/shm segment the C++ MemInfoTracker creates for
+        # this pool; shutdown() unlinks it.
+        self.ipc_name = DEFAULT_IPC_NAME
+        self._shut_down = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = threading.Event()
+        self._prealloc_stopped = False
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -133,7 +195,7 @@ class KVCacheManager:
             enable_page_prealloc=PAGE_PREALLOC_ENABLED,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
-            ipc_name=DEFAULT_IPC_NAME,
+            ipc_name=self.ipc_name,
         )
         # Tell the C++ PageAllocator whether map/unmap must be broadcast to
         # worker processes over IPC, even with world_size == 1 (e.g. vLLM V1
@@ -202,6 +264,13 @@ class KVCacheManager:
         self._memory_limit_bytes: Optional[int] = None
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
+        # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
+        # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated after every
+        # physical-pool mutation the manager drives (alloc, free, resize,
+        # trim, clear) and the in_shrink completion toggle, so a mutation is
+        # never served stale.
+        self._avail_physical_pages_cache: Optional[int] = None
+        self._avail_physical_pages_ts: float = 0.0
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -213,9 +282,6 @@ class KVCacheManager:
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
-        if self.null_block is not None:
-            return
-
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
@@ -231,9 +297,11 @@ class KVCacheManager:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
+            if self.null_block is not None:
+                return
             total_wait = 0.0
             last_error: Exception | None = None
-            while True:
+            while not self._shutdown_requested.is_set():
                 try:
                     if _check_kv_tensors_created():
                         break
@@ -247,11 +315,14 @@ class KVCacheManager:
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
+            if self._shutdown_requested.is_set():
+                return
             # KV tensors created now
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
-            self.page_allocator.start_prealloc_thread()
+            if not self._shutdown_requested.is_set():
+                self.page_allocator.start_prealloc_thread()
         except Exception as e:
             logger.error(
                 f"Error during KVCacheManager post-initialization: {e}")
@@ -318,7 +389,7 @@ class KVCacheManager:
                 f"pp_rank={getattr(self, 'pp_rank', None)}, "
                 f"{allocator_state}")
 
-        while True:
+        while not self._shutdown_requested.is_set():
             loop_count += 1
             available_before = self.available_size()
             if available_before < 1:
@@ -406,6 +477,10 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
+                    # alloc_page() mapped a new physical page, shrinking the
+                    # driver's free pool; drop the cached count so the next
+                    # available_size() re-reads instead of serving stale data.
+                    self._avail_physical_pages_cache = None
                 except StateConsistencyError:
                     # Do not run further free/unmap operations on an unsafe pool.
                     raise
@@ -425,6 +500,15 @@ class KVCacheManager:
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 page = self._pick_avail_page(remaining_need)
+                if getattr(self, "_retired_pages", None) and page.empty():
+                    # Reusing logical blocks does not revoke their mapping.
+                    # Worker queue order protects reuse; cancel the old unmap
+                    # epoch so a later free must acquire a new completion fence.
+                    self._retired_pages = [
+                        (epoch, remaining)
+                        for epoch, page_ids in self._retired_pages
+                        if (remaining := [pid for pid in page_ids if pid != page.page_id])
+                    ]
             num_from_page = min(page.num_free_blocks(), remaining_need)
             alloced_index = page.alloc(num_from_page)
             ret_index.extend(alloced_index)
@@ -531,13 +615,35 @@ class KVCacheManager:
 
             if page.empty():
                 pages_to_free.append(page.page_id)
-                self.num_avail_blocks -= page.num_free_blocks()
+                if getattr(self, "defer_physical_release", False):
+                    self.avail_pages[page_id] = page
+                else:
+                    self.num_avail_blocks -= page.num_free_blocks()
             else:
                 self.avail_pages[page_id] = page
 
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            if getattr(self, "defer_physical_release", False):
+                self._physical_release_epoch = (
+                    getattr(self, "_physical_release_epoch", 0) + 1
+                )
+                retired_pages = getattr(self, "_retired_pages", None)
+                if retired_pages is None:
+                    retired_pages = self._retired_pages = []
+                retired_pages.append(
+                    (self._physical_release_epoch, pages_to_free)
+                )
+            else:
+                self.page_allocator.free_pages(pages_to_free)
+                self._avail_physical_pages_cache = None
 
+        self._maybe_finish_shrink()
+
+    def _maybe_finish_shrink(self) -> None:
+        if getattr(self, "_retired_pages", None):
+            # PageAllocator.resize() cannot shrink past pages that are still
+            # physically mapped for an in-flight worker batch.
+            return
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
@@ -553,7 +659,46 @@ class KVCacheManager:
                 else:
                     if resized:
                         self.in_shrink = False
+                        # Exiting shrink: the resize above changed the physical
+                        # footprint and this toggle bypasses resize(), so drop the
+                        # cached value so available_size() re-reads the driver.
+                        self._avail_physical_pages_cache = None
                         self.target_num_blocks = None
+                    else:
+                        logger.warning(
+                            "shrink to %d blocks refused by allocator "
+                            "(in-use pages above target); keeping shrink pending",
+                            self.target_num_blocks)
+
+    @synchronized
+    def capture_physical_release_marker(self) -> int:
+        """Return the latest page-retirement epoch."""
+        return getattr(self, "_physical_release_epoch", 0)
+
+    @synchronized
+    def release_retired_pages_through(self, marker: int) -> None:
+        """Physically release retired pages up to an acknowledged batch."""
+        pages_to_free: List[int] = []
+        still_retired: List[tuple[int, List[int]]] = []
+        for epoch, page_ids in getattr(self, "_retired_pages", []):
+            if epoch <= marker:
+                pages_to_free.extend(page_ids)
+            else:
+                still_retired.append((epoch, page_ids))
+
+        if pages_to_free:
+            barrier = getattr(self, "physical_release_barrier", None)
+            if barrier is not None:
+                barrier()
+            self.page_allocator.free_pages(pages_to_free)
+            for page_id in pages_to_free:
+                page = self.avail_pages.pop(page_id)
+                self.num_avail_blocks -= page.num_free_blocks()
+            # Logical retirement does not change physical capacity. Invalidate
+            # the cached count only once physical release has succeeded.
+            self._avail_physical_pages_cache = None
+        self._retired_pages = still_retired
+        self._maybe_finish_shrink()
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -584,6 +729,10 @@ class KVCacheManager:
         new_mem_size: the memory size of the K or V tensor in one layer
         """
         self._wait_post_init()
+        # resize() changes the physical footprint (and may toggle in_shrink);
+        # drop the cached avail-physical-pages so the next available_size()
+        # re-reads the driver instead of serving pre-resize data.
+        self._avail_physical_pages_cache = None
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
         try:
             resized = self.page_allocator.resize(new_mem_size)
@@ -618,6 +767,11 @@ class KVCacheManager:
         """
         self._wait_post_init()
         self.page_allocator.trim()
+        # trim() unmaps reserved pages, returning them to the driver free
+        # pool; drop the cached count so available_size() re-reads instead
+        # of serving a pre-trim value for one TTL window. free() invalidates
+        # for the same grow-direction mutation, so trim() does too.
+        self._avail_physical_pages_cache = None
 
     @synchronized
     def set_memory_limit(
@@ -710,12 +864,55 @@ class KVCacheManager:
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
-            physical_free_pages = self.page_allocator.get_avail_physical_pages(
-            ) + self.page_allocator.get_num_reserved_pages()
+            physical_free_pages = (
+                self._get_cached_avail_physical_pages()
+                + self.page_allocator.get_num_reserved_pages())
             free_pages = min(virtual_free_pages, physical_free_pages)
+            # The allocator exposes only a COUNT of free pages, not their ids,
+            # so this term can't use the boundary-aware _page_capacity
+            # (capacity depends on page_id; some ids yield zero usable blocks
+            # when block_mem_size does not divide page_size — see _alloc's
+            # 0-block parking at kv_cache_manager.py:335). get_num_blocks is
+            # the theoretical page_size // block_mem_size, so this is an UPPER
+            # BOUND; the precise accounting in _get_num_alloced_blocks and
+            # get_page_occupancy uses _page_capacity / get_block_range. A
+            # precise fix here needs page-id enumeration from the allocator
+            # (a C++ change, out of scope).
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
         return avail_blocks + blocks_from_free_pages
+
+    def _get_cached_avail_physical_pages(self) -> int:
+        """Return get_avail_physical_pages(), TTL-cached for available_size().
+
+        The underlying call fires cudaMemGetInfo (csrc/page_allocator.cpp:481)
+        on every available_size(), which runs per alloc
+        (kvcached/integration/vllm/patches.py:792) and per scheduler step
+        (:927); the TTL window collapses those to one driver read. The cache
+        is invalidated after every physical-pool mutation the manager drives
+        -- alloc mapping a page, free(), resize(), trim(), and clear() --
+        plus the in_shrink completion toggle, so a mutation is never served
+        stale physical-free data. The TTL window also bounds two same-process
+        sources the manager cannot invalidate: the C++ prealloc thread mapping
+        reserved pages in the background (a stale avail plus live reserved
+        double-counts them for up to one window), and a sibling pool in a
+        multi-manager process whose invalidation does not reach this cache;
+        both are absorbed by the alloc_page miss path the way cross-process
+        races already are.
+        get_num_free_pages() and get_num_reserved_pages() stay uncached (cheap
+        / atomic). Called under available_size()'s @synchronized lock, so the
+        cache read/write here is already serialized.
+        """
+        now = time.monotonic()
+        cached = self._avail_physical_pages_cache
+        if (cached is not None
+                and now - self._avail_physical_pages_ts
+                < _AVAIL_PHYSICAL_PAGES_TTL_S):
+            return cached
+        result: int = self.page_allocator.get_avail_physical_pages()
+        self._avail_physical_pages_cache = result
+        self._avail_physical_pages_ts = now
+        return result
 
     @synchronized
     def get_page_occupancy(self, page_ids: List[int]) -> Dict[int, int]:
@@ -781,6 +978,36 @@ class KVCacheManager:
             integration=integration,
         ).to_dict()
 
+    def shutdown(self) -> bool:
+        """Release the state this pool keeps outside the process.
+
+        os._exit bypasses the native destructor (issue #477). Stop background
+        users, then ask the native owner to release its original segment.
+        Return False if a step needs another attempt.
+        Successful steps are not repeated and a replacement file is preserved.
+        """
+        with self._shutdown_lock:
+            if self._shut_down:
+                return True
+            self._shutdown_requested.set()
+            # Initialization may still be polling worker IPC or reserving the
+            # null block. Do not free its resources until it has stopped.
+            if not self._post_init_done.wait(timeout=1.0):
+                logger.warning("KV cache initialization is still stopping; "
+                               "keeping its shared segment for a shutdown retry")
+                return False
+            if not self._prealloc_stopped:
+                try:
+                    self.page_allocator.stop_prealloc_thread()
+                except Exception as e:
+                    logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
+                    return False
+                self._prealloc_stopped = True
+            # The native owner captured the inode when it created the segment.
+            # A shutdown-time pathname lookup could claim a replacement engine.
+            self._shut_down = self.page_allocator.release_shared_segment()
+            return self._shut_down
+
     @synchronized
     def clear(self):
         """
@@ -800,13 +1027,21 @@ class KVCacheManager:
         self.free_reserved()
 
         # Free all blocks from avail_pages and full_pages
-        pages_to_free: List[int] = []
+        pages_to_free: List[int] = [
+            page_id
+            for _, page_ids in getattr(self, "_retired_pages", [])
+            for page_id in page_ids
+        ]
         for page in self.avail_pages.values():
             pages_to_free.append(page.page_id)
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            self.page_allocator.free_pages(list(dict.fromkeys(pages_to_free)))
+            # free_pages() returned physical pages to the driver, growing the
+            # free pool; drop the cached count so available_size() re-reads.
+            self._avail_physical_pages_cache = None
+        self._retired_pages = []
         self.avail_pages.clear()
         self.full_pages.clear()
 
@@ -822,6 +1057,9 @@ class KVCacheManager:
 
         self.target_num_blocks = None
         self.in_shrink = False
+        # clear() freed every page and trimmed; drop the cached value so
+        # the next available_size() re-reads the post-clear physical state.
+        self._avail_physical_pages_cache = None
         self.num_avail_blocks = 0
 
         # Possibly reserve the first block as null block for padding tokens
@@ -839,13 +1077,19 @@ class KVCacheManager:
         try_to_reserve() obtains them via alloc(), so they have already left
         their pages. They are deliberately NOT added a second time below.
         """
-        # Blocks from fully allocated pages
-        blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size)
+        # Blocks from fully allocated pages. Capacity is per-page-id because
+        # blocks straddling a page boundary belong to neither page (see
+        # get_page_occupancy); a parked 0-block page (the _alloc branch at
+        # kv_cache_manager.py:335) contributes nothing here, whereas the
+        # previous len(self.full_pages) * get_num_blocks(...) inflated it.
+        blocks_from_full_pages = sum(
+            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            for page_id in self.full_pages)
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
-        blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        blocks_from_avail_pages = sum(
+            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            for page_id in self.avail_pages) - self.num_avail_blocks
         return blocks_from_full_pages + blocks_from_avail_pages

@@ -1,19 +1,21 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <vector>
 
 #include <stdexcept>
 #include <string>
 
-#include <ATen/ops/from_blob.h>
-#include <c10/core/ScalarType.h>
+#include <torch/csrc/stable/ops.h>
 
 #include "constants.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 #include "transaction_error.hpp"
 
 namespace kvcached {
@@ -41,14 +43,14 @@ void throw_on_gpu_error(Status status, const char *operation) {
 
 static std::atomic<size_t> g_vaddr_allocated_offset = 0;
 
-static inline int resolve_device_index(const c10::Device &dev) {
+static inline int resolve_device_index(const torch::stable::Device &dev) {
   if (dev.index() >= 0) {
     return dev.index();
   }
   return gpu_vmm::current_device();
 }
 
-static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
+static inline generic_ptr_t alloc_virtual_mem(const torch::stable::Device &dev,
                                               size_t size) {
   size_t alignment_2mb = 2 * 1024 * 1024;
   ASSERT(size % alignment_2mb == 0,
@@ -71,9 +73,9 @@ static inline generic_ptr_t alloc_virtual_mem(const c10::Device &dev,
   return vaddr;
 }
 
-static inline std::unique_ptr<Page> make_unique_page(const c10::Device &dev,
-                                                     page_id_t page_id,
-                                                     size_t page_size = 0) {
+static inline std::unique_ptr<Page>
+make_unique_page(const torch::stable::Device &dev, page_id_t page_id,
+                 size_t page_size = 0) {
   if (dev.is_cuda()) {
     return std::make_unique<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
@@ -84,20 +86,20 @@ static inline std::unique_ptr<Page> make_unique_page(const c10::Device &dev,
   return nullptr;
 }
 
-FTensor::FTensor(const std::string &name, size_t size, c10::ScalarType dtype,
-                 c10::Device dev, std::shared_ptr<Page> zero_page,
-                 size_t page_size)
+FTensor::FTensor(const std::string &name, size_t size,
+                 torch::headeronly::ScalarType dtype, torch::stable::Device dev,
+                 std::shared_ptr<Page> zero_page, size_t page_size)
     : name_(name), vaddr_(nullptr), size_(size),
       page_size_(page_size > 0 ? page_size : kPageSize), dtype_(dtype),
       dev_(dev), zero_page_(zero_page) {
   vaddr_ = alloc_virtual_mem(dev_, size_);
   init_with_zero_();
 
-  auto num_elems = static_cast<int64_t>(size / c10::elementSize(dtype_));
-  auto options =
-      at::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
-  tensor_ =
-      at::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+  auto num_elems = static_cast<int64_t>(size / element_size(dtype_));
+  std::vector<int64_t> sizes = {num_elems};
+  std::vector<int64_t> strides = {1};
+  tensor_ = torch::stable::from_blob(reinterpret_cast<void *>(vaddr_), sizes,
+                                     strides, dev_, dtype_);
 }
 
 FTensor::~FTensor() {
