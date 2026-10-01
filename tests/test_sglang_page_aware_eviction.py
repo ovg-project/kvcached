@@ -1141,17 +1141,23 @@ def test_page_aware_evict_falls_back_when_no_page_is_reclaimable():
     assert cache.eviction_strategy is original_strategy
 
 
-def test_page_aware_evict_batches_large_native_fallback():
-    cached_blocks = [4 * index + 1 for index in range(1200)]
-    pinned_blocks = [4 * index for index in range(1200)]
+def test_page_aware_evict_batches_no_reclaimable_page_fallback():
+    num_pages = 400
+    cached_blocks = [
+        4 * page_id + offset
+        for page_id in range(num_pages)
+        for offset in (1, 2, 3)
+    ]
+    pinned_blocks = [4 * page_id for page_id in range(num_pages)]
     cache, _manager, _nodes = _make_cache(
         cached_blocks,
         allocated=[*cached_blocks, *pinned_blocks],
     )
-    eviction_budgets = []
+    original_strategy = cache.eviction_strategy
+    eviction_calls = []
 
     def evict(params):
-        eviction_budgets.append(params.num_tokens)
+        eviction_calls.append((params.num_tokens, cache.eviction_strategy))
 
     cache.evict = evict
     _evict_radix_cache_page_aware(
@@ -1160,7 +1166,10 @@ def test_page_aware_evict_batches_large_native_fallback():
         evict_params_cls=FakeEvictParams,
     )
 
-    assert eviction_budgets == [600]
+    assert len(eviction_calls) == 1
+    assert eviction_calls[0][0] == 600
+    assert eviction_calls[0][1] is not original_strategy
+    assert cache.eviction_strategy is original_strategy
 
 
 def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
