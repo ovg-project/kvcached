@@ -56,10 +56,12 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
-| SGLang | ≥ v0.4.9 (tested up to v0.5.15) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Gemma-4-E2B-it, Gemma-4-12B-it |
+| SGLang | ≥ v0.4.9 (tested up to v0.5.20) | MHA / GQA / MLA / sliding window / hybrid / Mamba2 | DeepSeek-V2/V3, Qwen3-8B, GPT-OSS-20B, Qwen3.8-27B, Gemma-4-E2B-it, Mamba-Codestral-7B |
 | vLLM | ≥ v0.8.4 (tested up to v0.24.0) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Gemma-4-E2B-it, Gemma-4-12B-it |
 
-See [#425](https://github.com/ovg-project/kvcached/issues/425) for per-model results on each engine and KV layout.
+See [#425](https://github.com/ovg-project/kvcached/issues/425) for per-model results on each engine and KV layout, and [#509](https://github.com/ovg-project/kvcached/issues/509) for the SGLang v0.5.20 validation runs behind this table.
+
+> Hybrid linear-attention and Mamba models keep per-request recurrent state, and a model whose per-slot state exceeds the default 2 MiB physical page needs `KVCACHED_PAGE_SIZE_MB` raised: Qwen3.8-27B needs 4, Mamba-Codestral-7B needs 8. The serve error names the required value. The v0.5.20 validation covered Gemma-4-E2B-it text-only. Gemma-4-12B-it does not serve on SGLang v0.5.20 with or without kvcached ([sglang#35809](https://github.com/sgl-project/sglang/pull/35809), fixed upstream after v0.5.20) and returns to this row with the next SGLang release.
 
 ## Example use cases
 
@@ -128,7 +130,7 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 ### Prerequisites
 
 - Python (tested with 3.9 - 3.13)
-- SGLang (tested with v0.5.15) or vLLM (tested with v0.19.0)
+- SGLang (tested with v0.5.20) or vLLM (tested with v0.19.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
