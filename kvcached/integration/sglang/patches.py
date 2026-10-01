@@ -6,6 +6,7 @@ SGLang-specific patches using unified patch infrastructure.
 """
 
 import functools
+import heapq
 import inspect
 import math
 import os
@@ -2338,6 +2339,20 @@ class _RadixEvictionSelection(NamedTuple):
     token_count: int
 
 
+def _align_radix_eviction_budget(radix_cache: Any, num_tokens: int) -> int:
+    """Round eviction up because radix nodes split only on logical pages.
+
+    This is equivalent to rounding the effective cache cap down. It may evict
+    up to one page minus one extra token, but avoids an unsafe partial-page
+    split; the cache's evictable size remains the upper bound.
+    """
+    logical_page_size = max(1, int(radix_cache.page_size))
+    aligned_tokens = (
+        max(0, num_tokens) + logical_page_size - 1
+    ) // logical_page_size * logical_page_size
+    return min(aligned_tokens, int(radix_cache.evictable_size_))
+
+
 def _radix_suffix_closure(
     index: _RadixBlockIndex,
     plans: Sequence[_RadixSuffixPlan],
@@ -2426,9 +2441,6 @@ def _select_page_aware_plan(
             split_by_node[owner] = (
                 block_offset if previous is None else min(previous, block_offset)
             )
-        if not split_by_node:
-            continue
-
         plan = _radix_suffix_closure(
             index,
             [
@@ -2495,7 +2507,60 @@ def _select_page_aware_plan(
     return _RadixEvictionSelection(selected_plans, selected_tokens)
 
 
-def _split_page_aware_suffixes(
+def _select_native_order_plan(
+    radix_cache: Any,
+    token_budget: int,
+    eviction_strategy: Any,
+) -> _RadixEvictionSelection:
+    """Select a native-policy batch, splitting only its final victim."""
+    if token_budget <= 0:
+        return _RadixEvictionSelection([], 0)
+
+    heap: List[Tuple[Any, int, Any]] = []
+    sequence = 0
+    for leaf in radix_cache.evictable_leaves:
+        heapq.heappush(
+            heap,
+            (eviction_strategy.get_priority(leaf), sequence, leaf),
+        )
+        sequence += 1
+
+    remaining_children: Dict[int, int] = {}
+    plans: List[_RadixSuffixPlan] = []
+    selected_tokens = 0
+    logical_page_size = max(1, int(radix_cache.page_size))
+    while selected_tokens < token_budget and heap:
+        _priority, _sequence, node = heapq.heappop(heap)
+        node_tokens = int(node.value.numel())
+        tokens_needed = token_budget - selected_tokens
+        split_len = max(0, node_tokens - tokens_needed)
+        if split_len % logical_page_size != 0:
+            raise RuntimeError(
+                "LRU leaf length is not aligned to the logical page size"
+            )
+
+        plans.append((node, split_len))
+        selected_tokens += node_tokens - split_len
+        if split_len > 0:
+            break
+
+        parent = node.parent
+        if parent is None:
+            continue
+        parent_id = id(parent)
+        child_count = remaining_children.get(parent_id, len(parent.children)) - 1
+        remaining_children[parent_id] = child_count
+        if child_count == 0 and parent.lock_ref == 0:
+            heapq.heappush(
+                heap,
+                (eviction_strategy.get_priority(parent), sequence, parent),
+            )
+            sequence += 1
+
+    return _RadixEvictionSelection(plans, selected_tokens)
+
+
+def _split_eviction_suffixes(
     radix_cache: Any,
     plans: Sequence[_RadixSuffixPlan],
 ) -> Set[Any]:
@@ -2528,12 +2593,20 @@ def _evict_radix_cache_page_aware(
     num_tokens: int,
     evict_params_cls: Callable[..., Any],
 ) -> Any:
-    """Evict exactly ``num_tokens``, preferring page-reclaiming suffixes."""
-    if num_tokens >= radix_cache.evictable_size_:
+    """Evict at least ``num_tokens`` in legal logical-page units."""
+    eviction_budget = _align_radix_eviction_budget(radix_cache, num_tokens)
+    if eviction_budget <= 0:
+        return radix_cache.evict(
+            _make_sglang_evict_arg(
+                num_tokens=0,
+                evict_params_cls=evict_params_cls,
+            )
+        )
+    if eviction_budget >= radix_cache.evictable_size_:
         try:
             return radix_cache.evict(
                 _make_sglang_evict_arg(
-                    num_tokens=num_tokens,
+                    num_tokens=eviction_budget,
                     evict_params_cls=evict_params_cls,
                 )
             )
@@ -2563,40 +2636,35 @@ def _evict_radix_cache_page_aware(
             )
         return result
 
-    selection = _select_page_aware_plan(radix_cache, num_tokens)
+    selection = _select_page_aware_plan(radix_cache, eviction_budget)
     result = None
     try:
         if selection.suffix_plans:
-            selected = _split_page_aware_suffixes(radix_cache, selection.suffix_plans)
+            selected = _split_eviction_suffixes(radix_cache, selection.suffix_plans)
             result = evict_selected(selected, selection.token_count)
 
-        remaining = num_tokens - selection.token_count
-        while remaining > 0 and radix_cache.evictable_leaves:
-            leaf = min(
-                radix_cache.evictable_leaves,
-                key=original_strategy.get_priority,
-            )
-            leaf_tokens = int(leaf.value.numel())
-            if leaf_tokens > remaining:
-                split_len = leaf_tokens - remaining
-                if split_len % max(1, int(radix_cache.page_size)) != 0:
-                    raise RuntimeError(
-                        "LRU leaf length is not aligned to the logical page size"
-                    )
-                radix_cache._split_node(leaf.key, leaf, split_len)
-                leaf_tokens = remaining
-
-            result = evict_selected({leaf}, leaf_tokens)
-            remaining -= leaf_tokens
-        if remaining > 0:
+        remaining = eviction_budget - selection.token_count
+        native_selection = _select_native_order_plan(
+            radix_cache=radix_cache,
+            token_budget=remaining,
+            eviction_strategy=original_strategy,
+        )
+        if native_selection.token_count != remaining:
             raise RuntimeError("SGLang radix cache ran out of evictable tokens")
+        if native_selection.suffix_plans:
+            selected = _split_eviction_suffixes(
+                radix_cache, native_selection.suffix_plans
+            )
+            result = evict_selected(selected, native_selection.token_count)
         if result is not None:
-            result.num_tokens_evicted = num_tokens
+            result.num_tokens_evicted = eviction_budget
         return result
     finally:
         index = getattr(radix_cache, "_kvcached_radix_block_index", None)
         if index is not None:
             index.sync(_evictable_radix_nodes(radix_cache))
+
+
 class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     """Enforce KVCACHED_MAX_CACHED_TOKENS limit on SGLang's RadixCache.
 
