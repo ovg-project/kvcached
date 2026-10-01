@@ -233,7 +233,22 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
     target_class = "KVCacheConfigurator"
 
     def _get_mem_fraction_static(self, configurator: Any) -> float:
-        return float(configurator.server_args.mem_fraction_static)
+        # SGLang 0.5.17 moved the resolved value into the runtime-context
+        # schedule bag: KVCacheConfigurator's own sizing reads
+        # get_schedule().mem_fraction_static from 0.5.17 on, while
+        # configurator.server_args keeps the raw CLI value, which is None
+        # whenever --mem-fraction-static is not passed (and the unscaled
+        # number when it is). Reading server_args there made float(None)
+        # raise and the hook silently fall back to native profiling on
+        # every 0.5.17+ serve (#509 validation finding). Read the same
+        # source the configurator reads, detected by presence rather than
+        # version; 0.5.16 has no runtime_context and resolves the value
+        # onto server_args.
+        try:
+            from sglang.srt.runtime_context import get_schedule
+        except ImportError:
+            return float(configurator.server_args.mem_fraction_static)
+        return float(get_schedule().mem_fraction_static)
 
     def _handle_max_mamba_cache(
         self, configurator: Any, capacity_gib: float
