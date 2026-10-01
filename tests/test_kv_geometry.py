@@ -44,10 +44,19 @@ def _brute_zero_capacity(unit, page_size):
     (3211264, 4), (3211264, 8), (3211264, 16), (2162688, 4), (2162688, 16),
     (4 * MIB, 4), (2 * MIB, 4), (18432, 2), (32768, 2), (131072, 2),
     (3 * MIB, 4), (int(2.5 * MIB), 4), (MIB + 4096, 2), (MIB, 2),
+    (4 * MIB, 6), (6 * MIB, 10), (5 * MIB, 6),
 ])
 def test_zero_capacity_criterion_matches_page_ranges(unit, page_mb):
     page = page_mb * MIB
     assert has_zero_capacity_pages(unit, page) == _brute_zero_capacity(unit, page)
+
+
+def test_zero_capacity_criterion_matches_all_small_integer_geometries():
+    for page in range(1, 65):
+        for unit in range(1, 65):
+            assert has_zero_capacity_pages(unit, page) == _brute_zero_capacity(unit, page), (
+                unit, page,
+            )
 
 
 def test_real_hybrid_units():
@@ -84,6 +93,8 @@ def test_check_page_geometry_messages():
     assert check_page_geometry(18432, 2 * MIB, 16) is None        # MLA: straddles, no empty page
     assert check_page_geometry(3211264, 16 * MIB, 784) is None    # straddles, no empty page
     assert check_page_geometry(4 * MIB, 4 * MIB, 1024) is None
+    assert check_page_geometry(4 * MIB, 6 * MIB, 1024) is None
+    assert check_page_geometry(6 * MIB, 10 * MIB, 1536) is None
 
     msg = check_page_geometry(3211264, 4 * MIB, 784)
     assert msg is not None

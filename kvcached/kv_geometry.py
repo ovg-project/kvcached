@@ -12,6 +12,7 @@ and could never be released. Pure functions only, so this is testable without
 the compiled extension.
 """
 
+from math import gcd
 from typing import Optional
 
 MIB = 1024 * 1024
@@ -24,12 +25,12 @@ MAX_BLOCK_GROWTH = 2
 def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     """Whether some page would hold no whole block.
 
-    If ``2 * block_mem_size <= page_size``, the first block starting inside a
-    page ends before the page does, so every page holds one. If blocks tile the
-    page exactly, none straddles. Otherwise the blocks drift across page
-    boundaries and some page receives none.
+    Page starts visit multiples of ``gcd(page_size, block_mem_size)`` modulo
+    the block size. The largest gap to the next block start is therefore
+    ``block_mem_size - gcd(...)``. Every page holds a block exactly when it
+    can fit that worst-case gap plus one complete block.
     """
-    return 2 * block_mem_size > page_size and page_size % block_mem_size != 0
+    return page_size < 2 * block_mem_size - gcd(page_size, block_mem_size)
 
 
 def aligned_block_size(block_size: int, bytes_per_token: int,

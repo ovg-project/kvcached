@@ -156,8 +156,8 @@ class KVCacheManager:
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
         # Every page must hold a whole block. A block larger than a page leaves
-        # the pool empty (warmup deadlocks); a block larger than half a page
-        # that does not tile it leaves some pages with no block, and such a
+        # the pool empty (warmup deadlocks); an unfavorable block/page alignment
+        # can leave some pages with no block, and such a
         # page, once mapped, is never released. Both happen with hybrid
         # linear-attention models (e.g. Qwen3.5 GDN, Mamba) whose per-block
         # state is large. Fail loudly with a geometry that works.
