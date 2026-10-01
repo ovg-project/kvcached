@@ -19,18 +19,12 @@ from kvcached.integration.sglang.patches import (
 BLOCKS_PER_PAGE = 4
 
 
-def _selected_nodes(radix_cache: Any, token_budget: int):
+def _whole_node_suffixes(selection):
     return {
         leaf
-        for leaf, split_len in _select_page_aware_plan(
-            radix_cache, token_budget
-        ).suffix_plans
+        for leaf, split_len in selection.suffix_plans
         if split_len == 0
     }
-
-
-def _selected_token_count(selection):
-    return selection.token_count
 
 
 class FakeNode:
@@ -180,7 +174,9 @@ def test_selector_empties_one_page_instead_of_scattering_victims():
     block_ids = [4, 8, 5, 9, 6, 10, 7, 11]
     cache, _manager, nodes = _make_cache(block_ids)
 
-    selected = _selected_nodes(cache, token_budget=4)
+    selected = _whole_node_suffixes(
+        _select_page_aware_plan(cache, token_budget=4)
+    )
 
     assert {int(node.value[0]) for node in selected} == {4, 5, 6, 7}
     assert len(selected) == 4
@@ -195,7 +191,9 @@ def test_selector_skips_page_pinned_by_active_block():
         allocated=[4, 5, 6, 7, 8, 9, 10, 11],
     )
 
-    selected = _selected_nodes(cache, token_budget=4)
+    selected = _whole_node_suffixes(
+        _select_page_aware_plan(cache, token_budget=4)
+    )
 
     assert {int(node.value[0]) for node in selected} == {8, 9, 10, 11}
 
@@ -235,7 +233,7 @@ def test_selector_prefers_internal_closure_reclaiming_two_pages():
     )
 
     assert selection.suffix_plans == [(parent, 0)]
-    assert _selected_token_count(selection) == 8
+    assert selection.token_count == 8
 
 
 def test_selector_amortizes_long_node_over_all_pages_it_releases():
@@ -256,7 +254,9 @@ def test_selector_amortizes_long_node_over_all_pages_it_releases():
         token_to_kv_pool_allocator=FakeAllocator(manager),
     )
 
-    selected = _selected_nodes(cache, token_budget=8)
+    selected = _whole_node_suffixes(
+        _select_page_aware_plan(cache, token_budget=8)
+    )
 
     assert selected == {long_node}
 
@@ -270,7 +270,7 @@ def test_plan_rejects_first_candidate_that_exceeds_budget():
     )
 
     assert selection.suffix_plans == []
-    assert _selected_token_count(selection) == 0
+    assert selection.token_count == 0
 
 
 def test_plan_does_not_cross_remaining_budget():
@@ -281,8 +281,8 @@ def test_plan_does_not_cross_remaining_budget():
         token_budget=5,
     )
 
-    assert _selected_nodes(cache, token_budget=5) == set(nodes[:4])
-    assert _selected_token_count(selection) == 4
+    assert _whole_node_suffixes(selection) == set(nodes[:4])
+    assert selection.token_count == 4
 
 
 def test_selector_prefers_fewer_tokens_even_when_it_requires_more_nodes():
@@ -309,8 +309,8 @@ def test_selector_prefers_fewer_tokens_even_when_it_requires_more_nodes():
         token_budget=4,
     )
 
-    assert _selected_nodes(cache, token_budget=4) == set(small_nodes)
-    assert _selected_token_count(selection) == 4
+    assert _whole_node_suffixes(selection) == set(small_nodes)
+    assert selection.token_count == 4
 
 
 def test_leaf_suffix_can_reclaim_page_while_touching_partial_page():
@@ -341,7 +341,7 @@ def test_leaf_suffix_can_reclaim_page_while_touching_partial_page():
 
     assert len(selection.suffix_plans) == 1
     assert selection.suffix_plans[0][1] == 1
-    assert _selected_token_count(selection) == 5
+    assert selection.token_count == 5
 
 
 def test_leaf_suffix_split_uses_radix_logical_page_alignment():
@@ -373,7 +373,7 @@ def test_leaf_suffix_split_uses_radix_logical_page_alignment():
     assert len(selection.suffix_plans) == 1
     assert selection.suffix_plans[0][1] == 8
     assert selection.suffix_plans[0][1] % cache.page_size == 0
-    assert _selected_token_count(selection) == 8
+    assert selection.token_count == 8
 
 
 def test_leaf_suffix_uses_budget_to_reclaim_equal_cost_pages():
@@ -397,7 +397,7 @@ def test_leaf_suffix_uses_budget_to_reclaim_equal_cost_pages():
     )
 
     assert selection.suffix_plans == [(leaf, 1)]
-    assert _selected_token_count(selection) == 4
+    assert selection.token_count == 4
 
 
 def test_page_candidate_combines_suffixes_from_multiple_leaves():
@@ -457,7 +457,7 @@ def test_planner_compares_single_and_multi_leaf_suffix_candidates():
         leaf for leaf, split_len in selection.suffix_plans if split_len == 0
     }
     assert whole_leaf_suffixes == set(short_leaves)
-    assert _selected_token_count(selection) == 4
+    assert selection.token_count == 4
 
 
 def test_selector_converts_multi_token_logical_pages_to_block_ids(monkeypatch):
@@ -486,13 +486,13 @@ def test_selector_converts_multi_token_logical_pages_to_block_ids(monkeypatch):
         token_budget=8,
     )
 
-    assert _selected_nodes(cache, token_budget=8) == {
+    assert _whole_node_suffixes(selection) == {
         nodes[0],
         nodes[2],
         nodes[4],
         nodes[6],
     }
-    assert _selected_token_count(selection) == 8
+    assert selection.token_count == 8
     assert concatenated_elements == [len(block_ids)]
 
 
@@ -507,10 +507,10 @@ def test_selector_caches_block_ids_on_node_values(monkeypatch):
         return original_cat(*args, **kwargs)
 
     monkeypatch.setattr(torch, "cat", counting_cat)
-    _selected_nodes(cache, token_budget=4)
+    _select_page_aware_plan(cache, token_budget=4)
     index = cache._kvcached_radix_block_index
     block_owners = index.block_owners
-    _selected_nodes(cache, token_budget=4)
+    _select_page_aware_plan(cache, token_budget=4)
     assert cat_calls == 1
     assert cache._kvcached_radix_block_index is index
     assert index.block_owners is block_owners
@@ -519,7 +519,7 @@ def test_selector_caches_block_ids_on_node_values(monkeypatch):
     manager.allocated.add(12)
     nodes[0].value = nodes[0].value.clone()
     nodes[0].value[0] = 12
-    _selected_nodes(cache, token_budget=4)
+    _select_page_aware_plan(cache, token_budget=4)
     assert cat_calls == 2
     assert 4 not in index.block_owners
     assert index.block_owners[12] is nodes[0]
@@ -527,7 +527,7 @@ def test_selector_caches_block_ids_on_node_values(monkeypatch):
 
 def test_selector_removes_nodes_from_persistent_index():
     cache, manager, nodes = _make_cache([4, 5, 6, 7])
-    _selected_nodes(cache, token_budget=4)
+    _select_page_aware_plan(cache, token_budget=4)
     index = cache._kvcached_radix_block_index
 
     removed = nodes[0]
@@ -535,7 +535,7 @@ def test_selector_removes_nodes_from_persistent_index():
     del cache.root_node.children[4]
     manager.free([4])
 
-    _selected_nodes(cache, token_budget=3)
+    _select_page_aware_plan(cache, token_budget=3)
 
     assert removed not in index.node_blocks
     assert 4 not in index.block_owners
@@ -562,7 +562,7 @@ def test_native_split_refreshes_index_for_internal_suffix_closure():
         block_ids=[4, 5, 6, 7],
     )
 
-    _selected_nodes(cache, token_budget=4)
+    _select_page_aware_plan(cache, token_budget=4)
     old_node = cache.root_node.children[10]
     matched, split_node = _native_match(
         cache,
@@ -570,7 +570,8 @@ def test_native_split_refreshes_index_for_internal_suffix_closure():
         match_params_cls,
         tokens=[10, 11],
     )
-    selected = _selected_nodes(cache, token_budget=4)
+    selection = _select_page_aware_plan(cache, token_budget=4)
+    selected = _whole_node_suffixes(selection)
     index = cache._kvcached_radix_block_index
 
     assert matched == [4, 5]
@@ -817,6 +818,55 @@ def test_native_exact_lru_splits_final_leaf_at_logical_page_boundary():
         tokens=tokens,
     )[0] == [8, 9, 10, 11]
     assert manager.allocated == {4, 5, 7}
+
+
+@pytest.mark.parametrize(
+    ("cached_tokens", "requested_tokens", "expected_evicted"),
+    [
+        (1024, 24, 32),
+        (16, 8, 16),
+    ],
+)
+def test_native_page_aware_evict_aligns_fractional_page_budget(
+    cached_tokens, requested_tokens, expected_evicted
+):
+    (
+        radix_cache_cls,
+        radix_key_cls,
+        evict_params_cls,
+        insert_params_cls,
+        match_params_cls,
+    ) = _native_radix_types()
+    logical_page_size = 16
+    manager = FakeManager(range(cached_tokens // logical_page_size))
+    cache = radix_cache_cls.create_simulated(
+        mock_allocator=FakeAllocator(manager, page_size=logical_page_size),
+        page_size=logical_page_size,
+    )
+    tokens = list(range(10_000, 10_000 + cached_tokens))
+    _native_insert(
+        cache,
+        radix_key_cls,
+        insert_params_cls,
+        tokens=tokens,
+        block_ids=list(range(cached_tokens)),
+    )
+
+    result = _evict_radix_cache_page_aware(
+        radix_cache=cache,
+        num_tokens=requested_tokens,
+        evict_params_cls=evict_params_cls,
+    )
+
+    retained_values, _ = _native_match(
+        cache,
+        radix_key_cls,
+        match_params_cls,
+        tokens=tokens,
+    )
+    assert result.num_tokens_evicted == expected_evicted
+    assert len(retained_values) == cached_tokens - expected_evicted
+    assert cache.evictable_size_ == cached_tokens - expected_evicted
 
 
 def test_native_cancel_keeps_prefix_locked_by_another_request():
@@ -1086,9 +1136,31 @@ def test_page_aware_evict_falls_back_when_no_page_is_reclaimable():
         evict_params_cls=FakeEvictParams,
     )
 
-    assert [budget for budget, _strategy in eviction_calls] == [1, 1]
+    assert [budget for budget, _strategy in eviction_calls] == [2]
     assert all(strategy is not original_strategy for _, strategy in eviction_calls)
     assert cache.eviction_strategy is original_strategy
+
+
+def test_page_aware_evict_batches_large_native_fallback():
+    cached_blocks = [4 * index + 1 for index in range(1200)]
+    pinned_blocks = [4 * index for index in range(1200)]
+    cache, _manager, _nodes = _make_cache(
+        cached_blocks,
+        allocated=[*cached_blocks, *pinned_blocks],
+    )
+    eviction_budgets = []
+
+    def evict(params):
+        eviction_budgets.append(params.num_tokens)
+
+    cache.evict = evict
+    _evict_radix_cache_page_aware(
+        radix_cache=cache,
+        num_tokens=600,
+        evict_params_cls=FakeEvictParams,
+    )
+
+    assert eviction_budgets == [600]
 
 
 def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
@@ -1198,9 +1270,6 @@ def test_radix_patch_uses_native_eviction_for_legacy_sglang(monkeypatch):
         def cache_finished_req(self, *args, **kwargs):
             pass
 
-        def reset(self):
-            pass
-
         def evict(self, num_tokens):
             self.eviction_args.append(num_tokens)
 
@@ -1226,9 +1295,6 @@ def test_radix_patch_enforces_limit_after_each_finished_request(monkeypatch):
 
         def cache_finished_req(self, *args, **kwargs):
             self.evictable_size_ += 1
-
-        def reset(self):
-            pass
 
         def evict(self, num_tokens):
             self.eviction_args.append(num_tokens)

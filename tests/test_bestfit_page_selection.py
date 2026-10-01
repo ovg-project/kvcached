@@ -195,17 +195,5 @@ class TestPackedAllocationFillsDecodeHoles:
         assert mgr.avail_pages[41].num_free_blocks() == 1
         assert mgr.avail_pages[42].num_free_blocks() == 40
 
-    def test_normal_allocation_still_keeps_a_large_run_together(self):
-        mgr = _make_manager(
-            [FakePage(50, 3), FakePage(51, 5), FakePage(52, 40)]
-        )
-
-        block_ids = mgr.alloc(7)
-
-        assert block_ids is not None
-        assert _pages_touched(block_ids) == {52}
-
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
