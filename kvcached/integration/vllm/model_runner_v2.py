@@ -11,6 +11,7 @@ from functools import wraps
 from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
+from kvcached.kv_geometry import check_page_geometry
 from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, KVCachedConfigError
 
 _persistent_allocation: ContextVar[bool] = ContextVar("kvcached_mrv2_allocation", default=False)
@@ -126,10 +127,9 @@ def cache_geometry(config: Any) -> CacheGeometry:
             raise KVCachedConfigError("KV backing size disagrees with the uniform physical pool geometry")
     if page_bytes % block_size:
         raise KVCachedConfigError("KV allocation unit bytes must divide exactly by the attention block size")
-    if page_bytes > PAGE_SIZE:
-        raise KVCachedConfigError(
-            f"KV allocation unit ({page_bytes} bytes) exceeds the native page ({PAGE_SIZE} bytes)"
-        )
+    geometry_error = check_page_geometry(page_bytes, PAGE_SIZE, block_size)
+    if geometry_error is not None:
+        raise KVCachedConfigError(geometry_error)
     return CacheGeometry(block_size, page_bytes, num_pools)
 
 
