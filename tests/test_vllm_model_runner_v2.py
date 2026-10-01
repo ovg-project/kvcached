@@ -285,6 +285,47 @@ def test_mixed_packing_rejects_kernel_split_before_allocating(monkeypatch):
     assert captured == []
 
 
+@pytest.mark.parametrize("layout_name", ["BLNHC", "BLHNC", "LBNHC", "LBHNC"])
+@pytest.mark.parametrize("padded,kernel_size", [(None, 1), (128, 1), (128, 2)])
+def test_single_layer_kernel_split_uses_dense_page_size(monkeypatch, layout_name, padded, kernel_size):
+    contiguous = layout_name.startswith("B")
+    captured = mock_native_allocator(monkeypatch, contiguous)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 128)
+    spec = FullAttentionSpec(
+        block_size=2, num_kv_heads=2, head_size=4,
+        dtype=torch.bfloat16, page_size_padded=padded,
+    )
+    page_bytes = spec.page_size_bytes
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[KVCacheTensor(
+            size=3 * page_bytes, layers=["a"], block_stride=page_bytes,
+            layer_stride=page_bytes if contiguous else 3 * page_bytes,
+        )],
+        kv_cache_groups=[KVCacheGroupSpec(["a"], spec)],
+    )
+    if padded is not None and kernel_size == 1:
+        before = copy.deepcopy(config)
+        with pytest.raises(adapter.KVCachedConfigError, match="dense page is 64 bytes") as error:
+            adapter.allocate_kv_cache(
+                config, torch.device("cpu"), KVCacheLayout[layout_name], [kernel_size],
+            )
+        assert "Changing the KV layout does not remove" in str(error.value)
+        assert "KVCACHED_CONTIGUOUS_LAYOUT=false" not in str(error.value)
+        assert captured == []
+        assert config == before
+    else:
+        caches = adapter.allocate_kv_cache(
+            config, torch.device("cpu"), KVCacheLayout[layout_name], [kernel_size],
+        )
+        assert len(captured) == 1
+        assert caches["a"].shape[0] == 3 * (spec.block_size // kernel_size)
+        for block in range(caches["a"].shape[0]):
+            caches["a"][block].fill_(block + 1)
+        for block in range(caches["a"].shape[0]):
+            assert torch.all(caches["a"][block] == block + 1)
+
+
 def test_profile_and_failed_initialization_do_not_leak_persistent_scope(monkeypatch):
     calls = []
     attn_utils = types.ModuleType("vllm.v1.worker.gpu.attn_utils")
