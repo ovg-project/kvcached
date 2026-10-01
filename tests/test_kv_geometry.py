@@ -13,7 +13,6 @@ import math
 import sys
 import threading
 import types
-from typing import List
 from unittest import mock
 
 import pytest
@@ -87,12 +86,15 @@ def test_check_page_geometry_messages():
     assert check_page_geometry(4 * MIB, 4 * MIB, 1024) is None
 
     msg = check_page_geometry(3211264, 4 * MIB, 784)
+    assert msg is not None
     assert "does not tile" in msg and "--block-size 1024" in msg
     msg = check_page_geometry(3211264, 2 * MIB, 784)
+    assert msg is not None
     assert "larger than the page" in msg
     assert "KVCACHED_PAGE_SIZE_MB=4 with --block-size 1024" in msg
     # Without the token count the advice falls back to a page size.
-    assert "KVCACHED_PAGE_SIZE_MB=" in check_page_geometry(3211264, 4 * MIB)
+    msg = check_page_geometry(3211264, 4 * MIB)
+    assert msg is not None and "KVCACHED_PAGE_SIZE_MB=" in msg
 
 
 # --------------------------------------------------------------- KVCacheManager
@@ -145,7 +147,7 @@ def test_alloc_fails_loud_instead_of_parking_an_empty_page(monkeypatch):
     manager.num_avail_blocks = 0
     manager.avail_pages = {}
     manager.full_pages = {}
-    manager.reserved_blocks: List[int] = []
+    manager.reserved_blocks = []
     manager.in_shrink = False
     manager.target_num_blocks = None
     manager._lock = NoOpLock()

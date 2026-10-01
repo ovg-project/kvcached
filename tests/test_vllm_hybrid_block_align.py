@@ -65,7 +65,7 @@ def test_patch_wraps_the_platform_classmethod(vllm_patches, monkeypatch):
         pass
 
     module = types.ModuleType("vllm.platforms.interface")
-    module.Platform = Platform
+    module.Platform = Platform  # type: ignore[attr-defined]
     patch = vllm_patches.HybridBlockSizeAlignPatch()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _name: "0.29.0")
     monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: True)
@@ -87,7 +87,7 @@ def test_disabled_kvcached_keeps_native_behavior(vllm_patches, monkeypatch):
             vllm_config.cache_config.block_size = 784
 
     module = types.ModuleType("vllm.platforms.interface")
-    module.Platform = Platform
+    module.Platform = Platform  # type: ignore[attr-defined]
     patch = vllm_patches.HybridBlockSizeAlignPatch()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _name: "0.29.0")
     monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: False)
@@ -99,7 +99,7 @@ def test_disabled_kvcached_keeps_native_behavior(vllm_patches, monkeypatch):
 
 def test_release_without_the_hook_is_a_noop(vllm_patches, monkeypatch):
     module = types.ModuleType("vllm.platforms.interface")
-    module.Platform = type("Platform", (), {})
+    module.Platform = type("Platform", (), {})  # type: ignore[attr-defined]
     patch = vllm_patches.HybridBlockSizeAlignPatch()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _name: "0.25.1")
     assert patch.apply(module)
