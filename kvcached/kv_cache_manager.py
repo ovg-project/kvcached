@@ -120,6 +120,7 @@ class KVCacheManager:
         group_id: int = 0,
         pool_name: Optional[str] = None,
         defer_physical_release: bool = False,
+        own_segment: bool = False,
     ):
         """
         Args:
@@ -140,6 +141,9 @@ class KVCacheManager:
                 integration when this pool is created.
             defer_physical_release: Retire empty pages until the engine confirms
                 that previously submitted worker batches have completed.
+            own_segment: Give a non-zero group its own /dev/shm segment
+                (``<ipc name>_g<group_id>``) instead of the instance's shared
+                one, for pools whose sizes differ (SGLang SWA and Mamba pools).
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -170,8 +174,12 @@ class KVCacheManager:
         self.world_size = world_size
         self.pp_rank = pp_rank
         # Name of the /dev/shm segment the C++ MemInfoTracker creates for
-        # this pool; shutdown() unlinks it.
+        # this pool; shutdown() unlinks it. The C++ tracker derives the pool's
+        # limit from the segment, so pools of different sizes cannot share
+        # one; it adds the _g<id> suffix only when given no name.
         self.ipc_name = DEFAULT_IPC_NAME
+        if own_segment and group_id != 0:
+            self.ipc_name = f"{DEFAULT_IPC_NAME}_g{group_id}"
         self._shut_down = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = threading.Event()
