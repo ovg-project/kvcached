@@ -2359,7 +2359,7 @@ def _align_radix_eviction_budget(radix_cache: Any, num_tokens: int) -> int:
     """
     logical_page_size = max(1, int(radix_cache.page_size))
     aligned_tokens = (
-        max(0, num_tokens) + logical_page_size - 1
+        num_tokens + logical_page_size - 1
     ) // logical_page_size * logical_page_size
     return min(aligned_tokens, int(radix_cache.evictable_size_))
 
@@ -2433,7 +2433,7 @@ def _select_page_aware_plan(
     )
     occupancy = manager.get_page_occupancy(list(by_page))
     reclaimable_pages = [
-        (page_id, block_ids)
+        block_ids
         for page_id, block_ids in by_page.items()
         if len(block_ids) == occupancy.get(page_id, 0)
     ]
@@ -2443,12 +2443,12 @@ def _select_page_aware_plan(
     block_offsets = {
         block_id: offset
         for node in index.node_blocks
-        for offset, block_id in enumerate(index.node_blocks.get(node, ()))
+        for offset, block_id in enumerate(index.node_blocks[node])
     }
     candidates: List[_RadixCandidate] = []
     seen_plans: Set[frozenset[Tuple[Any, int]]] = set()
 
-    for target_page_id, target_blocks in reclaimable_pages:
+    for target_blocks in reclaimable_pages:
         split_by_node: Dict[Any, int] = {}
         for block_id in target_blocks:
             owner = index.block_owners[block_id]
@@ -2491,8 +2491,6 @@ def _select_page_aware_plan(
             for page_id, count in selected_blocks.items()
             if count == occupancy.get(page_id, 0)
         ]
-        if target_page_id not in completed_pages:
-            continue
         priority = max(
             radix_cache.eviction_strategy.get_priority(node) for node in closure
         )
@@ -2509,8 +2507,7 @@ def _select_page_aware_plan(
     selected_tokens = 0
     for _sort_key, candidate_plans in sorted(candidates, key=lambda item: item[0]):
         plan = _radix_suffix_closure(index, [*selected_plans, *candidate_plans])
-        if plan is None:
-            continue
+        assert plan is not None
         merged_plans, closure = plan
         merged_tokens = index.count_tokens(closure)
         if merged_tokens <= selected_tokens or merged_tokens > token_budget:
@@ -2611,13 +2608,6 @@ def _evict_radix_cache_page_aware(
 ) -> Any:
     """Evict at least ``num_tokens`` in legal logical-page units."""
     eviction_budget = _align_radix_eviction_budget(radix_cache, num_tokens)
-    if eviction_budget <= 0:
-        return radix_cache.evict(
-            _make_sglang_evict_arg(
-                num_tokens=0,
-                evict_params_cls=evict_params_cls,
-            )
-        )
     if eviction_budget >= radix_cache.evictable_size_:
         try:
             return radix_cache.evict(
