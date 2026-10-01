@@ -2114,10 +2114,17 @@ class _RadixBlockIndex:
             for node in nodes
             if node not in self.node_blocks
             or self.node_blocks[node]
-            != getattr(node.value, "_kvcached_block_ids", None)
+            is not getattr(node.value, "_kvcached_block_ids", None)
         ]
-        for node in (self.node_blocks.keys() - nodes) | set(changed_nodes):
+        removed_nodes = self.node_blocks.keys() - nodes
+        for node in removed_nodes:
             for block_id in self.node_blocks.pop(node, ()):
+                if self.block_owners.get(block_id) is node:
+                    del self.block_owners[block_id]
+        for node in changed_nodes:
+            if node not in self.node_blocks:
+                continue
+            for block_id in self.node_blocks.pop(node):
                 if self.block_owners.get(block_id) is node:
                     del self.block_owners[block_id]
 
@@ -2131,9 +2138,13 @@ class _RadixBlockIndex:
 
             values = [node.value for node in uncached]
             lengths = [int(value.numel()) // self.logical_page_size for value in values]
-            flattened = torch.cat([value[:: self.logical_page_size] for value in values])
             if self.logical_page_size > 1:
+                flattened = torch.cat(
+                    [value[:: self.logical_page_size] for value in values]
+                )
                 flattened = flattened // self.logical_page_size
+            else:
+                flattened = torch.cat(values)
             new_block_ids = cast(List[int], cast(Any, flattened).tolist())
             offset = 0
             for node, length in zip(uncached, lengths):
@@ -2260,6 +2271,14 @@ def _select_page_aware_plan(
         list(index.block_owners), manager.block_mem_size
     )
     occupancy = manager.get_page_occupancy(list(by_page))
+    reclaimable_pages = [
+        (page_id, block_ids)
+        for page_id, block_ids in by_page.items()
+        if len(block_ids) == occupancy.get(page_id, 0)
+    ]
+    if not reclaimable_pages:
+        return empty
+
     block_offsets = {
         block_id: offset
         for node in index.node_blocks
@@ -2268,10 +2287,7 @@ def _select_page_aware_plan(
     candidates: List[_RadixCandidate] = []
     seen_plans: Set[frozenset[Tuple[Any, int]]] = set()
 
-    for target_page_id, target_blocks in by_page.items():
-        if len(target_blocks) != occupancy.get(target_page_id, 0):
-            continue
-
+    for target_page_id, target_blocks in reclaimable_pages:
         split_by_node: Dict[Any, int] = {}
         for block_id in target_blocks:
             owner = index.block_owners[block_id]
