@@ -344,3 +344,91 @@ def test_virtual_capacity_reads_server_args_without_runtime_context(
         - reserved_memory
     )
     assert configurator._profile_available_bytes(14) == expected
+
+
+@pytest.mark.parametrize("runtime_context", [False, True])
+@pytest.mark.parametrize("precomputed_budget", [False, True])
+def test_configure_rejects_unified_memory_before_pool_creation(
+    monkeypatch, runtime_context, precomputed_budget,
+):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
+    module = _make_kv_cache_configurator_module()
+    calls = []
+
+    def configure(owner, *, pre_model_load_memory):
+        if not owner.memory_pool_config:
+            calls.append("profile")
+        calls.append("allocate")
+
+    module.KVCacheConfigurator.configure = configure
+    if runtime_context:
+        module.get_memory = lambda: types.SimpleNamespace(enable_unified_memory=True)
+    owner = module.KVCacheConfigurator()
+    owner.server_args = types.SimpleNamespace(enable_unified_memory=not runtime_context)
+    owner.memory_pool_config = object() if precomputed_budget else None
+    patch = SGLangVirtualKVCapacityPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    assert patch.apply(module)
+    with pytest.raises(RuntimeError, match="unified memory"):
+        owner.configure(pre_model_load_memory=7)
+    assert calls == []
+
+
+@pytest.mark.parametrize("enabled,device", [(False, "cuda"), (True, "cpu")])
+def test_configure_guard_preserves_disabled_and_cpu_paths(monkeypatch, enabled, device):
+    monkeypatch.setenv("ENABLE_KVCACHED", str(enabled).lower())
+    module = _make_kv_cache_configurator_module()
+    sentinel = object()
+    module.KVCacheConfigurator.configure = lambda owner, **kwargs: sentinel
+    module.get_memory = lambda: pytest.fail("disabled path queried runtime context")
+    owner = module.KVCacheConfigurator()
+    owner.device = device
+    assert SGLangVirtualKVCapacityPatch().patch_configure(module)
+    assert owner.configure(pre_model_load_memory=7) is sentinel
+
+
+def test_configure_guard_preserves_supported_call_and_is_idempotent(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
+    module = _make_kv_cache_configurator_module()
+    module.get_memory = lambda: types.SimpleNamespace(enable_unified_memory=False)
+    module.KVCacheConfigurator.configure = lambda owner, **kwargs: kwargs
+    patch = SGLangVirtualKVCapacityPatch()
+    assert patch.patch_configure(module)
+    first = module.KVCacheConfigurator.configure
+    assert patch.patch_configure(module)
+    assert first is module.KVCacheConfigurator.configure
+    assert module.KVCacheConfigurator().configure(pre_model_load_memory=7) == {
+        "pre_model_load_memory": 7,
+    }
+
+
+def test_configure_rejects_post_capture_with_precomputed_budget(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
+    module = _make_kv_cache_configurator_module()
+    module.KVCacheConfigurator.configure = lambda owner, **kwargs: pytest.fail("allocated")
+    owner = module.KVCacheConfigurator()
+    owner.post_capture_kv_active = True
+    owner.memory_pool_config = object()
+    assert SGLangVirtualKVCapacityPatch().patch_configure(module)
+    with pytest.raises(RuntimeError, match="post-capture"):
+        owner.configure(pre_model_load_memory=7)
+
+
+def test_configure_guard_reports_missing_native_entrypoint():
+    assert not SGLangVirtualKVCapacityPatch().patch_configure(
+        _make_kv_cache_configurator_module()
+    )
+
+
+def test_configure_guard_does_not_hide_runtime_context_failure(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
+    module = _make_kv_cache_configurator_module()
+    module.KVCacheConfigurator.configure = lambda owner, **kwargs: pytest.fail("allocated")
+
+    def get_memory():
+        raise RuntimeError("runtime context not initialized")
+
+    module.get_memory = get_memory
+    assert SGLangVirtualKVCapacityPatch().patch_configure(module)
+    with pytest.raises(RuntimeError, match="runtime context not initialized"):
+        module.KVCacheConfigurator().configure(pre_model_load_memory=7)

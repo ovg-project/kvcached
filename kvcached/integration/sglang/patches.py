@@ -232,6 +232,43 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
     target_module = "sglang.srt.mem_cache.kv_cache_configurator"
     target_class = "KVCacheConfigurator"
 
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not super().apply(target_module):
+            return False
+        return self.patch_configure(target_module)
+
+    def patch_configure(self, target_module: types.ModuleType) -> bool:
+        target_class = self._get_target_class(target_module)
+        original = getattr(target_class, "configure", None)
+        if original is None:
+            self.logger.warning("SGLang KVCacheConfigurator does not expose configure")
+            return False
+        if self._is_already_patched(original, "elastic_pool_modes"):
+            return True
+
+        @functools.wraps(original)
+        def configure(owner, *args, **kwargs):
+            if enable_kvcached() and _is_supported_gpu_device(owner.device):
+                # Draft workers can reuse a budget and skip the profiling hook.
+                if getattr(owner, "post_capture_kv_active", False):
+                    raise RuntimeError(
+                        "SGLang post-capture KV sizing is not supported with "
+                        "kvcached elastic pools"
+                    )
+                # Follow the native source of truth across the runtime-context move.
+                get_memory = getattr(target_module, "get_memory", None)
+                memory = get_memory() if get_memory is not None else owner.server_args
+                if memory.enable_unified_memory:
+                    raise RuntimeError(
+                        "SGLang unified memory is not supported with kvcached "
+                        "elastic pools; disable --enable-unified-memory"
+                    )
+            return original(owner, *args, **kwargs)
+
+        self._mark_as_patched(configure, "elastic_pool_modes")
+        target_class.configure = configure
+        return True
+
     def _get_mem_fraction_static(self, configurator: Any) -> float:
         # SGLang 0.5.17 moved the resolved value into the runtime-context
         # schedule bag: KVCacheConfigurator's own sizing reads
