@@ -1168,8 +1168,11 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.cell_size = (
                         self.kv_cache_dim * self.store_dtype.itemsize
                     )
+                    # KVCacheManager counts allocation blocks, and one MLA
+                    # block represents one SGLang page of token rows.
+                    num_blocks = math.ceil(size / page_size) + 1
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num,
+                        num_blocks, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
                         pool_name="mla",
                     )
