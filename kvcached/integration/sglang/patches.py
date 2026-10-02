@@ -6,7 +6,6 @@ SGLang-specific patches using unified patch infrastructure.
 """
 
 import functools
-import heapq
 import inspect
 import math
 import os
@@ -2359,59 +2358,6 @@ def _select_page_aware_plan(
     return _RadixEvictionSelection(selected_plans, selected_tokens)
 
 
-def _select_native_order_plan(
-    radix_cache: Any,
-    token_budget: int,
-    eviction_strategy: Any,
-) -> _RadixEvictionSelection:
-    """Select a native-policy batch, splitting only its final victim."""
-    if token_budget <= 0:
-        return _RadixEvictionSelection([], 0)
-
-    heap: List[Tuple[Any, int, Any]] = []
-    sequence = 0
-    for leaf in radix_cache.evictable_leaves:
-        heapq.heappush(
-            heap,
-            (eviction_strategy.get_priority(leaf), sequence, leaf),
-        )
-        sequence += 1
-
-    remaining_children: Dict[int, int] = {}
-    plans: List[_RadixSuffixPlan] = []
-    selected_tokens = 0
-    logical_page_size = max(1, int(radix_cache.page_size))
-    while selected_tokens < token_budget and heap:
-        _priority, _sequence, node = heapq.heappop(heap)
-        node_tokens = int(node.value.numel())
-        tokens_needed = token_budget - selected_tokens
-        split_len = max(0, node_tokens - tokens_needed)
-        if split_len % logical_page_size != 0:
-            raise RuntimeError(
-                "LRU leaf length is not aligned to the logical page size"
-            )
-
-        plans.append((node, split_len))
-        selected_tokens += node_tokens - split_len
-        if split_len > 0:
-            break
-
-        parent = node.parent
-        if parent is None:
-            continue
-        parent_id = id(parent)
-        child_count = remaining_children.get(parent_id, len(parent.children)) - 1
-        remaining_children[parent_id] = child_count
-        if child_count == 0 and parent.lock_ref == 0:
-            heapq.heappush(
-                heap,
-                (eviction_strategy.get_priority(parent), sequence, parent),
-            )
-            sequence += 1
-
-    return _RadixEvictionSelection(plans, selected_tokens)
-
-
 def _split_eviction_suffixes(
     radix_cache: Any,
     plans: Sequence[_RadixSuffixPlan],
@@ -2489,20 +2435,15 @@ def _evict_radix_cache_page_aware(
             result = evict_selected(selected, selection.token_count)
 
         remaining = eviction_budget - selection.token_count
-        native_selection = _select_native_order_plan(
-            radix_cache=radix_cache,
-            token_budget=remaining,
-            eviction_strategy=original_strategy,
-        )
-        if native_selection.token_count != remaining:
-            raise RuntimeError("SGLang radix cache ran out of evictable tokens")
-        if native_selection.suffix_plans:
-            selected = _split_eviction_suffixes(
-                radix_cache, native_selection.suffix_plans
+        if remaining > 0:
+            # Let SGLang choose the remaining victims. Native eviction removes
+            # complete radix nodes, so the actual count may exceed `remaining`.
+            native_result = radix_cache.evict(
+                _make_sglang_evict_arg(remaining, evict_params_cls)
             )
-            result = evict_selected(selected, native_selection.token_count)
-        if result is not None:
-            result.num_tokens_evicted = eviction_budget
+            if native_result is not None:
+                native_result.num_tokens_evicted += selection.token_count
+                result = native_result
         return result
     finally:
         index = getattr(radix_cache, "_kvcached_radix_block_index", None)
