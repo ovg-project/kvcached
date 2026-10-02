@@ -259,3 +259,88 @@ def test_legacy_virtual_capacity_still_patches_model_runner(monkeypatch):
     runner = module.ModelRunner()
     expected = math.ceil(total_memory * runner.mem_fraction_static) - reserved_memory
     assert runner._profile_available_bytes(14) == expected
+
+
+def _install_fake_runtime_context(monkeypatch, resolved_mem_fraction):
+    """SGLang 0.5.17+ shape: the resolved value lives in the schedule bag.
+
+    From 0.5.17 the resolution pipeline declares computed values into a
+    side store that ``runtime_context.get_schedule()`` projects, and
+    ``KVCacheConfigurator``'s own sizing reads
+    ``get_schedule().mem_fraction_static``. ``server_args`` keeps the raw
+    CLI value: ``None`` when ``--mem-fraction-static`` is not passed.
+    """
+    module = types.ModuleType("sglang.srt.runtime_context")
+    schedule = types.SimpleNamespace(mem_fraction_static=resolved_mem_fraction)
+    setattr(module, "get_schedule", lambda: schedule)
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", module)
+
+
+def test_virtual_capacity_engages_via_schedule_bag(monkeypatch):
+    """0.5.17..0.5.20 default shape: server_args carries None, the
+    schedule bag carries the resolved fraction. The hook must engage with
+    the resolved value instead of falling back to native profiling (the
+    #509 validation found every 0.5.20 serve taking the fallback)."""
+    total_memory = 16 * 1024**3
+    reserved_memory = 3 * 1024**3
+    resolved = 0.78
+    _install_fake_torch(monkeypatch, total_memory, reserved_memory)
+    _install_fake_runtime_context(monkeypatch, resolved)
+    module = _make_kv_cache_configurator_module()
+
+    patch = SGLangVirtualKVCapacityPatch()
+    assert patch.patch_profile_available_bytes(module) is True
+
+    configurator = module.KVCacheConfigurator()
+    configurator.server_args = types.SimpleNamespace(mem_fraction_static=None)
+
+    expected = math.ceil(total_memory * resolved) - reserved_memory
+    assert configurator._profile_available_bytes(14) == expected
+
+
+def test_virtual_capacity_prefers_resolved_over_raw_cli(monkeypatch):
+    """0.5.17+ resolution may rescale an explicitly passed fraction (the
+    attention-backend hook declares mem_fraction_static * 0.85 for long
+    contexts) without writing server_args back. The hook must use the
+    value the configurator's own sizing uses."""
+    total_memory = 16 * 1024**3
+    raw_cli = 0.9
+    resolved = raw_cli * 0.85
+    _install_fake_torch(monkeypatch, total_memory)
+    _install_fake_runtime_context(monkeypatch, resolved)
+    module = _make_kv_cache_configurator_module()
+
+    patch = SGLangVirtualKVCapacityPatch()
+    assert patch.patch_profile_available_bytes(module) is True
+
+    configurator = module.KVCacheConfigurator()
+    configurator.server_args = types.SimpleNamespace(
+        mem_fraction_static=raw_cli)
+
+    expected = math.ceil(total_memory * resolved)
+    assert configurator._profile_available_bytes(14) == expected
+
+
+def test_virtual_capacity_reads_server_args_without_runtime_context(
+        monkeypatch):
+    """0.5.16 shape: no runtime_context module exists and the resolved
+    fraction sits on server_args. The presence probe must leave this
+    arm on the server_args read."""
+    total_memory = 16 * 1024**3
+    reserved_memory = 1 * 1024**3
+    _install_fake_torch(monkeypatch, total_memory, reserved_memory)
+    monkeypatch.delitem(
+        sys.modules, "sglang.srt.runtime_context", raising=False)
+    module = _make_kv_cache_configurator_module()
+
+    patch = SGLangVirtualKVCapacityPatch()
+    assert patch.patch_profile_available_bytes(module) is True
+
+    configurator = module.KVCacheConfigurator()
+    with pytest.raises(ImportError):
+        import sglang.srt.runtime_context  # noqa: F401
+    expected = (
+        math.ceil(total_memory * configurator.server_args.mem_fraction_static)
+        - reserved_memory
+    )
+    assert configurator._profile_available_bytes(14) == expected
