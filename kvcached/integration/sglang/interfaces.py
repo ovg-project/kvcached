@@ -477,6 +477,11 @@ def get_kv_cache_manager(
     # Each SGLang TP worker owns and drives its local pool. Keep the real TP
     # world size in init_kvcached() for rank-aware IPC listener setup, but do
     # not broadcast this worker's local map/unmap operations to its peers.
+    logical_capacity = (
+        {"logical_num_blocks": logical_num_blocks}
+        if logical_num_blocks is not None
+        else {}
+    )
     manager = KVCacheManager(
         num_blocks,
         block_size,
@@ -489,7 +494,7 @@ def get_kv_cache_manager(
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
         pool_name=pool_name,
-        logical_num_blocks=logical_num_blocks,
+        **logical_capacity,
     )
     register_kv_cache_pool(
         manager,
