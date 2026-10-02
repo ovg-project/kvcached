@@ -488,6 +488,9 @@ def get_kv_cache_manager(
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
         pool_name=pool_name,
+        # SWA and Mamba pools differ in size from the full-attention pool:
+        # each needs its own limit and usage, i.e. its own segment.
+        own_segment=True,
     )
     register_kv_cache_pool(
         manager,
