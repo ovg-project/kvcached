@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
+from kvcached.kv_geometry import check_page_geometry
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
@@ -119,6 +120,7 @@ class KVCacheManager:
         group_id: int = 0,
         pool_name: Optional[str] = None,
         defer_physical_release: bool = False,
+        own_segment: bool = False,
     ):
         """
         Args:
@@ -139,6 +141,9 @@ class KVCacheManager:
                 integration when this pool is created.
             defer_physical_release: Retire empty pages until the engine confirms
                 that previously submitted worker batches have completed.
+            own_segment: Give a non-zero group its own /dev/shm segment
+                (``<ipc name>_g<group_id>``) instead of the instance's shared
+                one, for pools whose sizes differ (SGLang SWA and Mamba pools).
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -154,32 +159,27 @@ class KVCacheManager:
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE
-        # A block must fit within a single page; otherwise a page holds zero
-        # usable blocks, the KV pool is permanently empty, and the engine
-        # silently deadlocks during warmup (available_size() stays 0). This
-        # happens with hybrid linear-attention models (e.g. Qwen3.5/3.6 GDN,
-        # Mamba) whose per-block recurrent state exceeds the default 2MB page.
-        # Fail loudly here with the exact page size needed instead of hanging.
-        if self.block_mem_size > self.page_size:
-            base = 2 * 1024 * 1024  # KVCACHED_PAGE_SIZE_MB granularity
-            min_page_mb = ((self.block_mem_size + base - 1) // base) * 2
-            raise KVCachedConfigError(
-                f"kvcached KV block size ({self.block_mem_size} bytes, "
-                f"{self.block_mem_size / (1024 * 1024):.2f} MiB) is larger than the "
-                f"page size ({self.page_size} bytes, "
-                f"{self.page_size // (1024 * 1024)} MiB), so no block fits in a "
-                f"page and the KV pool would be empty. This typically happens "
-                f"with hybrid linear-attention models (e.g. Qwen3.5/3.6 GDN, "
-                f"Mamba) whose per-block state is large. Re-launch with "
-                f"KVCACHED_PAGE_SIZE_MB={min_page_mb} (or larger; must be a "
-                f"multiple of 2).")
+        # Every page must hold a whole block. A block larger than a page leaves
+        # the pool empty (warmup deadlocks); an unfavorable block/page alignment
+        # can leave some pages with no block, and such a
+        # page, once mapped, is never released. Both happen with hybrid
+        # linear-attention models (e.g. Qwen3.5 GDN, Mamba) whose per-block
+        # state is large. Fail loudly with a geometry that works.
+        geometry_error = check_page_geometry(self.block_mem_size,
+                                             self.page_size, block_size)
+        if geometry_error is not None:
+            raise KVCachedConfigError(geometry_error)
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
         # Name of the /dev/shm segment the C++ MemInfoTracker creates for
-        # this pool; shutdown() unlinks it.
+        # this pool; shutdown() unlinks it. The C++ tracker derives the pool's
+        # limit from the segment, so pools of different sizes cannot share
+        # one; it adds the _g<id> suffix only when given no name.
         self.ipc_name = DEFAULT_IPC_NAME
+        if own_segment and group_id != 0:
+            self.ipc_name = f"{DEFAULT_IPC_NAME}_g{group_id}"
         self._shut_down = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = threading.Event()
@@ -490,13 +490,14 @@ class KVCacheManager:
                         f"alloc_page() failed after partially allocating "
                         f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
                     return None
-                # A page may have zero usable blocks when block_mem_size is
-                # large (e.g. HYBRID_LINEAR) and every aligned block would
-                # straddle the page boundary. Park it in full_pages so it's
-                # not re-handed-out but stays lookupable by free().
+                # __init__ rejects geometries where a page can hold no whole
+                # block. Parking such a page would keep it mapped forever
+                # (free() never visits a page without blocks), so fail loud.
                 if page.num_free_blocks() == 0:
-                    self.full_pages[page.page_id] = page
-                    continue
+                    raise StateConsistencyError(
+                        f"page {page.page_id} holds no whole "
+                        f"{self.block_mem_size}-byte block; the page geometry "
+                        "check should have rejected this configuration")
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 page = self._pick_avail_page(remaining_need)

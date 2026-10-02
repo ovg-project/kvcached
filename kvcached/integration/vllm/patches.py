@@ -1121,6 +1121,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _selects_v2_model_runner(vllm_config: Any) -> bool:
+    """Whether vLLM will run Model Runner V2 for this config.
+
+    From 0.22 ``VllmConfig.use_v2_model_runner`` also resolves vLLM's default
+    choice; older releases only honour ``VLLM_USE_V2_MODEL_RUNNER``.
+    """
+    selected = getattr(vllm_config, "use_v2_model_runner", None)
+    if selected is not None:
+        return bool(selected)
+    try:
+        import vllm.envs as envs
+
+        return bool(getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False))
+    except Exception:
+        return False
+
+
 class EngineCorePatch(VersionAwarePatch, BasePatch):
     """Patch EngineCore initialization, async batch ordering, and shutdown."""
 
@@ -1168,6 +1185,17 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                             "kvcached on vLLM 0.29 requires Model Runner V2; "
                             "use a supported configuration or disable kvcached"
                         )
+                elif (detected_version and VersionRange("<0.28.0").contains(detected_version)
+                        and _selects_v2_model_runner(vllm_config)):
+                    # From 0.22 vLLM picks Model Runner V2 by default for many
+                    # models; kvcached only adapts it from 0.28. Without an
+                    # adapter the workers never create kvcached KV tensors and
+                    # the engine dies on its first request.
+                    raise KVCachedConfigError(
+                        f"kvcached does not support the vLLM {detected_version} Model Runner V2 "
+                        "yet; set VLLM_USE_V2_MODEL_RUNNER=0 to use the V1 model runner, "
+                        "or disable kvcached"
+                    )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
@@ -2992,6 +3020,82 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
             _patched_determine_available_memory, "determine_available_memory"
         )
         Worker.determine_available_memory = _patched_determine_available_memory
+        return True
+
+
+def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
+    """Grow a hybrid attention block so its KV unit tiles kvcached's page.
+
+    vLLM's _align_hybrid_block_size picks the smallest attention block whose
+    page covers a mamba state and pads the state to that page. The resulting
+    unit (e.g. 784 tokens x 4096 B = 3,211,264 B for Qwen3.8-27B) generally does
+    not divide kvcached's page, so blocks straddle page boundaries: straddling
+    blocks are unusable and, when the unit exceeds half a page, some pages hold
+    no block at all. vLLM keeps any block size at least as large as the one it
+    requires and pads the state to it, so choose the smallest such block whose
+    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). A block size
+    given by the user is kept; the page geometry check then reports it.
+    """
+    from kvcached.kv_geometry import aligned_block_size
+    from kvcached.utils import PAGE_SIZE
+
+    padded = getattr(cache_config, "mamba_page_size_padded", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if not padded or not block_size or padded % block_size:
+        return
+    if PAGE_SIZE % padded == 0:
+        return
+    if (getattr(cache_config, "user_specified_block_size", False)
+            or getattr(cache_config, "user_specified_mamba_block_size", False)):
+        return
+    bytes_per_token = padded // block_size
+    aligned = aligned_block_size(block_size, bytes_per_token, PAGE_SIZE)
+    if aligned is None or aligned == block_size:
+        return
+    cache_config.block_size = aligned
+    if getattr(cache_config, "mamba_cache_mode", None) in ("align", "all"):
+        cache_config.mamba_block_size = aligned
+    cache_config.mamba_page_size_padded = aligned * bytes_per_token
+    logger.info(
+        "Setting attention block size to %d tokens (was %d) so the KV unit "
+        "(%d bytes) tiles the %d-byte kvcached page",
+        aligned, block_size, aligned * bytes_per_token, PAGE_SIZE)
+
+
+class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
+    """Choose hybrid attention block sizes whose KV unit tiles kvcached pages."""
+
+    library = "vllm"
+    target_module = "vllm.platforms.interface"
+    target_class = "Platform"
+    patch_name = "hybrid_block_size_align"
+
+    def apply(self, platform_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        platform = self._get_target_class(platform_mod)
+        if platform is None:
+            return False
+        raw = platform.__dict__.get("_align_hybrid_block_size")
+        if raw is None:
+            # Releases without this hook: the page geometry check still
+            # rejects unusable geometries at startup.
+            self.logger.debug("Platform._align_hybrid_block_size not found")
+            return True
+        original = raw.__func__ if isinstance(raw, classmethod) else raw
+        if self._is_already_patched(original):
+            return True
+        logger = self.logger
+
+        @wraps(original)
+        def align_hybrid_block_size(cls, vllm_config, *args: Any, **kwargs: Any):
+            result = original(cls, vllm_config, *args, **kwargs)
+            if enable_kvcached():
+                _align_block_size_to_kvcached_page(vllm_config.cache_config, logger)
+            return result
+
+        self._mark_as_patched(align_hybrid_block_size)
+        platform._align_hybrid_block_size = classmethod(align_hybrid_block_size)
         return True
 
 

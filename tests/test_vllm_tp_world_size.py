@@ -321,6 +321,13 @@ def test_coordinator_propagates_uninitialized_world_size(
     "version,enabled,use_v2,reject",
     [
         ("0.24.0", True, None, False),
+        # Before 0.28 kvcached has no Model Runner V2 adapter: fail at startup.
+        ("0.22.0", True, True, True),
+        ("0.25.1", True, True, True),
+        ("0.27.1", True, True, True),
+        ("0.27.1", True, False, False),
+        ("0.27.1", False, True, False),
+        ("0.28.0", True, True, False),
         ("0.29.0", True, True, False),
         ("0.29.0", True, False, True),
         ("0.30.0", True, None, True),

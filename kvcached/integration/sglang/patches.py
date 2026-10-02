@@ -270,7 +270,22 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
         return True
 
     def _get_mem_fraction_static(self, configurator: Any) -> float:
-        return float(configurator.server_args.mem_fraction_static)
+        # SGLang 0.5.17 moved the resolved value into the runtime-context
+        # schedule bag: KVCacheConfigurator's own sizing reads
+        # get_schedule().mem_fraction_static from 0.5.17 on, while
+        # configurator.server_args keeps the raw CLI value, which is None
+        # whenever --mem-fraction-static is not passed (and the unscaled
+        # number when it is). Reading server_args there made float(None)
+        # raise and the hook silently fall back to native profiling on
+        # every 0.5.17+ serve (#509 validation finding). Read the same
+        # source the configurator reads, detected by presence rather than
+        # version; 0.5.16 has no runtime_context and resolves the value
+        # onto server_args.
+        try:
+            from sglang.srt.runtime_context import get_schedule
+        except ImportError:
+            return float(configurator.server_args.mem_fraction_static)
+        return float(get_schedule().mem_fraction_static)
 
     def _handle_max_mamba_cache(
         self, configurator: Any, capacity_gib: float
@@ -792,6 +807,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # calls _create_buffers() which needs self._group_id.
                     self._group_id = ElasticMHATokenToKVPool._next_group_id
                     ElasticMHATokenToKVPool._next_group_id += 1
+                    # Older SGLang pools do not expose a separate physical
+                    # storage dtype. The parent may call our _create_buffers()
+                    # before returning, so install the logical fallback first.
+                    self.store_dtype = dtype
 
                     super().__init__(
                         size=size,
@@ -809,7 +828,9 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
                     import kvcached.integration.sglang.interfaces as kvi
 
-                    self.cell_size = self.head_num * self.head_dim * dtype.itemsize
+                    self.cell_size = (
+                        self.head_num * self.head_dim * self.store_dtype.itemsize
+                    )
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
@@ -885,7 +906,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 self.head_num,
                                 self.head_dim,
                             ),
-                            dtype=self.dtype,
+                            dtype=self.store_dtype,
                             device=self.device,
                             num_layers=self.layer_num,
                             page_size=self.page_size,
@@ -1005,7 +1026,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.head_num * self.head_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self.store_dtype.itemsize
 
                     k_size_bytes = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
                     v_size_bytes = k_size_bytes
@@ -1098,6 +1119,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         start_layer,
                         end_layer,
                     )
+                    self.store_dtype = getattr(
+                        self, "store_dtype", getattr(self, "dtype", dtype)
+                    )
 
                     # MLA-specific attributes (mirroring MLATokenToKVPool).
                     # SGLang 0.5.13 renamed the sparse-attention kwarg and
@@ -1164,7 +1188,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 1,
                                 self.kv_cache_dim,
                             ),
-                            dtype=dtype,
+                            dtype=self.store_dtype,
                             device=device,
                             num_layers=layer_num,
                             page_size=page_size,
@@ -1178,7 +1202,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         device=self.device,
                     )
 
-                    self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
+                    self.cell_size = (
+                        self.kv_cache_dim * self.store_dtype.itemsize
+                    )
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         size + page_size, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
@@ -1203,7 +1229,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """Return the physical memory limits of the KV buffer."""
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.kv_cache_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self.store_dtype.itemsize
 
                     return self.layer_num * total_tokens * elems_per_token * bytes_per_elem
 
@@ -2186,3 +2212,69 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
         )
         return True
+
+
+class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
+    """Enforce KVCACHED_MAX_CACHED_TOKENS on a prefix cache that is not a
+    RadixCache subclass, so RadixCacheLimitPatch alone leaves it unbounded.
+    The cap counts full-attention tokens, like RadixCache.evictable_size_.
+    """
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_radix_cache_limit(self, radix_cache_mod: types.ModuleType) -> bool:
+        cache_cls = self._get_target_class(radix_cache_mod)
+        if cache_cls is None:
+            return False
+
+        original_cache_finished = getattr(cache_cls, "cache_finished_req", None)
+        if original_cache_finished is None:
+            self.logger.warning("%s.cache_finished_req not found", self.target_class)
+            return False
+
+        if self._is_already_patched(original_cache_finished):
+            return True
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        max_cached = MAX_CACHED_TOKENS
+
+        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+            original_cache_finished(self_rc, *args, **kwargs)
+            excess = self_rc.full_evictable_size() - max_cached
+            if excess > 0:
+                self_rc.evict(EvictParams(num_tokens=excess))
+
+        self._mark_as_patched(_wrapped)
+        cache_cls.cache_finished_req = _wrapped
+
+        logger.info(
+            f"[kvcached] {self.target_class} evictable size capped at "
+            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+        )
+        return True
+
+
+class UnifiedRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """SGLang builds UnifiedRadixCache for hybrid SWA/Mamba models from
+    0.5.16 and for every radix-cache model from 0.5.19."""
+
+    target_module = "sglang.srt.mem_cache.unified_radix_cache"
+    target_class = "UnifiedRadixCache"
+    patch_name = "unified_radix_cache_limit"
+
+
+class SWARadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid SWA models (gpt-oss, Gemma) use SWARadixCache up to 0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.swa_radix_cache"
+    target_class = "SWARadixCache"
+    patch_name = "swa_radix_cache_limit"
+
+
+class MambaRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid Mamba models (Qwen3-Next, Qwen3.5) use MambaRadixCache up to
+    0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.mamba_radix_cache"
+    target_class = "MambaRadixCache"
+    patch_name = "mamba_radix_cache_limit"
