@@ -195,5 +195,6 @@ class TestPackedAllocationFillsDecodeHoles:
         assert mgr.avail_pages[41].num_free_blocks() == 1
         assert mgr.avail_pages[42].num_free_blocks() == 40
 
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
