@@ -141,6 +141,10 @@ class _WorkerListener:
         self.socket_dir = socket_dir
         self.socket_path = socket_path
         self.server_sock = server_sock
+        # The pathname alone does not identify this listener: a same-name
+        # restart can bind a new socket at the same path. Unlink only while
+        # the path still refers to the inode this listener bound.
+        self.socket_id = _path_identity(socket_path)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self._conns: set[socket.socket] = set()
@@ -189,11 +193,16 @@ class _WorkerListener:
             except OSError:
                 pass  # the handler is already past this connection
         # accept() only returns on a connection, so make one to let an idle
-        # loop observe stop_event.
+        # loop observe stop_event. If the path now belongs to a replacement,
+        # connecting would reach the replacement instead; shutting down the
+        # listening socket wakes accept() on Linux.
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
-                wake.settimeout(1.0)
-                wake.connect(self.socket_path)
+            if self.owns_path():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                    wake.settimeout(1.0)
+                    wake.connect(self.socket_path)
+            else:
+                self.server_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         thread = self.thread
@@ -206,16 +215,30 @@ class _WorkerListener:
                       f"{drain_timeout_s:g}s; keeping it for a retry")
                 return False
         self.server_sock.close()
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+        owned = self.owns_path()
+        if owned:
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
         _remove_dir_if_empty(self.socket_dir)
         if self.socket_dir != self.root_dir:
             _remove_dir_if_empty(self.root_dir)
         self._stopped = True
-        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        removed = f", removed {self.socket_path}" if owned else ""
+        print(f"Worker {self.rank} IPC listener stopped{removed}")
         return True
+
+    def owns_path(self) -> bool:
+        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
+
+
+def _path_identity(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
 
 def _remove_dir_if_empty(path: str) -> None:

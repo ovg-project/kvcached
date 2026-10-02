@@ -612,5 +612,85 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     assert "not found" in capsys.readouterr().err
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="shutdown() wakes a blocked accept() only on Linux")
+def test_stop_of_idle_listener_keeps_replacement_socket(socket_root):
+    """An idle old listener whose path now belongs to a replacement must stop
+    without connecting to, or unlinking, the replacement's socket."""
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    os.unlink(path)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(path)
+    replacement.listen()
+    replacement.settimeout(0.5)
+    try:
+        assert tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=2.0)
+        assert listener.thread is not None and not listener.thread.is_alive()
+        with pytest.raises(socket.timeout):
+            replacement.accept()  # stop() must not have connected to it
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
+    finally:
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypatch):
+    """Same-name restart during a delayed cleanup (issue #510): the first stop
+    times out behind a busy handler, a replacement then binds the same path,
+    and the retry after the handler finishes must not unlink the
+    replacement's socket."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_map(*a, **kw):
+        entered.set()
+        release.wait(10)
+        return True, []
+
+    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", slow_map)
+
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    header, body = _delayed_map_request()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(path)
+            client.sendall(header + body)
+            assert entered.wait(5)
+            assert not tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=0.2)
+
+            os.unlink(path)  # what the replacement's start does
+            replacement.bind(path)
+            replacement.listen()
+
+            release.set()
+            assert listener.thread is not None
+            listener.thread.join(5)
+            assert not listener.thread.is_alive()
+
+        assert tp_ipc_util.stop_worker_listener_threads()
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
+    finally:
+        release.set()
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
