@@ -2105,9 +2105,13 @@ class _RadixBlockIndex:
         self.root_node = root_node
         self.logical_page_size = logical_page_size
         self.block_owners: Dict[int, Any] = {}
+        self.block_offsets: Dict[int, int] = {}
         self.node_blocks: Dict[Any, Tuple[int, ...]] = {}
 
     def sync(self, nodes: Set[Any]) -> None:
+        # node_blocks and the tensor attribute reference the same immutable
+        # tuple.  Identity therefore detects unchanged nodes in O(1), without
+        # comparing every cached block id on each eviction pass.
         changed_nodes = [
             node
             for node in nodes
@@ -2120,12 +2124,14 @@ class _RadixBlockIndex:
             for block_id in self.node_blocks.pop(node, ()):
                 if self.block_owners.get(block_id) is node:
                     del self.block_owners[block_id]
+                    del self.block_offsets[block_id]
         for node in changed_nodes:
             if node not in self.node_blocks:
                 continue
             for block_id in self.node_blocks.pop(node):
                 if self.block_owners.get(block_id) is node:
                     del self.block_owners[block_id]
+                    del self.block_offsets[block_id]
 
         uncached = [
             node
@@ -2155,8 +2161,9 @@ class _RadixBlockIndex:
         for node in changed_nodes:
             block_ids = cast(Tuple[int, ...], node.value._kvcached_block_ids)
             self.node_blocks[node] = block_ids
-            for block_id in block_ids:
+            for offset, block_id in enumerate(block_ids):
                 self.block_owners[block_id] = node
+                self.block_offsets[block_id] = offset
 
     def count_tokens(self, nodes: Dict[Any, int]) -> int:
         return sum(
@@ -2278,11 +2285,6 @@ def _select_page_aware_plan(
     if not reclaimable_pages:
         return empty
 
-    block_offsets = {
-        block_id: offset
-        for node in index.node_blocks
-        for offset, block_id in enumerate(index.node_blocks[node])
-    }
     candidates: List[_RadixCandidate] = []
     seen_plans: Set[frozenset[Tuple[Any, int]]] = set()
 
@@ -2290,7 +2292,7 @@ def _select_page_aware_plan(
         split_by_node: Dict[Any, int] = {}
         for block_id in target_blocks:
             owner = index.block_owners[block_id]
-            block_offset = block_offsets[block_id]
+            block_offset = index.block_offsets[block_id]
             previous = split_by_node.get(owner)
             split_by_node[owner] = (
                 block_offset if previous is None else min(previous, block_offset)
@@ -2386,6 +2388,12 @@ def _make_sglang_evict_arg(
     return evict_params_cls(num_tokens=num_tokens)
 
 
+def _sync_radix_block_index(radix_cache: Any) -> None:
+    index = getattr(radix_cache, "_kvcached_radix_block_index", None)
+    if index is not None:
+        index.sync(_evictable_radix_nodes(radix_cache))
+
+
 def _evict_radix_cache_page_aware(
     radix_cache: Any,
     num_tokens: int,
@@ -2402,9 +2410,7 @@ def _evict_radix_cache_page_aware(
                 )
             )
         finally:
-            index = getattr(radix_cache, "_kvcached_radix_block_index", None)
-            if index is not None:
-                index.sync(_evictable_radix_nodes(radix_cache))
+            _sync_radix_block_index(radix_cache)
 
     original_strategy = radix_cache.eviction_strategy
 
@@ -2446,9 +2452,7 @@ def _evict_radix_cache_page_aware(
                 result = native_result
         return result
     finally:
-        index = getattr(radix_cache, "_kvcached_radix_block_index", None)
-        if index is not None:
-            index.sync(_evictable_radix_nodes(radix_cache))
+        _sync_radix_block_index(radix_cache)
 
 
 class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):

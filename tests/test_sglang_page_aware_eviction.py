@@ -578,6 +578,7 @@ def test_native_split_refreshes_index_for_internal_suffix_closure():
     assert split_node is not old_node
     assert index.node_blocks[split_node] == (4, 5)
     assert index.node_blocks[old_node] == (6, 7)
+    assert index.block_offsets == {4: 0, 5: 1, 6: 0, 7: 1}
     assert selected == {split_node}
 
     result = _evict_radix_cache_page_aware(
@@ -590,6 +591,7 @@ def test_native_split_refreshes_index_for_internal_suffix_closure():
     assert manager.allocated == set()
     assert index.node_blocks == {}
     assert index.block_owners == {}
+    assert index.block_offsets == {}
 
 
 def test_native_page_aware_evict_trims_reclaimable_leaf_suffix():

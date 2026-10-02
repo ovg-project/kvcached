@@ -26,6 +26,7 @@ class FakeTensor:
             return self.shape[0]
         return len(self.data)
 
+
 class FakeKVCachedAllocator:
     def __init__(self):
         self.alloc_calls = []
