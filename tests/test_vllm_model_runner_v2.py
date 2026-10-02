@@ -85,7 +85,8 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
     assert geometry.block_size * geometry.cell_size == 64
     assert geometry.num_pools == 2
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for layer_index, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 2, 2, 8)
         for block in range(3):
@@ -121,7 +122,8 @@ def test_mla_native_views_preserve_latent_vectors_and_neighboring_pages(monkeypa
     )
     assert adapter.cache_geometry(config) == adapter.CacheGeometry(64, 73728, 2)
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [64])
-    assert captured == [(2 * 1024**2, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(2 * 1024**2, 1, "cpu", 2, {
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 2 * 1024**2})]
     for layer, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 1, 64, 576)
         for block in range(3):

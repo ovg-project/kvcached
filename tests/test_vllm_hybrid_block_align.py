@@ -42,12 +42,35 @@ def test_mamba_block_size_untouched_without_prefix_caching(vllm_patches, monkeyp
     ({"user": True}, 4),                            # user-chosen block size is kept
     ({"block_size": 1024, "padded": 4 * MIB}, 4),   # already tiles
     ({"padded": None}, 4),                          # not a hybrid model
-    ({}, 2),                                        # no block fits a 2 MiB page
 ])
 def test_left_unchanged(vllm_patches, monkeypatch, cfg_kwargs, page_mb):
     cfg = _cache_config(**cfg_kwargs)
     before = dict(vars(cfg))
     _align(vllm_patches, monkeypatch, cfg, page_mb)
+    assert vars(cfg) == before
+
+
+@pytest.mark.parametrize("tokens,per_token,expected", [
+    (784, 4096, 1024), (1056, 2048, 2048), (528, 4096, 1024),
+])
+def test_default_page_and_block_are_selected_together(
+        vllm_patches, monkeypatch, tokens, per_token, expected):
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    cfg = _cache_config(tokens, tokens * per_token)
+    _align(vllm_patches, monkeypatch, cfg, 2)
+    assert cfg.block_size == expected
+    assert cfg.mamba_page_size_padded == 4 * MIB
+    assert cfg.mamba_block_size == expected
+    before = dict(vars(cfg))
+    _align(vllm_patches, monkeypatch, cfg, 2)
+    assert vars(cfg) == before
+
+
+def test_explicit_small_page_is_not_overridden(vllm_patches, monkeypatch):
+    monkeypatch.setenv("KVCACHED_PAGE_SIZE_MB", "2")
+    cfg = _cache_config()
+    before = dict(vars(cfg))
+    _align(vllm_patches, monkeypatch, cfg, 2)
     assert vars(cfg) == before
 
 

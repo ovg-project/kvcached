@@ -33,6 +33,17 @@ def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     return page_size < 2 * block_mem_size - gcd(page_size, block_mem_size)
 
 
+def minimum_page_size(block_mem_size: int) -> int:
+    """Smallest supported page with at least one whole block in every page."""
+    if block_mem_size <= 0:
+        raise ValueError("KV block size must be positive")
+    page_size = ((block_mem_size + PAGE_GRANULARITY - 1)
+                 // PAGE_GRANULARITY * PAGE_GRANULARITY)
+    while has_zero_capacity_pages(block_mem_size, page_size):
+        page_size += PAGE_GRANULARITY
+    return page_size
+
+
 def aligned_block_size(block_size: int, bytes_per_token: int,
                        page_size: int) -> Optional[int]:
     """Smallest block size whose block tiles ``page_size`` exactly.

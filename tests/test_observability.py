@@ -285,6 +285,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 
@@ -377,6 +378,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 

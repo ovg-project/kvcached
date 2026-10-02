@@ -22,7 +22,13 @@ from kvcached.tp_ipc_util import (
     start_worker_listener_thread,
     stop_worker_listener_threads,
 )
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    get_kvcached_logger,
+    get_page_size_for_block,
+    normalize_gpu_device,
+)
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -579,20 +585,24 @@ def alloc_kv_cache(
 
     requested_num_blocks = kvcache_shape[blocks_dim_idx]
 
+    # Unified pools map combined K+V blocks; ordinary MHA maps K and V
+    # separately. Use the same allocation unit as the scheduler's manager.
+    physical_block_bytes = block_mem_bytes * (num_k_or_v if unified_pool else 1)
+    page_size = get_page_size_for_block(physical_block_bytes, PAGE_SIZE)
+
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
 
     # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
-    # Round down to 2 * PAGE_SIZE for MLA backend.
+    # Round down to twice the selected page size for the MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
     # gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) to be a multiple of
-    # 2 * PAGE_SIZE. When num_k_or_v == 1 (MLA), we must align this value
-    # to 2 * PAGE_SIZE directly. For MHA/GQA (num_k_or_v == 2), aligning
-    # to PAGE_SIZE suffices because ftensor_bytes = 2 * aligned_value is
-    # automatically 2*PAGE_SIZE-aligned.
-    alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
+    # 2 * page_size. When num_k_or_v == 1 (MLA), align this value directly.
+    # For MHA/GQA (num_k_or_v == 2), one page suffices because
+    # ftensor_bytes = 2 * aligned_value is automatically 2*page_size-aligned.
+    alignment = 2 * page_size if is_mla else page_size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
@@ -607,7 +617,7 @@ def alloc_kv_cache(
     # buffer per layer, so the KVCacheManager / PageAllocator use
     # num_kv_buffers=1 (see _get_kv_cache_params in patches.py). The C++
     # contiguous layout sizes its compound page as
-    # kPageSize*num_layers*num_kv_buffers, so it MUST see the same 1 here --
+    # page_size*num_layers*num_kv_buffers, so it MUST see the same 1 here --
     # otherwise the compound page is 2x too large and FTensor::map's
     # offset-alignment assert fails on every odd page id (and the compound-page
     # count no longer matches the manager's block count). In non-contiguous
@@ -621,6 +631,7 @@ def alloc_kv_cache(
         "ftensor_bytes_per_layer": ftensor_bytes_per_layer,
         "num_layers": num_layers,
         "num_kv_buffers": compound_num_kv_buffers,
+        "page_size": page_size,
     }
     # Manager-first order: a KVCacheManager for this group may already exist,
     # polling kv_tensors_created() from its _post_init thread and mapping
@@ -632,6 +643,7 @@ def alloc_kv_cache(
         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
         num_kv_buffers=compound_num_kv_buffers, group_id=group_id,
         unified_pool=unified_pool,
+        page_size=page_size,
     )
 
     # Record the geometry actually created for this group so that
@@ -810,6 +822,7 @@ def _validate_manager_against_created_tensors(
     num_layers: int,
     num_kv_buffers: int,
     group_id: int,
+    page_size: Optional[int] = None,
 ) -> None:
     """Raise ValueError unless a manager of this geometry fits ``record``.
 
@@ -847,6 +860,14 @@ def _validate_manager_against_created_tensors(
                 "or 1 for MLA/HYBRID_LINEAR."
             )
 
+    if page_size is None:
+        page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
+    recorded_page_size = record.get("page_size", PAGE_SIZE)
+    if page_size != recorded_page_size:
+        raise ValueError(
+            f"Manager page size {page_size} does not match the KV tensors' "
+            f"page size {recorded_page_size} for group {group_id}")
+
     capacity_num_blocks = _created_capacity_num_blocks(record, block_mem_size, num_kv_buffers)
     if num_blocks > capacity_num_blocks:
         raise ValueError(
@@ -882,6 +903,7 @@ def _validate_registered_managers(group_id: int, record: Dict[str, int]) -> None
             manager.num_layers,
             manager.num_kv_buffers,
             group_id,
+            manager.page_size,
         )
 
 
@@ -960,6 +982,7 @@ def get_kv_cache_manager(
         reserve_null_block=True,
         pool_name=pool_name,
         defer_physical_release=_async_sched,
+        page_size=get_page_size_for_block(block_size * cell_size, PAGE_SIZE),
     )
     register_kv_cache_pool(
         manager,

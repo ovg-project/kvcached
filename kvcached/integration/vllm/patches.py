@@ -3033,10 +3033,12 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
     blocks are unusable and, when the unit exceeds half a page, some pages hold
     no block at all. vLLM keeps any block size at least as large as the one it
     requires and pads the state to it, so choose the smallest such block whose
-    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). A block size
-    given by the user is kept; the page geometry check then reports it.
+    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). When the
+    default page is too small, choose a larger page/block pair; allocation
+    resolves the physical page from the final block. User block sizes stay
+    unchanged.
     """
-    from kvcached.kv_geometry import aligned_block_size
+    from kvcached.kv_geometry import MIB, aligned_block_size, recommend_page_geometry
     from kvcached.utils import PAGE_SIZE
 
     padded = getattr(cache_config, "mamba_page_size_padded", None)
@@ -3049,7 +3051,13 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
             or getattr(cache_config, "user_specified_mamba_block_size", False)):
         return
     bytes_per_token = padded // block_size
-    aligned = aligned_block_size(block_size, bytes_per_token, PAGE_SIZE)
+    page_size = PAGE_SIZE
+    if padded > page_size and os.getenv("KVCACHED_PAGE_SIZE_MB") is None:
+        recommendation = recommend_page_geometry(block_size, bytes_per_token)
+        if recommendation is not None:
+            page_mb, _ = recommendation
+            page_size = page_mb * MIB
+    aligned = aligned_block_size(block_size, bytes_per_token, page_size)
     if aligned is None or aligned == block_size:
         return
     cache_config.block_size = aligned
@@ -3059,7 +3067,7 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
     logger.info(
         "Setting attention block size to %d tokens (was %d) so the KV unit "
         "(%d bytes) tiles the %d-byte kvcached page",
-        aligned, block_size, aligned * bytes_per_token, PAGE_SIZE)
+        aligned, block_size, aligned * bytes_per_token, page_size)
 
 
 class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
