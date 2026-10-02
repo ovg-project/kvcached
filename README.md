@@ -58,10 +58,10 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
-| SGLang | ≥ v0.5.11 (tested up to v0.5.20) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it, Gemma-4-12B-it |
+| SGLang | ≥ v0.5.11 (tested up to v0.5.20) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it |
 | vLLM | ≥ v0.17.0 (tested up to v0.29.0) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it, Gemma-4-12B-it |
 
-The minimum versions follow from the PyTorch requirement below. See [#425](https://github.com/ovg-project/kvcached/issues/425) for per-model results on each engine and KV layout, and [#509](https://github.com/ovg-project/kvcached/issues/509) for the v0.1.6 validation.
+The minimum versions follow from the PyTorch requirement below. See [#425](https://github.com/ovg-project/kvcached/issues/425) for per-model results on each engine and KV layout.
 
 ## Example use cases
 
