@@ -120,6 +120,7 @@ class KVCacheManager:
         group_id: int = 0,
         pool_name: Optional[str] = None,
         defer_physical_release: bool = False,
+        logical_num_blocks: Optional[int] = None,
     ):
         """
         Args:
@@ -140,8 +141,18 @@ class KVCacheManager:
                 integration when this pool is created.
             defer_physical_release: Retire empty pages until the engine confirms
                 that previously submitted worker batches have completed.
+            logical_num_blocks: Optional allocation limit when ``num_blocks``
+                includes extra backing capacity needed to retain a physical
+                page. The limit includes any reserved null block.
         """
+        if logical_num_blocks is not None and not (
+            0 <= logical_num_blocks <= num_blocks
+        ):
+            raise ValueError(
+                "logical_num_blocks must be between 0 and num_blocks"
+            )
         self.num_blocks = num_blocks
+        self.logical_num_blocks = logical_num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -873,7 +884,14 @@ class KVCacheManager:
             # (a C++ change, out of scope).
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        available = avail_blocks + blocks_from_free_pages
+        logical_num_blocks = getattr(self, "logical_num_blocks", None)
+        if logical_num_blocks is not None and logical_num_blocks < self.num_blocks:
+            logical_available = max(
+                0, logical_num_blocks - self._get_num_alloced_blocks()
+            )
+            available = min(available, logical_available)
+        return available
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().
