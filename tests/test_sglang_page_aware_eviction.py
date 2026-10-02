@@ -782,7 +782,7 @@ def test_native_page_aware_evict_runs_exact_lru_after_suffix_plan():
     )[0] == []
 
 
-def test_native_exact_lru_splits_final_leaf_at_logical_page_boundary():
+def test_native_fallback_may_overshoot_with_a_multi_block_leaf():
     (
         radix_cache_cls,
         radix_key_cls,
@@ -810,20 +810,20 @@ def test_native_exact_lru_splits_final_leaf_at_logical_page_boundary():
         evict_params_cls=evict_params_cls,
     )
 
-    assert result.num_tokens_evicted == 2
+    assert result.num_tokens_evicted == 6
     assert _native_match(
         cache,
         radix_key_cls,
         match_params_cls,
         tokens=tokens,
-    )[0] == [8, 9, 10, 11]
-    assert manager.allocated == {4, 5, 7}
+    )[0] == []
+    assert manager.allocated == {7}
 
 
 @pytest.mark.parametrize(
     ("cached_tokens", "requested_tokens", "expected_evicted"),
     [
-        (1024, 24, 32),
+        (1024, 24, 1024),
         (16, 8, 16),
     ],
 )
@@ -1097,7 +1097,7 @@ def test_page_aware_evict_uses_native_radix_eviction():
     assert set(index.block_owners) == {8, 9, 10, 11}
 
 
-def test_page_aware_evict_preserves_budget_when_page_does_not_fit():
+def test_page_aware_evict_passes_budget_to_native_when_page_does_not_fit():
     cache, _manager, _nodes = _make_cache([4, 5, 6, 7])
     original_strategy = cache.eviction_strategy
     eviction_calls = []
@@ -1114,7 +1114,7 @@ def test_page_aware_evict_preserves_budget_when_page_does_not_fit():
 
     assert len(eviction_calls) == 1
     assert eviction_calls[0][0] == 1
-    assert eviction_calls[0][1] is not original_strategy
+    assert eviction_calls[0][1] is original_strategy
     assert cache.eviction_strategy is original_strategy
 
 
@@ -1137,8 +1137,66 @@ def test_page_aware_evict_falls_back_when_no_page_is_reclaimable():
     )
 
     assert [budget for budget, _strategy in eviction_calls] == [2]
-    assert all(strategy is not original_strategy for _, strategy in eviction_calls)
+    assert all(strategy is original_strategy for _, strategy in eviction_calls)
     assert cache.eviction_strategy is original_strategy
+
+
+def test_page_aware_evict_combines_selected_pages_with_native_overshoot():
+    cached_nodes = [
+        FakeNode(block_id, priority)
+        for priority, block_id in enumerate([4, 5, 6, 7])
+    ]
+    native_node = FakeNode([9, 10, 13], priority=100)
+    nodes = [*cached_nodes, native_node]
+    root = types.SimpleNamespace(
+        children={int(node.value[0]): node for node in nodes},
+        lock_ref=1,
+        parent=None,
+    )
+    for node in nodes:
+        node.parent = root
+
+    manager = FakeManager(range(4, 16))
+    original_strategy = FakeStrategy()
+    cache = types.SimpleNamespace(
+        root_node=root,
+        evictable_leaves=set(nodes),
+        evictable_size_=7,
+        eviction_strategy=original_strategy,
+        page_size=1,
+        token_to_kv_pool_allocator=FakeAllocator(manager),
+    )
+    eviction_calls = []
+
+    def evict(params):
+        eviction_calls.append((params.num_tokens, cache.eviction_strategy))
+        heap = [
+            (cache.eviction_strategy.get_priority(node), index, node)
+            for index, node in enumerate(cache.evictable_leaves)
+        ]
+        heapq.heapify(heap)
+        num_evicted = 0
+        while num_evicted < params.num_tokens:
+            _priority, _index, node = heapq.heappop(heap)
+            block_ids = node.value.tolist()
+            manager.free(block_ids)
+            num_evicted += len(block_ids)
+            cache.evictable_leaves.remove(node)
+            del cache.root_node.children[int(node.value[0])]
+        return types.SimpleNamespace(num_tokens_evicted=num_evicted)
+
+    cache.evict = evict
+    result = _evict_radix_cache_page_aware(
+        radix_cache=cache,
+        num_tokens=5,
+        evict_params_cls=FakeEvictParams,
+    )
+
+    assert [budget for budget, _strategy in eviction_calls] == [4, 1]
+    assert eviction_calls[0][1] is not original_strategy
+    assert eviction_calls[1][1] is original_strategy
+    assert result.num_tokens_evicted == 7
+    assert manager.allocated == {8, 11, 12, 14, 15}
 
 
 def test_page_aware_evict_batches_no_reclaimable_page_fallback():
@@ -1168,7 +1226,7 @@ def test_page_aware_evict_batches_no_reclaimable_page_fallback():
 
     assert len(eviction_calls) == 1
     assert eviction_calls[0][0] == 600
-    assert eviction_calls[0][1] is not original_strategy
+    assert eviction_calls[0][1] is original_strategy
     assert cache.eviction_strategy is original_strategy
 
 
