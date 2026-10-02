@@ -28,6 +28,9 @@ class FakeTensor:
 
 
 class FakeKVCachedAllocator:
+    def available_size(self):
+        return 100
+
     def alloc(self, num_pages):
         return list(range(num_pages))
 
@@ -279,6 +282,25 @@ def test_alloc_extend_kernel(
     )
     if "max_num_extend_tokens" in kwargs:
         assert kwargs["max_num_extend_tokens"] == 8
+
+
+def test_paged_allocator_caps_backing_capacity_at_logical_size(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    alloc_mod = _make_allocator_module(
+        FakeTritonKernel(FakeKernelFn(("unused",)))
+    )
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+
+    allocator = alloc_mod.ElasticPagedTokenToKVPoolAllocator(
+        size=1024,
+        page_size=64,
+        dtype=object(),
+        device="cuda:0",
+        kvcache=FakeKVCache(),
+    )
+    assert allocator.available_size() == 1024
 
 
 def test_swa_allocator_uses_elastic_sub_allocators(monkeypatch):
