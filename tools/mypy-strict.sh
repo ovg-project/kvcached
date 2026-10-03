@@ -2,7 +2,7 @@
 
 # Run mypy with the same strictness as CI
 # Usage: ./tools/mypy-strict.sh [python_version]
-# Example: ./tools/mypy-strict.sh 3.9
+# Example: ./tools/mypy-strict.sh 3.10
 
 set -e
 
