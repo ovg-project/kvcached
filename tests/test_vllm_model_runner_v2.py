@@ -200,7 +200,8 @@ def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
     native = native_allocate(config, torch.device("cpu"), layout, [2, 2])
     owners = adapter.allocate_kv_cache(config, torch.device("cpu"), layout, [2, 2])
     assert set(owners) == {layer for tensor in backing for layer in tensor.layers}
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for name, cache in owners.items():
         assert cache.shape == native[name].shape
         assert cache.stride() == native[name].stride()
@@ -243,7 +244,8 @@ def test_mixed_native_packing_survives_scheduler_collapse_and_group_reuse(monkey
     # The shared block holds 32 + 96 bytes, not two copies of the first layer.
     assert geometry.page_bytes * geometry.num_pools == 128
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     assert caches["b"].data_ptr() - caches["a"].data_ptr() == 32
     assert all(cache.stride(0) * cache.element_size() == 128 for cache in caches.values())
 
