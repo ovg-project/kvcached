@@ -85,8 +85,7 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
     assert geometry.block_size * geometry.cell_size == 64
     assert geometry.num_pools == 2
-    assert captured == [(512, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for layer_index, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 2, 2, 8)
         for block in range(3):
@@ -128,8 +127,7 @@ def test_automatic_page_preserves_native_views(monkeypatch, layout_name):
     assert scheduler_geometry == adapter.cache_geometry(config)
     caches = adapter.allocate_kv_cache(
         config, torch.device("cpu"), KVCacheLayout[layout_name], [2048])
-    assert captured == [(30 * mib, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 6 * mib})]
+    assert captured == [(30 * mib, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 6 * mib})]
     # Verify native view offsets; CUDA tests separately allocate usable block IDs.
     for layer, name in enumerate(("a", "b")):
         for block in range(5):
@@ -159,8 +157,7 @@ def test_mla_native_views_preserve_latent_vectors_and_neighboring_pages(monkeypa
     )
     assert adapter.cache_geometry(config) == adapter.CacheGeometry(64, 73728, 2)
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [64])
-    assert captured == [(2 * 1024**2, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 2 * 1024**2})]
+    assert captured == [(2 * 1024**2, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 2 * 1024**2})]
     for layer, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 1, 64, 576)
         for block in range(3):
@@ -237,8 +234,7 @@ def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
     native = native_allocate(config, torch.device("cpu"), layout, [2, 2])
     owners = adapter.allocate_kv_cache(config, torch.device("cpu"), layout, [2, 2])
     assert set(owners) == {layer for tensor in backing for layer in tensor.layers}
-    assert captured == [(512, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for name, cache in owners.items():
         assert cache.shape == native[name].shape
         assert cache.stride() == native[name].stride()
@@ -281,8 +277,7 @@ def test_mixed_native_packing_survives_scheduler_collapse_and_group_reuse(monkey
     # The shared block holds 32 + 96 bytes, not two copies of the first layer.
     assert geometry.page_bytes * geometry.num_pools == 128
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
-    assert captured == [(512, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     assert caches["b"].data_ptr() - caches["a"].data_ptr() == 32
     assert all(cache.stride(0) * cache.element_size() == 128 for cache in caches.values())
 
