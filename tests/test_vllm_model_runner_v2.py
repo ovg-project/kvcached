@@ -103,7 +103,7 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
 
 
 @pytest.mark.parametrize("layout_name", ["BLNHC", "LBNHC"])
-def test_automatic_tiling_page_preserves_native_views(monkeypatch, layout_name):
+def test_automatic_page_preserves_native_views(monkeypatch, layout_name):
     contiguous = layout_name.startswith("B")
     captured = mock_native_allocator(monkeypatch, contiguous)
     mib = 1024**2
@@ -129,8 +129,8 @@ def test_automatic_tiling_page_preserves_native_views(monkeypatch, layout_name):
     caches = adapter.allocate_kv_cache(
         config, torch.device("cpu"), KVCacheLayout[layout_name], [2048])
     assert captured == [(30 * mib, 1, "cpu", 2, {
-        "num_kv_buffers": 1, "unified_pool": True, "page_size": 10 * mib})]
-    # Five blocks cross the four-block physical-page boundary.
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 6 * mib})]
+    # Verify native view offsets; CUDA tests separately allocate usable block IDs.
     for layer, name in enumerate(("a", "b")):
         for block in range(5):
             caches[name][block].fill_(10 * layer + block + 1)

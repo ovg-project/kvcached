@@ -52,12 +52,17 @@ def test_left_unchanged(vllm_patches, monkeypatch, cfg_kwargs, page_mb):
 
 @pytest.mark.parametrize("tokens,per_token,expected,page_mb", [
     (784, 4096, 1024, 4), (1056, 2048, 2048, 4), (528, 4096, 1024, 4),
-    (1728, 1280, 2048, 10), (896, 2560, 1024, 10),
-    (2048, 1280, 2048, 10),  # already aligned block still needs the tiling page
+    (1728, 1280, 1728, 6), (896, 2560, 896, 6),
+    (2048, 1280, 2048, 6),  # safe non-divisible pages are allowed by #522
+    (1088, 2048, 2048, 4),  # do not chase the original block's 34 MiB tiling page
+    (512, 2048, 512, 2),   # default page already holds an exactly tiling block
+    (768, 2048, 1024, 2),  # #522 can still align a block smaller than the default page
+    (1024, 2048, 1024, 2), # equal sizes do not trigger page enlargement
 ])
 def test_default_page_and_block_are_selected_together(
         vllm_patches, monkeypatch, tokens, per_token, expected, page_mb):
     from kvcached import utils
+    from kvcached.kv_geometry import check_page_geometry
 
     monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
     cfg = _cache_config(tokens, tokens * per_token)
@@ -67,18 +72,55 @@ def test_default_page_and_block_are_selected_together(
     assert cfg.mamba_block_size == expected
     actual_page = utils.get_page_size_for_block(cfg.mamba_page_size_padded, 2 * MIB)
     assert actual_page == page_mb * MIB
-    assert actual_page % cfg.mamba_page_size_padded == 0
+    assert check_page_geometry(cfg.mamba_page_size_padded, actual_page) is None
     before = dict(vars(cfg))
     _align(vllm_patches, monkeypatch, cfg, 2)
     assert vars(cfg) == before
 
 
+@pytest.mark.parametrize("flag", ["user_specified_block_size", "user_specified_mamba_block_size"])
+def test_default_page_grows_without_overriding_fixed_blocks(vllm_patches, monkeypatch, flag):
+    from kvcached.utils import get_page_size_for_block
+
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    cfg = _cache_config(2048, 5 * MIB // 2)
+    setattr(cfg, flag, True)
+    before = dict(vars(cfg))
+    _align(vllm_patches, monkeypatch, cfg, 2)
+    assert vars(cfg) == before
+    assert get_page_size_for_block(cfg.mamba_page_size_padded, 2 * MIB) == 6 * MIB
+
+
 def test_explicit_small_page_is_not_overridden(vllm_patches, monkeypatch):
+    from kvcached.kv_geometry import check_page_geometry
+    from kvcached.utils import get_page_size_for_block
+
     monkeypatch.setenv("KVCACHED_PAGE_SIZE_MB", "2")
     cfg = _cache_config()
     before = dict(vars(cfg))
     _align(vllm_patches, monkeypatch, cfg, 2)
     assert vars(cfg) == before
+    page = get_page_size_for_block(cfg.mamba_page_size_padded, 2 * MIB)
+    assert page == 2 * MIB
+    assert check_page_geometry(cfg.mamba_page_size_padded, page) is not None
+
+
+@pytest.mark.parametrize("user", [False, True])
+@pytest.mark.parametrize("page_mb", [4, 6])
+def test_initial_page_holding_block_keeps_upstream_validation(
+        vllm_patches, monkeypatch, user, page_mb):
+    from kvcached.kv_geometry import check_page_geometry
+    from kvcached.utils import get_page_size_for_block
+
+    monkeypatch.setenv("KVCACHED_PAGE_SIZE_MB", str(page_mb))
+    cfg = _cache_config(2048, 5 * MIB // 2, user=user)
+    before = dict(vars(cfg))
+    _align(vllm_patches, monkeypatch, cfg, page_mb)
+    assert vars(cfg) == before
+    page = get_page_size_for_block(cfg.mamba_page_size_padded, page_mb * MIB)
+    assert page == page_mb * MIB
+    error = check_page_geometry(cfg.mamba_page_size_padded, page)
+    assert (error is not None) == (page_mb == 4)
 
 
 def test_patch_wraps_the_platform_classmethod(vllm_patches, monkeypatch):

@@ -10,21 +10,21 @@ from unittest import mock
 import pytest
 from test_vllm_ftensor_capacity_guard import iface  # noqa: F401
 
-from kvcached.kv_geometry import MIB, recommend_page_geometry, select_page_size
+from kvcached.kv_geometry import MIB, aligned_block_size, select_page_size
 from kvcached.utils import get_page_size_for_block
 
 
 @pytest.mark.parametrize("block,expected_mb", [
     (32768, 2), (2 * MIB, 2), (2162688, 6), (3211264, 8),
     (4 * MIB, 4), (6 * MIB, 6),
-    (5 * MIB // 2, 10), (17 * MIB // 8, 34),
+    (5 * MIB // 2, 6), (17 * MIB // 8, 6),
     (64 * MIB, 64), (65 * MIB, 130),
 ])
 def test_select_page_size(block, expected_mb):
     assert select_page_size(block) == expected_mb * MIB
 
 
-def test_tiling_preference_and_safe_fallback_by_enumerating_block_boundaries():
+def test_smallest_safe_page_by_enumerating_block_boundaries():
     def capacities(block, page):
         return [((i + 1) * page) // block - (i * page + block - 1) // block
                 for i in range(block // math.gcd(block, page))]
@@ -32,13 +32,8 @@ def test_tiling_preference_and_safe_fallback_by_enumerating_block_boundaries():
     for block in range(65536, 129 * 65536, 65536):
         chosen = select_page_size(block)
         assert min(capacities(block, chosen)) > 0
-        tiling_pages = [page for page in range(2 * MIB, 65 * MIB, 2 * MIB)
-                        if page % block == 0]
-        if tiling_pages:
-            assert chosen == min(tiling_pages)
-        else:
-            for smaller in range(2 * MIB, chosen, 2 * MIB):
-                assert min(capacities(block, smaller)) <= 0
+        for smaller in range(2 * MIB, chosen, 2 * MIB):
+            assert min(capacities(block, smaller)) <= 0
 
 
 @pytest.mark.parametrize("block", [0, -1])
@@ -47,18 +42,21 @@ def test_nonpositive_block_is_rejected(block):
         select_page_size(block)
 
 
-def test_recommended_block_keeps_its_tiling_page_at_allocation():
+def test_first_safe_hybrid_page_matches_allocation():
     for cell in (640, 768, 1280, 1536, 2048, 2560, 3072, 4096, 5120, 6144, 8192):
         for tokens in range(16, 4097, 16):
             if tokens * cell <= 2 * MIB:
                 continue
-            recommendation = recommend_page_geometry(tokens, cell)
-            if recommendation is None:
-                continue
-            page_mb, aligned = recommendation
-            page = select_page_size(aligned * cell)
-            assert page == page_mb * MIB, (tokens, cell, recommendation)
-            assert page % (aligned * cell) == 0
+            page = select_page_size(tokens * cell, tokens)
+            aligned = aligned_block_size(tokens, cell, page) or tokens
+            assert select_page_size(aligned * cell) == page, (tokens, cell, page)
+            for smaller in range(2 * MIB, page, 2 * MIB):
+                assert aligned_block_size(tokens, cell, smaller) is None
+                # Independent oracle: some page contains no complete block.
+                block = tokens * cell
+                assert any(((i + 1) * smaller) // block
+                           <= (i * smaller + block - 1) // block
+                           for i in range(block // math.gcd(block, smaller)))
 
 
 def test_auto_selection_is_local_and_logged(monkeypatch):
@@ -73,6 +71,7 @@ def test_auto_selection_is_local_and_logged(monkeypatch):
     assert get_page_size_for_block(32768, 2 * MIB) == 2 * MIB
     assert logger.info.call_count == 1
     assert logger.info.call_args.args[1:] == (2 * MIB, 4 * MIB, 4 * MIB)
+    assert "KVCACHED_PAGE_SIZE_MB" not in utils.os.environ
 
 
 @pytest.mark.parametrize("configured_mb", [2, 4, 6, 8, 10])
@@ -82,12 +81,22 @@ def test_explicit_page_is_preserved(monkeypatch, configured_mb):
     assert get_page_size_for_block(5 * MIB // 2, configured_mb * MIB) == configured_mb * MIB
 
 
+def test_fitting_default_page_is_not_enlarged_to_repair_invalid_geometry(monkeypatch):
+    from kvcached.kv_geometry import check_page_geometry
+
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    block = 3 * MIB // 2
+    page = get_page_size_for_block(block, 2 * MIB)
+    assert page == 2 * MIB
+    assert check_page_geometry(block, page) is not None
+
+
 @pytest.mark.parametrize("tokens,head_dim,attention_type,expected_mb", [
     (2048, 256, "HYBRID_LINEAR", 4),
     (1056, 256, "HYBRID_LINEAR", 6),  # fixed block / releases without the align hook
-    (2048, 160, "HYBRID_LINEAR", 10),
+    (2048, 160, "HYBRID_LINEAR", 6),
     (2048, 256, "MHA", 2),          # K and V are separate allocation units
-    (4096, 160, "MHA", 10),
+    (4096, 160, "MHA", 6),
     (1024, 160, "MHA", 2),          # do not grow an already usable default page
 ])
 @pytest.mark.parametrize("contiguous", [False, True])
@@ -136,7 +145,8 @@ def test_manager_first_checks_the_page_size_already_in_use(iface, monkeypatch):
 @pytest.mark.parametrize("contiguous", [False, True])
 @pytest.mark.parametrize("tokens,cell_bytes,explicit,expected_mb", [
     (2048, 2048, None, 4), (1056, 2048, None, 6), (2048, 2048, "2", None),
-    (2048, 1280, None, 10),
+    (2048, 1280, None, 6), (2048, 1280, "2", None),
+    (2048, 1280, "4", None), (2048, 1280, "6", 6),
 ])
 def test_mrv2_resolves_page_before_geometry_check_and_native_allocation(
         iface, monkeypatch, contiguous, tokens, cell_bytes, explicit, expected_mb):
@@ -156,7 +166,7 @@ def test_mrv2_resolves_page_before_geometry_check_and_native_allocation(
     setattr(specs, "create_kv_cache_views", mock.Mock())
     monkeypatch.setitem(sys.modules, specs.__name__, specs)
     monkeypatch.setattr(adapter, "CONTIGUOUS_LAYOUT", contiguous)
-    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * MIB)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", int(explicit or "2") * MIB)
     if explicit is None:
         monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
     else:
