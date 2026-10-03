@@ -233,7 +233,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
         patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
     )
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, *groups: 0)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "get_world_size", lambda: 4)
@@ -289,7 +289,7 @@ def test_coordinator_propagates_uninitialized_world_size(
         patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
     )
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, *groups: 0)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     # EngineCore never recorded a world size, so get_world_size() raises.
     monkeypatch.setattr(interfaces, "_kvcached_initialized", False)
@@ -368,6 +368,41 @@ def test_engine_core_rejects_partial_integration_before_initialization(
         EngineCore(config)
         assert initialize.call_count == int(enabled)
         original_init.assert_called_once()
+
+
+def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modules):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", 160)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(
+        patches, "_get_first_attention_group",
+        lambda cfg: types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=64)),
+    )
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
+    monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(fake_block_pool_mod, "ElasticBlockPool", FakeElasticBlockPool)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod)
+
+    class FakeKVCacheCoordinator:
+        def __init__(self, *args, **kwargs):
+            self.enable_caching = True
+            # e.g. one full-attention and two sliding-window groups
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8, kv_cache_groups=[object()] * 3)
+            self.single_type_managers = [types.SimpleNamespace() for _ in range(3)]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16)
+
+    kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
+    setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
+    assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
+    coordinator = kvcoord_mod.KVCacheCoordinator()
+    # 160 tokens of 64-token blocks is 2 blocks per group.
+    assert coordinator.block_pool.kwargs["max_cached_blocks"] == 6
 
 
 def test_engine_core_rejects_hisparse(monkeypatch, vllm_modules):

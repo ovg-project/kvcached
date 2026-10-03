@@ -458,12 +458,14 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     return isinstance(kv_cache_spec, MLAAttentionSpec)
 
 
-def _get_max_cached_blocks(block_size: int) -> int:
+def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)``.
+    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)`` times the
+    number of KV cache groups: every group holds its own blocks for the same
+    cached tokens, and all of them count against one pool-wide cap.
 
     The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
     ``block_size`` (e.g. 8 tokens with a 16-token block) integer-divides to
@@ -487,8 +489,8 @@ def _get_max_cached_blocks(block_size: int) -> int:
             MAX_CACHED_TOKENS,
             block_size,
         )
-        return 1
-    return max_cached_blocks
+        max_cached_blocks = 1
+    return max_cached_blocks * max(1, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -1854,7 +1856,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 num_layers=group_size,
                 enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size),
+                max_cached_blocks=_get_max_cached_blocks(
+                    block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
                 hash_block_size=hash_block_size,
             )
             for manager in self.single_type_managers:
