@@ -10,7 +10,7 @@ We also provide a development image that has both vLLM and SGLang.
 
 | Engine | Public image | Default tag |
 | ------ | ------------ | ----------- |
-| vLLM   | `ghcr.io/ovg-project/kvcached-vllm`   | `latest`, `kvcached-v0.1.6-vllm-v0.29.0` |
+| vLLM   | `ghcr.io/ovg-project/kvcached-vllm`   | `latest`, `kvcached-v0.1.6-vllm-v0.30.0` |
 | SGLang | `ghcr.io/ovg-project/kvcached-sglang` | `latest`, `kvcached-v0.1.6-sglang-v0.5.20` |
 | vLLM+SGLang | `ghcr.io/ovg-project/kvcached-dev` | `latest`, `v0.1.6` |
 
@@ -68,7 +68,7 @@ NOTE: If installed correctly, you should see that kvcached patches the vLLM:
 
 ```
 [kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:98] Applying 16 patches for vllm
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:199] Detected vllm version: 0.29.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:199] Detected vllm version: 0.30.0
 [kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:178] Successfully patched vllm: nixl_connector_compat, elastic_block_pool, engine_core, mp_client, core_engine_proc_manager, model_runner_v2, kv_layout_v2, gpu_worker, hybrid_block_size_align, kv_cache_coordinator, allocate_slots, mamba_partial_tail
 ```
 

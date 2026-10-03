@@ -43,7 +43,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 
 ## 📢 Updates
 
-- **[2026-10]** kvcached **v0.1.6** supports **vLLM v0.29** (including Model Runner V2) and **SGLang v0.5.20**, hybrid linear-attention models (Qwen3.5, Qwen3.8), Gemma 4, and AMD GPUs (ROCm).
+- **[2026-10]** kvcached **v0.1.6** supports **vLLM v0.30** (including Model Runner V2) and **SGLang v0.5.20**, hybrid linear-attention models (Qwen3.5, Qwen3.8), Gemma 4, and AMD GPUs (ROCm).
 
 - **[2026-04]** kvcached is **featured by Red Hat** for running LLMs dynamically in production under limited resources! Red Hat's [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) builds on kvcached to provide dynamic multi-model serving with Kubernetes and OpenShift support. See the [blog post](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach) for more details.
   [[▶ View Demo]](https://app.arcade.software/share/xZoDfo1vyDbZrbZTK2gv?ref=share-link)
@@ -59,7 +59,7 @@ GPT-OSS support in SGLang updated to **v0.5.9**.
 | Engine | Versions | Attention types | Example models |
 |--------|----------|-----------------|----------------|
 | SGLang | ≥ v0.5.11 (tested up to v0.5.20) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it |
-| vLLM | ≥ v0.17.0 (tested up to v0.29.0) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it, Gemma-4-12B-it |
+| vLLM | ≥ v0.17.0 (tested up to v0.30.0) | MHA / GQA / MLA / sliding window / hybrid | DeepSeek-V3, Qwen3-8B, GPT-OSS-20B, Qwen3.5-9B, Qwen3.8-27B, Gemma-4-E2B-it, Gemma-4-12B-it |
 
 The minimum versions follow from the PyTorch requirement below. See [#425](https://github.com/ovg-project/kvcached/issues/425) for per-model results on each engine and KV layout.
 
@@ -131,7 +131,7 @@ Details can be found in [benchmarks/bench_latency_benefit](https://github.com/ov
 
 - Python (tested with 3.10 - 3.13)
 - PyTorch >= 2.10 (kvcached builds against the PyTorch stable ABI)
-- SGLang (tested with v0.5.20) or vLLM (tested with v0.29.0)
+- SGLang (tested with v0.5.20) or vLLM (tested with v0.30.0)
 
 kvcached can be installed as a plugin with existing SGLang or vLLM environment.
 
@@ -155,7 +155,7 @@ kvcached installed with original engine dockers.
 
 ```bash
 docker pull ghcr.io/ovg-project/kvcached-sglang:latest   # kvcached-v0.1.6-sglang-v0.5.20
-docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.6-vllm-v0.29.0
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest     # kvcached-v0.1.6-vllm-v0.30.0
 ```
 
 We prepare an all-in-one docker for developers:
