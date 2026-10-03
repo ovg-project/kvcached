@@ -161,7 +161,12 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[tensor.layers[0]]
+        if getattr(tensor, "host_resident", False):
+            raise KVCachedConfigError("kvcached does not support host-resident KV tensors")
         kernel_size = kernel_block_sizes[group_id] if kernel_block_sizes is not None else None
+        if getattr(spec, "storage_block_size", None) is not None:
+            # vLLM 0.30 MLA specs can fix the stored kernel block size.
+            kernel_size = spec.storage_block_size
         # Match create_kv_cache_views: splitting requires dense, unpadded
         # manager blocks. page_size_bytes includes padding and is not the
         # dense size. Layer-compact storage removes interleaving, not padding.

@@ -330,7 +330,9 @@ def test_coordinator_propagates_uninitialized_world_size(
         ("0.28.0", True, True, False),
         ("0.29.0", True, True, False),
         ("0.29.0", True, False, True),
-        ("0.30.0", True, None, True),
+        ("0.30.0", True, True, False),
+        ("0.30.0", True, False, True),
+        ("0.31.0", True, None, True),
         ("0.29.0", False, None, False),
         ("0.30.0", False, None, False),
     ],
@@ -366,3 +368,70 @@ def test_engine_core_rejects_partial_integration_before_initialization(
         EngineCore(config)
         assert initialize.call_count == int(enabled)
         original_init.assert_called_once()
+
+
+def test_engine_core_rejects_hisparse(monkeypatch, vllm_modules):
+    # HiSparse allocates through vLLM's own allocator on 0.30.
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = "0.30.0"
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    config = types.SimpleNamespace(
+        use_v2_model_runner=True,
+        attention_config=types.SimpleNamespace(hisparse_config=object()),
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+    )
+    with pytest.raises(patches.KVCachedConfigError, match="HiSparse"):
+        EngineCore(config)
+    initialize.assert_not_called()
+    original_init.assert_not_called()
+
+
+@pytest.mark.parametrize("coordinator_flag,pool_flag,expected", [
+    (True, False, True),   # <= 0.29: the coordinator owns the flag
+    (False, True, False),
+    (None, True, True),    # 0.30: only the native pool has it
+    (None, False, False),
+])
+def test_coordinator_reads_caching_flag(
+    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(
+        patches, "_get_first_attention_group",
+        lambda cfg: types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=64)),
+    )
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
+    monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(fake_block_pool_mod, "ElasticBlockPool", FakeElasticBlockPool)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod)
+
+    class FakeKVCacheCoordinator:
+        def __init__(self, *args, **kwargs):
+            if coordinator_flag is not None:
+                self.enable_caching = coordinator_flag
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
+            self.single_type_managers = [types.SimpleNamespace()]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16, enable_caching=pool_flag)
+
+    kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
+    setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
+    assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
+    coordinator = kvcoord_mod.KVCacheCoordinator()
+    assert coordinator.block_pool.kwargs["enable_caching"] is expected
