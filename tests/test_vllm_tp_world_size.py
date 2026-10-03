@@ -414,7 +414,7 @@ def test_coordinator_reads_caching_flag(
     monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
     monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, num_kv_cache_groups=1: 0)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
     monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
