@@ -596,12 +596,13 @@ def alloc_kv_cache(
     # --- Compute per-layer memory budget and number of blocks ---
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
-    # Round down to twice the selected page size for the MLA backend.
+    # Round down to 2 * page_size for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
     # gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) to be a multiple of
-    # 2 * page_size. When num_k_or_v == 1 (MLA), align this value directly.
-    # For MHA/GQA (num_k_or_v == 2), one page suffices because
-    # ftensor_bytes = 2 * aligned_value is automatically 2*page_size-aligned.
+    # 2 * page_size. When num_k_or_v == 1 (MLA), we must align this value
+    # to 2 * page_size directly. For MHA/GQA (num_k_or_v == 2), aligning
+    # to page_size suffices because ftensor_bytes = 2 * aligned_value is
+    # automatically 2*page_size-aligned.
     alignment = 2 * page_size if is_mla else page_size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
 

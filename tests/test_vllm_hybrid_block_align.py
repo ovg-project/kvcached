@@ -55,9 +55,9 @@ def test_left_unchanged(vllm_patches, monkeypatch, cfg_kwargs, page_mb):
     (1728, 1280, 1728, 6), (896, 2560, 896, 6),
     (2048, 1280, 2048, 6),  # safe non-divisible pages are allowed by #522
     (1088, 2048, 2048, 4),  # do not chase the original block's 34 MiB tiling page
-    (512, 2048, 512, 2),   # default page already holds an exactly tiling block
-    (768, 2048, 1024, 2),  # #522 can still align a block smaller than the default page
-    (1024, 2048, 1024, 2), # equal sizes do not trigger page enlargement
+    (512, 2048, 512, 2),    # default page already holds an exactly tiling block
+    (768, 2048, 1024, 2),   # #522 can still align a block smaller than the default page
+    (1024, 2048, 1024, 2),  # equal sizes do not trigger page enlargement
 ])
 def test_default_page_and_block_are_selected_together(
         vllm_patches, monkeypatch, tokens, per_token, expected, page_mb):
