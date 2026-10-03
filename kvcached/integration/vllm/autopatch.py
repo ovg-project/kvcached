@@ -66,7 +66,7 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
             (KVCacheManagerAllocateSlotsPatch(), VLLM_ALL_RANGE),
-            (MambaPartialTailPatch(), ">=0.28.0,<0.30.0"),
+            (MambaPartialTailPatch(), ">=0.28.0,<0.31.0"),
             (TritonAttentionPatch(), ">=0.9.0,<0.29.0"),
         ]
     )

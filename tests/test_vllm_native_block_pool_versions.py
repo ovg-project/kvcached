@@ -18,6 +18,7 @@ from kvcached.integration.vllm.patches import ElasticBlockPoolPatch
     ("0.27.0", True),
     ("0.28.0", True),
     ("0.29.0", True),
+    ("0.30.0", True),
 ])
 def test_native_metadata_is_selected_from_026(version, use_native):
     target = ModuleType("_versioned_elastic_pool")
@@ -34,3 +35,10 @@ def test_native_metadata_is_selected_from_026(version, use_native):
         assert pool_cls.get_cached_block is NativeBlockPoolMixin.get_cached_block
         assert pool_cls._remove_cached_block is NativeBlockPoolMixin._remove_cached_block
         assert pool_cls.free_blocks is NativeBlockPoolMixin.free_blocks
+
+
+def test_native_pool_rejects_unpinned_blocks():
+    # vLLM 0.30 HiSparse unpins blocks and waits for reuse callbacks that the
+    # elastic pool never fires; HiSparse itself is rejected at startup.
+    with pytest.raises(NotImplementedError, match="unpinned"):
+        NativeBlockPoolMixin.unpin_blocks(NativeBlockPoolMixin.__new__(NativeBlockPoolMixin), [])
