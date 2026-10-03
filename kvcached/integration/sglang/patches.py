@@ -232,6 +232,43 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
     target_module = "sglang.srt.mem_cache.kv_cache_configurator"
     target_class = "KVCacheConfigurator"
 
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not super().apply(target_module):
+            return False
+        return self.patch_configure(target_module)
+
+    def patch_configure(self, target_module: types.ModuleType) -> bool:
+        target_class = self._get_target_class(target_module)
+        original = getattr(target_class, "configure", None)
+        if original is None:
+            self.logger.warning("SGLang KVCacheConfigurator does not expose configure")
+            return False
+        if self._is_already_patched(original, "elastic_pool_modes"):
+            return True
+
+        @functools.wraps(original)
+        def configure(owner, *args, **kwargs):
+            if enable_kvcached() and _is_supported_gpu_device(owner.device):
+                # Draft workers can reuse a budget and skip the profiling hook.
+                if getattr(owner, "post_capture_kv_active", False):
+                    raise RuntimeError(
+                        "SGLang post-capture KV sizing is not supported with "
+                        "kvcached elastic pools"
+                    )
+                # Follow the native source of truth across the runtime-context move.
+                get_memory = getattr(target_module, "get_memory", None)
+                memory = get_memory() if get_memory is not None else owner.server_args
+                if memory.enable_unified_memory:
+                    raise RuntimeError(
+                        "SGLang unified memory is not supported with kvcached "
+                        "elastic pools; disable --enable-unified-memory"
+                    )
+            return original(owner, *args, **kwargs)
+
+        self._mark_as_patched(configure, "elastic_pool_modes")
+        target_class.configure = configure
+        return True
+
     def _get_mem_fraction_static(self, configurator: Any) -> float:
         # SGLang 0.5.17 moved the resolved value into the runtime-context
         # schedule bag: KVCacheConfigurator's own sizing reads
@@ -2175,3 +2212,69 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
         )
         return True
+
+
+class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
+    """Enforce KVCACHED_MAX_CACHED_TOKENS on a prefix cache that is not a
+    RadixCache subclass, so RadixCacheLimitPatch alone leaves it unbounded.
+    The cap counts full-attention tokens, like RadixCache.evictable_size_.
+    """
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_radix_cache_limit(self, radix_cache_mod: types.ModuleType) -> bool:
+        cache_cls = self._get_target_class(radix_cache_mod)
+        if cache_cls is None:
+            return False
+
+        original_cache_finished = getattr(cache_cls, "cache_finished_req", None)
+        if original_cache_finished is None:
+            self.logger.warning("%s.cache_finished_req not found", self.target_class)
+            return False
+
+        if self._is_already_patched(original_cache_finished):
+            return True
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        max_cached = MAX_CACHED_TOKENS
+
+        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+            original_cache_finished(self_rc, *args, **kwargs)
+            excess = self_rc.full_evictable_size() - max_cached
+            if excess > 0:
+                self_rc.evict(EvictParams(num_tokens=excess))
+
+        self._mark_as_patched(_wrapped)
+        cache_cls.cache_finished_req = _wrapped
+
+        logger.info(
+            f"[kvcached] {self.target_class} evictable size capped at "
+            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+        )
+        return True
+
+
+class UnifiedRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """SGLang builds UnifiedRadixCache for hybrid SWA/Mamba models from
+    0.5.16 and for every radix-cache model from 0.5.19."""
+
+    target_module = "sglang.srt.mem_cache.unified_radix_cache"
+    target_class = "UnifiedRadixCache"
+    patch_name = "unified_radix_cache_limit"
+
+
+class SWARadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid SWA models (gpt-oss, Gemma) use SWARadixCache up to 0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.swa_radix_cache"
+    target_class = "SWARadixCache"
+    patch_name = "swa_radix_cache_limit"
+
+
+class MambaRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid Mamba models (Qwen3-Next, Qwen3.5) use MambaRadixCache up to
+    0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.mamba_radix_cache"
+    target_class = "MambaRadixCache"
+    patch_name = "mamba_radix_cache_limit"
