@@ -103,6 +103,43 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
 
 
 @pytest.mark.parametrize("layout_name", ["BLNHC", "LBNHC"])
+def test_automatic_tiling_page_preserves_native_views(monkeypatch, layout_name):
+    contiguous = layout_name.startswith("B")
+    captured = mock_native_allocator(monkeypatch, contiguous)
+    mib = 1024**2
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * mib)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda _: types.SimpleNamespace(total_memory=64 * mib))
+    spec = FullAttentionSpec(block_size=2048, num_kv_heads=5,
+                             head_size=128, dtype=torch.uint8)
+    block_bytes = spec.page_size_bytes
+    assert block_bytes == 5 * mib // 2
+    config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[KVCacheTensor(
+            size=10 * block_bytes, layers=["a", "b"],
+            layer_stride=block_bytes if contiguous else 5 * block_bytes,
+            block_stride=2 * block_bytes if contiguous else block_bytes,
+        )],
+        kv_cache_groups=[KVCacheGroupSpec(["a", "b"], spec)],
+    )
+    scheduler_geometry = adapter.cache_geometry(generate_scheduler_kv_cache_config([config]))
+    assert scheduler_geometry == adapter.cache_geometry(config)
+    caches = adapter.allocate_kv_cache(
+        config, torch.device("cpu"), KVCacheLayout[layout_name], [2048])
+    assert captured == [(30 * mib, 1, "cpu", 2, {
+        "num_kv_buffers": 1, "unified_pool": True, "page_size": 10 * mib})]
+    # Five blocks cross the four-block physical-page boundary.
+    for layer, name in enumerate(("a", "b")):
+        for block in range(5):
+            caches[name][block].fill_(10 * layer + block + 1)
+    for layer, name in enumerate(("a", "b")):
+        for block in range(5):
+            assert torch.all(caches[name][block] == 10 * layer + block + 1)
+
+
+@pytest.mark.parametrize("layout_name", ["BLNHC", "LBNHC"])
 def test_mla_native_views_preserve_latent_vectors_and_neighboring_pages(monkeypatch, layout_name):
     contiguous = layout_name.startswith("B")
     captured = mock_native_allocator(monkeypatch, contiguous)

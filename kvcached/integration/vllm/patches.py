@@ -3035,8 +3035,8 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
     requires and pads the state to it, so choose the smallest such block whose
     unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). When the
     default page is too small, choose a larger page/block pair; allocation
-    resolves the physical page from the final block. User block sizes stay
-    unchanged.
+    resolves the same tiling page from the final block. User block sizes
+    stay unchanged.
     """
     from kvcached.kv_geometry import MIB, aligned_block_size, recommend_page_geometry
     from kvcached.utils import PAGE_SIZE

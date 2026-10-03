@@ -204,6 +204,9 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 For vLLM, leaving `KVCACHED_PAGE_SIZE_MB` unset lets kvcached choose a larger
 physical page when a KV block exceeds the default 2 MiB page. Hybrid block
 alignment is applied before allocation, and the selected page size is logged.
+Automatic selection prefers a page that the block tiles exactly, up to the
+64 MiB recommendation limit; otherwise it uses the smallest page with a whole
+block in every page.
 An explicit `KVCACHED_PAGE_SIZE_MB` is preserved and validated as before.
 
 > [!NOTE]

@@ -50,17 +50,24 @@ def test_left_unchanged(vllm_patches, monkeypatch, cfg_kwargs, page_mb):
     assert vars(cfg) == before
 
 
-@pytest.mark.parametrize("tokens,per_token,expected", [
-    (784, 4096, 1024), (1056, 2048, 2048), (528, 4096, 1024),
+@pytest.mark.parametrize("tokens,per_token,expected,page_mb", [
+    (784, 4096, 1024, 4), (1056, 2048, 2048, 4), (528, 4096, 1024, 4),
+    (1728, 1280, 2048, 10), (896, 2560, 1024, 10),
+    (2048, 1280, 2048, 10),  # already aligned block still needs the tiling page
 ])
 def test_default_page_and_block_are_selected_together(
-        vllm_patches, monkeypatch, tokens, per_token, expected):
+        vllm_patches, monkeypatch, tokens, per_token, expected, page_mb):
+    from kvcached import utils
+
     monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
     cfg = _cache_config(tokens, tokens * per_token)
     _align(vllm_patches, monkeypatch, cfg, 2)
     assert cfg.block_size == expected
-    assert cfg.mamba_page_size_padded == 4 * MIB
+    assert cfg.mamba_page_size_padded == expected * per_token
     assert cfg.mamba_block_size == expected
+    actual_page = utils.get_page_size_for_block(cfg.mamba_page_size_padded, 2 * MIB)
+    assert actual_page == page_mb * MIB
+    assert actual_page % cfg.mamba_page_size_padded == 0
     before = dict(vars(cfg))
     _align(vllm_patches, monkeypatch, cfg, 2)
     assert vars(cfg) == before

@@ -17,8 +17,8 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
     vmm.init_kvcached("cuda:0", 2 * mib, contiguous)
     pools = []
     try:
-        for group, page in enumerate((4 * mib, 6 * mib, 2 * mib)):
-            kwargs = {"page_size": page} if group < 2 else {}
+        for group, page in enumerate((4 * mib, 6 * mib, 10 * mib, 2 * mib)):
+            kwargs = {"page_size": page} if group < 3 else {}
             raw = vmm.create_kv_tensors(
                 4 * page, 1, "cuda:0", layers, num_kv_buffers=buffers,
                 group_id=group, unified_pool=unified, **kwargs)

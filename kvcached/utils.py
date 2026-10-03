@@ -146,9 +146,9 @@ def get_page_size_for_block(block_mem_size: int, configured_page_size: int) -> i
     if (block_mem_size <= configured_page_size
             or os.getenv("KVCACHED_PAGE_SIZE_MB") is not None):
         return configured_page_size
-    from kvcached.kv_geometry import minimum_page_size
+    from kvcached.kv_geometry import select_page_size
 
-    page_size = minimum_page_size(block_mem_size)
+    page_size = select_page_size(block_mem_size)
     get_kvcached_logger().info(
         "Default kvcached page (%d bytes) cannot hold the KV block (%d bytes); "
         "using %d-byte pages for this pool", configured_page_size,

@@ -20,6 +20,8 @@ MIB = 1024 * 1024
 PAGE_GRANULARITY = 2 * MIB
 # Do not grow a block by more than this factor to make it tile a page.
 MAX_BLOCK_GROWTH = 2
+# Keep automatic tiling within the same search range as startup advice.
+MAX_TILING_PAGE_MB = 64
 
 
 def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
@@ -33,10 +35,19 @@ def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     return page_size < 2 * block_mem_size - gcd(page_size, block_mem_size)
 
 
-def minimum_page_size(block_mem_size: int) -> int:
-    """Smallest supported page with at least one whole block in every page."""
+def select_page_size(block_mem_size: int) -> int:
+    """Prefer the smallest tiling page up to 64 MiB, else the smallest safe page.
+
+    A block chosen by ``recommend_page_geometry`` must retain its tiling page
+    at allocation time. Its least common multiple with PAGE_GRANULARITY is
+    that same page; choosing only for safety could reintroduce straddling.
+    """
     if block_mem_size <= 0:
         raise ValueError("KV block size must be positive")
+    tiling_page = (block_mem_size // gcd(block_mem_size, PAGE_GRANULARITY)
+                   * PAGE_GRANULARITY)
+    if tiling_page <= MAX_TILING_PAGE_MB * MIB:
+        return tiling_page
     page_size = ((block_mem_size + PAGE_GRANULARITY - 1)
                  // PAGE_GRANULARITY * PAGE_GRANULARITY)
     while has_zero_capacity_pages(block_mem_size, page_size):
@@ -67,7 +78,7 @@ def aligned_block_size(block_size: int, bytes_per_token: int,
 
 def recommend_page_geometry(block_size: int,
                             bytes_per_token: int,
-                            max_page_mb: int = 64) -> Optional[tuple[int, int]]:
+                            max_page_mb: int = MAX_TILING_PAGE_MB) -> Optional[tuple[int, int]]:
     """Smallest ``(KVCACHED_PAGE_SIZE_MB, block_size)`` whose blocks tile the page."""
     for page_mb in range(PAGE_GRANULARITY // MIB, max_page_mb + 1,
                          PAGE_GRANULARITY // MIB):
