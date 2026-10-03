@@ -66,6 +66,23 @@ def _sglang_reset_free_group(allocator: Any) -> None:
         allocator.free_group = None
 
 
+def _sglang_pool_has_zero_attention_layers(kvcache: Any) -> bool:
+    """True when the pool's attention side holds zero layers.
+
+    SGLang builds zero-layer attention pools for models without
+    full-attention layers: the ``full_kv_pool`` inside
+    ``HybridLinearKVPool`` for pure Mamba2 models, and the full-attention
+    sub-pool of ``SWAKVPool`` for all-SWA models. Such a pool owns no KV
+    memory (native allocates no buffers for it), so there is nothing for
+    kvcached to manage and the elastic allocators defer to the native
+    ones. Composite pools are unwrapped through ``full_kv_pool``.
+    """
+    if kvcache is None:
+        return False
+    attention_pool = getattr(kvcache, "full_kv_pool", kvcache)
+    return getattr(attention_pool, "layer_num", None) == 0
+
+
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
     """Return one capacity shared by every rank in the SGLang world group."""
     from sglang.srt.distributed.parallel_state import get_world_group
@@ -345,10 +362,31 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            # Captured before alias_allocator_to_elastic() rebinds the name,
+            # so it is the native class even on re-entry.
+            native_token_allocator = getattr(alloc_mod, "TokenToKVPoolAllocator", None)
 
             class ElasticTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
             ):
+                _native_allocator_cls = native_token_allocator
+
+                def __new__(cls, size=None, dtype=None, device=None, kvcache=None,
+                            *args, **kwargs):
+                    if (cls._native_allocator_cls is not None
+                            and _sglang_pool_has_zero_attention_layers(kvcache)):
+                        # Zero-layer attention pool (e.g. pure Mamba2):
+                        # no KV memory exists for kvcached to manage, so
+                        # serve the exact native allocator over the
+                        # phantom token slots. Python skips our __init__
+                        # for the foreign instance.
+                        logger.info(
+                            "[kvcached] zero attention layers; using the "
+                            "native TokenToKVPoolAllocator for this pool")
+                        return cls._native_allocator_cls(
+                            size, dtype, device, kvcache, *args, **kwargs)
+                    return super().__new__(cls)
+
                 def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
                     super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
@@ -438,6 +476,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            # Captured before alias_paged_allocator_to_elastic() rebinds the
+            # name, so it is the native class even on re-entry.
+            native_paged_allocator = getattr(
+                alloc_mod, "PagedTokenToKVPoolAllocator", None)
             alloc_extend_kernel, alloc_decode_kernel = (
                 _resolve_sglang_allocator_kernels(alloc_mod)
             )
@@ -454,6 +496,26 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             class ElasticPagedTokenToKVPoolAllocator(
                 BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
             ):
+                _native_allocator_cls = native_paged_allocator
+
+                def __new__(cls, size=None, page_size=None, dtype=None,
+                            device=None, kvcache=None, *args, **kwargs):
+                    if (cls._native_allocator_cls is not None
+                            and _sglang_pool_has_zero_attention_layers(kvcache)):
+                        # Zero-layer attention pool (e.g. pure Mamba2):
+                        # no KV memory exists for kvcached to manage, so
+                        # serve the exact native allocator over the
+                        # phantom token slots. Python skips our __init__
+                        # for the foreign instance.
+                        logger.info(
+                            "[kvcached] zero attention layers; using the "
+                            "native PagedTokenToKVPoolAllocator for this "
+                            "pool")
+                        return cls._native_allocator_cls(
+                            size, page_size, dtype, device, kvcache,
+                            *args, **kwargs)
+                    return super().__new__(cls)
+
                 def __init__(
                     self, size: int, page_size: int, dtype, device: str, kvcache, *args, **kwargs
                 ) -> None:
@@ -831,6 +893,25 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.cell_size = (
                         self.head_num * self.head_dim * self.store_dtype.itemsize
                     )
+
+                    if layer_num == 0:
+                        # Zero-layer pool: SGLang builds one as the
+                        # full-attention sub-pool of models without
+                        # full-attention layers (e.g. pure Mamba2 under
+                        # HybridLinearKVPool, all-SWA under SWAKVPool). It
+                        # owns no KV memory, so there is nothing for
+                        # kvcached to manage; _create_buffers_elastic()
+                        # left the buffers empty, mirroring native. The
+                        # None allocator tells the elastic token allocators
+                        # to stay native for this pool.
+                        self.kvcached_allocator = None
+                        self.mem_usage = 0.0
+                        logger.info(
+                            "ElasticMHATokenToKVPool: zero attention "
+                            "layers, no elastic KV pool created "
+                            f"(group_id={self._group_id})")
+                        return
+
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
@@ -855,6 +936,16 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                 def _create_buffers_elastic(self):
                     import kvcached.integration.sglang.interfaces as kvi
+
+                    if self.layer_num == 0:
+                        # Native SGLang allocates no buffers for a
+                        # zero-layer pool (its per-layer loops run zero
+                        # times); alloc_kv_cache() would divide the GPU
+                        # budget by zero layers. Leave the same empty
+                        # buffers native would.
+                        self.k_buffer: List[Any] = []
+                        self.v_buffer: List[Any] = []
+                        return
 
                     # kvcached backs NHD rows, one (head_num, head_dim) row
                     # per token slot. HND and the ROCm vectorized layouts
