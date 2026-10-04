@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU tensors with actual vLLM 0.29 view helpers; no GPU or native VMM needed."""
+"""CPU tensors with actual vLLM 0.29/0.30 view helpers; no GPU or native VMM needed."""
 
 import copy
+import dataclasses
 import importlib.metadata
 import logging
 import sys
@@ -13,8 +14,8 @@ import pytest
 
 pytest.importorskip("torch")
 pytest.importorskip("vllm")
-if not importlib.metadata.version("vllm").startswith("0.29."):
-    pytest.skip("requires the vLLM 0.29 view contract", allow_module_level=True)
+if not importlib.metadata.version("vllm").startswith(("0.29.", "0.30.")):
+    pytest.skip("requires the vLLM 0.29/0.30 view contract", allow_module_level=True)
 
 import torch
 from vllm.v1.core.kv_cache_utils import (
@@ -85,7 +86,7 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
     assert geometry.block_size * geometry.cell_size == 64
     assert geometry.num_pools == 2
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for layer_index, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 2, 2, 8)
         for block in range(3):
@@ -99,6 +100,42 @@ def test_native_views_preserve_block_layer_and_group_aliases(monkeypatch, layout
     caches["alias_a"][1].fill_(55)
     assert torch.all(caches["a"][1] == 55)
     assert torch.all(caches["b"][1, :, :, :4] == 12)
+
+
+@pytest.mark.parametrize("layout_name", ["BLNHC", "LBNHC"])
+def test_automatic_page_preserves_native_views(monkeypatch, layout_name):
+    contiguous = layout_name.startswith("B")
+    captured = mock_native_allocator(monkeypatch, contiguous)
+    mib = 1024**2
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * mib)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda _: types.SimpleNamespace(total_memory=64 * mib))
+    spec = FullAttentionSpec(block_size=2048, num_kv_heads=5,
+                             head_size=128, dtype=torch.uint8)
+    block_bytes = spec.page_size_bytes
+    assert block_bytes == 5 * mib // 2
+    config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[KVCacheTensor(
+            size=10 * block_bytes, layers=["a", "b"],
+            layer_stride=block_bytes if contiguous else 5 * block_bytes,
+            block_stride=2 * block_bytes if contiguous else block_bytes,
+        )],
+        kv_cache_groups=[KVCacheGroupSpec(["a", "b"], spec)],
+    )
+    scheduler_geometry = adapter.cache_geometry(generate_scheduler_kv_cache_config([config]))
+    assert scheduler_geometry == adapter.cache_geometry(config)
+    caches = adapter.allocate_kv_cache(
+        config, torch.device("cpu"), KVCacheLayout[layout_name], [2048])
+    assert captured == [(30 * mib, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 6 * mib})]
+    # Verify native view offsets; CUDA tests separately allocate usable block IDs.
+    for layer, name in enumerate(("a", "b")):
+        for block in range(5):
+            caches[name][block].fill_(10 * layer + block + 1)
+    for layer, name in enumerate(("a", "b")):
+        for block in range(5):
+            assert torch.all(caches[name][block] == 10 * layer + block + 1)
 
 
 @pytest.mark.parametrize("layout_name", ["BLNHC", "LBNHC"])
@@ -121,7 +158,7 @@ def test_mla_native_views_preserve_latent_vectors_and_neighboring_pages(monkeypa
     )
     assert adapter.cache_geometry(config) == adapter.CacheGeometry(64, 73728, 2)
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [64])
-    assert captured == [(2 * 1024**2, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(2 * 1024**2, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 2 * 1024**2})]
     for layer, name in enumerate(("a", "b")):
         assert caches[name].shape == (3, 1, 64, 576)
         for block in range(3):
@@ -152,7 +189,7 @@ def mixed_config(layout_name):
         get_resolved_kv_cache_layout=lambda: KVCacheLayout[layout_name],
         num_gpu_blocks_override=3,
         prefix_cache_retention_interval=None,
-    ))
+    ), attention_config=types.SimpleNamespace(hisparse_config=None))  # read by 0.30
     return get_kv_cache_config_from_groups(config, groups, available_memory=384)
 
 
@@ -165,7 +202,7 @@ def test_native_borrowers_preserve_owner_geometry(monkeypatch, layout_name, borr
         get_resolved_kv_cache_layout=lambda: KVCacheLayout[layout_name],
         num_gpu_blocks_override=3,
         prefix_cache_retention_interval=None,
-    ))
+    ), attention_config=types.SimpleNamespace(hisparse_config=None))  # read by 0.30
     config = get_kv_cache_config_from_groups(
         native_config, config.kv_cache_groups, available_memory=384,
     )
@@ -198,7 +235,7 @@ def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
     native = native_allocate(config, torch.device("cpu"), layout, [2, 2])
     owners = adapter.allocate_kv_cache(config, torch.device("cpu"), layout, [2, 2])
     assert set(owners) == {layer for tensor in backing for layer in tensor.layers}
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     for name, cache in owners.items():
         assert cache.shape == native[name].shape
         assert cache.stride() == native[name].stride()
@@ -212,13 +249,20 @@ def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
     bound = []
     monkeypatch.setattr(attn_utils, "allocate_kv_cache", lambda *args: owners)
     monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: sharing)
-    monkeypatch.setattr(attn_utils, "bind_kv_cache", lambda caches, *args: bound.append(caches))
     engine_config = types.SimpleNamespace(
         cache_config=types.SimpleNamespace(get_resolved_kv_cache_layout=lambda: layout),
         model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace(model_type="test")),
+        attention_config=types.SimpleNamespace(hisparse_config=None),
     )
-    caches = attn_utils.init_kv_cache([], {}, config, torch.device("cpu"), [2, 2], engine_config)
-    assert bound == [caches]
+    if hasattr(attn_utils, "bind_kv_cache"):  # 0.29
+        monkeypatch.setattr(attn_utils, "bind_kv_cache", lambda caches, *args: bound.append(caches))
+        caches = attn_utils.init_kv_cache([], {}, config, torch.device("cpu"), [2, 2], engine_config)
+        assert bound == [caches]
+    else:  # 0.30 binds only the layers present in the forward context
+        monkeypatch.setattr(attn_utils, "bind_kv_cache_to_layers",
+                            lambda caches, *args, **kwargs: bound.append(caches))
+        caches = attn_utils.init_kv_cache({}, config, torch.device("cpu"), [2, 2], engine_config)
+        assert bound == [{}]
     for borrower in sharing:
         assert caches[borrower] is caches["b"]
         assert caches[borrower].data_ptr() == caches["b"].data_ptr()
@@ -241,7 +285,7 @@ def test_mixed_native_packing_survives_scheduler_collapse_and_group_reuse(monkey
     # The shared block holds 32 + 96 bytes, not two copies of the first layer.
     assert geometry.page_bytes * geometry.num_pools == 128
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [2, 2])
-    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True})]
+    assert captured == [(512, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 64})]
     assert caches["b"].data_ptr() - caches["a"].data_ptr() == 32
     assert all(cache.stride(0) * cache.element_size() == 128 for cache in caches.values())
 
@@ -391,3 +435,47 @@ def test_rejects_unqualified_attention_types_before_native_allocation(monkeypatc
     with pytest.raises(adapter.KVCachedConfigError):
         adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLNHC, [2, 2])
     assert not captured
+
+
+_HAS_030_FIELDS = (
+    "host_resident" in KVCacheTensor.__dataclass_fields__
+    and "storage_block_size" in MLAAttentionSpec.__dataclass_fields__
+)
+
+
+@pytest.mark.skipif(not _HAS_030_FIELDS, reason="vLLM 0.30 KV tensor and MLA fields")
+def test_host_resident_tensor_is_rejected(monkeypatch):
+    mock_native_allocator(monkeypatch, True)
+    config = uniform_config(True)
+    config.kv_cache_tensors[0] = dataclasses.replace(config.kv_cache_tensors[0], host_resident=True)
+    with pytest.raises(adapter.KVCachedConfigError, match="host-resident"):
+        adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLNHC, [2, 2])
+
+
+@pytest.mark.skipif(not _HAS_030_FIELDS, reason="vLLM 0.30 KV tensor and MLA fields")
+def test_mla_storage_block_size_overrides_kernel_block(monkeypatch):
+    # Mirrors vLLM 0.30 worker/utils.allocate_kv_cache for storage-sized MLA views.
+    mock_native_allocator(monkeypatch, False)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * 1024**2)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: types.SimpleNamespace(total_memory=4 * 1024**2))
+    import vllm.v1.kv_cache_interface as kv_interface
+
+    seen = []
+    native_views = kv_interface.create_kv_cache_views
+
+    def record(*args, **kwargs):
+        seen.append(args[5] if len(args) > 5 else kwargs.get("kernel_block_size"))
+        return native_views(*args, **kwargs)
+
+    monkeypatch.setattr(kv_interface, "create_kv_cache_views", record)
+    spec = MLAAttentionSpec(block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16,
+                            storage_block_size=32)
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[KVCacheTensor(size=442368, layers=["a", "b"],
+                                        layer_stride=221184, block_stride=73728)],
+        kv_cache_groups=[KVCacheGroupSpec(["a", "b"], spec)],
+    )
+    caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBNHC, [64])
+    assert seen == [32, 32]
+    assert caches["a"].shape[0] == 6

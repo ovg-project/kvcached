@@ -151,6 +151,12 @@ setup_sglang_from_source() {
         uv pip install transformers==4.57.0
     fi
 
+    # SGLang 0.5.16+ source builds compile optional Rust extensions with
+    # cargo. Without a Rust toolchain, build without them.
+    if ! command -v cargo &> /dev/null; then
+        export SGLANG_BUILD_RUST_EXTS=${SGLANG_BUILD_RUST_EXTS:-none}
+    fi
+
     uv pip install -e "python[all]"  --prerelease=allow
 
     install_kvcached_from_source
@@ -161,7 +167,7 @@ setup_sglang_from_source() {
 
 # Dispatch helper wrappers that pick defaults when VERSION is not provided
 setup_vllm() {
-    local _default_ver="0.19.0"
+    local _default_ver="0.30.0"
     local _version=${version:-"$_default_ver"}
 
     if [[ "$method" == "source" ]]; then
@@ -192,13 +198,13 @@ ${BOLD}${CYAN}Arguments:${RESET}
   ${BOLD}--engine${RESET}            Target engine to set up (vllm, sglang) [required]
   ${BOLD}--method${RESET}            Engine installation method: pip (default) or source
   ${BOLD}--version${RESET}           Specific engine version to install. Default versions:
-        - vllm   : 0.16.0
+        - vllm   : 0.30.0
         - sglang : 0.5.20
 
 ${BOLD}${CYAN}Examples:${RESET}
-  $0 --engine vllm                                     # vLLM 0.16.0 (pip) + kvcached (source)
-  $0 --engine vllm --method source --version 0.16.0    # vLLM 0.16.0 (source) + kvcached (source)
-  $0 --engine sglang --method source --version 0.5.15  # sglang 0.5.15 (source) + kvcached (source)
+  $0 --engine vllm                                     # vLLM 0.30.0 (pip) + kvcached (source)
+  $0 --engine vllm --method source --version 0.30.0    # vLLM 0.30.0 (source) + kvcached (source)
+  $0 --engine sglang --method source --version 0.5.20  # sglang 0.5.20 (source) + kvcached (source)
 EOF
 }
 

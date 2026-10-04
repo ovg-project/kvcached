@@ -385,7 +385,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
-VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
+VLLM_MRV2_RANGE = ">=0.29.0,<0.31.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _uses_packed_attention_kv() -> bool:
@@ -458,12 +458,14 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     return isinstance(kv_cache_spec, MLAAttentionSpec)
 
 
-def _get_max_cached_blocks(block_size: int) -> int:
+def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)``.
+    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)`` times the
+    number of KV cache groups: every group holds its own blocks for the same
+    cached tokens, and all of them count against one pool-wide cap.
 
     The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
     ``block_size`` (e.g. 8 tokens with a 16-token block) integer-divides to
@@ -487,8 +489,8 @@ def _get_max_cached_blocks(block_size: int) -> int:
             MAX_CACHED_TOKENS,
             block_size,
         )
-        return 1
-    return max_cached_blocks
+        max_cached_blocks = 1
+    return max_cached_blocks * max(1, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -1118,7 +1120,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return []
 
         elastic_block_pool_cls: type = ElasticBlockPool
-        if self.detected_version and VersionRange(">=0.26.0,<0.30.0").contains(self.detected_version):
+        if self.detected_version and VersionRange(">=0.26.0,<0.31.0").contains(self.detected_version):
             from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
 
             elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
@@ -1187,8 +1189,17 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                         )
                     if not vllm_config.use_v2_model_runner:
                         raise KVCachedConfigError(
-                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            f"kvcached on vLLM {detected_version} requires Model Runner V2, "
+                            "but this configuration falls back to the V1 runner; "
                             "use a supported configuration or disable kvcached"
+                        )
+                    attention_config = getattr(vllm_config, "attention_config", None)
+                    if getattr(attention_config, "hisparse_config", None) is not None:
+                        # HiSparse allocates its KV tensors through vLLM's own
+                        # allocator and pins blocks kvcached cannot release.
+                        raise KVCachedConfigError(
+                            "kvcached does not support HiSparse; "
+                            "remove the HiSparse config or disable kvcached"
                         )
                 elif (detected_version and VersionRange("<0.28.0").contains(detected_version)
                         and _selects_v2_model_runner(vllm_config)):
@@ -1775,7 +1786,11 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 return
 
         def _setup_kvcached_coordinator(self) -> None:
-            enable_caching = getattr(self, "enable_caching", False)
+            # vLLM 0.30 keeps the flag only on the native block pool.
+            enable_caching = getattr(self, "enable_caching", None)
+            if enable_caching is None:
+                enable_caching = bool(getattr(
+                    getattr(self, "block_pool", None), "enable_caching", False))
             if enable_caching:
                 logger.info("Prefix caching enabled for kvcached")
 
@@ -1844,9 +1859,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 block_size,
                 cell_size=cell_size,
                 num_layers=group_size,
-                enable_caching=getattr(self, "enable_caching", False),
+                enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size),
+                max_cached_blocks=_get_max_cached_blocks(
+                    block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
                 hash_block_size=hash_block_size,
             )
             for manager in self.single_type_managers:
@@ -3038,10 +3054,12 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
     blocks are unusable and, when the unit exceeds half a page, some pages hold
     no block at all. vLLM keeps any block size at least as large as the one it
     requires and pads the state to it, so choose the smallest such block whose
-    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). A block size
-    given by the user is kept; the page geometry check then reports it.
+    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). When the
+    default page is too small, try larger pages in 2 MiB steps and stop at
+    the first safe pair, allowing non-divisible pairs as the geometry check
+    does. Explicit page settings and user block sizes stay unchanged.
     """
-    from kvcached.kv_geometry import aligned_block_size
+    from kvcached.kv_geometry import aligned_block_size, select_page_size
     from kvcached.utils import PAGE_SIZE
 
     padded = getattr(cache_config, "mamba_page_size_padded", None)
@@ -3054,7 +3072,10 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
             or getattr(cache_config, "user_specified_mamba_block_size", False)):
         return
     bytes_per_token = padded // block_size
-    aligned = aligned_block_size(block_size, bytes_per_token, PAGE_SIZE)
+    page_size = PAGE_SIZE
+    if padded > page_size and os.getenv("KVCACHED_PAGE_SIZE_MB") is None:
+        page_size = select_page_size(padded, block_size)
+    aligned = aligned_block_size(block_size, bytes_per_token, page_size)
     if aligned is None or aligned == block_size:
         return
     cache_config.block_size = aligned
@@ -3064,7 +3085,7 @@ def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
     logger.info(
         "Setting attention block size to %d tokens (was %d) so the KV unit "
         "(%d bytes) tiles the %d-byte kvcached page",
-        aligned, block_size, aligned * bytes_per_token, PAGE_SIZE)
+        aligned, block_size, aligned * bytes_per_token, page_size)
 
 
 class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
@@ -3124,7 +3145,7 @@ class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
     def apply(self, target_module: types.ModuleType) -> bool:
         if not self.initialize_version_info():
             return False
-        if not VersionRange(">=0.28.0,<0.30.0").contains(self.detected_version or "0"):
+        if not VersionRange(">=0.28.0,<0.31.0").contains(self.detected_version or "0"):
             return False
         manager = self._get_target_class(target_module)
         original = getattr(manager, "_cache_partial_tail_block", None)
@@ -3136,11 +3157,12 @@ class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
         from vllm.v1.request import RequestStatus
 
         @wraps(original)
-        def cache_partial_tail(self, request, num_tokens):
+        def cache_partial_tail(self, request, num_tokens, *args, **kwargs):
+            # vLLM 0.30 adds a retention_interval argument.
             if (enable_kvcached() and request.status == RequestStatus.RUNNING
                     and num_tokens <= request.num_computed_tokens):
                 return None
-            return original(self, request, num_tokens)
+            return original(self, request, num_tokens, *args, **kwargs)
 
         self._mark_as_patched(cache_partial_tail)
         manager._cache_partial_tail_block = cache_partial_tail
@@ -3199,7 +3221,7 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
         logger = self.logger
 
         repair_native_retry = self.detected_version is not None and VersionRange(
-            ">=0.28.0,<0.30.0").contains(self.detected_version)
+            ">=0.28.0,<0.31.0").contains(self.detected_version)
 
         def _patched_allocate_slots(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():

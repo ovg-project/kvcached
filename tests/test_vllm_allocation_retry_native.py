@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Run separately with real vLLM 0.28/0.29, not the CPU import stubs."""
+"""Run separately with real vLLM 0.28-0.30, not the CPU import stubs."""
 
 from types import SimpleNamespace
 
@@ -11,8 +11,8 @@ from test_vllm_native_block_pool import native_pool_factory  # noqa: F401
 @pytest.fixture(params=["native", "elastic"])
 def manager_factory(monkeypatch, request, native_pool_factory):  # noqa: F811
     vllm = pytest.importorskip("vllm")
-    if not isinstance(vllm.__version__, str) or not vllm.__version__.startswith(("0.28.", "0.29.")):
-        pytest.skip("Requires native vLLM 0.28 or 0.29")
+    if not isinstance(vllm.__version__, str) or not vllm.__version__.startswith(("0.28.", "0.29.", "0.30.")):
+        pytest.skip("Requires native vLLM 0.28 through 0.30")
     import torch
     from vllm.v1.core import kv_cache_manager as native
     from vllm.v1.kv_cache_interface import (
@@ -154,7 +154,10 @@ def test_running_producer_hashes_and_handoff_restored(manager_factory, monkeypat
     key = pool.cache_partial_block(req, source, 8, 0, 16)
     pool.cache_partial_block(req, source, 4, 0, 16)
     group._partial_hit_reqs[req.request_id] = (0, source)
-    group._producer_partial_tail_reqs[req.request_id] = 8
+    # vLLM 0.30 records the producer tail as (block, tokens), 0.28/0.29 as tokens.
+    import vllm
+    tail = (source, 8) if vllm.__version__.startswith("0.30.") else 8
+    group._producer_partial_tail_reqs[req.request_id] = tail
     original_aliases = set(pool.cached_block_hashes_by_block[source.block_id])
     refs = [b.ref_cnt for b in pool.blocks]
     calls, original = inject(pool, monkeypatch, 2)
@@ -164,7 +167,7 @@ def test_running_producer_hashes_and_handoff_restored(manager_factory, monkeypat
     assert set(pool.cached_block_hashes_by_block[source.block_id]) == original_aliases
     assert pool.get_cached_block(req.block_hashes[1], [0]) == [source]
     assert group._partial_hit_reqs[req.request_id] == (0, source)
-    assert group._producer_partial_tail_reqs[req.request_id] == 8
+    assert group._producer_partial_tail_reqs[req.request_id] == tail
     assert group.cached_blocks_this_step == set()
     assert [b.ref_cnt for b in pool.blocks] == refs
     for name in ("_pending_boundary_state_offloads", "_pending_partial_tail_offloads"):

@@ -199,6 +199,7 @@ def test_version_guard_leaves_other_runners_untouched(monkeypatch, version):
     ("0.28.0", ["gpu_model_runner_v2"]),
     ("0.28.1+cu129", ["gpu_model_runner_v2"]),
     ("0.29.0", ["model_runner_v2", "kv_layout_v2"]),
+    ("0.30.0", ["model_runner_v2", "kv_layout_v2"]),
 ])
 def test_autopatch_routes_v2_versions_without_overlap(monkeypatch, version, expected):
     import wrapt.importer
