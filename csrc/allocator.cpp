@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -47,18 +48,20 @@ make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
   return nullptr;
 }
 
-static inline size_t get_v_base_offset(const torch::stable::Tensor &tensor) {
+static inline size_t get_v_base_offset(const torch::stable::Tensor &tensor,
+                                       size_t page_size) {
   size_t num_eles = tensor.numel() * tensor.element_size();
-  ASSERT(num_eles % (2 * kPageSize) == 0,
+  ASSERT(num_eles % (2 * page_size) == 0,
          "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
-         num_eles, 2 * kPageSize);
+         num_eles, 2 * page_size);
   return num_eles / 2;
 }
 
 FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
-    : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
-      unified_pool_(false), kv_tensor_size_per_layer_(0) {
+    : dev_(device), page_size_(kPageSize), num_layers_(0),
+      contiguous_layout_(contiguous_layout), unified_pool_(false),
+      kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
     init_gpu_();
   }
@@ -128,18 +131,29 @@ void FTensorAllocator::shutdown() {
 std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     size_t size, torch::headeronly::ScalarType dtype,
     const std::string &dev_str, int64_t num_layers, int64_t num_kv_buffers,
-    bool unified_pool) {
+    bool unified_pool, size_t page_size) {
   std::lock_guard<std::mutex> lock(mtx_);
+
+  const auto resolved_page_size = page_size == 0 ? page_size_ : page_size;
+  if (resolved_page_size == 0 || resolved_page_size % (2 * 1024 * 1024) != 0) {
+    throw std::invalid_argument(
+        "KV page size must be a positive multiple of 2 MiB");
+  }
+  if (num_layers_ > 0 && resolved_page_size != page_size_) {
+    throw std::logic_error(
+        "Cannot change page size after KV tensors are created");
+  }
+  page_size_ = resolved_page_size;
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
   unified_pool_ = unified_pool;
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
-  if (size % kPageSize != 0) {
-    aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+  if (size % page_size_ != 0) {
+    aligned_size = ((size + page_size_ - 1) / page_size_) * page_size_;
     LOGGER(WARNING, "Size %zu is not aligned to page size %zu, aligning to %zu",
-           size, kPageSize, aligned_size);
+           size, page_size_, aligned_size);
   }
   kv_tensor_size_per_layer_ = aligned_size;
 
@@ -147,7 +161,7 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
-    size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
+    size_t compound_page_size = page_size_ * num_layers * num_kv_buffers;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
     // We can use the aligned size directly for contiguous layout too because
     // both compound_page_size and aligned_size are already/will be multiplied
@@ -155,7 +169,7 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, page_size_);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
@@ -198,7 +212,8 @@ FTensorAllocator::map_to_kv_tensors_with_result(
         auto ftensor = ftensors_[kv_name].get();
         group.targets.emplace_back(ftensor, offset);
         if (!unified_pool_) {
-          auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+          auto v_base_offset =
+              get_v_base_offset(ftensor->get_tensor(), page_size_);
           group.targets.emplace_back(ftensor, offset + v_base_offset);
         }
       }
@@ -418,7 +433,8 @@ FTensorAllocator::unmap_retain_locked_(const std::vector<offset_t> &offsets) {
         auto ftensor = ftensors_[kv_name].get();
         group.targets.emplace_back(ftensor, offset);
         if (!unified_pool_) {
-          auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+          auto v_base_offset =
+              get_v_base_offset(ftensor->get_tensor(), page_size_);
           group.targets.emplace_back(ftensor, offset + v_base_offset);
         }
       }
@@ -582,8 +598,8 @@ torch::stable::Tensor FTensorAllocator::create_ftensor_(
   }
 
   // Create a new FTensor
-  ftensors_[name] =
-      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
+  ftensors_[name] = std::make_unique<FTensor>(name, size, dtype, dev_,
+                                              zero_page_, page_size_);
   return ftensors_[name]->get_tensor();
 }
 

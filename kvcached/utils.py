@@ -135,6 +135,26 @@ def _get_page_size() -> int:
 
 PAGE_SIZE = _get_page_size()
 
+
+def get_page_size_for_block(block_mem_size: int, configured_page_size: int) -> int:
+    """Resolve a vLLM pool's page size without changing process-wide defaults.
+
+    Explicit page settings keep their existing validation behavior. Resolve
+    from the final block geometry in both the scheduler and worker, before
+    constructing the manager or its backing tensors.
+    """
+    if (block_mem_size <= configured_page_size
+            or os.getenv("KVCACHED_PAGE_SIZE_MB") is not None):
+        return configured_page_size
+    from kvcached.kv_geometry import select_page_size
+
+    page_size = select_page_size(block_mem_size)
+    get_kvcached_logger().info(
+        "Default kvcached page (%d bytes) cannot hold the KV block (%d bytes); "
+        "using %d-byte pages for this pool", configured_page_size,
+        block_mem_size, page_size)
+    return page_size
+
 # Configuration constants for KVCacheManager
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
 PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",

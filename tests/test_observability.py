@@ -12,6 +12,7 @@ from typing import Any
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
+from kvcached.errors import StateConsistencyError  # noqa: E402
 from kvcached.observability import (  # noqa: E402
     KVCachePoolSnapshot,
     RuntimeReservationSnapshot,
@@ -152,6 +153,8 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["available_physical_pages"] == 4
     assert data["effective_free_pages"] == 6
     assert data["resize_target_bytes"] == 0
+    # A manager-like object without a lifecycle reports no phase.
+    assert data["lifecycle_phase"] is None
     assert FakeManager.page_allocator.page_state_calls == 1
     json.dumps(data)
 
@@ -201,6 +204,30 @@ def test_pool_snapshot_clamps_negative_block_gauges():
     assert data["available_bytes"] == 0
     assert data["allocated_blocks"] == 0
     assert data["allocated_bytes"] == 0
+
+
+def test_pool_snapshot_reports_a_failed_pool_instead_of_raising():
+    """A FAILED pool fail-closes the free-page read behind available_size()
+    (``PageAllocator::throw_if_failed``), and the snapshot used to propagate
+    that raise, so the documented polling path lost the pool exactly when it
+    had to report the failure (#478 review). The gauge degrades to zero and
+    the getters a failed native pool still answers keep their values."""
+
+    class FailClosedManager(FakeManager):
+        lifecycle_phase = "failed"
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailClosedManager()).to_dict()
+
+    assert data["lifecycle_phase"] == "failed"
+    assert data["available_blocks"] == 0
+    assert data["available_bytes"] == 0
+    assert data["total_pages"] == 20
+    assert data["inuse_pages"] == 10
+    assert data["allocated_blocks"] == 16
+    json.dumps(data)
 
 
 def test_registered_pool_snapshot_uses_manager_snapshot_entrypoint():
@@ -286,6 +313,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 
@@ -378,6 +406,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 
@@ -441,6 +470,8 @@ def test_capabilities_report_planned_surfaces_as_unsupported():
     assert features["runtime_reservation_reporting"] is True
     # Landed in #414: revisioned allocator control.
     assert features["instance_memory_limit"] is True
+    # Landed with #375 item (5): poll-only lifecycle readiness.
+    assert features["lifecycle_readiness"] is True
 
 
 def test_capabilities_describe_runtime_reservation_reports():
