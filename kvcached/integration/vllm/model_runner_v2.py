@@ -13,7 +13,12 @@ from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.kv_geometry import check_page_geometry
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, KVCachedConfigError
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    KVCachedConfigError,
+    get_page_size_for_block,
+)
 
 _persistent_allocation: ContextVar[bool] = ContextVar("kvcached_mrv2_allocation", default=False)
 
@@ -128,7 +133,8 @@ def cache_geometry(config: Any) -> CacheGeometry:
             raise KVCachedConfigError("KV backing size disagrees with the uniform physical pool geometry")
     if page_bytes % block_size:
         raise KVCachedConfigError("KV allocation unit bytes must divide exactly by the attention block size")
-    geometry_error = check_page_geometry(page_bytes, PAGE_SIZE, block_size)
+    page_size = get_page_size_for_block(page_bytes, PAGE_SIZE)
+    geometry_error = check_page_geometry(page_bytes, page_size, block_size)
     if geometry_error is not None:
         raise KVCachedConfigError(geometry_error)
     return CacheGeometry(block_size, page_bytes, num_pools)
@@ -190,7 +196,8 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
             )
         placements.append((tensor, spec, kernel_size))
     per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
-    per_pool_bytes = per_pool_bytes // PAGE_SIZE * PAGE_SIZE
+    page_size = get_page_size_for_block(geometry.page_bytes, PAGE_SIZE)
+    per_pool_bytes = per_pool_bytes // page_size * page_size
     if config.num_blocks * geometry.page_bytes > per_pool_bytes:
         raise KVCachedConfigError("Configured KV blocks exceed the native virtual reservation")
     raw = kvi.create_kv_tensors(
@@ -200,6 +207,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
         geometry.num_pools,
         num_kv_buffers=1,
         unified_pool=True,
+        page_size=page_size,
     )
 
     caches: dict[str, Any] = {}

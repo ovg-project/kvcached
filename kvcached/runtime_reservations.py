@@ -53,7 +53,9 @@ def register_runtime_owned_reservation(
     """Replace one live owner's reported bytes for a device and category.
 
     ``pool_name`` is an integration-defined, low-cardinality category, such
-    as ``workspace`` or ``swa_kv``. The owner must support weak references;
+    as ``workspace`` or ``swa_kv``. Reuse common names for generic buffers;
+    prefix feature-specific categories, e.g. ``dsv4.workspace``.
+    The owner must support weak references;
     it is tracked by identity, not equality, and is never kept alive here.
     Different owners of the same category add together. Zero removes only
     this owner's entry. Report only runtime-owned bytes, excluding backing
