@@ -17,6 +17,7 @@ import pytest
 
 SCENARIO = r"""
 import gc
+import threading
 import time
 import weakref
 
@@ -130,8 +131,67 @@ for fail, defer_release in ((False, False), (True, False),
     del tensors, buffers
     gc.collect()
 assert hits == 6, hits
+
+def run_cancelled_clear(group_id, async_sched):
+    tensors = native.create_kv_tensors(PAGE * 4, 1, "cuda:0", 1, 1, group_id)
+    manager = kcm.KVCacheManager(
+        16, 1, PAGE // 4, 1, world_size=2, num_kv_buffers=1,
+        group_id=group_id, reserve_null_block=True, async_sched=async_sched,
+        own_segment=True)
+    manager.wait_ready(timeout=5)
+    # Healthy clear still rebuilds the null page and makes it usable.
+    manager.clear()
+    manager.wait_ready(timeout=5)
+    assert manager.page_allocator.get_num_inuse_pages() == 1
+    view = tensors[0].reshape(-1)[:16]
+    view.fill_(7)
+    torch.cuda.synchronize()
+    assert torch.all(view == 7).item()
+    del view
+    reserving = threading.Event()
+    errors = []
+    reserve = manager._reserve_null_block
+
+    def reserve_without_capacity():
+        # At this boundary clear has unmapped the old null page. Apply a
+        # real native zero-capacity limit so reservation waits for shutdown.
+        assert manager.page_allocator.get_num_inuse_pages() == 0
+        assert manager.page_allocator.resize(0)
+        assert manager.available_size() == 0
+        reserving.set()
+        reserve()
+
+    def clear():
+        try:
+            manager.clear()
+        except Exception as exc:
+            errors.append(exc)
+
+    manager._reserve_null_block = reserve_without_capacity
+    clearer = threading.Thread(target=clear, daemon=True)
+    clearer.start()
+    try:
+        assert reserving.wait(5)
+        assert manager.lifecycle_phase is LifecyclePhase.INITIALIZING
+        assert manager.shutdown()
+    finally:
+        manager._shutdown_requested.set()
+        clearer.join(5)
+    assert not clearer.is_alive() and not errors
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.null_block is None
+    assert manager.page_allocator.get_num_inuse_pages() == 0
+    try:
+        manager.wait_ready(timeout=0)
+    except RuntimeError as exc:
+        assert "clear() cancelled by shutdown" in str(exc)
+    else:
+        raise AssertionError("cancelled clear reopened the readiness gate")
+
+for async_sched in (False, True):
+    run_cancelled_clear(200 + int(async_sched), async_sched)
 native.shutdown_kvcached()
-print("native lifetime: healthy=6/6, failed=6/6, injections=6", flush=True)
+print("native lifetime: healthy=6/6, failed=6/6, injections=6, cancelled-clear=2/2", flush=True)
 """
 
 
@@ -156,3 +216,4 @@ def test_native_unmap_error_does_not_retain_manager():
         capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "healthy=6/6, failed=6/6, injections=6" in result.stdout
+    assert "cancelled-clear=2/2" in result.stdout

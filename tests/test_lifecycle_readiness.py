@@ -94,6 +94,10 @@ class FakePageAllocator:
     def stop_prealloc_thread(self) -> None:
         self._record("stop_prealloc_thread")
 
+    def release_shared_segment(self) -> bool:
+        self._record("release_shared_segment")
+        return True
+
     def free_pages(self, page_ids: List[int]) -> None:
         self._record("free_pages")
 
@@ -322,6 +326,7 @@ def _bare_manager() -> kcm.KVCacheManager:
     manager.page_allocator = FakePageAllocator()
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
+    manager._shutdown_lock = threading.Lock()
     manager._shutdown_requested = threading.Event()
     manager._lifecycle = LifecycleState("bare")
     return manager
@@ -1007,6 +1012,52 @@ def test_clear_failure_moves_to_failed(monkeypatch):
     assert manager.lifecycle_phase is LifecyclePhase.FAILED
     with pytest.raises(RuntimeError, match="prealloc thread did not start"):
         manager.wait_ready()
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+@pytest.mark.parametrize("degraded", [False, True])
+def test_cancelled_clear_fails_readiness_without_restarting_prealloc(
+    monkeypatch, async_sched, degraded,
+):
+    manager = _make_manager(monkeypatch)
+    manager.wait_ready(timeout=5)
+    manager._lock = threading.RLock() if async_sched else NoOpLock()
+    if degraded:
+        manager._lifecycle.mark_degraded("earlier broadcast failure")
+    manager.reserve_null_block = True
+    manager.null_block = [0]
+    waiting_for_capacity = threading.Event()
+    errors: List[Exception] = []
+    starts_before = manager.page_allocator.calls.count("start_prealloc_thread")
+
+    def no_capacity():
+        waiting_for_capacity.set()
+        return 0
+
+    def clear():
+        try:
+            manager.clear()
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(manager, "available_size", no_capacity)
+    clearer = threading.Thread(target=clear, daemon=True)
+    clearer.start()
+    try:
+        assert waiting_for_capacity.wait(5)
+        assert manager.lifecycle_phase is LifecyclePhase.INITIALIZING
+        assert manager.shutdown()
+    finally:
+        manager._shutdown_requested.set()
+        clearer.join(5)
+
+    assert not clearer.is_alive()
+    assert not errors  # Preserve clear()'s record-only cancellation behavior.
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.null_block is None
+    assert manager.page_allocator.calls.count("start_prealloc_thread") == starts_before
+    with pytest.raises(RuntimeError, match=r"clear\(\) cancelled by shutdown"):
+        manager.wait_ready(timeout=0)
 
 
 def test_clear_keeps_a_degraded_pool_degraded(monkeypatch):

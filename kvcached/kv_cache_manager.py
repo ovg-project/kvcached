@@ -1189,10 +1189,18 @@ class KVCacheManager:
         self._lifecycle.begin_reinit()
         try:
             self._clear_locked()
+            # Reservation can return normally when shutdown cancels its wait.
+            # Serialize restart/publication with shutdown so a cancelled clear
+            # neither restarts preallocation nor advertises a usable pool.
+            with self._shutdown_lock:
+                if self._shutdown_requested.is_set():
+                    self._lifecycle.mark_failed("clear() cancelled by shutdown")
+                else:
+                    self.page_allocator.start_prealloc_thread()
+                    self._lifecycle.mark_ready()
         except Exception as e:
             self._lifecycle.mark_failed("clear() failed", e)
             raise
-        self._lifecycle.mark_ready()
 
     def _clear_locked(self) -> None:
         # Stop the prealloc thread first — it runs on the PageAllocator's
@@ -1223,6 +1231,7 @@ class KVCacheManager:
         self._retired_pages = []
         self.avail_pages.clear()
         self.full_pages.clear()
+        self.null_block = None
 
         # Trim the page allocator to free up reserved pages
         self.trim()
@@ -1243,9 +1252,6 @@ class KVCacheManager:
 
         # Possibly reserve the first block as null block for padding tokens
         self._reserve_null_block()
-
-        # Restart the prealloc thread now that null block is safely reserved.
-        self.page_allocator.start_prealloc_thread()
 
     # Private methods
     @synchronized
