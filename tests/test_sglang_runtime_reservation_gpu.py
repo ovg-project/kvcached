@@ -10,7 +10,8 @@ import pytest
 
 
 @pytest.mark.parametrize("split_indexer", [False, True])
-def test_gpu_reservations_survive_failed_peer_pool(monkeypatch, split_indexer):
+@pytest.mark.parametrize("split_unified", [False, True])
+def test_gpu_reservations_survive_failed_peer_pool(monkeypatch, split_indexer, split_unified):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
@@ -40,6 +41,16 @@ def test_gpu_reservations_survive_failed_peer_pool(monkeypatch, split_indexer):
                 self.c4_indexer_kv_pool = types.SimpleNamespace(
                     index_k_with_scale_buffer=[torch.zeros(size, dtype=torch.uint8, device=self.device)]
                 )
+            if split_unified:
+                # SGLang 0.5.20 stores FP8 NoPE and BF16 RoPE separately.
+                # Byte writes/readback test storage without requiring FP8 compute.
+                nope = torch.empty(size, dtype=torch.float8_e4m3fn, device=self.device)
+                nope.view(torch.uint8).fill_(3)
+                self.unified_kv_pool = types.SimpleNamespace(
+                    kv_buffer=[nope],
+                    kv_buffer_rope=[torch.full(
+                        (size // 2,), 11, dtype=torch.bfloat16, device=self.device)],
+                )
 
     monkeypatch.setattr(
         patches.DeepSeekV4RuntimeReservationPatch, "initialize_version_info", lambda self: True
@@ -52,7 +63,9 @@ def test_gpu_reservations_survive_failed_peer_pool(monkeypatch, split_indexer):
     target, draft = Pool(size), Pool(size // 2)
     target_bytes = sum(target._kvcached_runtime_reservation_breakdown.values())
     draft_bytes = sum(draft._kvcached_runtime_reservation_breakdown.values())
-    assert target_bytes == size * 2 + (size // 4 if split_indexer else 0)
+    assert target_bytes == (
+        size * 2 + (size // 4 if split_indexer else 0)
+        + (size * 2 if split_unified else 0))
     expected = before + target_bytes + draft_bytes
     assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == expected
     for _ in range(2):
@@ -62,6 +75,10 @@ def test_gpu_reservations_survive_failed_peer_pool(monkeypatch, split_indexer):
         assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == expected
         assert bool((target.swa_kv_pool.kv_buffer[0] == 7).all())
         assert bool((draft.swa_kv_pool.kv_buffer[0] == 7).all())
+        if split_unified:
+            assert bool((target.unified_kv_pool.kv_buffer[0].view(torch.uint8) == 3).all())
+            assert bool((target.unified_kv_pool.kv_buffer_rope[0] == 11).all())
+            assert bool((draft.unified_kv_pool.kv_buffer_rope[0] == 11).all())
     del target
     gc.collect()
     assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == before + draft_bytes

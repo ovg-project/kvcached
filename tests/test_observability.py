@@ -14,6 +14,7 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
 
 from kvcached.observability import (  # noqa: E402
     KVCachePoolSnapshot,
+    RuntimeReservationSnapshot,
     RuntimeSnapshot,
     build_kv_cache_pool_snapshot,
     build_runtime_snapshot,
@@ -268,6 +269,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs.get(
+                "defer_physical_release", False
+            )
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -308,6 +312,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -321,6 +326,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     assert manager.group_id == 4
     assert manager.pool_name == "mha"
+    assert manager.defer_physical_release is False
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "sglang"
     assert snapshots[0]["pool_name"] == "mha"
@@ -328,6 +334,8 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+
+
 def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     clear_registered_kv_cache_pools()
 
@@ -354,6 +362,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs["defer_physical_release"]
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -395,6 +404,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -409,6 +419,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     assert manager.group_id == 5
     assert manager.pool_name == "unified"
     assert manager.world_size == 1
+    assert manager.defer_physical_release is True
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "vllm"
     assert snapshots[0]["pool_name"] == "unified"
@@ -427,9 +438,15 @@ def test_capabilities_report_planned_surfaces_as_unsupported():
     features = get_capabilities()["features"]
 
     assert features["operation_counters"] is False
-    assert features["runtime_reservation_reporting"] is False
-    # Landed in #414: the one write path on the surface.
+    assert features["runtime_reservation_reporting"] is True
+    # Landed in #414: revisioned allocator control.
     assert features["instance_memory_limit"] is True
+
+
+def test_capabilities_describe_runtime_reservation_reports():
+    capabilities = get_capabilities()
+    assert capabilities["runtime_reservation_snapshot_fields"] == list(
+        RuntimeReservationSnapshot.__dataclass_fields__)
 
 
 def test_capabilities_expose_backend_and_integration_records():
@@ -451,7 +468,8 @@ def test_capabilities_expose_backend_and_integration_records():
     for entry in integrations.values():
         assert "MHA" in entry["attention_types"]
         assert "MLA" in entry["attention_types"]
-        assert entry["kv_layouts"] == ["NHD"]
+    assert integrations["vllm"]["kv_layouts"] == ["NHD", "HND"]
+    assert integrations["sglang"]["kv_layouts"] == ["NHD"]
 
     # A real, code-level distinction between the two shims: only the vLLM
     # integration accepts HYBRID_LINEAR through alloc_kv_cache(); SGLang

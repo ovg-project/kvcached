@@ -8,6 +8,10 @@ import types
 from typing import Any
 from unittest import mock
 
+import pytest
+
+from kvcached import runtime_reservations
+
 
 class FakeTensor:
     def __init__(self, nbytes=0):
@@ -24,6 +28,7 @@ class FakeTensor:
 
 class PoolOwner:
     device = "cuda:0"
+    unified_kv_pool: types.SimpleNamespace
     c4_indexer_kv_pool: types.SimpleNamespace
 
 
@@ -60,11 +65,28 @@ def test_split_indexer_buffers_are_counted_unless_managed(monkeypatch):
     assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.c4_indexer_kv_pool"] == 0
 
 
+@pytest.mark.parametrize("split_rope", [False, True])
+def test_unified_fp8_rope_buffers_are_counted_unless_managed(monkeypatch, split_rope):
+    _, patches, _ = _load_sglang_modules(monkeypatch)
+    pool = PoolOwner()
+    pool.unified_kv_pool = types.SimpleNamespace(
+        kv_buffer=[FakeTensor(5), FakeTensor(7)],
+        kv_buffer_rope=[FakeTensor(24) if split_rope else None],
+    )
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.unified_kv_pool"] == (
+        12 + (24 if split_rope else 0))
+    pool.unified_kv_pool._kvcached_managed = True
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.unified_kv_pool"] == 0
+
+
 def _load_sglang_modules(monkeypatch):
+    runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
     torch_mock = mock.MagicMock()
     torch_mock.__version__ = "2.6.0"
     torch_mock.cuda.is_available.return_value = True
     torch_mock.cuda.current_device.return_value = 0
+    torch_mock.device.side_effect = lambda device: types.SimpleNamespace(
+        index=int(device.split(":")[1]) if ":" in device else None)
     torch_mock.cuda.get_device_properties.return_value = types.SimpleNamespace(
         total_memory=64 * 1024 * 1024
     )
@@ -203,7 +225,8 @@ def test_zero_reservation_clears_stale_pool_value(monkeypatch):
     }
 
 
-def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch):
+@pytest.mark.parametrize("device", ["cuda:0", "cuda"])
+def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch, device):
     interfaces, _patches, torch_mock = _load_sglang_modules(monkeypatch)
     page_size = interfaces.PAGE_SIZE
     captured: dict[str, Any] = {}
@@ -219,16 +242,19 @@ def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch)
     monkeypatch.setattr(interfaces, "create_kv_tensors", fake_create_kv_tensors)
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "_contiguous_layout", False)
-    interfaces._runtime_owned_reservations.clear()
     owner = PoolOwner()
     interfaces.register_runtime_owned_reservation(
         "cuda:0", "dsv4.swa_kv_pool", 3 * page_size, owner=owner
+    )
+    # General reports do not opt unrelated memory into the DSV4 budget rule.
+    interfaces.register_runtime_owned_reservation(
+        "cuda:0", "workspace", 4 * page_size, owner=owner
     )
 
     interfaces.alloc_kv_cache(
         kvcache_shape=(1, 1, 1),
         dtype=types.SimpleNamespace(itemsize=1),
-        device="cuda:0",
+        device=device,
         num_layers=1,
         page_size=1,
         attention_type="MLA",
@@ -236,6 +262,19 @@ def test_sglang_alloc_kv_cache_subtracts_runtime_owned_reservations(monkeypatch)
 
     # MLA allocations are aligned to 2 * PAGE_SIZE.  (16P - 3P) rounds down to 12P.
     assert captured["mem_size"] == 12 * page_size
+
+
+@pytest.mark.parametrize("device", ["cuda", "hip"])
+def test_dsv4_adapter_resolves_the_runtime_device_before_reporting(monkeypatch, device):
+    interfaces, patches, _ = _load_sglang_modules(monkeypatch)
+    owner = PoolOwner()
+    owner.device = device
+    patches._register_dsv4_runtime_reservations(owner, {"dsv4.swa_kv_pool": 1024})
+    assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == 1024
+    snapshot, = interfaces.runtime_reservation_snapshot_dicts()
+    assert snapshot["integration"] == "sglang"
+    assert snapshot["device"] == "cuda:0"
+    assert snapshot["num_bytes"] == 1024
 
 
 def test_sglang_shutdown_clears_runtime_owned_reservations(monkeypatch):

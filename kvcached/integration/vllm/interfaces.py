@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
+    RuntimeReservationSnapshot,
     build_runtime_snapshot,
     get_registered_kv_cache_pool_snapshot_dicts,
     get_registered_kv_cache_pool_snapshots,
@@ -51,7 +53,7 @@ _created_kv_tensor_capacity: Dict[int, Dict[str, int]] = {}
 # in kvcached.observability reports these, so the guards below and the
 # reported record cannot drift apart.
 SUPPORTED_ATTENTION_TYPES = ("MHA", "GQA", "MLA", "HYBRID_LINEAR")
-SUPPORTED_KV_LAYOUTS = ("NHD",)
+SUPPORTED_KV_LAYOUTS = ("NHD", "HND")
 
 
 def should_use_worker_ipc() -> bool:
@@ -128,6 +130,7 @@ def shutdown_kvcached() -> bool:
     _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
+        runtime_reservations.clear_runtime_owned_reservations(integration="vllm")
         return True
 
     if not stop_worker_listener_threads():
@@ -150,11 +153,133 @@ def shutdown_kvcached() -> bool:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
+    runtime_reservations.clear_runtime_owned_reservations(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
     _is_worker = False
     return True
+
+
+def _set_block_copy_view(
+    tensor: torch.Tensor, backing: torch.Tensor, num_blocks: int, block_bytes: int,
+) -> None:
+    """Record logical block boundaries without using the reserved storage size."""
+    raw = backing.view(torch.uint8).view(-1)
+    pages = raw[:num_blocks * block_bytes].view(num_blocks, block_bytes)
+    setattr(tensor, "_kvcached_block_copy_view", pages)
+
+
+def _copy_kv_cache_blocks(
+    kv_caches, num_blocks: int, block_copies,
+) -> None:
+    """Copy shared backing pools once, using their actual logical page stride."""
+    if not block_copies:
+        return
+    pairs = list(block_copies)
+    if num_blocks <= 0 or any(
+        src < 0 or dst < 0 or src >= num_blocks or dst >= num_blocks
+        for src, dst in pairs
+    ):
+        raise ValueError("KV block copy index is outside the logical block pool")
+    if len({dst for _, dst in pairs}) != len(pairs):
+        raise ValueError("KV block copies must have distinct destinations")
+
+    views = []
+    seen = set()
+    for entry in kv_caches:
+        for tensor in entry if isinstance(entry, (list, tuple)) else (entry,):
+            pages = getattr(tensor, "_kvcached_block_copy_view", None)
+            if pages is None:
+                raise ValueError("KV block copy requires kvcached logical page metadata")
+            if pages.ndim < 2 or pages.dtype != torch.uint8 or pages.shape[0] < num_blocks:
+                raise ValueError("Invalid kvcached logical block copy view")
+            key = (pages.data_ptr(), tuple(pages.shape), tuple(pages.stride()))
+            if key not in seen:
+                seen.add(key)
+                views.append(pages)
+    if not views:
+        return
+    device = views[0].device
+    if any(pages.device != device for pages in views):
+        raise ValueError("KV block copy views must belong to the same device")
+    if device.type == "cuda":
+        import numpy as np
+        from vllm.v1.worker.utils import async_tensor_h2d
+
+        indices = async_tensor_h2d(np.array(pairs, dtype=np.int64), device=device)
+    else:
+        indices = torch.tensor(pairs, dtype=torch.int64, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+    for pages in views:
+        # Advanced indexing snapshots the sources, including overlapping copies.
+        pages[dst_indices] = pages[src_indices]
+
+
+def _set_legacy_block_copy_views(
+    tensors: List[torch.Tensor], raw_tensors: List[torch.Tensor],
+    num_blocks: int, page_bytes: int, num_layers: int,
+    unified: bool, split_offset: int,
+) -> None:
+    for layer, tensor in enumerate(tensors):
+        backing = raw_tensors[0 if _contiguous_layout else layer]
+        if _contiguous_layout or unified:
+            _set_block_copy_view(
+                tensor, backing, num_blocks,
+                page_bytes * (num_layers if _contiguous_layout else 1),
+            )
+        else:
+            # Preserve the reserved gap between K and V instead of copying it.
+            raw_bytes = backing.view(torch.uint8)
+            half_bytes = page_bytes // 2
+            setattr(tensor, "_kvcached_block_copy_view", torch.as_strided(
+                raw_bytes, (num_blocks, 2, half_bytes),
+                (half_bytes, split_offset, 1),
+                storage_offset=raw_bytes.storage_offset(),
+            ))
+
+
+def _build_packed_kv_views(
+    raw_kv_tensors: List[torch.Tensor],
+    shape: Tuple[int, ...],
+    num_blocks: int,
+    block_size: int,
+    kernel_block_size: int,
+    dtype: torch.dtype,
+    num_layers: int,
+    kv_layout: str,
+) -> List[torch.Tensor]:
+    """View a unified pool as vLLM's (blocks, heads, tokens, K+V) cache."""
+    if (len(shape) != 4 or shape[2] != block_size
+            or any(dim <= 0 for dim in shape) or shape[3] % 2):
+        raise ValueError(f"Unsupported packed KV cache shape: {shape}")
+    heads, width = shape[1], shape[3]
+    if kv_layout == "NHD":
+        inner_strides = (width, heads * width, 1)
+    elif kv_layout == "HND":
+        inner_strides = (kernel_block_size * width, width, 1)
+    else:
+        raise ValueError(f"Unsupported packed KV layout: {kv_layout}")
+    kernel_elements = heads * kernel_block_size * width
+    layer_stride = kernel_elements if _contiguous_layout else 0
+    block_stride = kernel_elements * (num_layers if _contiguous_layout else 1)
+    view_shape = (num_blocks * (block_size // kernel_block_size),
+                  heads, kernel_block_size, width)
+    tensors = [
+        torch.as_strided(
+            raw_kv_tensors[0 if _contiguous_layout else layer].view(dtype),
+            view_shape, (block_stride, *inner_strides),
+            storage_offset=layer * layer_stride,
+        )
+        for layer in range(num_layers)
+    ]
+    block_bytes = heads * block_size * width * dtype.itemsize
+    for layer, tensor in enumerate(tensors):
+        _set_block_copy_view(
+            tensor, raw_kv_tensors[0 if _contiguous_layout else layer],
+            num_blocks, block_bytes * (num_layers if _contiguous_layout else 1),
+        )
+    return tensors
 
 
 def build_kv_views(
@@ -167,6 +292,7 @@ def build_kv_views(
     gpu_mem_bytes_per_layer_k_or_v: int,
     num_layers: int,
     kernel_block_size: Optional[int] = None,
+    kv_layout: str = "NHD",
 ) -> Tuple[List[torch.Tensor], int]:
     """Reinterpret already-allocated raw KV pools as per-layer KV views.
 
@@ -196,6 +322,13 @@ def build_kv_views(
             f"block_size ({block_size}) must be a multiple of "
             f"kernel_block_size ({kernel_block_size})")
     ratio = block_size // kernel_block_size
+
+    if not is_mla and len(kvcache_shape) == 4:
+        views = _build_packed_kv_views(
+            raw_kv_tensors, kvcache_shape, num_blocks_per_layer, block_size,
+            kernel_block_size, dtype, num_layers, kv_layout,
+        )
+        return views, math.prod(kvcache_shape[1:]) * dtype.itemsize
 
     if is_mla:
         blocks_dim_idx = 0
@@ -280,7 +413,47 @@ def build_kv_views(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
+    _set_legacy_block_copy_views(
+        kv_tensors, raw_kv_tensors, num_blocks_per_layer, page_size_bytes,
+        num_layers, is_mla or unified_pool, gpu_mem_bytes_per_layer_k_or_v,
+    )
     return kv_tensors, page_size_bytes
+
+
+def register_runtime_owned_reservation(
+    device: str, pool_name: str, num_bytes: int, *, owner: Any,
+) -> None:
+    """Report live runtime-owned bytes; registration does not resize KV pools."""
+    runtime_reservations.register_runtime_owned_reservation(
+        device, pool_name, num_bytes, owner=owner, integration="vllm")
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    """Return reported runtime bytes by pool category for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_breakdown(
+        device, integration="vllm")
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    """Return reported runtime bytes on one device for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_bytes(
+        device, integration="vllm")
+
+
+def runtime_reservation_snapshots(
+    device: Optional[str] = None,
+) -> List[RuntimeReservationSnapshot]:
+    """Return immutable runtime reservation reports for this integration."""
+    return runtime_reservations.get_runtime_reservation_snapshots(
+        integration="vllm", device=device)
+
+
+def runtime_reservation_snapshot_dicts(
+    device: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable runtime reservation reports."""
+    return runtime_reservations.get_runtime_reservation_snapshot_dicts(
+        integration="vllm", device=device)
 
 
 def observability_snapshot():
@@ -335,6 +508,7 @@ def alloc_kv_cache(
     For MHA/GQA, kvcache_shape is expected to be:
       - FlashAttn:  (2, num_blocks, block_size, head_num, head_dim)
       - FlashInfer: (num_blocks, 2, block_size, head_num, head_dim)
+      - Packed KV: (num_blocks, head_num, block_size, 2 * head_dim)
     For MLA, kvcache_shape is expected to be:
       - (num_blocks, block_size, head_size)
 
@@ -367,12 +541,13 @@ def alloc_kv_cache(
     if attention_type not in SUPPORTED_ATTENTION_TYPES:
         raise ValueError(f"Attention type {attention_type} is not supported.")
 
-    if kv_layout not in SUPPORTED_KV_LAYOUTS:
+    is_mla = attention_type == "MLA"
+    packed_kv = not is_mla and len(kvcache_shape) == 4
+    if kv_layout not in SUPPORTED_KV_LAYOUTS or (kv_layout == "HND" and not packed_kv):
         raise ValueError(f"KV layout {kv_layout} is not supported.")
 
-    is_mla = attention_type == "MLA"
     is_hybrid_linear = attention_type == "HYBRID_LINEAR"
-    unified_pool = is_hybrid_linear
+    unified_pool = is_hybrid_linear or packed_kv
 
     # Hybrid linear-attention (HYBRID_LINEAR) supports BOTH the contiguous and
     # non-contiguous KV layouts. In contiguous layout the attention view
@@ -403,7 +578,15 @@ def alloc_kv_cache(
     # interpretation is ever live for a given block.
 
     # --- Validate shape and determine layout indices ---
-    if is_mla:
+    if packed_kv:
+        if (kvcache_shape[2] != block_size
+                or any(dim <= 0 for dim in kvcache_shape)
+                or kvcache_shape[3] % 2):
+            raise ValueError(f"Unsupported packed KV cache shape: {kvcache_shape}")
+        blocks_dim_idx = 0
+        permute_order = [0, 1, 2, 3]
+        block_mem_bytes = math.prod(kvcache_shape[1:]) * dtype.itemsize // 2
+    elif is_mla:
         # MLA shape: (num_blocks, block_size, head_size)
         if len(kvcache_shape) <= 2:
             raise ValueError(f"Unsupported MLA kv cache shape: {kvcache_shape}")
@@ -515,8 +698,14 @@ def alloc_kv_cache(
         kernel_kvcache_shape[token_dim_idx] = kernel_block_size
 
     # --- Reshape raw tensors into per-layer KV cache views ---
-    if not _contiguous_layout:
-        kv_tensors: List[torch.Tensor] = []
+    kv_tensors: List[torch.Tensor]
+    if packed_kv:
+        kv_tensors = _build_packed_kv_views(
+            raw_kv_tensors, kvcache_shape, num_blocks_per_layer, block_size,
+            kernel_block_size, dtype, num_layers, kv_layout,
+        )
+    elif not _contiguous_layout:
+        kv_tensors = []
         if is_mla:
             num_eles = math.prod(kernel_kvcache_shape)
             kv_tensors = [
@@ -596,6 +785,12 @@ def alloc_kv_cache(
             contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
         ]
 
+    if not packed_kv:
+        _set_legacy_block_copy_views(
+            kv_tensors, raw_kv_tensors, num_blocks_per_layer, page_size_bytes,
+            num_layers, is_mla or unified_pool, gpu_mem_bytes_per_layer_k_or_v,
+        )
+
     meta = {
         "raw_kv_tensors": raw_kv_tensors,
         "num_blocks_per_layer": num_blocks_per_layer,
@@ -604,7 +799,7 @@ def alloc_kv_cache(
         "dtype": dtype,
     }
 
-    if not unified_pool:
+    if not is_hybrid_linear:
         if return_meta:
             return kv_tensors, meta  # type: ignore[return-value]
         return kv_tensors
@@ -804,6 +999,7 @@ def get_kv_cache_manager(
         group_id=group_id,
         reserve_null_block=True,
         pool_name=pool_name,
+        defer_physical_release=_async_sched,
     )
     register_kv_cache_pool(
         manager,

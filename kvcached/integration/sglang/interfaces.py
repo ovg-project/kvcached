@@ -3,12 +3,13 @@
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
-from weakref import WeakKeyDictionary
 
 import torch
 
+from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
+    RuntimeReservationSnapshot,
     build_runtime_snapshot,
     get_registered_kv_cache_pool_snapshot_dicts,
     get_registered_kv_cache_pool_snapshots,
@@ -37,7 +38,6 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
-_runtime_owned_reservations: Dict[str, Dict[str, WeakKeyDictionary[Any, int]]] = {}
 
 # Single source of truth for what this shim accepts. The capability record
 # in kvcached.observability reports these, so the guards below and the
@@ -83,7 +83,7 @@ def shutdown_kvcached() -> bool:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
-        _runtime_owned_reservations.clear()
+        runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
         return True
 
     if not stop_worker_listener_threads():
@@ -91,59 +91,47 @@ def shutdown_kvcached() -> bool:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")
+    runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
-    _runtime_owned_reservations.clear()
     return True
 
 
 def register_runtime_owned_reservation(
-    device: str,
-    pool_name: str,
-    num_bytes: int,
-    *,
-    owner: Any,
+    device: str, pool_name: str, num_bytes: int, *, owner: Any,
 ) -> None:
-    """Record memory owned by the serving runtime outside kvcached.
-
-    Some runtimes allocate model-specific side pools that kvcached should not
-    manage directly.  The reservation is still consumed by the same GPU, so
-    kvcached's later virtual KV budgets must subtract it to avoid overbooking
-    colocated pools. Entries belong to a live pool instance; recording a draft
-    pool must not replace the target pool's allocation of the same category.
-    """
-    device = normalize_gpu_device(device)
-    if num_bytes < 0:
-        raise ValueError(f"runtime reservation for {pool_name} is negative: {num_bytes}")
-    if num_bytes == 0:
-        device_reservations = _runtime_owned_reservations.get(device)
-        if device_reservations is not None:
-            owners = device_reservations.get(pool_name)
-            if owners is not None:
-                owners.pop(owner, None)
-                if not owners:
-                    device_reservations.pop(pool_name, None)
-            if not device_reservations:
-                _runtime_owned_reservations.pop(device, None)
-        return
-    owners = _runtime_owned_reservations.setdefault(device, {}).setdefault(
-        pool_name, WeakKeyDictionary()
-    )
-    owners[owner] = int(num_bytes)
-
-
-def get_runtime_owned_reservation_bytes(device: str) -> int:
-    return sum(get_runtime_owned_reservation_breakdown(device).values())
+    """Report live runtime-owned bytes; registration does not resize KV pools."""
+    runtime_reservations.register_runtime_owned_reservation(
+        device, pool_name, num_bytes, owner=owner, integration="sglang")
 
 
 def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
-    device = normalize_gpu_device(device)
-    return {
-        name: sum(owners.values())
-        for name, owners in _runtime_owned_reservations.get(device, {}).items()
-        if owners
-    }
+    """Return reported runtime bytes by pool category for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_breakdown(
+        device, integration="sglang")
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    """Return reported runtime bytes on one device for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_bytes(
+        device, integration="sglang")
+
+
+def runtime_reservation_snapshots(
+    device: Optional[str] = None,
+) -> List[RuntimeReservationSnapshot]:
+    """Return immutable runtime reservation reports for this integration."""
+    return runtime_reservations.get_runtime_reservation_snapshots(
+        integration="sglang", device=device)
+
+
+def runtime_reservation_snapshot_dicts(
+    device: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable runtime reservation reports."""
+    return runtime_reservations.get_runtime_reservation_snapshot_dicts(
+        integration="sglang", device=device)
 
 
 def observability_snapshot():
@@ -207,23 +195,27 @@ def alloc_kv_cache(
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    if ":" not in device:
+        device = f"{device}:{resolve_gpu_device_index(device)}"
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
     block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
 
-    runtime_reserved_bytes = get_runtime_owned_reservation_bytes(device)
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    # This adapter accounts only for the DeepSeek-V4 pools it recognizes.
+    # Other shared reports may already be included by the engine profiler.
+    runtime_reserved_bytes = sum(
+        num_bytes for pool_name, num_bytes in get_runtime_owned_reservation_breakdown(device).items()
+        if pool_name.startswith("dsv4.")
+    )
     if runtime_reserved_bytes:
         gpu_mem_bytes = max(0, gpu_mem_bytes - runtime_reserved_bytes)
         logger.info(
-            "Reserved %.2f GB for runtime-owned SGLang pools on %s; "
-            "remaining kvcached budget is %.2f GB",
-            runtime_reserved_bytes / (1024**3),
-            device,
-            gpu_mem_bytes / (1024**3),
-        )
+            "Reserved %.2f GB for runtime-owned DeepSeek-V4 pools on %s; "
+            "remaining kvcached backing budget is %.2f GB",
+            runtime_reserved_bytes / (1024**3), device, gpu_mem_bytes / (1024**3))
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * PAGE_SIZE for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
@@ -535,18 +527,24 @@ def get_kv_cache_manager(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
+    # Each SGLang TP worker owns and drives its local pool. Keep the real TP
+    # world size in init_kvcached() for rank-aware IPC listener setup, but do
+    # not broadcast this worker's local map/unmap operations to its peers.
     manager = KVCacheManager(
         num_blocks,
         block_size,
         cell_size,
         num_layers,
-        world_size=_world_size,
+        world_size=1,
         pp_rank=_pp_rank,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
         pool_name=pool_name,
+        # SWA and Mamba pools differ in size from the full-attention pool:
+        # each needs its own limit and usage, i.e. its own segment.
+        own_segment=True,
     )
     register_kv_cache_pool(
         manager,
