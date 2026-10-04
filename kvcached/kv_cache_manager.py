@@ -14,6 +14,8 @@ from __future__ import annotations
 import functools
 import threading
 import time
+import weakref
+from collections.abc import Iterable
 from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
@@ -105,6 +107,7 @@ class KVCacheManager:
     # about the cache; available_size() re-fetches when the TTL elapses.
     _avail_physical_pages_cache: Optional[int] = None
     _avail_physical_pages_ts: float = 0.0
+    _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
 
     def __init__(
         self,
@@ -576,6 +579,19 @@ class KVCacheManager:
         return self.avail_pages.pop(chosen)
 
     @synchronized
+    def _register_page_release_callback(
+        self, callback: Callable[[Iterable[int]], None],
+    ) -> None:
+        """Watch releases without keeping an engine's eviction index alive.
+
+        Callbacks must be bound methods that only mark page ids dirty. They
+        run under the manager lock, before release, including partial failures.
+        """
+        self._page_release_callbacks = tuple(
+            ref for ref in self._page_release_callbacks if ref() is not None
+        ) + (weakref.WeakMethod(callback),)
+
+    @synchronized
     def free(self, indices: List[int]):
         self._wait_post_init()
 
@@ -589,6 +605,14 @@ class KVCacheManager:
                                      " reserved_blocks, which is not allowed.")
 
         idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
+
+        # Releases may bypass the engine block pool (reserved blocks, resize,
+        # or allocation rollback). Only these pages need their cached eviction
+        # eligibility refreshed; never rescan all pinned pages on every trim.
+        for ref in self._page_release_callbacks:
+            callback = ref()
+            if callback is not None:
+                callback(idx_dict)
 
         pages_to_free: List[int] = []
         for page_id, idxs in idx_dict.items():

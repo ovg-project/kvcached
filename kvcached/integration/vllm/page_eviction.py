@@ -25,6 +25,9 @@ class PageEvictionIndex:
         self.candidates: dict[int, tuple[int, int, int, int]] = {}
         self.heap: list[tuple[int, int, int, int]] = []
         self.clock = 0
+        watch_releases = getattr(manager, "_register_page_release_callback", None)
+        if watch_releases is not None:
+            watch_releases(self._pages_released)
 
     def page_id(self, block_id: int) -> int:
         # Same byte-address calculation as PageAllocator::get_page_id, also
@@ -48,6 +51,9 @@ class PageEvictionIndex:
 
     def changed(self, block_ids: Iterable[int]) -> None:
         self.dirty.update(self.page_id(bid) for bid in block_ids)
+
+    def _pages_released(self, page_ids: Iterable[int]) -> None:
+        self.dirty.update(page for page in page_ids if page in self.pages)
 
     def clear(self) -> None:
         self.pages.clear()
