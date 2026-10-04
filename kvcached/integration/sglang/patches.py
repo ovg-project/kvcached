@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import types
+from abc import ABCMeta
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -81,6 +82,17 @@ def _sglang_pool_has_zero_attention_layers(kvcache: Any) -> bool:
         return False
     attention_pool = getattr(kvcache, "full_kv_pool", kvcache)
     return getattr(attention_pool, "layer_num", None) == 0
+
+
+class _ElasticAllocatorMeta(ABCMeta):
+    """Keep native zero-layer fallbacks valid for downstream type checks."""
+
+    def __instancecheck__(cls, instance: Any) -> bool:
+        if super().__instancecheck__(instance):
+            return True
+        native_cls = getattr(cls, "_native_allocator_cls", None)
+        return (native_cls is not None and isinstance(instance, native_cls)
+                and getattr(instance, "_kvcached_zero_attention", False) is True)
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -315,7 +327,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             native_token_allocator = getattr(alloc_mod, "TokenToKVPoolAllocator", None)
 
             class ElasticTokenToKVPoolAllocator(
-                BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
+                BaseTokenToKVPoolAllocator,  # type: ignore[misc, valid-type]
+                metaclass=_ElasticAllocatorMeta,
             ):
                 _native_allocator_cls = native_token_allocator
 
@@ -331,8 +344,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         logger.info(
                             "[kvcached] zero attention layers; using the "
                             "native TokenToKVPoolAllocator for this pool")
-                        return cls._native_allocator_cls(
+                        allocator = cls._native_allocator_cls(
                             size, dtype, device, kvcache, *args, **kwargs)
+                        allocator._kvcached_zero_attention = True
+                        return allocator
                     return super().__new__(cls)
 
                 def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
@@ -442,7 +457,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
             class ElasticPagedTokenToKVPoolAllocator(
-                BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
+                BaseTokenToKVPoolAllocator,  # type: ignore[misc, valid-type]
+                metaclass=_ElasticAllocatorMeta,
             ):
                 _native_allocator_cls = native_paged_allocator
 
@@ -459,9 +475,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             "[kvcached] zero attention layers; using the "
                             "native PagedTokenToKVPoolAllocator for this "
                             "pool")
-                        return cls._native_allocator_cls(
+                        allocator = cls._native_allocator_cls(
                             size, page_size, dtype, device, kvcache,
                             *args, **kwargs)
+                        allocator._kvcached_zero_attention = True
+                        return allocator
                     return super().__new__(cls)
 
                 def __init__(

@@ -20,6 +20,7 @@ clear error instead of dividing by it.
 import importlib.util
 import sys
 import types
+from abc import ABC
 from pathlib import Path
 from typing import Any, Dict
 
@@ -342,7 +343,7 @@ def test_hybrid_pool_property_reports_missing_manager(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-class FakeBaseTokenToKVPoolAllocator:
+class FakeBaseTokenToKVPoolAllocator(ABC):
     def __init__(self, size, page_size, dtype, device, kvcache, *args, **kwargs):
         self.size = size
         self.page_size = page_size
@@ -413,8 +414,8 @@ def test_token_allocator_dispatches_native_for_zero_layer_pool(monkeypatch):
     allocator = alloc_mod.TokenToKVPoolAllocator(
         2048, "bf16", "cuda:0", FakeZeroLayerPool())
 
-    assert isinstance(allocator, FakeNativeTokenToKVPoolAllocator)
-    assert not isinstance(allocator, alloc_mod.ElasticTokenToKVPoolAllocator)
+    assert type(allocator) is FakeNativeTokenToKVPoolAllocator
+    assert isinstance(allocator, alloc_mod.ElasticTokenToKVPoolAllocator)
     assert allocator.size == 2048
 
 
@@ -427,8 +428,8 @@ def test_paged_allocator_dispatches_native_for_zero_layer_pool(monkeypatch):
     allocator = alloc_mod.PagedTokenToKVPoolAllocator(
         2048, 16, "bf16", "cuda:0", FakeZeroLayerPool())
 
-    assert isinstance(allocator, FakeNativePagedTokenToKVPoolAllocator)
-    assert not isinstance(
+    assert type(allocator) is FakeNativePagedTokenToKVPoolAllocator
+    assert isinstance(
         allocator, alloc_mod.ElasticPagedTokenToKVPoolAllocator)
     assert allocator.page_size == 16
 
@@ -446,3 +447,56 @@ def test_token_allocator_stays_elastic_for_attention_pools(monkeypatch):
         2048, "bf16", "cuda:0", FakeElasticPool())
 
     assert isinstance(allocator, alloc_mod.ElasticTokenToKVPoolAllocator)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("import_before_patch", [False, True])
+def test_zero_layer_allocator_passes_cache_constructor(
+    monkeypatch, paged, import_before_patch
+):
+    alloc_mod = _make_allocator_module(monkeypatch)
+    token_cls = alloc_mod.TokenToKVPoolAllocator
+    paged_cls = alloc_mod.PagedTokenToKVPoolAllocator
+    patch = ElasticAllocatorPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version", lambda _: "0.5.15")
+    assert patch.apply(alloc_mod)
+    # Re-entry must retain the native classes captured before aliasing.
+    assert patch.apply(alloc_mod)
+    if not import_before_patch:
+        token_cls = alloc_mod.TokenToKVPoolAllocator
+        paged_cls = alloc_mod.PagedTokenToKVPoolAllocator
+
+    class MambaCache:
+        def __init__(self, allocator):
+            # MambaRadixCache checks the classes it imported from allocator.
+            assert isinstance(allocator, token_cls) or isinstance(allocator, paged_cls)
+            self.allocator = allocator
+
+    if paged:
+        allocator = alloc_mod.PagedTokenToKVPoolAllocator(
+            2048, 16, "bf16", "cuda:0", FakeZeroLayerPool())
+        assert type(allocator) is FakeNativePagedTokenToKVPoolAllocator
+        assert not isinstance(allocator, alloc_mod.ElasticTokenToKVPoolAllocator)
+    else:
+        allocator = alloc_mod.TokenToKVPoolAllocator(
+            2048, "bf16", "cuda:0", FakeZeroLayerPool())
+        assert type(allocator) is FakeNativeTokenToKVPoolAllocator
+        assert not isinstance(allocator, alloc_mod.ElasticPagedTokenToKVPoolAllocator)
+    assert MambaCache(allocator).allocator is allocator
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_nonzero_native_allocator_is_not_treated_as_elastic(monkeypatch, paged):
+    alloc_mod = _make_allocator_module(monkeypatch)
+    patch = ElasticAllocatorPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version", lambda _: "0.5.15")
+    assert patch.apply(alloc_mod)
+    allocator: FakeBaseTokenToKVPoolAllocator
+    if paged:
+        allocator = FakeNativePagedTokenToKVPoolAllocator(
+            2048, 16, "bf16", "cuda:0", FakeElasticPool())
+    else:
+        allocator = FakeNativeTokenToKVPoolAllocator(
+            2048, "bf16", "cuda:0", FakeElasticPool())
+    assert not isinstance(allocator, alloc_mod.ElasticTokenToKVPoolAllocator)
+    assert not isinstance(allocator, alloc_mod.ElasticPagedTokenToKVPoolAllocator)
