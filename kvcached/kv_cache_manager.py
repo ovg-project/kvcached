@@ -123,6 +123,7 @@ class KVCacheManager:
         pool_name: Optional[str] = None,
         defer_physical_release: bool = False,
         own_segment: bool = False,
+        page_size: Optional[int] = None,
     ):
         """
         Args:
@@ -146,6 +147,8 @@ class KVCacheManager:
             own_segment: Give a non-zero group its own /dev/shm segment
                 (``<ipc name>_g<group_id>``) instead of the instance's shared
                 one, for pools whose sizes differ (SGLang SWA and Mamba pools).
+            page_size: Physical page size, matching this pool's backing tensors.
+                Defaults to KVCACHED_PAGE_SIZE_MB.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -166,7 +169,7 @@ class KVCacheManager:
         self._retired_pages: List[tuple[int, List[int]]] = []
 
         # The physical page size used by kvcached page allocator.
-        self.page_size = PAGE_SIZE
+        self.page_size = PAGE_SIZE if page_size is None else page_size
         # Every page must hold a whole block. A block larger than a page leaves
         # the pool empty (warmup deadlocks); an unfavorable block/page alignment
         # can leave some pages with no block, and such a
