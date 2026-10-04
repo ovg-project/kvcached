@@ -31,6 +31,8 @@ class NativeBlockPoolMixin:
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[Any]] = {}
         self.metrics_collector = None
+        # vLLM 0.30 native methods read these; kvcached never pins blocks.
+        self._reuse_watchers: dict[int, Any] = {}
 
     def get_cached_block(self, block_hash: Any, kv_cache_group_ids: list[int]) -> Any:
         if not self.enable_prefix_cache:
@@ -73,6 +75,10 @@ class NativeBlockPoolMixin:
         # Evict every native alias before the physical slot can be reused.
         block = self.blocks[block_id]
         return block if self._remove_cached_block_hashes(block) else None
+
+    def unpin_blocks(self, *args: Any, **kwargs: Any) -> None:
+        # Only HiSparse (rejected at startup) unpins blocks in vLLM 0.30.
+        raise NotImplementedError("kvcached does not support unpinned KV blocks")
 
     def touch(self, blocks: Sequence[Any]) -> None:
         for block in blocks:

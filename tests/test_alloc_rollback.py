@@ -51,6 +51,13 @@ class FakePage:
     def get_num_blocks(page_size: int, block_mem_size: int) -> int:
         return page_size // block_mem_size
 
+    @staticmethod
+    def get_block_range(page_id: int, page_size: int,
+                        block_mem_size: int) -> tuple[int, int]:
+        start = (page_id * page_size + block_mem_size - 1) // block_mem_size
+        end = (page_id + 1) * page_size // block_mem_size
+        return start, end
+
 
 class FakePageAllocator:
     """Reports ample capacity but fails alloc_page() after ``fail_after``
@@ -110,6 +117,7 @@ except ImportError:
     _install_vmm_ops_stub()
 
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
+from kvcached.lifecycle import LifecycleState  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
 
 
@@ -131,6 +139,8 @@ def make_manager(fail_after: int,
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
+    manager._lifecycle = LifecycleState("rollback-test")
+    manager._lifecycle.mark_ready()
     return manager
 
 
@@ -138,6 +148,31 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+
+
+def test_logical_limit_keeps_reserved_blocks_allocatable():
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = 8
+    manager.logical_num_blocks = 5
+    manager.null_block = manager.alloc(1)
+    assert manager.null_block == [0]
+
+    assert manager.try_to_reserve(4)
+    reserved = list(manager.reserved_blocks)
+    assert len(reserved) == 4
+    assert manager.available_size() == 4
+    first = manager.alloc(2)
+    assert first == reserved[:2]
+    assert manager.available_size() == 2
+    assert manager.alloc(3) is None
+    second = manager.alloc(2)
+    assert second == reserved[2:]
+    assert manager.available_size() == 0
+    assert manager.alloc(1) is None
+    assert manager.reserved_blocks == []
+
+    manager.free(reserved)
+    assert manager.available_size() == 4
 
 
 def test_consistency_error_is_not_an_allocation_miss(monkeypatch):

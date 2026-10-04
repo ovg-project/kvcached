@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import types
+from abc import ABCMeta
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -17,6 +18,7 @@ from kvcached.integration.version_utils import (
     VersionAwarePatch,
     version_range,
 )
+from kvcached.kv_geometry import backing_blocks_for_capacity
 from kvcached.utils import MAX_CACHED_TOKENS, PAGE_SIZE, get_kvcached_logger
 
 BYTES_PER_GB = 1024**3
@@ -64,6 +66,34 @@ def _sglang_reset_free_group(allocator: Any) -> None:
         allocator.free_group = []
     else:
         allocator.free_group = None
+
+
+def _sglang_pool_has_zero_attention_layers(kvcache: Any) -> bool:
+    """True when the pool's attention side holds zero layers.
+
+    SGLang builds zero-layer attention pools for models without
+    full-attention layers: the ``full_kv_pool`` inside
+    ``HybridLinearKVPool`` for pure Mamba2 models, and the full-attention
+    sub-pool of ``SWAKVPool`` for all-SWA models. Such a pool owns no KV
+    memory (native allocates no buffers for it), so there is nothing for
+    kvcached to manage and the elastic allocators defer to the native
+    ones. Composite pools are unwrapped through ``full_kv_pool``.
+    """
+    if kvcache is None:
+        return False
+    attention_pool = getattr(kvcache, "full_kv_pool", kvcache)
+    return getattr(attention_pool, "layer_num", None) == 0
+
+
+class _ElasticAllocatorMeta(ABCMeta):
+    """Keep native zero-layer fallbacks valid for downstream type checks."""
+
+    def __instancecheck__(cls, instance: Any) -> bool:
+        if super().__instancecheck__(instance):
+            return True
+        native_cls = getattr(cls, "_native_allocator_cls", None)
+        return (native_cls is not None and isinstance(instance, native_cls)
+                and getattr(instance, "_kvcached_zero_attention", False) is True)
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -232,6 +262,43 @@ class SGLangVirtualKVCapacityPatch(_SGLangVirtualKVCapacityPatchBase):
     target_module = "sglang.srt.mem_cache.kv_cache_configurator"
     target_class = "KVCacheConfigurator"
 
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not super().apply(target_module):
+            return False
+        return self.patch_configure(target_module)
+
+    def patch_configure(self, target_module: types.ModuleType) -> bool:
+        target_class = self._get_target_class(target_module)
+        original = getattr(target_class, "configure", None)
+        if original is None:
+            self.logger.warning("SGLang KVCacheConfigurator does not expose configure")
+            return False
+        if self._is_already_patched(original, "elastic_pool_modes"):
+            return True
+
+        @functools.wraps(original)
+        def configure(owner, *args, **kwargs):
+            if enable_kvcached() and _is_supported_gpu_device(owner.device):
+                # Draft workers can reuse a budget and skip the profiling hook.
+                if getattr(owner, "post_capture_kv_active", False):
+                    raise RuntimeError(
+                        "SGLang post-capture KV sizing is not supported with "
+                        "kvcached elastic pools"
+                    )
+                # Follow the native source of truth across the runtime-context move.
+                get_memory = getattr(target_module, "get_memory", None)
+                memory = get_memory() if get_memory is not None else owner.server_args
+                if memory.enable_unified_memory:
+                    raise RuntimeError(
+                        "SGLang unified memory is not supported with kvcached "
+                        "elastic pools; disable --enable-unified-memory"
+                    )
+            return original(owner, *args, **kwargs)
+
+        self._mark_as_patched(configure, "elastic_pool_modes")
+        target_class.configure = configure
+        return True
+
     def _get_mem_fraction_static(self, configurator: Any) -> float:
         # SGLang 0.5.17 moved the resolved value into the runtime-context
         # schedule bag: KVCacheConfigurator's own sizing reads
@@ -308,10 +375,34 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            # Captured before alias_allocator_to_elastic() rebinds the name,
+            # so it is the native class even on re-entry.
+            native_token_allocator = getattr(alloc_mod, "TokenToKVPoolAllocator", None)
 
             class ElasticTokenToKVPoolAllocator(
-                BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
+                BaseTokenToKVPoolAllocator,  # type: ignore[misc, valid-type]
+                metaclass=_ElasticAllocatorMeta,
             ):
+                _native_allocator_cls = native_token_allocator
+
+                def __new__(cls, size=None, dtype=None, device=None, kvcache=None,
+                            *args, **kwargs):
+                    if (cls._native_allocator_cls is not None
+                            and _sglang_pool_has_zero_attention_layers(kvcache)):
+                        # Zero-layer attention pool (e.g. pure Mamba2):
+                        # no KV memory exists for kvcached to manage, so
+                        # serve the exact native allocator over the
+                        # phantom token slots. Python skips our __init__
+                        # for the foreign instance.
+                        logger.info(
+                            "[kvcached] zero attention layers; using the "
+                            "native TokenToKVPoolAllocator for this pool")
+                        allocator = cls._native_allocator_cls(
+                            size, dtype, device, kvcache, *args, **kwargs)
+                        allocator._kvcached_zero_attention = True
+                        return allocator
+                    return super().__new__(cls)
+
                 def __init__(self, size: int, dtype, device: str, kvcache, *args, **kwargs) -> None:
                     super().__init__(size, 1, dtype, device, kvcache, *args, **kwargs)
                     if not hasattr(kvcache, "kvcached_allocator"):
@@ -401,6 +492,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             import torch
 
             BaseTokenToKVPoolAllocator = getattr(alloc_mod, "BaseTokenToKVPoolAllocator")
+            # Captured before alias_paged_allocator_to_elastic() rebinds the
+            # name, so it is the native class even on re-entry.
+            native_paged_allocator = getattr(
+                alloc_mod, "PagedTokenToKVPoolAllocator", None)
             alloc_extend_kernel, alloc_decode_kernel = (
                 _resolve_sglang_allocator_kernels(alloc_mod)
             )
@@ -415,8 +510,31 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
             from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
             class ElasticPagedTokenToKVPoolAllocator(
-                BaseTokenToKVPoolAllocator  # type: ignore[misc, valid-type]
+                BaseTokenToKVPoolAllocator,  # type: ignore[misc, valid-type]
+                metaclass=_ElasticAllocatorMeta,
             ):
+                _native_allocator_cls = native_paged_allocator
+
+                def __new__(cls, size=None, page_size=None, dtype=None,
+                            device=None, kvcache=None, *args, **kwargs):
+                    if (cls._native_allocator_cls is not None
+                            and _sglang_pool_has_zero_attention_layers(kvcache)):
+                        # Zero-layer attention pool (e.g. pure Mamba2):
+                        # no KV memory exists for kvcached to manage, so
+                        # serve the exact native allocator over the
+                        # phantom token slots. Python skips our __init__
+                        # for the foreign instance.
+                        logger.info(
+                            "[kvcached] zero attention layers; using the "
+                            "native PagedTokenToKVPoolAllocator for this "
+                            "pool")
+                        allocator = cls._native_allocator_cls(
+                            size, page_size, dtype, device, kvcache,
+                            *args, **kwargs)
+                        allocator._kvcached_zero_attention = True
+                        return allocator
+                    return super().__new__(cls)
+
                 def __init__(
                     self, size: int, page_size: int, dtype, device: str, kvcache, *args, **kwargs
                 ) -> None:
@@ -800,6 +918,25 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.cell_size = (
                         self.head_num * self.head_dim * self.store_dtype.itemsize
                     )
+
+                    if layer_num == 0:
+                        # Zero-layer pool: SGLang builds one as the
+                        # full-attention sub-pool of models without
+                        # full-attention layers (e.g. pure Mamba2 under
+                        # HybridLinearKVPool, all-SWA under SWAKVPool). It
+                        # owns no KV memory, so there is nothing for
+                        # kvcached to manage; _create_buffers_elastic()
+                        # left the buffers empty, mirroring native. The
+                        # None allocator tells the elastic token allocators
+                        # to stay native for this pool.
+                        self.kvcached_allocator = None
+                        self.mem_usage = 0.0
+                        logger.info(
+                            "ElasticMHATokenToKVPool: zero attention "
+                            "layers, no elastic KV pool created "
+                            f"(group_id={self._group_id})")
+                        return
+
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
@@ -824,6 +961,16 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                 def _create_buffers_elastic(self):
                     import kvcached.integration.sglang.interfaces as kvi
+
+                    if self.layer_num == 0:
+                        # Native SGLang allocates no buffers for a
+                        # zero-layer pool (its per-layer loops run zero
+                        # times); alloc_kv_cache() would divide the GPU
+                        # budget by zero layers. Leave the same empty
+                        # buffers native would.
+                        self.k_buffer: List[Any] = []
+                        self.v_buffer: List[Any] = []
+                        return
 
                     # kvcached backs NHD rows, one (head_num, head_dim) row
                     # per token slot. HND and the ROCm vectorized layouts
@@ -1176,13 +1323,12 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     )
                     # KVCacheManager counts allocation blocks, and one MLA
                     # block represents one SGLang page of token rows.  Its
-                    # PageAllocator rounds the byte capacity down to physical
-                    # PAGE_SIZE units, so a sub-page pool needs enough backing
-                    # blocks to retain one page for the null-block reservation.
+                    # Backing must cover physical-page rounding and blocks
+                    # excluded at page boundaries, including the null block.
                     logical_num_blocks = math.ceil(size / page_size) + 1
                     block_mem_size = page_size * self.cell_size
-                    min_backing_blocks = math.ceil(PAGE_SIZE / block_mem_size)
-                    num_blocks = max(logical_num_blocks, min_backing_blocks)
+                    num_blocks = backing_blocks_for_capacity(
+                        logical_num_blocks, block_mem_size, PAGE_SIZE)
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         num_blocks, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
@@ -2191,3 +2337,69 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
         )
         return True
+
+
+class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
+    """Enforce KVCACHED_MAX_CACHED_TOKENS on a prefix cache that is not a
+    RadixCache subclass, so RadixCacheLimitPatch alone leaves it unbounded.
+    The cap counts full-attention tokens, like RadixCache.evictable_size_.
+    """
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_radix_cache_limit(self, radix_cache_mod: types.ModuleType) -> bool:
+        cache_cls = self._get_target_class(radix_cache_mod)
+        if cache_cls is None:
+            return False
+
+        original_cache_finished = getattr(cache_cls, "cache_finished_req", None)
+        if original_cache_finished is None:
+            self.logger.warning("%s.cache_finished_req not found", self.target_class)
+            return False
+
+        if self._is_already_patched(original_cache_finished):
+            return True
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        max_cached = MAX_CACHED_TOKENS
+
+        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+            original_cache_finished(self_rc, *args, **kwargs)
+            excess = self_rc.full_evictable_size() - max_cached
+            if excess > 0:
+                self_rc.evict(EvictParams(num_tokens=excess))
+
+        self._mark_as_patched(_wrapped)
+        cache_cls.cache_finished_req = _wrapped
+
+        logger.info(
+            f"[kvcached] {self.target_class} evictable size capped at "
+            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+        )
+        return True
+
+
+class UnifiedRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """SGLang builds UnifiedRadixCache for hybrid SWA/Mamba models from
+    0.5.16 and for every radix-cache model from 0.5.19."""
+
+    target_module = "sglang.srt.mem_cache.unified_radix_cache"
+    target_class = "UnifiedRadixCache"
+    patch_name = "unified_radix_cache_limit"
+
+
+class SWARadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid SWA models (gpt-oss, Gemma) use SWARadixCache up to 0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.swa_radix_cache"
+    target_class = "SWARadixCache"
+    patch_name = "swa_radix_cache_limit"
+
+
+class MambaRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
+    """Hybrid Mamba models (Qwen3-Next, Qwen3.5) use MambaRadixCache up to
+    0.5.15."""
+
+    target_module = "sglang.srt.mem_cache.mamba_radix_cache"
+    target_class = "MambaRadixCache"
+    patch_name = "mamba_radix_cache_limit"

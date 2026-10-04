@@ -153,6 +153,18 @@ def alloc_kv_cache(
     if len(kvcache_shape) <= 2:
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
+    if num_layers <= 0:
+        # SGLang builds zero-layer attention pools for models without
+        # full-attention layers (e.g. the full-attention sub-pool of a pure
+        # Mamba2 model's HybridLinearKVPool). Those pools own no KV memory,
+        # so there is nothing to allocate; the per-layer sizing below would
+        # divide by zero. Callers must skip allocation instead (the elastic
+        # pools do), mirroring native SGLang, which allocates no buffers for
+        # zero-layer pools.
+        raise ValueError(
+            f"num_layers must be positive, got {num_layers}. A zero-layer "
+            "attention pool owns no KV memory; skip alloc_kv_cache() for it.")
+
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
 
@@ -490,6 +502,9 @@ def get_kv_cache_manager(
         group_id=group_id,
         pool_name=pool_name,
         logical_num_blocks=logical_num_blocks,
+        # SWA and Mamba pools differ in size from the full-attention pool:
+        # each needs its own limit and usage, i.e. its own segment.
+        own_segment=True,
     )
     register_kv_cache_pool(
         manager,

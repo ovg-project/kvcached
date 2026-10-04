@@ -13,10 +13,13 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 print(f"MLATokenToKVPool class: {MLATokenToKVPool.__name__}")
 assert "Elastic" in MLATokenToKVPool.__name__, "MLA pool was not patched!"
 
-# Small-pool regression: the logical capacity is below one 2 MiB kvcached
-# physical page. The manager still needs one physical page to reserve block 0.
-size = 1024          # token number
-page_size = 64
+# Include pools whose logical byte count fits but whole-block packing does not.
+size, page_size, backing_blocks, physical_pages = {
+    "small": (1024, 64, 29, 1),
+    "page64": (8192, 64, 143, 5),
+    "packing": (16320, 64, 285, 10),
+    "page32": (8192, 32, 285, 5),
+}[os.environ.get("KVCACHED_TEST_MLA_CAPACITY", "small")]
 dtype = torch.bfloat16
 kv_lora_rank = 512
 qk_rope_head_dim = 64
@@ -45,8 +48,8 @@ try:
         allocator = pool.kvcached_allocator
         assert allocator._post_init_done.wait(timeout=10.0)
         assert allocator.null_block == [0]
-        assert allocator.num_blocks == 29
-        assert allocator.page_allocator.get_num_total_pages() == 1
+        assert allocator.num_blocks == backing_blocks
+        assert allocator.page_allocator.get_num_total_pages() == physical_pages
 
         logical_allocator = PagedTokenToKVPoolAllocator(
             size, page_size, dtype, device, pool, False
@@ -54,11 +57,17 @@ try:
         assert logical_allocator.available_size() == size
         print(f"  available_size: {logical_allocator.available_size()}")
 
+        if os.environ.get("KVCACHED_TEST_MLA_RESERVE") == "1":
+            assert allocator.try_to_reserve(size // page_size)
+            assert len(allocator.reserved_blocks) == size // page_size
+            assert logical_allocator.available_size() == size
+
         # Fill the logical pool, reject the extra backing-only capacity, and
         # verify that the mapped CUDA rows are writable through the inherited
         # MLA write path.
         indices = logical_allocator.alloc(size)
         assert indices is not None and len(indices) == size
+        assert indices.unique().numel() == size
         print(
             f"  alloc({size}) -> [{indices[0].item()}, ..., "
             f"{indices[-1].item()}]"
@@ -70,16 +79,15 @@ try:
             f"{logical_allocator.available_size()}"
         )
 
-        loc = torch.tensor(
-            [indices[0].item()], dtype=torch.int64, device=device
-        )
+        loc = indices
         expected = torch.arange(
             pool.kv_cache_dim, dtype=torch.float32, device=device
-        ).to(dtype).reshape(1, 1, pool.kv_cache_dim)
-        pool.set_kv_buffer(
-            SimpleNamespace(layer_id=pool.start_layer), loc, expected, expected
-        )
-        torch.testing.assert_close(pool.kv_buffer[0][loc].cpu(), expected.cpu())
+        ).to(dtype).reshape(1, 1, pool.kv_cache_dim).expand(size, 1, -1).contiguous()
+        for layer in range(layer_num):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=pool.start_layer + layer), loc, expected, expected
+            )
+            torch.testing.assert_close(pool.kv_buffer[layer][loc].cpu(), expected.cpu())
 
         # test deallocation
         logical_allocator.free(indices)

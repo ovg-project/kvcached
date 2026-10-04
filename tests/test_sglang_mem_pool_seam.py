@@ -648,19 +648,22 @@ def test_mla_pool_sets_renamed_dsa_attributes(elastic_env):
     assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (12, 1, 6)
 
 
-def test_mla_manager_capacity_uses_page_count(elastic_env):
+@pytest.mark.parametrize("size,page_size,logical,backing", [
+    (8192, 64, 129, 143), (16320, 64, 256, 285), (8192, 32, 257, 285),
+])
+def test_mla_manager_capacity_uses_page_count(elastic_env, size, page_size, logical, backing):
     module = _inject_mla()
 
     module.ElasticMLATokenToKVPool(
-        8192, 64, torch.float16, 512, 64, 1, "cpu", False
+        size, page_size, torch.float16, 512, 64, 1, "cpu", False
     )
 
     manager_args, manager_kwargs = elastic_env["get_kv_cache_manager"]
-    assert manager_args[:2] == (129, 64)
+    assert manager_args[:2] == (backing, page_size)
     assert manager_kwargs["pool_name"] == "mla"
-    assert manager_kwargs["logical_num_blocks"] == 129
+    assert manager_kwargs["logical_num_blocks"] == logical
     # The backing tensor remains measured in token rows.
-    assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (8256, 1, 576)
+    assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (size + page_size, 1, 576)
 
 
 def test_mla_manager_small_capacity_has_one_physical_page(elastic_env):

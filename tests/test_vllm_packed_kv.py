@@ -17,7 +17,10 @@ LAYERS = 3
 def interfaces(monkeypatch):
     mod = importlib.import_module("kvcached.integration.vllm.interfaces")
     monkeypatch.setattr(mod, "_kvcached_initialized", True)
-    monkeypatch.setattr(mod, "PAGE_SIZE", 256)
+    # Keep the synthetic page large enough for the packed K+V block, just as
+    # real physical pages must be. Otherwise automatic selection grows it to
+    # 2 MiB, exceeding this fixture's deliberately tiny memory budget.
+    monkeypatch.setattr(mod, "PAGE_SIZE", 2048)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda _: SimpleNamespace(total_memory=24 * 1024))

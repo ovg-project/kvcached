@@ -22,6 +22,39 @@ PAGE_GRANULARITY = 2 * MIB
 MAX_BLOCK_GROWTH = 2
 
 
+def backing_blocks_for_capacity(logical_num_blocks: int, block_mem_size: int,
+                                page_size: int) -> int:
+    """Smallest backing extent that packs the requested whole-block capacity.
+
+    The allocator floors backing bytes to physical pages and excludes blocks
+    crossing page boundaries. Count those gaps before rounding the backing
+    extent; rounding logical bytes alone can still leave the pool too small.
+    """
+    if logical_num_blocks < 0 or block_mem_size <= 0 or page_size < block_mem_size:
+        raise ValueError("capacity must be nonnegative and blocks must fit a positive page")
+    if logical_num_blocks == 0:
+        return 0
+    period = block_mem_size // gcd(page_size, block_mem_size)
+
+    def packed_blocks(pages: int) -> int:
+        boundaries = pages - 1
+        # Each unaligned internal boundary excludes one straddling block.
+        return (pages * page_size // block_mem_size
+                - boundaries + boundaries // period)
+
+    low = 1
+    high = max(1, (logical_num_blocks * block_mem_size + page_size - 1) // page_size)
+    while packed_blocks(high) < logical_num_blocks:
+        high *= 2
+    while low < high:
+        mid = (low + high) // 2
+        if packed_blocks(mid) < logical_num_blocks:
+            low = mid + 1
+        else:
+            high = mid
+    return (low * page_size + block_mem_size - 1) // block_mem_size
+
+
 def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     """Whether some page would hold no whole block.
 
@@ -31,6 +64,25 @@ def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     can fit that worst-case gap plus one complete block.
     """
     return page_size < 2 * block_mem_size - gcd(page_size, block_mem_size)
+
+
+def select_page_size(block_mem_size: int, block_size: Optional[int] = None) -> int:
+    """Smallest 2 MiB multiple with a whole block in every page.
+
+    ``block_size`` enables the existing hybrid block alignment at each page
+    candidate. Stop as soon as either the original or aligned block is safe.
+    """
+    if block_mem_size <= 0:
+        raise ValueError("KV block size must be positive")
+    page_size = ((block_mem_size + PAGE_GRANULARITY - 1)
+                 // PAGE_GRANULARITY * PAGE_GRANULARITY)
+    while has_zero_capacity_pages(block_mem_size, page_size):
+        if (block_size and block_mem_size % block_size == 0
+                and aligned_block_size(block_size, block_mem_size // block_size,
+                                       page_size) is not None):
+            break
+        page_size += PAGE_GRANULARITY
+    return page_size
 
 
 def aligned_block_size(block_size: int, bytes_per_token: int,

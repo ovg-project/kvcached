@@ -26,7 +26,7 @@ def apply(vllm_patches, monkeypatch, version="0.29.0", enabled=True):
     return manager(), original, patch, target, applied
 
 
-@pytest.mark.parametrize("version", ["0.28.0", "0.28.1", "0.29.0"])
+@pytest.mark.parametrize("version", ["0.28.0", "0.28.1", "0.29.0", "0.30.0"])
 @pytest.mark.parametrize("computed", [8, 9])
 def test_running_stale_boundary_is_not_delegated(vllm_patches, monkeypatch, version, computed):
     manager, original, _, _, applied = apply(vllm_patches, monkeypatch, version)
@@ -56,7 +56,7 @@ def test_disabled_patch_passes_through_and_propagates_errors(vllm_patches, monke
         manager._cache_partial_tail_block(req, 8)
 
 
-@pytest.mark.parametrize("version", [None, "0.27.0", "0.30.0"])
+@pytest.mark.parametrize("version", [None, "0.27.0", "0.31.0"])
 def test_other_versions_are_not_modified(vllm_patches, monkeypatch, version):
     manager, original, _, _, applied = apply(vllm_patches, monkeypatch, version)
     assert not applied
@@ -69,3 +69,15 @@ def test_patch_installation_is_idempotent(vllm_patches, monkeypatch):
     wrapped = manager._cache_partial_tail_block.__func__
     assert patch.apply(target)
     assert manager._cache_partial_tail_block.__func__ is wrapped
+
+
+def test_030_retention_interval_reaches_native(vllm_patches, monkeypatch):
+    # vLLM 0.30 calls _cache_partial_tail_block(..., retention_interval=N).
+    manager, original, _, _, applied = apply(vllm_patches, monkeypatch, "0.30.0")
+    assert applied
+    req = types.SimpleNamespace(status="waiting", num_computed_tokens=0)
+    assert manager._cache_partial_tail_block(req, 8, retention_interval=5) == "native hash"
+    original.assert_called_once_with(manager, req, 8, retention_interval=5)
+    running = types.SimpleNamespace(status="running", num_computed_tokens=8)
+    assert manager._cache_partial_tail_block(running, 8, retention_interval=5) is None
+    original.assert_called_once()
