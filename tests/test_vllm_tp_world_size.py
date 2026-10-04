@@ -36,6 +36,94 @@ def vllm_modules(monkeypatch):
     return interfaces, patches
 
 
+
+@pytest.mark.parametrize("version", ["0.9.2", "0.10.2", "0.11.2", "0.12.0", "0.22.1", "0.28.0", None])
+def test_hash_granularity_preserves_native_value(vllm_modules, version):
+    _, patches = vllm_modules
+    pool = types.SimpleNamespace(hash_block_size=4)
+    assert patches._get_native_hash_block_size(pool, 16, version) == 4
+
+
+@pytest.mark.parametrize("version", ["0.9.2", "0.10.2", "0.11.2"])
+def test_legacy_pool_without_hash_granularity_uses_allocation_size(vllm_modules, version):
+    _, patches = vllm_modules
+    assert patches._get_native_hash_block_size(types.SimpleNamespace(), 16, version) == 16
+
+
+@pytest.mark.parametrize("version", ["0.12.0", "0.22.1", "0.28.0", "unknown", None])
+def test_modern_or_unknown_pool_must_expose_hash_granularity(vllm_modules, version):
+    _, patches = vllm_modules
+    with pytest.raises(RuntimeError, match="BlockPool.hash_block_size is missing"):
+        patches._get_native_hash_block_size(types.SimpleNamespace(), 16, version)
+
+
+@pytest.mark.parametrize("version", ["0.11.2", "0.28.0"])
+@pytest.mark.parametrize("value", [None, 0, -4, "4"])
+def test_invalid_native_hash_granularity_never_falls_back(vllm_modules, version, value):
+    _, patches = vllm_modules
+    with pytest.raises(RuntimeError, match="positive integer"):
+        patches._get_native_hash_block_size(
+            types.SimpleNamespace(hash_block_size=value), 16, version,
+        )
+
+
+@pytest.mark.parametrize("version", ["0.11.2", "0.28.0", None])
+def test_missing_native_pool_never_uses_legacy_fallback(vllm_modules, version):
+    _, patches = vllm_modules
+    with pytest.raises(RuntimeError, match="missing its native BlockPool"):
+        patches._get_native_hash_block_size(None, 16, version)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("version", ["0.11.2", "0.12.0", "0.22.1", "0.28.0", None])
+def test_coordinator_missing_hash_field_fails_before_initialization(
+    monkeypatch, vllm_modules, enabled, version,
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(patches, "_get_first_attention_group", lambda cfg: types.SimpleNamespace(
+        kv_cache_spec=types.SimpleNamespace(block_size=16),
+    ))
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    constructor = mock.Mock(return_value=types.SimpleNamespace(null_block=object()))
+    pool_module = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(pool_module, "ElasticBlockPool", constructor)
+    monkeypatch.setitem(sys.modules, pool_module.__name__, pool_module)
+    native_pool = types.SimpleNamespace()
+
+    class Coordinator:
+        def __init__(self):
+            self.block_pool = native_pool
+            # An unrelated coordinator field must not conceal a broken pool.
+            self.hash_block_size = 16
+            self.enable_caching = True
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
+            self.single_type_managers = []
+
+    patch = patches.KVCacheCoordinatorPatch()
+    patch.detected_version = version
+    assert patch.patch_coordinator(types.SimpleNamespace(KVCacheCoordinator=Coordinator))
+    if enabled and version != "0.11.2":
+        with pytest.raises(RuntimeError, match="BlockPool.hash_block_size is missing"):
+            Coordinator()
+        initialize.assert_not_called()
+        constructor.assert_not_called()
+    elif enabled:
+        Coordinator()
+        assert constructor.call_args.kwargs["hash_block_size"] == 16
+        initialize.assert_called_once()
+    else:
+        assert Coordinator().block_pool is native_pool
+        initialize.assert_not_called()
+        constructor.assert_not_called()
+
+
 def test_get_world_size_returns_engine_core_recorded_value(
     monkeypatch, vllm_modules
 ):
@@ -145,7 +233,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
         patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
     )
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, *groups: 0)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "get_world_size", lambda: 4)
@@ -201,7 +289,7 @@ def test_coordinator_propagates_uninitialized_world_size(
         patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
     )
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size: 0)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, *groups: 0)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     # EngineCore never recorded a world size, so get_world_size() raises.
     monkeypatch.setattr(interfaces, "_kvcached_initialized", False)
@@ -219,6 +307,7 @@ def test_coordinator_propagates_uninitialized_world_size(
             self.enable_caching = False
             self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
             self.single_type_managers = [types.SimpleNamespace()]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16)
 
     setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
 
@@ -232,9 +321,18 @@ def test_coordinator_propagates_uninitialized_world_size(
     "version,enabled,use_v2,reject",
     [
         ("0.24.0", True, None, False),
+        # Before 0.28 kvcached has no Model Runner V2 adapter: fail at startup.
+        ("0.22.0", True, True, True),
+        ("0.25.1", True, True, True),
+        ("0.27.1", True, True, True),
+        ("0.27.1", True, False, False),
+        ("0.27.1", False, True, False),
+        ("0.28.0", True, True, False),
         ("0.29.0", True, True, False),
         ("0.29.0", True, False, True),
-        ("0.30.0", True, None, True),
+        ("0.30.0", True, True, False),
+        ("0.30.0", True, False, True),
+        ("0.31.0", True, None, True),
         ("0.29.0", False, None, False),
         ("0.30.0", False, None, False),
     ],
@@ -270,3 +368,105 @@ def test_engine_core_rejects_partial_integration_before_initialization(
         EngineCore(config)
         assert initialize.call_count == int(enabled)
         original_init.assert_called_once()
+
+
+def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modules):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", 160)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(
+        patches, "_get_first_attention_group",
+        lambda cfg: types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=64)),
+    )
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
+    monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(fake_block_pool_mod, "ElasticBlockPool", FakeElasticBlockPool)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod)
+
+    class FakeKVCacheCoordinator:
+        def __init__(self, *args, **kwargs):
+            self.enable_caching = True
+            # e.g. one full-attention and two sliding-window groups
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8, kv_cache_groups=[object()] * 3)
+            self.single_type_managers = [types.SimpleNamespace() for _ in range(3)]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16)
+
+    kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
+    setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
+    assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
+    coordinator = kvcoord_mod.KVCacheCoordinator()
+    # 160 tokens of 64-token blocks is 2 blocks per group.
+    assert coordinator.block_pool.kwargs["max_cached_blocks"] == 6
+
+
+def test_engine_core_rejects_hisparse(monkeypatch, vllm_modules):
+    # HiSparse allocates through vLLM's own allocator on 0.30.
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = "0.30.0"
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    config = types.SimpleNamespace(
+        use_v2_model_runner=True,
+        attention_config=types.SimpleNamespace(hisparse_config=object()),
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+    )
+    with pytest.raises(patches.KVCachedConfigError, match="HiSparse"):
+        EngineCore(config)
+    initialize.assert_not_called()
+    original_init.assert_not_called()
+
+
+@pytest.mark.parametrize("coordinator_flag,pool_flag,expected", [
+    (True, False, True),   # <= 0.29: the coordinator owns the flag
+    (False, True, False),
+    (None, True, True),    # 0.30: only the native pool has it
+    (None, False, False),
+])
+def test_coordinator_reads_caching_flag(
+    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected
+):
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
+    monkeypatch.setattr(
+        patches, "_get_first_attention_group",
+        lambda cfg: types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=64)),
+    )
+    monkeypatch.setattr(patches, "_infer_attention_type", lambda cfg: "MHA")
+    monkeypatch.setattr(patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2))
+    monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
+    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, num_kv_cache_groups=1: 0)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    monkeypatch.setattr(interfaces, "get_world_size", lambda: 1)
+    monkeypatch.setattr(interfaces, "init_kvcached", mock.Mock())
+    fake_block_pool_mod = types.ModuleType("vllm.v1.core.block_pool")
+    setattr(fake_block_pool_mod, "ElasticBlockPool", FakeElasticBlockPool)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.block_pool", fake_block_pool_mod)
+
+    class FakeKVCacheCoordinator:
+        def __init__(self, *args, **kwargs):
+            if coordinator_flag is not None:
+                self.enable_caching = coordinator_flag
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
+            self.single_type_managers = [types.SimpleNamespace()]
+            self.block_pool = types.SimpleNamespace(hash_block_size=16, enable_caching=pool_flag)
+
+    kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
+    setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
+    assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
+    coordinator = kvcoord_mod.KVCacheCoordinator()
+    assert coordinator.block_pool.kwargs["enable_caching"] is expected

@@ -54,14 +54,15 @@ def expect_fail_closed(call):
         return
     raise AssertionError("a FAILED pool must stay fail-closed")
 
-def run_case(group_id, fail):
+def run_case(group_id, fail, defer_release):
     global inject
     tensors = native.create_kv_tensors(PAGE * 4, 1, "cuda:0", 1, 1, group_id)
     # world_size=2 selects the production C++ -> Python broadcast callback.
     # Its body maps a single local device; this is not a distributed TP test.
     manager = kcm.KVCacheManager(
         16, 1, PAGE // 4, 1, world_size=2, num_kv_buffers=1,
-        group_id=group_id, pool_name="native-lifetime")
+        group_id=group_id, pool_name="native-lifetime",
+        defer_physical_release=defer_release)
     manager.wait_ready(timeout=5)
     blocks = manager.alloc(1)
     assert blocks and len(blocks) == 1
@@ -72,6 +73,9 @@ def run_case(group_id, fail):
     inject = fail
     try:
         manager.free(blocks)
+        if defer_release:
+            assert manager.lifecycle_phase is LifecyclePhase.READY
+            manager.release_retired_pages_through(manager.capture_physical_release_marker())
         assert not fail, "fault did not reach the native callback"
     except StateConsistencyError as exc:
         assert fail and "injected native unmap failure" in str(exc)
@@ -106,12 +110,13 @@ def run_case(group_id, fail):
         assert manager.lifecycle_phase is LifecyclePhase.READY
     return weakref.ref(manager), weakref.ref(manager._lifecycle), tensors
 
-for fail in (False, True):
+for fail, defer_release in ((False, False), (True, False),
+                           (False, True), (True, True)):
     refs = []
     buffers = []
     for index in range(3):
         manager_ref, lifecycle_ref, tensors = run_case(
-            100 + int(fail) * 10 + index, fail)
+            100 + int(fail) * 10 + int(defer_release) * 20 + index, fail, defer_release)
         refs.append((manager_ref, lifecycle_ref))
         buffers.append(tensors)
     deadline = time.monotonic() + 5
@@ -124,9 +129,9 @@ for fail in (False, True):
         "native callback retained the lifecycle/traceback/manager cycle", fail)
     del tensors, buffers
     gc.collect()
-assert hits == 3, hits
+assert hits == 6, hits
 native.shutdown_kvcached()
-print("native lifetime: healthy=3/3, failed=3/3, injections=3", flush=True)
+print("native lifetime: healthy=6/6, failed=6/6, injections=6", flush=True)
 """
 
 
@@ -150,4 +155,4 @@ def test_native_unmap_error_does_not_retain_manager():
         [sys.executable, "-c", SCENARIO], env=env,
         capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "healthy=3/3, failed=3/3, injections=3" in result.stdout
+    assert "healthy=6/6, failed=6/6, injections=6" in result.stdout

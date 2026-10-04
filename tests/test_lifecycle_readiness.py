@@ -766,7 +766,8 @@ def _assert_phase_matches_native(manager: kcm.KVCacheManager) -> None:
     assert (manager.lifecycle_phase is LifecyclePhase.FAILED) == native_failed
 
 
-def test_untyped_unmap_failure_through_free_fails_the_pool(monkeypatch):
+@pytest.mark.parametrize("defer_release", [False, True])
+def test_untyped_unmap_failure_through_free_fails_the_pool(monkeypatch, defer_release):
     """The #478 review's real-VMM repro: an untyped unmap callback failure
     was recorded DEGRADED by the callback, then the native side converted
     it to fail_pool() plus StateConsistencyError after the callback
@@ -783,9 +784,16 @@ def test_untyped_unmap_failure_through_free_fails_the_pool(monkeypatch):
 
     blocks = manager.alloc(1)
     assert blocks is not None and len(blocks) == 1
+    manager.defer_physical_release = defer_release
+    if defer_release:
+        manager.free(blocks)
+        assert manager.lifecycle_phase is LifecyclePhase.READY
     with pytest.raises(StateConsistencyError,
                        match="injected native unmap failure") as excinfo:
-        manager.free(blocks)
+        if defer_release:
+            manager.release_retired_pages_through(manager.capture_physical_release_marker())
+        else:
+            manager.free(blocks)
 
     assert manager.lifecycle_phase is LifecyclePhase.FAILED
     assert manager.lifecycle_error is excinfo.value
@@ -841,7 +849,8 @@ def test_resize_records_the_native_verdict(monkeypatch):
     _assert_phase_matches_native(manager)
 
 
-def test_untyped_error_with_a_failed_native_verdict_records_failed(monkeypatch):
+@pytest.mark.parametrize("defer_release", [False, True])
+def test_untyped_error_with_a_failed_native_verdict_records_failed(monkeypatch, defer_release):
     """Do not rely on the exception type alone: a plain RuntimeError whose
     native transaction state says FAILED is the fatal verdict too."""
     manager = _make_manager(
@@ -851,9 +860,15 @@ def test_untyped_error_with_a_failed_native_verdict_records_failed(monkeypatch):
     manager.wait_ready(timeout=5)
     blocks = manager.alloc(1)
     assert blocks is not None
+    manager.defer_physical_release = defer_release
+    if defer_release:
+        manager.free(blocks)
 
     with pytest.raises(RuntimeError, match="prepare failed") as excinfo:
-        manager.free(blocks)
+        if defer_release:
+            manager.release_retired_pages_through(manager.capture_physical_release_marker())
+        else:
+            manager.free(blocks)
 
     assert type(excinfo.value) is RuntimeError  # untyped, not the subclass
     assert manager.lifecycle_phase is LifecyclePhase.FAILED
