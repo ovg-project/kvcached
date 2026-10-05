@@ -20,6 +20,9 @@ def pools(monkeypatch, request):
     from kvcached.integration.sglang import interfaces
 
     torch.cuda.init()
+    # Other GPU tests can initialize the shim during collection and later
+    # shut down native VMM directly. Reset both before choosing the layout.
+    assert interfaces.shutdown_kvcached()
     monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
     monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * MIB)
     monkeypatch.setattr(interfaces, "_contiguous_layout", request.param)
