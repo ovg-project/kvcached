@@ -212,6 +212,7 @@ def test_autopatch_routes_v2_versions_without_overlap(monkeypatch, version, expe
     manager.register_patches_with_versions.side_effect = registered.extend
     manager.apply_all_patches.return_value = []
     monkeypatch.setattr(patch_base, "PatchManager", lambda _: manager)
+    monkeypatch.setattr(patch_base, "is_integration_version_supported", lambda *_: True)
     monkeypatch.setattr(patch_base, "log_patch_results", lambda *_: None)
     monkeypatch.setattr(wrapt.importer, "when_imported", lambda _: lambda fn: fn)
     monkeypatch.setenv("KVCACHED_AUTOPATCH", "true")
