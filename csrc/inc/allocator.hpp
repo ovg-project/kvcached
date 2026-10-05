@@ -105,6 +105,7 @@ private:
   size_t page_size_;
 
   int64_t num_layers_;
+  int64_t num_kv_buffers_; // 2 for separate K/V, 1 for a combined buffer.
   bool contiguous_layout_;
   bool unified_pool_;
   size_t kv_tensor_size_per_layer_;

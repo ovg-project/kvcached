@@ -59,7 +59,7 @@ static inline size_t get_v_base_offset(const torch::stable::Tensor &tensor,
 
 FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
-    : dev_(device), page_size_(kPageSize), num_layers_(0),
+    : dev_(device), page_size_(kPageSize), num_layers_(0), num_kv_buffers_(2),
       contiguous_layout_(contiguous_layout), unified_pool_(false),
       kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
@@ -147,6 +147,7 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
+  num_kv_buffers_ = num_kv_buffers;
   unified_pool_ = unified_pool;
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
@@ -211,7 +212,8 @@ FTensorAllocator::map_to_kv_tensors_with_result(
         auto kv_name = std::string(kv_prefix) + std::to_string(i);
         auto ftensor = ftensors_[kv_name].get();
         group.targets.emplace_back(ftensor, offset);
-        if (!unified_pool_) {
+        // MLA has one combined KV buffer, so it has no separate V region.
+        if (!unified_pool_ && num_kv_buffers_ != 1) {
           auto v_base_offset =
               get_v_base_offset(ftensor->get_tensor(), page_size_);
           group.targets.emplace_back(ftensor, offset + v_base_offset);
@@ -432,7 +434,7 @@ FTensorAllocator::unmap_retain_locked_(const std::vector<offset_t> &offsets) {
         auto kv_name = std::string(kv_prefix) + std::to_string(i);
         auto ftensor = ftensors_[kv_name].get();
         group.targets.emplace_back(ftensor, offset);
-        if (!unified_pool_) {
+        if (!unified_pool_ && num_kv_buffers_ != 1) {
           auto v_base_offset =
               get_v_base_offset(ftensor->get_tensor(), page_size_);
           group.targets.emplace_back(ftensor, offset + v_base_offset);
