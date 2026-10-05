@@ -137,7 +137,7 @@ PAGE_SIZE = _get_page_size()
 
 
 def get_page_size_for_block(block_mem_size: int, configured_page_size: int) -> int:
-    """Resolve a vLLM pool's page size without changing process-wide defaults.
+    """Resolve a KV pool's page size without changing process-wide defaults.
 
     Explicit page settings keep their existing validation behavior. Resolve
     from the final block geometry in both the scheduler and worker, before
