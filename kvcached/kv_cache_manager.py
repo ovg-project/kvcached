@@ -14,9 +14,12 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from typing import Any, Dict, List, Optional
+import weakref
+from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
+from kvcached.kv_geometry import check_page_geometry
+from kvcached.lifecycle import LifecyclePhase, LifecycleState
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
@@ -118,6 +121,9 @@ class KVCacheManager:
         num_kv_buffers: int = 2,
         group_id: int = 0,
         pool_name: Optional[str] = None,
+        defer_physical_release: bool = False,
+        own_segment: bool = False,
+        page_size: Optional[int] = None,
     ):
         """
         Args:
@@ -136,6 +142,13 @@ class KVCacheManager:
                 Different groups have independent FTensors and page spaces.
             pool_name: Stable, low-cardinality name assigned by the engine
                 integration when this pool is created.
+            defer_physical_release: Retire empty pages until the engine confirms
+                that previously submitted worker batches have completed.
+            own_segment: Give a non-zero group its own /dev/shm segment
+                (``<ipc name>_g<group_id>``) instead of the instance's shared
+                one, for pools whose sizes differ (SGLang SWA and Mamba pools).
+            page_size: Physical page size, matching this pool's backing tensors.
+                Defaults to KVCACHED_PAGE_SIZE_MB.
         """
         self.num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
@@ -144,35 +157,40 @@ class KVCacheManager:
         self.reserve_null_block = reserve_null_block
         self.group_id = group_id
         self._pool_name = pool_name
+        # Poll-only lifecycle phase (#375): set by _post_init(), clear(), the
+        # broadcast callbacks below, and _record_native_fatal() where a fatal
+        # native verdict propagates out of an allocator call; read via
+        # lifecycle_phase/wait_ready().
+        self._lifecycle = LifecycleState(
+            f"{pool_name}:group{group_id}" if pool_name else f"group{group_id}")
+        self.defer_physical_release = defer_physical_release
+        self.physical_release_barrier: Optional[Callable[[], None]] = None
+        self._physical_release_epoch = 0
+        self._retired_pages: List[tuple[int, List[int]]] = []
 
         # The physical page size used by kvcached page allocator.
-        self.page_size = PAGE_SIZE
-        # A block must fit within a single page; otherwise a page holds zero
-        # usable blocks, the KV pool is permanently empty, and the engine
-        # silently deadlocks during warmup (available_size() stays 0). This
-        # happens with hybrid linear-attention models (e.g. Qwen3.5/3.6 GDN,
-        # Mamba) whose per-block recurrent state exceeds the default 2MB page.
-        # Fail loudly here with the exact page size needed instead of hanging.
-        if self.block_mem_size > self.page_size:
-            base = 2 * 1024 * 1024  # KVCACHED_PAGE_SIZE_MB granularity
-            min_page_mb = ((self.block_mem_size + base - 1) // base) * 2
-            raise KVCachedConfigError(
-                f"kvcached KV block size ({self.block_mem_size} bytes, "
-                f"{self.block_mem_size / (1024 * 1024):.2f} MiB) is larger than the "
-                f"page size ({self.page_size} bytes, "
-                f"{self.page_size // (1024 * 1024)} MiB), so no block fits in a "
-                f"page and the KV pool would be empty. This typically happens "
-                f"with hybrid linear-attention models (e.g. Qwen3.5/3.6 GDN, "
-                f"Mamba) whose per-block state is large. Re-launch with "
-                f"KVCACHED_PAGE_SIZE_MB={min_page_mb} (or larger; must be a "
-                f"multiple of 2).")
+        self.page_size = PAGE_SIZE if page_size is None else page_size
+        # Every page must hold a whole block. A block larger than a page leaves
+        # the pool empty (warmup deadlocks); an unfavorable block/page alignment
+        # can leave some pages with no block, and such a
+        # page, once mapped, is never released. Both happen with hybrid
+        # linear-attention models (e.g. Qwen3.5 GDN, Mamba) whose per-block
+        # state is large. Fail loudly with a geometry that works.
+        geometry_error = check_page_geometry(self.block_mem_size,
+                                             self.page_size, block_size)
+        if geometry_error is not None:
+            raise KVCachedConfigError(geometry_error)
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
         # Name of the /dev/shm segment the C++ MemInfoTracker creates for
-        # this pool; shutdown() unlinks it.
+        # this pool; shutdown() unlinks it. The C++ tracker derives the pool's
+        # limit from the segment, so pools of different sizes cannot share
+        # one; it adds the _g<id> suffix only when given no name.
         self.ipc_name = DEFAULT_IPC_NAME
+        if own_segment and group_id != 0:
+            self.ipc_name = f"{DEFAULT_IPC_NAME}_g{group_id}"
         self._shut_down = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = threading.Event()
@@ -213,6 +231,39 @@ class KVCacheManager:
                     broadcast_unmap_from_kv_tensors,
                 )
 
+                # The native callback must not own the lifecycle holder:
+                # a recorded error's traceback can lead back to this manager,
+                # forming a cycle hidden from Python's garbage collector.
+                # Both wrappers re-raise unchanged, so alloc_page() and the
+                # prealloc thread see exactly the error they saw before. Only
+                # unmap failures change lifecycle state in phase 1:
+                #
+                # * A failed map broadcast is routinely the expected
+                #   co-tenancy capacity miss (#453): a worker that cannot
+                #   back the page replies status=error, the C++ alloc_page()
+                #   returns the page to its free list, and _alloc() turns the
+                #   re-raised error into a rollback and a scheduling miss
+                #   (None); the C++ prealloc thread likewise absorbs it. But
+                #   tp_ipc_util reports every per-rank failure, transport or
+                #   application, as one RuntimeError shape naming only the
+                #   first failing target (#373 kept that shape, renaming the
+                #   target "pp{p}/rank{r}" and propagating worker-side
+                #   failures that used to report success), so this layer
+                #   cannot tell that recoverable miss from an unknown or
+                #   partial cross-rank outcome without matching message
+                #   text. Rather than publish a sticky false DEGRADED for
+                #   normal memory pressure, phase 1 does not transition on
+                #   map failures; per-rank classification (safe miss stays
+                #   READY, unknown DEGRADED, confirmed partial FAILED) is
+                #   phase 2, once the broadcast returns structured per-rank
+                #   results.
+                # * A failed unmap broadcast has no recoverable caller: the
+                #   Python block ledger is updated before free_pages()
+                #   reaches the broadcast, so ranks may still hold mappings
+                #   the ledger dropped. That is an unknown cross-rank outcome
+                #   and degrades the pool per the #375 rule.
+                lifecycle_ref = weakref.ref(self._lifecycle)
+
                 # Wrap Python functions to match C++ callback signature
                 def map_callback(
                     world_size: int,
@@ -230,7 +281,13 @@ class KVCacheManager:
                     group_id: int = self.group_id,
                 ) -> None:
                     """Wrapper for Python broadcast function"""
-                    broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    try:
+                        broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    except Exception as exc:
+                        lifecycle = lifecycle_ref()
+                        if lifecycle is not None:
+                            lifecycle.record_broadcast_failure("unmap", exc)
+                        raise
 
                 # Set the callbacks in the PageAllocator
                 self.page_allocator.set_broadcast_map_callback(map_callback)
@@ -319,14 +376,85 @@ class KVCacheManager:
         except Exception as e:
             logger.error(
                 f"Error during KVCacheManager post-initialization: {e}")
-            # Set the event even on error to unblock waiting threads
-            raise
-        finally:
+            # Open the soft gate first, so the existing entry points behave
+            # exactly as before (record-only), then keep the error so
+            # wait_ready() re-raises it instead of letting this thread swallow
+            # it. Ordering matters: once wait_ready() has returned or raised,
+            # _wait_post_init() must already be open.
             self._post_init_done.set()
+            self._lifecycle.mark_failed("post-initialization failed", e)
+            raise
+        else:
+            self._post_init_done.set()
+            if not self._shutdown_requested.is_set():
+                self._lifecycle.mark_ready()
+        finally:
+            # Also covers exits that are not an Exception.
+            self._post_init_done.set()
+            if self._shutdown_requested.is_set():
+                # Shutdown can cancel either the tensor wait or null-block
+                # reservation without raising from the background thread.
+                self._lifecycle.mark_failed("initialization cancelled by shutdown")
 
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+
+    def wait_ready(self, timeout: Optional[float] = None) -> None:
+        """Block until background initialization has settled.
+
+        Returns once the pool is READY, or DEGRADED (still serving with
+        suspect accounting). Re-raises the exception captured from the
+        background ``_post_init`` thread if the pool is FAILED, so a caller
+        cannot proceed into an unusable pool the way ``_wait_post_init()``
+        lets it. Raises ``TimeoutError`` if the pool is still INITIALIZING
+        after ``timeout`` seconds (``None`` waits forever).
+
+        Deliberately not ``@synchronized``: the init thread holds the manager
+        lock while reserving the null block.
+        """
+        if not self._lifecycle.wait_settled(timeout):
+            raise TimeoutError(
+                f"kvcached pool {self._lifecycle.name} is still initializing "
+                f"after {timeout}s")
+        self._lifecycle.raise_if_failed()
+
+    @property
+    def lifecycle_phase(self) -> LifecyclePhase:
+        """Current lifecycle phase of this pool (poll-only, issue #375)."""
+        return self._lifecycle.phase
+
+    @property
+    def lifecycle_error(self) -> Optional[BaseException]:
+        """The error behind a DEGRADED or FAILED phase, if any."""
+        return self._lifecycle.error
+
+    def _record_native_fatal(self, op: str, exc: BaseException) -> bool:
+        """Record #418's fatal verdict where it propagates out of a native call.
+
+        The unmap callback sees only the error raised inside Python.
+        ``PageAllocator::unmap_pages()`` then converts any unmap failure into
+        ``fail_pool()`` plus a raised ``StateConsistencyError`` after the
+        callback has returned, and the background prealloc thread can fail
+        the pool with no Python frame on the stack at all. Both leave the
+        native verdict FAILED while the phase here still says DEGRADED or
+        READY, so ``wait_ready()`` would pass an unusable pool.
+
+        The exception type alone is not the signal either way: a
+        confirmed-aborted unmap prepare surfaces as a plain ``RuntimeError``
+        (tp_ipc_util), while a recoverable co-tenancy miss is untyped too.
+        ``StateConsistencyError`` is definitive by contract; any other
+        exception defers to the allocator's own transaction state. Returns
+        True when the outcome is fatal and the caller must stay fail-loud.
+        """
+        if not isinstance(exc, StateConsistencyError):
+            get_state = getattr(self.page_allocator, "get_transaction_state",
+                                None)
+            if get_state is None or get_state().get("state") != "FAILED":
+                return False
+        self._lifecycle.mark_failed(
+            f"{op} transaction unsafe: state consistency lost", exc)
+        return True
 
     def _reserve_null_block(self) -> None:
         """
@@ -470,29 +598,51 @@ class KVCacheManager:
                 try:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
-                    # alloc_page() mapped a new physical page, shrinking the
-                    # driver's free pool; drop the cached count so the next
-                    # available_size() re-reads instead of serving stale data.
+                    # A new mapping changes the driver's free capacity.
                     self._avail_physical_pages_cache = None
-                except StateConsistencyError:
-                    # Do not run further free/unmap operations on an unsafe pool.
+                except StateConsistencyError as e:
+                    # #418's definitive verdict: mapping safety cannot be
+                    # established, so this is not the recoverable co-tenancy
+                    # miss the map-failure exclusion is about. Record FAILED
+                    # for pollers, then stay fail-loud; no further free/unmap
+                    # operations may run on an unsafe pool.
+                    self._lifecycle.mark_failed(
+                        "map transaction unsafe: state consistency lost", e)
                     raise
                 except RuntimeError as e:
+                    # The recoverable-miss classification only holds while
+                    # the native pool is healthy. An untyped failure that
+                    # left the transaction state FAILED (e.g. one racing in
+                    # from the prealloc thread) must not be rolled back into
+                    # a scheduling miss, and rollback itself would touch the
+                    # dead pool.
+                    if self._record_native_fatal("alloc", e):
+                        raise
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
                         f"alloc_page() failed after partially allocating "
                         f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
                     return None
-                # A page may have zero usable blocks when block_mem_size is
-                # large (e.g. HYBRID_LINEAR) and every aligned block would
-                # straddle the page boundary. Park it in full_pages so it's
-                # not re-handed-out but stays lookupable by free().
+                # __init__ rejects geometries where a page can hold no whole
+                # block. Parking such a page would keep it mapped forever
+                # (free() never visits a page without blocks), so fail loud.
                 if page.num_free_blocks() == 0:
-                    self.full_pages[page.page_id] = page
-                    continue
+                    raise StateConsistencyError(
+                        f"page {page.page_id} holds no whole "
+                        f"{self.block_mem_size}-byte block; the page geometry "
+                        "check should have rejected this configuration")
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 page = self._pick_avail_page(remaining_need)
+                if getattr(self, "_retired_pages", None) and page.empty():
+                    # Reusing logical blocks does not revoke their mapping.
+                    # Worker queue order protects reuse; cancel the old unmap
+                    # epoch so a later free must acquire a new completion fence.
+                    self._retired_pages = [
+                        (epoch, remaining)
+                        for epoch, page_ids in self._retired_pages
+                        if (remaining := [pid for pid in page_ids if pid != page.page_id])
+                    ]
             num_from_page = min(page.num_free_blocks(), remaining_need)
             alloced_index = page.alloc(num_from_page)
             ret_index.extend(alloced_index)
@@ -599,16 +749,39 @@ class KVCacheManager:
 
             if page.empty():
                 pages_to_free.append(page.page_id)
-                self.num_avail_blocks -= page.num_free_blocks()
+                if getattr(self, "defer_physical_release", False):
+                    self.avail_pages[page_id] = page
+                else:
+                    self.num_avail_blocks -= page.num_free_blocks()
             else:
                 self.avail_pages[page_id] = page
 
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
-            # free_pages() returned physical pages to the driver, growing the
-            # free pool; drop the cached count so available_size() re-reads.
-            self._avail_physical_pages_cache = None
+            if getattr(self, "defer_physical_release", False):
+                self._physical_release_epoch = (
+                    getattr(self, "_physical_release_epoch", 0) + 1
+                )
+                retired_pages = getattr(self, "_retired_pages", None)
+                if retired_pages is None:
+                    retired_pages = self._retired_pages = []
+                retired_pages.append(
+                    (self._physical_release_epoch, pages_to_free)
+                )
+            else:
+                try:
+                    self.page_allocator.free_pages(pages_to_free)
+                except Exception as e:
+                    self._record_native_fatal("free", e)
+                    raise
+                self._avail_physical_pages_cache = None
 
+        self._maybe_finish_shrink()
+
+    def _maybe_finish_shrink(self) -> None:
+        if getattr(self, "_retired_pages", None):
+            # PageAllocator.resize() cannot shrink past pages that are still
+            # physically mapped for an in-flight worker batch.
+            return
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
@@ -621,6 +794,11 @@ class KVCacheManager:
                     self.in_shrink = False
                     self.target_num_blocks = None
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
+                except Exception as e:
+                    # The lazy-shrink completion unmaps pages, so it can
+                    # carry the same fatal verdict as free_pages() above.
+                    self._record_native_fatal("free", e)
+                    raise
                 else:
                     if resized:
                         self.in_shrink = False
@@ -634,6 +812,42 @@ class KVCacheManager:
                             "shrink to %d blocks refused by allocator "
                             "(in-use pages above target); keeping shrink pending",
                             self.target_num_blocks)
+
+    @synchronized
+    def capture_physical_release_marker(self) -> int:
+        """Return the latest page-retirement epoch."""
+        return getattr(self, "_physical_release_epoch", 0)
+
+    @synchronized
+    def release_retired_pages_through(self, marker: int) -> None:
+        """Physically release retired pages up to an acknowledged batch."""
+        pages_to_free: List[int] = []
+        still_retired: List[tuple[int, List[int]]] = []
+        for epoch, page_ids in getattr(self, "_retired_pages", []):
+            if epoch <= marker:
+                pages_to_free.extend(page_ids)
+            else:
+                still_retired.append((epoch, page_ids))
+
+        if pages_to_free:
+            barrier = getattr(self, "physical_release_barrier", None)
+            try:
+                if barrier is not None:
+                    barrier()
+                self.page_allocator.free_pages(pages_to_free)
+            except Exception as e:
+                # With deferred release, a fatal unmap verdict surfaces here
+                # rather than in free(). Keep the readiness gate in agreement.
+                self._record_native_fatal("deferred release", e)
+                raise
+            for page_id in pages_to_free:
+                page = self.avail_pages.pop(page_id)
+                self.num_avail_blocks -= page.num_free_blocks()
+            # Logical retirement does not change physical capacity. Invalidate
+            # the cached count only once physical release has succeeded.
+            self._avail_physical_pages_cache = None
+        self._retired_pages = still_retired
+        self._maybe_finish_shrink()
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -677,6 +891,11 @@ class KVCacheManager:
                 self.target_num_blocks = None
                 self._resize_rejected = True
             raise
+        except Exception as e:
+            # resize() unmaps reclaimed pages, so the fatal verdict can
+            # propagate here too.
+            self._record_native_fatal("resize", e)
+            raise
         self._resize_rejected = False
         self._rejected_resize_target = None
         if resized:
@@ -701,7 +920,11 @@ class KVCacheManager:
         Trim the reserved pages to free up physical memory.
         """
         self._wait_post_init()
-        self.page_allocator.trim()
+        try:
+            self.page_allocator.trim()
+        except Exception as e:
+            self._record_native_fatal("trim", e)
+            raise
         # trim() unmaps reserved pages, returning them to the driver free
         # pool; drop the cached count so available_size() re-reads instead
         # of serving a pre-trim value for one TTL window. free() invalidates
@@ -795,7 +1018,15 @@ class KVCacheManager:
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         # Also surfaces a fatal background-preallocation failure during shrink.
-        virtual_free_pages = self.page_allocator.get_num_free_pages()
+        try:
+            virtual_free_pages = self.page_allocator.get_num_free_pages()
+        except Exception as e:
+            # This is the capacity check on the alloc path: it raises before
+            # _alloc()'s own alloc_page() classification is reached, so the
+            # verdict must be recorded here or the phase never leaves
+            # DEGRADED (the #478 review's T4 repro).
+            self._record_native_fatal("available_size", e)
+            raise
         if self.in_shrink:
             blocks_from_free_pages = 0
         else:
@@ -950,7 +1181,31 @@ class KVCacheManager:
         """
 
         self._wait_post_init()
+        # The legacy event opens before post-init publishes its lifecycle.
+        # Let that publication finish before starting a new clear window.
+        self._lifecycle.wait_settled()
 
+        # The pool is INITIALIZING again until the null block is reserved and
+        # the prealloc thread is running (#375). A DEGRADED pool re-enters
+        # INITIALIZING too and settles back to DEGRADED with its cause kept,
+        # so wait_ready() holds during the teardown. FAILED stays put.
+        self._lifecycle.begin_reinit()
+        try:
+            self._clear_locked()
+            # Reservation can return normally when shutdown cancels its wait.
+            # Serialize restart/publication with shutdown so a cancelled clear
+            # neither restarts preallocation nor advertises a usable pool.
+            with self._shutdown_lock:
+                if self._shutdown_requested.is_set():
+                    self._lifecycle.mark_failed("clear() cancelled by shutdown")
+                else:
+                    self.page_allocator.start_prealloc_thread()
+                    self._lifecycle.mark_ready()
+        except Exception as e:
+            self._lifecycle.mark_failed("clear() failed", e)
+            raise
+
+    def _clear_locked(self) -> None:
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
@@ -962,18 +1217,24 @@ class KVCacheManager:
         self.free_reserved()
 
         # Free all blocks from avail_pages and full_pages
-        pages_to_free: List[int] = []
+        pages_to_free: List[int] = [
+            page_id
+            for _, page_ids in getattr(self, "_retired_pages", [])
+            for page_id in page_ids
+        ]
         for page in self.avail_pages.values():
             pages_to_free.append(page.page_id)
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
         if pages_to_free:
-            self.page_allocator.free_pages(pages_to_free)
+            self.page_allocator.free_pages(list(dict.fromkeys(pages_to_free)))
             # free_pages() returned physical pages to the driver, growing the
             # free pool; drop the cached count so available_size() re-reads.
             self._avail_physical_pages_cache = None
+        self._retired_pages = []
         self.avail_pages.clear()
         self.full_pages.clear()
+        self.null_block = None
 
         # Trim the page allocator to free up reserved pages
         self.trim()
@@ -994,9 +1255,6 @@ class KVCacheManager:
 
         # Possibly reserve the first block as null block for padding tokens
         self._reserve_null_block()
-
-        # Restart the prealloc thread now that null block is safely reserved.
-        self.page_allocator.start_prealloc_thread()
 
     # Private methods
     @synchronized

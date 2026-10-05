@@ -44,10 +44,10 @@ def native_pool_factory(monkeypatch):
     try:
         installed_version = distribution_version("vllm")
     except PackageNotFoundError:
-        pytest.skip("Native metadata checks require vLLM 0.26 through 0.29")
-    supported_versions = ("0.26.", "0.27.", "0.28.", "0.29.")
+        pytest.skip("Native metadata checks require vLLM 0.26 through 0.30")
+    supported_versions = ("0.26.", "0.27.", "0.28.", "0.29.", "0.30.")
     if not installed_version.startswith(supported_versions):
-        pytest.skip("Native metadata checks target vLLM 0.26 through 0.29")
+        pytest.skip("Native metadata checks target vLLM 0.26 through 0.30")
     vllm = importlib.import_module("vllm")
     version = getattr(vllm, "__version__", "")
     if not isinstance(version, str) or not version.startswith(supported_versions):

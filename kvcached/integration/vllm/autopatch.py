@@ -23,9 +23,11 @@ from kvcached.integration.vllm.patches import (
     EngineCorePatch,
     GPUModelRunnerPatch,
     GPUWorkerPatch,
+    HybridBlockSizeAlignPatch,
     KVCacheCoordinatorPatch,
     KVCacheManagerAllocateSlotsPatch,
     KVCacheManagerPatch,
+    MambaPartialTailPatch,
     MPClientPatch,
     TritonAttentionPatch,
 )
@@ -60,9 +62,11 @@ def _patch_vllm(_vllm: types.ModuleType) -> None:
             (ModelRunnerV2Patch(), VLLM_MRV2_RANGE),
             (KVLayoutV2Patch(), VLLM_MRV2_RANGE),
             (GPUWorkerPatch(), VLLM_ALL_RANGE),
+            (HybridBlockSizeAlignPatch(), VLLM_ALL_RANGE),
             (KVCacheCoordinatorPatch(), VLLM_V9_PLUS_RANGE),
             (KVCacheManagerPatch(), VLLM_V8_RANGE),
             (KVCacheManagerAllocateSlotsPatch(), VLLM_ALL_RANGE),
+            (MambaPartialTailPatch(), ">=0.28.0,<0.31.0"),
             (TritonAttentionPatch(), ">=0.9.0,<0.29.0"),
         ]
     )

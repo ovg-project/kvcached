@@ -63,10 +63,14 @@ def _worker_config(*, utilization=0.9, explicit_budget=None):
     )
 
 
-def _patch_worker(patches, monkeypatch, worker_cls, *, enabled=True) -> Any:
+def _patch_worker(
+    patches, monkeypatch, worker_cls, *, enabled=True, **native_helpers
+) -> Any:
     monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
     module = types.ModuleType("mock_gpu_worker")
     setattr(module, "Worker", worker_cls)
+    for name, helper in native_helpers.items():
+        setattr(module, name, helper)
     patch = patches.GPUWorkerPatch()
     assert patch.patch_worker_init_device(module)
     assert patch.patch_worker_determine_available_memory(module)
@@ -538,6 +542,150 @@ def test_determine_available_memory_propagates_profile_failure(
     with pytest.raises(RuntimeError, match="profile run failed"):
         worker.determine_available_memory()
     assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.fixture
+def startup_worker(monkeypatch):
+    _install_memory_profiling(monkeypatch, torch_peak_increase=50)
+
+    class Worker:
+        def __init__(self):
+            self.cache_config = _worker_config()
+            self.init_snapshot = types.SimpleNamespace(total_memory=1000)
+            self.requested_memory = 800
+            self.model_config = types.SimpleNamespace(multimodal_config=object())
+            self.parallel_config = types.SimpleNamespace(_api_process_count=3)
+            self.model_runner = types.SimpleNamespace(
+                model_memory_usage=200, profile_run=mock.Mock(),
+            )
+
+        def init_device(self):
+            pass
+
+        def determine_available_memory(self):
+            raise AssertionError("whole-device profiling must not run")
+
+    return Worker
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_startup_plan_precedes_budget_selection(
+    patches, monkeypatch, startup_worker, accepted,
+):
+    effective_applications = []
+
+    def maybe_apply(worker):
+        if worker.cache_config.kv_cache_memory_bytes is None and accepted:
+            effective_applications.append(worker)
+            worker.cache_config.kv_cache_memory_bytes = 400
+
+    apply_plan = mock.Mock(side_effect=maybe_apply)
+    reserve = mock.Mock(side_effect=lambda capacity, *_: capacity - 100)
+
+    def native_determine(worker):
+        # Native vLLM rechecks the plan, but an already selected budget is
+        # authoritative: the second helper call must have no effective change.
+        apply_plan(worker)
+        assert worker.cache_config.kv_cache_memory_bytes == 400
+        worker.model_runner.profile_run()
+        return reserve(400, worker.model_config.multimodal_config, 3)
+
+    startup_worker.determine_available_memory = native_determine
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        maybe_apply_startup_plan=apply_plan,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+
+    assert worker.determine_available_memory() == (300 if accepted else 450)
+    assert effective_applications == ([worker] if accepted else [])
+    assert apply_plan.call_count == (2 if accepted else 1)
+    worker.model_runner.profile_run.assert_called_once_with()
+    reserve.assert_called_once_with(
+        400 if accepted else 550, worker.model_config.multimodal_config, 3,
+    )
+
+
+def test_startup_plan_errors_propagate(patches, monkeypatch, startup_worker):
+    apply_plan = mock.Mock(side_effect=RuntimeError("startup plan failed"))
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        maybe_apply_startup_plan=apply_plan,
+    )()
+    with pytest.raises(RuntimeError, match="startup plan failed"):
+        worker.determine_available_memory()
+    worker.model_runner.profile_run.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit,enabled", [(True, True), (False, False)])
+def test_delegated_startup_calls_helpers_only_in_native_method(
+    patches, monkeypatch, startup_worker, explicit, enabled,
+):
+    apply_plan = mock.Mock()
+    reserve = mock.Mock(return_value=321)
+
+    def native_determine(worker):
+        apply_plan(worker)
+        worker.model_runner.profile_run()
+        return reserve(400, worker.model_config.multimodal_config, 3)
+
+    startup_worker.determine_available_memory = native_determine
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker, enabled=enabled,
+        maybe_apply_startup_plan=apply_plan,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    if explicit:
+        worker.cache_config.kv_cache_memory_bytes = 400
+    assert worker.determine_available_memory() == 321
+    apply_plan.assert_called_once_with(worker)
+    reserve.assert_called_once_with(400, worker.model_config.multimodal_config, 3)
+    worker.model_runner.profile_run.assert_called_once_with()
+
+
+@pytest.mark.parametrize("frontend_count", [None, 1, 3])
+@pytest.mark.parametrize("remaining", [550, 450])
+def test_automatic_memory_reservation_preserves_warmup_accounting(
+    patches, monkeypatch, startup_worker, frontend_count, remaining,
+):
+    reserve = mock.Mock(return_value=remaining)
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    if frontend_count is None:
+        del worker.parallel_config._api_process_count
+        worker.model_config.multimodal_config = None
+    else:
+        worker.parallel_config._api_process_count = frontend_count
+
+    assert worker.determine_available_memory() == remaining
+    reserve.assert_called_once_with(
+        550, worker.model_config.multimodal_config, frontend_count or 1,
+    )
+    # Native warmup uses the pre-reservation field, not the returned budget.
+    assert worker.available_kv_cache_memory_bytes == 550
+    assert worker.total_consumed == 200
+    assert worker.peak_activation_memory == 50
+    assert worker.non_torch_memory == 0
+    worker.model_runner.profile_run.assert_called_once_with()
+
+
+def test_reservation_failure_and_retry_keep_automatic_budget(
+    patches, monkeypatch, startup_worker,
+):
+    reserve = mock.Mock(side_effect=[ValueError("no KV budget"), 450])
+    worker = _patch_worker(
+        patches, monkeypatch, startup_worker,
+        reserve_mm_ipc_gpu_memory=reserve,
+    )()
+    with pytest.raises(ValueError, match="no KV budget"):
+        worker.determine_available_memory()
+    assert worker.cache_config.kv_cache_memory_bytes is None
+    assert worker.determine_available_memory() == 450
+    assert worker.cache_config.kv_cache_memory_bytes is None
+    assert reserve.call_count == 2
+    assert worker.model_runner.profile_run.call_count == 2
 
 
 def test_legacy_determine_available_memory_runs_profile_without_device_delta(

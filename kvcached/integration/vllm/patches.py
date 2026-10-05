@@ -15,6 +15,7 @@ import time
 import types
 from collections import OrderedDict
 from functools import wraps
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -41,6 +42,28 @@ if TYPE_CHECKING:
 
 
 logger = get_kvcached_logger()
+
+
+def _worker_physical_release_barrier(worker: Any) -> bool:
+    """Finish earlier worker RPCs and their CUDA work before retiring pages."""
+    import torch
+
+    device = getattr(worker, "device", None)
+    if device is None:
+        device = getattr(worker, "local_rank", None)
+    if device is None:
+        raise RuntimeError("Cannot determine the vLLM worker CUDA device")
+
+    with torch.cuda.device(device):
+        torch.cuda.synchronize()
+    return True
+
+
+def _get_vllm_kv_cache_manager(engine_core: Any) -> Any:
+    scheduler = getattr(engine_core, "scheduler", None)
+    vllm_manager = getattr(scheduler, "kv_cache_manager", None)
+    block_pool = getattr(vllm_manager, "block_pool", None)
+    return getattr(block_pool, "kv_cache_manager", None)
 
 
 def _is_attention_spec(spec: Any) -> bool:
@@ -362,7 +385,7 @@ VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
 VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
-VLLM_MRV2_RANGE = ">=0.29.0,<0.30.0"  # MRV2/native-cache adapter compatibility window
+VLLM_MRV2_RANGE = ">=0.29.0,<0.31.0"  # MRV2/native-cache adapter compatibility window
 
 
 def _uses_packed_attention_kv() -> bool:
@@ -435,12 +458,14 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     return isinstance(kv_cache_spec, MLAAttentionSpec)
 
 
-def _get_max_cached_blocks(block_size: int) -> int:
+def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
-    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)``.
+    Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)`` times the
+    number of KV cache groups: every group holds its own blocks for the same
+    cached tokens, and all of them count against one pool-wide cap.
 
     The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
     ``block_size`` (e.g. 8 tokens with a 16-token block) integer-divides to
@@ -464,8 +489,8 @@ def _get_max_cached_blocks(block_size: int) -> int:
             MAX_CACHED_TOKENS,
             block_size,
         )
-        return 1
-    return max_cached_blocks
+        max_cached_blocks = 1
+    return max_cached_blocks * max(1, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -1090,7 +1115,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return []
 
         elastic_block_pool_cls: type = ElasticBlockPool
-        if self.detected_version and VersionRange(">=0.26.0,<0.30.0").contains(self.detected_version):
+        if self.detected_version and VersionRange(">=0.26.0,<0.31.0").contains(self.detected_version):
             from kvcached.integration.vllm.native_block_pool import NativeBlockPoolMixin
 
             elastic_block_pool_cls = type("ElasticBlockPool", (NativeBlockPoolMixin, ElasticBlockPool), {})
@@ -1098,8 +1123,25 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _selects_v2_model_runner(vllm_config: Any) -> bool:
+    """Whether vLLM will run Model Runner V2 for this config.
+
+    From 0.22 ``VllmConfig.use_v2_model_runner`` also resolves vLLM's default
+    choice; older releases only honour ``VLLM_USE_V2_MODEL_RUNNER``.
+    """
+    selected = getattr(vllm_config, "use_v2_model_runner", None)
+    if selected is not None:
+        return bool(selected)
+    try:
+        import vllm.envs as envs
+
+        return bool(getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False))
+    except Exception:
+        return False
+
+
 class EngineCorePatch(VersionAwarePatch, BasePatch):
-    """Patch EngineCore.__init__ / shutdown to initialize and release kvcached"""
+    """Patch EngineCore initialization, async batch ordering, and shutdown."""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core"
@@ -1111,10 +1153,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if not self.initialize_version_info():
             return False
 
-        # Apply version-specific patches
         init_patched = self.patch_engine_init(engine_mod)
+        lifetime_patched = self.patch_async_batch_lifetime(engine_mod)
         shutdown_patched = self.patch_engine_shutdown(engine_mod)
-        return init_patched and shutdown_patched
+        return init_patched and lifetime_patched and shutdown_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -1132,6 +1174,15 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # OffloadingConnector allocates cross-layer KV tensors outside
+                # kvcached's VMM path (issue #267). Reject before any startup.
+                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
+                    raise KVCachedConfigError(
+                        "kvcached does not support vLLM CPU KV offloading "
+                        "(OffloadingConnector, --kv-offloading-size); "
+                        "remove --kv-offloading-size or disable kvcached"
+                    )
                 # Reject a partial integration before either allocator or the
                 # native executor starts. vLLM can select V1 automatically.
                 if detected_version and VersionRange(">=0.29.0").contains(detected_version):
@@ -1142,21 +1193,50 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                         )
                     if not vllm_config.use_v2_model_runner:
                         raise KVCachedConfigError(
-                            "kvcached on vLLM 0.29 requires Model Runner V2; "
+                            f"kvcached on vLLM {detected_version} requires Model Runner V2, "
+                            "but this configuration falls back to the V1 runner; "
                             "use a supported configuration or disable kvcached"
                         )
-                # OffloadingConnector (--kv-offloading-size) makes vLLM allocate
-                # a cross-layer KV cache that bypasses kvcached (issue #267).
-                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
+                    attention_config = getattr(vllm_config, "attention_config", None)
+                    if getattr(attention_config, "hisparse_config", None) is not None:
+                        # HiSparse allocates its KV tensors through vLLM's own
+                        # allocator and pins blocks kvcached cannot release.
+                        raise KVCachedConfigError(
+                            "kvcached does not support HiSparse; "
+                            "remove the HiSparse config or disable kvcached"
+                        )
+                elif (detected_version and VersionRange("<0.28.0").contains(detected_version)
+                        and _selects_v2_model_runner(vllm_config)):
+                    # From 0.22 vLLM picks Model Runner V2 by default for many
+                    # models; kvcached only adapts it from 0.28. Without an
+                    # adapter the workers never create kvcached KV tensors and
+                    # the engine dies on its first request.
                     raise KVCachedConfigError(
-                        "kvcached does not support vLLM CPU KV offloading "
-                        "(OffloadingConnector, --kv-offloading-size); "
-                        "remove --kv-offloading-size or disable kvcached"
+                        f"kvcached does not support the vLLM {detected_version} Model Runner V2 "
+                        "yet; set VLLM_USE_V2_MODEL_RUNNER=0 to use the V1 model runner, "
+                        "or disable kvcached"
                     )
                 from kvcached.integration.vllm.interfaces import init_kvcached
 
                 pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
+                parallel_config = vllm_config.parallel_config
+                if (
+                    getattr(parallel_config, "distributed_executor_backend", None)
+                    == "external_launcher"
+                    and (
+                        pp_size > 1
+                        or (
+                            int(parallel_config.tensor_parallel_size) > 1
+                            and _should_enable_async_sched(vllm_config)
+                        )
+                    )
+                ):
+                    # Each external launcher owns only its local worker. Its
+                    # RPC cannot fence every rank reached by the IPC unmap.
+                    raise KVCachedConfigError(
+                        "kvcached cannot order multi-rank queued KV release with "
+                        "external_launcher; use the mp executor or disable kvcached"
+                    )
                 os.environ["KVCACHED_PP_SIZE"] = str(pp_size)
 
                 # Keep TP ranks local to each PP stage. A negative PP rank
@@ -1168,10 +1248,124 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     is_worker=False,
                     async_sched=_should_enable_async_sched(vllm_config),
                 )
-            return original_init(self, vllm_config, *args, **kwargs)
+            result = original_init(self, vllm_config, *args, **kwargs)
+            if enable_kvcached():
+                self._kvcached_install_ordered_unmap()
+            return result
+
+        patch_logger = self.logger
+
+        def _kvcached_install_ordered_unmap(self) -> None:
+            manager = _get_vllm_kv_cache_manager(self)
+            if manager is None:
+                return
+            # PP can queue batches without async scheduling, while a single
+            # synchronous batch has no later queued work to fence. Use the
+            # initialized executor queue, not the scheduler flag, as authority.
+            manager.defer_physical_release = getattr(self, "batch_queue", None) is not None
+            if not manager.defer_physical_release:
+                return
+            executor = getattr(self, "model_executor", None)
+            collective_rpc = getattr(executor, "collective_rpc", None)
+            if not callable(collective_rpc):
+                raise RuntimeError(
+                    "Cannot install ordered KVCached unmap without the vLLM "
+                    "worker collective RPC"
+                )
+
+            parallel_config = self.vllm_config.parallel_config
+            configured_workers = int(parallel_config.tensor_parallel_size) * int(
+                parallel_config.pipeline_parallel_size
+            )
+            expected_workers = int(
+                getattr(executor, "world_size", configured_workers)
+            )
+
+            def physical_release_barrier() -> None:
+                responses = collective_rpc(
+                    _worker_physical_release_barrier,
+                    args=(),
+                )
+                if len(responses) != expected_workers or not all(responses):
+                    raise RuntimeError(
+                        "KV release barrier failed on one or more vLLM workers: "
+                        f"expected={expected_workers}, responses={responses}"
+                    )
+
+            # Only the engine's retired-page drain may submit worker RPCs.
+            # Keep the allocator's transactional IPC callback for unmap, including
+            # background trimming, rather than replacing it with worker RPCs.
+            manager.physical_release_barrier = physical_release_barrier
+            patch_logger.info(
+                "Installed physical release barrier for %d vLLM workers",
+                expected_workers,
+            )
 
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+        EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_async_batch_lifetime(self, engine_mod: types.ModuleType) -> bool:
+        """Order physical page release after prior async worker batches."""
+        EngineCore = self._get_target_class(engine_mod)
+        if EngineCore is None:
+            return False
+
+        original_step = getattr(EngineCore, "step_with_batch_queue", None)
+        if original_step is None:
+            return True
+        if self._is_already_patched(original_step, "async_batch_lifetime"):
+            self.logger.debug("EngineCore.step_with_batch_queue already patched")
+            return True
+
+        def _batch_queue_size(batch_queue: Any) -> int:
+            if batch_queue is None:
+                return 0
+            # Older PP schedulers use Queue; newer schedulers use deque.
+            # Only the engine thread adds/removes batches on either path.
+            if isinstance(batch_queue, Queue):
+                return batch_queue.qsize()
+            return len(batch_queue)
+
+        def _patched_step_with_batch_queue(self, *args: Any, **kwargs: Any):
+            manager = _get_vllm_kv_cache_manager(self)
+            if manager is None or not getattr(manager, "defer_physical_release", False):
+                return original_step(self, *args, **kwargs)
+
+            result = original_step(self, *args, **kwargs)
+            # The step must submit deferred sampling before the release RPC.
+            # The manager drains only pending retirements, after every worker
+            # has crossed the ordered barrier; no batch countdown is needed.
+            marker = manager.capture_physical_release_marker()
+            manager.release_retired_pages_through(marker)
+            return result
+
+        self._mark_as_patched(
+            _patched_step_with_batch_queue, "async_batch_lifetime"
+        )
+        EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
+
+        original_reset = getattr(EngineCore, "reset_prefix_cache", None)
+        if original_reset is not None:
+
+            def _patched_reset_prefix_cache(self, *args: Any, **kwargs: Any):
+                result = original_reset(self, *args, **kwargs)
+                manager = _get_vllm_kv_cache_manager(self)
+                if manager is None or not getattr(manager, "defer_physical_release", False):
+                    return result
+
+                batch_queue = getattr(self, "batch_queue", None)
+                if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
+                    # Idle control operations have no subsequent batch step to
+                    # drain retirements. Busy engines drain at the next step.
+                    marker = manager.capture_physical_release_marker()
+                    manager.release_retired_pages_through(marker)
+                return result
+
+            self._mark_as_patched(_patched_reset_prefix_cache, "async_batch_lifetime")
+            EngineCore.reset_prefix_cache = _patched_reset_prefix_cache
         return True
 
     @version_range(VLLM_ALL_RANGE)
@@ -1596,7 +1790,11 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 return
 
         def _setup_kvcached_coordinator(self) -> None:
-            enable_caching = getattr(self, "enable_caching", False)
+            # vLLM 0.30 keeps the flag only on the native block pool.
+            enable_caching = getattr(self, "enable_caching", None)
+            if enable_caching is None:
+                enable_caching = bool(getattr(
+                    getattr(self, "block_pool", None), "enable_caching", False))
             if enable_caching:
                 logger.info("Prefix caching enabled for kvcached")
 
@@ -1665,9 +1863,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 block_size,
                 cell_size=cell_size,
                 num_layers=group_size,
-                enable_caching=getattr(self, "enable_caching", False),
+                enable_caching=enable_caching,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(block_size),
+                max_cached_blocks=_get_max_cached_blocks(
+                    block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
                 hash_block_size=hash_block_size,
             )
             for manager in self.single_type_managers:
@@ -2741,6 +2940,13 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 return original_determine(self, *args, **kwargs)
 
             cache_config = self.cache_config
+            if getattr(cache_config, "kv_cache_memory_bytes", None) is None:
+                # A native startup plan can select an explicit budget. Apply it
+                # before choosing the process-local profiling path; older vLLM
+                # releases do not expose this helper.
+                apply_plan = getattr(gpuworker_mod, "maybe_apply_startup_plan", None)
+                if apply_plan is not None:
+                    apply_plan(self)
             configured_budget = getattr(cache_config, "kv_cache_memory_bytes", None)
             if configured_budget is not None:
                 return original_determine(self, *args, **kwargs)
@@ -2823,12 +3029,147 @@ class GPUWorkerPatch(VersionAwarePatch, BasePatch):
                 cudagraph_memory_estimate,
                 available_memory,
             )
+            reserve_mm_memory = getattr(
+                gpuworker_mod, "reserve_mm_ipc_gpu_memory", None)
+            if reserve_mm_memory is not None:
+                # Match native return-time reservations without changing the
+                # pre-reservation field used by compile/warmup bookkeeping.
+                return reserve_mm_memory(
+                    available_memory,
+                    self.model_config.multimodal_config,
+                    getattr(self.parallel_config, "_api_process_count", 1),
+                )
             return available_memory
 
         self._mark_as_patched(
             _patched_determine_available_memory, "determine_available_memory"
         )
         Worker.determine_available_memory = _patched_determine_available_memory
+        return True
+
+
+def _align_block_size_to_kvcached_page(cache_config: Any, logger: Any) -> None:
+    """Grow a hybrid attention block so its KV unit tiles kvcached's page.
+
+    vLLM's _align_hybrid_block_size picks the smallest attention block whose
+    page covers a mamba state and pads the state to that page. The resulting
+    unit (e.g. 784 tokens x 4096 B = 3,211,264 B for Qwen3.8-27B) generally does
+    not divide kvcached's page, so blocks straddle page boundaries: straddling
+    blocks are unusable and, when the unit exceeds half a page, some pages hold
+    no block at all. vLLM keeps any block size at least as large as the one it
+    requires and pads the state to it, so choose the smallest such block whose
+    unit divides the page (1024 tokens -> 4 MiB for a 4 MiB page). When the
+    default page is too small, try larger pages in 2 MiB steps and stop at
+    the first safe pair, allowing non-divisible pairs as the geometry check
+    does. Explicit page settings and user block sizes stay unchanged.
+    """
+    from kvcached.kv_geometry import aligned_block_size, select_page_size
+    from kvcached.utils import PAGE_SIZE
+
+    padded = getattr(cache_config, "mamba_page_size_padded", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if not padded or not block_size or padded % block_size:
+        return
+    if PAGE_SIZE % padded == 0:
+        return
+    if (getattr(cache_config, "user_specified_block_size", False)
+            or getattr(cache_config, "user_specified_mamba_block_size", False)):
+        return
+    bytes_per_token = padded // block_size
+    page_size = PAGE_SIZE
+    if padded > page_size and os.getenv("KVCACHED_PAGE_SIZE_MB") is None:
+        page_size = select_page_size(padded, block_size)
+    aligned = aligned_block_size(block_size, bytes_per_token, page_size)
+    if aligned is None or aligned == block_size:
+        return
+    cache_config.block_size = aligned
+    if getattr(cache_config, "mamba_cache_mode", None) in ("align", "all"):
+        cache_config.mamba_block_size = aligned
+    cache_config.mamba_page_size_padded = aligned * bytes_per_token
+    logger.info(
+        "Setting attention block size to %d tokens (was %d) so the KV unit "
+        "(%d bytes) tiles the %d-byte kvcached page",
+        aligned, block_size, aligned * bytes_per_token, page_size)
+
+
+class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
+    """Choose hybrid attention block sizes whose KV unit tiles kvcached pages."""
+
+    library = "vllm"
+    target_module = "vllm.platforms.interface"
+    target_class = "Platform"
+    patch_name = "hybrid_block_size_align"
+
+    def apply(self, platform_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        platform = self._get_target_class(platform_mod)
+        if platform is None:
+            return False
+        raw = platform.__dict__.get("_align_hybrid_block_size")
+        if raw is None:
+            # Releases without this hook: the page geometry check still
+            # rejects unusable geometries at startup.
+            self.logger.debug("Platform._align_hybrid_block_size not found")
+            return True
+        original = raw.__func__ if isinstance(raw, classmethod) else raw
+        if self._is_already_patched(original):
+            return True
+        logger = self.logger
+
+        @wraps(original)
+        def align_hybrid_block_size(cls, vllm_config, *args: Any, **kwargs: Any):
+            result = original(cls, vllm_config, *args, **kwargs)
+            if enable_kvcached():
+                _align_block_size_to_kvcached_page(vllm_config.cache_config, logger)
+            return result
+
+        self._mark_as_patched(align_hybrid_block_size)
+        platform._align_hybrid_block_size = classmethod(align_hybrid_block_size)
+        return True
+
+
+class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
+    """Do not re-publish an old prompt boundary from a running Mamba state.
+
+    In 0.28/0.29 async decode, allocate_slots() can clamp cache publication
+    to the prompt length after the boundary's hash has moved to a CoW snapshot.
+    Registering the running source again queues another copy on the next step,
+    this time of an advanced state under the old hash. Keep the original
+    checkpoint position and skip only publication behind a running request's
+    scheduled position. Remote-KV completion and preempted replay still use
+    the native registration path.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.single_type_kv_cache_manager"
+    target_class = "MambaManager"
+    patch_name = "mamba_partial_tail"
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if not VersionRange(">=0.28.0,<0.31.0").contains(self.detected_version or "0"):
+            return False
+        manager = self._get_target_class(target_module)
+        original = getattr(manager, "_cache_partial_tail_block", None)
+        if original is None:
+            return False
+        if self._is_already_patched(original):
+            return True
+
+        from vllm.v1.request import RequestStatus
+
+        @wraps(original)
+        def cache_partial_tail(self, request, num_tokens, *args, **kwargs):
+            # vLLM 0.30 adds a retention_interval argument.
+            if (enable_kvcached() and request.status == RequestStatus.RUNNING
+                    and num_tokens <= request.num_computed_tokens):
+                return None
+            return original(self, request, num_tokens, *args, **kwargs)
+
+        self._mark_as_patched(cache_partial_tail)
+        manager._cache_partial_tail_block = cache_partial_tail
         return True
 
 
@@ -2883,21 +3224,38 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger
 
+        repair_native_retry = self.detected_version is not None and VersionRange(
+            ">=0.28.0,<0.31.0").contains(self.detected_version)
+
         def _patched_allocate_slots(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():
                 return original_allocate_slots(self, *args, **kwargs)
+            attempt = None
+            coordinator = getattr(self, "coordinator", None)
+            if repair_native_retry and coordinator is not None:
+                from kvcached.integration.vllm.allocation_attempt import AllocationAttempt
+
+                attempt = getattr(self, "_kvcached_allocation_attempt", None)
+                if attempt is None:
+                    attempt = AllocationAttempt(coordinator)
+                    self._kvcached_allocation_attempt = attempt
+                request = args[0] if args else kwargs["request"]
+                attempt.begin(request.request_id)
             try:
                 return original_allocate_slots(self, *args, **kwargs)
             except KVCachePoolExhausted as exhausted:
-                # None is the scheduler's own "cannot schedule this request
-                # now" path. Partially allocated blocks are released when the
-                # scheduler preempts or frees the request, so returning here
-                # does not strand them.
+                if attempt is not None:
+                    attempt.rollback()
+                # Waiting requests remain queued on None; the scheduler does
+                # not free their partially allocated blocks for us.
                 logger.warning(
                     "Shared physical KV pool is exhausted; reporting a "
                     "scheduling miss so the engine can preempt and retry: %s",
                     exhausted)
                 return None
+            finally:
+                if attempt is not None:
+                    attempt.end()
 
         self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
         KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]
