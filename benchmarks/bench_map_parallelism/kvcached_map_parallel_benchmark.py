@@ -55,7 +55,7 @@ def _worker(
         # Init kvcached
         from kvcached.integration.vllm.interfaces import init_kvcached
 
-        init_kvcached(tp_rank=rank, tp_size=procs, is_worker=False, async_sched=False)
+        init_kvcached(tp_rank=rank, world_size=procs, is_worker=False, async_sched=False)
 
         # This shape is not critical for timing the memory mapping ops
         kvcache_shape = (2, 30000, 16, 2, 128)

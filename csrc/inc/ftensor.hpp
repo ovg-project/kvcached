@@ -4,29 +4,36 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <unordered_map>
-
-#include <torch/extension.h>
+#include <vector>
 
 #include "constants.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 
 namespace kvcached {
 
 /* NOTE: FTensorAllocator is thread-safe but FTensor is not. */
-class FTensor {
+class KVCACHED_HIDDEN FTensor {
 public:
-  FTensor(const std::string &name, size_t size, torch::Dtype dtype,
-          torch::Device dev, std::shared_ptr<Page> zero_page,
-          size_t page_size = 0);
+  FTensor(const std::string &name, size_t size,
+          torch::headeronly::ScalarType dtype, torch::stable::Device dev,
+          std::shared_ptr<Page> zero_page, size_t page_size = 0);
   ~FTensor();
   bool map(offset_t offset);
   bool unmap(offset_t offset);
 
-  inline torch::Tensor get_tensor() noexcept { return tensor_; }
+  inline torch::stable::Tensor get_tensor() noexcept { return tensor_; }
 
 private:
+  friend class FTensorAllocator;
+
+  bool is_mapped_(offset_t offset) const;
+  bool unmap_retain_(offset_t offset, std::unique_ptr<Page> &retained_page);
+  bool restore_mapping_(offset_t offset, std::unique_ptr<Page> &retained_page);
   bool map_(Page *page, offset_t offset, bool set_access = true);
+  void validate_offset_(offset_t offset) const;
   bool set_access_(generic_ptr_t addr, size_t size);
   bool init_with_zero_();
 
@@ -34,12 +41,13 @@ private:
   generic_ptr_t vaddr_;
   size_t size_;
   size_t page_size_;
-  torch::Dtype dtype_;
-  torch::Device dev_;
+  torch::headeronly::ScalarType dtype_;
+  torch::stable::Device dev_;
   std::shared_ptr<Page> zero_page_;
 
-  torch::Tensor tensor_;
+  torch::stable::Tensor tensor_;
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
+  std::vector<std::unique_ptr<Page>> failed_pages_;
 };
 
 } // namespace kvcached

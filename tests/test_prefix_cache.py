@@ -10,6 +10,7 @@ to test the prefix cache logic in isolation without GPU or vLLM dependency.
 
 import sys
 import types
+from typing import Optional
 from unittest import mock
 
 # ---------------------------------------------------------------------------
@@ -30,8 +31,16 @@ sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
 
 # Pre-mock the interfaces module so mock.patch can resolve its attributes.
 # This avoids importing torch / C extensions transitively via interfaces.py.
-_interfaces_mock = mock.MagicMock()
-sys.modules.setdefault("kvcached.integration.vllm.interfaces", _interfaces_mock)
+sys.modules.setdefault("kvcached.integration.vllm.interfaces",
+                       mock.MagicMock())
+import kvcached.integration.vllm as _vllm_pkg  # noqa: E402
+
+# Binding the stub into sys.modules is not enough: mock.patch() resolves a
+# dotted target with getattr() on the parent package, and a hand-installed
+# sys.modules entry never sets that attribute. Point it at whatever is
+# actually in sys.modules -- another test module may have stubbed this first,
+# and patching a different object than the code imports silently does nothing.
+_vllm_pkg.interfaces = sys.modules["kvcached.integration.vllm.interfaces"]
 
 import pytest  # noqa: E402
 
@@ -41,7 +50,10 @@ import pytest  # noqa: E402
 
 class MockBlockPool:
     """Minimal stand-in for vLLM's BlockPool base class."""
-    pass
+    enable_caching: bool
+
+    def native_cache_enabled(self):
+        return self.enable_caching
 
 
 class MockKVCacheBlock:
@@ -51,6 +63,21 @@ class MockKVCacheBlock:
         self.block_id = block_id
         self.ref_cnt = ref_cnt
         self.is_null = False
+        self._block_hash: Optional[object] = None
+        self._block_hash_num_tokens: Optional[int] = None
+
+    @property
+    def block_hash(self):
+        return self._block_hash
+
+    def set_block_hash(self, value, num_tokens=None):
+        assert self._block_hash is None
+        self._block_hash = value
+        self._block_hash_num_tokens = num_tokens
+
+    def reset_hash(self):
+        self._block_hash = None
+        self._block_hash_num_tokens = None
 
 
 class MockKVCacheManager:
@@ -61,8 +88,13 @@ class MockKVCacheManager:
     """
 
     def __init__(self, num_blocks: int):
-        self._free: list[int] = list(range(num_blocks))
+        # Mirror KVCacheManager(reserve_null_block=True): block 0 is reserved
+        # as the null block during manager init and never enters circulation,
+        # so the free list starts at 1 (same id sequence the old code produced
+        # by allocating block 0 for the null block).
+        self._free: list[int] = list(range(1, num_blocks))
         self._allocated: set[int] = set()
+        self.null_block = [0]
 
     def alloc(self, n: int):
         if len(self._free) < n:
@@ -88,19 +120,101 @@ class MockRequest:
         self.block_hashes = block_hashes
 
 
+class MockBlockHashListWithBlockSize:
+    def __init__(self, block_hashes, hash_block_size, target_block_size):
+        assert target_block_size % hash_block_size == 0
+        self.block_hashes = block_hashes
+        self.scale_factor = target_block_size // hash_block_size
+
+    def __len__(self):
+        return len(self.block_hashes) // self.scale_factor
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        return self.block_hashes[(index + 1) * self.scale_factor - 1]
+
+
+def test_set_block_hash_supports_legacy_writable_property():
+    """vLLM before 0.24 uses a writable block_hash property."""
+    from kvcached.integration.vllm.patches import _set_block_hash
+
+    block = types.SimpleNamespace(block_hash=None)
+    key = b"legacy-key"
+
+    _set_block_hash(block, key)
+
+    assert block.block_hash == key
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_pool_caching_attribute(pool_factory, enabled):
+    pool, _ = pool_factory(enable_caching=enabled)
+    assert pool.native_cache_enabled() is enabled
+    assert pool.enable_prefix_cache is enabled
+
+
+@pytest.mark.parametrize("num_cached_blocks", [0, 1])
+def test_legacy_pool_converts_fine_hashes_before_registering_blocks(
+    pool_factory, monkeypatch, num_cached_blocks
+):
+    pool, _ = pool_factory()
+    pool.hash_block_size = 4
+    blocks = pool.get_new_blocks(2)
+    req = MockRequest([f"h{i}" for i in range(8)])
+    converter = mock.Mock(return_value=["h3", "h7"])
+    utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    setattr(utils, "BlockHashListWithBlockSize", converter)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    pool.cache_full_blocks(req, blocks, num_cached_blocks, 2, 16, 0)
+
+    converter.assert_called_once_with(req.block_hashes, 4, 16)
+    for index in range(num_cached_blocks, 2):
+        assert pool.get_cached_block(f"h{(index + 1) * 4 - 1}", [0]) == [blocks[index]]
+    assert pool.get_cached_block("h0", [0]) is None
+    assert pool.get_cached_block("h1", [0]) is None
+
+
+def test_legacy_pool_rejects_missing_hash_converter(pool_factory, monkeypatch):
+    pool, _ = pool_factory()
+    pool.hash_block_size = 4
+    blocks = pool.get_new_blocks(1)
+    utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    with pytest.raises(RuntimeError, match="heterogeneous block-hash conversion"):
+        pool.cache_full_blocks(MockRequest([f"h{i}" for i in range(4)]), blocks, 0, 1, 16, 0)
+
+    assert blocks[0].block_hash is None
+    assert not pool._cached_blocks
+
+
 # ---------------------------------------------------------------------------
 # Fixture: create an ElasticBlockPool via the real patch injection
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def pool_factory():
+def pool_factory(monkeypatch):
     """Factory that builds an ElasticBlockPool with a given number of blocks.
 
     Returns (pool, manager) so tests can inspect both.
     """
 
-    def _make(num_blocks: int = 100, enable_caching: bool = True):
-        manager = MockKVCacheManager(num_blocks)
+    def _make(num_blocks: int = 100, enable_caching: bool = True, manager=None):
+        if manager is None:
+            manager = MockKVCacheManager(num_blocks)
+
+        kv_cache_utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+        setattr(
+            kv_cache_utils,
+            "BlockHashListWithBlockSize",
+            MockBlockHashListWithBlockSize,
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm.v1.core.kv_cache_utils", kv_cache_utils
+        )
 
         # Build a mock module that looks like vllm.v1.core.block_pool
         mock_mod = types.ModuleType("mock_block_pool")
@@ -178,6 +292,7 @@ class TestLazyEviction:
 
         # Request A
         blocks_a = _simulate_request(pool, hashes)
+        assert all(block.block_hash is not None for block in blocks_a)
         _finish_request(pool, blocks_a)
 
         # All blocks should be in evictable pool, NOT freed to kvcached
@@ -215,6 +330,7 @@ class TestLazyEviction:
         # Not cached -> freed immediately
         assert len(pool._evictable_blocks) == 0
         assert mgr.available_size() == initial_free
+        assert all(block.block_hash is None for block in blocks)
 
     def test_touch_removes_from_evictable_pool(self, pool_and_manager):
         """Touching an evictable block reactivates it (removes from pool)."""
@@ -305,12 +421,14 @@ class TestEvictOnDemand:
         _finish_request(pool, blocks)
 
         # Evict 3 -> should evict h0, h1, h2 (oldest)
+        evicted_blocks = blocks[:3]
         pool._evict_blocks_from_pool(3)
 
         assert pool.get_cached_block("h0", [0]) is None
         assert pool.get_cached_block("h1", [0]) is None
         assert pool.get_cached_block("h2", [0]) is None
         assert pool.get_cached_block("h3", [0]) is not None  # still cached
+        assert all(block.block_hash is None for block in evicted_blocks)
 
     def test_evict_all_then_alloc(self, pool_factory):
         """Can evict entire pool and allocate fresh blocks."""
@@ -381,6 +499,7 @@ class TestResetAndExplicitEviction:
         assert len(pool._cached_blocks) == 0
         assert len(pool._block_id_to_key) == 0
         assert mgr.available_size() == 20  # all freed (null_block still allocated)
+        assert all(block.block_hash is None for block in blocks)
 
     def test_reset_with_no_evictable(self, pool_and_manager):
         """reset_prefix_cache works even when evictable pool is empty."""
@@ -404,6 +523,8 @@ class TestResetAndExplicitEviction:
         assert pool.get_cached_block("h0", [0]) is None
         assert pool.get_cached_block("h1", [0]) is None
         assert pool.get_cached_block("h2", [0]) is not None
+        assert all(block.block_hash is None for block in blocks[:2])
+        assert all(block.block_hash is not None for block in blocks[2:])
 
     def test_evict_blocks_active_not_freed(self, pool_factory):
         """evict_blocks on active (ref_cnt>0) blocks removes cache entry
@@ -512,6 +633,99 @@ class TestEdgeCases:
         pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
         assert len(pool._cached_blocks) == 2
 
+    def test_heterogeneous_block_size_uses_final_fine_grained_hash(
+        self, pool_and_manager, monkeypatch
+    ):
+        """A 64-token block uses the final hash from its four 16-token chunks."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest([f"h{i}" for i in range(8)])
+
+        kv_cache_utils = sys.modules["vllm.v1.core.kv_cache_utils"]
+        converter = mock.Mock(side_effect=MockBlockHashListWithBlockSize)
+        monkeypatch.setattr(
+            kv_cache_utils, "BlockHashListWithBlockSize", converter
+        )
+
+        pool.cache_full_blocks(req, blocks, 0, 2, 64, 1)
+
+        converter.assert_called_once_with(req.block_hashes, 16, 64)
+        assert pool.get_cached_block("h0", [1]) is None
+        assert pool.get_cached_block("h1", [1]) is None
+        assert pool.get_cached_block("h3", [1]) == [blocks[0]]
+        assert pool.get_cached_block("h7", [1]) == [blocks[1]]
+
+    def test_heterogeneous_block_size_conversion_respects_cached_offset(
+        self, pool_and_manager
+    ):
+        """Incremental caching indexes the converted hash list by physical block."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest([f"h{i}" for i in range(8)])
+
+        pool.cache_full_blocks(req, blocks, 0, 1, 64, 1)
+        pool.cache_full_blocks(req, blocks, 1, 2, 64, 1)
+
+        assert pool.get_cached_block("h3", [1]) == [blocks[0]]
+        assert pool.get_cached_block("h7", [1]) == [blocks[1]]
+
+    def test_heterogeneous_block_size_requires_vllm_converter(
+        self, pool_and_manager, monkeypatch
+    ):
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(1)
+        req = MockRequest([f"h{i}" for i in range(4)])
+
+        kv_cache_utils = sys.modules["vllm.v1.core.kv_cache_utils"]
+        monkeypatch.delattr(kv_cache_utils, "BlockHashListWithBlockSize")
+
+        with pytest.raises(
+            RuntimeError, match="does not support heterogeneous block-hash conversion"
+        ):
+            pool.cache_full_blocks(req, blocks, 0, 1, 64, 1)
+
+    def test_cache_full_blocks_honors_block_mask(self, pool_and_manager):
+        """Masked physical blocks must not become reusable prefix entries."""
+        pool, _ = pool_and_manager
+        blocks = pool.get_new_blocks(2)
+        req = MockRequest(["h0", "h1"])
+
+        pool.cache_full_blocks(
+            request=req,
+            blocks=blocks,
+            num_cached_blocks=0,
+            num_full_blocks=2,
+            block_size=16,
+            kv_cache_group_id=0,
+            block_mask=[False, True],
+        )
+
+        assert pool.get_cached_block("h0", [0]) is None
+        assert pool.get_cached_block("h1", [0]) == [blocks[1]]
+
+    def test_duplicate_hashes_keep_each_block_metadata(self, pool_and_manager):
+        """Concurrent requests may materialize the same prefix twice."""
+        pool, _ = pool_and_manager
+        first = pool.get_new_blocks(1)
+        second = pool.get_new_blocks(1)
+        req = MockRequest(["shared-prefix"])
+
+        pool.cache_full_blocks(req, first, 0, 1, 16, 0)
+        pool.cache_full_blocks(req, second, 0, 1, 16, 0)
+
+        assert first[0].block_hash is not None
+        assert second[0].block_hash == first[0].block_hash
+        assert len(pool._cached_blocks) == 1
+        assert pool.get_cached_block("shared-prefix", [0]) is not None
+
+        _finish_request(pool, first)
+        _finish_request(pool, second)
+        pool._evict_blocks_from_pool(1)
+
+        assert first[0].block_hash is None
+        assert second[0].block_hash is not None
+        assert pool.get_cached_block("shared-prefix", [0]) == [second[0]]
+
     def test_reuse_after_eviction_and_realloc(self, pool_factory):
         """After eviction, block IDs can be reallocated and recached."""
         pool, mgr = pool_factory(5)  # +1 for null_block
@@ -523,6 +737,7 @@ class TestEdgeCases:
         # Evict all
         pool._evict_blocks_from_pool(4)
         assert len(pool._cached_blocks) == 0
+        assert all(block.block_hash is None for block in blocks)
 
         # Reallocate -- may get same block IDs
         new_blocks = pool.get_new_blocks(4)
@@ -547,6 +762,33 @@ class TestEdgeCases:
         assert len(pool._evictable_blocks) == 2
         assert mgr.available_size() == initial_free - 2  # 2 held by pool
 
+    def test_free_blocks_accepts_prepend_kwarg(self, pool_and_manager):
+        """vLLM >= 0.23 calls free_blocks(..., prepend=...); must not raise
+        and must free identically for both values (#438)."""
+        pool, mgr = pool_and_manager
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
+        blocks = pool.get_new_blocks(2)
+        for block in blocks:
+            block.ref_cnt = 1
+        pool.free_blocks(blocks, prepend=False)
+        assert mgr.available_size() == initial_free
+
+    def test_free_blocks_prepend_with_caching_disabled(self, pool_factory):
+        """The caching-disabled fast path must accept prepend too (#438)."""
+        pool, mgr = pool_factory(enable_caching=False)
+        initial_free = mgr.available_size()
+
+        blocks = pool.get_new_blocks(3)
+        pool.free_blocks(blocks, prepend=True)
+        assert mgr.available_size() == initial_free
+
     def test_get_usage(self, pool_factory):
         """get_usage reflects the fraction of blocks in use."""
         pool, mgr = pool_factory(100)
@@ -556,3 +798,32 @@ class TestEdgeCases:
         pool.get_new_blocks(50)
         # 50+1(null) allocated, 0 evictable -> 49 free from kvcached
         assert pool.get_usage() == pytest.approx(0.51)
+
+
+class DrainedPoolManager(MockKVCacheManager):
+    """Leave the pool in the state a colocated peer produces.
+
+    ``available_size()`` reads device-wide free memory, so it is a snapshot of
+    state shared with every colocated engine, not a reservation: a peer can
+    take the last pages between the pool reading it and the pages being
+    claimed.
+    """
+
+    def available_size(self) -> int:
+        return 1000
+
+    def alloc(self, n: int):
+        return None
+
+
+def test_exhaustion_raises_the_type_the_integration_translates(pool_factory):
+    """The other half of this fix lives in KVCacheManagerAllocateSlotsPatch,
+    which turns exactly this exception into a scheduling miss. Widening it back
+    to a plain ValueError would silently restore the EngineCore crash."""
+    from kvcached.utils import KVCachePoolExhausted
+
+    pool, _ = pool_factory(manager=DrainedPoolManager(100))
+
+    with pytest.raises(KVCachePoolExhausted,
+                       match="Unable to allocate KV cache blocks"):
+        pool.get_new_blocks(4)

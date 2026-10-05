@@ -132,7 +132,7 @@ def _worker_entry(
         from kvcached.integration.vllm.interfaces import init_kvcached
 
         init_kvcached(
-            tp_rank=rank, tp_size=tp_size, is_worker=True, async_sched=async_sched
+            tp_rank=rank, world_size=tp_size, is_worker=True, async_sched=async_sched
         )
 
         # Let the C++ layer allocates some virtual memory.

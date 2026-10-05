@@ -17,6 +17,8 @@ sleep_manager: # sleep configuration
   auto_sleep_enabled: false           # Enable automatic sleep mode for idle models
   wakeup_on_request: true            # Automatically wake models when requests come in
   min_sleep_duration: 80             # Minimum time to keep model asleep (2 minutes)
+  vllm_sleep_mode: abort             # abort (default) or wait; wait requires vLLM >= 0.17.0
+  vllm_sleep_timeout_seconds: 30     # Controller HTTP timeout, including drain and offload
 
 instances: # instances configuration
   - name: instance1

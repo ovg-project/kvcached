@@ -8,9 +8,17 @@ extension, a GPU, nor an installed vLLM. It guards the str-hash fix: some vLLM
 versions pass a ``str`` (hex digest) where ``bytes(block_hash)`` would raise
 ``TypeError``.
 """
+import sys
+import types
+from importlib.machinery import ModuleSpec
+
 import pytest
 
-from kvcached.integration.vllm.patches import _make_cache_key
+_torch_mock = types.ModuleType("torch")
+_torch_mock.__spec__ = ModuleSpec("torch", loader=None)
+sys.modules.setdefault("torch", _torch_mock)
+
+from kvcached.integration.vllm.patches import _make_cache_key  # noqa: E402
 
 
 def _gid(group_id: int) -> bytes:

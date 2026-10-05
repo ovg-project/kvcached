@@ -1,17 +1,20 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
 #include <memory>
 #include <mutex>
-#include <torch/extension.h>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "allocator.hpp"
 #include "constants.hpp"
-#include "cuda_utils.hpp"
 #include "ftensor.hpp"
+#include "gpu_utils.hpp"
 #include "page.hpp"
-#include "torch_utils.hpp"
+#include "transaction_error.hpp"
 
 namespace kvcached {
 // Global configurable page size
@@ -20,14 +23,24 @@ size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
     FTensorAllocator::g_allocators_;
 std::mutex FTensorAllocator::g_allocator_mutex_;
-torch::Device FTensorAllocator::g_device_(torch::kCPU);
+torch::stable::Device FTensorAllocator::g_device_(torch::headeronly::kCPU);
 bool FTensorAllocator::g_contiguous_layout_ = false;
 
-static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
-                                                     page_id_t page_id,
-                                                     size_t page_size = 0) {
+static inline std::shared_ptr<Page>
+make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
+                 size_t page_size = 0) {
+  auto resolve_device_index = [](const torch::stable::Device &device) -> int {
+    if (device.index() >= 0) {
+      return device.index();
+    }
+    return gpu_vmm::current_device();
+  };
+
+  // is_cuda() returns true for both NVIDIA (CUDA) and AMD (HIP/ROCm) devices,
+  // because PyTorch's ROCm build masquerades HIP devices as CUDA.
   if (dev.is_cuda()) {
-    return std::make_shared<GPUPage>(page_id, dev.index(), page_size);
+    return std::make_shared<GPUPage>(page_id, resolve_device_index(dev),
+                                     page_size);
   } else if (dev.is_cpu()) {
     return std::make_shared<CPUPage>(page_id, page_size);
   }
@@ -35,21 +48,22 @@ static inline std::shared_ptr<Page> make_shared_page(const torch::Device &dev,
   return nullptr;
 }
 
-static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
+static inline size_t get_v_base_offset(const torch::stable::Tensor &tensor,
+                                       size_t page_size) {
   size_t num_eles = tensor.numel() * tensor.element_size();
-  ASSERT(num_eles % (2 * kPageSize) == 0,
+  ASSERT(num_eles % (2 * page_size) == 0,
          "Invalid tensor size: %zu, must be a multiple of 2 * page size %zu",
-         num_eles, 2 * kPageSize);
+         num_eles, 2 * page_size);
   return num_eles / 2;
 }
 
-FTensorAllocator::FTensorAllocator(const torch::Device &device,
+FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
-    : dev_(device), num_layers_(0), num_kv_buffers_(2),
+    : dev_(device), page_size_(kPageSize), num_layers_(0), num_kv_buffers_(2),
       contiguous_layout_(contiguous_layout), unified_pool_(false),
       kv_tensor_size_per_layer_(0) {
   if (dev_.is_cuda()) {
-    init_cuda_();
+    init_gpu_();
   }
 }
 
@@ -57,6 +71,9 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
+  pending_unmap_.reset();
+  finalized_unmap_transactions_.clear();
+  finalized_unmap_order_.clear();
   ftensors_.clear();
   contiguous_kv_tensor_.reset();
   zero_page_.reset();
@@ -84,7 +101,7 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
     kPageSize = page_size;
   }
 
-  auto device = torch::Device(dev_str);
+  torch::stable::Device device(dev_str);
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
   g_allocators_[0] =
@@ -111,10 +128,22 @@ void FTensorAllocator::shutdown() {
   g_allocators_.clear();
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
-    size_t size, torch::Dtype dtype, const std::string &dev_str,
-    int64_t num_layers, int64_t num_kv_buffers, bool unified_pool) {
+std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, int64_t num_layers, int64_t num_kv_buffers,
+    bool unified_pool, size_t page_size) {
   std::lock_guard<std::mutex> lock(mtx_);
+
+  const auto resolved_page_size = page_size == 0 ? page_size_ : page_size;
+  if (resolved_page_size == 0 || resolved_page_size % (2 * 1024 * 1024) != 0) {
+    throw std::invalid_argument(
+        "KV page size must be a positive multiple of 2 MiB");
+  }
+  if (num_layers_ > 0 && resolved_page_size != page_size_) {
+    throw std::logic_error(
+        "Cannot change page size after KV tensors are created");
+  }
+  page_size_ = resolved_page_size;
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
@@ -122,10 +151,10 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
   unified_pool_ = unified_pool;
   // Ensure size is aligned to page size.
   size_t aligned_size = size;
-  if (size % kPageSize != 0) {
-    aligned_size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+  if (size % page_size_ != 0) {
+    aligned_size = ((size + page_size_ - 1) / page_size_) * page_size_;
     LOGGER(WARNING, "Size %zu is not aligned to page size %zu, aligning to %zu",
-           size, kPageSize, aligned_size);
+           size, page_size_, aligned_size);
   }
   kv_tensor_size_per_layer_ = aligned_size;
 
@@ -133,7 +162,7 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
-    size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
+    size_t compound_page_size = page_size_ * num_layers * num_kv_buffers;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
     // We can use the aligned size directly for contiguous layout too because
     // both compound_page_size and aligned_size are already/will be multiplied
@@ -141,7 +170,7 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, page_size_);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
@@ -153,54 +182,111 @@ bool FTensorAllocator::kv_tensors_created() {
 }
 
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+  return map_to_kv_tensors_with_result(offsets).first;
+}
+
+std::pair<bool, std::vector<offset_t>>
+FTensorAllocator::map_to_kv_tensors_with_result(
+    const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
   if (num_layers_ == 0) {
     LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
-    return false;
+    return {false, {}};
   }
+  reject_if_unmap_pending_locked_("map KV tensors");
 
-  if (contiguous_layout_) {
-    // In contiguous layout, use the single contiguous tensor for mapping
-    // Each offset maps a block that contains all layers
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
+  using MappingTarget = std::pair<FTensor *, offset_t>;
+  struct MappingGroup {
+    offset_t logical_offset;
+    std::vector<MappingTarget> targets;
+  };
 
-    for (auto offset : offsets) {
-      // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
-    }
-  } else if (unified_pool_ || num_kv_buffers_ == 1) {
-    // Unified pool or MLA (num_kv_buffers==1): single map per offset per layer.
-    // - unified_pool: K and V share a single block-interleaved FTensor.
-    // - MLA: combined KV buffer, no separate V region.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->map(offset);
+  std::vector<MappingGroup> groups;
+  groups.reserve(offsets.size());
+  for (auto offset : offsets) {
+    MappingGroup group{offset, {}};
+    if (contiguous_layout_) {
+      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
+    } else {
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        group.targets.emplace_back(ftensor, offset);
+        // MLA has one combined KV buffer, so it has no separate V region.
+        if (!unified_pool_ && num_kv_buffers_ != 1) {
+          auto v_base_offset =
+              get_v_base_offset(ftensor->get_tensor(), page_size_);
+          group.targets.emplace_back(ftensor, offset + v_base_offset);
+        }
       }
     }
-  } else {
-    // MHA/GQA per-layer mapping: K and V are stacked, map both regions.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        auto koffset = offset;
-        auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
+    groups.push_back(std::move(group));
+  }
+
+  std::vector<MappingTarget> mapped;
+  std::vector<offset_t> newly_mapped_offsets;
+  bool new_mapping_damaged = false;
+  try {
+    for (const auto &group : groups) {
+      size_t existing = 0;
+      for (const auto &[ftensor, offset] : group.targets) {
+        existing += ftensor->is_mapped_(offset) ? 1 : 0;
+      }
+      if (existing == group.targets.size()) {
+        continue;
+      }
+      if (existing != 0) {
+        throw StateConsistencyError("state_inconsistency: logical KV offset is "
+                                    "only partially mapped: " +
+                                    std::to_string(group.logical_offset));
+      }
+
+      for (const auto &[ftensor, offset] : group.targets) {
+        try {
+          if (!ftensor->map(offset)) {
+            throw std::runtime_error("physical page map returned false");
+          }
+        } catch (const StateConsistencyError &) {
+          new_mapping_damaged = true;
+          throw;
+        }
+        mapped.emplace_back(ftensor, offset);
+      }
+      newly_mapped_offsets.push_back(group.logical_offset);
+    }
+  } catch (const std::exception &error) {
+    std::vector<std::string> rollback_errors;
+    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
+      try {
+        if (!it->first->unmap(it->second)) {
+          rollback_errors.emplace_back("offset " + std::to_string(it->second) +
+                                       " returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        rollback_errors.emplace_back("offset " + std::to_string(it->second) +
+                                     ": " + rollback_error.what());
       }
     }
+    if (!rollback_errors.empty() || new_mapping_damaged) {
+      std::string message =
+          std::string("state_inconsistency: KV map failed: ") + error.what() +
+          "; rollback failed: ";
+      for (size_t i = 0; i < rollback_errors.size(); ++i) {
+        if (i != 0) {
+          message += "; ";
+        }
+        message += rollback_errors[i];
+      }
+      // A pre-existing partial mapping is not known to be unpublished.
+      if (!new_mapping_damaged &&
+          dynamic_cast<const StateConsistencyError *>(&error)) {
+        throw StateConsistencyError(message);
+      }
+      throw MapQuarantinedError(message);
+    }
+    throw;
   }
-  return true;
+  return {true, std::move(newly_mapped_offsets)};
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
@@ -211,45 +297,254 @@ bool FTensorAllocator::unmap_from_kv_tensors(
            "try to unmap from KV tensors when KV tensors are not created");
     return false;
   }
-
-  if (contiguous_layout_) {
-    // In contiguous layout, unmap using the single contiguous tensor
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
-
-    for (auto offset : offsets) {
-      // Unmap K and V regions for this block (covers all layers)
-      ftensor->unmap(offset);
-    }
-  } else if (unified_pool_ || num_kv_buffers_ == 1) {
-    // Unified pool or MLA (num_kv_buffers==1): single unmap per offset per
-    // layer.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
+  reject_if_unmap_pending_locked_("unmap KV tensors");
+  auto retained = unmap_retain_locked_(offsets);
+  try {
+    release_retained_locked_(retained);
+  } catch (...) {
+    for (auto &mapping : retained) {
+      if (mapping.page) {
+        failed_unmap_retained_.push_back(std::move(mapping));
       }
     }
-  } else {
-    // MHA/GQA per-layer unmapping: K and V are stacked, unmap both regions.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
-        ftensor->unmap(offset + v_base_offset);
-      }
-    }
+    throw;
   }
   return true;
+}
+
+bool FTensorAllocator::prepare_unmap_from_kv_tensors(
+    const std::vector<offset_t> &offsets, const std::string &transaction_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (transaction_id.empty()) {
+    throw std::invalid_argument("unmap transaction id must not be empty");
+  }
+  if (num_layers_ == 0) {
+    LOGGER(ERROR, "try to prepare unmap when KV tensors are not created");
+    return false;
+  }
+  if (pending_unmap_) {
+    if (pending_unmap_->id == transaction_id) {
+      return true;
+    }
+    throw std::runtime_error(
+        "state_inconsistency: another unmap transaction is pending: " +
+        pending_unmap_->id);
+  }
+  auto finalized = finalized_unmap_transactions_.find(transaction_id);
+  if (finalized != finalized_unmap_transactions_.end()) {
+    if (finalized->second == UnmapTransactionOutcome::COMMITTED) {
+      return true;
+    }
+    throw std::runtime_error("unmap transaction was already aborted: " +
+                             transaction_id);
+  }
+
+  pending_unmap_.emplace(
+      PendingUnmapTransaction{transaction_id, unmap_retain_locked_(offsets)});
+  return true;
+}
+
+bool FTensorAllocator::commit_unmap_from_kv_tensors(
+    const std::string &transaction_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (transaction_id.empty()) {
+    throw std::invalid_argument("unmap transaction id must not be empty");
+  }
+  if (pending_unmap_ && pending_unmap_->id == transaction_id) {
+    pending_unmap_->commit_started = true;
+    release_retained_locked_(pending_unmap_->retained);
+    remember_unmap_outcome_locked_(transaction_id,
+                                   UnmapTransactionOutcome::COMMITTED);
+    pending_unmap_.reset();
+    return true;
+  }
+  if (pending_unmap_) {
+    throw std::runtime_error("state_inconsistency: commit does not match "
+                             "pending unmap transaction " +
+                             pending_unmap_->id);
+  }
+  auto finalized = finalized_unmap_transactions_.find(transaction_id);
+  if (finalized != finalized_unmap_transactions_.end() &&
+      finalized->second == UnmapTransactionOutcome::COMMITTED) {
+    return true;
+  }
+  if (finalized != finalized_unmap_transactions_.end()) {
+    throw std::runtime_error("cannot commit an aborted unmap transaction: " +
+                             transaction_id);
+  }
+  throw std::runtime_error("unknown unmap transaction: " + transaction_id);
+}
+
+bool FTensorAllocator::abort_unmap_from_kv_tensors(
+    const std::string &transaction_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (transaction_id.empty()) {
+    throw std::invalid_argument("unmap transaction id must not be empty");
+  }
+  if (pending_unmap_ && pending_unmap_->id == transaction_id) {
+    if (pending_unmap_->commit_started) {
+      throw StateConsistencyError(
+          "cannot abort an unmap after physical release started: " +
+          transaction_id);
+    }
+    restore_retained_locked_(pending_unmap_->retained,
+                             "distributed unmap aborted");
+    pending_unmap_.reset();
+    remember_unmap_outcome_locked_(transaction_id,
+                                   UnmapTransactionOutcome::ABORTED);
+    return true;
+  }
+  if (pending_unmap_) {
+    throw std::runtime_error(
+        "state_inconsistency: abort does not match pending unmap transaction " +
+        pending_unmap_->id);
+  }
+  auto finalized = finalized_unmap_transactions_.find(transaction_id);
+  if (finalized != finalized_unmap_transactions_.end()) {
+    if (finalized->second == UnmapTransactionOutcome::ABORTED) {
+      return true;
+    }
+    throw std::runtime_error("cannot abort a committed unmap transaction: " +
+                             transaction_id);
+  }
+
+  // Prepare may not have reached this worker. Recording the abort prevents a
+  // delayed prepare from reopening the transaction.
+  remember_unmap_outcome_locked_(transaction_id,
+                                 UnmapTransactionOutcome::ABORTED);
+  return true;
+}
+
+std::vector<FTensorAllocator::RetainedMapping>
+FTensorAllocator::unmap_retain_locked_(const std::vector<offset_t> &offsets) {
+
+  using MappingTarget = std::pair<FTensor *, offset_t>;
+  struct MappingGroup {
+    offset_t logical_offset;
+    std::vector<MappingTarget> targets;
+  };
+  std::vector<MappingGroup> groups;
+  groups.reserve(offsets.size());
+  for (auto offset : offsets) {
+    MappingGroup group{offset, {}};
+    if (contiguous_layout_) {
+      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
+    } else {
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        group.targets.emplace_back(ftensor, offset);
+        if (!unified_pool_ && num_kv_buffers_ != 1) {
+          auto v_base_offset =
+              get_v_base_offset(ftensor->get_tensor(), page_size_);
+          group.targets.emplace_back(ftensor, offset + v_base_offset);
+        }
+      }
+    }
+    groups.push_back(std::move(group));
+  }
+
+  std::vector<RetainedMapping> retained;
+  try {
+    for (const auto &group : groups) {
+      size_t existing = 0;
+      for (const auto &[ftensor, offset] : group.targets) {
+        existing += ftensor->is_mapped_(offset) ? 1 : 0;
+      }
+      if (existing == 0) {
+        continue;
+      }
+      if (existing != group.targets.size()) {
+        throw StateConsistencyError("state_inconsistency: logical KV offset is "
+                                    "only partially mapped: " +
+                                    std::to_string(group.logical_offset));
+      }
+
+      for (const auto &[ftensor, offset] : group.targets) {
+        std::unique_ptr<Page> page;
+        if (!ftensor->unmap_retain_(offset, page) || !page) {
+          throw std::runtime_error("physical page unmap returned no page");
+        }
+        retained.push_back({ftensor, offset, std::move(page)});
+      }
+    }
+  } catch (const std::exception &error) {
+    restore_retained_locked_(retained, error.what());
+    throw;
+  }
+  return retained;
+}
+
+void FTensorAllocator::restore_retained_locked_(
+    std::vector<RetainedMapping> &retained, const std::string &original_error) {
+  std::vector<std::string> rollback_errors;
+  for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+    if (!it->page) {
+      continue;
+    }
+    try {
+      if (!it->ftensor->restore_mapping_(it->offset, it->page)) {
+        rollback_errors.emplace_back("offset " + std::to_string(it->offset) +
+                                     " returned false");
+      }
+    } catch (const std::exception &rollback_error) {
+      rollback_errors.emplace_back("offset " + std::to_string(it->offset) +
+                                   ": " + rollback_error.what());
+    }
+  }
+  if (!rollback_errors.empty()) {
+    std::string message =
+        "state_inconsistency: KV unmap failed: " + original_error +
+        "; rollback failed: ";
+    for (size_t i = 0; i < rollback_errors.size(); ++i) {
+      if (i != 0) {
+        message += "; ";
+      }
+      message += rollback_errors[i];
+    }
+    // Keep original handles alive when restoration cannot be confirmed.
+    for (auto &mapping : retained) {
+      if (mapping.page) {
+        failed_unmap_retained_.push_back(std::move(mapping));
+      }
+    }
+    throw StateConsistencyError(message);
+  }
+}
+
+void FTensorAllocator::release_retained_locked_(
+    std::vector<RetainedMapping> &retained) {
+  for (auto &mapping : retained) {
+    if (mapping.page) {
+      // Keep failed handles owned, including across an idempotent commit retry.
+      mapping.page->release();
+      mapping.page.reset();
+    }
+  }
+}
+
+void FTensorAllocator::remember_unmap_outcome_locked_(
+    const std::string &transaction_id, UnmapTransactionOutcome outcome) {
+  constexpr size_t max_finalized_transactions = 64;
+  auto [it, inserted] =
+      finalized_unmap_transactions_.insert_or_assign(transaction_id, outcome);
+  (void)it;
+  if (inserted) {
+    finalized_unmap_order_.push_back(transaction_id);
+  }
+  while (finalized_unmap_order_.size() > max_finalized_transactions) {
+    finalized_unmap_transactions_.erase(finalized_unmap_order_.front());
+    finalized_unmap_order_.pop_front();
+  }
+}
+
+void FTensorAllocator::reject_if_unmap_pending_locked_(
+    const char *operation) const {
+  if (pending_unmap_) {
+    throw std::runtime_error(
+        std::string("cannot ") + operation +
+        " while unmap transaction is pending: " + pending_unmap_->id);
+  }
 }
 
 std::string FTensorAllocator::get_anon_tensor_name_() {
@@ -258,10 +553,11 @@ std::string FTensorAllocator::get_anon_tensor_name_() {
   return std::string(prefix) + std::to_string(counter++);
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
-    std::string_view prefix, size_t size, torch::Dtype dtype,
+std::vector<torch::stable::Tensor>
+FTensorAllocator::create_kv_tensors_per_layer_(
+    std::string_view prefix, size_t size, torch::headeronly::ScalarType dtype,
     const std::string &dev_str, int64_t num_layers) {
-  std::vector<torch::Tensor> ftensors;
+  std::vector<torch::stable::Tensor> ftensors;
   for (int64_t i = 0; i < num_layers; i++) {
     auto name = std::string(prefix) + std::to_string(i);
     auto tensor = create_ftensor_(size, dtype, dev_str, name);
@@ -270,9 +566,10 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
   return ftensors;
 }
 
-std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
-    size_t size, torch::Dtype dtype, const std::string &dev_str,
-    int64_t num_layers, size_t compound_page_size) {
+std::vector<torch::stable::Tensor>
+FTensorAllocator::create_kv_tensors_contiguous_(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, int64_t num_layers, size_t compound_page_size) {
   // In contiguous layout, Python passes per-layer size, and we multiply by
   // num_layers to get total size
   size_t total_kv_size = size * num_layers;
@@ -289,64 +586,44 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
 }
 
 /** this function is not thread-safe */
-torch::Tensor FTensorAllocator::create_ftensor_(size_t size, torch::Dtype dtype,
-                                                const std::string &dev_str,
-                                                std::string name) {
+torch::stable::Tensor FTensorAllocator::create_ftensor_(
+    size_t size, torch::headeronly::ScalarType dtype,
+    const std::string &dev_str, std::string name) {
   if (name.empty())
     name = get_anon_tensor_name_();
 
   if (ftensors_.find(name) != ftensors_.end()) {
     auto tensor = ftensors_[name].get()->get_tensor();
-    assert(tensor.numel() * tensor.element_size() == size);
-    assert(tensor.device() == torch::Device(dev_str));
+    assert(static_cast<size_t>(tensor.numel()) * tensor.element_size() == size);
+    assert(tensor.device() == torch::stable::Device(dev_str));
     return tensor;
   }
 
   // Create a new FTensor
-  ftensors_[name] =
-      std::make_unique<FTensor>(name, size, dtype, dev_, zero_page_);
+  ftensors_[name] = std::make_unique<FTensor>(name, size, dtype, dev_,
+                                              zero_page_, page_size_);
   return ftensors_[name]->get_tensor();
 }
 
-/** this function is not thread-safe */
-void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
-  auto name = ftensor.name();
-  if (ftensors_.find(name) == ftensors_.end()) {
-    return;
-  }
-  ftensors_.erase(name);
-}
+void FTensorAllocator::init_gpu_() {
+  CHECK_GPU(gpu_vmm::initialize_runtime());
 
-void FTensorAllocator::init_cuda_() {
-  CHECK_RT(cudaFree(0));
+  int dev_idx = dev_.index() >= 0 ? dev_.index() : gpu_vmm::current_device();
+  CHECK_GPU(gpu_vmm::set_device(dev_idx));
 
-  CUdevice dev;
-  CHECK_DRV(cuCtxGetDevice(&dev));
+  int supports_vmm = 0;
+  CHECK_GPU(gpu_vmm::get_vmm_support(&supports_vmm, dev_idx));
+  ASSERT(supports_vmm != 0,
+         "VMM is not supported on %s device %d. kvcached requires GPU VMM "
+         "support.",
+         gpu_vmm::backend_name(), dev_idx);
 
-  int supportsVMM = 0;
-  CHECK_DRV(cuDeviceGetAttribute(
-      &supportsVMM, CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED,
-      dev));
-  // LOGE("Supports VMM: %d", supportsVMM);
-
-  CUcontext context;
-  CHECK_DRV(cuCtxGetCurrent(&context));
-
-  CUmemAllocationProp prop{
-      .type = CU_MEM_ALLOCATION_TYPE_PINNED,
-      .location =
-          {
-              .type = CU_MEM_LOCATION_TYPE_DEVICE,
-              .id = dev,
-          },
-  };
-
+  auto prop = gpu_vmm::make_pinned_device_allocation_prop(dev_idx);
   size_t chunk_sz = 0;
-  CHECK_DRV(cuMemGetAllocationGranularity(&chunk_sz, &prop,
-                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  CHECK_GPU(gpu_vmm::get_allocation_granularity(&chunk_sz, &prop));
   ASSERT(kPageSize % chunk_sz == 0,
-         "Invalid page size: %lu must be a multiple of CUDA granularity %lu\n",
-         kPageSize, chunk_sz);
+         "Invalid page size: %lu must be a multiple of %s granularity %lu\n",
+         kPageSize, gpu_vmm::backend_name(), chunk_sz);
 }
 
 } // namespace kvcached

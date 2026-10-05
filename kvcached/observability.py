@@ -1,0 +1,441 @@
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+
+"""Read-only observability snapshots for kvcached integrations.
+
+The structures in this module are intentionally policy-free.  They expose
+allocator and runtime state so monitoring systems or external control planes
+can consume kvcached status without depending on private patch details.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
+
+from kvcached.errors import StateConsistencyError
+from kvcached.pool_registry import get_registered_kv_cache_pools
+from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE
+
+SCHEMA_VERSION = "kvcached.observability.v1"
+
+def _call_int(obj: Any, name: str) -> Optional[int]:
+    method = getattr(obj, name, None)
+    if method is None:
+        return None
+    return int(method())
+
+
+def _int_attr(obj: Any, name: str) -> Optional[int]:
+    value = getattr(obj, name, None)
+    if value is None:
+        return None
+    return int(value)
+
+
+@dataclass(frozen=True)
+class RuntimeSnapshot:
+    """Runtime integration state for an engine shim."""
+
+    schema_version: str
+    engine: str
+    initialized: bool
+    device: Optional[str]
+    world_size: int
+    pp_rank: int
+    async_sched: bool
+    contiguous_layout: bool
+    is_worker: Optional[bool] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class KVCachePoolSnapshot:
+    """Read-only state of one kvcached-backed KV pool.
+
+    Block accounting (these fields are NOT mutually exclusive -- do not sum
+    them):
+
+    * ``allocated_blocks`` -- blocks currently handed out of their pages.
+      Includes ``reserved_blocks``.
+    * ``reserved_blocks`` -- the subset of ``allocated_blocks`` held on the
+      pool's reserve ledger. ``alloc()`` drains this ledger first.
+    * ``available_blocks`` -- what the next request could obtain. Because
+      ``alloc()`` drains the reserve ledger first, this also includes
+      ``reserved_blocks``. Reported as 0 when the native allocator has
+      fail-closed (``lifecycle_phase`` ``failed``): nothing is obtainable
+      from a failed pool, and the free-page read behind it raises.
+
+    ``reserved_blocks`` counts *blocks* on that ledger and is unrelated to
+    ``reserved_pages``, which counts *physical pages* held by the background
+    pre-allocation thread.
+
+    Virtual reservation:
+
+    * ``virtual_per_layer_bytes`` -- virtual bytes reserved for one layer,
+      across all of its KV buffers (K and V for MHA, the single combined
+      buffer for MLA).
+    * ``virtual_total_bytes`` -- the whole pool, i.e.
+      ``virtual_per_layer_bytes * num_layers``.
+
+    The page-count fields are captured atomically with respect to allocator
+    mutations. Other fields remain best-effort and may come from marginally
+    different instants.
+
+    ``lifecycle_phase`` is the pool's level-triggered lifecycle phase
+    (``kvcached.lifecycle.LifecyclePhase`` values ``initializing``,
+    ``ready``, ``degraded``, ``failed``), or ``None`` when the manager does
+    not expose one. It is poll-only; ``KVCacheManager.wait_ready()`` is the
+    blocking gate.
+    """
+
+    schema_version: str
+    pool_type: str
+    integration: Optional[str]
+    pool_name: Optional[str]
+    group_id: int
+    num_layers: int
+    num_kv_buffers: int
+    page_size_bytes: int
+    block_size_bytes: int
+    total_blocks: int
+    available_blocks: int
+    allocated_blocks: int
+    reserved_blocks: int
+    available_bytes: int
+    allocated_bytes: int
+    reserved_bytes: int
+    null_block_reserved: bool
+    virtual_per_layer_bytes: int
+    virtual_total_bytes: int
+    mapped_bytes: int
+    total_pages: Optional[int]
+    free_pages: Optional[int]
+    inuse_pages: Optional[int]
+    reserved_pages: Optional[int]
+    available_physical_pages: Optional[int]
+    effective_free_pages: Optional[int]
+    in_shrink: bool
+    shrink_target_blocks: Optional[int]
+    resize_target_bytes: Optional[int]
+    # Added with #375 item (5); optional so older builders keep working.
+    lifecycle_phase: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _lifecycle_phase_value(obj: Any) -> Optional[str]:
+    phase = getattr(obj, "lifecycle_phase", None)
+    if phase is None:
+        return None
+    return str(getattr(phase, "value", phase))
+
+
+def _get_backend_capabilities() -> Dict[str, Any]:
+    """Report allocator-level capabilities shared by every integration.
+
+    These describe the kvcached core, not a particular engine shim. Per-engine
+    differences (which attention types a shim actually accepts, for example)
+    live under ``integrations``.
+    """
+
+    return {
+        "kv_pooling": True,
+        # Physical pages are mapped and unmapped on demand under a virtual
+        # reservation, which is what makes the pool elastic.
+        "elastic_capacity": True,
+        # resize() lowers addressable capacity, draining lazily through the
+        # in_shrink state machine rather than revoking live blocks.
+        "resize": True,
+        # trim() releases pages held by the background pre-allocation thread.
+        "trim": True,
+        # Both values below are read from the environment when
+        # ``kvcached.utils`` is imported, so they describe THIS process, not a
+        # live engine. A control plane importing kvcached out of process sees
+        # its own environment. For the runtime page size of a specific pool,
+        # read ``KVCachePoolSnapshot.page_size_bytes`` instead.
+        "default_page_size_bytes": PAGE_SIZE,
+        "contiguous_layout_default": CONTIGUOUS_LAYOUT,
+        # kvcached accounts for non-KV device memory but never manages it.
+        "non_kv_memory_management": False,
+    }
+
+
+def _get_integration_capabilities() -> Dict[str, Any]:
+    """Report per-engine capabilities.
+
+    Reported statically from the shim contracts in
+    ``kvcached.integration.<engine>.interfaces`` so the record can be queried
+    without importing an engine shim or attaching to a running engine.
+    (Importing ``kvcached`` itself still requires torch; see
+    ``kvcached/__init__.py``.)
+    """
+
+    return {
+        "vllm": {
+            "attention_types": ["MHA", "GQA", "MLA", "HYBRID_LINEAR"],
+            # HND applies to packed K/V; legacy split K/V remains NHD-only.
+            "kv_layouts": ["NHD", "HND"],
+            # Hybrid attention + linear/SSM (mamba) state is carved out of the
+            # same pool via the HYBRID_LINEAR attention type, so that state is
+            # visible in this pool's KVCachePoolSnapshot.
+            "hybrid_linear_state_pooling": True,
+            "hybrid_linear_state_pooling_mode": "unified_pool",
+            # Prefix-cache blocks are evicted page-aware so eviction actually
+            # releases physical memory.
+            "prefix_caching": True,
+            "page_aware_eviction": True,
+            "worker_ipc": True,
+        },
+        "sglang": {
+            "attention_types": ["MHA", "GQA", "MLA"],
+            # Validated for MHA/GQA only; the SGLang shim skips the layout
+            # check for MLA, where the argument is ignored rather than
+            # rejected.
+            "kv_layouts": ["NHD"],
+            # SGLang allocates mamba/linear state through a separate
+            # alloc_mamba_states() entry point rather than the KV pool, so
+            # that state does NOT appear in this pool's KVCachePoolSnapshot.
+            "hybrid_linear_state_pooling": True,
+            "hybrid_linear_state_pooling_mode": "separate_allocation",
+            "prefix_caching": True,
+            "page_aware_eviction": False,
+            "worker_ipc": True,
+        },
+    }
+
+
+def get_capabilities() -> Dict[str, Any]:
+    """Return the stable extension surface currently exposed by kvcached.
+
+    Consumers should feature-detect against this record rather than pinning a
+    kvcached version or inspecting private allocator/patch attributes.
+
+    Compatibility rule: new optional keys are added without bumping
+    ``schema_version``, so a consumer must treat a missing key as "unsupported"
+    rather than an error. ``schema_version`` only changes when the meaning of
+    an existing key changes incompatibly.
+
+    ``features`` reports surfaces that either exist or are known-planned; a
+    surface that has not landed yet is reported ``False`` instead of being
+    omitted, so a consumer can write the detection once and have it start
+    returning ``True`` when the surface ships.
+    """
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "features": {
+            "runtime_snapshot": True,
+            "kv_cache_pool_snapshot": True,
+            "registered_kv_cache_pool_snapshots": True,
+            "read_only": True,
+            "policy_control": False,
+            # Revisioned instance memory limits. This is the one write path on
+            # the surface: the caller owns quota policy, kvcached only stores
+            # and enforces the assigned cap through the resize()/in_shrink
+            # state machine.
+            "instance_memory_limit": True,
+            # Allocator-owned operation counters. Not landed yet.
+            "operation_counters": False,
+            # Runtime reservation reporting for non-KV memory. Not landed yet.
+            "runtime_reservation_reporting": False,
+            # Poll-only lifecycle readiness (#375, item 5): every pool exposes
+            # ``lifecycle_phase``, ``lifecycle_error`` and ``wait_ready()``,
+            # and ``KVCachePoolSnapshot.lifecycle_phase`` carries the phase.
+            "lifecycle_readiness": True,
+        },
+        "backends": _get_backend_capabilities(),
+        "integrations": _get_integration_capabilities(),
+        "pool_snapshot_fields": list(KVCachePoolSnapshot.__dataclass_fields__.keys()),
+        "runtime_snapshot_fields": list(RuntimeSnapshot.__dataclass_fields__.keys()),
+        # Names the counters exposed once operation observability lands. Kept
+        # coupled to features["operation_counters"]: this list is non-empty if
+        # and only if that flag is True.
+        "operation_counter_names": [],
+    }
+
+
+def build_runtime_snapshot(
+    *,
+    engine: str,
+    initialized: bool,
+    device: Optional[str],
+    world_size: int,
+    pp_rank: int,
+    async_sched: bool,
+    contiguous_layout: bool,
+    is_worker: Optional[bool] = None,
+) -> RuntimeSnapshot:
+    return RuntimeSnapshot(
+        schema_version=SCHEMA_VERSION,
+        engine=engine,
+        initialized=initialized,
+        device=device,
+        world_size=world_size,
+        pp_rank=pp_rank,
+        async_sched=async_sched,
+        contiguous_layout=contiguous_layout,
+        is_worker=is_worker,
+    )
+
+
+def build_kv_cache_pool_snapshot(
+    manager: Any,
+    *,
+    integration: Optional[str] = None,
+) -> KVCachePoolSnapshot:
+    """Build a read-only snapshot from a ``KVCacheManager``-like object."""
+
+    allocator = manager.page_allocator
+    page_state_fn = getattr(allocator, "get_page_state", None)
+    page_state = page_state_fn() if callable(page_state_fn) else None
+    if page_state is None:
+        total_pages = _call_int(allocator, "get_num_total_pages")
+        free_pages = _call_int(allocator, "get_num_free_pages")
+        inuse_pages = _call_int(allocator, "get_num_inuse_pages")
+        reserved_pages = _call_int(allocator, "get_num_reserved_pages")
+    else:
+        total_pages = int(page_state["total_pages"])
+        free_pages = int(page_state["free_pages"])
+        inuse_pages = int(page_state["inuse_pages"])
+        reserved_pages = int(page_state["reserved_pages"])
+    available_physical_pages = _call_int(allocator, "get_avail_physical_pages")
+    if free_pages is None or reserved_pages is None or available_physical_pages is None:
+        effective_free_pages = None
+    else:
+        effective_free_pages = min(free_pages, available_physical_pages + reserved_pages)
+
+    num_layers = _int_attr(manager, "num_layers") or 0
+    num_kv_buffers = _int_attr(manager, "num_kv_buffers") or 0
+    if page_state is None or inuse_pages is None:
+        mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
+    else:
+        mapped_bytes = (
+            inuse_pages
+            * (_int_attr(manager, "page_size") or 0)
+            * num_layers
+            * num_kv_buffers
+        )
+    # manager.mem_size is the virtual reservation for ONE KV buffer of ONE
+    # layer -- K (or V) for MHA, the single combined buffer for MLA -- which
+    # is why the total scales by both num_layers and num_kv_buffers. Scale by
+    # num_kv_buffers here so the exported field means what its name says: all
+    # KV buffers of one layer.
+    virtual_bytes_per_buffer = _int_attr(manager, "mem_size") or 0
+    virtual_per_layer_bytes = virtual_bytes_per_buffer * num_kv_buffers
+    block_size_bytes = _int_attr(manager, "block_mem_size") or 0
+    bytes_per_block = block_size_bytes * num_layers * num_kv_buffers
+    # available_size() reads three allocator getters at three separate instants
+    # and never consults get_page_state(), so it can report an inconsistent
+    # total no matter which native extension is loaded. #436 also observed it
+    # returning a negative value, and that cause has not been established. A
+    # negative gauge is never meaningful to an exporter, so clamp at zero.
+    try:
+        available_blocks = max(int(manager.available_size()), 0)
+    except StateConsistencyError:
+        # The free-page getter behind available_size() fail-closes on a
+        # FAILED pool (PageAllocator::throw_if_failed), and the snapshot is
+        # the documented polling path, so it must keep reporting such a pool
+        # rather than raise at the poller (#478 review). Nothing is
+        # obtainable from a failed pool, so the gauge reports zero; the
+        # page-count fields above keep whatever the allocator still answers.
+        # Allocation paths call available_size() directly and keep raising.
+        # On a KVCacheManager the call has already recorded the verdict
+        # (_record_native_fatal), so the lifecycle_phase exported below
+        # reports the failure this snapshot just observed.
+        available_blocks = 0
+    allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
+    reserved_blocks = len(getattr(manager, "reserved_blocks", []))
+
+    return KVCachePoolSnapshot(
+        schema_version=SCHEMA_VERSION,
+        pool_type="kv_cache",
+        integration=integration,
+        pool_name=getattr(manager, "pool_name", None),
+        group_id=_int_attr(manager, "group_id") or 0,
+        num_layers=num_layers,
+        num_kv_buffers=num_kv_buffers,
+        page_size_bytes=_int_attr(manager, "page_size") or 0,
+        block_size_bytes=block_size_bytes,
+        total_blocks=_int_attr(manager, "num_blocks") or 0,
+        available_blocks=available_blocks,
+        allocated_blocks=allocated_blocks,
+        reserved_blocks=reserved_blocks,
+        available_bytes=available_blocks * bytes_per_block,
+        allocated_bytes=allocated_blocks * bytes_per_block,
+        reserved_bytes=reserved_blocks * bytes_per_block,
+        null_block_reserved=getattr(manager, "null_block", None) is not None,
+        virtual_per_layer_bytes=virtual_per_layer_bytes,
+        virtual_total_bytes=virtual_per_layer_bytes * num_layers,
+        mapped_bytes=mapped_bytes,
+        total_pages=total_pages,
+        free_pages=free_pages,
+        inuse_pages=inuse_pages,
+        reserved_pages=reserved_pages,
+        available_physical_pages=available_physical_pages,
+        effective_free_pages=effective_free_pages,
+        in_shrink=bool(getattr(manager, "in_shrink", False)),
+        shrink_target_blocks=getattr(manager, "target_num_blocks", None),
+        resize_target_bytes=_call_int(allocator, "get_resize_target"),
+        lifecycle_phase=_lifecycle_phase_value(manager),
+    )
+
+
+def _snapshot_one_pool(
+    manager: Any,
+    integration: Optional[str],
+) -> KVCachePoolSnapshot:
+    """Snapshot one pool through its own synchronized entry point.
+
+    ``KVCacheManager.observability_snapshot()`` is ``@synchronized``, so the
+    whole snapshot is taken under a single hold of the manager lock (the
+    nested per-accessor acquisitions are reentrant). Calling
+    ``build_kv_cache_pool_snapshot()`` directly instead takes the lock once
+    per accessor, which lets a writer commit in the gaps and stitches the
+    result together from several different instants.
+
+    Fall back to the module-level builder for the duck-typed manager-likes
+    that ``build_kv_cache_pool_snapshot`` is documented to accept.
+    """
+    take_snapshot = getattr(manager, "observability_snapshot", None)
+    if take_snapshot is None:
+        return build_kv_cache_pool_snapshot(manager, integration=integration)
+    return take_snapshot(integration=integration)
+
+
+def get_registered_kv_cache_pool_snapshots(
+    *,
+    integration: Optional[str] = None,
+) -> List[KVCachePoolSnapshot]:
+    """Return snapshots of currently live registered KV pools."""
+
+    snapshots = []
+    for manager, registered_integration in get_registered_kv_cache_pools(
+        integration=integration
+    ):
+        snapshots.append(
+            _snapshot_one_pool(manager, registered_integration)
+        )
+    return sorted(
+        snapshots,
+        key=lambda snapshot: (
+            snapshot.integration or "",
+            snapshot.pool_name or "",
+            snapshot.group_id,
+        ),
+    )
+
+
+def get_registered_kv_cache_pool_snapshot_dicts(
+    *,
+    integration: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable snapshots of currently live registered KV pools."""
+
+    return [
+        snapshot.to_dict()
+        for snapshot in get_registered_kv_cache_pool_snapshots(integration=integration)
+    ]

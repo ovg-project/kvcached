@@ -112,6 +112,18 @@ curl "http://localhost:8080/action/wakeup/meta-llama%2FLlama-3.2-1B" -X POST
 curl http://localhost:8080/sleep/candidates
 ```
 
+To let running vLLM requests finish before sleep, configure:
+
+```yaml
+sleep_manager:
+  vllm_sleep_mode: wait
+  vllm_sleep_timeout_seconds: 120
+```
+
+These settings apply to all vLLM models in the controller; defaults are `abort` and a 30-second HTTP timeout. `frontend.py --vllm-sleep-mode wait` overrides the YAML mode.
+
+`wait` requires vLLM >= 0.17.0 with V1 multiprocessing and [sleep mode enabled](https://docs.vllm.ai/en/latest/features/sleep_mode/#online-serving). It drains running requests, not queued ones. Allow enough timeout for draining and offload; an HTTP timeout does not cancel remote sleep.
+
 ### Note: URL Encoding for Model Names
 When using endpoints with model names containing slashes (e.g., `meta-llama/Llama-3.2-1B`), URL encode the slashes:
 * Original: `meta-llama/Llama-3.2-1B`

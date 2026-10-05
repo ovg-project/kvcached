@@ -4,6 +4,31 @@
 import importlib.util
 import logging
 import os
+import threading
+import uuid
+from typing import BinaryIO, Optional
+
+
+class KVCachedConfigError(RuntimeError):
+    """Raised for kvcached misconfiguration the user must fix (e.g. a KV block
+    larger than the page size). Integration patches re-raise this loudly to
+    abort startup instead of silently falling back to non-kvcached behavior."""
+
+
+class KVCachePoolExhausted(ValueError):
+    """Raised when the shared physical KV pool cannot back an allocation.
+
+    This is a transient condition, not a defect: colocated engines share one
+    physical pool, so a peer can take the last pages between the moment
+    availability is observed and the moment the pages are claimed. Serving
+    engines already know how to respond -- free something and try again -- so
+    integrations translate this into whatever "cannot allocate right now"
+    signal their engine understands, rather than letting it terminate the
+    process.
+
+    It subclasses ValueError so callers written against the pre-existing
+    behavior keep working.
+    """
 
 
 def _sanitize_segment(segment: str) -> str:
@@ -47,6 +72,14 @@ def _obtain_default_ipc_name() -> str:
     single segment, while separate launches get distinct names.
     """
 
+    explicit = os.getenv("KVCACHED_IPC_NAME")
+    if explicit:
+        # An explicit IPC name is a contract between all processes in one
+        # serving instance.  Treat it as exact after SHM-safe sanitization: do
+        # not probe or auto-suffix it, because late-importing TP workers must
+        # still join the same namespace.
+        return _sanitize_segment(explicit)
+
     engine_tag = _detect_engine_tag()
     try:
         group_id = os.getpgid(0)
@@ -55,24 +88,6 @@ def _obtain_default_ipc_name() -> str:
             group_id = os.getsid(0)
         except Exception:
             group_id = os.getpid()
-
-    explicit = os.getenv("KVCACHED_IPC_NAME")
-    if explicit:
-        preferred = _sanitize_segment(explicit)
-
-        if not _ipc_segment_exists(preferred):
-            return preferred
-
-        base_candidate = f"{preferred}_{engine_tag}_{group_id}"
-        if not _ipc_segment_exists(base_candidate):
-            return base_candidate
-        # As a last resort, append a small numeric suffix until unique
-        for i in range(1, 100):
-            candidate = f"{base_candidate}_{i}"
-            if not _ipc_segment_exists(candidate):
-                return candidate
-        # If everything somehow exists, fall back to PID-specific name
-        return f"{base_candidate}_{os.getpid()}"
 
     # No explicit override: start from conventional base and ensure uniqueness
     base = "kvcached"
@@ -120,6 +135,26 @@ def _get_page_size() -> int:
 
 PAGE_SIZE = _get_page_size()
 
+
+def get_page_size_for_block(block_mem_size: int, configured_page_size: int) -> int:
+    """Resolve a KV pool's page size without changing process-wide defaults.
+
+    Explicit page settings keep their existing validation behavior. Resolve
+    from the final block geometry in both the scheduler and worker, before
+    constructing the manager or its backing tensors.
+    """
+    if (block_mem_size <= configured_page_size
+            or os.getenv("KVCACHED_PAGE_SIZE_MB") is not None):
+        return configured_page_size
+    from kvcached.kv_geometry import select_page_size
+
+    page_size = select_page_size(block_mem_size)
+    get_kvcached_logger().info(
+        "Default kvcached page (%d bytes) cannot hold the KV block (%d bytes); "
+        "using %d-byte pages for this pool", configured_page_size,
+        block_mem_size, page_size)
+    return page_size
+
 # Configuration constants for KVCacheManager
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
 PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
@@ -139,11 +174,103 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 # Used by both SGLang (RadixCacheLimitPatch) and vLLM (ElasticBlockPool),
 # which converts to blocks internally via MAX_CACHED_TOKENS // block_size.
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
-CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
-                              "true").lower() == "true"
+
+
+def _default_contiguous_layout() -> bool:
+    """Default KV-cache layout: contiguous on CUDA, non-contiguous on HIP/ROCm.
+
+    An explicit ``KVCACHED_CONTIGUOUS_LAYOUT`` always wins. Otherwise we pick
+    non-contiguous on ROCm: the contiguous (compound-page) layout hands the
+    attention backend strided/interleaved per-layer KV tensors, which vLLM's
+    ROCm attention path (``split_kv_cache`` + paged kernels) reads incorrectly,
+    whereas CUDA's FlashAttention/FlashInfer tolerate it.
+    """
+    explicit = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT")
+    if explicit is not None:
+        return explicit.lower() == "true"
+    try:
+        import torch
+        if getattr(torch.version, "hip", None):
+            return False  # ROCm/HIP: non-contiguous is required for correctness
+    except Exception:
+        pass
+    return True
+
+
+CONTIGUOUS_LAYOUT = _default_contiguous_layout()
 
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
+
+# Root of the per-instance TP worker socket directories (kvcached.tp_ipc_util).
+# The naming rule lives here, next to the IPC name, so tools that never load
+# the compiled extension (kvctl) can derive the directory from an IPC name.
+TP_SOCKET_DIR_ROOT = "/tmp"
+
+
+def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
+    """Return the TP worker socket directory for *ipc_name* (default: this
+    instance's DEFAULT_IPC_NAME).
+
+    The directory keeps the IPC name readable and appends a short
+    deterministic hash, so every worker of one engine instance agrees on it.
+    Unix domain socket paths are limited to 108 characters on Linux; the
+    caller validates the final socket path length.
+    """
+    name = DEFAULT_IPC_NAME if ipc_name is None else ipc_name
+    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, name).hex[:8]
+    return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
+
+
+class IPCSegmentCleanup:
+    """Remember one segment across teardown and retry only its failed unlink.
+
+    Capture before stopping the engine: it may remove its own segment during
+    shutdown. The open file pins the inode, so a later file at the same path
+    cannot inherit its identity. No contents are read or modified. This is
+    a replacement check, not a lock against concurrent instance startup.
+    """
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        self._lock = threading.Lock()
+        self._file: Optional[BinaryIO]
+        try:
+            self._file = open(segment, "rb")
+        except FileNotFoundError:
+            self._file = None
+
+    def unlink(self) -> bool:
+        """Return True when done; keep the original file open on failure."""
+        with self._lock:
+            return self._unlink()
+
+    def _unlink(self) -> bool:
+        if self._file is None:
+            return True
+        try:
+            current = os.stat(self.segment)
+            original = os.fstat(self._file.fileno())
+            if os.path.samestat(current, original):
+                os.unlink(self.segment)
+                get_kvcached_logger().info(
+                    "Unlinked KV cache limit segment %s", self.segment)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            get_kvcached_logger().warning(
+                "Failed to unlink %s on shutdown: %s", self.segment, e)
+            return False
+        self._file.close()
+        self._file = None
+        return True
+
+    def close(self) -> None:
+        """Discard an unconfirmed identity without deleting anything."""
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")
@@ -156,6 +283,19 @@ _LEVEL_TO_COLOR = {
     logging.CRITICAL: "\033[35m",  # Magenta
 }
 _COLOR_RESET = "\033[0m"
+
+
+def normalize_gpu_device(device: str) -> str:
+    """Map a ``hip[:N]`` device string to ``cuda[:N]``.
+
+    PyTorch-ROCm and the C++ extension (``c10::Device``) address AMD GPUs as
+    ``cuda``; kvcached's integration accepts ``hip`` strings, so normalize them
+    before handing the device to any ``torch.cuda`` API or ``create_kv_tensors``.
+    """
+    dev = str(device)
+    if dev.lower().startswith("hip"):
+        return "cuda" + dev[3:]
+    return dev
 
 
 def align_to(x: int, a: int) -> int:

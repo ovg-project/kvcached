@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -14,9 +15,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-#include <cuda_runtime.h>
-#include <torch/extension.h>
 
 #include "constants.hpp"
 #include "mem_info_tracker.hpp"
@@ -29,7 +27,20 @@ using BroadcastMapCallback =
     std::function<void(int64_t, const std::vector<offset_t> &)>;
 using BroadcastUnmapCallback =
     std::function<void(int64_t, const std::vector<offset_t> &)>;
-using ShouldUseWorkerIpcCallback = std::function<bool()>;
+
+struct PageState {
+  int64_t total_pages;
+  int64_t free_pages;
+  int64_t inuse_pages;
+  int64_t reserved_pages;
+};
+
+struct TransactionState {
+  std::vector<page_id_t> quarantined_page_ids;
+  std::string last_error;
+  bool failed;
+  int64_t retained_bytes_upper_bound;
+};
 
 // Independent InternalPage class
 class InternalPage {
@@ -77,9 +88,15 @@ public:
 
   // Status queries
   int64_t get_num_free_pages() const;
+  // Approximate. Reads num_total_pages_ and num_free_pages_ as two separate
+  // relaxed loads, so a concurrent resize() can land between them; expansion
+  // bumps num_free_pages_ before num_total_pages_, which can make this return
+  // a negative. Use get_page_state() when the value has to be consistent.
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
+  PageState get_page_state() const;
+  TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
@@ -105,11 +122,19 @@ public:
   // Thread management
   void start_prealloc_thread();
   void stop_prealloc_thread();
+  // Call only after stopping users of the shared segment.
+  bool release_shared_segment() { return mem_info_tracker_->release_segment(); }
 
   // Callback function setters for multi-process support
   void set_broadcast_map_callback(BroadcastMapCallback callback);
   void set_broadcast_unmap_callback(BroadcastUnmapCallback callback);
-  void set_should_use_worker_ipc_callback(ShouldUseWorkerIpcCallback callback);
+  // Whether map/unmap must be broadcast to worker processes over IPC. Python
+  // pushes the decision once at init. A pushed value instead of a pulled
+  // callback keeps every allocator thread (the prealloc worker in particular)
+  // out of Python: calling back into Python needs the GIL, and a thread that
+  // blocks inside this class while some other thread holds the GIL forever is
+  // exactly the deadlock of issue #371.
+  void set_use_worker_ipc(bool use_worker_ipc);
 
 private:
   // Preallocation thread worker
@@ -121,15 +146,22 @@ private:
   // Internal methods
   void map_pages(const std::vector<page_id_t> &page_ids);
   void unmap_pages(const std::vector<page_id_t> &page_ids);
-  void update_memory_usage();
+  int64_t get_num_inuse_pages_unlocked() const;
+  PageState get_page_state_unlocked() const;
+  void update_memory_usage_unlocked();
   void trigger_preallocation();
   void start_prealloc_thread_internal();
   void stop_prealloc_thread_internal();
   bool should_use_worker_ipc() const;
+  void throw_if_failed() const;
+  void quarantine_pages_unlocked(const std::vector<page_id_t> &page_ids,
+                                 const std::string &reason);
+  void fail_pool(const std::string &reason);
 
   // Configuration
   int64_t num_layers_;
-  int64_t mem_size_per_layer_;
+  // Last controller quota, read and updated only by the resize watcher.
+  int64_t last_observed_mem_size_;
   int64_t page_size_;
   int64_t world_size_;
   int64_t pp_rank_;
@@ -141,13 +173,16 @@ private:
   double gpu_utilization_;
 
   // Memory tracking
-  int64_t num_free_pages_;
-  int64_t num_total_pages_;
+  std::atomic<int64_t> num_free_pages_;
+  std::atomic<int64_t> num_total_pages_;
 
   // Page lists
   std::deque<page_id_t> free_page_list_;
   std::deque<page_id_t> reserved_page_list_;
   std::deque<page_id_t> reclaimed_page_list_;
+  std::vector<page_id_t> quarantined_page_ids_;
+  std::string transaction_error_;
+  std::atomic<bool> transaction_failed_{false};
 
   // Preallocation settings
   int64_t min_reserved_pages_;
@@ -155,9 +190,18 @@ private:
 
   // Thread management
   mutable std::mutex lock_;
+  // Serializes this pool's IPC transactions, not allocation across instances.
+  // Never acquire while holding lock_; Python callbacks may acquire the GIL.
+  std::mutex transaction_lock_;
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;
+  // Serializes start/stop of the background threads. Before the blocking
+  // bindings released the GIL, concurrent start and stop callers were
+  // accidentally serialized by the GIL itself; they no longer are, so the
+  // thread handles need their own lock. Held across join(): the workers
+  // never take this lock, so no cycle.
+  std::mutex thread_ctl_lock_;
   std::unique_ptr<std::thread> prealloc_thread_;
 
   // Resize watcher thread
@@ -172,7 +216,7 @@ private:
   // Callback functions for multi-process support
   BroadcastMapCallback broadcast_map_callback_;
   BroadcastUnmapCallback broadcast_unmap_callback_;
-  ShouldUseWorkerIpcCallback should_use_worker_ipc_callback_;
+  std::atomic<bool> use_worker_ipc_{false};
 };
 
 } // namespace kvcached

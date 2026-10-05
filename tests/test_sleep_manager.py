@@ -10,6 +10,11 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Dict, List
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 # Add the controller directory to the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -20,6 +25,17 @@ from test_utils import load_example_config
 from controller.sleep_manager import SleepConfig, SleepManager
 from controller.traffic_monitor import TrafficMonitor
 from controller.utils import extract_models_mapping
+
+
+def _make_manager() -> SleepManager:
+    return SleepManager(SleepConfig(), traffic_monitor=TrafficMonitor())
+
+
+@pytest.fixture
+def manager() -> SleepManager:
+    """Fresh SleepManager for each test (the script path in main() shares one
+    manager across steps instead)."""
+    return _make_manager()
 
 
 def load_config_models():
@@ -54,10 +70,7 @@ async def test_basic_functionality():
     """Test basic SleepManager functionality"""
     print("=== Testing Basic Functionality ===")
 
-    # Create sleep manager with default config
-    config = SleepConfig()
-    traffic_monitor = TrafficMonitor()
-    manager = SleepManager(config, traffic_monitor=traffic_monitor)
+    manager = _make_manager()
 
     print("✓ SleepManager created successfully")
     print(f"  Auto sleep enabled: {manager.config.auto_sleep_enabled}")
@@ -65,7 +78,10 @@ async def test_basic_functionality():
     print(f"  Wake on request: {manager.config.wakeup_on_request}")
     print(f"  Min sleep duration: {manager.config.min_sleep_duration}s")
 
-    return manager
+    assert manager.config.auto_sleep_enabled is False
+    assert manager.config.idle_threshold_seconds == 300
+    assert manager.config.wakeup_on_request is True
+    assert manager.config.min_sleep_duration == 60
 
 
 async def test_real_vllm_instances(manager):
@@ -85,7 +101,9 @@ async def test_real_vllm_instances(manager):
     for model_name, config in models.items():
         print(f"  {model_name}: {config['host']}:{config['port']}")
 
-    return models
+    assert len(models) == len(vllm_models)
+    for model_info in vllm_models:
+        assert model_info["name"] in models
 
 
 async def test_sglang_configuration(manager):
@@ -105,14 +123,16 @@ async def test_sglang_configuration(manager):
     for model_name, config in sglang_models.items():
         print(f"  {model_name}: {config['host']}:{config['port']}")
 
+    assert len(sglang_models) == len(sglang_models_config)
+
     # Test removing a model (but don't remove the one we need for testing)
     test_remove_model = 'test-remove-model'
     manager.add_sglang_model(test_remove_model, 'localhost', '30001')
+    assert test_remove_model in manager.get_sglang_models()
     manager.remove_sglang_model(test_remove_model)
     sglang_models = manager.get_sglang_models()
     print(f"✓ After removal test, {len(sglang_models)} SGLang models remain")
-
-    return sglang_models
+    assert test_remove_model not in sglang_models
 
 
 async def test_sleep_wake_functionality(manager):
@@ -125,6 +145,8 @@ async def test_sleep_wake_functionality(manager):
         print("⚠ No vLLM models found in config, skipping sleep/wake test")
         return
 
+    for model_info in vllm_models:
+        manager.add_vllm_model(model_info["name"], model_info["host"], model_info["port"])
     test_model = vllm_models[0]["name"]
 
     print(f"Testing sleep/wake cycle for {test_model}")
@@ -187,6 +209,8 @@ async def test_sglang_sleep_wake_functionality(manager):
         print("⚠ No SGLang models found in config, skipping SGLang sleep/wake test")
         return
 
+    for model_info in sglang_models:
+        manager.add_sglang_model(model_info["name"], model_info["host"], model_info["port"])
     test_model = sglang_models[0]["name"]
 
     print(f"Testing SGLang sleep/wake cycle for {test_model}")
@@ -243,9 +267,10 @@ async def test_sleep_state_tracking(manager):
     """Test sleep state tracking functionality"""
     print("\n=== Testing Sleep State Tracking ===")
 
-    # Get sleeping models
+    # Get sleeping models (none on a manager that has not slept anything)
     sleeping_models = manager.get_sleeping_models()
     print(f"✓ Currently sleeping models: {len(sleeping_models)}")
+    assert isinstance(sleeping_models, dict)
 
     if sleeping_models:
         for model_name, info in sleeping_models.items():
@@ -277,31 +302,143 @@ async def test_config_updates(manager):
     print(f"  Idle threshold: {manager.config.idle_threshold_seconds}s")
     print(f"  Min sleep duration: {manager.config.min_sleep_duration}s")
 
+    assert manager.config.auto_sleep_enabled is True
+    assert manager.config.idle_threshold_seconds == 600
+    assert manager.config.min_sleep_duration == 120
+
 
 async def test_api_methods_simulation(manager):
     """Test API method signatures without making actual HTTP calls"""
     print("\n=== Testing API Method Signatures ===")
 
     # These methods would make HTTP calls in real usage
-    # Here we just test that they can be called without syntax errors
-    print("✓ vLLM sleep/wake API methods are properly defined:")
-    print(
-        f"  _call_vllm_sleep_api: {hasattr(manager, '_call_vllm_sleep_api')}")
-    print(f"  _call_vllm_wake_api: {hasattr(manager, '_call_vllm_wake_api')}")
+    # Here we just test that they are properly defined
+    print("✓ vLLM sleep/wake API methods are properly defined")
+    assert hasattr(manager, '_call_vllm_sleep_api')
+    assert hasattr(manager, '_call_vllm_wakeup_api')
 
-    print("✓ SGLang API methods are properly defined:")
-    print(
-        f"  _call_sglang_release_api: {hasattr(manager, '_call_sglang_release_api')}"
-    )
-    print(
-        f"  _call_sglang_resume_api: {hasattr(manager, '_call_sglang_resume_api')}"
-    )
+    print("✓ SGLang API methods are properly defined")
+    assert hasattr(manager, '_call_sglang_release_api')
+    assert hasattr(manager, '_call_sglang_resume_api')
 
-    print("✓ Common API methods:")
-    print(
-        f"  check_model_sleep_status: {hasattr(manager, 'check_model_sleep_status')}"
-    )
-    print(f"  handle_model_wakeup: {hasattr(manager, 'handle_model_wakeup')}")
+    print("✓ Common API methods")
+    assert hasattr(manager, 'check_model_sleep_status')
+    assert hasattr(manager, 'handle_model_wakeup_on_request')
+
+
+async def test_concurrent_sleep_calls_issue_one_upstream_request(manager,
+                                                                 monkeypatch):
+    manager.add_vllm_model("model")
+    release = asyncio.Event()
+    calls = 0
+
+    async def sleep_api(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_sleep_api", sleep_api)
+
+    first = asyncio.create_task(manager.put_model_to_sleep("model"))
+    second = asyncio.create_task(manager.put_model_to_sleep("model"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    assert calls == 1
+
+
+async def test_concurrent_wakeup_calls_issue_one_upstream_request(manager,
+                                                                  monkeypatch):
+    manager.add_vllm_model("model")
+    manager.sleeping_models["model"] = 0
+    manager.config.min_sleep_duration = 0
+    release = asyncio.Event()
+    calls = 0
+
+    async def wakeup_api(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_wakeup_api", wakeup_api)
+
+    first = asyncio.create_task(manager.wakeup_model("model"))
+    second = asyncio.create_task(manager.wakeup_model("model"))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    assert calls == 1
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+async def test_concurrent_request_wakeups_both_succeed(manager, monkeypatch, engine):
+    """Requests waiting for another wakeup must proceed without repeating it."""
+    getattr(manager, f"add_{engine}_model")("model")
+    manager.sleeping_models["model"] = 0
+    manager.config.min_sleep_duration = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    second_entered = asyncio.Event()
+    calls = []
+    wakeup_model = manager.wakeup_model
+    requests = 0
+
+    async def tracked_wakeup(model_name):
+        nonlocal requests
+        requests += 1
+        if requests == 2:
+            second_entered.set()
+        return await wakeup_model(model_name)
+
+    async def wakeup_api(*_args, **_kwargs):
+        calls.append("wake")
+        entered.set()
+        await release.wait()
+        return True
+
+    async def recovery(*_args, **_kwargs):
+        calls.append("recovery")
+        return True
+
+    monkeypatch.setattr(manager, "wakeup_model", tracked_wakeup)
+    api = "_call_vllm_wakeup_api" if engine == "vllm" else "_call_sglang_resume_api"
+    monkeypatch.setattr(manager, api, wakeup_api)
+    monkeypatch.setattr(manager, "_perform_sglang_model_recovery", recovery)
+    first = asyncio.create_task(manager.handle_model_wakeup_on_request("model"))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = asyncio.create_task(manager.handle_model_wakeup_on_request("model"))
+        await asyncio.wait_for(second_entered.wait(), timeout=5)
+        release.set()
+        assert await asyncio.wait_for(asyncio.gather(first, second), timeout=5) == [True, True]
+    finally:
+        release.set()
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (first, second) if task is not None),
+                             return_exceptions=True)
+
+    assert calls == (["wake"] if engine == "vllm" else ["wake", "recovery"])
+    assert not manager.is_model_sleeping("model")
+
+
+async def test_request_wakeup_still_reports_upstream_failure(manager, monkeypatch):
+    manager.add_vllm_model("model")
+    manager.sleeping_models["model"] = 0
+    manager.config.min_sleep_duration = 0
+
+    async def failed_wakeup(*_args):
+        return False
+
+    monkeypatch.setattr(manager, "_call_vllm_wakeup_api", failed_wakeup)
+    assert not await manager.handle_model_wakeup_on_request("model")
+    assert manager.is_model_sleeping("model")
 
 
 async def test_sglang_api_methods_simulation(manager):
@@ -310,19 +447,50 @@ async def test_sglang_api_methods_simulation(manager):
 
     # Test configuration methods
     print("✓ SGLang model management methods:")
-    print(f"  add_sglang_model: {hasattr(manager, 'add_sglang_model')}")
-    print(f"  remove_sglang_model: {hasattr(manager, 'remove_sglang_model')}")
-    print(f"  get_sglang_models: {hasattr(manager, 'get_sglang_models')}")
+    assert hasattr(manager, 'add_sglang_model')
+    assert hasattr(manager, 'remove_sglang_model')
+    assert hasattr(manager, 'get_sglang_models')
 
     # Test model detection logic
     sglang_models = MODELS_CONFIG["sglang"]
     if sglang_models:
+        for model_info in sglang_models:
+            manager.add_sglang_model(model_info["name"], model_info["host"],
+                                     model_info["port"])
         test_model = sglang_models[0]["name"]
         print(f"\n✓ Model type detection for '{test_model}':")
         is_sglang = test_model in manager.config.sglang_models_config
         print(f"  Detected as SGLang model: {is_sglang}")
+        assert is_sglang
     else:
         print("\n⚠ No SGLang models found in config, skipping model detection test")
+
+
+@pytest.mark.parametrize("mode", ["abort", "wait"])
+async def test_vllm_sleep_level_is_sent_as_query_parameter(manager, mode):
+    """vLLM's /sleep route reads ``level`` from the query string and never
+    parses the body (``raw_request.query_params.get("level", "1")``), so the
+    level must travel as a query parameter or the engine always sleeps at
+    level 1 (issue #475). The fake server below mirrors the vLLM handler."""
+    seen: Dict[str, object] = {}
+
+    async def sleep(request: web.Request) -> web.Response:
+        seen["level"] = request.query.get("level", "1")
+        seen["mode"] = request.query.get("mode")
+        seen["body"] = await request.text()
+        return web.Response(status=200)
+
+    app = web.Application()
+    app.router.add_post("/sleep", sleep)
+    async with TestServer(app) as server:
+        manager.config.vllm_sleep_mode = mode
+        ok = await manager._call_vllm_sleep_api(server.host, str(server.port),
+                                                level=2)
+
+    assert ok is True
+    assert seen["level"] == "2"
+    assert seen["mode"] == mode
+    assert seen["body"] == ""
 
 
 async def main():
@@ -332,7 +500,8 @@ async def main():
 
     try:
         # Run all tests
-        manager = await test_basic_functionality()
+        await test_basic_functionality()
+        manager = _make_manager()
 
         # Test vLLM functionality
         await test_real_vllm_instances(manager)
@@ -370,3 +539,64 @@ async def main():
 if __name__ == "__main__":
     success = asyncio.run(main())
     sys.exit(0 if success else 1)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"vllm_sleep_mode": "keep"},
+    {"vllm_sleep_timeout_seconds": 0},
+    {"vllm_sleep_timeout_seconds": float("inf")},
+])
+def test_invalid_sleep_config(overrides):
+    with pytest.raises(ValueError):
+        SleepConfig(**overrides)
+
+
+@pytest.mark.parametrize("settings, expected", [
+    ({}, ("abort", 30)),
+    ({"vllm_sleep_mode": "wait", "vllm_sleep_timeout_seconds": 120}, ("wait", 120)),
+])
+def test_sleep_config_from_yaml(settings, expected):
+    from controller.frontend import _extract_sleep_config
+
+    config = _extract_sleep_config({"sleep_manager": settings})
+    assert (config.vllm_sleep_mode, config.vllm_sleep_timeout_seconds) == expected
+
+
+@pytest.mark.parametrize("yaml_text", ["", "sleep_manager:\n",
+                                     "sleep_manager:\n  vllm_sleep_mode: abort\n"])
+async def test_sleep_mode_cli_overrides_yaml(tmp_path, monkeypatch, yaml_text):
+    from controller import frontend
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("instances: []\n" + yaml_text)
+    factory = Mock()
+    factory.return_value.start = AsyncMock()
+    monkeypatch.setattr(frontend, "MultiLLMFrontend", factory)
+    monkeypatch.setattr(sys, "argv", ["frontend.py", "--config_path", str(config_path),
+                                     "--vllm-sleep-mode", "wait"])
+
+    await frontend.main()
+
+    assert factory.call_args.kwargs["sleep_config"].vllm_sleep_mode == "wait"
+    factory.return_value.start.assert_awaited_once()
+
+
+async def test_vllm_sleep_timeout_applies_to_http_request(manager):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def sleep(request):
+        started.set()
+        await release.wait()
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/sleep", sleep)
+    async with TestServer(app) as server:
+        manager.config = SleepConfig(vllm_sleep_timeout_seconds=0.05)
+        try:
+            ok = await asyncio.wait_for(
+                manager._call_vllm_sleep_api(server.host, str(server.port)), 1)
+            assert started.is_set()
+            assert ok is False
+        finally:
+            release.set()

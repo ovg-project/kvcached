@@ -3,6 +3,8 @@
 
 #include "page_allocator.hpp"
 
+#include <Python.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -12,9 +14,10 @@
 #include <stdexcept>
 
 #include "allocator.hpp"
-#include "cuda_utils.hpp"
+#include "gpu_utils.hpp"
+#include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
-#include "torch_utils.hpp"
+#include "transaction_error.hpp"
 
 namespace kvcached {
 
@@ -107,7 +110,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              bool contiguous_layout, bool enable_page_prealloc,
                              int64_t num_kv_buffers, int64_t group_id,
                              const std::string &ipc_name)
-    : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
+    : num_layers_(num_layers), last_observed_mem_size_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
@@ -115,13 +118,17 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
-      min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
-      max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
+      min_reserved_pages_(std::min(
+          num_free_pages_.load(std::memory_order_relaxed), MIN_RESERVED_PAGES)),
+      max_reserved_pages_(std::min(
+          num_free_pages_.load(std::memory_order_relaxed), MAX_RESERVED_PAGES)),
       prealloc_running_(false), prealloc_needed_(false),
       total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers) {
 
   // Initialize free page list
-  for (int64_t i = 0; i < num_free_pages_; ++i) {
+  const int64_t initial_free_pages =
+      num_free_pages_.load(std::memory_order_relaxed);
+  for (int64_t i = 0; i < initial_free_pages; ++i) {
     free_page_list_.push_back(i);
   }
 
@@ -160,17 +167,21 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
 
   while (page_id == -1) {
+    if (transaction_failed_.load(std::memory_order_acquire)) {
+      throw StateConsistencyError(transaction_error_);
+    }
     // Fast path: allocate from reserved pages
     if (!reserved_page_list_.empty()) {
       page_id = reserved_page_list_.front();
       reserved_page_list_.pop_front();
-      num_free_pages_--;
+      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
       // Trigger preallocation to refill reserved pool if getting low
       if (reserved_page_list_.size() <
@@ -179,7 +190,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
         cond_.notify_all();
       }
 
-      update_memory_usage();
+      update_memory_usage_unlocked();
       auto end_time = std::chrono::steady_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
           end_time - start_time);
@@ -194,11 +205,11 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     if (!free_page_list_.empty()) {
       page_id = free_page_list_.front();
       free_page_list_.pop_front();
-      num_free_pages_--;
+      num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
       break;
     }
 
-    if (num_free_pages_ <= 0) {
+    if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
       throw std::runtime_error("No free pages left");
     }
 
@@ -215,10 +226,19 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   try {
     map_pages({page_id});
+  } catch (const MapQuarantinedError &e) {
+    std::lock_guard<std::mutex> guard(lock_);
+    quarantine_pages_unlocked({page_id}, e.what());
+    throw;
+  } catch (const StateConsistencyError &e) {
+    std::lock_guard<std::mutex> guard(lock_);
+    quarantine_pages_unlocked({page_id}, e.what());
+    transaction_failed_.store(true, std::memory_order_release);
+    throw;
   } catch (const std::exception &e) {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
-    num_free_pages_++;
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
     cond_.notify_all();
     throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
                              ": " + e.what());
@@ -228,7 +248,10 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     trigger_preallocation();
   }
 
-  update_memory_usage();
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    update_memory_usage_unlocked();
+  }
   auto end_time = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
@@ -238,14 +261,15 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 }
 
 void PageAllocator::free_page(page_id_t page_id) {
+  throw_if_failed();
   {
     std::lock_guard<std::mutex> lock(lock_);
-    num_free_pages_++;
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
 
     if (reserved_page_list_.size() < static_cast<size_t>(max_reserved_pages_)) {
       // Fast path: reserve page
       reserved_page_list_.push_back(page_id);
-      update_memory_usage();
+      update_memory_usage_unlocked();
       cond_.notify_all();
       return;
     }
@@ -257,19 +281,21 @@ void PageAllocator::free_page(page_id_t page_id) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.push_back(page_id);
-    update_memory_usage();
+    update_memory_usage_unlocked();
     cond_.notify_all();
   }
 }
 
 void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    num_free_pages_ += page_ids.size();
+    num_free_pages_.fetch_add(static_cast<int64_t>(page_ids.size()),
+                              std::memory_order_relaxed);
     int64_t num_to_reserve = max_reserved_pages_ - reserved_page_list_.size();
 
     if (num_to_reserve > 0) {
@@ -283,7 +309,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       pages_to_unmap.assign(reserve_end, page_ids.end());
 
       if (pages_to_unmap.empty()) {
-        update_memory_usage();
+        update_memory_usage_unlocked();
         cond_.notify_all();
         return;
       }
@@ -299,7 +325,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
     cond_.notify_all();
   }
 
@@ -311,6 +337,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 bool PageAllocator::resize(int64_t new_mem_size) {
+  throw_if_failed();
   int64_t new_num_pages = new_mem_size / page_size_;
 
   std::vector<page_id_t> pages_to_unmap;
@@ -318,14 +345,25 @@ bool PageAllocator::resize(int64_t new_mem_size) {
   {
     std::lock_guard<std::mutex> lock(lock_);
 
-    if (new_num_pages < get_num_inuse_pages()) {
+    // Resizing must not recycle an ID whose physical state is quarantined.
+    if (!quarantined_page_ids_.empty()) {
+      if (new_num_pages == num_total_pages_.load(std::memory_order_relaxed)) {
+        return true;
+      }
+      throw QuarantinedResizeError(
+          "cannot resize a pool with quarantined pages");
+    }
+
+    if (new_num_pages < get_num_inuse_pages_unlocked()) {
       return false;
     }
 
-    if (new_num_pages == num_total_pages_) {
+    const int64_t current_total_pages =
+        num_total_pages_.load(std::memory_order_relaxed);
+    if (new_num_pages == current_total_pages) {
       return true;
-    } else if (new_num_pages > num_total_pages_) {
-      int64_t num_to_expand = new_num_pages - num_total_pages_;
+    } else if (new_num_pages > current_total_pages) {
+      int64_t num_to_expand = new_num_pages - current_total_pages;
 
       // Reuse previously reclaimed pages first
       int64_t num_to_reuse = std::min(
@@ -336,23 +374,23 @@ bool PageAllocator::resize(int64_t new_mem_size) {
           reclaimed_page_list_.pop_front();
         }
         num_to_expand -= num_to_reuse;
-        num_free_pages_ += num_to_reuse;
+        num_free_pages_.fetch_add(num_to_reuse, std::memory_order_relaxed);
       }
 
       // Allocate new pages if needed
       if (num_to_expand > 0) {
-        for (int64_t i = num_total_pages_; i < num_total_pages_ + num_to_expand;
-             ++i) {
+        for (int64_t i = current_total_pages;
+             i < current_total_pages + num_to_expand; ++i) {
           free_page_list_.push_back(i);
         }
-        num_free_pages_ += num_to_expand;
+        num_free_pages_.fetch_add(num_to_expand, std::memory_order_relaxed);
       }
-      num_total_pages_ = new_num_pages;
-      update_memory_usage();
+      num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
+      update_memory_usage_unlocked();
       return true;
     } else {
       // Shrink path
-      int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
+      int64_t num_to_reclaim = current_total_pages - new_num_pages;
 
       if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
         // Need to trim reserved pages first
@@ -369,8 +407,8 @@ bool PageAllocator::resize(int64_t new_mem_size) {
           reclaimed_page_list_.push_back(free_page_list_.back());
           free_page_list_.pop_back();
         }
-        num_free_pages_ -= num_to_reclaim;
-        num_total_pages_ = new_num_pages;
+        num_free_pages_.fetch_sub(num_to_reclaim, std::memory_order_relaxed);
+        num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
         return true;
       }
     }
@@ -381,11 +419,12 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    int64_t num_to_reclaim = num_total_pages_ - new_num_pages;
+    int64_t num_to_reclaim =
+        num_total_pages_.load(std::memory_order_relaxed) - new_num_pages;
 
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
 
     if (free_page_list_.size() < static_cast<size_t>(num_to_reclaim)) {
       return false;
@@ -395,13 +434,14 @@ bool PageAllocator::resize(int64_t new_mem_size) {
       reclaimed_page_list_.push_back(free_page_list_.back());
       free_page_list_.pop_back();
     }
-    num_free_pages_ -= num_to_reclaim;
-    num_total_pages_ = new_num_pages;
+    num_free_pages_.fetch_sub(num_to_reclaim, std::memory_order_relaxed);
+    num_total_pages_.store(new_num_pages, std::memory_order_relaxed);
   }
   return true;
 }
 
 void PageAllocator::trim() {
+  throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
@@ -411,7 +451,7 @@ void PageAllocator::trim() {
     reserved_page_list_.clear();
 
     if (pages_to_unmap.empty()) {
-      update_memory_usage();
+      update_memory_usage_unlocked();
       return;
     }
   }
@@ -423,33 +463,91 @@ void PageAllocator::trim() {
     std::lock_guard<std::mutex> lock(lock_);
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
-    update_memory_usage();
+    update_memory_usage_unlocked();
   }
 }
 
-int64_t PageAllocator::get_num_free_pages() const { return num_free_pages_; }
-
-int64_t PageAllocator::get_num_inuse_pages() const {
-  return num_total_pages_ - num_free_pages_;
+int64_t PageAllocator::get_num_free_pages() const {
+  throw_if_failed();
+  return num_free_pages_.load(std::memory_order_relaxed);
 }
 
-int64_t PageAllocator::get_num_total_pages() const { return num_total_pages_; }
+int64_t PageAllocator::get_num_inuse_pages() const {
+  const int64_t total = num_total_pages_.load(std::memory_order_relaxed);
+  const int64_t free = num_free_pages_.load(std::memory_order_relaxed);
+  return total - free;
+}
+
+int64_t PageAllocator::get_num_total_pages() const {
+  return num_total_pages_.load(std::memory_order_relaxed);
+}
 
 int64_t PageAllocator::get_num_reserved_pages() const {
   std::lock_guard<std::mutex> lock(lock_);
   return reserved_page_list_.size();
 }
 
-int64_t PageAllocator::get_avail_physical_pages() const {
-  size_t avail_phy_mem_size, total_phy_mem_size;
-  cudaMemGetInfo(&avail_phy_mem_size, &total_phy_mem_size);
+PageState PageAllocator::get_page_state() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_page_state_unlocked();
+}
 
-  size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
-  avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+TransactionState PageAllocator::get_transaction_state() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return {quarantined_page_ids_, transaction_error_,
+          transaction_failed_.load(std::memory_order_relaxed),
+          static_cast<int64_t>(quarantined_page_ids_.size()) * page_size_ *
+              num_layers_ * num_kv_buffers_};
+}
+
+void PageAllocator::throw_if_failed() const {
+  if (transaction_failed_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(lock_);
+    throw StateConsistencyError(transaction_error_);
+  }
+}
+
+void PageAllocator::quarantine_pages_unlocked(
+    const std::vector<page_id_t> &page_ids, const std::string &reason) {
+  quarantined_page_ids_.insert(quarantined_page_ids_.end(), page_ids.begin(),
+                               page_ids.end());
+  transaction_error_ = reason;
+  update_memory_usage_unlocked();
+  cond_.notify_all();
+  LOGGER(ERROR, "KV map quarantined %zu unpublished pages: %s", page_ids.size(),
+         reason.c_str());
+}
+
+void PageAllocator::fail_pool(const std::string &reason) {
+  std::lock_guard<std::mutex> lock(lock_);
+  transaction_error_ = reason;
+  transaction_failed_.store(true, std::memory_order_release);
+  cond_.notify_all();
+}
+
+int64_t PageAllocator::get_num_inuse_pages_unlocked() const {
+  return num_total_pages_.load(std::memory_order_relaxed) -
+         num_free_pages_.load(std::memory_order_relaxed);
+}
+
+PageState PageAllocator::get_page_state_unlocked() const {
+  const int64_t total = num_total_pages_.load(std::memory_order_relaxed);
+  const int64_t free = num_free_pages_.load(std::memory_order_relaxed);
+  return PageState{total, free, total - free,
+                   static_cast<int64_t>(reserved_page_list_.size())};
+}
+
+int64_t PageAllocator::get_avail_physical_pages() const {
+  size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
+  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+
+  const size_t headroom =
+      static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
+  const size_t usable_phy_mem_size =
+      saturating_subtract(avail_phy_mem_size, headroom);
 
   // Calculate available pages considering layers and KV buffers
-  int64_t avail_phy_pages = avail_phy_mem_size / page_size_;
+  int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
   return avail_pages_per_layer;
@@ -499,27 +597,41 @@ PageAllocator::group_indices_by_page(const std::vector<int64_t> &indices,
 }
 
 // Callback function setters
+//
+// The swap-then-assign shape in the two setters below is deliberate: these
+// callbacks wrap Python callables, and destroying one acquires the GIL. With
+// the blocking bindings releasing the GIL, destroying a callback while holding
+// lock_ would invert the lock/GIL order against a thread that holds lock_ and
+// needs the GIL -- so the old callback must be destroyed after lock_ is
+// released (when `old` goes out of scope).
 void PageAllocator::set_broadcast_map_callback(BroadcastMapCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  broadcast_map_callback_ = callback;
+  BroadcastMapCallback old;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    old = std::move(broadcast_map_callback_);
+    broadcast_map_callback_ = std::move(callback);
+  }
   LOGGER(INFO, "Broadcast map callback set for PageAllocator (world_size=%ld)",
          world_size_);
 }
 
 void PageAllocator::set_broadcast_unmap_callback(
     BroadcastUnmapCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  broadcast_unmap_callback_ = callback;
+  BroadcastUnmapCallback old;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    old = std::move(broadcast_unmap_callback_);
+    broadcast_unmap_callback_ = std::move(callback);
+  }
   LOGGER(INFO,
          "Broadcast unmap callback set for PageAllocator (world_size=%ld)",
          world_size_);
 }
 
-void PageAllocator::set_should_use_worker_ipc_callback(
-    ShouldUseWorkerIpcCallback callback) {
-  std::lock_guard<std::mutex> lock(lock_);
-  should_use_worker_ipc_callback_ = callback;
-  LOGGER(INFO, "Should-use-worker-ipc callback set for PageAllocator");
+void PageAllocator::set_use_worker_ipc(bool use_worker_ipc) {
+  use_worker_ipc_.store(use_worker_ipc, std::memory_order_release);
+  LOGGER(INFO, "use_worker_ipc set to %d for PageAllocator",
+         static_cast<int>(use_worker_ipc));
 }
 
 void PageAllocator::start_prealloc_thread() {
@@ -541,12 +653,14 @@ void PageAllocator::prealloc_worker() {
     std::unique_lock<std::mutex> lock(lock_);
 
     // Wait until preallocation is needed or thread is stopped
-    while (!prealloc_needed_ && prealloc_running_) {
+    while (!prealloc_needed_ && prealloc_running_ &&
+           !transaction_failed_.load(std::memory_order_acquire)) {
       cond_.wait(lock);
     }
 
     LOGGER(INFO, "prealloc worker triggered...");
-    if (!prealloc_running_) {
+    if (!prealloc_running_ ||
+        transaction_failed_.load(std::memory_order_acquire)) {
       break;
     }
 
@@ -594,10 +708,23 @@ void PageAllocator::prealloc_worker() {
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
                                    pages_to_reserve.end());
-        update_memory_usage();
+        update_memory_usage_unlocked();
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
+      } catch (const MapQuarantinedError &e) {
+        lock.lock();
+        // Pending prealloc pages are still included in the free counter.
+        num_free_pages_.fetch_sub(pages_to_reserve.size(),
+                                  std::memory_order_relaxed);
+        quarantine_pages_unlocked(pages_to_reserve, e.what());
+      } catch (const StateConsistencyError &e) {
+        lock.lock();
+        num_free_pages_.fetch_sub(pages_to_reserve.size(),
+                                  std::memory_order_relaxed);
+        quarantine_pages_unlocked(pages_to_reserve, e.what());
+        transaction_failed_.store(true, std::memory_order_release);
+        break;
       } catch (const std::exception &e) {
         lock.lock();
         free_page_list_.insert(free_page_list_.begin(),
@@ -618,6 +745,8 @@ void PageAllocator::prealloc_worker() {
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+  std::lock_guard<std::mutex> transaction(transaction_lock_);
+  throw_if_failed();
   std::vector<offset_t> offsets;
   offsets.reserve(page_ids.size());
 
@@ -631,22 +760,31 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) && broadcast_map_callback_) {
-    // Multi-process mode: execute map on all TP workers via broadcast callback
-    broadcast_map_callback_(world_size_, offsets);
-  } else {
-    // Single-process mode: directly call FTensorAllocator
-    auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->map_to_kv_tensors(offsets);
-    if (!success) {
-      throw std::runtime_error("Failed to map pages to KV tensors");
+  try {
+    if ((world_size_ > 1 || should_use_worker_ipc()) &&
+        broadcast_map_callback_) {
+      // Multi-process mode: execute map on all TP workers via broadcast
+      // callback
+      broadcast_map_callback_(world_size_, offsets);
+    } else {
+      // Single-process mode: directly call FTensorAllocator
+      auto allocator = FTensorAllocator::global_allocator(group_id_);
+      bool success = allocator->map_to_kv_tensors(offsets);
+      if (!success) {
+        throw std::runtime_error("Failed to map pages to KV tensors");
+      }
     }
+  } catch (const StateConsistencyError &e) {
+    fail_pool(e.what());
+    throw;
   }
 
   LOGGER(INFO, "Mapped %zu pages to KV tensors", page_ids.size());
 }
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+  std::lock_guard<std::mutex> transaction(transaction_lock_);
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
@@ -662,21 +800,30 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) &&
-      broadcast_unmap_callback_) {
-    // Multi-process mode: execute unmap on all TP workers via broadcast
-    // callback
-    broadcast_unmap_callback_(world_size_, offsets);
-  } else {
-    // Need to synchronize CUDA first in async scheduling mode
-    if (async_sched_) {
-      CHECK_RT(cudaDeviceSynchronize());
+  try {
+    if ((world_size_ > 1 || should_use_worker_ipc()) &&
+        broadcast_unmap_callback_) {
+      // Multi-process mode: execute unmap on all TP workers via broadcast
+      // callback
+      broadcast_unmap_callback_(world_size_, offsets);
+    } else {
+      // Need to synchronize first in async scheduling mode
+      if (async_sched_) {
+        CHECK_GPU(gpu_vmm::device_synchronize());
+      }
+      auto allocator = FTensorAllocator::global_allocator(group_id_);
+      bool success = allocator->unmap_from_kv_tensors(offsets);
+      if (!success) {
+        throw std::runtime_error("Failed to unmap pages from KV tensors");
+      }
     }
-    auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->unmap_from_kv_tensors(offsets);
-    if (!success) {
-      throw std::runtime_error("Failed to unmap pages from KV tensors");
-    }
+
+  } catch (const std::exception &e) {
+    // Logical free/trim callers cannot safely resume after a failed release.
+    const std::string reason =
+        std::string("KV unmap could not complete: ") + e.what();
+    fail_pool(reason);
+    throw StateConsistencyError(reason);
   }
 
   auto end_time = std::chrono::steady_clock::now();
@@ -686,10 +833,10 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
          page_ids.size(), duration.count());
 }
 
-void PageAllocator::update_memory_usage() {
+void PageAllocator::update_memory_usage_unlocked() {
   // Calculate currently used physical memory (excluding preallocated pages)
-  int64_t used_phy_mem_size =
-      get_num_inuse_pages() * num_layers_ * page_size_ * num_kv_buffers_;
+  int64_t used_phy_mem_size = get_num_inuse_pages_unlocked() * num_layers_ *
+                              page_size_ * num_kv_buffers_;
   // Calculate physical memory occupied by preallocated pages
   int64_t prealloc_phy_mem_size =
       static_cast<int64_t>(reserved_page_list_.size()) * num_layers_ *
@@ -716,6 +863,7 @@ void PageAllocator::trigger_preallocation() {
 }
 
 void PageAllocator::start_prealloc_thread_internal() {
+  std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (!prealloc_thread_) {
     prealloc_running_ = true;
     prealloc_thread_ =
@@ -733,7 +881,25 @@ void PageAllocator::start_prealloc_thread_internal() {
   }
 }
 
+namespace {
+// Join a thread without holding the GIL. The prealloc worker may be inside a
+// Python broadcast callback waiting for the GIL; joining it while holding the
+// GIL would deadlock. The stop_prealloc_thread binding already releases the
+// GIL, but the destructor runs from Python garbage collection with the GIL
+// held, so release conditionally here.
+void join_without_gil(std::thread &t) {
+  if (PyGILState_Check()) {
+    PyThreadState *state = PyEval_SaveThread();
+    t.join();
+    PyEval_RestoreThread(state);
+  } else {
+    t.join();
+  }
+}
+} // namespace
+
 void PageAllocator::stop_prealloc_thread_internal() {
+  std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
   if (prealloc_thread_) {
     {
       std::lock_guard<std::mutex> lock(lock_);
@@ -741,7 +907,7 @@ void PageAllocator::stop_prealloc_thread_internal() {
       cond_.notify_all();
     }
 
-    prealloc_thread_->join();
+    join_without_gil(*prealloc_thread_);
     prealloc_thread_.reset();
     LOGGER(DEBUG, "Stopped page preallocation thread");
   }
@@ -749,17 +915,17 @@ void PageAllocator::stop_prealloc_thread_internal() {
   // Stop resize watcher thread
   if (resize_watcher_thread_) {
     resize_watcher_running_ = false;
-    resize_watcher_thread_->join();
+    join_without_gil(*resize_watcher_thread_);
     resize_watcher_thread_.reset();
     LOGGER(DEBUG, "Stopped resize watcher thread");
   }
 }
 
 bool PageAllocator::should_use_worker_ipc() const {
-  if (should_use_worker_ipc_callback_) {
-    return should_use_worker_ipc_callback_();
-  }
-  return false;
+  // A plain pushed value: no thread ever needs Python (or the GIL) to answer
+  // this. The decision is fixed once Python calls set_use_worker_ipc() during
+  // KVCacheManager init, before the prealloc thread starts.
+  return use_worker_ipc_.load(std::memory_order_acquire);
 }
 
 void PageAllocator::resize_watcher() {
@@ -771,8 +937,14 @@ void PageAllocator::resize_watcher() {
     }
     if (mem_info_tracker_) {
       int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
-      resize_target_.store(target, std::memory_order_relaxed);
+          last_observed_mem_size_, num_layers_, num_kv_buffers_);
+      if (target >= 0) {
+        // Observe quota changes, including a return to the startup value.
+        // Retain the latest request between polls so allocations can apply
+        // it later, including when an in-use page initially prevents shrink.
+        last_observed_mem_size_ = target;
+        resize_target_.store(target, std::memory_order_relaxed);
+      }
     }
   }
   LOGGER(INFO, "Resize watcher thread stopped");
