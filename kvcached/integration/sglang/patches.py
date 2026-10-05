@@ -19,7 +19,12 @@ from kvcached.integration.version_utils import (
     version_range,
 )
 from kvcached.kv_geometry import backing_blocks_for_capacity
-from kvcached.utils import MAX_CACHED_TOKENS, PAGE_SIZE, get_kvcached_logger
+from kvcached.utils import (
+    MAX_CACHED_TOKENS,
+    PAGE_SIZE,
+    get_kvcached_logger,
+    get_page_size_for_block,
+)
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
@@ -1327,8 +1332,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # excluded at page boundaries, including the null block.
                     logical_num_blocks = math.ceil(size / page_size) + 1
                     block_mem_size = page_size * self.cell_size
+                    physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
                     num_blocks = backing_blocks_for_capacity(
-                        logical_num_blocks, block_mem_size, PAGE_SIZE)
+                        logical_num_blocks, block_mem_size, physical_page_size)
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
                         num_blocks, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,

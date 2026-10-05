@@ -14,14 +14,17 @@ print(f"MLATokenToKVPool class: {MLATokenToKVPool.__name__}")
 assert "Elastic" in MLATokenToKVPool.__name__, "MLA pool was not patched!"
 
 # Include pools whose logical byte count fits but whole-block packing does not.
-size, page_size, backing_blocks, physical_pages = {
-    "small": (1024, 64, 29, 1),
-    "page64": (8192, 64, 143, 5),
-    "packing": (16320, 64, 285, 10),
-    "page32": (8192, 32, 285, 5),
+size, page_size, backing_blocks, physical_pages, kv_lora_rank, physical_page_mb = {
+    "small": (1024, 64, 29, 1, 512, 2),
+    "page64": (8192, 64, 143, 5, 512, 2),
+    "packing": (16320, 64, 285, 10, 512, 2),
+    "page32": (8192, 32, 285, 5, 512, 2),
+    "oversized": (256, 16, 17, 17, 131008, 4),
+    "oversized_packing": (256, 16, 27, 11, 81856, 6),
+    # This case is run with KVCACHED_PAGE_SIZE_MB=6.
+    "oversized_explicit": (256, 16, 26, 17, 131008, 6),
 }[os.environ.get("KVCACHED_TEST_MLA_CAPACITY", "small")]
 dtype = torch.bfloat16
-kv_lora_rank = 512
 qk_rope_head_dim = 64
 layer_num = 4        # test with few layers
 device = "cuda:0"
@@ -48,6 +51,7 @@ try:
         allocator = pool.kvcached_allocator
         assert allocator._post_init_done.wait(timeout=10.0)
         assert allocator.null_block == [0]
+        assert allocator.page_size == physical_page_mb * 1024 * 1024
         assert allocator.num_blocks == backing_blocks
         assert allocator.page_allocator.get_num_total_pages() == physical_pages
 

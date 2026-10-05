@@ -84,4 +84,5 @@ def test_sglang_keeps_real_tp_size_for_ipc_but_owns_pool_locally(
         "pool_name": None,
         "logical_num_blocks": None,
         "own_segment": True,
+        "page_size": interfaces.PAGE_SIZE,
     }
