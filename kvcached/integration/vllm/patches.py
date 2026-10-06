@@ -727,6 +727,24 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+                from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+                self._page_eviction = (
+                    PageEvictionIndex(self.kv_cache_manager)
+                    if enable_caching and getattr(self.kv_cache_manager, "page_allocator", None) is not None
+                    else None
+                )
+
+            def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
+                block = self._evictable_blocks.pop(block_id, None)
+                if block is not None and self._page_eviction is not None:
+                    self._page_eviction.remove(block_id)
+                return block
+
+            def _free_block_ids(self, block_ids: list[int]) -> None:
+                self.kv_cache_manager.free(block_ids)
+                if self._page_eviction is not None:
+                    self._page_eviction.changed(block_ids)
 
             def _get_one_cached_block(self, key: Any) -> Optional[KVCacheBlock]:
                 blocks = self._cached_blocks.get(key)
@@ -882,33 +900,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 can empty outright, cheapest first; draining a page only part of
                 the way costs hit rate and frees nothing.
                 """
-                mgr = self.kv_cache_manager
-                allocator = getattr(mgr, "page_allocator", None)
-                if allocator is None:
+                if (self._page_eviction is None
+                        or getattr(self.kv_cache_manager, "page_allocator", None) is None):
                     return []
-
-                bids = list(self._evictable_blocks)
-                by_page = allocator.group_indices_by_page(
-                    bids, mgr.block_mem_size)
-                # Blocks held by running requests are absent from
-                # _evictable_blocks, so a page whose occupancy exceeds its
-                # evictable count cannot be emptied here -- skip it.
-                occupancy = mgr.get_page_occupancy(list(by_page))
-                lru_rank = {bid: i for i, bid in enumerate(bids)}
-
-                pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
-                         for page_id, ids in by_page.items()
-                         if len(ids) >= occupancy.get(page_id, 0)]
-                # Cheapest page first; break ties on the page whose most
-                # recently used block is oldest, so hot pages are kept.
-                pages.sort(key=lambda page: (page[0], page[1]))
-
-                victims: list[int] = []
-                for cost, _rank, ids in pages:
-                    if len(victims) + cost > num_to_evict:
-                        break
-                    victims.extend(ids)
-                return victims
+                return self._page_eviction.victims(num_to_evict)
 
             def _evict_blocks_from_pool(self,
                                         num_to_evict: int,
@@ -925,8 +920,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 reuse the freed logical slot immediately (allocation shortage)
                 get no page benefit -- the page is neither unmapped nor
                 remapped -- so reordering victims by page only trades away a
-                newer prefix for an older one and pays for the full evictable
-                scan and page sort.
+                newer prefix for an older one.
 
                 Returns the number of blocks actually evicted.
                 """
@@ -934,19 +928,21 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if num_to_evict <= 0:
                     return 0
 
-                if page_aware:
-                    ordered = self._page_aligned_victims(num_to_evict)
-                    chosen = set(ordered)
-                    # Top up in LRU order: page alignment is best-effort, but
-                    # the caller still needs the count it asked for.
-                    ordered.extend(bid for bid in self._evictable_blocks
-                                   if bid not in chosen)
-                else:
-                    ordered = list(self._evictable_blocks)
+                ordered = (self._page_aligned_victims(num_to_evict)
+                           if page_aware and num_to_evict < len(self._evictable_blocks) else [])
+                chosen = set(ordered)
+                # Stop as soon as the budget is filled, including for pure LRU
+                # allocation shortages. Never copy the whole evictable pool.
+                if len(ordered) < num_to_evict:
+                    for bid in self._evictable_blocks:
+                        if bid not in chosen:
+                            ordered.append(bid)
+                            if len(ordered) == num_to_evict:
+                                break
 
                 ids_to_free: list[int] = []
-                for bid in ordered[:num_to_evict]:
-                    block = self._evictable_blocks.pop(bid, None)
+                for bid in ordered:
+                    block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._remove_cached_block(key, bid)
@@ -954,7 +950,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
+                if not self._evictable_blocks and self._page_eviction is not None:
+                    self._page_eviction.clear()
                 return len(ids_to_free)
 
             def get_new_blocks(
@@ -997,6 +995,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # contract violation rather than a recoverable runtime state.
                 assert len(block_ids) == num_blocks, (
                     f"alloc returned {len(block_ids)} blocks, expected {num_blocks}")
+                if self._page_eviction is not None:
+                    self._page_eviction.changed(block_ids)
 
                 blocks = []
                 for bid in block_ids:
@@ -1015,11 +1015,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         for block in block_list:
                             block.ref_cnt += 1
                             # Reactivate: remove from evictable pool
-                            self._evictable_blocks.pop(block.block_id, None)
+                            self._remove_evictable(block.block_id)
                 else:
                     for block in blocks:
                         block.ref_cnt += 1
-                        self._evictable_blocks.pop(block.block_id, None)
+                        self._remove_evictable(block.block_id)
 
             def free_blocks(
                 self,
@@ -1050,12 +1050,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         if block.block_id in self._block_id_to_key:
                             # Cached block: retain for cross-request reuse
                             self._evictable_blocks[block.block_id] = block
+                            if self._page_eviction is not None:
+                                self._page_eviction.add(block.block_id)
                         else:
                             # Uncached block (e.g. partial): free immediately
                             _reset_block_hash(block)
                             uncached_to_free.append(block.block_id)
                 if uncached_to_free:
-                    self.kv_cache_manager.free(uncached_to_free)
+                    self._free_block_ids(uncached_to_free)
 
                 if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
@@ -1077,12 +1079,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             _reset_block_hash(block)
                         removed += 1
                     if bid in self._evictable_blocks:
-                        block = self._evictable_blocks.pop(bid)
+                        block = self._remove_evictable(bid)
                         _reset_block_hash(block)
                         ids_to_free.append(bid)
 
                 if ids_to_free:
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
                 if removed:
                     logger.debug(f"Evicted {removed} blocks from prefix cache")
 
@@ -1096,7 +1098,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         _reset_block_hash(block)
                     ids_to_free = list(self._evictable_blocks.keys())
                     self._evictable_blocks.clear()
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
+
+                if self._page_eviction is not None:
+                    self._page_eviction.clear()
 
                 self._cached_blocks.clear()
                 self._block_id_to_key.clear()
