@@ -1,4 +1,4 @@
-FROM lmsysorg/sglang:v0.5.10
+FROM lmsysorg/sglang:v0.5.20
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
 
 ENV ENABLE_KVCACHED=true

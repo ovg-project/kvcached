@@ -54,12 +54,15 @@ void shutdown_kvcached() { FTensorAllocator::shutdown(); }
 std::vector<torch::stable::Tensor>
 create_kv_tensors(int64_t size, int64_t dtype_size, std::string dev_str,
                   int64_t num_layers, int64_t num_kv_buffers, int64_t group_id,
-                  bool unified_pool) {
+                  bool unified_pool, int64_t page_size) {
+  if (page_size < 0) {
+    throw std::invalid_argument("KV page size must not be negative");
+  }
   auto allocator = FTensorAllocator::global_allocator(group_id);
   auto dtype_ = torch_dtype_from_size(static_cast<size_t>(dtype_size));
-  return allocator->create_kv_tensors(static_cast<size_t>(size), dtype_,
-                                      dev_str, num_layers, num_kv_buffers,
-                                      unified_pool);
+  return allocator->create_kv_tensors(
+      static_cast<size_t>(size), dtype_, dev_str, num_layers, num_kv_buffers,
+      unified_pool, static_cast<size_t>(page_size));
 }
 
 bool kv_tensors_created(int64_t group_id) {
@@ -348,7 +351,7 @@ STABLE_TORCH_LIBRARY(kvcached, m) {
   m.def("shutdown_kvcached() -> ()");
   m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
         "num_layers, int num_kv_buffers=2, int group_id=0, bool "
-        "unified_pool=False) -> Tensor[]");
+        "unified_pool=False, int page_size=0) -> Tensor[]");
   m.def("kv_tensors_created(int group_id=0) -> bool");
   m.def("map_to_kv_tensors(int[] offsets, int group_id=0) -> bool");
   m.def("unmap_from_kv_tensors(int[] offsets, int group_id=0) -> bool");

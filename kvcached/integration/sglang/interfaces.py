@@ -23,7 +23,13 @@ from kvcached.tp_ipc_util import (
     start_worker_listener_thread,
     stop_worker_listener_threads,
 )
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger, normalize_gpu_device
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    get_kvcached_logger,
+    get_page_size_for_block,
+    normalize_gpu_device,
+)
 from kvcached.vmm_ops import (
     create_kv_tensors,
     init_kvcached as _init_kvcached_impl,
@@ -165,6 +171,18 @@ def alloc_kv_cache(
     if len(kvcache_shape) <= 2:
         raise ValueError(f"Unsupported kv cache shape: {kvcache_shape}")
 
+    if num_layers <= 0:
+        # SGLang builds zero-layer attention pools for models without
+        # full-attention layers (e.g. the full-attention sub-pool of a pure
+        # Mamba2 model's HybridLinearKVPool). Those pools own no KV memory,
+        # so there is nothing to allocate; the per-layer sizing below would
+        # divide by zero. Callers must skip allocation instead (the elastic
+        # pools do), mirroring native SGLang, which allocates no buffers for
+        # zero-layer pools.
+        raise ValueError(
+            f"num_layers must be positive, got {num_layers}. A zero-layer "
+            "attention pool owns no KV memory; skip alloc_kv_cache() for it.")
+
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
 
@@ -172,22 +190,23 @@ def alloc_kv_cache(
     # it "block" to distinguish a KV cache block and a physical memory page.
     block_size = page_size
     block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
+    physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
 
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
-    # Round down to 2 * PAGE_SIZE for MLA backend.
+    # Round down to 2 * physical_page_size for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
     # gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) to be a multiple of
-    # 2 * PAGE_SIZE. When num_k_or_v == 1 (MLA), we must align this value
-    # to 2 * PAGE_SIZE directly. For MHA/GQA (num_k_or_v == 2), aligning
-    # to PAGE_SIZE suffices because ftensor_bytes = 2 * aligned_value is
-    # automatically 2*PAGE_SIZE-aligned.
-    alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
+    # 2 * physical_page_size. When num_k_or_v == 1 (MLA), we must align this
+    # value directly. For MHA/GQA (num_k_or_v == 2), one page suffices because
+    # ftensor_bytes = 2 * aligned_value is automatically two-page-aligned.
+    alignment = 2 * physical_page_size if is_mla else physical_page_size
     gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
 
     raw_kv_tensors = create_kv_tensors(
         gpu_mem_bytes_per_layer_k_or_v * num_k_or_v, dtype.itemsize, device, num_layers,
         num_kv_buffers=num_k_or_v, group_id=group_id,
+        page_size=physical_page_size,
     )
 
     num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_size
@@ -317,15 +336,19 @@ def alloc_mamba_states(
 
     max_align = max(conv_dtype.itemsize, ssm_dtype.itemsize)
     raw_cell_size = _align_up(offset, max_align)
+    # Mamba already pads each slot to a page divisor below. When the default
+    # page is too small, round the slot to a whole page before selection so
+    # padding can use the next page size (e.g. 2.5 MiB -> 4 MiB, not 6 MiB).
+    page_size = get_page_size_for_block(_align_up(raw_cell_size, PAGE_SIZE), PAGE_SIZE)
 
-    if raw_cell_size > PAGE_SIZE:
+    if raw_cell_size > page_size:
         raise RuntimeError(
             f"Mamba per-slot super-cell ({raw_cell_size} bytes) exceeds "
-            f"kvcached PAGE_SIZE ({PAGE_SIZE} bytes). Raise "
+            f"kvcached PAGE_SIZE ({page_size} bytes). Raise "
             "KVCACHED_PAGE_SIZE_MB so a single physical page can back at "
             "least one slot.")
 
-    # Pad cell_size up to a divisor of PAGE_SIZE so blocks_per_page is an
+    # Pad cell_size up to a divisor of page_size so blocks_per_page is an
     # integer with no straddle-skipping.  Reason: kvcached's PageAllocator
     # delivers floor(page_size / block_mem_size) blocks per page when
     # block_mem_size does not divide page_size evenly (straddling block IDs
@@ -336,7 +359,7 @@ def alloc_mamba_states(
     # num_slots.  The scheduler then hits "Not enough space for mamba
     # cache" long before the real pool is full.
     #
-    # Padding to the smallest divisor of PAGE_SIZE >= raw_cell_size makes
+    # Padding to the smallest divisor of page_size >= raw_cell_size makes
     # blocks_per_page a clean integer; num_slots blocks are actually
     # deliverable.  Raising KVCACHED_PAGE_SIZE_MB exposes finer divisors
     # (e.g. 6 MB has a 1.5 MB divisor) and reduces the virtual overhead.
@@ -353,19 +376,19 @@ def alloc_mamba_states(
             i += 1
         return best
 
-    cell_size = _smallest_divisor_ge(PAGE_SIZE, raw_cell_size)
+    cell_size = _smallest_divisor_ge(page_size, raw_cell_size)
     if cell_size != raw_cell_size:
         overhead = (cell_size - raw_cell_size) * num_mamba_layers * num_slots
         logger.info(
             f"[kvcached] Elastic mamba cell padded: "
             f"raw={raw_cell_size}B -> {cell_size}B "
-            f"(divisor of PAGE_SIZE={PAGE_SIZE}B). Virtual overhead: "
+            f"(divisor of PAGE_SIZE={page_size}B). Virtual overhead: "
             f"{overhead / (1024**3):.2f} GB. Raise KVCACHED_PAGE_SIZE_MB "
             "for finer divisors if needed.")
 
-    # create_kv_tensors expects per-layer size aligned to PAGE_SIZE.
+    # create_kv_tensors expects per-layer size aligned to page_size.
     per_layer_bytes = num_slots * cell_size
-    per_layer_bytes_aligned = _align_up(per_layer_bytes, PAGE_SIZE)
+    per_layer_bytes_aligned = _align_up(per_layer_bytes, page_size)
 
     # Non-contiguous layout requires unified_pool=True so the per-layer
     # FTensor map path skips the K/V split (which assumes a 2-buffer layout
@@ -378,6 +401,7 @@ def alloc_mamba_states(
         per_layer_bytes_aligned, torch.int8.itemsize, device,
         num_mamba_layers, num_kv_buffers=1, group_id=group_id,
         unified_pool=not _contiguous_layout,
+        page_size=page_size,
     )
 
     layout_info: Dict[str, Any] = {
@@ -485,18 +509,25 @@ def get_kv_cache_manager(
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
+    # Each SGLang TP worker owns and drives its local pool. Keep the real TP
+    # world size in init_kvcached() for rank-aware IPC listener setup, but do
+    # not broadcast this worker's local map/unmap operations to its peers.
     manager = KVCacheManager(
         num_blocks,
         block_size,
         cell_size,
         num_layers,
-        world_size=_world_size,
+        world_size=1,
         pp_rank=_pp_rank,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
         pool_name=pool_name,
+        # SWA and Mamba pools differ in size from the full-attention pool:
+        # each needs its own limit and usage, i.e. its own segment.
+        own_segment=True,
+        page_size=get_page_size_for_block(block_size * cell_size, PAGE_SIZE),
     )
     register_kv_cache_pool(
         manager,

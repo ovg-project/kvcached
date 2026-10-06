@@ -42,6 +42,9 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     manager.pp_rank = 0
     manager.group_id = 0
     manager._post_init_done = threading.Event()
+    # _post_init() records the outcome on the lifecycle holder, normally
+    # created in __init__.
+    manager._lifecycle = kv_cache_manager.LifecycleState("post-init-test")
     manager._shutdown_requested = threading.Event()
 
     calls = 0
@@ -63,6 +66,7 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
         manager._post_init()
 
     assert manager._post_init_done.is_set()
+    assert manager.lifecycle_phase is kv_cache_manager.LifecyclePhase.FAILED
 
 
 def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):

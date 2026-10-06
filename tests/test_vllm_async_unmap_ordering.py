@@ -5,6 +5,7 @@ import sys
 import types
 from collections import deque
 from importlib.machinery import ModuleSpec
+from queue import Queue
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -29,6 +30,7 @@ class FakeManager:
         self.defer_physical_release = True
         self.marker = 0
         self.released = []
+        self.drained_marker = 0
 
     def retire(self):
         self.marker += 1
@@ -37,7 +39,68 @@ class FakeManager:
         return self.marker
 
     def release_retired_pages_through(self, marker):
-        self.released.append(marker)
+        if marker > self.drained_marker:
+            self.released.append(marker)
+            self.drained_marker = marker
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_queue_api_drains_through_barrier_without_counting_batches(monkeypatch, legacy):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+    put = queue.put_nowait if legacy else queue.appendleft
+    take = queue.get_nowait if legacy else queue.pop
+    for _ in range(3):
+        put(object())
+
+    def original_step(self):
+        take()
+        return ({}, True)
+
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, queue)
+    manager.retire()
+    engine.step_with_batch_queue()
+    engine.step_with_batch_queue()
+    assert manager.released == [1]
+    engine.step_with_batch_queue()
+    assert manager.released == [1]
+    assert not hasattr(engine, "_kvcached_release_fences")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+def test_queue_api_reset_flushes_only_when_empty(monkeypatch, legacy, pending):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+    if pending:
+        (queue.put_nowait if legacy else queue.appendleft)(object())
+
+    def original_reset(self):
+        manager.retire()
+        return True
+
+    EngineCore = _patch_engine(monkeypatch, mock.Mock(), original_reset)
+    engine = _engine(EngineCore, manager, queue)
+    assert engine.reset_prefix_cache() is True
+    assert manager.released == ([] if pending else [1])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_queue_api_submission_drains_after_step_returns(monkeypatch, legacy):
+    manager = FakeManager()
+    queue: Any = Queue() if legacy else deque()
+
+    def original_step(self):
+        (queue.put_nowait if legacy else queue.appendleft)(object())
+        manager.retire()
+        assert manager.released == []
+        return (None, True)
+
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, queue)
+    assert engine.step_with_batch_queue() == (None, True)
+    assert manager.released == [1]
 
 
 @pytest.mark.parametrize("failed_patch", [None, "init", "lifetime", "shutdown"])
@@ -120,7 +183,7 @@ def test_immediate_release_bypasses_batch_lifetime_tracking(monkeypatch, manager
     assert not hasattr(engine, "_kvcached_last_fenced_release_marker")
 
 
-def test_completed_batch_releases_only_pages_retired_before_call(monkeypatch):
+def test_completed_step_drains_all_retirements_through_barrier(monkeypatch):
     manager = FakeManager()
     manager.retire()
 
@@ -133,7 +196,7 @@ def test_completed_batch_releases_only_pages_retired_before_call(monkeypatch):
 
     engine.step_with_batch_queue()
 
-    assert manager.released == [1]
+    assert manager.released == [2]
 
 
 def test_final_completed_batch_releases_all_retired_pages(monkeypatch):
@@ -153,7 +216,7 @@ def test_final_completed_batch_releases_all_retired_pages(monkeypatch):
     assert manager.released == [2]
 
 
-def test_queue_submission_without_completion_does_not_release_pages(monkeypatch):
+def test_queue_submission_without_completion_uses_release_barrier(monkeypatch):
     manager = FakeManager()
 
     def original_step(self):
@@ -166,10 +229,10 @@ def test_queue_submission_without_completion_does_not_release_pages(monkeypatch)
 
     engine.step_with_batch_queue()
 
-    assert manager.released == []
+    assert manager.released == [1]
 
 
-def test_retired_pages_wait_for_every_older_inflight_batch(monkeypatch):
+def test_retired_pages_do_not_need_engine_batch_countdown(monkeypatch):
     manager = FakeManager()
 
     def original_step(self):
@@ -182,7 +245,7 @@ def test_retired_pages_wait_for_every_older_inflight_batch(monkeypatch):
 
     engine.step_with_batch_queue()
     engine.step_with_batch_queue()
-    assert manager.released == []
+    assert manager.released == [1]
 
     engine.step_with_batch_queue()
     assert manager.released == [1]
@@ -199,17 +262,16 @@ def test_idle_prefix_reset_releases_pages_without_another_batch(monkeypatch):
 
     EngineCore = _patch_engine(monkeypatch, mock.Mock(), original_reset)
     engine = _engine(EngineCore, manager, deque())
-    engine._kvcached_release_fences = [[0, 0]]
 
     result = engine.reset_prefix_cache(mock.sentinel.argument, reset_connector=True)
 
     assert result is mock.sentinel.reset_result
     assert calls == [(engine, (mock.sentinel.argument,), {"reset_connector": True})]
     assert manager.released == [1]
-    assert engine._kvcached_release_fences == []
+    assert not hasattr(engine, "_kvcached_release_fences")
 
 
-def test_prefix_reset_with_inflight_batches_keeps_retirement_fenced(monkeypatch):
+def test_busy_prefix_reset_leaves_retirement_for_next_step_barrier(monkeypatch):
     manager = FakeManager()
 
     def original_reset(self):
@@ -226,7 +288,7 @@ def test_prefix_reset_with_inflight_batches_keeps_retirement_fenced(monkeypatch)
     assert engine.reset_prefix_cache() is True
     assert manager.released == []
     engine.step_with_batch_queue()
-    assert manager.released == []
+    assert manager.released == [1]
     engine.step_with_batch_queue()
     assert manager.released == [1]
 
@@ -286,7 +348,7 @@ def test_failed_prefix_reset_preserves_exception_without_releasing(monkeypatch):
     assert manager.released == []
 
 
-def test_failed_release_preserves_completed_fence(monkeypatch):
+def test_failed_release_retries_manager_retirement_without_engine_fences(monkeypatch):
     manager = FakeManager()
     manager.retire()
 
@@ -299,11 +361,45 @@ def test_failed_release_preserves_completed_fence(monkeypatch):
     monkeypatch.setattr(manager, "release_retired_pages_through", release)
     with pytest.raises(RuntimeError, match="worker barrier failed"):
         engine.step_with_batch_queue()
-    assert engine._kvcached_release_fences == [[1, 0]]
+    assert manager.marker == 1
+    assert not hasattr(engine, "_kvcached_release_fences")
     release.side_effect = None
     engine.step_with_batch_queue()
-    assert engine._kvcached_release_fences == []
     assert release.call_args_list == [mock.call(1), mock.call(1)]
+
+
+def test_failed_step_does_not_submit_release_barrier(monkeypatch):
+    manager = FakeManager()
+
+    def original_step(self):
+        manager.retire()
+        raise RuntimeError("worker result failed")
+
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, deque([object()]))
+    with pytest.raises(RuntimeError, match="worker result failed"):
+        engine.step_with_batch_queue()
+    assert manager.released == []
+    assert manager.marker == 1
+
+
+def test_retirement_drain_happens_after_deferred_sampling_submission(monkeypatch):
+    manager = FakeManager()
+    events: list[Any] = []
+
+    def original_step(self):
+        events.append("execute")
+        manager.retire()
+        events.append("update_scheduler")
+        events.append("deferred_sample")
+        return ({}, True)
+
+    release = mock.Mock(side_effect=lambda marker: events.append(("barrier_drain", marker)))
+    monkeypatch.setattr(manager, "release_retired_pages_through", release)
+    EngineCore = _patch_engine(monkeypatch, original_step)
+    engine = _engine(EngineCore, manager, deque([object()]))
+    assert engine.step_with_batch_queue() == ({}, True)
+    assert events == ["execute", "update_scheduler", "deferred_sample", ("barrier_drain", 1)]
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -450,3 +546,53 @@ def test_release_barrier_rejects_failed_or_missing_worker(monkeypatch, responses
     with pytest.raises(RuntimeError, match="KV release barrier failed"):
         manager.physical_release_barrier()
     assert page_allocator.callback is None
+
+
+@pytest.mark.parametrize("version", ["0.28.0", "0.29.0"])
+@pytest.mark.parametrize("backend,tp_size,pp_size,async_scheduling,enabled,rejected", [
+    ("external_launcher", 2, 1, True, True, True),
+    ("external_launcher", 1, 2, False, True, True),
+    ("external_launcher", 1, 2, True, True, True),
+    ("external_launcher", 1, 1, True, True, False),
+    ("external_launcher", 2, 1, False, True, False),
+    ("external_launcher", 2, 1, True, False, False),
+    ("mp", 2, 1, True, True, False),
+    ("uni", 1, 1, True, True, False),
+])
+def test_external_launcher_queued_ranks_rejected_before_initialization(
+    monkeypatch, version, backend, tp_size, pp_size, async_scheduling, enabled, rejected,
+):
+    patches = _load_patches(monkeypatch)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: enabled)
+    interfaces = __import__(
+        "kvcached.integration.vllm.interfaces", fromlist=["init_kvcached"],
+    )
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    target = types.ModuleType("engine")
+    setattr(target, "EngineCore", EngineCore)
+    patch = patches.EngineCorePatch()
+    patch.detected_version = version
+    assert patch.patch_engine_init(target)
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size,
+            distributed_executor_backend=backend,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    if rejected:
+        with pytest.raises(patches.KVCachedConfigError, match="external_launcher"):
+            EngineCore(config)
+        initialize.assert_not_called()
+        original_init.assert_not_called()
+    else:
+        EngineCore(config)
+        original_init.assert_called_once()
+        assert initialize.call_count == int(enabled)

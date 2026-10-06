@@ -40,12 +40,20 @@ def exercise_native_queue(native_step, deferred_sampling, worker_failure):
     class Manager:
         defer_physical_release = True
         marker = 0
+        drained_marker = 0
 
         def capture_physical_release_marker(self):
             return self.marker
 
         def release_retired_pages_through(self, marker):
+            if marker <= self.drained_marker:
+                return
+            # In particular, structured-output sampling must already be queued.
+            assert engine.model_executor.sample_tokens.call_count == 1
+            assert engine.batch_queue[0][0] is newer
+            events.append("barrier")
             events.append(("unmap", marker))
+            self.drained_marker = marker
 
     manager = Manager()
 
@@ -70,7 +78,8 @@ def exercise_native_queue(native_step, deferred_sampling, worker_failure):
                                   pending_structured_output_tokens=deferred_sampling)
 
     def update(*_):
-        manager.marker = 1
+        if manager.marker == 0:
+            manager.marker = 1
         events.append("logical-free")
         return {}
 
@@ -93,17 +102,18 @@ def exercise_native_queue(native_step, deferred_sampling, worker_failure):
     engine._process_aborts_queue = lambda: None
 
     assert engine.step_with_batch_queue() == ({}, True)
-    assert events == ["older-result", "logical-free"]
+    assert events == ["older-result", "logical-free", "barrier", ("unmap", 1)]
     assert len(engine.batch_queue) == 1
     assert engine.batch_queue[0][0] is newer
     engine.scheduler.has_requests.return_value = False
     if worker_failure:
         with pytest.raises(RuntimeError, match="worker failed"):
             engine.step_with_batch_queue()
-        assert not any(isinstance(event, tuple) for event in events)
+        assert events.count(("unmap", 1)) == 1
     else:
         assert engine.step_with_batch_queue() == ({}, False)
-        assert events[-3:] == ["newer-result", "logical-free", ("unmap", 1)]
+        assert events[-2:] == ["newer-result", "logical-free"]
+        assert events.count(("unmap", 1)) == 1
 
 
 @pytest.mark.parametrize("deferred_sampling", [False, True])
