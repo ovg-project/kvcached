@@ -45,6 +45,9 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     manager.pp_rank = 0
     manager.group_id = 0
     manager._post_init_done = threading.Event()
+    # _post_init() records the outcome on the lifecycle holder, normally
+    # created in __init__.
+    manager._lifecycle = kv_cache_manager.LifecycleState("post-init-test")
     manager._shutdown_requested = threading.Event()
 
     calls = 0
@@ -67,12 +70,14 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
 
     assert manager._post_init_done.is_set()
     with pytest.raises(TimeoutError, match="last error: kv tensor map failed"):
-        manager._wait_post_init()
+        manager.wait_ready()
+    assert manager.lifecycle_phase is kv_cache_manager.LifecyclePhase.FAILED
 
 
 def test_readiness_deadline_includes_time_spent_in_ipc(monkeypatch):
     module = _import_kv_cache_manager(monkeypatch)
     manager = module.KVCacheManager.__new__(module.KVCacheManager)
+    manager._lifecycle = module.LifecycleState("deadline-test")
     manager.null_block = None
     manager.world_size = 2
     manager._shutdown_requested = threading.Event()

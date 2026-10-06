@@ -110,6 +110,7 @@ except ImportError:
     _install_vmm_ops_stub()
 
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
+from kvcached.lifecycle import LifecycleState  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
 
 
@@ -129,8 +130,12 @@ def make_manager(fail_after: int,
     manager.in_shrink = False
     manager.target_num_blocks = None
     manager._lock = NoOpLock()
+    manager._shutdown_lock = threading.Lock()
+    manager._shutdown_requested = threading.Event()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
+    manager._lifecycle = LifecycleState("rollback-test")
+    manager._lifecycle.mark_ready()
     return manager
 
 
@@ -252,11 +257,13 @@ def test_quarantined_map_returns_miss_without_handing_out_blocks(monkeypatch):
 
 
 @pytest.mark.parametrize("rejected", [False, True])
-def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected):
+@pytest.mark.parametrize("defer_release", [False, True])
+def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected, defer_release):
     from kvcached.errors import QuarantinedResizeError
 
     manager = make_manager(fail_after=2)
     enable_operation_counters(manager)
+    manager.defer_physical_release = defer_release
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     manager.in_shrink = True
     manager.target_num_blocks = BLOCKS_PER_PAGE
@@ -268,10 +275,19 @@ def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected
 
     monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
     manager.free(blocks)
+    if defer_release:
+        assert manager.operation_snapshot_dict()["resize_errors_total"] == 0
+        manager.release_retired_pages_through(manager.capture_physical_release_marker())
     assert manager._operation_counters.get("resize_completions_total", 0) == 0
     assert manager._operation_counters["free_successes_total"] == 1
     assert manager._operation_counters["freed_blocks_total"] == BLOCKS_PER_PAGE
+    data = manager.operation_snapshot_dict()
+    assert data["resize_errors_total"] == data["operation_errors_total"] == int(rejected)
+    assert data["free_errors_total"] == data["free_failures_total"] == 0
     if rejected:
+        assert data["last_error_code"] == "resize_failed"
+        manager.free([])
+        assert manager.operation_snapshot_dict()["resize_errors_total"] == 1
         assert manager._resize_rejected
         assert not manager.in_shrink
         assert manager.target_num_blocks is None
@@ -381,6 +397,176 @@ def test_internal_free_keeps_tuple_contract_without_caller_accounting():
     assert data["free_successes_total"] == 0
 
 
+def test_deferred_release_counts_only_the_completed_handoff():
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    assert blocks is not None
+    manager.free(blocks)
+    marker = manager.capture_physical_release_marker()
+
+    manager.release_retired_pages_through(marker - 1)
+    data = manager.operation_snapshot_dict()
+    assert data["free_successes_total"] == 1
+    assert data["freed_blocks_total"] == BLOCKS_PER_PAGE
+    assert data["manager_page_releases_total"] == 0
+    assert manager.page_allocator.freed_pages == []
+
+    manager.release_retired_pages_through(marker)
+    manager.release_retired_pages_through(marker)
+    data = manager.operation_snapshot_dict()
+    assert data["manager_page_releases_total"] == 1
+    assert data["free_requests_total"] == 1
+    assert data["freed_blocks_total"] == BLOCKS_PER_PAGE
+    assert manager.page_allocator.freed_pages == [0]
+
+
+def test_reused_retired_page_does_not_count_as_a_new_handoff():
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    assert blocks is not None
+    manager.free(blocks)
+    old_marker = manager.capture_physical_release_marker()
+    assert manager.alloc(BLOCKS_PER_PAGE) == blocks
+    manager.release_retired_pages_through(old_marker)
+    assert manager.page_allocator.freed_pages == []
+    assert manager.operation_snapshot_dict()["manager_page_allocations_total"] == 1
+    assert manager.operation_snapshot_dict()["manager_page_releases_total"] == 0
+
+    manager.free(blocks)
+    manager.release_retired_pages_through(old_marker)
+    assert manager.page_allocator.freed_pages == []
+    manager.release_retired_pages_through(manager.capture_physical_release_marker())
+    assert manager.operation_snapshot_dict()["manager_page_releases_total"] == 1
+
+
+@pytest.mark.parametrize("stage", ["barrier", "free_pages", "resize"])
+@pytest.mark.parametrize("fatal", [False, True])
+def test_deferred_release_failure_keeps_logical_free_accounting(monkeypatch, stage, fatal):
+    from kvcached.errors import StateConsistencyError
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    assert blocks is not None
+    manager.in_shrink = True
+    manager.target_num_blocks = 0
+    manager.free(blocks)
+    error = (StateConsistencyError if fatal else RuntimeError)("release failed")
+
+    def fail(*args):
+        raise error
+
+    if stage == "barrier":
+        manager.physical_release_barrier = fail
+    else:
+        monkeypatch.setattr(manager.page_allocator, stage, fail, raising=False)
+    with pytest.raises(type(error)) as caught:
+        manager.release_retired_pages_through(manager.capture_physical_release_marker())
+    assert caught.value is error
+    data = manager.operation_snapshot_dict()
+    assert data["free_requests_total"] == data["free_successes_total"] == 1
+    assert data["free_failures_total"] == 0
+    assert data["freed_blocks_total"] == BLOCKS_PER_PAGE
+    assert data["manager_page_releases_total"] == int(stage == "resize")
+    assert data["free_errors_total"] == data["operation_errors_total"] == 1
+    assert data["last_error_code"] == "deferred_release_failed"
+    from kvcached.lifecycle import LifecyclePhase
+
+    assert manager.lifecycle_phase is (
+        LifecyclePhase.FAILED if fatal else LifecyclePhase.READY)
+    if fatal:
+        with pytest.raises(type(error)) as readiness_error:
+            manager.wait_ready()
+        assert readiness_error.value is error
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_fatal_mapping_counts_error_and_closes_readiness(monkeypatch, typed):
+    from kvcached.errors import StateConsistencyError
+    from kvcached.lifecycle import LifecyclePhase
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    error = (StateConsistencyError if typed else RuntimeError)("unsafe mapping")
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    monkeypatch.setattr(manager.page_allocator, "get_transaction_state",
+                        lambda: {"state": "FAILED"}, raising=False)
+    with pytest.raises(type(error)) as caught:
+        manager.alloc(1)
+    assert caught.value is error
+    assert manager.page_allocator.freed_pages == []
+    data = manager.operation_snapshot_dict()
+    assert data["manager_page_allocation_failures_total"] == 1
+    assert data["allocation_failures_total"] == 1
+    assert data["allocation_errors_total"] == 1
+    assert data["capacity_exhausted_total"] == 0
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(type(error)) as readiness_error:
+        manager.wait_ready()
+    assert readiness_error.value is error
+
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_growth_latch_closes_readiness_and_preserves_error_accounting(monkeypatch, background):
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.lifecycle import LifecyclePhase
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    unresolved: Dict[str, Dict[str, str]] = {}
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", unresolved)
+
+    def fail():
+        unresolved["lost-ack"] = {"message": "unresolved worker result"}
+        raise RuntimeError("legacy callback lost its exception type")
+
+    if background:
+        unresolved["lost-ack"] = {"message": "unresolved worker result"}
+    else:
+        monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+
+    def action():
+        return manager.available_size() if background else manager.alloc(1)
+
+    with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+        action()
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+        manager.wait_ready()
+    data = manager.operation_snapshot_dict()
+    assert data["capacity_exhausted_total"] == 0
+    assert data["manager_page_allocation_failures_total"] == int(not background)
+    assert data["allocation_errors_total"] == int(not background)
+    assert manager.page_allocator.freed_pages == []
+
+
+def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatch):
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    manager.reserve_null_block = False
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    assert blocks is not None
+    manager.free(blocks)
+    assert manager.avail_pages and manager._retired_pages
+    for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim", "reset_free_page_order"):
+        monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
+    manager.clear()
+    assert manager.page_allocator.freed_pages == [0]
+    assert manager.operation_snapshot_dict()["manager_page_releases_total"] == 1
+    assert not manager._retired_pages
+
+
 @pytest.mark.parametrize("pending_shrink", [False, True])
 def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatch, pending_shrink):
     from kvcached.errors import QuarantinedResizeError
@@ -408,6 +594,32 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
     assert manager.target_num_blocks is None
     with pytest.raises(QuarantinedResizeError):
         manager.resize(2000)
+
+
+@pytest.mark.parametrize("pending_shrink", [False, True])
+def test_retained_resize_target_is_retried_after_recovery(monkeypatch, pending_shrink):
+    from kvcached.errors import RetainedResizeError
+
+    manager = make_manager(fail_after=2)
+    manager.in_shrink = pending_shrink
+    manager.target_num_blocks = 1 if pending_shrink else None
+    pending = [True]
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        if pending[0]:
+            raise RetainedResizeError("retained map pending")
+        return True
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: 1000)
+    assert manager.alloc(1) is not None
+    assert not manager.in_shrink
+    pending[0] = False
+    assert manager.alloc(1) is not None
+    assert calls == [1000, 1000]
+    assert not manager._resize_rejected
 
 
 def test_miss_with_no_partial_state_is_clean():

@@ -172,7 +172,8 @@ def test_fatal_native_state_never_becomes_recoverable_or_committed(monkeypatch, 
         _restore_tp_ipc_util(previous)
 
 
-def test_prepare_failure_retains_adopted_orphan(monkeypatch):
+@pytest.mark.parametrize("state", ["prepared", "reserved", "orphaned"])
+def test_prepare_failure_retains_adopted_orphan(monkeypatch, state):
     tp_ipc_util, previous = _import_tp_ipc_util(monkeypatch)
     tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update({(0, 0): "gpu-0", (0, 1): "gpu-1"})
     events: list[tuple[str, int]] = []
@@ -181,19 +182,22 @@ def test_prepare_failure_retains_adopted_orphan(monkeypatch):
         events.append((message["cmd"], rank))
         if message["cmd"] == "prepare_map_to_kv_tensors":
             if rank == 0:
-                return {"status": "success", "transaction_state": "prepared"}
+                return {"status": "success", "transaction_state": state}
             return {
                 "status": "error",
                 "message": "capacity_exhausted",
                 "transaction_state": "not_prepared",
             }
+        if message["cmd"] == "abort_prepared_map":
+            return {"status": "success", "transaction_state": "orphaned"}
         return _success_response(message["cmd"])
 
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", exchange)
     try:
-        with pytest.raises(RuntimeError, match="capacity_exhausted"):
+        with pytest.raises(tp_ipc_util.MapRetainedError, match="capacity_exhausted"):
             tp_ipc_util.broadcast_map_to_kv_tensors(2, [0], group_id=7)
         assert events[-1] == ("orphan_map_transaction", 0)
+        assert not tp_ipc_util._UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS
         assert not any("unmap" in command for command, _ in events)
     finally:
         _restore_tp_ipc_util(previous)
@@ -246,7 +250,7 @@ def test_commit_failure_retains_mapped_pages_without_online_unmap(monkeypatch):
 
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", exchange)
     try:
-        with pytest.raises(RuntimeError, match="map failed after partial commit"):
+        with pytest.raises(tp_ipc_util.MapRetainedError, match="map failed after partial commit"):
             tp_ipc_util.broadcast_map_to_kv_tensors(2, [0])
         assert ("orphan_map_transaction", 0) in events
         assert ("orphan_map_transaction", 1) in events
@@ -354,6 +358,122 @@ def test_reserved_transaction_can_only_abort(monkeypatch):
         with pytest.raises(RuntimeError, match="cannot be orphaned"):
             registry.mark_orphan("reserved", 7, [0])
         assert registry.abort_reserved("reserved", 7, [0]) == "aborted"
+    finally:
+        _restore_tp_ipc_util(previous)
+
+
+def test_aborted_adopted_reservation_retains_mapping_for_another_retry(monkeypatch):
+    module, previous = _import_tp_ipc_util(monkeypatch)
+    try:
+        registry = module._MapTransactionRegistry(max_terminal=1)
+        registry.record_reserved("original", 7, [64, 0])
+        registry.mark_mapped("original", 7, [64, 0])
+        registry.mark_partial("original", 7, [64, 0])
+        registry.mark_prepared("original", 7, [64, 0])
+        registry.mark_orphan("original", 7, [64, 0])
+        owner = "original"
+        for retry in ("retry-1", "retry-2"):
+            assert registry.adopt_orphan(retry, 7, [0, 64]) == owner
+            registry.mark_reserved_after_orphan_adoption(retry, 7, [0, 64])
+            assert registry.abort_reserved(retry, 7, [0, 64]) == "orphaned"
+            assert registry.abort_reserved(retry, 7, [0, 64]) == "orphaned"
+            assert registry.has_live_transactions()
+            owner = retry
+        assert registry.adopt_orphan("complete", 7, [0, 64]) == owner
+        registry.mark_reserved_after_orphan_adoption("complete", 7, [0, 64])
+        registry.mark_mapped("complete", 7, [0, 64])
+        registry.mark_prepared("complete", 7, [0, 64])
+        assert registry.finalize("complete", 7, [0, 64]) == "committed"
+        assert not registry.has_live_transactions()
+        assert not registry._adopted_reservations
+    finally:
+        _restore_tp_ipc_util(previous)
+
+
+def test_commit_failure_preserves_adopted_mapping_after_aborting_reservation(monkeypatch):
+    module, previous = _import_tp_ipc_util(monkeypatch)
+    module._PHYSICAL_DEVICE_ID_CACHE.update({(0, 0): "gpu-0", (0, 1): "gpu-1"})
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        if command == "commit_prepared_map":
+            return {"status": "error", "transaction_state": "reserved"}
+        if command == "abort_prepared_map" and rank == 0:
+            return {"status": "success", "transaction_state": "orphaned"}
+        return _success_response(command)
+
+    monkeypatch.setattr(module, "_send_and_receive_message", exchange)
+    try:
+        with pytest.raises(module.MapRetainedError):
+            module.broadcast_map_to_kv_tensors(2, [0])
+        assert not module._UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS
+    finally:
+        _restore_tp_ipc_util(previous)
+
+
+@pytest.mark.parametrize("lost", ["request", "response"])
+def test_finalize_loss_reconciles_worker_bookkeeping(monkeypatch, lost):
+    module, previous = _import_tp_ipc_util(monkeypatch)
+    module._PHYSICAL_DEVICE_ID_CACHE.update({(0, 0): "gpu-0", (0, 1): "gpu-1"})
+    registries = [module._MapTransactionRegistry(), module._MapTransactionRegistry()]
+    events = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        events.append((command, rank))
+        registry = registries[rank]
+        args = (message["transaction_id"], message["group_id"], message["offsets"])
+        if command == "prepare_map_to_kv_tensors":
+            registry.record_reserved(*args)
+        elif command == "commit_prepared_map":
+            registry.mark_mapped(*args)
+            registry.mark_prepared(*args)
+        elif command == "finalize_map_to_kv_tensors":
+            if rank == 1 and events.count((command, rank)) == 1:
+                if lost == "response":
+                    registry.finalize(*args)
+                raise ConnectionError("finalize lost")
+            registry.finalize(*args)
+        return {"status": "success", "transaction_state": registry.state(*args)}
+
+    monkeypatch.setattr(module, "_send_and_receive_message", exchange)
+    try:
+        module.broadcast_map_to_kv_tensors(2, [0])
+        assert events.count(("finalize_map_to_kv_tensors", 1)) == (2 if lost == "request" else 1)
+        assert events.count(("get_map_transaction_state", 1)) == 1
+        assert events.count(("finalize_map_to_kv_tensors", 0)) == 1
+        assert all(not registry.has_live_transactions() for registry in registries)
+        assert not module._UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS
+    finally:
+        _restore_tp_ipc_util(previous)
+
+
+@pytest.mark.parametrize("state", ["prepared", "not_prepared", "unreachable"])
+def test_unconfirmed_finalize_blocks_growth_instead_of_leaking_live_state(monkeypatch, state):
+    module, previous = _import_tp_ipc_util(monkeypatch)
+    module._PHYSICAL_DEVICE_ID_CACHE[(0, 0)] = "gpu-0"
+    events = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        events.append(command)
+        if command == "finalize_map_to_kv_tensors":
+            raise ConnectionError("finalize lost")
+        if command == "get_map_transaction_state":
+            if state == "unreachable":
+                raise ConnectionError("worker unreachable")
+            return {"status": "success", "transaction_state": state}
+        return _success_response(command)
+
+    monkeypatch.setattr(module, "_send_and_receive_message", exchange)
+    try:
+        with pytest.raises(module.MapTransactionOutcomeUnknownError, match="finalize"):
+            module.broadcast_map_to_kv_tensors(1, [0])
+        assert events.count("finalize_map_to_kv_tensors") == (2 if state == "prepared" else 1)
+        assert events.count("prepare_map_to_kv_tensors") == 1
+        assert events.count("commit_prepared_map") == 1
+        with pytest.raises(module.MapTransactionOutcomeUnknownError):
+            module.raise_if_physical_growth_unresolved()
     finally:
         _restore_tp_ipc_util(previous)
 

@@ -559,6 +559,99 @@ def test_lost_map_reply_preserves_completed_phase(socket_root, monkeypatch, phas
     prepare.assert_called_once()
 
 
+@pytest.mark.parametrize("stop_first", [False, True])
+def test_listener_cannot_forget_a_native_reservation(socket_root, monkeypatch, stop_first):
+    from kvcached.errors import StateConsistencyError
+
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "pending-replacement", "offsets": [0]}
+    assert _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))["transaction_state"] == "reserved"
+    if stop_first:
+        assert tp_ipc_util.stop_worker_listener_threads()
+    with pytest.raises(StateConsistencyError, match="IPC listener"):
+        tp_ipc_util.start_worker_listener_thread(0)
+    if not stop_first:
+        # Rejected replacement leaves the original owner available to reconcile.
+        assert _ask(path, dict(message, cmd="get_map_transaction_state"))["transaction_state"] == "reserved"
+
+
+def test_listener_can_restart_after_confirmed_abort(socket_root, monkeypatch):
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(tp_ipc_util, "abort_prepared_map", lambda *a, **kw: True)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "aborted-replacement", "offsets": [0]}
+    assert _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))["transaction_state"] == "reserved"
+    assert _ask(path, dict(message, cmd="abort_prepared_map"))["transaction_state"] == "aborted"
+    assert tp_ipc_util.stop_worker_listener_threads()
+    tp_ipc_util.start_worker_listener_thread(0)
+    assert _ask(path, {"cmd": "kv_tensors_created"})["status"] == "success"
+
+
+def test_prepare_cleanup_failure_during_stop_blocks_replacement(socket_root, monkeypatch):
+    from kvcached.errors import StateConsistencyError
+
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def prepare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        raise StateConsistencyError("native reservation cleanup failed")
+
+    def replace():
+        try:
+            tp_ipc_util.start_worker_listener_thread(0)
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", prepare)
+    tp_ipc_util.start_worker_listener_thread(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    replacement = threading.Thread(target=replace)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(listener.socket_path)
+            header, body = _delayed_map_request()
+            client.sendall(header + body)
+            assert entered.wait(5)
+            replacement.start()
+            assert listener.stop_event.wait(5)
+            release.set()
+            replacement.join(5)
+            assert not replacement.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], StateConsistencyError)
+        with pytest.raises(StateConsistencyError, match="restart"):
+            tp_ipc_util.start_worker_listener_thread(0)
+    finally:
+        release.set()
+        if replacement.ident is not None:
+            replacement.join(5)
+
+
+@pytest.mark.parametrize("implementation", ["seq", "thread", "async"])
+def test_benchmark_transports_use_the_transaction_protocol(socket_root, monkeypatch, implementation):
+    prepare = mock.Mock(return_value={"success": True})
+    commit = mock.Mock(return_value={"success": True})
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", prepare)
+    monkeypatch.setattr(tp_ipc_util, "commit_prepared_map", commit)
+    monkeypatch.setattr(tp_ipc_util, "_sync_after_map", lambda *args: None)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = Path(__file__).parents[1] / "benchmarks/bench_tp_ipc/kvcached_tp_ipc_benchmark.py"
+    spec = importlib.util.spec_from_file_location("_ipc_benchmark", path)
+    assert spec is not None and spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    original = tp_ipc_util._send_and_receive_message
+    benchmark.get_broadcast_impl(implementation)(1, [0])
+    assert tp_ipc_util._send_and_receive_message is original
+    prepare.assert_called_once()
+    commit.assert_called_once()
+    assert not tp_ipc_util._listeners[(0, 0)].has_pending_maps()
+
+
 def test_partial_native_commit_is_retained_not_aborted(socket_root, monkeypatch):
     monkeypatch.setattr(tp_ipc_util.vmm_ops, "has_prepared_map", lambda *a, **kw: False, raising=False)
     monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
@@ -702,6 +795,86 @@ def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeyp
     kvctl.cmd_delete(IPC_NAME)
 
     assert "not found" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="shutdown() wakes a blocked accept() only on Linux")
+def test_stop_of_idle_listener_keeps_replacement_socket(socket_root):
+    """An idle old listener whose path now belongs to a replacement must stop
+    without connecting to, or unlinking, the replacement's socket."""
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    os.unlink(path)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(path)
+    replacement.listen()
+    replacement.settimeout(0.5)
+    try:
+        assert tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=2.0)
+        assert listener.thread is not None and not listener.thread.is_alive()
+        with pytest.raises(socket.timeout):
+            replacement.accept()  # stop() must not have connected to it
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
+    finally:
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypatch):
+    """Same-name restart during a delayed cleanup (issue #510): the first stop
+    times out behind a busy handler, a replacement then binds the same path,
+    and the retry after the handler finishes must not unlink the
+    replacement's socket."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_map(*a, **kw):
+        entered.set()
+        release.wait(10)
+        return {"success": True}
+
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", slow_map)
+
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    header, body = _delayed_map_request()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(path)
+            client.sendall(header + body)
+            assert entered.wait(5)
+            assert not tp_ipc_util.stop_worker_listener_threads(drain_timeout_s=0.2)
+
+            os.unlink(path)  # what the replacement's start does
+            replacement.bind(path)
+            replacement.listen()
+
+            release.set()
+            assert listener.thread is not None
+            listener.thread.join(5)
+            assert not listener.thread.is_alive()
+
+        assert tp_ipc_util.stop_worker_listener_threads()
+        assert os.path.exists(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+            other.settimeout(5)
+            other.connect(path)
+    finally:
+        release.set()
+        replacement.close()
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, NoReturn, Optional, Tuple, cast
 
 from kvcached import vmm_ops
-from kvcached.errors import MapQuarantinedError, StateConsistencyError
+from kvcached.errors import MapQuarantinedError, MapRetainedError, StateConsistencyError
 from kvcached.utils import get_tp_socket_dir, normalize_gpu_device
 
 kv_tensors_created = vmm_ops.kv_tensors_created
@@ -156,6 +156,7 @@ class _MapTransactionRegistry:
     ):
         self._transactions: dict[str, tuple[str, int, tuple[int, ...]]] = {}
         self._orphans: dict[tuple[int, tuple[int, ...]], str] = {}
+        self._adopted_reservations: set[str] = set()
         self._terminal: OrderedDict[str, None] = OrderedDict()
         self._max_terminal = max_terminal
         self._lock = threading.RLock()
@@ -240,12 +241,22 @@ class _MapTransactionRegistry:
     ) -> str:
         with self._lock:
             state = self._state_unlocked(transaction_id, group_id, offsets)
+            if state == "orphaned":
+                return "orphaned"
             if state is None or state == "aborted":
                 return "aborted"
             if state != "reserved":
                 raise RuntimeError(
                     f"KV map transaction {transaction_id} cannot be aborted from state {state}"
                 )
+            if transaction_id in self._adopted_reservations:
+                # Native abort releases only newly reserved handles. The
+                # adopted mapping still belongs to this exact retry payload.
+                payload = self._payload(group_id, offsets)
+                self._transactions[transaction_id] = ("orphaned", group_id, payload[1])
+                self._orphans[payload] = transaction_id
+                self._adopted_reservations.discard(transaction_id)
+                return "orphaned"
             self._transactions[transaction_id] = (
                 "aborted",
                 group_id,
@@ -283,6 +294,7 @@ class _MapTransactionRegistry:
                 group_id,
                 payload[1],
             )
+            self._adopted_reservations.add(transaction_id)
             return orphan_id
 
     def mark_prepared(
@@ -357,14 +369,21 @@ class _MapTransactionRegistry:
                 payload[1],
             )
             self._orphans[payload] = transaction_id
+            self._adopted_reservations.discard(transaction_id)
             return "orphaned"
 
     def _remember_terminal(self, transaction_id: str) -> None:
+        self._adopted_reservations.discard(transaction_id)
         self._terminal[transaction_id] = None
         self._terminal.move_to_end(transaction_id)
         while len(self._terminal) > self._max_terminal:
             stale_id, _ = self._terminal.popitem(last=False)
             self._transactions.pop(stale_id, None)
+
+    def has_live_transactions(self) -> bool:
+        with self._lock:
+            return any(state in {"reserved", "mapped", "partial", "prepared", "orphaned"}
+                       for state, _, _ in self._transactions.values())
 
 
 def _target_pp_ranks(pp_rank: int) -> list[int]:
@@ -495,11 +514,20 @@ class _WorkerListener:
         self.socket_dir = socket_dir
         self.socket_path = socket_path
         self.server_sock = server_sock
+        # The pathname alone does not identify this listener: a same-name
+        # restart can bind a new socket at the same path. Unlink only while
+        # the path still refers to the inode this listener bound.
+        self.socket_id = _path_identity(socket_path)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self._conns: set[socket.socket] = set()
         self._conn_lock = threading.Lock()
         self._stopped = False
+        self.map_transactions = _MapTransactionRegistry()
+        self.map_failures: dict[str, Exception] = {}
+
+    def has_pending_maps(self) -> bool:
+        return bool(self.map_failures) or self.map_transactions.has_live_transactions()
 
     def track_conn(self, conn: socket.socket) -> bool:
         """Register an accepted connection so stop() can cancel its read.
@@ -543,11 +571,16 @@ class _WorkerListener:
             except OSError:
                 pass  # the handler is already past this connection
         # accept() only returns on a connection, so make one to let an idle
-        # loop observe stop_event.
+        # loop observe stop_event. If the path now belongs to a replacement,
+        # connecting would reach the replacement instead; shutting down the
+        # listening socket wakes accept() on Linux.
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
-                wake.settimeout(1.0)
-                wake.connect(self.socket_path)
+            if self.owns_path():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                    wake.settimeout(1.0)
+                    wake.connect(self.socket_path)
+            else:
+                self.server_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
         thread = self.thread
@@ -560,16 +593,30 @@ class _WorkerListener:
                       f"{drain_timeout_s:g}s; keeping it for a retry")
                 return False
         self.server_sock.close()
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+        owned = self.owns_path()
+        if owned:
+            try:
+                os.unlink(self.socket_path)
+            except FileNotFoundError:
+                pass
         _remove_dir_if_empty(self.socket_dir)
         if self.socket_dir != self.root_dir:
             _remove_dir_if_empty(self.root_dir)
         self._stopped = True
-        print(f"Worker {self.rank} IPC listener stopped, removed {self.socket_path}")
+        removed = f", removed {self.socket_path}" if owned else ""
+        print(f"Worker {self.rank} IPC listener stopped{removed}")
         return True
+
+    def owns_path(self) -> bool:
+        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
+
+
+def _path_identity(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
 
 def _remove_dir_if_empty(path: str) -> None:
@@ -582,6 +629,9 @@ def _remove_dir_if_empty(path: str) -> None:
 
 _listeners: Dict[Tuple[int, int], _WorkerListener] = {}
 _listeners_lock = threading.Lock()
+# A stopped listener can outlive the native reservation it owned. Until the
+# worker process is restarted, never replace that ownership with an empty registry.
+_blocked_listener_restarts: set[tuple[str, int, int]] = set()
 _atexit_registered = False
 
 
@@ -610,6 +660,8 @@ def stop_worker_listener_threads(
                 all_stopped = False
                 continue
             if stopped:
+                if listener.has_pending_maps():
+                    _blocked_listener_restarts.add((listener.root_dir, listener.rank, listener.pp_rank))
                 del _listeners[key]
             else:
                 all_stopped = False
@@ -643,12 +695,20 @@ def _start_worker_listener_thread(
     """Start or replace a listener while holding the lifecycle lock."""
     global _atexit_registered
     key = (rank, pp_rank)
+    restart_key = (SOCKET_DIR, rank, pp_rank)
+    if restart_key in _blocked_listener_restarts:
+        raise StateConsistencyError("Cannot restart an IPC listener with retained transaction ownership; restart the worker process")
     previous = _listeners.get(key)
     if previous is not None:
+        if previous.has_pending_maps():
+            raise StateConsistencyError("Cannot replace an IPC listener with pending map transactions")
         if not previous.stop():
             raise RuntimeError(
                 f"Cannot replace worker {rank} IPC listener while it is still active"
             )
+        if previous.has_pending_maps():
+            _blocked_listener_restarts.add((previous.root_dir, rank, pp_rank))
+            raise StateConsistencyError("Map transaction completed during listener stop; restart the worker process")
         del _listeners[key]
 
     import torch
@@ -684,8 +744,8 @@ def _start_worker_listener_thread(
     server_sock.listen()
     listener = _WorkerListener(rank, pp_rank, root_dir, socket_dir, socket_path,
                                server_sock)
-    map_transactions = _MapTransactionRegistry()
-    map_failures: dict[str, Exception] = {}
+    map_transactions = listener.map_transactions
+    map_failures = listener.map_failures
 
     def listen_loop():
         # CUDA's current device is thread-local. Bind the listener before any
@@ -941,10 +1001,11 @@ def _start_worker_listener_thread(
                                 f"Failed to abort prepared KV tensors for group_id={group_id}"
                             )
                         native_map_operation = None
-                        map_transactions.abort_reserved(
+                        transaction_state = map_transactions.abort_reserved(
                             transaction_id, group_id, msg["offsets"]
                         )
-                        transaction_state = "not_prepared"
+                        if transaction_state == "aborted":
+                            transaction_state = "not_prepared"
                     elif transaction_state in {"mapped", "partial"}:
                         _sync_after_map(device_index)
                         map_transactions.mark_prepared(
@@ -1017,6 +1078,12 @@ def _start_worker_listener_thread(
                     })
             except Exception as e:
                 if listener.stop_event.is_set():
+                    transaction_id = msg.get("transaction_id")
+                    if native_map_operation is not None and transaction_id is not None:
+                        # Draining a native call can fail before it records a
+                        # reservation. Keep that ownership uncertainty visible
+                        # to the replacement guard even though no reply is sent.
+                        map_failures[transaction_id] = e
                     break  # read cancelled by stop()
                 transaction_id = msg.get("transaction_id")
                 if transaction_id is not None and msg.get("cmd") in {
@@ -1257,6 +1324,7 @@ async def _broadcast_abort_prepared_map(
     offsets: list[int],
     group_id: int,
     transaction_id: str,
+    retained_targets: list[tuple[int, int]],
 ) -> list[str]:
     if not targets:
         return []
@@ -1276,12 +1344,14 @@ async def _broadcast_abort_prepared_map(
             isinstance(response, Exception)
             or not isinstance(response, dict)
             or response.get("status") != "success"
-            or response.get("transaction_state") not in {"aborted", "not_prepared"}
+            or response.get("transaction_state") not in {"aborted", "not_prepared", "orphaned"}
         ):
             failures.append(
                 f"Worker pp{pp}/rank{rank} failed to abort reserved transaction "
                 f"{transaction_id}: {response}"
             )
+        elif response.get("transaction_state") == "orphaned":
+            retained_targets.append((pp, rank))
     return failures
 
 
@@ -1360,10 +1430,10 @@ async def _broadcast_map_to_kv_tensors(
         retained_targets = [
             target
             for target, state in prepare_states.items()
-            if state in {"mapped", "partial", "prepared"}
+            if state in {"mapped", "partial", "prepared", "orphaned"}
         ]
         cleanup_failures = await _broadcast_abort_prepared_map(
-            reserved_targets, offsets, group_id, transaction_id
+            reserved_targets, offsets, group_id, transaction_id, retained_targets
         )
         cleanup_failures.extend(
             await _broadcast_orphan_map_transaction(
@@ -1383,7 +1453,8 @@ async def _broadcast_map_to_kv_tensors(
                 transaction_id, offsets, group_id, "prepare cleanup",
                 prepare_failures + cleanup_failures,
             )
-        error_class = MapQuarantinedError if "quarantined" in prepare_states.values() else RuntimeError
+        error_class = (MapQuarantinedError if "quarantined" in prepare_states.values()
+                       else MapRetainedError if retained_targets else RuntimeError)
         raise error_class(
             f"KV map transaction {transaction_id} reservation failed: "
             + "; ".join(prepare_failures)
@@ -1439,7 +1510,7 @@ async def _broadcast_map_to_kv_tensors(
 
     if commit_failures:
         cleanup_failures = await _broadcast_abort_prepared_map(
-            abort_targets, offsets, group_id, transaction_id
+            abort_targets, offsets, group_id, transaction_id, retain_targets
         )
         prepared_targets = [
             target
@@ -1459,7 +1530,8 @@ async def _broadcast_map_to_kv_tensors(
                 transaction_id, offsets, group_id, "commit cleanup",
                 commit_failures + cleanup_failures,
             )
-        error_class = MapQuarantinedError if "quarantined" in commit_states.values() else RuntimeError
+        error_class = (MapQuarantinedError if "quarantined" in commit_states.values()
+                       else MapRetainedError if retain_targets or prepared_targets else RuntimeError)
         raise error_class(
             f"KV map transaction {transaction_id} failed; mapped pages were "
             "retained for a same-offset retry: "
@@ -1472,22 +1544,43 @@ async def _broadcast_map_to_kv_tensors(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
-    finalize_responses = await asyncio.gather(
-        *[_send_and_receive_message(rank, finalize_message, pp) for pp, rank in targets],
-        return_exceptions=True,
-    )
-    for (pp, rank), response in zip(targets, finalize_responses):
-        if (
-            isinstance(response, Exception)
-            or not isinstance(response, dict)
-            or response.get("status") != "success"
-        ):
-            print(
-                "KVCached warning: worker "
-                f"pp{pp}/rank{rank} did not finalize committed KV map "
-                f"transaction {transaction_id}: {response}",
-                flush=True,
+    pending_targets = targets
+    finalize_timeout = min(IPC_TIMEOUT_S, 60.0) if IPC_TIMEOUT_S > 0 else 60.0
+    for _ in range(2):
+        # Finalize changes only worker bookkeeping and is idempotent. A lost
+        # request may be retried after confirming the mapping is still prepared.
+        finalize_responses = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    _send_and_receive_message(rank, finalize_message, pp),
+                    timeout=finalize_timeout,
+                )
+                for pp, rank in pending_targets
+            ],
+            return_exceptions=True,
+        )
+        finalize_states, failures = await _reconcile_map_transaction_states(
+            pending_targets, finalize_responses, offsets, group_id, transaction_id
+        )
+        failures.extend(
+            f"Worker pp{pp}/rank{rank} cannot finalize from state {state}"
+            for (pp, rank), state in finalize_states.items()
+            if state not in {"prepared", "committed"}
+        )
+        if failures:
+            _fail_unresolved_map_transaction(
+                transaction_id, offsets, group_id, "finalize", failures
             )
+        pending_targets = [
+            target for target, state in finalize_states.items() if state == "prepared"
+        ]
+        if not pending_targets:
+            return
+    _fail_unresolved_map_transaction(
+        transaction_id, offsets, group_id, "finalize",
+        [f"Worker pp{pp}/rank{rank} did not finalize its prepared mapping"
+         for pp, rank in pending_targets],
+    )
 
 
 async def _broadcast_orphan_map_transaction(

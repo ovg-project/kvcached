@@ -8,12 +8,52 @@ from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import wraps
+from math import prod
 from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, KVCachedConfigError
+from kvcached.kv_geometry import check_page_geometry
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    KVCachedConfigError,
+    get_page_size_for_block,
+)
 
 _persistent_allocation: ContextVar[bool] = ContextVar("kvcached_mrv2_allocation", default=False)
+
+
+class _OwnerSpecLookup(dict):
+    """Resolve consumer indexing without including aliases in storage accounting."""
+
+    def __init__(self, specs, shared_layers):
+        super().__init__(specs)
+        self._consumer_specs = {
+            consumer: specs[owner]
+            for consumer, owner in shared_layers.items()
+            if owner in specs
+        }
+
+    def __missing__(self, name):
+        return self._consumer_specs[name]
+
+
+def _with_owner_spec_lookup(config, shared_layers):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    groups = []
+    changed = False
+    for group in config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if (isinstance(spec, UniformTypeKVCacheSpecs)
+                and any(owner in spec.kv_cache_specs for owner in shared_layers.values())):
+            spec = replace(spec, kv_cache_specs=_OwnerSpecLookup(spec.kv_cache_specs, shared_layers))
+            # Preserve native layer-list updates for subsequent binding, while
+            # keeping the owner's original spec dictionary entirely untouched.
+            group = replace(group, kv_cache_spec=spec)
+            changed = True
+        groups.append(group)
+    return replace(config, kv_cache_groups=groups) if changed else config
 
 
 @dataclass(frozen=True)
@@ -93,17 +133,21 @@ def cache_geometry(config: Any) -> CacheGeometry:
             raise KVCachedConfigError("KV backing size disagrees with the uniform physical pool geometry")
     if page_bytes % block_size:
         raise KVCachedConfigError("KV allocation unit bytes must divide exactly by the attention block size")
-    if page_bytes > PAGE_SIZE:
-        raise KVCachedConfigError(
-            f"KV allocation unit ({page_bytes} bytes) exceeds the native page ({PAGE_SIZE} bytes)"
-        )
+    page_size = get_page_size_for_block(page_bytes, PAGE_SIZE)
+    geometry_error = check_page_geometry(page_bytes, page_size, block_size)
+    if geometry_error is not None:
+        raise KVCachedConfigError(geometry_error)
     return CacheGeometry(block_size, page_bytes, num_pools)
 
 
 def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=None):
     """Reserve raw native storage and let vLLM construct its configured views."""
     import torch
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs, create_kv_cache_views
+    from vllm.v1.kv_cache_interface import (
+        UniformTypeKVCacheSpecs,
+        compute_layer_kv_cache_shape_bytes,
+        create_kv_cache_views,
+    )
 
     from kvcached.integration.vllm import interfaces as kvi
 
@@ -113,20 +157,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
     allowed = ("BLNHC", "BLHNC") if CONTIGUOUS_LAYOUT else ("LBNHC", "LBHNC")
     if layout.name not in allowed:
         raise KVCachedConfigError(f"KV layout {layout.name} is incompatible with kvcached {allowed}")
-    per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
-    per_pool_bytes = per_pool_bytes // PAGE_SIZE * PAGE_SIZE
-    if config.num_blocks * geometry.page_bytes > per_pool_bytes:
-        raise KVCachedConfigError("Configured KV blocks exceed the native virtual reservation")
-    raw = kvi.create_kv_tensors(
-        per_pool_bytes,
-        1,
-        str(device),
-        geometry.num_pools,
-        num_kv_buffers=1,
-        unified_pool=True,
-    )
-
-    caches: dict[str, Any] = {}
+    placements = []
     for tensor in config.kv_cache_tensors:
         group_id, group = next(
             (index, group)
@@ -136,7 +167,51 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[tensor.layers[0]]
+        if getattr(tensor, "host_resident", False):
+            raise KVCachedConfigError("kvcached does not support host-resident KV tensors")
         kernel_size = kernel_block_sizes[group_id] if kernel_block_sizes is not None else None
+        if getattr(spec, "storage_block_size", None) is not None:
+            # vLLM 0.30 MLA specs can fix the stored kernel block size.
+            kernel_size = spec.storage_block_size
+        # Match create_kv_cache_views: splitting requires dense, unpadded
+        # manager blocks. page_size_bytes includes padding and is not the
+        # dense size. Layer-compact storage removes interleaving, not padding.
+        shape_bytes = compute_layer_kv_cache_shape_bytes(spec, 1, kernel_size)
+        dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
+        block_stride = tensor.block_stride if CONTIGUOUS_LAYOUT else geometry.page_bytes
+        if shape_bytes[0] > 1 and block_stride != dense_page_size:
+            layout_advice = (
+                "For uniform, unpadded per-layer pages, "
+                "KVCACHED_CONTIGUOUS_LAYOUT=false can remove layer interleaving. "
+                if CONTIGUOUS_LAYOUT and spec.page_size_bytes == dense_page_size else
+                "Changing the KV layout does not remove per-layer page padding. "
+            )
+            raise KVCachedConfigError(
+                f"vLLM cannot split {spec.block_size}-token blocks into the "
+                f"{kernel_size}-token kernel blocks this attention backend reads: "
+                f"the {layout.name} block stride is {block_stride} bytes but a dense "
+                f"page is {dense_page_size} bytes. {layout_advice}"
+                f"Pick an attention backend that accepts {spec.block_size}-token "
+                "blocks (e.g. --attention-backend TRITON_ATTN)."
+            )
+        placements.append((tensor, spec, kernel_size))
+    per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
+    page_size = get_page_size_for_block(geometry.page_bytes, PAGE_SIZE)
+    per_pool_bytes = per_pool_bytes // page_size * page_size
+    if config.num_blocks * geometry.page_bytes > per_pool_bytes:
+        raise KVCachedConfigError("Configured KV blocks exceed the native virtual reservation")
+    raw = kvi.create_kv_tensors(
+        per_pool_bytes,
+        1,
+        str(device),
+        geometry.num_pools,
+        num_kv_buffers=1,
+        unified_pool=True,
+        page_size=page_size,
+    )
+
+    caches: dict[str, Any] = {}
+    for tensor, spec, kernel_size in placements:
         if CONTIGUOUS_LAYOUT:
             views = create_kv_cache_views(
                 raw[0], spec, config.num_blocks, layout, tensor, kernel_size
@@ -182,6 +257,15 @@ class ModelRunnerV2Patch(BasePatch):
         original_init = runner.__init__
         original_initialize = runner.initialize_kv_cache
         original_allocate = attn_utils.allocate_kv_cache
+        original_discovery = module.init_attn_backend
+
+        @wraps(original_discovery)
+        def discover_attention(kv_cache_config, vllm_config, *args, **kwargs):
+            if enable_kvcached():
+                shared_layers = attn_utils.get_shared_kv_cache_layers(vllm_config)
+                if shared_layers:
+                    kv_cache_config = _with_owner_spec_lookup(kv_cache_config, shared_layers)
+            return original_discovery(kv_cache_config, vllm_config, *args, **kwargs)
 
         @wraps(original_init)
         def initialize_worker(self, *args, **kwargs):
@@ -227,6 +311,7 @@ class ModelRunnerV2Patch(BasePatch):
         self._mark_as_patched(initialize_cache)
         runner.__init__ = initialize_worker
         runner.initialize_kv_cache = initialize_cache
+        module.init_attn_backend = discover_attention
         attn_utils.allocate_kv_cache = scoped_allocate
         return True
 

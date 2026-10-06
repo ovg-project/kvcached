@@ -7,6 +7,12 @@
 
 namespace kvcached {
 
+// Confirmed worker mappings stay owned by a retry of the identical page batch.
+class MapRetainedError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 // Only a newly allocated, unpublished page may be quarantined and bypassed.
 class MapQuarantinedError : public std::runtime_error {
 public:
@@ -22,6 +28,11 @@ public:
 class QuarantinedResizeError : public std::invalid_argument {
 public:
   using std::invalid_argument::invalid_argument;
+};
+
+class RetainedResizeError : public QuarantinedResizeError {
+public:
+  using QuarantinedResizeError::QuarantinedResizeError;
 };
 
 } // namespace kvcached

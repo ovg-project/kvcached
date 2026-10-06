@@ -70,6 +70,46 @@ def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch,
         vmm_ops.shutdown_kvcached()
 
 
+@pytest.mark.parametrize("page_mib", [2, 4])
+@pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguous, buffers):
+    import torch
+
+    vmm = _compiled_vmm_ops()
+    page = page_mib * 1024 * 1024
+    layers = 2
+    # The per-pool page can differ from the process default (#529/#540).
+    vmm.init_kvcached("cuda:0", 2 * 1024 * 1024, contiguous)
+    try:
+        tensors = vmm.create_kv_tensors(
+            8 * page, 1, "cuda:0", layers, buffers, page_size=page)
+        # Non-contiguous MLA's upper half is usable, not a mirrored V region.
+        offset = 4 * page if not contiguous and buffers == 1 else 0
+        prepared = vmm.prepare_map_to_kv_tensors("geometry-abort", [offset], 0)
+        assert prepared["success"]
+        assert prepared["targets_count"] == (1 if contiguous else layers * buffers)
+        assert prepared["required_bytes"] == page * layers * buffers
+        assert vmm.abort_prepared_map("geometry-abort", 0)
+        assert vmm.prepare_map_to_kv_tensors("geometry-commit", [offset], 0)["success"]
+        assert vmm.commit_prepared_map("geometry-commit", 0)["success"]
+        views = [tensor[start:start + 128] for tensor in tensors
+                 for start in ([offset] if contiguous or buffers == 1 else [0, 4 * page])]
+        for index, view in enumerate(views):
+            view.fill_(index + 9)
+        torch.cuda.synchronize()
+        adopted = vmm.prepare_map_to_kv_tensors("geometry-adopt", [offset], 0)
+        assert adopted["success"] and adopted["required_bytes"] == 0
+        assert vmm.commit_prepared_map("geometry-adopt", 0)["success"]
+        assert vmm.prepare_unmap_from_kv_tensors([offset], "geometry-release", 0)
+        assert vmm.abort_unmap_from_kv_tensors("geometry-release", 0)
+        for index, view in enumerate(views):
+            assert torch.all(view == index + 9).item()
+        torch.cuda.synchronize()
+        assert vmm.unmap_from_kv_tensors([offset], 0)
+    finally:
+        vmm.shutdown_kvcached()
+
+
 def test_native_allocator_preserves_recoverable_callback_error():
     import uuid
 
@@ -115,6 +155,7 @@ def _check_background_unknown_outcome():
 
     from kvcached import tp_ipc_util as ipc
     from kvcached.kv_cache_manager import KVCacheManager
+    from kvcached.lifecycle import LifecyclePhase, LifecycleState
     from kvcached.locks import NoOpLock
 
     vmm_ops = _compiled_vmm_ops()
@@ -136,11 +177,17 @@ def _check_background_unknown_outcome():
     allocator.set_broadcast_map_callback(fail)
     manager = object.__new__(KVCacheManager)
     manager._lock = NoOpLock()
+    manager.page_allocator = allocator
+    manager._lifecycle = LifecycleState("background-unknown")
+    manager._lifecycle.mark_ready()
     try:
         allocator.start_prealloc_thread()
         assert entered.wait(10), "preallocator did not exercise the callback"
         with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="background"):
             manager.available_size()
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+            manager.wait_ready()
     finally:
         allocator.stop_prealloc_thread()
 

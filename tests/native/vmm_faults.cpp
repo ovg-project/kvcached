@@ -4,13 +4,16 @@
 // Test-only LD_PRELOAD shim. Successful calls always reach the real driver.
 #include <atomic>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <dlfcn.h>
+#include <string>
 
 namespace {
 std::atomic<int> create_count{0}, unmap_count{0}, map_count{0};
 std::atomic<int> fail_create{0}, fail_unmap{0}, fail_map_start{0};
 std::atomic<int> injected{0};
 std::atomic<int> release_count{0}, fail_release{0};
+std::atomic<bool> zero_free_memory{false};
 void *driver_symbol(const char *name) {
   // PyTorch may load libcuda locally, outside LD_PRELOAD's RTLD_NEXT scope.
   static void *driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -37,6 +40,50 @@ extern "C" void kvcached_fault_release(int release_at) {
 
 extern "C" int kvcached_fault_hits() { return injected.load(); }
 extern "C" int kvcached_fault_release_calls() { return release_count.load(); }
+extern "C" int kvcached_create_count() { return create_count.load(); }
+extern "C" int kvcached_release_count() { return release_count.load(); }
+
+extern "C" void kvcached_fault_zero_free_memory(int enabled) {
+  zero_free_memory = enabled != 0;
+}
+
+extern "C" cudaError_t CUDARTAPI cudaMemGetInfo(size_t *free_bytes,
+                                                size_t *total_bytes) {
+  using GetInfo = decltype(&cudaMemGetInfo);
+  static GetInfo original = []() -> GetInfo {
+    auto next = reinterpret_cast<GetInfo>(dlsym(RTLD_NEXT, "cudaMemGetInfo"));
+    if (next != nullptr && next != &cudaMemGetInfo) {
+      return next;
+    }
+    const std::string soname =
+        "libcudart.so." + std::to_string(CUDART_VERSION / 1000);
+    void *runtime = dlopen(soname.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (runtime == nullptr) {
+      return nullptr;
+    }
+    next = reinterpret_cast<GetInfo>(dlsym(runtime, "cudaMemGetInfo"));
+    return next == &cudaMemGetInfo ? nullptr : next;
+  }();
+  if (original == nullptr) {
+    return cudaErrorUnknown;
+  }
+  const auto result = original(free_bytes, total_bytes);
+  if (result == cudaSuccess && zero_free_memory) {
+    *free_bytes = 0;
+  }
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuMemGetInfo_v2(size_t *free_bytes,
+                                            size_t *total_bytes) {
+  auto original = reinterpret_cast<decltype(&cuMemGetInfo_v2)>(
+      driver_symbol("cuMemGetInfo_v2"));
+  const auto result = original(free_bytes, total_bytes);
+  if (result == CUDA_SUCCESS && zero_free_memory) {
+    *free_bytes = 0;
+  }
+  return result;
+}
 
 extern "C" CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle handle) {
   if (fail_at(release_count, fail_release)) {
