@@ -51,6 +51,11 @@ class FakePage:
     def get_num_blocks(page_size: int, block_mem_size: int) -> int:
         return page_size // block_mem_size
 
+    @staticmethod
+    def get_block_range(page_id: int, page_size: int,
+                        block_mem_size: int) -> tuple[int, int]:
+        return page_id * BLOCKS_PER_PAGE, (page_id + 1) * BLOCKS_PER_PAGE
+
 
 class FakePageAllocator:
     """Reports ample capacity but fails alloc_page() after ``fail_after``
@@ -151,6 +156,93 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+
+
+@pytest.mark.parametrize("indexed_before_reservation", [False, True])
+@pytest.mark.parametrize("release", ["free_reserved", "resize"])
+def test_external_release_restores_page_eviction_candidate(
+    monkeypatch, indexed_before_reservation, release,
+):
+    import kvcached.kv_cache_manager as kcm
+    from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    manager = make_manager(fail_after=2)
+    manager.page_allocator.resize = lambda size: False
+    index = PageEvictionIndex(manager)
+    cached = manager.alloc(1)
+    assert cached is not None
+    index.add(cached[0])
+    if indexed_before_reservation:
+        assert index.victims(1) == cached
+    assert manager.try_to_reserve(1)
+    assert index.victims(1) == []
+
+    if release == "free_reserved":
+        manager.free_reserved()
+    else:
+        assert manager.resize(0) is False
+
+    assert manager.reserved_blocks == []
+    assert index.victims(1) == cached
+    index.remove(cached[0])
+    manager.free(cached)
+    assert manager.page_allocator.freed_pages == [0]
+
+
+def test_external_release_only_refreshes_affected_pages(monkeypatch):
+    from unittest.mock import Mock
+
+    import kvcached.kv_cache_manager as kcm
+    from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    manager = make_manager(fail_after=4096)
+    manager.page_allocator.get_num_free_pages = lambda: 4096
+    manager.page_allocator.get_avail_physical_pages = lambda: 4096
+    allocated = manager.alloc(4096 * BLOCKS_PER_PAGE)
+    assert allocated is not None
+    index = PageEvictionIndex(manager)
+    for block in allocated[::BLOCKS_PER_PAGE]:
+        index.add(block)
+    assert index.victims(1) == []
+    occupancy = Mock(wraps=manager.get_page_occupancy)
+    manager.get_page_occupancy = occupancy
+
+    # Release the other occupants of just one of 4096 pinned pages directly.
+    manager.free(allocated[1:BLOCKS_PER_PAGE])
+    assert index.victims(1) == [allocated[0]]
+    assert sum(len(call.args[0]) for call in occupancy.call_args_list) == 2
+
+
+def test_page_release_watchers_are_weak_and_manager_local(monkeypatch):
+    import gc
+    import weakref
+
+    import kvcached.kv_cache_manager as kcm
+    from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    manager = make_manager(fail_after=2)
+    other = make_manager(fail_after=2)
+    allocated = manager.alloc(2)
+    assert allocated is not None
+    cached, pinned = allocated
+    index = PageEvictionIndex(manager)
+    index.add(cached)
+    survivor = PageEvictionIndex(manager)
+    survivor.add(cached)
+    assert index.victims(1) == survivor.victims(1) == []
+    owner = weakref.ref(index)
+    del index
+    gc.collect()
+    assert owner() is None
+
+    # A release in another manager with the same page ids cannot notify us.
+    other.free(other.alloc(1))
+    assert not survivor.dirty
+    manager.free([pinned])
+    assert survivor.victims(1) == [cached]
 
 
 def test_manager_page_counters_include_retained_page_reuse():

@@ -13,6 +13,7 @@ test_prefix_cache.py.
 
 import sys
 import types
+from collections import OrderedDict
 from unittest import mock
 
 _torch_mock = mock.MagicMock()
@@ -232,3 +233,139 @@ class TestPageAwareEviction:
         # LRU dropped the oldest; the newest prefix survives.
         assert pool.get_cached_block(f"h{oldest.block_id}", [0]) is None
         assert pool.get_cached_block(f"h{newest.block_id}", [0]) is not None
+
+    def test_single_block_trim_does_not_scan_the_pool(self, pool_factory):
+        class CountingLRU(OrderedDict):
+            visits = 0
+
+            def __iter__(self):
+                for bid in super().__iter__():
+                    self.visits += 1
+                    yield bid
+
+        pool, mgr = pool_factory(8192)
+        _cache_n(pool, 4096)
+        # Build the index once, as the first cap trim would.
+        pool._page_aligned_victims(1)
+        pool.max_cached_blocks = len(pool._evictable_blocks)
+        pool._evictable_blocks = CountingLRU(pool._evictable_blocks)
+        occupancy = mock.Mock(wraps=mgr.get_page_occupancy)
+        mgr.get_page_occupancy = occupancy
+        for _ in range(32):
+            _cache_n(pool, 1)
+            assert len(pool._evictable_blocks) == pool.max_cached_blocks
+        assert pool._evictable_blocks.visits <= 32
+        assert sum(len(call.args[0]) for call in occupancy.call_args_list) < 128
+
+    def test_lru_shortage_only_visits_requested_blocks(self, pool_factory):
+        pool, _ = pool_factory(128)
+        blocks = _cache_n(pool, 100)
+
+        class BoundedLRU(OrderedDict):
+            def __iter__(self):
+                for i, bid in enumerate(super().__iter__()):
+                    assert i < 2, "scanned past the eviction budget"
+                    yield bid
+
+        pool._evictable_blocks = BoundedLRU(pool._evictable_blocks)
+        assert pool._evict_blocks_from_pool(2, page_aware=False) == 2
+        assert all(b.block_id not in pool._evictable_blocks for b in blocks[:2])
+
+    def test_uncached_release_makes_its_page_a_candidate(self, pool_factory):
+        pool, mgr = pool_factory(64)
+        blocks = pool.get_new_blocks(7)
+        # Page 1 contains one cached block and three active uncached blocks.
+        target = blocks[3]
+        pool.cache_full_blocks(MockRequest(["target"]), [target], 0, 1, 16, 0)
+        pool.free_blocks([target])
+        assert pool._page_aligned_victims(1) == []
+        pool.free_blocks(blocks[4:])
+        assert pool._page_aligned_victims(1) == [target.block_id]
+        before = mgr.pages_pinned()
+        pool._evict_blocks_from_pool(1)
+        assert mgr.pages_pinned() == before - 1
+
+    def test_reallocation_invalidates_a_candidate(self, pool_factory):
+        pool, mgr = pool_factory(64)
+        blocks = _cache_n(pool, 4)
+        candidate = blocks[-1]
+        assert pool._page_aligned_victims(1) == [candidate.block_id]
+        active = pool.get_new_blocks(1)
+        assert active[0].block_id // BLOCKS_PER_PAGE == candidate.block_id // BLOCKS_PER_PAGE
+        assert pool._page_aligned_victims(1) == []
+        pool.free_blocks(active)
+        assert pool._page_aligned_victims(2) == [candidate.block_id]
+        assert pool._page_aligned_victims(2) == [candidate.block_id]
+
+    def test_touch_invalidation_and_reset_drop_old_candidates(self, pool_factory):
+        pool, _ = pool_factory(64)
+        blocks = _cache_n(pool, 8)
+        newest = blocks[-1]
+        assert pool._page_aligned_victims(1) == [newest.block_id]
+        pool.touch([newest])
+        assert pool._page_aligned_victims(1) == []
+        pool.free_blocks([newest])
+        assert pool._page_aligned_victims(1) == [newest.block_id]
+        pool.evict_blocks({newest.block_id})
+        assert pool._page_aligned_victims(1) == []
+        pool.reset_prefix_cache()
+        assert pool._page_aligned_victims(64) == []
+        assert not pool._page_eviction.pages
+        assert not pool._page_eviction.heap
+
+    def test_incremental_order_matches_full_scan_during_churn(self, pool_factory):
+        import random
+
+        pool, mgr = pool_factory(128)
+        rng = random.Random(532)
+        active = []
+
+        def reference(budget):
+            bids = list(pool._evictable_blocks)
+            groups = mgr.page_allocator.group_indices_by_page(bids, mgr.block_mem_size)
+            occupancy = mgr.get_page_occupancy(list(groups))
+            ranks = {bid: i for i, bid in enumerate(bids)}
+            pages = sorted((len(ids), max(ranks[bid] for bid in ids), ids)
+                           for page, ids in groups.items() if len(ids) >= occupancy[page])
+            result: list[int] = []
+            for cost, _, ids in pages:
+                if len(result) + cost > budget:
+                    break
+                result.extend(ids)
+            return result
+
+        for _ in range(1000):
+            op = rng.randrange(5)
+            if op == 0 and mgr.available_size():
+                active.extend(pool.get_new_blocks(min(5, mgr.available_size())))
+            elif op == 1 and active:
+                blocks, active = active[:3], active[3:]
+                if rng.randrange(2):
+                    pool.cache_full_blocks(MockRequest([f"h{b.block_id}" for b in blocks]),
+                                           blocks, 0, len(blocks), 16, 0)
+                pool.free_blocks(blocks)
+            elif op == 2 and pool._evictable_blocks:
+                block = rng.choice(list(pool._evictable_blocks.values()))
+                pool.touch([block])
+                active.append(block)
+            elif op == 3:
+                pool._evict_blocks_from_pool(rng.randrange(1, 8), page_aware=False)
+            budget = rng.randrange(1, 12)
+            assert pool._page_aligned_victims(budget) == reference(budget)
+            if op == 4:
+                pool._evict_blocks_from_pool(budget)
+            assert len(pool._page_eviction.heap) <= max(64, 2 * len(pool._page_eviction.candidates))
+
+
+def test_page_index_uses_byte_offsets_for_nondivisible_geometry():
+    from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+    # 3-byte blocks in 8-byte pages: block 2 straddles a page and is never
+    # allocated. Block 3 belongs to page 1, not 3 // floor(8 / 3) by accident.
+    manager = types.SimpleNamespace(block_mem_size=3, page_size=8,
+                                    get_page_occupancy=lambda pages: {p: 1 for p in pages})
+    index = PageEvictionIndex(manager)
+    for bid in (0, 3, 6, 8):
+        index.add(bid)
+    assert index.victims(4) == [0, 3, 6, 8]
+    assert set(index.pages) == {0, 1, 2, 3}

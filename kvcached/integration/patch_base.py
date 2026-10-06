@@ -21,6 +21,31 @@ def enable_kvcached() -> bool:
     return os.getenv("ENABLE_KVCACHED", "false").lower() in ("true", "1")
 
 
+def is_integration_version_supported(
+    library_name: str, supported_range: str
+) -> bool:
+    """Return whether an engine integration is safe to patch."""
+    detected_version = VersionManager.get_instance().detect_version(library_name)
+    if detected_version is None:
+        logger.warning(
+            "%s integration disabled: version could not be detected; "
+            "running without kvcached",
+            library_name,
+        )
+        return False
+
+    if not VersionRange(supported_range).contains(detected_version):
+        logger.warning(
+            "%s integration disabled: unsupported version %s; "
+            "running without kvcached",
+            library_name,
+            detected_version,
+        )
+        return False
+
+    return True
+
+
 class BasePatch(ABC):
     """Base class for all patches"""
 
@@ -131,9 +156,10 @@ class PatchManager:
         library_version = self.version_manager.detect_version(self.library_name)
         if library_version is None:
             self.logger.warning(
-                f"Could not determine {self.library_name} version, skipping version check"
+                f"Could not determine {self.library_name} version; "
+                f"skipping incompatible patch {patch.patch_name}"
             )
-            return True
+            return False
 
         try:
             version_range_obj = VersionRange(version_range)
