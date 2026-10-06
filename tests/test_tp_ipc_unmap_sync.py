@@ -37,3 +37,16 @@ def test_release_barrier_rejects_unknown_worker_device():
 
     with pytest.raises(RuntimeError, match="worker CUDA device"):
         _worker_physical_release_barrier(SimpleNamespace())
+
+
+
+def test_listener_release_barrier_uses_assigned_device(monkeypatch):
+    synchronize = mock.Mock()
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, synchronize=synchronize)
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    from kvcached.tp_ipc_util import _sync_before_unmap
+
+    _sync_before_unmap(2)
+    synchronize.assert_called_once_with(2)

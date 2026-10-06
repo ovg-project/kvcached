@@ -27,6 +27,7 @@
 
 #include "allocator.hpp"
 #include "constants.hpp"
+#include "gpu_vmm.hpp"
 #include "page_allocator.hpp"
 #include "torch_utils.hpp"
 #include "transaction_error.hpp"
@@ -91,6 +92,81 @@ map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors_with_result(offsets);
+}
+
+std::string current_device_pci_bus_id() {
+  py::gil_scoped_release release;
+  char pci_bus_id[64] = {};
+  const int device_index = gpu_vmm::current_device();
+  const auto status = gpu_vmm::device_get_pci_bus_id(
+      pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), device_index);
+  if (!gpu_vmm::is_success(status)) {
+    throw std::runtime_error(std::string("failed to resolve physical GPU: ") +
+                             gpu_vmm::error_string(status));
+  }
+  return std::string(pci_bus_id);
+}
+
+namespace {
+
+py::dict physical_growth_result(bool success,
+                                const PhysicalGrowthOperationStats &stats,
+                                bool include_reservation_timing) {
+  py::dict result;
+  result["success"] = success;
+  if (include_reservation_timing) {
+    result["ticket_wait_us"] = stats.ticket_wait_us;
+    result["admission_us"] = stats.admission_us;
+    result["reserve_us"] = stats.reserve_us;
+  }
+  result["map_us"] = stats.map_us;
+  result["offsets_count"] = stats.offsets_count;
+  result["targets_count"] = stats.targets_count;
+  result["capacity_checks"] = stats.capacity_checks;
+  result["capacity_rejections"] = stats.capacity_rejections;
+  result["required_bytes"] = stats.required_bytes;
+  result["free_bytes"] = stats.free_bytes;
+  result["total_bytes"] = stats.total_bytes;
+  result["headroom_bytes"] = stats.headroom_bytes;
+  result["usable_bytes"] = stats.usable_bytes;
+  result["shortfall_bytes"] = stats.shortfall_bytes;
+  return result;
+}
+
+} // namespace
+
+py::dict prepare_map_to_kv_tensors(const std::string &transaction_id,
+                                   const std::vector<offset_t> &offsets,
+                                   int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  auto [success, stats] =
+      allocator->prepare_map_to_kv_tensors(transaction_id, offsets);
+  py::gil_scoped_acquire acquire;
+  return physical_growth_result(success, stats, true);
+}
+
+py::dict commit_prepared_map(const std::string &transaction_id,
+                             int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto [success, stats] =
+      FTensorAllocator::global_allocator(group_id)->commit_prepared_map(
+          transaction_id);
+  py::gil_scoped_acquire acquire;
+  return physical_growth_result(success, stats, false);
+}
+
+bool abort_prepared_map(const std::string &transaction_id,
+                        int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)->abort_prepared_map(
+      transaction_id);
+}
+
+bool has_prepared_map(const std::string &transaction_id, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)->has_prepared_map(
+      transaction_id);
 }
 
 bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
@@ -238,6 +314,9 @@ void page_allocator_set_broadcast_map_callback(
           if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
             throw MapQuarantinedError(error.what());
           }
+          if (error.matches(errors.attr("MapRetainedError").ptr())) {
+            throw MapRetainedError(error.what());
+          }
           throw;
         }
       });
@@ -295,12 +374,16 @@ STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
   auto errors = py::module_::import("kvcached.errors");
+  py::register_exception<kvcached::MapRetainedError>(
+      m, "MapRetainedError", errors.attr("MapRetainedError").ptr());
   py::register_exception<kvcached::MapQuarantinedError>(
       m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
   py::register_exception<kvcached::StateConsistencyError>(
       m, "StateConsistencyError", errors.attr("StateConsistencyError").ptr());
   py::register_exception<kvcached::QuarantinedResizeError>(
       m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
+  py::register_exception<kvcached::RetainedResizeError>(
+      m, "RetainedResizeError", errors.attr("RetainedResizeError").ptr());
 
   // Torch-free transactional ops (the six core ops are on the stable
   // dispatcher; see STABLE_TORCH_LIBRARY above).
@@ -308,6 +391,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &kvcached::map_to_kv_tensors_with_result,
         "map_to_kv_tensors_with_result", py::arg("offsets"),
         py::arg("group_id") = 0);
+  m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
+        "prepare_map_to_kv_tensors", py::arg("transaction_id"),
+        py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("commit_prepared_map", &kvcached::commit_prepared_map,
+        "commit_prepared_map", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("abort_prepared_map", &kvcached::abort_prepared_map,
+        "abort_prepared_map", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("has_prepared_map", &kvcached::has_prepared_map, "has_prepared_map",
+        py::arg("transaction_id"), py::arg("group_id") = 0);
+  m.def("current_device_pci_bus_id", &kvcached::current_device_pci_bus_id,
+        "current_device_pci_bus_id");
   m.def("prepare_unmap_from_kv_tensors",
         &kvcached::prepare_unmap_from_kv_tensors,
         "prepare_unmap_from_kv_tensors", py::arg("offsets"),
@@ -377,12 +473,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("trim", &kvcached::page_allocator_trim,
            py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
-           &kvcached::page_allocator_reset_free_page_order)
+           &kvcached::page_allocator_reset_free_page_order,
+           py::call_guard<py::gil_scoped_release>())
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
       .def("get_num_inuse_pages", &kvcached::page_allocator_get_num_inuse_pages)
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_num_retryable_pages",
+           &kvcached::PageAllocator::get_num_retryable_pages)
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)

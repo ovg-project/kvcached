@@ -201,6 +201,15 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
       return std::make_shared<InternalPage>(page_id, page_size_);
     }
 
+    // Retry confirmed retained mappings before taking a fresh page ID. A
+    // preallocation failure may own a whole batch, which must stay intact.
+    if (!retained_page_batches_.empty()) {
+      lock.unlock();
+      retry_retained_pages();
+      lock.lock();
+      continue;
+    }
+
     // Slow path: allocate from free pages
     if (!free_page_list_.empty()) {
       page_id = free_page_list_.front();
@@ -226,6 +235,12 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   try {
     map_pages({page_id});
+  } catch (const MapRetainedError &) {
+    std::lock_guard<std::mutex> guard(lock_);
+    retained_page_batches_.push_back({page_id});
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
+    cond_.notify_all();
+    throw;
   } catch (const MapQuarantinedError &e) {
     std::lock_guard<std::mutex> guard(lock_);
     quarantine_pages_unlocked({page_id}, e.what());
@@ -236,12 +251,14 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     transaction_failed_.store(true, std::memory_order_release);
     throw;
   } catch (const std::exception &e) {
+    // A Python callback error may acquire the GIL while formatting what().
+    const std::string message = e.what();
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
     num_free_pages_.fetch_add(1, std::memory_order_relaxed);
     cond_.notify_all();
     throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
-                             ": " + e.what());
+                             ": " + message);
   }
 
   if (enable_page_prealloc_) {
@@ -352,6 +369,13 @@ bool PageAllocator::resize(int64_t new_mem_size) {
       }
       throw QuarantinedResizeError(
           "cannot resize a pool with quarantined pages");
+    }
+    if (!retained_page_batches_.empty() || retry_pages_in_flight_ != 0) {
+      if (new_num_pages == num_total_pages_.load(std::memory_order_relaxed)) {
+        return true;
+      }
+      throw RetainedResizeError(
+          "cannot resize until retained map batches recover");
     }
 
     if (new_num_pages < get_num_inuse_pages_unlocked()) {
@@ -487,6 +511,19 @@ int64_t PageAllocator::get_num_reserved_pages() const {
   return reserved_page_list_.size();
 }
 
+int64_t PageAllocator::get_num_retryable_pages_unlocked() const {
+  int64_t count = 0;
+  for (const auto &batch : retained_page_batches_) {
+    count += static_cast<int64_t>(batch.size());
+  }
+  return count;
+}
+
+int64_t PageAllocator::get_num_retryable_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_retryable_pages_unlocked();
+}
+
 PageState PageAllocator::get_page_state() const {
   std::lock_guard<std::mutex> lock(lock_);
   return get_page_state_unlocked();
@@ -496,8 +533,9 @@ TransactionState PageAllocator::get_transaction_state() const {
   std::lock_guard<std::mutex> lock(lock_);
   return {quarantined_page_ids_, transaction_error_,
           transaction_failed_.load(std::memory_order_relaxed),
-          static_cast<int64_t>(quarantined_page_ids_.size()) * page_size_ *
-              num_layers_ * num_kv_buffers_};
+          (static_cast<int64_t>(quarantined_page_ids_.size()) +
+           get_num_retryable_pages_unlocked() + retry_pages_in_flight_) *
+              page_size_ * num_layers_ * num_kv_buffers_};
 }
 
 void PageAllocator::throw_if_failed() const {
@@ -667,6 +705,18 @@ void PageAllocator::prealloc_worker() {
     start_time = std::chrono::steady_clock::now();
     prealloc_needed_ = false;
 
+    if (!retained_page_batches_.empty()) {
+      lock.unlock();
+      try {
+        retry_retained_pages();
+      } catch (const StateConsistencyError &) {
+        break;
+      } catch (const std::exception &error) {
+        LOGGER(ERROR, "Retained map retry remains pending: %s", error.what());
+      }
+      continue;
+    }
+
     int64_t current_reserved = reserved_page_list_.size();
     int64_t to_reserve = std::max(0L, min_reserved_pages_ - current_reserved);
     // Only try to reserve up to the available free pages and physical memory
@@ -712,6 +762,12 @@ void PageAllocator::prealloc_worker() {
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
+      } catch (const MapRetainedError &e) {
+        lock.lock();
+        retained_page_batches_.push_back(pages_to_reserve);
+        cond_.notify_all();
+        LOGGER(ERROR, "Retaining %zu pages for a batch retry: %s",
+               pages_to_reserve.size(), e.what());
       } catch (const MapQuarantinedError &e) {
         lock.lock();
         // Pending prealloc pages are still included in the free counter.
@@ -726,13 +782,14 @@ void PageAllocator::prealloc_worker() {
         transaction_failed_.store(true, std::memory_order_release);
         break;
       } catch (const std::exception &e) {
+        const std::string message = e.what();
         lock.lock();
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
         cond_.notify_all();
         LOGGER(ERROR, "Failed to preallocate %ld pages: %s",
-               pages_to_reserve.size(), e.what());
+               pages_to_reserve.size(), message.c_str());
       }
 
       auto end_time = std::chrono::steady_clock::now();
@@ -742,6 +799,53 @@ void PageAllocator::prealloc_worker() {
              duration.count(), pages_to_reserve.size());
     }
   }
+}
+
+bool PageAllocator::retry_retained_pages() {
+  std::vector<page_id_t> pages;
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (retained_page_batches_.empty()) {
+      return false;
+    }
+    pages = std::move(retained_page_batches_.front());
+    retained_page_batches_.pop_front();
+    retry_pages_in_flight_ += static_cast<int64_t>(pages.size());
+  }
+  try {
+    map_pages(pages);
+  } catch (const MapQuarantinedError &error) {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    num_free_pages_.fetch_sub(pages.size(), std::memory_order_relaxed);
+    quarantine_pages_unlocked(pages, error.what());
+    throw;
+  } catch (const StateConsistencyError &error) {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    num_free_pages_.fetch_sub(pages.size(), std::memory_order_relaxed);
+    quarantine_pages_unlocked(pages, error.what());
+    transaction_failed_.store(true, std::memory_order_release);
+    throw;
+  } catch (const std::exception &error) {
+    // available_size() may hold the GIL while waiting for lock_.
+    const std::string message = error.what();
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    retained_page_batches_.push_front(std::move(pages));
+    cond_.notify_all();
+    throw std::runtime_error(std::string("Retained map retry failed: ") +
+                             message);
+  }
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    reserved_page_list_.insert(reserved_page_list_.end(), pages.begin(),
+                               pages.end());
+    update_memory_usage_unlocked();
+    cond_.notify_all();
+  }
+  return true;
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
@@ -849,6 +953,15 @@ void PageAllocator::update_memory_usage_unlocked() {
 }
 
 void PageAllocator::reset_free_page_order() {
+  // clear() must reserve page zero next. Complete unpublished batches before
+  // releasing them normally; never split or physically roll back a partial map.
+  bool recovered = false;
+  while (retry_retained_pages()) {
+    recovered = true;
+  }
+  if (recovered) {
+    trim();
+  }
   std::lock_guard<std::mutex> lock(lock_);
   std::vector<page_id_t> sorted_pages(free_page_list_.begin(),
                                       free_page_list_.end());

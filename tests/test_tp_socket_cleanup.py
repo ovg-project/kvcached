@@ -58,6 +58,11 @@ def socket_root(monkeypatch):
                             dir="/tmp" if os.path.isdir("/tmp") else None)
     monkeypatch.setattr(kvcached.utils, "TP_SOCKET_DIR_ROOT", root)
     monkeypatch.setattr(tp_ipc_util, "SOCKET_DIR", get_tp_socket_dir(IPC_NAME))
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(tp_ipc_util, "current_device_pci_bus_id", lambda: "0000:00:00.0")
     # Other test files start listeners through faked sockets and threads and
     # never stop them; drop those so stop() here only meets this file's own.
     tp_ipc_util._listeners.clear()
@@ -142,7 +147,7 @@ def test_stop_is_safe_without_listeners(socket_root):
 
 def _delayed_map_request():
     """A map_to_kv_tensors request split into its length header and body."""
-    body = pickle.dumps({"cmd": "map_to_kv_tensors", "offsets": [],
+    body = pickle.dumps({"cmd": "prepare_map_to_kv_tensors", "transaction_id": "cleanup-test", "offsets": [],
                          "group_id": 0})
     return len(body).to_bytes(4, "big"), body
 
@@ -160,9 +165,9 @@ def test_stop_cancels_a_read_stalled_in_recv_msg(socket_root, monkeypatch):
 
     def fake_map(*a, **kw):
         mapped.set()
-        return True, []
+        return {"success": True}
 
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", fake_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", fake_map)
     in_recv = threading.Event()
     real_recv = tp_ipc_util.recv_msg
 
@@ -215,9 +220,9 @@ def test_stop_drains_a_handler_executing_a_backend_operation(
         entered.set()
         release.wait(10)
         finished.set()
-        return True, []
+        return {"success": True}
 
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", slow_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", slow_map)
 
     tp_ipc_util.start_worker_listener_thread(0)
     path = tp_ipc_util.get_worker_socket_path(0)
@@ -259,9 +264,9 @@ def test_incomplete_stop_retains_the_listener_and_a_retry_finishes(
     def stuck_map(*a, **kw):
         entered.set()
         release.wait(10)
-        return True, []
+        return {"success": True}
 
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", stuck_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", stuck_map)
 
     tp_ipc_util.start_worker_listener_thread(0)
     path = tp_ipc_util.get_worker_socket_path(0)
@@ -322,11 +327,11 @@ def test_integration_shutdown_defers_allocator_teardown_until_drained(
         entered.set()
         release.wait(10)
         finished.set()
-        return True, []
+        return {"success": True}
 
     teardown = mock.Mock(side_effect=lambda: finished.is_set())
     monkeypatch.setattr(interfaces, "_shutdown_kvcached_impl", teardown)
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", parked_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", parked_map)
     tp_ipc_util.start_worker_listener_thread(0)
     listener = tp_ipc_util._listeners[(0, 0)]
     header, body = _delayed_map_request()
@@ -403,9 +408,9 @@ def test_concurrent_stop_does_not_report_success_while_another_is_draining(
     def parked_map(*a, **kw):
         entered.set()
         release.wait(10)
-        return True, []
+        return {"success": True}
 
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", parked_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", parked_map)
     tp_ipc_util.start_worker_listener_thread(0)
     listener = tp_ipc_util._listeners[(0, 0)]
     header, body = _delayed_map_request()
@@ -439,7 +444,7 @@ def test_concurrent_stop_does_not_report_success_while_another_is_draining(
 def test_combined_unmap_preserves_typed_error_and_phase(socket_root, monkeypatch, phase):
     from kvcached.errors import StateConsistencyError
 
-    monkeypatch.setattr(tp_ipc_util, "_sync_before_unmap", lambda: None)
+    monkeypatch.setattr(tp_ipc_util, "_sync_before_unmap", lambda device: None)
     prepare = mock.Mock(return_value=True)
     commit = mock.Mock(return_value=True)
     failing = prepare if phase == "prepare" else commit
@@ -468,7 +473,7 @@ def test_disconnected_error_reply_does_not_kill_listener(socket_root, monkeypatc
     from kvcached.errors import MapQuarantinedError
 
     failed = mock.Mock(side_effect=MapQuarantinedError("injected map failure"))
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", failed)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", failed)
     monkeypatch.setattr(tp_ipc_util, "kv_tensors_created", lambda **kw: True)
     real_send = tp_ipc_util.send_msg
     errors = []
@@ -483,12 +488,192 @@ def test_disconnected_error_reply_does_not_kill_listener(socket_root, monkeypatc
     tp_ipc_util.start_worker_listener_thread(0)
     path = tp_ipc_util.get_worker_socket_path(0)
     with pytest.raises(ConnectionError):
-        _ask(path, {"cmd": "map_to_kv_tensors", "offsets": [0]})
+        _ask(path, {"cmd": "prepare_map_to_kv_tensors", "transaction_id": "cleanup-test", "offsets": [0]})
 
     assert len(errors) == 1
     assert errors[0]["error_type"] == "map_quarantined"
     assert _ask(path, {"cmd": "kv_tensors_created"})["status"] == "success"
     assert tp_ipc_util.stop_worker_listener_threads() is True
+
+
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_pending_native_cleanup_remains_fatal_during_state_query(socket_root, monkeypatch, phase):
+    pending = False
+
+    def fail(*args, **kwargs):
+        nonlocal pending
+        pending = True
+        raise RuntimeError("injected handle release failure")
+
+    monkeypatch.setattr(tp_ipc_util.vmm_ops, "has_prepared_map", lambda *a, **kw: pending, raising=False)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", fail if phase == "prepare" else lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(tp_ipc_util, "commit_prepared_map", fail)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "failed-cleanup", "offsets": [0]}
+    response = _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))
+    if phase == "commit":
+        assert response["transaction_state"] == "reserved"
+        response = _ask(path, dict(message, cmd="commit_prepared_map"))
+    assert response["error_type"] == "state_consistency"
+    query = _ask(path, dict(message, cmd="get_map_transaction_state"))
+    assert query["status"] == "error"
+    assert query["error_type"] == "state_consistency"
+    assert "cleanup is pending" in query["message"]
+    assert "transaction_state" not in query
+
+
+@pytest.mark.parametrize("phase, expected_state", [
+    ("prepare_map_to_kv_tensors", "reserved"),
+    ("commit_prepared_map", "prepared"),
+    ("abort_prepared_map", "aborted"),
+])
+def test_lost_map_reply_preserves_completed_phase(socket_root, monkeypatch, phase, expected_state):
+    prepare = mock.Mock(return_value={"success": True})
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", prepare)
+    monkeypatch.setattr(tp_ipc_util, "commit_prepared_map", lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(tp_ipc_util, "abort_prepared_map", lambda *a, **kw: True)
+    monkeypatch.setattr(tp_ipc_util, "_sync_after_map", lambda *a: None)
+    monkeypatch.setattr(tp_ipc_util.vmm_ops, "has_prepared_map", lambda *a, **kw: True, raising=False)
+    real_send = tp_ipc_util.send_msg
+    dropped = False
+
+    def lose_first_reply(sock, message):
+        nonlocal dropped
+        if message.get("transaction_state") == expected_state and not dropped:
+            dropped = True
+            raise BrokenPipeError("lost response")
+        real_send(sock, message)
+
+    monkeypatch.setattr(tp_ipc_util, "send_msg", lose_first_reply)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "lost-prepare", "offsets": [0]}
+    _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))
+    if phase != "prepare_map_to_kv_tensors":
+        _ask(path, dict(message, cmd=phase))
+    query = _ask(path, dict(message, cmd="get_map_transaction_state"))
+    assert dropped
+    assert query["status"] == "success"
+    assert query["transaction_state"] == expected_state
+    prepare.assert_called_once()
+
+
+@pytest.mark.parametrize("stop_first", [False, True])
+def test_listener_cannot_forget_a_native_reservation(socket_root, monkeypatch, stop_first):
+    from kvcached.errors import StateConsistencyError
+
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "pending-replacement", "offsets": [0]}
+    assert _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))["transaction_state"] == "reserved"
+    if stop_first:
+        assert tp_ipc_util.stop_worker_listener_threads()
+    with pytest.raises(StateConsistencyError, match="IPC listener"):
+        tp_ipc_util.start_worker_listener_thread(0)
+    if not stop_first:
+        # Rejected replacement leaves the original owner available to reconcile.
+        assert _ask(path, dict(message, cmd="get_map_transaction_state"))["transaction_state"] == "reserved"
+
+
+def test_listener_can_restart_after_confirmed_abort(socket_root, monkeypatch):
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(tp_ipc_util, "abort_prepared_map", lambda *a, **kw: True)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "aborted-replacement", "offsets": [0]}
+    assert _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))["transaction_state"] == "reserved"
+    assert _ask(path, dict(message, cmd="abort_prepared_map"))["transaction_state"] == "aborted"
+    assert tp_ipc_util.stop_worker_listener_threads()
+    tp_ipc_util.start_worker_listener_thread(0)
+    assert _ask(path, {"cmd": "kv_tensors_created"})["status"] == "success"
+
+
+def test_prepare_cleanup_failure_during_stop_blocks_replacement(socket_root, monkeypatch):
+    from kvcached.errors import StateConsistencyError
+
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def prepare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        raise StateConsistencyError("native reservation cleanup failed")
+
+    def replace():
+        try:
+            tp_ipc_util.start_worker_listener_thread(0)
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", prepare)
+    tp_ipc_util.start_worker_listener_thread(0)
+    listener = tp_ipc_util._listeners[(0, 0)]
+    replacement = threading.Thread(target=replace)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(listener.socket_path)
+            header, body = _delayed_map_request()
+            client.sendall(header + body)
+            assert entered.wait(5)
+            replacement.start()
+            assert listener.stop_event.wait(5)
+            release.set()
+            replacement.join(5)
+            assert not replacement.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], StateConsistencyError)
+        with pytest.raises(StateConsistencyError, match="restart"):
+            tp_ipc_util.start_worker_listener_thread(0)
+    finally:
+        release.set()
+        if replacement.ident is not None:
+            replacement.join(5)
+
+
+@pytest.mark.parametrize("implementation", ["seq", "thread", "async"])
+def test_benchmark_transports_use_the_transaction_protocol(socket_root, monkeypatch, implementation):
+    prepare = mock.Mock(return_value={"success": True})
+    commit = mock.Mock(return_value={"success": True})
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", prepare)
+    monkeypatch.setattr(tp_ipc_util, "commit_prepared_map", commit)
+    monkeypatch.setattr(tp_ipc_util, "_sync_after_map", lambda *args: None)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = Path(__file__).parents[1] / "benchmarks/bench_tp_ipc/kvcached_tp_ipc_benchmark.py"
+    spec = importlib.util.spec_from_file_location("_ipc_benchmark", path)
+    assert spec is not None and spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    original = tp_ipc_util._send_and_receive_message
+    benchmark.get_broadcast_impl(implementation)(1, [0])
+    assert tp_ipc_util._send_and_receive_message is original
+    prepare.assert_called_once()
+    commit.assert_called_once()
+    assert not tp_ipc_util._listeners[(0, 0)].has_pending_maps()
+
+
+def test_partial_native_commit_is_retained_not_aborted(socket_root, monkeypatch):
+    monkeypatch.setattr(tp_ipc_util.vmm_ops, "has_prepared_map", lambda *a, **kw: False, raising=False)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", lambda *a, **kw: {"success": True})
+    commit = mock.Mock(side_effect=RuntimeError("one target map failed"))
+    abort = mock.Mock()
+    sync = mock.Mock()
+    monkeypatch.setattr(tp_ipc_util, "commit_prepared_map", commit)
+    monkeypatch.setattr(tp_ipc_util, "abort_prepared_map", abort)
+    monkeypatch.setattr(tp_ipc_util, "_sync_after_map", sync)
+    tp_ipc_util.start_worker_listener_thread(0)
+    path = tp_ipc_util.get_worker_socket_path(0)
+    message = {"transaction_id": "partial-commit", "offsets": [0]}
+    assert _ask(path, dict(message, cmd="prepare_map_to_kv_tensors"))["transaction_state"] == "reserved"
+    response = _ask(path, dict(message, cmd="commit_prepared_map"))
+    assert response["status"] == "error"
+    assert response["transaction_state"] == "partial"
+    assert _ask(path, dict(message, cmd="get_map_transaction_state"))["transaction_state"] == "partial"
+    assert _ask(path, dict(message, cmd="commit_prepared_map"))["status"] == "error"
+    commit.assert_called_once()
+    assert _ask(path, dict(message, cmd="orphan_map_transaction"))["transaction_state"] == "orphaned"
+    sync.assert_called_once_with(0)
+    abort.assert_not_called()
 
 
 def test_worker_shutdown_stops_the_listener(monkeypatch):
@@ -653,9 +838,9 @@ def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypat
     def slow_map(*a, **kw):
         entered.set()
         release.wait(10)
-        return True, []
+        return {"success": True}
 
-    monkeypatch.setattr(tp_ipc_util, "_map_to_kv_tensors_with_result", slow_map)
+    monkeypatch.setattr(tp_ipc_util, "prepare_map_to_kv_tensors", slow_map)
 
     tp_ipc_util.start_worker_listener_thread(0)
     path = tp_ipc_util.get_worker_socket_path(0)

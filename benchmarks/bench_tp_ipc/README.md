@@ -197,11 +197,18 @@ Pages Per Iteration     : 1
 * Drop a my_impl.py file into broadcast_map_impl/ that defines:
 
 ```python
-def broadcast_map_to_kv_tensors(tp_size: int,
-                                           offsets: list[int]) -> None:
+from kvcached.tp_ipc_util import Message
+
+
+async def send_and_receive_message(
+    rank: int, message: Message, pp_rank: int = 0
+) -> Message:
     ...
-# If you use async def, the factory auto-wraps it with asyncio.run().
 ```
+
+The factory uses the production prepare/commit/finalize protocol. Each strategy
+only supplies the transport and returns worker responses, including errors, for
+the coordinator to reconcile.
 
 * Register it in get_broadcast_impl.name_map, e.g.
 
