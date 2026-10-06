@@ -6,6 +6,8 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
 
+import pytest
+
 # Importing kvcached only requires torch to be loaded first; these tests exercise
 # patch selection and do not need any torch APIs. Remove the local stub after the
 # import so it cannot leak into other test modules in the same process.
@@ -23,6 +25,8 @@ try:
         PatchManager,
         is_integration_version_supported,
     )
+    from kvcached.integration.sglang.patches import SGLANG_ALL_RANGE  # noqa: E402
+    from kvcached.integration.vllm.patches import VLLM_ALL_RANGE  # noqa: E402
 finally:
     if _remove_torch_stub:
         sys.modules.pop("torch", None)
@@ -30,8 +34,8 @@ finally:
 
 def test_unsupported_integrations_run_without_kvcached(monkeypatch):
     cases = [
-        ("vllm", None, ">=0.8.4", "version could not be detected"),
-        ("sglang", "0.0.0", ">=0.4.9", "unsupported version 0.0.0"),
+        ("vllm", None, VLLM_ALL_RANGE, "version could not be detected"),
+        ("sglang", "0.0.0", SGLANG_ALL_RANGE, "unsupported version 0.0.0"),
     ]
     manager = PatchManager("vllm").version_manager
     warning = Mock()
@@ -54,7 +58,28 @@ def test_patch_manager_rejects_unknown_version(monkeypatch):
     manager = PatchManager("vllm")
     monkeypatch.setattr(manager.version_manager, "detect_version", lambda _: None)
 
-    assert not manager._is_patch_compatible(Mock(patch_name="test_patch"), ">=0.8.4")
+    assert not manager._is_patch_compatible(Mock(patch_name="test_patch"), VLLM_ALL_RANGE)
+
+
+@pytest.mark.parametrize("library,detected_version,supported", [
+    ("vllm", "0.16.0", False),
+    ("vllm", "0.17.0", True),
+    ("vllm", "0.30.1", True),
+    # A newer engine would get only the patches without an upper bound.
+    ("vllm", "0.31.0.dev5", False),
+    ("vllm", "0.31.0", False),
+    ("sglang", "0.5.10", False),
+    ("sglang", "0.5.11", True),
+    ("sglang", "0.5.20.post1", True),
+    ("sglang", "0.5.21.dev3+gabc1234", False),
+    ("sglang", "0.5.21", False),
+])
+def test_supported_range_bounds(monkeypatch, library, detected_version, supported):
+    supported_range = {"vllm": VLLM_ALL_RANGE, "sglang": SGLANG_ALL_RANGE}[library]
+    manager = PatchManager(library).version_manager
+    monkeypatch.setattr(manager, "detect_version", lambda _: detected_version)
+
+    assert is_integration_version_supported(library, supported_range) is supported
 
 
 def test_autopatches_guard_versions_before_constructing_manager():

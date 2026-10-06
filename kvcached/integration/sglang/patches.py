@@ -24,7 +24,10 @@ BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
 
 # Version ranges for SGLang support
-SGLANG_ALL_RANGE = ">=0.4.9"  # All supported versions
+# All supported versions. Autopatch leaves any other SGLang unpatched, so
+# raise the upper bound when a new release is supported. "<X.dev0" also keeps
+# out pre-release builds of X.
+SGLANG_ALL_RANGE = ">=0.5.11,<0.5.21.dev0"
 
 logger = get_kvcached_logger()
 
