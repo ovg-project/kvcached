@@ -384,7 +384,10 @@ VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.pos
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
-VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+# All supported versions. Autopatch leaves any other vLLM unpatched, so raise
+# the upper bound when a new release is supported. "<X.dev0" also keeps out
+# pre-release builds of X.
+VLLM_ALL_RANGE = ">=0.17.0,<0.31.0.dev0"
 VLLM_MRV2_RANGE = ">=0.29.0,<0.31.0"  # MRV2/native-cache adapter compatibility window
 
 
