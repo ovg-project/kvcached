@@ -204,6 +204,10 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
 
+For vLLM, leaving `KVCACHED_PAGE_SIZE_MB` unset lets kvcached choose a larger physical page when a KV block exceeds the default 2 MiB page. Hybrid block alignment is applied before allocation, and the selected page size is logged. Automatic selection tries multiples of 2 MiB in ascending order, reusing hybrid block alignment where possible, and stops as soon as every page can hold a whole block. It does not require exact tiling or enlarge an already sufficient default page; existing geometry validation still applies. An explicit `KVCACHED_PAGE_SIZE_MB` is preserved and validated as before.
+
+SGLang also selects a larger physical page when `KVCACHED_PAGE_SIZE_MB` is unset and an attention block or Mamba state slot exceeds 2 MiB. Attention blocks keep their token size and use the smallest safe 2 MiB multiple. Mamba retains its existing slot padding: an oversized slot uses the next 2 MiB multiple, then is padded to a divisor of that page. Each pool uses its own page size, so a larger Mamba page does not enlarge the attention pool's pages. The selected size is logged; explicit page settings and blocks that fit the default retain their existing behavior. SGLang's `--page-size` still specifies tokens per attention block, not the physical page size.
+
 > [!NOTE]
 > **AMD / ROCm:** on ROCm (HIP) builds, kvcached automatically defaults to the **non-contiguous** KV-cache layout. The contiguous layout (the default on NVIDIA) hands vLLM's ROCm attention backend strided per-layer KV tensors it cannot read correctly, whereas non-contiguous matches the layout the backend expects. You can override with `KVCACHED_CONTIGUOUS_LAYOUT=true|false`, but contiguous is not recommended on ROCm.
 

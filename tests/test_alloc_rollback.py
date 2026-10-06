@@ -110,6 +110,7 @@ except ImportError:
     _install_vmm_ops_stub()
 
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
+from kvcached.lifecycle import LifecycleState  # noqa: E402
 from kvcached.locks import NoOpLock  # noqa: E402
 
 
@@ -129,8 +130,12 @@ def make_manager(fail_after: int,
     manager.in_shrink = False
     manager.target_num_blocks = None
     manager._lock = NoOpLock()
+    manager._shutdown_lock = threading.Lock()
+    manager._shutdown_requested = threading.Event()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
+    manager._lifecycle = LifecycleState("rollback-test")
+    manager._lifecycle.mark_ready()
     return manager
 
 
@@ -470,6 +475,44 @@ def test_deferred_release_failure_keeps_logical_free_accounting(monkeypatch, sta
     assert data["manager_page_releases_total"] == int(stage == "resize")
     assert data["free_errors_total"] == data["operation_errors_total"] == 1
     assert data["last_error_code"] == "deferred_release_failed"
+    from kvcached.lifecycle import LifecyclePhase
+
+    assert manager.lifecycle_phase is (
+        LifecyclePhase.FAILED if fatal else LifecyclePhase.READY)
+    if fatal:
+        with pytest.raises(type(error)) as readiness_error:
+            manager.wait_ready()
+        assert readiness_error.value is error
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_fatal_mapping_counts_error_and_closes_readiness(monkeypatch, typed):
+    from kvcached.errors import StateConsistencyError
+    from kvcached.lifecycle import LifecyclePhase
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    error = (StateConsistencyError if typed else RuntimeError)("unsafe mapping")
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    monkeypatch.setattr(manager.page_allocator, "get_transaction_state",
+                        lambda: {"state": "FAILED"}, raising=False)
+    with pytest.raises(type(error)) as caught:
+        manager.alloc(1)
+    assert caught.value is error
+    assert manager.page_allocator.freed_pages == []
+    data = manager.operation_snapshot_dict()
+    assert data["manager_page_allocation_failures_total"] == 1
+    assert data["allocation_failures_total"] == 1
+    assert data["allocation_errors_total"] == 1
+    assert data["capacity_exhausted_total"] == 0
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(type(error)) as readiness_error:
+        manager.wait_ready()
+    assert readiness_error.value is error
 
 
 def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatch):

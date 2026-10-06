@@ -33,6 +33,25 @@ def has_zero_capacity_pages(block_mem_size: int, page_size: int) -> bool:
     return page_size < 2 * block_mem_size - gcd(page_size, block_mem_size)
 
 
+def select_page_size(block_mem_size: int, block_size: Optional[int] = None) -> int:
+    """Smallest 2 MiB multiple with a whole block in every page.
+
+    ``block_size`` enables the existing hybrid block alignment at each page
+    candidate. Stop as soon as either the original or aligned block is safe.
+    """
+    if block_mem_size <= 0:
+        raise ValueError("KV block size must be positive")
+    page_size = ((block_mem_size + PAGE_GRANULARITY - 1)
+                 // PAGE_GRANULARITY * PAGE_GRANULARITY)
+    while has_zero_capacity_pages(block_mem_size, page_size):
+        if (block_size and block_mem_size % block_size == 0
+                and aligned_block_size(block_size, block_mem_size // block_size,
+                                       page_size) is not None):
+            break
+        page_size += PAGE_GRANULARITY
+    return page_size
+
+
 def aligned_block_size(block_size: int, bytes_per_token: int,
                        page_size: int) -> Optional[int]:
     """Smallest block size whose block tiles ``page_size`` exactly.

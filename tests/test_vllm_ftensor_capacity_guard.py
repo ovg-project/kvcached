@@ -123,6 +123,7 @@ class FakeManager:
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
         self.group_id = group_id
+        self.page_size = kwargs.get("page_size", PAGE_SIZE)
 
 
 def _enable_manager_factory(iface, monkeypatch):
@@ -364,6 +365,7 @@ class TestManagerFirstOrder:
             "ftensor_bytes_per_layer": FTENSOR_BYTES,
             "num_layers": NUM_LAYERS,
             "num_kv_buffers": NUM_KV_BUFFERS,
+            "page_size": PAGE_SIZE,
         }
 
     def test_alloc_first_then_none_derives_created_capacity(
