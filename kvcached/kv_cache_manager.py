@@ -321,7 +321,13 @@ class KVCacheManager:
         # never served stale.
         self._avail_physical_pages_cache: Optional[int] = None
         self._avail_physical_pages_ts: float = 0.0
-        self._operation_lock = threading.RLock()
+        # Foreground counters follow the allocator's existing writer contract:
+        # one sync scheduler, or async writers serialized by _lock. Post-init
+        # hands page accounting over through _post_init_done. Native background
+        # mapping updates native counters/lifecycle, not these operation totals.
+        # Only error publication can overlap foreground work and post-init.
+        self._operation_error_lock = threading.RLock()
+        self._operation_error_state: tuple[int, Optional[str], Optional[int]] = (0, None, None)
         self._operation_counters = {
             "allocation_requests_total": 0,
             "allocation_successes_total": 0,
@@ -438,32 +444,39 @@ class KVCacheManager:
             self._post_init_done.wait()
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
-        operation_lock = getattr(self, "_operation_lock", None)
-        if operation_lock is None:
-            return
-        with operation_lock:
-            counters = getattr(self, "_operation_counters", None)
-            if counters is None:
-                counters = {}
-                self._operation_counters = counters
+        """Update under the caller's allocator writer discipline."""
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
             counters[name] = counters.get(name, 0) + value
 
     def _get_operation_counter(self, name: str) -> int:
-        operation_lock = getattr(self, "_operation_lock", None)
-        if operation_lock is None:
-            return 0
-        with operation_lock:
-            return getattr(self, "_operation_counters", {}).get(name, 0)
+        counters = getattr(self, "_operation_counters", None)
+        return counters.get(name, 0) if counters is not None else 0
 
-    def _record_operation_error(self, code: str, counter_name: str) -> None:
-        operation_lock = getattr(self, "_operation_lock", None)
-        if operation_lock is None:
+    def _record_operation_error(self, code: str, counter_name: str, *,
+                                failure_counter: Optional[str] = None) -> None:
+        # Post-init errors may overlap a foreground request waiting for its
+        # readiness gate. This cold path owns shared error totals and publishes
+        # code/time as one immutable record; successful operations never take it.
+        error_lock = getattr(self, "_operation_error_lock", None)
+        if error_lock is None:
             return
-        with operation_lock:
-            self._increment_operation_counter("operation_errors_total")
-            self._increment_operation_counter(counter_name)
+        with error_lock:
+            counters = getattr(self, "_operation_counters", None)
+            if counters is None:
+                counters = self._operation_counters = {}
+            counters["operation_errors_total"] = counters.get("operation_errors_total", 0) + 1
+            counters[counter_name] = counters.get(counter_name, 0) + 1
+            if failure_counter is not None:
+                counters[failure_counter] = counters.get(failure_counter, 0) + 1
+            revision = getattr(self, "_operation_error_state", (0, None, None))[0]
+            # A background init failure must not suppress a distinct free error.
+            # Foreground nested errors still prevent double counting by free().
+            revision += int(counter_name != "post_init_errors_total")
+            timestamp_ns = time.time_ns()
+            self._operation_error_state = (revision, code, timestamp_ns)
             self._last_error_code = code
-            self._last_error_timestamp_ns = time.time_ns()
+            self._last_error_timestamp_ns = timestamp_ns
 
     def wait_ready(self, timeout: Optional[float] = None) -> None:
         """Block until background initialization has settled.
@@ -615,28 +628,27 @@ class KVCacheManager:
     def _alloc(self,
                need_size: int,
                _skip_wait: bool = False) -> Optional[List[int]]:
-        track_operation = not _skip_wait
-        if track_operation:
-            self._increment_operation_counter("allocation_requests_total")
+        counters = getattr(self, "_operation_counters", None) if not _skip_wait else None
+        if counters is not None:
+            counters["allocation_requests_total"] = counters.get("allocation_requests_total", 0) + 1
         try:
             indices = self._alloc_impl(need_size, _skip_wait=_skip_wait)
         except Exception:
-            if track_operation:
-                self._increment_operation_counter("allocation_failures_total")
+            if counters is not None:
                 self._record_operation_error(
                     "allocation_failed",
                     "allocation_errors_total",
+                    failure_counter="allocation_failures_total",
                 )
             raise
 
-        if not track_operation:
-            return indices
-        if indices is None:
-            self._increment_operation_counter("allocation_failures_total")
-            self._increment_operation_counter("capacity_exhausted_total")
-        else:
-            self._increment_operation_counter("allocation_successes_total")
-            self._increment_operation_counter("allocated_blocks_total", len(indices))
+        if counters is not None:
+            if indices is None:
+                counters["allocation_failures_total"] = counters.get("allocation_failures_total", 0) + 1
+                counters["capacity_exhausted_total"] = counters.get("capacity_exhausted_total", 0) + 1
+            else:
+                counters["allocation_successes_total"] = counters.get("allocation_successes_total", 0) + 1
+                counters["allocated_blocks_total"] = counters.get("allocated_blocks_total", 0) + len(indices)
         return indices
 
     def _alloc_impl(self,
@@ -809,28 +821,28 @@ class KVCacheManager:
 
     @synchronized
     def free(self, indices: List[int]):
-        self._increment_operation_counter("free_requests_total")
-        errors_before = self._get_operation_counter("operation_errors_total")
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
+            counters["free_requests_total"] = counters.get("free_requests_total", 0) + 1
+        errors_before = getattr(self, "_operation_error_state", (0, None, None))[0]
         try:
             _, had_inconsistency = self._free(indices, track_freed_blocks=True)
         except Exception:
-            self._increment_operation_counter("free_failures_total")
-            if self._get_operation_counter("operation_errors_total") == errors_before:
-                self._record_operation_error(
-                    "free_failed",
-                    "free_errors_total",
-                )
+            if counters is not None:
+                counters["free_failures_total"] = counters.get("free_failures_total", 0) + 1
+                if getattr(self, "_operation_error_state", (0, None, None))[0] == errors_before:
+                    self._record_operation_error("free_failed", "free_errors_total")
             raise
 
-        if had_inconsistency:
-            self._increment_operation_counter("free_failures_total")
-        else:
-            self._increment_operation_counter("free_successes_total")
+        if counters is not None:
+            name = "free_failures_total" if had_inconsistency else "free_successes_total"
+            counters[name] = counters.get(name, 0) + 1
 
     def _free(self, indices: List[int], *,
               track_freed_blocks: bool = False) -> tuple[int, bool]:
         """Free blocks, optionally recording caller progress rather than rollback."""
         self._wait_post_init()
+        counters = getattr(self, "_operation_counters", None) if track_freed_blocks else None
 
         if len(indices) == 0:
             return 0, False  # Nothing to free
@@ -874,9 +886,9 @@ class KVCacheManager:
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
             freed_blocks += len(idxs)
-            if track_freed_blocks:
+            if counters is not None:
                 # Later pages, unmap, or deferred resize may still fail.
-                self._increment_operation_counter("freed_blocks_total", len(idxs))
+                counters["freed_blocks_total"] = counters.get("freed_blocks_total", 0) + len(idxs)
 
             if page.empty():
                 pages_to_free.append(page.page_id)
@@ -1348,16 +1360,19 @@ class KVCacheManager:
             self._shut_down = self.page_allocator.release_shared_segment()
             return self._shut_down
 
-    @synchronized
     def operation_snapshot(self, *, integration=None):
-        """Return monotonic operation counters for this KV cache pool."""
+        """Sample cumulative counters without blocking allocator writers.
+
+        Each counter is monotonic; fields can describe different instants and
+        requests can still be in flight. This is not a coherent page-table or
+        multi-counter transaction snapshot. Error code/time share one record.
+        """
         from kvcached.observability import build_kv_cache_pool_operation_snapshot
         return build_kv_cache_pool_operation_snapshot(
             self,
             integration=integration,
         )
 
-    @synchronized
     def operation_snapshot_dict(self, *, integration=None):
         """Return JSON-serializable operation counters for this KV cache pool."""
         return self.operation_snapshot(
@@ -1365,15 +1380,12 @@ class KVCacheManager:
         ).to_dict()
 
     def _get_operation_observability_state(self):
-        operation_lock = getattr(self, "_operation_lock", None)
-        if operation_lock is None:
-            return {}, None, None
-        with operation_lock:
-            return (
-                dict(getattr(self, "_operation_counters", {})),
-                getattr(self, "_last_error_code", None),
-                getattr(self, "_last_error_timestamp_ns", None),
-            )
+        counters = dict(getattr(self, "_operation_counters", {}) or {})
+        error_state = getattr(self, "_operation_error_state", None)
+        if error_state is not None:
+            return counters, error_state[1], error_state[2]
+        return (counters, getattr(self, "_last_error_code", None),
+                getattr(self, "_last_error_timestamp_ns", None))
 
     @synchronized
     def clear(self):

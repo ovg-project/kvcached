@@ -13,7 +13,7 @@ must roll back partially consumed reserved blocks and page blocks and return
 import sys
 import threading
 import types
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -140,7 +140,8 @@ def make_manager(fail_after: int,
 
 
 def enable_operation_counters(manager: KVCacheManager) -> None:
-    manager._operation_lock = threading.RLock()
+    manager._operation_error_lock = threading.RLock()
+    manager._operation_error_state = (0, None, None)
     manager._operation_counters = {}
     manager._last_error_code = None
     manager._last_error_timestamp_ns = None
@@ -702,3 +703,336 @@ def test_page_init_failure_is_not_a_physical_allocation_miss(monkeypatch):
     assert counters["allocation_failures_total"] == 1
     assert counters["allocation_errors_total"] == 1
     assert counters.get("capacity_exhausted_total", 0) == 0
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "capacity", "error"])
+def test_operation_snapshot_reports_inflight_allocation(monkeypatch, async_sched, outcome):
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+    entered = threading.Event()
+    release = threading.Event()
+    error = RuntimeError("injected allocation failure")
+
+    def allocate(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if outcome == "error":
+            raise error
+        return [0, 1] if outcome == "success" else None
+
+    monkeypatch.setattr(manager, "_alloc_impl", allocate)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        allocation = executor.submit(manager.alloc, 2)
+        try:
+            assert entered.wait(5)
+            data = executor.submit(manager.operation_snapshot_dict).result(timeout=5)
+            assert data["allocation_requests_total"] == 1
+            assert data["allocation_successes_total"] == data["allocation_failures_total"] == 0
+        finally:
+            release.set()
+        if outcome == "error":
+            with pytest.raises(RuntimeError) as raised:
+                allocation.result(timeout=5)
+            assert raised.value is error
+        else:
+            assert allocation.result(timeout=5) == ([0, 1] if outcome == "success" else None)
+    data = manager.operation_snapshot_dict()
+    assert data["allocation_successes_total"] == int(outcome == "success")
+    assert data["allocated_blocks_total"] == (2 if outcome == "success" else 0)
+    assert data["allocation_failures_total"] == int(outcome != "success")
+    assert data["capacity_exhausted_total"] == int(outcome == "capacity")
+    assert data["allocation_errors_total"] == data["operation_errors_total"] == int(outcome == "error")
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+@pytest.mark.parametrize("phase", ["construction", "serialization"])
+def test_operation_snapshot_formatting_does_not_block_writers(monkeypatch, async_sched, phase):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import kvcached.observability as observability
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+    entered = threading.Event()
+    release = threading.Event()
+    snapshot_type = observability.KVCachePoolOperationSnapshot
+
+    if phase == "construction":
+        def blocked_constructor(**kwargs):
+            entered.set()
+            assert release.wait(5)
+            return snapshot_type(**kwargs)
+
+        monkeypatch.setattr(observability, "KVCachePoolOperationSnapshot", blocked_constructor)
+    else:
+        serialize = snapshot_type.to_dict
+
+        def blocked_serialization(snapshot):
+            entered.set()
+            assert release.wait(5)
+            return serialize(snapshot)
+
+        monkeypatch.setattr(snapshot_type, "to_dict", blocked_serialization)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        snapshot = executor.submit(manager.operation_snapshot_dict)
+        try:
+            assert entered.wait(5)
+            # Both the allocator and counter locks must be free while formatting.
+            assert executor.submit(manager.alloc, 1).result(timeout=5) == [0]
+        finally:
+            release.set()
+        data = snapshot.result(timeout=5)
+    assert data["allocation_requests_total"] == 0  # The copied state stays detached.
+    assert manager.operation_snapshot_dict()["allocation_requests_total"] == 1
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+def test_operation_sampling_preserves_concurrent_events(async_sched):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from kvcached.observability import get_registered_kv_cache_pool_operation_snapshot_dicts
+    from kvcached.pool_registry import clear_registered_kv_cache_pools, register_kv_cache_pool
+
+    manager = make_manager(fail_after=2)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+    # Sync scheduling has one allocator writer; async writers already share
+    # the business lock. Background error publication has its own cold lock.
+    allocator_writers = 3 if async_sched else 1
+    manager.alloc(1)  # Keep a page mapped during repeated block allocation/free.
+    integration = "concurrent-operation-test"
+    register_kv_cache_pool(manager, integration=integration)
+    ready = threading.Event()
+    stop = threading.Event()
+    rounds = 300
+
+    def allocate_and_free():
+        assert ready.wait(5)
+        for _ in range(rounds):
+            blocks = manager.alloc(1)
+            assert blocks is not None
+            manager.free(blocks)
+
+    def record_errors():
+        assert ready.wait(5)
+        for _ in range(rounds):
+            manager._record_operation_error("post_init_failed", "post_init_errors_total")
+
+    def sample():
+        previous: Dict[str, Any] = {}
+        samples = 0
+        while not stop.is_set():
+            direct = manager.operation_snapshot_dict(integration=integration)
+            registered = get_registered_kv_cache_pool_operation_snapshot_dicts(
+                integration=integration)[0]
+            for data in (direct, registered):
+                for name, value in data.items():
+                    if name.endswith("_total"):
+                        assert value >= previous.get(name, 0)
+                # Polling may see related counters at different instants.
+                if data["last_error_code"] is not None:
+                    assert data["last_error_code"] == "post_init_failed"
+                    assert data["last_error_timestamp_ns"] is not None
+                previous = data
+            samples += 1
+            ready.set()
+        return samples
+
+    try:
+        with ThreadPoolExecutor(max_workers=allocator_writers + 3) as executor:
+            sampler = executor.submit(sample)
+            writers = [executor.submit(allocate_and_free) for _ in range(allocator_writers)]
+            writers.extend(executor.submit(record_errors) for _ in range(2))
+            try:
+                for writer in writers:
+                    writer.result(timeout=10)
+            finally:
+                stop.set()
+            assert sampler.result(timeout=5) > 0
+        data = manager.operation_snapshot_dict(integration=integration)
+        assert data == get_registered_kv_cache_pool_operation_snapshot_dicts(
+            integration=integration)[0]
+        assert data["allocation_requests_total"] == rounds * allocator_writers + 1
+        assert data["allocation_successes_total"] == rounds * allocator_writers + 1
+        assert data["free_requests_total"] == data["free_successes_total"] == rounds * allocator_writers
+        assert data["freed_blocks_total"] == rounds * allocator_writers
+        assert data["post_init_errors_total"] == data["operation_errors_total"] == rounds * 2
+        assert data["free_failures_total"] == data["allocation_failures_total"] == 0
+    finally:
+        clear_registered_kv_cache_pools(integration=integration)
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "error", "recorded_error"])
+def test_free_start_preserves_inflight_request_and_error_baseline(monkeypatch, async_sched, outcome):
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+    manager._record_operation_error("post_init_failed", "post_init_errors_total")
+    entered = threading.Event()
+    release = threading.Event()
+    error = RuntimeError("injected free failure")
+
+    def free(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if outcome == "recorded_error":
+            manager._record_operation_error("state_inconsistency", "state_inconsistency_errors_total")
+        if outcome != "success":
+            raise error
+        return 0, False
+
+    monkeypatch.setattr(manager, "_free", free)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        freeing = executor.submit(manager.free, [])
+        try:
+            assert entered.wait(5)
+            data = executor.submit(manager.operation_snapshot_dict).result(timeout=5)
+            assert data["free_requests_total"] == 1
+            assert data["free_successes_total"] == data["free_failures_total"] == 0
+            assert data["operation_errors_total"] == data["post_init_errors_total"] == 1
+        finally:
+            release.set()
+        if outcome == "success":
+            assert freeing.result(timeout=5) is None
+        else:
+            with pytest.raises(RuntimeError) as raised:
+                freeing.result(timeout=5)
+            assert raised.value is error
+    data = manager.operation_snapshot_dict()
+    assert data["free_successes_total"] == int(outcome == "success")
+    assert data["free_failures_total"] == int(outcome != "success")
+    assert data["operation_errors_total"] == 1 + int(outcome != "success")
+    assert data["free_errors_total"] == int(outcome == "error")
+    assert data["state_inconsistency_errors_total"] == int(outcome == "recorded_error")
+    assert data["freed_blocks_total"] == 0
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+def test_operation_sampling_and_success_do_not_acquire_error_lock(monkeypatch, async_sched):
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+
+    class ForbiddenLock:
+        def __enter__(self):
+            pytest.fail("normal operations and sampling must not acquire the error lock")
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(manager, "_operation_error_lock", ForbiddenLock())
+    blocks = manager.alloc(1)
+    assert blocks == [0]
+    manager.free(blocks)
+    assert manager.alloc(2 * BLOCKS_PER_PAGE) is None
+    data = manager.operation_snapshot_dict()
+    assert data["allocation_requests_total"] == 2
+    assert data["allocation_successes_total"] == data["allocation_failures_total"] == 1
+    assert data["free_successes_total"] == data["freed_blocks_total"] == 1
+    assert data["operation_errors_total"] == 0
+
+
+def test_async_counter_updates_use_existing_allocator_writer_lock():
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    class YieldingCounters(Dict[str, int]):
+        def get(self, key, default=None):
+            result = super().get(key, default)
+            if key in ("allocation_requests_total", "allocation_successes_total",
+                       "allocated_blocks_total", "free_requests_total",
+                       "free_successes_total", "freed_blocks_total"):
+                # Force a thread switch between read and write. Accuracy must
+                # come from the allocator lock, not a claim about Python +=.
+                time.sleep(0.00001)
+            return result
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    manager._lock = threading.RLock()
+    manager._operation_counters = YieldingCounters()
+    anchor = manager.alloc(1)
+    assert anchor is not None
+
+    def worker():
+        for _ in range(40):
+            blocks = manager.alloc(1)
+            assert blocks is not None
+            manager.free(blocks)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        jobs = [executor.submit(worker) for _ in range(3)]
+        for job in jobs:
+            job.result(timeout=10)
+    data = manager.operation_snapshot_dict()
+    assert data["allocation_requests_total"] == data["allocation_successes_total"] == 121
+    assert data["free_requests_total"] == data["free_successes_total"] == 120
+    assert data["allocated_blocks_total"] == 121
+    assert data["freed_blocks_total"] == 120
+    manager.free(anchor)
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch, async_sched):
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    if async_sched:
+        manager._lock = threading.RLock()
+    manager.world_size = 1
+    manager.pp_rank = 0
+    manager.group_id = 0
+    manager._post_init_done.clear()
+    entered_init, entered_free, release_init = (threading.Event() for _ in range(3))
+    init_error = RuntimeError("injected initialization failure")
+    free_error = RuntimeError("independent foreground free failure")
+    init_globals = getattr(KVCacheManager._post_init, "__globals__")
+    monkeypatch.setitem(init_globals, "kv_tensors_created", lambda **kwargs: True)
+    monkeypatch.setitem(init_globals, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
+
+    def reserve():
+        entered_init.set()
+        assert release_init.wait(5)
+        raise init_error
+
+    def free(*args, **kwargs):
+        entered_free.set()
+        manager._wait_post_init()
+        raise free_error
+
+    monkeypatch.setattr(manager, "_reserve_null_block", reserve)
+    monkeypatch.setattr(manager, "_free", free)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        initializing = executor.submit(manager._post_init)
+        assert entered_init.wait(5)
+        freeing = executor.submit(manager.free, [])
+        try:
+            assert entered_free.wait(5)
+            assert manager.operation_snapshot_dict()["free_requests_total"] == 1
+        finally:
+            release_init.set()
+        for future, expected in ((initializing, init_error), (freeing, free_error)):
+            with pytest.raises(RuntimeError) as raised:
+                future.result(timeout=5)
+            assert raised.value is expected
+    data = manager.operation_snapshot_dict()
+    assert data["operation_errors_total"] == 2
+    assert data["post_init_errors_total"] == data["free_errors_total"] == 1
+    assert data["free_failures_total"] == 1
+    assert data["last_error_code"] == "free_failed"
+    assert data["last_error_timestamp_ns"] is not None

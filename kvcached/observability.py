@@ -213,6 +213,11 @@ def _get_integration_capabilities() -> Dict[str, Any]:
 class KVCachePoolOperationSnapshot:
     """Monotonic operation counters for one kvcached-backed KV pool.
 
+    This polling view does not serialize allocator writers. Counters remain
+    cumulative, but related fields may reflect different instants, including
+    in-flight requests. Error code and timestamp come from one immutable
+    publication. Use the separate occupancy snapshot for coherent page state.
+
     ``manager_page_allocations_total`` counts pages successfully handed to the
     manager by ``alloc_page()``, including reuse of already-mapped reserved
     pages. ``manager_page_allocation_failures_total`` counts its RuntimeError
