@@ -12,7 +12,8 @@ occupy 128. The `waste` column is that ratio.
 ## Run
 
 ```bash
-python bench_frag.py
+python bench_frag.py --backend vllm
+python bench_frag.py --backend sglang
 ```
 
 Defaults to 16 layers and 16384 blocks of 16 KiB, i.e. 128 blocks per 2 MB page.
@@ -43,10 +44,11 @@ blocks, touches every stride-th block so an age-only policy spares it, then
 evicts down to 512 and reports the memory released.
 
 ```bash
-python bench_evict.py
+python bench_evict.py --backend vllm
+python bench_evict.py --backend sglang
 ```
 
-Measured on an RTX PRO 4000 Blackwell (24GB), 8 layers, 16 KiB blocks, 2 MB
+vllm result measured on an RTX PRO 4000 Blackwell (24GB), 8 layers, 16 KiB blocks, 2 MB
 pages (128 blocks per page). Both columns evict the same 3584 blocks:
 
 | stride | freed before (LRU) | freed after (page-aware) |
@@ -59,3 +61,20 @@ pages (128 blocks per page). Both columns evict the same 3584 blocks:
 Age-only eviction degrades as the retained blocks scatter: at stride 8 it evicts
 3584 blocks and frees almost nothing, because each surviving block pins a page.
 Page-aware selection holds flat, evicting the same count.
+
+## CPU-only no-reclaimable-page scaling
+
+`bench_no_reclaimable_evict.py` covers the fallback where every four-block
+physical page has one active block outside the radix tree and three cached
+one-token leaves. No page can be reclaimed. It evicts half the leaves and
+compares one direct native eviction with the page-aware fallback, checking that
+the latter also makes exactly one native `evict()` call.
+
+```bash
+python benchmarks/bench_frag/bench_no_reclaimable_evict.py
+```
+
+The defaults measure 1200 and 2400 leaves with one warm-up and seven timed
+runs. The table reports median/min/max latency and the scaling ratio when the
+leaf count doubles. This benchmark uses SGLang's simulated radix cache and does
+not allocate GPU memory.
