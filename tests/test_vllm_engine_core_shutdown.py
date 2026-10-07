@@ -24,12 +24,21 @@ shutdown directly, with no MPClient in that process at all. That manager
 is the final owner boundary, so its shutdown now removes the segment the
 killed engines leave, the same capture-then-unlink as the client patch.
 
+The same owners remove the worker sockets a killed engine tree leaves
+(issue #510): a process-group SIGTERM lets the process manager SIGKILL
+the workers before Worker.shutdown() runs. Sockets remembered at READY
+are removed after the confirmed engine exit, only while they keep their
+inode and no worker accepts connections on them.
+
 CPU-only: torch, posix_ipc and the compiled extension are stubbed.
 """
 
 import importlib
 import os
+import shutil
+import socket
 import sys
+import tempfile
 import threading
 import types
 from typing import Any
@@ -166,19 +175,27 @@ def test_engine_core_without_shutdown_is_left_alone(vllm_modules):
     assert not hasattr(engine_mod.EngineCore, "shutdown")
 
 
-def _fake_client_module(shutdown=None, resources="owner"):
+def _parallel_config(tp_size, pp_size=1):
+    """The part of vllm_config the socket capture reads."""
+    return types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+        tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size))
+
+
+def _fake_client_module(shutdown=None, resources="owner", vllm_config=None):
     """A mock core_client module.
 
     The default FakeMPClient owns its engines (resources.engine_manager
     set), like the single-API MPClient that launched them. Pass any object
     to use it as the client's resources, or None for a client without the
-    attribute.
+    attribute. vllm_config, when given, is stored like the real client does.
     """
     client_mod = types.ModuleType("mock_client_mod")
 
     class FakeMPClient:
         def __init__(self):
             self._test_children = ()
+            if vllm_config is not None:
+                self.vllm_config = vllm_config
             if resources == "owner":
                 self.resources = types.SimpleNamespace(engine_manager=types.SimpleNamespace(
                     processes=[types.SimpleNamespace(exitcode=None, join=mock.Mock())]))
@@ -870,7 +887,7 @@ def _fake_engine_utils_module(shutdown=None):
     utils_mod = types.ModuleType("mock_engine_utils_mod")
 
     class FakeCoreEngineProcManager:
-        def __init__(self, processes=None):
+        def __init__(self, processes=None, vllm_config=None):
             self._stop_test_children = processes is None
             self.processes = processes if processes is not None else [
                 types.SimpleNamespace(exitcode=None, join=mock.Mock())]
@@ -1699,6 +1716,263 @@ def test_registry_keeps_shared_segment_until_every_pool_stops(
     first.page_allocator.stop_prealloc_thread.assert_called_once_with()
     assert second.page_allocator.stop_prealloc_thread.call_count == 2
     assert not get_registered_kv_cache_pools(integration="vllm")
+
+
+def _bind_worker_socket(path):
+    """A listening socket at *path*, as a live worker binds it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen()
+    return server
+
+
+def _replace_worker_socket(path):
+    """Bind a same-name replacement over *path* with a different inode: the
+    new node is created beside the old one, so the OS cannot hand it the
+    old inode number, and renamed into place like a restart's unlink+bind."""
+    replacement = _bind_worker_socket(path + ".new")
+    os.rename(path + ".new", path)
+    return replacement
+
+
+def _accepts_connection(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(5)
+        try:
+            probe.connect(path)
+        except ConnectionRefusedError:
+            return False
+    return True
+
+
+@pytest.fixture(params=["client", "legacy_client", "supervisor"])
+def socket_owner(request, monkeypatch, tmp_path, vllm_modules):
+    """One ready owner of two engines whose TP=2 workers bound their IPC
+    sockets before READY (issue #510). state.workers holds the listening
+    sockets; closing one is what a killed worker leaves behind: the node
+    stays, nobody accepts on it."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "socket_segment")
+    # Not tmp_path: unix socket paths are limited to ~104 characters on macOS.
+    root = tempfile.mkdtemp(prefix="kvcached-test-", dir="/tmp")
+    monkeypatch.setattr(kv_utils, "TP_SOCKET_DIR_ROOT", root)
+    segment = tmp_path / "socket_segment"
+    segment.write_bytes(b"engines")
+    socket_dir = kv_utils.get_tp_socket_dir()
+    paths = [os.path.join(socket_dir, f"w{rank}.sock") for rank in range(2)]
+    children = [types.SimpleNamespace(exitcode=None, join=mock.Mock()) for _ in range(2)]
+    state = types.SimpleNamespace(
+        segment=segment, socket_dir=socket_dir, paths=paths, children=children,
+        workers={}, stop_children=True, exitcode=-9, calls=0,
+    )
+
+    def bind_workers():
+        for path in paths:
+            state.workers[path] = _bind_worker_socket(path)
+
+    def kill_workers(*which):
+        for path in which or tuple(paths):
+            state.workers.pop(path).close()
+
+    state.bind_workers = bind_workers
+    state.kill_workers = kill_workers
+
+    def shutdown(self, *args, **kwargs):
+        state.calls += 1
+        if state.stop_children:
+            for child in children:
+                child.exitcode = state.exitcode
+        return "upstream result"
+
+    config = _parallel_config(2)
+    if request.param == "supervisor":
+        mod = _fake_engine_utils_module(shutdown)
+        assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(mod)
+        def owner_class():
+            return mod.CoreEngineProcManager(processes=children, vllm_config=config)
+    else:
+        if request.param == "client":
+            resources = types.SimpleNamespace(
+                engine_manager=types.SimpleNamespace(processes=children))
+        else:
+            resources = types.SimpleNamespace(core_engines=[
+                types.SimpleNamespace(proc_handle=child) for child in children])
+        mod = _fake_client_module(shutdown, resources=resources, vllm_config=config)
+        assert patches.MPClientPatch().patch_client_shutdown(mod)
+        owner_class = mod.MPClient
+    state.owner_class = owner_class
+    try:
+        yield state
+    finally:
+        for server in state.workers.values():
+            server.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_group_sigterm_leaves_no_worker_socket_directory(socket_owner):
+    """The process-group SIGTERM shape from the #482 two-GPU run: vLLM's
+    process manager kills the engine tree before Worker.shutdown() runs,
+    so every socket node stays with nobody listening. The owner that
+    removes the segment must also remove them once the engines are gone."""
+    state = socket_owner
+    state.bind_workers()
+    owner = state.owner_class()
+    state.kill_workers()
+    for path in state.paths:
+        assert os.path.exists(path)
+
+    assert owner.shutdown() == "upstream result"
+
+    assert not state.segment.exists()
+    for path in state.paths:
+        assert not os.path.exists(path), "a killed worker's socket was left behind"
+    assert not os.path.exists(state.socket_dir)
+
+
+def test_delayed_worker_keeps_its_socket_until_it_exits(socket_owner):
+    """Engine exit alone is not enough (issue #510): a worker that is still
+    alive after its engine died, stopped or delayed, keeps its socket, and
+    the retry removes it once the worker is gone."""
+    state = socket_owner
+    state.bind_workers()
+    owner = state.owner_class()
+    state.kill_workers(state.paths[0])
+
+    owner.shutdown()
+
+    assert not os.path.exists(state.paths[0])
+    assert os.path.exists(state.paths[1])
+    assert _accepts_connection(state.paths[1])
+    assert os.path.isdir(state.socket_dir)
+
+    state.kill_workers(state.paths[1])
+    owner.shutdown()
+    assert not os.path.exists(state.paths[1])
+    assert not os.path.exists(state.socket_dir)
+
+
+@pytest.mark.parametrize("replacement_alive", [True, False])
+def test_same_name_replacement_socket_is_never_claimed(socket_owner, replacement_alive):
+    state = socket_owner
+    state.bind_workers()
+    owner = state.owner_class()
+    state.kill_workers()
+    replacement = _replace_worker_socket(state.paths[0])
+    try:
+        if not replacement_alive:
+            replacement.close()
+        owner.shutdown()
+        assert not os.path.exists(state.paths[1])
+        assert os.path.exists(state.paths[0]), "the replacement's socket was removed"
+        assert _accepts_connection(state.paths[0]) is replacement_alive
+        assert os.path.isdir(state.socket_dir)
+        owner.shutdown()
+        assert os.path.exists(state.paths[0])
+    finally:
+        replacement.close()
+
+
+def test_live_engines_keep_worker_sockets_until_their_exit_is_confirmed(socket_owner):
+    state = socket_owner
+    state.bind_workers()
+    owner = state.owner_class()
+    state.kill_workers()
+    state.stop_children = False
+
+    owner.shutdown()
+    for path in state.paths:
+        assert os.path.exists(path)
+
+    for child in state.children:
+        child.exitcode = -9
+    owner.shutdown()
+    for path in state.paths:
+        assert not os.path.exists(path)
+    assert not os.path.exists(state.socket_dir)
+
+
+def test_sockets_absent_at_ready_are_never_claimed(socket_owner):
+    """Ownership is established at READY only: nodes that appear later
+    belong to another generation, even when nobody serves them."""
+    state = socket_owner
+    owner = state.owner_class()
+    state.bind_workers()
+    state.kill_workers()
+
+    owner.shutdown()
+
+    assert not state.segment.exists()
+    for path in state.paths:
+        assert os.path.exists(path)
+
+
+def test_non_owning_frontend_leaves_worker_sockets_alone(monkeypatch, tmp_path, vllm_modules):
+    """--api-server-count 2: a frontend's client stops no engines and must
+    not touch the sockets, served or not."""
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "frontend_segment")
+    root = tempfile.mkdtemp(prefix="kvcached-test-", dir="/tmp")
+    monkeypatch.setattr(kv_utils, "TP_SOCKET_DIR_ROOT", root)
+    path = os.path.join(kv_utils.get_tp_socket_dir(), "w0.sock")
+    try:
+        _bind_worker_socket(path).close()
+        mod = _fake_client_module(
+            lambda self: None, resources=types.SimpleNamespace(engine_manager=None),
+            vllm_config=_parallel_config(1))
+        assert patches.MPClientPatch().patch_client_shutdown(mod)
+        frontend = mod.MPClient()
+        frontend.shutdown()
+        assert os.path.exists(path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_owner_without_parallel_config_still_removes_the_segment(
+    monkeypatch, tmp_path, vllm_modules
+):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "no_config_segment")
+    root = tempfile.mkdtemp(prefix="kvcached-test-", dir="/tmp")
+    monkeypatch.setattr(kv_utils, "TP_SOCKET_DIR_ROOT", root)
+    segment = tmp_path / "no_config_segment"
+    segment.write_bytes(b"engine")
+    path = os.path.join(kv_utils.get_tp_socket_dir(), "w0.sock")
+    try:
+        _bind_worker_socket(path).close()
+        mod = _fake_client_module(lambda self: None)
+        assert patches.MPClientPatch().patch_client_shutdown(mod)
+        owner = mod.MPClient()
+        assert owner._kvcached_worker_sockets is None
+        owner.shutdown()
+        assert not segment.exists()
+        assert os.path.exists(path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_client_reuses_supervisor_socket_capture(monkeypatch, vllm_modules):
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    child = types.SimpleNamespace(exitcode=None)
+    sockets = mock.Mock()
+    manager = types.SimpleNamespace(
+        processes=[child], _kvcached_engine_processes=(child,),
+        _kvcached_ipc_cleanup=mock.Mock(), _kvcached_worker_sockets=sockets,
+    )
+    mod = _fake_client_module(lambda self: setattr(child, "exitcode", 0),
+                              resources=types.SimpleNamespace(engine_manager=manager))
+    assert patches.MPClientPatch().patch_client_shutdown(mod)
+    client = mod.MPClient()
+    assert client._kvcached_worker_sockets is sockets
+    client.shutdown()
+    sockets.unlink.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -4,9 +4,10 @@
 import importlib.util
 import logging
 import os
+import socket
 import threading
 import uuid
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -220,6 +221,115 @@ def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
     name = DEFAULT_IPC_NAME if ipc_name is None else ipc_name
     suffix = uuid.uuid5(uuid.NAMESPACE_DNS, name).hex[:8]
     return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
+
+
+def get_tp_worker_socket_path(socket_dir: str, rank: int, pp_rank: int = 0) -> str:
+    """Return the socket path of TP worker *rank* in PP stage *pp_rank*
+    under *socket_dir*: w<rank>.sock, inside a pp<pp_rank> subdirectory for
+    every stage after the first so that stages starting concurrently never
+    bind the same path."""
+    if pp_rank > 0:
+        return os.path.join(socket_dir, f"pp{pp_rank}", f"w{rank}.sock")
+    return os.path.join(socket_dir, f"w{rank}.sock")
+
+
+def path_identity(path: str) -> Optional[Tuple[int, int]]:
+    """(st_dev, st_ino) of the node at *path*, or None when there is none.
+
+    The pathname alone does not identify a socket: a same-name restart
+    binds a new node at the same path."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def remove_dir_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Still holds another worker's socket, or already gone.
+        pass
+
+
+def _accepts_connections(path: str) -> Optional[bool]:
+    """Whether some process still accepts connections on the socket node at
+    *path*. A Unix stream socket node answers connect() only while the
+    process that bound it is alive (a stopped process still queues the
+    connection); once that process has exited the connection is refused.
+    None when the probe cannot tell."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:
+            return None
+    return True
+
+
+class WorkerSocketCleanup:
+    """Remember one deployment's worker sockets while its workers are live
+    and remove, later, only the ones no worker serves any more (issue #510).
+
+    A worker unlinks its own socket from Worker.shutdown(). On a process
+    group SIGTERM vLLM's process manager kills the engine tree before that
+    runs, so the parent that removes the segment the engines left removes
+    the sockets too, behind the same confirmed engine exit. A socket node
+    cannot be pinned by an open descriptor, so each one is remembered by
+    (st_dev, st_ino): a node that no longer matches belongs to a same-name
+    replacement and is kept. A remembered node is removed only once a
+    connect() to it is refused; a stopped or delayed worker still accepts
+    and keeps its socket for a later retry. The check-then-unlink window
+    of the worker's own listener stop applies here as well.
+    """
+
+    def __init__(self, socket_dir: str, tp_size: int, pp_size: int) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, Tuple[int, int]] = {}
+        for pp_rank in range(max(int(pp_size), 1)):
+            for rank in range(max(int(tp_size), 1)):
+                path = get_tp_worker_socket_path(socket_dir, rank, pp_rank)
+                identity = path_identity(path)
+                if identity is not None:
+                    self._pending[path] = identity
+        # Deepest first: a pp<k> directory before the deployment root.
+        self._dirs = sorted({os.path.dirname(path) for path in self._pending},
+                            key=len, reverse=True)
+
+    def unlink(self) -> bool:
+        """Remove the remembered sockets nobody serves and the directories
+        that leaves empty. Return True when nothing is left to retry."""
+        with self._lock:
+            logger = get_kvcached_logger()
+            for path, identity in list(self._pending.items()):
+                current = path_identity(path)
+                if current is None or current != identity:
+                    del self._pending[path]  # gone, or a replacement's
+                    continue
+                served = _accepts_connections(path)
+                if served is None:
+                    logger.warning("Keeping worker socket %s: cannot tell whether "
+                                   "a worker still serves it", path)
+                    continue
+                if served:
+                    logger.warning("Keeping worker socket %s: a worker still "
+                                   "accepts connections on it", path)
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("Failed to remove worker socket %s: %s", path, e)
+                    continue
+                logger.info("Removed worker socket %s left by a killed worker", path)
+                del self._pending[path]
+            for directory in self._dirs:
+                remove_dir_if_empty(directory)
+            return not self._pending
 
 
 class IPCSegmentCleanup:
