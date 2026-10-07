@@ -27,6 +27,7 @@ from kvcached.integration.sglang.patches import (
     SWARadixCacheLimitPatch,
     UnifiedRadixCacheLimitPatch,
 )
+from kvcached.integration.sglang.shutdown import SGLangShutdownPatch
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
@@ -68,6 +69,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
             (SWARadixCacheLimitPatch(), ">=0.5.13"),
             (MambaRadixCacheLimitPatch(), ">=0.5.13"),
+            (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
         ]
     )
 
