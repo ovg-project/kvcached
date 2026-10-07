@@ -54,7 +54,9 @@ class FakePage:
     @staticmethod
     def get_block_range(page_id: int, page_size: int,
                         block_mem_size: int) -> tuple[int, int]:
-        return page_id * BLOCKS_PER_PAGE, (page_id + 1) * BLOCKS_PER_PAGE
+        start = (page_id * page_size + block_mem_size - 1) // block_mem_size
+        end = (page_id + 1) * page_size // block_mem_size
+        return start, end
 
 
 class FakePageAllocator:
@@ -146,6 +148,31 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+
+
+def test_logical_limit_keeps_reserved_blocks_allocatable():
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = 8
+    manager.logical_num_blocks = 5
+    manager.null_block = manager.alloc(1)
+    assert manager.null_block == [0]
+
+    assert manager.try_to_reserve(4)
+    reserved = list(manager.reserved_blocks)
+    assert len(reserved) == 4
+    assert manager.available_size() == 4
+    first = manager.alloc(2)
+    assert first == reserved[:2]
+    assert manager.available_size() == 2
+    assert manager.alloc(3) is None
+    second = manager.alloc(2)
+    assert second == reserved[2:]
+    assert manager.available_size() == 0
+    assert manager.alloc(1) is None
+    assert manager.reserved_blocks == []
+
+    manager.free(reserved)
+    assert manager.available_size() == 4
 
 
 @pytest.mark.parametrize("indexed_before_reservation", [False, True])

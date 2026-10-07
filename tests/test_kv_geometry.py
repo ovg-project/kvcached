@@ -20,6 +20,7 @@ import pytest
 from kvcached.kv_geometry import (
     MIB,
     aligned_block_size,
+    backing_blocks_for_capacity,
     check_page_geometry,
     has_zero_capacity_pages,
     recommend_page_geometry,
@@ -38,6 +39,34 @@ def _brute_zero_capacity(unit, page_size):
     period = unit // math.gcd(unit, page_size) + 1
     return any(_block_range(p, page_size, unit)[1] <= _block_range(p, page_size, unit)[0]
                for p in range(period))
+
+
+@pytest.mark.parametrize("logical,unit,expected", [
+    (0, 64 * 1152, 0), (17, 64 * 1152, 29),
+    (129, 64 * 1152, 143), (256, 64 * 1152, 285),
+    (257, 32 * 1152, 285), (33, 65536, 64),
+])
+def test_backing_blocks_cover_physical_rounding_and_packing(logical, unit, expected):
+    assert backing_blocks_for_capacity(logical, unit, 2 * MIB) == expected
+
+
+def test_backing_capacity_matches_native_page_ranges():
+    for page in (16, 32):
+        for unit in range(1, page + 1):
+            for logical in (1, 2, 7, 31):
+                backing = backing_blocks_for_capacity(logical, unit, page)
+                pages = backing * unit // page
+                capacities = [end - start for start, end in
+                              (_block_range(pid, page, unit) for pid in range(pages))]
+                assert sum(capacities) >= logical
+                assert sum(capacities[:-1]) < logical
+                assert (backing - 1) * unit // page < pages
+
+
+@pytest.mark.parametrize("logical,unit,page", [(-1, 1, 16), (1, 0, 16), (1, 17, 16)])
+def test_backing_capacity_rejects_invalid_geometry(logical, unit, page):
+    with pytest.raises(ValueError):
+        backing_blocks_for_capacity(logical, unit, page)
 
 
 @pytest.mark.parametrize("unit,page_mb", [

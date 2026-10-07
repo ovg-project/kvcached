@@ -648,6 +648,65 @@ def test_mla_pool_sets_renamed_dsa_attributes(elastic_env):
     assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (12, 1, 6)
 
 
+@pytest.mark.parametrize("size,page_size,logical,backing", [
+    (8192, 64, 129, 143), (16320, 64, 256, 285), (8192, 32, 257, 285),
+])
+def test_mla_manager_capacity_uses_page_count(elastic_env, size, page_size, logical, backing):
+    module = _inject_mla()
+
+    module.ElasticMLATokenToKVPool(
+        size, page_size, torch.float16, 512, 64, 1, "cpu", False
+    )
+
+    manager_args, manager_kwargs = elastic_env["get_kv_cache_manager"]
+    assert manager_args[:2] == (backing, page_size)
+    assert manager_kwargs["pool_name"] == "mla"
+    assert manager_kwargs["logical_num_blocks"] == logical
+    # The backing tensor remains measured in token rows.
+    assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (size + page_size, 1, 576)
+
+
+def test_mla_manager_small_capacity_has_one_physical_page(elastic_env):
+    module = _inject_mla()
+
+    module.ElasticMLATokenToKVPool(
+        1024, 64, torch.float16, 512, 64, 1, "cpu", False
+    )
+
+    manager_args, manager_kwargs = elastic_env["get_kv_cache_manager"]
+    # 17 logical blocks occupy less than the default 2 MiB physical page.
+    # 29 backing blocks retain one page after PageAllocator rounds down.
+    assert manager_args[:2] == (29, 64)
+    assert manager_kwargs["logical_num_blocks"] == 17
+
+
+@pytest.mark.parametrize("block_mib,explicit_mb,backing", [
+    (4, None, 17), (2.5, None, 27), (4, 6, 26), (2.5, 10, 20),
+])
+def test_mla_capacity_uses_selected_physical_page(
+        elastic_env, monkeypatch, block_mib, explicit_mb, backing):
+    from kvcached.integration.sglang import patches
+
+    mib = 1024 * 1024
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    if explicit_mb is not None:
+        monkeypatch.setenv("KVCACHED_PAGE_SIZE_MB", str(explicit_mb))
+    configured_page = (explicit_mb or 2) * mib
+    monkeypatch.setattr(patches, "PAGE_SIZE", configured_page)
+    block_bytes = int(block_mib * mib)
+    dimension = block_bytes // 16 // torch.float16.itemsize
+    module = _inject_mla()
+
+    module.ElasticMLATokenToKVPool(
+        256, 16, torch.float16, dimension - 64, 64, 1, "cpu", False
+    )
+
+    manager_args, manager_kwargs = elastic_env["get_kv_cache_manager"]
+    assert manager_args[:3] == (backing, 16, block_bytes // 16)
+    assert manager_kwargs["logical_num_blocks"] == 17
+    assert patches.PAGE_SIZE == configured_page
+
+
 @pytest.mark.parametrize("spelling", ["use_dsa", "use_nsa"])
 def test_mla_pool_accepts_either_dsa_kwarg_spelling(elastic_env, spelling):
     module = _inject_mla()

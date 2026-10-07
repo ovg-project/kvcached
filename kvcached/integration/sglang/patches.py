@@ -18,7 +18,13 @@ from kvcached.integration.version_utils import (
     VersionAwarePatch,
     version_range,
 )
-from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
+from kvcached.kv_geometry import backing_blocks_for_capacity
+from kvcached.utils import (
+    MAX_CACHED_TOKENS,
+    PAGE_SIZE,
+    get_kvcached_logger,
+    get_page_size_for_block,
+)
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
@@ -570,7 +576,13 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     self.free_page_ids_group: List[Any] = []
 
                 def available_size(self):
-                    return self.kvcached_allocator.available_size() * self.page_size
+                    # The manager may be rounded up to one physical kvcached
+                    # page so a small logical pool can reserve its null block.
+                    # Do not expose that backing-only capacity to SGLang.
+                    return min(
+                        self.kvcached_allocator.available_size() * self.page_size,
+                        self.size,
+                    )
 
                 def alloc(self, need_size: int):
                     num_pages = need_size // self.page_size
@@ -1317,10 +1329,20 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     self.cell_size = (
                         self.kv_cache_dim * self.store_dtype.itemsize
                     )
+                    # KVCacheManager counts allocation blocks, and one MLA
+                    # block represents one SGLang page of token rows.  Its
+                    # Backing must cover physical-page rounding and blocks
+                    # excluded at page boundaries, including the null block.
+                    logical_num_blocks = math.ceil(size / page_size) + 1
+                    block_mem_size = page_size * self.cell_size
+                    physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
+                    num_blocks = backing_blocks_for_capacity(
+                        logical_num_blocks, block_mem_size, physical_page_size)
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        size + page_size, page_size, self.cell_size, layer_num,
+                        num_blocks, page_size, self.cell_size, layer_num,
                         num_kv_buffers=1,
                         pool_name="mla",
+                        logical_num_blocks=logical_num_blocks,
                     )
 
                     kv_size = self.get_kv_size_bytes()

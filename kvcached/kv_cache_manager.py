@@ -126,6 +126,7 @@ class KVCacheManager:
         defer_physical_release: bool = False,
         own_segment: bool = False,
         page_size: Optional[int] = None,
+        logical_num_blocks: Optional[int] = None,
     ):
         """
         Args:
@@ -151,8 +152,18 @@ class KVCacheManager:
                 one, for pools whose sizes differ (SGLang SWA and Mamba pools).
             page_size: Physical page size, matching this pool's backing tensors.
                 Defaults to KVCACHED_PAGE_SIZE_MB.
+            logical_num_blocks: Optional allocation limit when ``num_blocks``
+                includes extra backing for physical-page rounding and packing.
+                The limit includes any reserved null block.
         """
+        if logical_num_blocks is not None and not (
+            0 <= logical_num_blocks <= num_blocks
+        ):
+            raise ValueError(
+                "logical_num_blocks must be between 0 and num_blocks"
+            )
         self.num_blocks = num_blocks
+        self.logical_num_blocks = logical_num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -1069,7 +1080,17 @@ class KVCacheManager:
             # (a C++ change, out of scope).
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        available = avail_blocks + blocks_from_free_pages
+        logical_num_blocks = getattr(self, "logical_num_blocks", None)
+        if logical_num_blocks is not None and logical_num_blocks < self.num_blocks:
+            # Reserved blocks have left their pages but remain available for
+            # the next alloc(), just as in the physical capacity above.
+            logical_available = max(
+                0, logical_num_blocks - self._get_num_alloced_blocks()
+                + len(self.reserved_blocks)
+            )
+            available = min(available, logical_available)
+        return available
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().

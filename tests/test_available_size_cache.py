@@ -107,6 +107,15 @@ def test_available_size_caches_get_avail_physical_pages():
     assert manager.page_allocator.get_avail_call_count == 1
 
 
+def test_available_size_honors_logical_block_limit():
+    manager = make_manager()
+    manager.num_blocks = 10
+    manager.logical_num_blocks = 5
+    manager._get_num_alloced_blocks = lambda: 2
+
+    assert manager.available_size() == 3
+
+
 def test_available_size_refetches_after_ttl_window(monkeypatch):
     """Once the TTL window elapses, available_size() re-reads the driver call
     and serves the fresh value from the cache until the window elapses again."""
