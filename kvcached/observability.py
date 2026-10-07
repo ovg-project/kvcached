@@ -94,7 +94,9 @@ class KVCachePoolSnapshot:
 
     ``mapped_bytes`` counts pages in active use. ``reserved_mapped_bytes``
     counts mapped pages held by background pre-allocation, and
-    ``total_mapped_bytes`` is the sum of both physical footprints.
+    ``total_mapped_bytes`` is the sum of both physical footprints. The latter
+    two are ``None`` after a degraded or failed map/unmap transaction because
+    the allocator's page counters may no longer match the physical mappings.
     """
 
     schema_version: str
@@ -318,6 +320,9 @@ def build_kv_cache_pool_snapshot(
     transaction_data = (
         transaction_state_fn() if callable(transaction_state_fn) else None
     )
+    transaction_state = (
+        str(transaction_data["state"]) if transaction_data is not None else None
+    )
     lifecycle_error = getattr(manager, "lifecycle_error", None)
     available_physical_pages = _call_int(allocator, "get_avail_physical_pages")
     if free_pages is None or reserved_pages is None or available_physical_pages is None:
@@ -333,7 +338,7 @@ def build_kv_cache_pool_snapshot(
         mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
     else:
         mapped_bytes = inuse_pages * page_bundle_bytes
-    if reserved_pages is None:
+    if reserved_pages is None or transaction_state in {"DEGRADED", "FAILED"}:
         reserved_mapped_bytes = None
         total_mapped_bytes = None
     else:
@@ -401,9 +406,7 @@ def build_kv_cache_pool_snapshot(
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
         lifecycle_phase=_lifecycle_phase_value(manager),
-        transaction_state=(
-            str(transaction_data["state"]) if transaction_data is not None else None
-        ),
+        transaction_state=transaction_state,
         quarantined_pages=(
             int(transaction_data["quarantined_pages"])
             if transaction_data is not None

@@ -180,7 +180,43 @@ def test_pool_snapshot_reports_allocator_health_details():
     assert data["quarantined_pages"] == 2
     assert data["retained_bytes_upper_bound"] == 64 * 1024 * 1024
     assert data["lifecycle_error"] == "map transaction aborted"
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
     json.dumps(data)
+
+
+def test_pool_snapshot_omits_mapped_totals_after_failed_unmap():
+    class FailedUnmapPageAllocator(FakePageAllocator):
+        def get_page_state(self):
+            return {
+                "total_pages": 20,
+                "free_pages": 20,
+                "inuse_pages": 0,
+                "reserved_pages": 0,
+            }
+
+        def get_transaction_state(self):
+            return {
+                "state": "FAILED",
+                "quarantined_pages": 0,
+                "retained_bytes_upper_bound": 0,
+                "last_error": "KV unmap could not complete",
+            }
+
+    class FailedUnmapManager(FakeManager):
+        page_allocator = FailedUnmapPageAllocator()
+        lifecycle_phase = "failed"
+        lifecycle_error = StateConsistencyError("KV unmap could not complete")
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailedUnmapManager()).to_dict()
+
+    assert data["transaction_state"] == "FAILED"
+    assert data["mapped_bytes"] == 0
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
 
 
 def test_pool_snapshot_falls_back_for_older_page_allocator():
