@@ -52,6 +52,26 @@ class RuntimeSnapshot:
 
 
 @dataclass(frozen=True)
+class RuntimeReservationSnapshot:
+    """Runtime-owned bytes reported per integration, device and category.
+
+    Owners within a category are summed without retaining their objects.
+    This is a report, not memory managed or reserved by the KV allocator.
+    Consumers should feature-detect optional fields as for the other snapshots.
+    """
+
+    schema_version: str
+    integration: str
+    device: str
+    pool_name: str
+    num_bytes: int
+    owner_count: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class KVCachePoolSnapshot:
     """Read-only state of one kvcached-backed KV pool.
 
@@ -247,15 +267,14 @@ def get_capabilities() -> Dict[str, Any]:
             "registered_kv_cache_pool_snapshots": True,
             "read_only": True,
             "policy_control": False,
-            # Revisioned instance memory limits. This is the one write path on
-            # the surface: the caller owns quota policy, kvcached only stores
-            # and enforces the assigned cap through the resize()/in_shrink
-            # state machine.
+            # Revisioned instance memory limits: the caller owns quota policy;
+            # kvcached stores and enforces the assigned cap through the
+            # resize()/in_shrink state machine.
             "instance_memory_limit": True,
             # Allocator-owned operation counters. Not landed yet.
             "operation_counters": False,
-            # Runtime reservation reporting for non-KV memory. Not landed yet.
-            "runtime_reservation_reporting": False,
+            # Runtime-owned memory registration and read-only reports.
+            "runtime_reservation_reporting": True,
             # Poll-only lifecycle readiness (#375, item 5): every pool exposes
             # ``lifecycle_phase``, ``lifecycle_error`` and ``wait_ready()``,
             # and ``KVCachePoolSnapshot.lifecycle_phase`` carries the phase.
@@ -265,6 +284,8 @@ def get_capabilities() -> Dict[str, Any]:
         "integrations": _get_integration_capabilities(),
         "pool_snapshot_fields": list(KVCachePoolSnapshot.__dataclass_fields__.keys()),
         "runtime_snapshot_fields": list(RuntimeSnapshot.__dataclass_fields__.keys()),
+        "runtime_reservation_snapshot_fields": list(
+            RuntimeReservationSnapshot.__dataclass_fields__.keys()),
         # Names the counters exposed once operation observability lands. Kept
         # coupled to features["operation_counters"]: this list is non-empty if
         # and only if that flag is True.

@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
+    RuntimeReservationSnapshot,
     build_runtime_snapshot,
     get_registered_kv_cache_pool_snapshot_dicts,
     get_registered_kv_cache_pool_snapshots,
@@ -134,6 +136,7 @@ def shutdown_kvcached() -> bool:
     _created_kv_tensor_capacity.clear()
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="vllm")
+        runtime_reservations.clear_runtime_owned_reservations(integration="vllm")
         return True
 
     if not stop_worker_listener_threads():
@@ -156,6 +159,7 @@ def shutdown_kvcached() -> bool:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="vllm")
+    runtime_reservations.clear_runtime_owned_reservations(integration="vllm")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
@@ -420,6 +424,42 @@ def build_kv_views(
         num_layers, is_mla or unified_pool, gpu_mem_bytes_per_layer_k_or_v,
     )
     return kv_tensors, page_size_bytes
+
+
+def register_runtime_owned_reservation(
+    device: str, pool_name: str, num_bytes: int, *, owner: Any,
+) -> None:
+    """Report live runtime-owned bytes; registration does not resize KV pools."""
+    runtime_reservations.register_runtime_owned_reservation(
+        device, pool_name, num_bytes, owner=owner, integration="vllm")
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    """Return reported runtime bytes by pool category for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_breakdown(
+        device, integration="vllm")
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    """Return reported runtime bytes on one device for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_bytes(
+        device, integration="vllm")
+
+
+def runtime_reservation_snapshots(
+    device: Optional[str] = None,
+) -> List[RuntimeReservationSnapshot]:
+    """Return immutable runtime reservation reports for this integration."""
+    return runtime_reservations.get_runtime_reservation_snapshots(
+        integration="vllm", device=device)
+
+
+def runtime_reservation_snapshot_dicts(
+    device: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable runtime reservation reports."""
+    return runtime_reservations.get_runtime_reservation_snapshot_dicts(
+        integration="vllm", device=device)
 
 
 def observability_snapshot():
