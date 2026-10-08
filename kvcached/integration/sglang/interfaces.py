@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
+    RuntimeReservationSnapshot,
     build_runtime_snapshot,
     get_registered_kv_cache_pool_snapshot_dicts,
     get_registered_kv_cache_pool_snapshots,
@@ -87,6 +89,7 @@ def shutdown_kvcached() -> bool:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
+        runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
         return True
 
     if not stop_worker_listener_threads():
@@ -94,10 +97,47 @@ def shutdown_kvcached() -> bool:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")
+    runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
     return True
+
+
+def register_runtime_owned_reservation(
+    device: str, pool_name: str, num_bytes: int, *, owner: Any,
+) -> None:
+    """Report live runtime-owned bytes; registration does not resize KV pools."""
+    runtime_reservations.register_runtime_owned_reservation(
+        device, pool_name, num_bytes, owner=owner, integration="sglang")
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    """Return reported runtime bytes by pool category for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_breakdown(
+        device, integration="sglang")
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    """Return reported runtime bytes on one device for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_bytes(
+        device, integration="sglang")
+
+
+def runtime_reservation_snapshots(
+    device: Optional[str] = None,
+) -> List[RuntimeReservationSnapshot]:
+    """Return immutable runtime reservation reports for this integration."""
+    return runtime_reservations.get_runtime_reservation_snapshots(
+        integration="sglang", device=device)
+
+
+def runtime_reservation_snapshot_dicts(
+    device: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable runtime reservation reports."""
+    return runtime_reservations.get_runtime_reservation_snapshot_dicts(
+        integration="sglang", device=device)
 
 
 def observability_snapshot():
