@@ -3,6 +3,7 @@
 """Dependency-free ownership checks for the native metadata adapter."""
 
 import importlib.util
+import os
 import types
 from collections import OrderedDict
 from pathlib import Path
@@ -12,7 +13,8 @@ from unittest.mock import Mock
 # package's torch requirement so its lifetime checks also run on a plain CPU host.
 _spec = importlib.util.spec_from_file_location(
     "_native_block_pool_under_test",
-    Path(__file__).parents[1] / "kvcached/integration/vllm/native_block_pool.py",
+    Path(os.environ.get("ENGINE_COMPAT_SOURCE", Path(__file__).parents[1]))
+    / "kvcached/integration/vllm/native_block_pool.py",
 )
 assert _spec is not None and _spec.loader is not None
 _module = importlib.util.module_from_spec(_spec)

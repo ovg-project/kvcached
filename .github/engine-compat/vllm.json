@@ -1,0 +1,8 @@
+{
+  "task": "Preserve worker profiling and warmup contracts across the selected vLLM release. Keep inference mode and graph initialization. Do not infer a colocated engine's KV capacity from whole-device memory deltas.",
+  "allow": ["kvcached/integration/vllm/patches.py", "kvcached/integration/vllm/interfaces.py", "tests/test_vllm_virtual_kv_capacity.py"],
+  "cpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "gpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "qualification": "single-gpu",
+  "releases": ["*"]
+}
