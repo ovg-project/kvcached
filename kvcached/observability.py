@@ -88,7 +88,15 @@ class KVCachePoolSnapshot:
     (``kvcached.lifecycle.LifecyclePhase`` values ``initializing``,
     ``ready``, ``degraded``, ``failed``), or ``None`` when the manager does
     not expose one. It is poll-only; ``KVCacheManager.wait_ready()`` is the
-    blocking gate.
+    blocking gate. ``transaction_state`` and the quarantine fields report the
+    native allocator verdict when that API is available; ``lifecycle_error``
+    is its JSON-safe Python-side error string.
+
+    ``mapped_bytes`` counts pages in active use. ``reserved_mapped_bytes``
+    counts mapped pages held by background pre-allocation, and
+    ``total_mapped_bytes`` is the sum of both physical footprints. The latter
+    two are ``None`` after a degraded or failed map/unmap transaction because
+    the allocator's page counters may no longer match the physical mappings.
     """
 
     schema_version: str
@@ -122,6 +130,12 @@ class KVCachePoolSnapshot:
     resize_target_bytes: Optional[int]
     # Added with #375 item (5); optional so older builders keep working.
     lifecycle_phase: Optional[str] = None
+    transaction_state: Optional[str] = None
+    quarantined_pages: Optional[int] = None
+    retained_bytes_upper_bound: Optional[int] = None
+    lifecycle_error: Optional[str] = None
+    reserved_mapped_bytes: Optional[int] = None
+    total_mapped_bytes: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -302,6 +316,14 @@ def build_kv_cache_pool_snapshot(
         free_pages = int(page_state["free_pages"])
         inuse_pages = int(page_state["inuse_pages"])
         reserved_pages = int(page_state["reserved_pages"])
+    transaction_state_fn = getattr(allocator, "get_transaction_state", None)
+    transaction_data = (
+        transaction_state_fn() if callable(transaction_state_fn) else None
+    )
+    transaction_state = (
+        str(transaction_data["state"]) if transaction_data is not None else None
+    )
+    lifecycle_error = getattr(manager, "lifecycle_error", None)
     available_physical_pages = _call_int(allocator, "get_avail_physical_pages")
     if free_pages is None or reserved_pages is None or available_physical_pages is None:
         effective_free_pages = None
@@ -310,15 +332,18 @@ def build_kv_cache_pool_snapshot(
 
     num_layers = _int_attr(manager, "num_layers") or 0
     num_kv_buffers = _int_attr(manager, "num_kv_buffers") or 0
+    page_size_bytes = _int_attr(manager, "page_size") or 0
+    page_bundle_bytes = page_size_bytes * num_layers * num_kv_buffers
     if page_state is None or inuse_pages is None:
         mapped_bytes = int(manager.get_mapped_memory_size("bytes"))
     else:
-        mapped_bytes = (
-            inuse_pages
-            * (_int_attr(manager, "page_size") or 0)
-            * num_layers
-            * num_kv_buffers
-        )
+        mapped_bytes = inuse_pages * page_bundle_bytes
+    if reserved_pages is None or transaction_state in {"DEGRADED", "FAILED"}:
+        reserved_mapped_bytes = None
+        total_mapped_bytes = None
+    else:
+        reserved_mapped_bytes = reserved_pages * page_bundle_bytes
+        total_mapped_bytes = mapped_bytes + reserved_mapped_bytes
     # manager.mem_size is the virtual reservation for ONE KV buffer of ONE
     # layer -- K (or V) for MHA, the single combined buffer for MLA -- which
     # is why the total scales by both num_layers and num_kv_buffers. Scale by
@@ -358,7 +383,7 @@ def build_kv_cache_pool_snapshot(
         group_id=_int_attr(manager, "group_id") or 0,
         num_layers=num_layers,
         num_kv_buffers=num_kv_buffers,
-        page_size_bytes=_int_attr(manager, "page_size") or 0,
+        page_size_bytes=page_size_bytes,
         block_size_bytes=block_size_bytes,
         total_blocks=_int_attr(manager, "num_blocks") or 0,
         available_blocks=available_blocks,
@@ -381,6 +406,20 @@ def build_kv_cache_pool_snapshot(
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
         lifecycle_phase=_lifecycle_phase_value(manager),
+        transaction_state=transaction_state,
+        quarantined_pages=(
+            int(transaction_data["quarantined_pages"])
+            if transaction_data is not None
+            else None
+        ),
+        retained_bytes_upper_bound=(
+            int(transaction_data["retained_bytes_upper_bound"])
+            if transaction_data is not None
+            else None
+        ),
+        lifecycle_error=(str(lifecycle_error) if lifecycle_error is not None else None),
+        reserved_mapped_bytes=reserved_mapped_bytes,
+        total_mapped_bytes=total_mapped_bytes,
     )
 
 

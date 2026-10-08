@@ -145,6 +145,8 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["virtual_per_layer_bytes"] == 128 * 4096 * 2
     assert data["virtual_total_bytes"] == 128 * 4096 * 8 * 2
     assert data["mapped_bytes"] == 10 * 8 * (2 * 1024 * 1024) * 2
+    assert data["reserved_mapped_bytes"] == 2 * 8 * (2 * 1024 * 1024) * 2
+    assert data["total_mapped_bytes"] == 12 * 8 * (2 * 1024 * 1024) * 2
     assert data["total_pages"] == 20
     assert data["free_pages"] == 10
     assert data["inuse_pages"] == 10
@@ -156,6 +158,65 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["lifecycle_phase"] is None
     assert FakeManager.page_allocator.page_state_calls == 1
     json.dumps(data)
+
+
+def test_pool_snapshot_reports_allocator_health_details():
+    class HealthPageAllocator(FakePageAllocator):
+        def get_transaction_state(self):
+            return {
+                "state": "DEGRADED",
+                "quarantined_pages": 2,
+                "retained_bytes_upper_bound": 64 * 1024 * 1024,
+                "last_error": "map transaction aborted",
+            }
+
+    class HealthManager(FakeManager):
+        page_allocator = HealthPageAllocator()
+        lifecycle_error = RuntimeError("map transaction aborted")
+
+    data = build_kv_cache_pool_snapshot(HealthManager()).to_dict()
+
+    assert data["transaction_state"] == "DEGRADED"
+    assert data["quarantined_pages"] == 2
+    assert data["retained_bytes_upper_bound"] == 64 * 1024 * 1024
+    assert data["lifecycle_error"] == "map transaction aborted"
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
+    json.dumps(data)
+
+
+def test_pool_snapshot_omits_mapped_totals_after_failed_unmap():
+    class FailedUnmapPageAllocator(FakePageAllocator):
+        def get_page_state(self):
+            return {
+                "total_pages": 20,
+                "free_pages": 20,
+                "inuse_pages": 0,
+                "reserved_pages": 0,
+            }
+
+        def get_transaction_state(self):
+            return {
+                "state": "FAILED",
+                "quarantined_pages": 0,
+                "retained_bytes_upper_bound": 0,
+                "last_error": "KV unmap could not complete",
+            }
+
+    class FailedUnmapManager(FakeManager):
+        page_allocator = FailedUnmapPageAllocator()
+        lifecycle_phase = "failed"
+        lifecycle_error = StateConsistencyError("KV unmap could not complete")
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailedUnmapManager()).to_dict()
+
+    assert data["transaction_state"] == "FAILED"
+    assert data["mapped_bytes"] == 0
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
 
 
 def test_pool_snapshot_falls_back_for_older_page_allocator():
@@ -187,6 +248,37 @@ def test_pool_snapshot_falls_back_for_older_page_allocator():
     assert data["free_pages"] == 7
     assert data["inuse_pages"] == 5
     assert data["reserved_pages"] == 1
+    assert data["transaction_state"] is None
+    assert data["quarantined_pages"] is None
+    assert data["retained_bytes_upper_bound"] is None
+    assert data["lifecycle_error"] is None
+
+
+def test_pool_snapshot_omits_complete_mapping_when_reserved_pages_are_unknown():
+    class NoReservedPageAllocator:
+        def get_num_free_pages(self):
+            return 7
+
+        def get_num_inuse_pages(self):
+            return 5
+
+        def get_num_total_pages(self):
+            return 12
+
+        def get_avail_physical_pages(self):
+            return 3
+
+        def get_resize_target(self):
+            return -1
+
+    class NoReservedManager(FakeManager):
+        page_allocator: Any = NoReservedPageAllocator()
+
+    data = build_kv_cache_pool_snapshot(NoReservedManager()).to_dict()
+
+    assert data["reserved_pages"] is None
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
 
 
 def test_pool_snapshot_clamps_negative_block_gauges():
