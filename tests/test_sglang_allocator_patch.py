@@ -5,6 +5,7 @@ import inspect
 import sys
 import types
 from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -28,7 +29,16 @@ class FakeTensor:
 
 
 class FakeKVCachedAllocator:
+    def __init__(self):
+        self.alloc_calls = []
+        self.packed_calls = []
+
     def alloc(self, num_pages):
+        self.alloc_calls.append(num_pages)
+        return list(range(num_pages))
+
+    def alloc_packed(self, num_pages):
+        self.packed_calls.append(num_pages)
         return list(range(num_pages))
 
 class FakeKVCache:
@@ -53,7 +63,10 @@ class FakeTritonKernel:
         self.calls = []
 
     def __getitem__(self, grid):
-        def launch(**kwargs):
+        def launch(*args, **kwargs):
+            if args:
+                self.calls.append({"grid": grid, "args": args, "kwargs": kwargs})
+                return
             expected_names = tuple(inspect.signature(self.fn).parameters)
             if set(kwargs) != set(expected_names):
                 missing = set(expected_names) - set(kwargs)
@@ -153,6 +166,35 @@ def _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kern
     setattr(parent, child_name, allocator_kernels)
     monkeypatch.setitem(sys.modules, parent_name, parent)
     monkeypatch.setitem(sys.modules, module_name, allocator_kernels)
+
+
+def test_token_allocator_recovers_after_allocation_miss(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    alloc_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+    alloc_mod.BaseTokenToKVPoolAllocator = FakeBaseTokenToKVPoolAllocator
+    assert ElasticAllocatorPatch().inject_elastic_allocator(alloc_mod) is True
+
+    kv_cache = FakeKVCache()
+    alloc = Mock(side_effect=[None, [3, 5], []])
+    monkeypatch.setattr(kv_cache.kvcached_allocator, "alloc", alloc)
+    allocator = alloc_mod.ElasticTokenToKVPoolAllocator(
+        size=16, dtype=object(), device="cuda:0", kvcache=kv_cache
+    )
+
+    assert allocator.alloc(2) is None
+
+    indices = allocator.alloc(2)
+    assert isinstance(indices, FakeTensor)
+    assert indices.data == [3, 5]
+    assert indices.dtype == "int64"
+    assert indices.device == "cuda:0"
+
+    empty = allocator.alloc(0)
+    assert isinstance(empty, FakeTensor)
+    assert empty.data == []
+    assert empty.dtype == "int64"
+    assert empty.device == "cuda:0"
+    assert alloc.call_args_list == [call(2), call(2), call(0)]
 
 
 @pytest.mark.parametrize(
@@ -279,6 +321,47 @@ def test_alloc_extend_kernel(
     )
     if "max_num_extend_tokens" in kwargs:
         assert kwargs["max_num_extend_tokens"] == 8
+
+
+def test_paged_decode_uses_packed_allocation(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    _install_fake_sglang_utils(monkeypatch)
+    setattr(sys.modules["sglang.srt.utils"], "get_num_new_pages", lambda **kwargs: 2)
+    alloc_mod = _make_allocator_module(
+        FakeTritonKernel(
+            FakeKernelFn(
+                (
+                    "pre_lens_ptr",
+                    "seq_lens_ptr",
+                    "last_loc_ptr",
+                    "free_page_ptr",
+                    "out_indices",
+                    "bs_upper",
+                    "page_size",
+                )
+            )
+        )
+    )
+
+    assert ElasticAllocatorPatch().inject_elastic_paged_allocator(alloc_mod) is True
+
+    kv_cache = FakeKVCache()
+    allocator = alloc_mod.ElasticPagedTokenToKVPoolAllocator(
+        size=64,
+        page_size=4,
+        dtype=object(),
+        device="cuda:0",
+        kvcache=kv_cache,
+    )
+    seq_lens = FakeTensor(shape=(3,))
+    allocator.alloc_decode(
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        last_loc=FakeTensor(shape=(3,)),
+    )
+
+    assert kv_cache.kvcached_allocator.alloc_calls == []
+    assert kv_cache.kvcached_allocator.packed_calls == [2]
 
 
 def test_swa_allocator_uses_elastic_sub_allocators(monkeypatch):

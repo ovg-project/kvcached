@@ -626,15 +626,27 @@ class KVCacheManager:
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
 
+    def alloc_packed(self, need_size: int) -> Optional[List[int]]:
+        """Allocate by draining the smallest existing holes first.
+
+        Batched decode combines many independent one-block allocations into a
+        single request. Treating that request as one long run skips partially
+        free pages that cannot fit the whole batch. Packed allocation preserves
+        the placement of repeated one-block allocations while keeping one lock
+        acquisition and one capacity check.
+        """
+        return self._alloc(need_size, pack_pages=True)
+
     @synchronized
     def _alloc(self,
                need_size: int,
-               _skip_wait: bool = False) -> Optional[List[int]]:
+               _skip_wait: bool = False,
+               pack_pages: bool = False) -> Optional[List[int]]:
         counters = getattr(self, "_operation_counters", None) if not _skip_wait else None
         if counters is not None:
             counters["allocation_requests_total"] = counters.get("allocation_requests_total", 0) + 1
         try:
-            indices = self._alloc_impl(need_size, _skip_wait=_skip_wait)
+            indices = self._alloc_impl(need_size, _skip_wait=_skip_wait, pack_pages=pack_pages)
         except Exception:
             if counters is not None:
                 self._record_operation_error(
@@ -655,7 +667,8 @@ class KVCacheManager:
 
     def _alloc_impl(self,
                     need_size: int,
-                    _skip_wait: bool = False) -> Optional[List[int]]:
+                    _skip_wait: bool = False,
+                    pack_pages: bool = False) -> Optional[List[int]]:
         if not _skip_wait:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
@@ -744,7 +757,8 @@ class KVCacheManager:
                         "check should have rejected this configuration")
                 self.num_avail_blocks += page.num_free_blocks()
             else:
-                page = self._pick_avail_page(remaining_need)
+                page = self._pick_avail_page(
+                    1 if pack_pages else remaining_need)
                 if getattr(self, "_retired_pages", None) and page.empty():
                     # Reusing logical blocks does not revoke their mapping.
                     # Worker queue order protects reuse; cancel the old unmap

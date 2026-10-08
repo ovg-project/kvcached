@@ -182,5 +182,19 @@ class TestAllocationKeepsARunTogether:
             assert got is not None and len(got) == 1
 
 
+class TestPackedAllocationFillsDecodeHoles:
+    def test_drains_smallest_holes_before_opening_a_large_run(self):
+        mgr = _make_manager(
+            [FakePage(40, 3), FakePage(41, 5), FakePage(42, 40)]
+        )
+
+        block_ids = mgr.alloc_packed(7)
+
+        assert block_ids is not None and len(block_ids) == 7
+        assert _pages_touched(block_ids) == {40, 41}
+        assert mgr.avail_pages[41].num_free_blocks() == 1
+        assert mgr.avail_pages[42].num_free_blocks() == 40
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
