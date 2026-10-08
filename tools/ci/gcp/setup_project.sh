@@ -16,7 +16,7 @@
 #     the workflows need no stored key;
 #   - a firewall rule that admits SSH from the IAP range to VMs tagged
 #     kvcached-ci.
-# It prints the repository variables the workflows read.
+# It prints the repository secrets and variables the workflows read.
 
 set -euo pipefail
 
@@ -70,10 +70,12 @@ gcloud compute firewall-rules create kvcached-ci-iap-ssh --project "$project" \
 
 cat <<EOF
 
-Set these repository variables (Settings > Secrets and variables > Actions > Variables):
+Set these repository secrets (Settings > Secrets and variables > Actions > Secrets),
+so that the public logs do not show them:
   GCP_PROJECT              $project
   GCP_WIF_PROVIDER         projects/$project_number/locations/global/workloadIdentityPools/$pool/providers/$provider
   GCP_CI_SERVICE_ACCOUNT   $sa
+and these repository variables (... > Variables):
   GCP_L4_ZONES             comma-separated zones with L4 quota, e.g. us-central1-a,us-central1-b
   GCE_IMAGE_FAMILY         an image family with NVIDIA driver >= 580, Docker optional
   GCE_IMAGE_PROJECT        the project that publishes that family

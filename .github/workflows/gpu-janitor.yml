@@ -16,11 +16,23 @@ jobs:
     if: github.repository == 'ovg-project/kvcached'
     runs-on: ubuntu-latest
     steps:
+      # The project, service account and provider are secrets, so that the
+      # public logs show *** for them, gcloud's resource URLs included. The
+      # project number inside the provider path can appear on its own too.
+      - name: Mask the GCP project number
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+        run: |
+          number=$(echo "$WIF_PROVIDER" | cut -d/ -f2)
+          if [ -n "$number" ]; then
+            echo "::add-mask::$number"
+          fi
+
       - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
-          project_id: ${{ vars.GCP_PROJECT }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT }}
 
       - uses: google-github-actions/setup-gcloud@v2
 
