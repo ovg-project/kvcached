@@ -5,6 +5,7 @@ import inspect
 import sys
 import types
 from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -165,6 +166,35 @@ def _install_allocator_kernel_module(monkeypatch, module_name, alloc_extend_kern
     setattr(parent, child_name, allocator_kernels)
     monkeypatch.setitem(sys.modules, parent_name, parent)
     monkeypatch.setitem(sys.modules, module_name, allocator_kernels)
+
+
+def test_token_allocator_recovers_after_allocation_miss(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    alloc_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+    alloc_mod.BaseTokenToKVPoolAllocator = FakeBaseTokenToKVPoolAllocator
+    assert ElasticAllocatorPatch().inject_elastic_allocator(alloc_mod) is True
+
+    kv_cache = FakeKVCache()
+    alloc = Mock(side_effect=[None, [3, 5], []])
+    monkeypatch.setattr(kv_cache.kvcached_allocator, "alloc", alloc)
+    allocator = alloc_mod.ElasticTokenToKVPoolAllocator(
+        size=16, dtype=object(), device="cuda:0", kvcache=kv_cache
+    )
+
+    assert allocator.alloc(2) is None
+
+    indices = allocator.alloc(2)
+    assert isinstance(indices, FakeTensor)
+    assert indices.data == [3, 5]
+    assert indices.dtype == "int64"
+    assert indices.device == "cuda:0"
+
+    empty = allocator.alloc(0)
+    assert isinstance(empty, FakeTensor)
+    assert empty.data == []
+    assert empty.dtype == "int64"
+    assert empty.device == "cuda:0"
+    assert alloc.call_args_list == [call(2), call(2), call(0)]
 
 
 @pytest.mark.parametrize(
