@@ -7,6 +7,7 @@ import functools
 import inspect
 import os
 import threading
+import types
 from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
@@ -15,6 +16,64 @@ from kvcached.utils import SHM_DIR, IPCSegmentCleanup, get_kvcached_logger
 
 logger = get_kvcached_logger()
 _SEGMENTS_KEY = "_kvcached_ipc_names"
+
+
+class _DPReadinessConnection:
+    """Carry scheduler metadata across the controller's rebuilt ready message."""
+
+    def __init__(self, connection, names, lock):
+        self.connection = connection
+        self.names = names
+        self.lock = lock
+
+    def recv(self):
+        info = self.connection.recv()
+        if isinstance(info, dict) and info.get("status") == "ready":
+            with self.lock:
+                self.names.update(info.get(_SEGMENTS_KEY, ()))
+        return info
+
+    def send(self, info):
+        if isinstance(info, dict) and info.get("status") == "ready":
+            with self.lock:
+                info = {**info, _SEGMENTS_KEY: sorted(
+                    self.names.union(info.get(_SEGMENTS_KEY, ())))}
+        return self.connection.send(info)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def _run_data_parallel_controller_process(*args, **kwargs):
+    # Keep this target at module scope (without wraps) so multiprocessing spawn
+    # can resolve it. The controller's original entrypoint remains untouched.
+    from sglang.srt.managers import data_parallel_controller as controller
+
+    original = controller.run_data_parallel_controller_process
+    if not enable_kvcached():
+        return original(*args, **kwargs)
+
+    bound = inspect.signature(original).bind(*args, **kwargs)
+    names: set[str] = set()
+    lock = threading.Lock()
+    original_mp = controller.mp
+
+    def pipe(*pipe_args, **pipe_kwargs):
+        reader, writer = original_mp.Pipe(*pipe_args, **pipe_kwargs)
+        # Only the reader stays in the controller; leave the writer passed to
+        # scheduler subprocesses unchanged and picklable.
+        return _DPReadinessConnection(reader, names, lock), writer
+
+    bound.arguments["pipe_writer"] = _DPReadinessConnection(
+        bound.arguments["pipe_writer"], names, lock)
+    # Each DP group receives readiness in its own thread. Observe only pipes
+    # created by this controller module, never global multiprocessing.Pipe.
+    controller.mp = types.SimpleNamespace(**vars(original_mp))
+    controller.mp.Pipe = pipe
+    try:
+        return original(*bound.args, **bound.kwargs)
+    finally:
+        controller.mp = original_mp
 
 
 class _ShutdownOwner:
@@ -131,6 +190,7 @@ class SGLangShutdownPatch(VersionAwarePatch, BasePatch):
 
         Scheduler.get_init_info = get_init_info
         Engine._launch_subprocesses = classmethod(launch)
+        engine_mod.run_data_parallel_controller_process = _run_data_parallel_controller_process
         # Keep the hook on these owning entrypoints, not SGLang's global
         # process utility, which is also used by workers and unrelated tools.
         engine_mod.kill_process_tree = wrap_kill(engine_mod.kill_process_tree)
