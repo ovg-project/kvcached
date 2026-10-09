@@ -323,6 +323,45 @@ class KVCacheManager:
         # never served stale.
         self._avail_physical_pages_cache: Optional[int] = None
         self._avail_physical_pages_ts: float = 0.0
+        # Foreground counters follow the allocator's existing writer contract:
+        # one sync scheduler, or async writers serialized by _lock. Post-init
+        # hands page accounting over through _post_init_done. Native background
+        # mapping updates native counters/lifecycle, not these operation totals.
+        # Only error publication can overlap foreground work and post-init.
+        self._operation_error_lock = threading.RLock()
+        self._operation_error_state: tuple[int, Optional[str], Optional[int]] = (0, None, None)
+        self._operation_counters = {
+            "allocation_requests_total": 0,
+            "allocation_successes_total": 0,
+            "allocation_failures_total": 0,
+            "capacity_exhausted_total": 0,
+            "allocated_blocks_total": 0,
+            "free_requests_total": 0,
+            "free_successes_total": 0,
+            "free_failures_total": 0,
+            "freed_blocks_total": 0,
+            "manager_page_allocations_total": 0,
+            "manager_page_allocation_failures_total": 0,
+            "manager_page_releases_total": 0,
+            "resize_requests_total": 0,
+            "resize_successes_total": 0,
+            "resize_deferred_total": 0,
+            "resize_completions_total": 0,
+            "trim_requests_total": 0,
+            "trim_successes_total": 0,
+            "clear_requests_total": 0,
+            "clear_successes_total": 0,
+            "operation_errors_total": 0,
+            "post_init_errors_total": 0,
+            "allocation_errors_total": 0,
+            "free_errors_total": 0,
+            "resize_errors_total": 0,
+            "trim_errors_total": 0,
+            "clear_errors_total": 0,
+            "state_inconsistency_errors_total": 0,
+        }
+        self._last_error_code: Optional[str] = None
+        self._last_error_timestamp_ns: Optional[int] = None
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
         self._lock = threading.RLock() if async_sched else NoOpLock()
 
@@ -376,6 +415,10 @@ class KVCacheManager:
             if not self._shutdown_requested.is_set():
                 self.page_allocator.start_prealloc_thread()
         except Exception as e:
+            self._record_operation_error(
+                "post_init_failed",
+                "post_init_errors_total",
+            )
             logger.error(
                 f"Error during KVCacheManager post-initialization: {e}")
             # Open the soft gate first, so the existing entry points behave
@@ -401,6 +444,41 @@ class KVCacheManager:
     def _wait_post_init(self):
         if not self._post_init_done.is_set():
             self._post_init_done.wait()
+
+    def _increment_operation_counter(self, name: str, value: int = 1) -> None:
+        """Update under the caller's allocator writer discipline."""
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
+            counters[name] = counters.get(name, 0) + value
+
+    def _get_operation_counter(self, name: str) -> int:
+        counters = getattr(self, "_operation_counters", None)
+        return counters.get(name, 0) if counters is not None else 0
+
+    def _record_operation_error(self, code: str, counter_name: str, *,
+                                failure_counter: Optional[str] = None) -> None:
+        # Post-init errors may overlap a foreground request waiting for its
+        # readiness gate. This cold path owns shared error totals and publishes
+        # code/time as one immutable record; successful operations never take it.
+        error_lock = getattr(self, "_operation_error_lock", None)
+        if error_lock is None:
+            return
+        with error_lock:
+            counters = getattr(self, "_operation_counters", None)
+            if counters is None:
+                counters = self._operation_counters = {}
+            counters["operation_errors_total"] = counters.get("operation_errors_total", 0) + 1
+            counters[counter_name] = counters.get(counter_name, 0) + 1
+            if failure_counter is not None:
+                counters[failure_counter] = counters.get(failure_counter, 0) + 1
+            revision = getattr(self, "_operation_error_state", (0, None, None))[0]
+            # A background init failure must not suppress a distinct free error.
+            # Foreground nested errors still prevent double counting by free().
+            revision += int(counter_name != "post_init_errors_total")
+            timestamp_ns = time.time_ns()
+            self._operation_error_state = (revision, code, timestamp_ns)
+            self._last_error_code = code
+            self._last_error_timestamp_ns = timestamp_ns
 
     def wait_ready(self, timeout: Optional[float] = None) -> None:
         """Block until background initialization has settled.
@@ -564,6 +642,33 @@ class KVCacheManager:
                need_size: int,
                _skip_wait: bool = False,
                pack_pages: bool = False) -> Optional[List[int]]:
+        counters = getattr(self, "_operation_counters", None) if not _skip_wait else None
+        if counters is not None:
+            counters["allocation_requests_total"] = counters.get("allocation_requests_total", 0) + 1
+        try:
+            indices = self._alloc_impl(need_size, _skip_wait=_skip_wait, pack_pages=pack_pages)
+        except Exception:
+            if counters is not None:
+                self._record_operation_error(
+                    "allocation_failed",
+                    "allocation_errors_total",
+                    failure_counter="allocation_failures_total",
+                )
+            raise
+
+        if counters is not None:
+            if indices is None:
+                counters["allocation_failures_total"] = counters.get("allocation_failures_total", 0) + 1
+                counters["capacity_exhausted_total"] = counters.get("capacity_exhausted_total", 0) + 1
+            else:
+                counters["allocation_successes_total"] = counters.get("allocation_successes_total", 0) + 1
+                counters["allocated_blocks_total"] = counters.get("allocated_blocks_total", 0) + len(indices)
+        return indices
+
+    def _alloc_impl(self,
+                    need_size: int,
+                    _skip_wait: bool = False,
+                    pack_pages: bool = False) -> Optional[List[int]]:
         if not _skip_wait:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
@@ -611,10 +716,11 @@ class KVCacheManager:
                 # restore) and must stay fail-loud.
                 try:
                     page = self.page_allocator.alloc_page()
-                    page.init(self.block_mem_size)
                     # A new mapping changes the driver's free capacity.
                     self._avail_physical_pages_cache = None
                 except StateConsistencyError as e:
+                    self._increment_operation_counter(
+                        "manager_page_allocation_failures_total")
                     # #418's definitive verdict: mapping safety cannot be
                     # established, so this is not the recoverable co-tenancy
                     # miss the map-failure exclusion is about. Record FAILED
@@ -624,6 +730,8 @@ class KVCacheManager:
                         "map transaction unsafe: state consistency lost", e)
                     raise
                 except RuntimeError as e:
+                    self._increment_operation_counter(
+                        "manager_page_allocation_failures_total")
                     # The recoverable-miss classification only holds while
                     # the native pool is healthy. An untyped failure that
                     # left the transaction state FAILED (e.g. one racing in
@@ -637,6 +745,8 @@ class KVCacheManager:
                         f"alloc_page() failed after partially allocating "
                         f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
                     return None
+                self._increment_operation_counter("manager_page_allocations_total")
+                page.init(self.block_mem_size)
                 # __init__ rejects geometries where a page can hold no whole
                 # block. Parking such a page would keep it mapped forever
                 # (free() never visits a page without blocks), so fail loud.
@@ -677,12 +787,14 @@ class KVCacheManager:
 
         The first ``num_from_reserved`` entries of ``ret_index`` came off the
         reservation ledger and are prepended back onto it; the rest came from
-        pages and go back through the regular free() path (safe to call here:
-        the lock is re-entrant).
+        pages and go back through the internal free path (safe to call here:
+        the lock is re-entrant). Rollback is part of the failed allocation,
+        not a caller-visible free operation, so it must not update the public
+        free request or block counters.
         """
         page_blocks = ret_index[num_from_reserved:]
         if page_blocks:
-            self.free(page_blocks)
+            self._free(page_blocks)
         reserved_blocks = ret_index[:num_from_reserved]
         if reserved_blocks:
             self.reserved_blocks = reserved_blocks + self.reserved_blocks
@@ -738,10 +850,31 @@ class KVCacheManager:
 
     @synchronized
     def free(self, indices: List[int]):
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
+            counters["free_requests_total"] = counters.get("free_requests_total", 0) + 1
+        errors_before = getattr(self, "_operation_error_state", (0, None, None))[0]
+        try:
+            _, had_inconsistency = self._free(indices, track_freed_blocks=True)
+        except Exception:
+            if counters is not None:
+                counters["free_failures_total"] = counters.get("free_failures_total", 0) + 1
+                if getattr(self, "_operation_error_state", (0, None, None))[0] == errors_before:
+                    self._record_operation_error("free_failed", "free_errors_total")
+            raise
+
+        if counters is not None:
+            name = "free_failures_total" if had_inconsistency else "free_successes_total"
+            counters[name] = counters.get(name, 0) + 1
+
+    def _free(self, indices: List[int], *,
+              track_freed_blocks: bool = False) -> tuple[int, bool]:
+        """Free blocks, optionally recording caller progress rather than rollback."""
         self._wait_post_init()
+        counters = getattr(self, "_operation_counters", None) if track_freed_blocks else None
 
         if len(indices) == 0:
-            return  # Nothing to free
+            return 0, False  # Nothing to free
 
         if SANITY_CHECK:
             for idx in indices:
@@ -760,6 +893,8 @@ class KVCacheManager:
                 callback(idx_dict)
 
         pages_to_free: List[int] = []
+        freed_blocks = 0
+        had_inconsistency = False
         for page_id, idxs in idx_dict.items():
             # Find the page - it must be in either full_pages or avail_pages
             page = None
@@ -768,6 +903,11 @@ class KVCacheManager:
             elif page_id in self.avail_pages:
                 page = self.avail_pages.pop(page_id)
             else:
+                had_inconsistency = True
+                self._record_operation_error(
+                    "state_inconsistency",
+                    "state_inconsistency_errors_total",
+                )
                 if SANITY_CHECK:
                     # This is a serious error - the page should exist
                     raise ValueError(
@@ -782,6 +922,10 @@ class KVCacheManager:
 
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
+            freed_blocks += len(idxs)
+            if counters is not None:
+                # Later pages, unmap, or deferred resize may still fail.
+                counters["freed_blocks_total"] = counters.get("freed_blocks_total", 0) + len(idxs)
 
             if page.empty():
                 pages_to_free.append(page.page_id)
@@ -810,8 +954,11 @@ class KVCacheManager:
                     self._record_native_fatal("free", e)
                     raise
                 self._avail_physical_pages_cache = None
+                self._increment_operation_counter(
+                    "manager_page_releases_total", len(pages_to_free))
 
         self._maybe_finish_shrink()
+        return freed_blocks, had_inconsistency
 
     def _maybe_finish_shrink(self) -> None:
         if getattr(self, "_retired_pages", None):
@@ -826,6 +973,7 @@ class KVCacheManager:
                         self.target_num_blocks * self.block_mem_size)
                 except QuarantinedResizeError:
                     # Reject the pending limit without blocking healthy pages.
+                    self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
                     self.in_shrink = False
                     self.target_num_blocks = None
@@ -837,6 +985,7 @@ class KVCacheManager:
                     raise
                 else:
                     if resized:
+                        self._increment_operation_counter("resize_completions_total")
                         self.in_shrink = False
                         # Exiting shrink: the resize above changed the physical
                         # footprint and this toggle bypasses resize(), so drop the
@@ -857,6 +1006,13 @@ class KVCacheManager:
     @synchronized
     def release_retired_pages_through(self, marker: int) -> None:
         """Physically release retired pages up to an acknowledged batch."""
+        try:
+            self._release_retired_pages_through(marker)
+        except Exception:
+            self._record_operation_error("deferred_release_failed", "free_errors_total")
+            raise
+
+    def _release_retired_pages_through(self, marker: int) -> None:
         pages_to_free: List[int] = []
         still_retired: List[tuple[int, List[int]]] = []
         for epoch, page_ids in getattr(self, "_retired_pages", []):
@@ -876,6 +1032,8 @@ class KVCacheManager:
                 # rather than in free(). Keep the readiness gate in agreement.
                 self._record_native_fatal("deferred release", e)
                 raise
+            self._increment_operation_counter(
+                "manager_page_releases_total", len(pages_to_free))
             for page_id in pages_to_free:
                 page = self.avail_pages.pop(page_id)
                 self.num_avail_blocks -= page.num_free_blocks()
@@ -909,6 +1067,23 @@ class KVCacheManager:
 
     @synchronized
     def resize(self, new_mem_size: int):
+        self._increment_operation_counter("resize_requests_total")
+        try:
+            resized = self._resize(new_mem_size)
+        except Exception:
+            self._record_operation_error(
+                "resize_failed",
+                "resize_errors_total",
+            )
+            raise
+
+        if resized:
+            self._increment_operation_counter("resize_successes_total")
+        else:
+            self._increment_operation_counter("resize_deferred_total")
+        return resized
+
+    def _resize(self, new_mem_size: int):
         """
         Reset the limit of the K or V tensor in one layer.
         new_mem_size: the memory size of the K or V tensor in one layer
@@ -952,6 +1127,18 @@ class KVCacheManager:
 
     @synchronized
     def trim(self) -> None:
+        self._increment_operation_counter("trim_requests_total")
+        try:
+            self._trim()
+        except Exception:
+            self._record_operation_error(
+                "trim_failed",
+                "trim_errors_total",
+            )
+            raise
+        self._increment_operation_counter("trim_successes_total")
+
+    def _trim(self) -> None:
         """
         Trim the reserved pages to free up physical memory.
         """
@@ -1210,8 +1397,47 @@ class KVCacheManager:
             self._shut_down = self.page_allocator.release_shared_segment()
             return self._shut_down
 
+    def operation_snapshot(self, *, integration=None):
+        """Sample cumulative counters without blocking allocator writers.
+
+        Each counter is monotonic; fields can describe different instants and
+        requests can still be in flight. This is not a coherent page-table or
+        multi-counter transaction snapshot. Error code/time share one record.
+        """
+        from kvcached.observability import build_kv_cache_pool_operation_snapshot
+        return build_kv_cache_pool_operation_snapshot(
+            self,
+            integration=integration,
+        )
+
+    def operation_snapshot_dict(self, *, integration=None):
+        """Return JSON-serializable operation counters for this KV cache pool."""
+        return self.operation_snapshot(
+            integration=integration,
+        ).to_dict()
+
+    def _get_operation_observability_state(self):
+        counters = dict(getattr(self, "_operation_counters", {}) or {})
+        error_state = getattr(self, "_operation_error_state", None)
+        if error_state is not None:
+            return counters, error_state[1], error_state[2]
+        return (counters, getattr(self, "_last_error_code", None),
+                getattr(self, "_last_error_timestamp_ns", None))
+
     @synchronized
     def clear(self):
+        self._increment_operation_counter("clear_requests_total")
+        try:
+            self._clear()
+        except Exception:
+            self._record_operation_error(
+                "clear_failed",
+                "clear_errors_total",
+            )
+            raise
+        self._increment_operation_counter("clear_successes_total")
+
+    def _clear(self):
         """
         Free all allocated blocks and reset the allocator to initial state.
         """
@@ -1263,10 +1489,15 @@ class KVCacheManager:
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
         if pages_to_free:
-            self.page_allocator.free_pages(list(dict.fromkeys(pages_to_free)))
+            pages_to_free = list(dict.fromkeys(pages_to_free))
+            self.page_allocator.free_pages(pages_to_free)
             # free_pages() returned physical pages to the driver, growing the
             # free pool; drop the cached count so available_size() re-reads.
             self._avail_physical_pages_cache = None
+            self._increment_operation_counter(
+                "manager_page_releases_total",
+                len(pages_to_free),
+            )
         self._retired_pages = []
         self.avail_pages.clear()
         self.full_pages.clear()

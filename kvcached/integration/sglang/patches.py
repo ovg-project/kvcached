@@ -444,7 +444,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                self.size)
 
                 def alloc(self, need_size: int):
-                    indices: list[int] = self.kvcached_allocator.alloc(need_size)
+                    indices = self.kvcached_allocator.alloc(need_size)
+                    if indices is None:
+                        return None
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def free(self, free_index):

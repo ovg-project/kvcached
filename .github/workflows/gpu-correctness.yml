@@ -1,0 +1,103 @@
+name: GPU Correctness
+# The profile in the run's title lets the next run find its predecessor.
+run-name: GPU Correctness (${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }})
+
+# Correctness on real GPUs: kvcached against the native engines, on the CI
+# machine with two L4s, a self-hosted runner set up by
+# tools/ci/gpu-runner/setup.sh. Nightly runs the vLLM and the SGLang cases at
+# the same time, one GPU each; weekly uses both GPUs for tensor parallelism.
+# The runner takes no job but this workflow's and gpu-pr.yml's from main
+# (tools/ci/gpu-runner/job_started.sh), and runs one job at a time. Every run
+# comments its results on the issue in the GPU_CI_RESULTS_ISSUE variable and
+# keeps the setup of its profile up to date in that issue's description.
+on:
+  schedule:
+    - cron: '0 8 * * *'     # nightly
+    - cron: '0 12 * * 6'    # weekly, Saturday
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Test profile in tests/e2e/matrix.py
+        default: nightly
+        type: choice
+        options: [nightly, weekly, smoke]
+
+permissions:
+  contents: read
+
+env:
+  PROFILE: ${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }}
+
+jobs:
+  e2e:
+    if: github.repository == 'ovg-project/kvcached'
+    runs-on: [kvcached-gpu]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run the e2e suite
+        run: bash tools/ci/gpu-runner/run.sh "$PROFILE" "$RUNNER_TEMP/results"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-${{ env.PROFILE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: e2e
+    if: always() && needs.e2e.result != 'skipped' && vars.GPU_CI_RESULTS_ISSUE != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    env:
+      RESULTS_ISSUE: ${{ vars.GPU_CI_RESULTS_ISSUE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true  # none when the job did not get to run
+        with:
+          name: gpu-${{ env.PROFILE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results
+
+      - name: Comment on the results issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The latest finished run of this profile, as SHA:CONCLUSION.
+          prev=$(gh run list --workflow gpu-correctness.yml --branch main --limit 50 \
+            --json databaseId,headSha,displayTitle,status,conclusion \
+            --jq ".[] | select(.status == \"completed\" and .databaseId != $GITHUB_RUN_ID
+                    and .displayTitle == \"GPU Correctness ($PROFILE)\")
+                  | \"\(.headSha):\(.conclusion)\"" | sed -n 1p)
+          # One directory per part of the run; none if it never started.
+          mkdir -p results
+          mapfile -t parts < <(find results -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ "${#parts[@]}" = 0 ]; then
+            parts=(results/all)
+          fi
+          python3 tools/ci/report.py correctness --results "${parts[@]}" --profile "$PROFILE" \
+            --run-url "$RUN_URL" --sha "$GITHUB_SHA" --subject "$(git log -1 --format=%s)" \
+            --prev "$prev" --artifact-url "$RUN_URL#artifacts" \
+            --comment comment.md --section section.md
+          gh issue comment "$RESULTS_ISSUE" --body-file comment.md
+          # Keep this profile's setup in the description; a smoke run only comments.
+          if [ -f section.md ] && [ "$PROFILE" != smoke ]; then
+            gh issue view "$RESULTS_ISSUE" --json body --jq .body > body.md
+            python3 tools/ci/report.py splice --body body.md --name "$PROFILE" \
+              --section section.md --out new.md
+            if ! cmp -s body.md new.md; then
+              gh issue edit "$RESULTS_ISSUE" --body-file new.md
+            fi
+          fi
