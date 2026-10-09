@@ -221,6 +221,7 @@ def test_reaper_python_tracker_and_tool_share_lifetime(tmp_path, monkeypatch):
     monkeypatch.setattr(tracker_module, "DEFAULT_IPC_NAME", name)
     tracker = MemInfoTracker(TOTAL_MEM)
     state = ipc.Reaper(str(root))
+    assert tracker._lease is not None and tracker._lease.fd is not None
     state.add(get_ipc_path(name), tracker._lease.fd)
     try:
         tracker.update_memory_usage(600, 900)
@@ -251,6 +252,7 @@ def test_reaper_tool_mapping_failure_releases_lease(tmp_path, monkeypatch):
     monkeypatch.setenv("KVCACHED_REAPER_DIR", str(root))
     owner = ipc.Lease(get_ipc_path(name), register_owner=False)
     state = ipc.Reaper(str(root))
+    assert owner.fd is not None
     state.add(owner.path, owner.fd)
 
     def fail(*args, **kwargs):

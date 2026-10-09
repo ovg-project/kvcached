@@ -140,6 +140,7 @@ def state_with_owner(namespace):
     root, path = namespace
     owner = ipc.Lease(str(path), register_owner=False)
     state = ipc.Reaper(str(root))
+    assert owner.fd is not None
     state.add(str(path), owner.fd)
     return state, owner
 
@@ -182,6 +183,7 @@ def test_data_flock_cannot_be_reused_as_a_lifetime_lock(namespace):
 def test_receiver_normalizes_a_mistaken_usage_fd(namespace, daemon):
     root, path = namespace
     owner = ipc.Lease(str(path), register_owner=False)
+    assert owner.fd is not None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
             connection.settimeout(5)
@@ -243,6 +245,7 @@ def test_cleanup_first_recreates_a_new_inode(namespace):
         state.tick()
         newcomer = ipc.Lease(old.path, register_owner=False)
         try:
+            assert newcomer.fd is not None
             assert ipc.identity(newcomer.fd) != original
             state.tick()
             assert Path(old.path).exists()
@@ -257,6 +260,7 @@ def test_cleanup_first_recreates_a_new_inode(namespace):
 def test_same_name_replacement_is_never_adopted(namespace, timing):
     root, path = namespace
     owner = ipc.Lease(str(path), register_owner=False)
+    assert owner.fd is not None
     proof = ipc.reopen(owner.fd)
     state = ipc.Reaper(str(root))
     try:
@@ -320,6 +324,7 @@ def test_failure_retries_only_original_identity(namespace, monkeypatch, fault, r
 def test_reopen_query_failure_closes_new_fd(namespace, monkeypatch, failed_query):
     _, path = namespace
     owner = ipc.Lease(str(path), register_owner=False)
+    assert owner.fd is not None
     before = len(list(Path("/proc/self/fd").iterdir()))
     original = ipc.identity
     queries = []
@@ -343,6 +348,7 @@ def test_reopen_query_failure_closes_new_fd(namespace, monkeypatch, failed_query
 def test_registration_failure_keeps_lease_and_can_retry(namespace, daemon, monkeypatch):
     _, path = namespace
     owner = ipc.Lease(str(path), register_owner=False)
+    assert owner.fd is not None
 
     def fail(fd):
         raise OSError(errno.EMFILE, "injected registration FD failure")
@@ -543,6 +549,7 @@ def test_repeated_registration_and_cleanup_does_not_leak_fds(namespace):
     try:
         for _ in range(40):
             owner = ipc.Lease(str(path), register_owner=False)
+            assert owner.fd is not None
             for _ in range(3):
                 state.add(str(path), owner.fd)
             assert len(state.records) == 1
