@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Release control segments after SGLang's owning child processes exit."""
+"""Release control segments and TP worker sockets after SGLang's owning
+child processes exit."""
 
 import functools
 import inspect
@@ -12,10 +13,17 @@ from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch
-from kvcached.utils import SHM_DIR, IPCSegmentCleanup, get_kvcached_logger
+from kvcached.utils import (
+    SHM_DIR,
+    IPCSegmentCleanup,
+    WorkerSocketCleanup,
+    get_kvcached_logger,
+    get_tp_socket_dir,
+)
 
 logger = get_kvcached_logger()
 _SEGMENTS_KEY = "_kvcached_ipc_names"
+_KILL_WRAPPER_MARK = "__kvcached_kill_process_tree_wrapper__"
 
 
 class _DPReadinessConnection:
@@ -77,6 +85,10 @@ def _run_data_parallel_controller_process(*args, **kwargs):
 
 
 class _ShutdownOwner:
+    """The segments and worker sockets one launch owns, released once every
+    recorded child process is gone. Each entry answers unlink() with True
+    when nothing of it is left to retry."""
+
     def __init__(self, processes, segments):
         self.pid = os.getpid()
         self.processes = processes
@@ -112,11 +124,13 @@ class SGLangShutdownPatch(VersionAwarePatch, BasePatch):
     def apply(self, engine_mod) -> bool:
         if not self.initialize_version_info():
             return False
+        from sglang.srt import utils
         from sglang.srt.managers import scheduler, tokenizer_manager
 
-        return self.patch_shutdown(engine_mod, scheduler, tokenizer_manager)
+        return self.patch_shutdown(engine_mod, scheduler, tokenizer_manager, utils)
 
-    def patch_shutdown(self, engine_mod, scheduler_mod, tokenizer_mod) -> bool:
+    def patch_shutdown(self, engine_mod, scheduler_mod, tokenizer_mod,
+                       utils_mod=None) -> bool:
         Engine = self._get_target_class(engine_mod)
         if Engine is None:
             return False
@@ -145,14 +159,18 @@ class SGLangShutdownPatch(VersionAwarePatch, BasePatch):
             result = original_launch(cls, *args, **kwargs)
             if enable_kvcached():
                 # _launch_subprocesses returns the readiness records and local
-                # child PIDs in its fourth item on all supported releases.
-                owner = _capture_owner(result[3])
+                # child PIDs in its fourth item on all supported releases, and
+                # takes server_args first on all of them.
+                server_args = kwargs.get("server_args", args[0] if args else None)
+                owner = _capture_owner(result[3], server_args)
                 if owner is not None:
                     with lock:
                         owners.append(owner)
             return result
 
         def wrap_kill(original):
+            if getattr(original, _KILL_WRAPPER_MARK, False):
+                return original
             signature = inspect.signature(original)
 
             @functools.wraps(original)
@@ -186,20 +204,30 @@ class SGLangShutdownPatch(VersionAwarePatch, BasePatch):
                         if kill_self:
                             original(*args, **kwargs)
 
+            setattr(kill, _KILL_WRAPPER_MARK, True)
             return kill
 
         Scheduler.get_init_info = get_init_info
         Engine._launch_subprocesses = classmethod(launch)
         engine_mod.run_data_parallel_controller_process = _run_data_parallel_controller_process
-        # Keep the hook on these owning entrypoints, not SGLang's global
-        # process utility, which is also used by workers and unrelated tools.
+        # The owning entrypoints bound their own name before this patch ran.
         engine_mod.kill_process_tree = wrap_kill(engine_mod.kill_process_tree)
         tokenizer_mod.kill_process_tree = wrap_kill(tokenizer_mod.kill_process_tree)
+        if utils_mod is not None:
+            # launch_server.py and cli/serve.py end with their own
+            # kill_process_tree(os.getpid(), include_parent=False), and
+            # http_server's crash paths call theirs. All three bind the name
+            # from this package after `import sglang` applied the patch
+            # (issue #548); python -m runs launch_server.py as __main__, so
+            # the package attribute is the only way to reach it. The wrapper
+            # acts in the process that launched the workers and calls the
+            # original everywhere else.
+            utils_mod.kill_process_tree = wrap_kill(utils_mod.kill_process_tree)
         self._mark_as_patched(Engine)
         return True
 
 
-def _capture_owner(init_result):
+def _capture_owner(init_result, server_args=None):
     import psutil
 
     segments: list[Any] = []
@@ -213,9 +241,33 @@ def _capture_owner(init_result):
         processes = tuple(psutil.Process(pid) for pid in init_result.all_child_pids)
         for name in sorted(names):
             segments.append(IPCSegmentCleanup(os.path.join(SHM_DIR, name)))
-        return _ShutdownOwner(processes, segments)
     except Exception as e:
         for segment in segments:
             segment.close()
         logger.warning("Cannot capture SGLang KV segments; leaving cleanup to kvctl: %s", e)
+        return None
+    sockets = _capture_worker_sockets(names, server_args)
+    if sockets is not None:
+        segments.append(sockets)
+    return _ShutdownOwner(processes, segments)
+
+
+def _capture_worker_sockets(names, server_args):
+    """Remember the launch's TP worker sockets (issue #548): w<rank>.sock for
+    its TP ranks in each PP stage directory. A scheduler binds them under
+    the directory tp_ipc_util derives from its default IPC name, which is
+    the name of its group-0 pool, so that reported name selects the
+    directory; the parent's own derivation is the fallback."""
+    try:
+        tp_size = int(server_args.tp_size)
+        pp_size = int(getattr(server_args, "pp_size", 1))
+    except Exception:
+        return None  # No parallel config: the sockets are left to kvctl delete.
+    base = min(names, key=len)
+    ipc_name = base if all(name.startswith(base) for name in names) else None
+    try:
+        return WorkerSocketCleanup(get_tp_socket_dir(ipc_name), tp_size, pp_size)
+    except Exception as e:
+        logger.warning("Cannot remember the SGLang workers' sockets; leaving the "
+                       "socket directory to kvctl: %s", e)
         return None
