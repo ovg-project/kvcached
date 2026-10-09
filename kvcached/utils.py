@@ -284,6 +284,12 @@ class WorkerSocketCleanup:
     connect() to it is refused; a stopped or delayed worker still accepts
     and keeps its socket for a later retry. The check-then-unlink window
     of the worker's own listener stop applies here as well.
+
+    A directory is removed only by the call that removed one of the
+    deployment's nodes from it, and a completed cleanup is a no-op: a
+    same-name replacement creates the same directory again between its
+    makedirs() and bind(), and vLLM calls the owner's shutdown more than
+    once per teardown.
     """
 
     def __init__(self, socket_dir: str, tp_size: int, pp_size: int) -> None:
@@ -295,15 +301,21 @@ class WorkerSocketCleanup:
                 identity = path_identity(path)
                 if identity is not None:
                     self._pending[path] = identity
-        # Deepest first: a pp<k> directory before the deployment root.
-        self._dirs = sorted({os.path.dirname(path) for path in self._pending},
-                            key=len, reverse=True)
+        # Deepest first: a pp<k> directory before the deployment root, which
+        # is removed once empty like the worker's own stop removes it.
+        directories = {os.path.dirname(path) for path in self._pending}
+        if directories:
+            directories.add(socket_dir)
+        self._dirs = sorted(directories, key=len, reverse=True)
 
     def unlink(self) -> bool:
         """Remove the remembered sockets nobody serves and the directories
         that leaves empty. Return True when nothing is left to retry."""
         with self._lock:
+            if not self._pending:
+                return True
             logger = get_kvcached_logger()
+            emptied: set[str] = set()
             for path, identity in list(self._pending.items()):
                 current = path_identity(path)
                 if current is None or current != identity:
@@ -327,8 +339,11 @@ class WorkerSocketCleanup:
                     continue
                 logger.info("Removed worker socket %s left by a killed worker", path)
                 del self._pending[path]
+                emptied.add(os.path.dirname(path))
             for directory in self._dirs:
-                remove_dir_if_empty(directory)
+                if any(target == directory or target.startswith(directory + os.sep)
+                       for target in emptied):
+                    remove_dir_if_empty(directory)
             return not self._pending
 
 

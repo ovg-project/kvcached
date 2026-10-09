@@ -825,5 +825,45 @@ def test_parent_cleanup_keeps_a_socket_it_cannot_probe(socket_root, monkeypatch)
     assert not os.path.exists(path)
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_completed_parent_cleanup_leaves_a_replacement_directory(socket_root, pp_rank):
+    """vLLM calls the owner's shutdown more than once per teardown. After
+    the first call removed everything, a same-name replacement paused
+    between its makedirs() and bind() must keep the directory it created,
+    so its bind cannot fail with ENOENT."""
+    path = tp_ipc_util.get_worker_socket_path(0, pp_rank)
+    _bind_worker_socket(path).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=1, pp_size=2)
+    assert cleanup.unlink() is True
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+
+    os.makedirs(os.path.dirname(path))  # the replacement, before its bind
+    assert cleanup.unlink() is True
+
+    assert os.path.isdir(os.path.dirname(path))
+    _bind_worker_socket(path).close()  # the replacement's bind succeeds
+
+
+def test_parent_cleanup_retry_that_removes_nothing_leaves_directories_alone(socket_root):
+    """A retry kept for a live worker removes no directory once that
+    worker's own stop has removed its socket: the empty directory it finds
+    then belongs to whoever created it again."""
+    paths = [tp_ipc_util.get_worker_socket_path(rank) for rank in range(2)]
+    workers = [_bind_worker_socket(path) for path in paths]
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=2, pp_size=1)
+    workers[0].close()
+    assert cleanup.unlink() is False  # w1 is still served
+    assert os.path.exists(paths[1])
+
+    workers[1].close()  # the worker's own stop: unlink, then rmdir
+    os.unlink(paths[1])
+    os.rmdir(tp_ipc_util.SOCKET_DIR)
+    os.makedirs(tp_ipc_util.SOCKET_DIR)  # a replacement, before its bind
+    assert cleanup.unlink() is True
+
+    assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+    _bind_worker_socket(paths[1]).close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

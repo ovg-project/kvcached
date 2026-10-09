@@ -1909,6 +1909,27 @@ def test_sockets_absent_at_ready_are_never_claimed(socket_owner):
         assert os.path.exists(path)
 
 
+def test_repeated_owner_shutdown_leaves_a_replacement_directory(socket_owner):
+    """vLLM 0.30 reaches the owner's shutdown three times per teardown:
+    MPClient.shutdown() calls the manager, BackgroundResources calls it
+    again, and the client's own wrapper runs last. Once the first call has
+    removed everything, a same-name replacement that created the directory
+    again, before its bind, must keep it."""
+    state = socket_owner
+    state.bind_workers()
+    owner = state.owner_class()
+    state.kill_workers()
+    owner.shutdown()
+    assert not os.path.exists(state.socket_dir)
+
+    os.makedirs(state.socket_dir)  # the replacement, before its bind
+    owner.shutdown()
+    owner.shutdown()
+
+    assert os.path.isdir(state.socket_dir)
+    state.bind_workers()  # the replacement's bind succeeds
+
+
 def test_non_owning_frontend_leaves_worker_sockets_alone(monkeypatch, tmp_path, vllm_modules):
     """--api-server-count 2: a frontend's client stops no engines and must
     not touch the sockets, served or not."""
