@@ -166,7 +166,7 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
             return {0: indices}
 
         def get_resize_target(self):
-            return 0
+            return -1
 
         def resize(self, new_mem_size):
             return True

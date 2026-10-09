@@ -9,7 +9,9 @@ import functools
 import inspect
 import math
 import os
+import time
 import types
+import weakref
 from abc import ABCMeta
 from typing import (
     Any,
@@ -2619,6 +2621,197 @@ def _evict_radix_cache_page_aware(
         return result
     finally:
         _sync_radix_block_index(radix_cache)
+
+
+def _sglang_evict_params_cls() -> Optional[Callable[..., Any]]:
+    try:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    except ImportError:  # SGLang versions whose evict() takes a token count
+        return None
+    return EvictParams
+
+
+def _evict_prefix_cache(cache: Any, num_tokens: int) -> None:
+    """Evict about ``num_tokens`` cached tokens, preferring whole pages."""
+    evict_params_cls = _sglang_evict_params_cls()
+    try:
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+    except ImportError:
+        RadixCache = None
+    # Same condition as RadixCacheLimitPatch: only RadixCache exposes the
+    # persistent evictable_leaves the page-aware planner needs.
+    if type(cache) is RadixCache and evict_params_cls is not None:
+        _evict_radix_cache_page_aware(cache, num_tokens, evict_params_cls)
+    else:
+        cache.evict(_make_sglang_evict_arg(num_tokens, evict_params_cls))
+
+
+def _frees_are_deferred(allocator: Any) -> bool:
+    if allocator is None or not (hasattr(allocator, "is_not_in_free_group")
+                                 or hasattr(allocator, "free_group")):
+        return False
+    return not _sglang_free_immediately(allocator)
+
+
+class _PrefixCacheShrinkReclaimer:
+    """Evicts a scheduler's prefix cache while one kvcached pool shrinks.
+
+    A lower memory limit only takes effect once enough pages are empty, but
+    the radix cache keeps finished requests' pages; allocations reuse their
+    slots without ever emptying a page.
+    """
+
+    def __init__(self, scheduler: Any, manager: Any) -> None:
+        self._scheduler = weakref.ref(scheduler)
+        self.manager = manager
+        self.seen_limits: Optional[Tuple[int, int]] = None
+        self.last_attempt = 0.0
+
+    def reclaim(self) -> None:
+        cache = getattr(self._scheduler(), "tree_cache", None)
+        evictable = getattr(cache, "full_evictable_size", None) or getattr(
+            cache, "evictable_size", None)
+        if not callable(evictable):
+            return
+        manager = self.manager
+        tokens_per_page = (manager.page_size // manager.block_mem_size
+                           * max(1, int(getattr(cache, "page_size", 1) or 1)))
+        allocator = getattr(cache, "token_to_kv_pool_allocator", None)
+        excess = manager.shrink_excess_pages()
+        while excess > 0:
+            before = evictable()
+            if before <= 0:
+                return
+            _evict_prefix_cache(cache, excess * tokens_per_page)
+            if evictable() >= before or _frees_are_deferred(allocator):
+                # Nothing evicted, or the frees wait for the free group to
+                # end: the next allocation or idle pass continues.
+                return
+            excess = manager.shrink_excess_pages()
+
+
+def _sglang_parallel_size(scheduler: Any) -> int:
+    ps = getattr(scheduler, "ps", scheduler)
+    return (int(getattr(ps, "tp_size", 1) or 1)
+            * int(getattr(ps, "pp_size", 1) or 1))
+
+
+def _token_kv_managers(allocator: Any) -> List[Any]:
+    """kvcached managers behind the scheduler's token KV allocator.
+
+    Only token KV pools: SGLang allocates those while preparing a batch,
+    outside any radix tree update, so evicting during their allocation is as
+    safe as SGLang's own evict-before-alloc. Mamba slots are allocated in the
+    middle of tree operations.
+    """
+    managers: List[Any] = []
+    for alloc in (allocator, getattr(allocator, "full_attn_allocator", None),
+                  getattr(allocator, "swa_attn_allocator", None)):
+        manager = getattr(alloc, "kvcached_allocator", None)
+        if manager is not None and all(manager is not m for m in managers):
+            managers.append(manager)
+    return managers
+
+
+def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclaimer]:
+    """Let the scheduler's token KV pools evict its prefix cache to shrink.
+
+    Runs when the scheduler is built, so an allocation that applies a lower
+    limit can reclaim before the scheduler has ever been idle.
+    """
+    reclaimers = getattr(scheduler, "_kvcached_shrink_reclaimers", None)
+    if reclaimers is None:
+        reclaimers = []
+        # Ranks see a new limit at different iterations; evicting then would
+        # make their radix caches, and so their batches, diverge.
+        if _sglang_parallel_size(scheduler) == 1:
+            for manager in _token_kv_managers(
+                    getattr(scheduler, "token_to_kv_pool_allocator", None)):
+                register = getattr(manager, "_register_shrink_reclaimer", None)
+                if register is None or getattr(manager, "page_allocator", None) is None:
+                    continue
+                reclaimer = _PrefixCacheShrinkReclaimer(scheduler, manager)
+                register(reclaimer.reclaim)
+                reclaimers.append(reclaimer)
+        scheduler._kvcached_shrink_reclaimers = reclaimers
+    return reclaimers
+
+
+def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
+    now = time.monotonic()
+    for reclaimer in _register_shrink_reclaimers(scheduler):
+        manager = reclaimer.manager
+        # kvctl publishes a target; set_memory_limit() bumps a revision.
+        limits = (manager.page_allocator.get_resize_target(),
+                  getattr(manager, "_memory_limit_revision", -1))
+        changed = limits != reclaimer.seen_limits
+        if changed:
+            reclaimer.seen_limits = limits
+            manager.apply_resize_target()
+        if manager.in_shrink and (changed or now - reclaimer.last_attempt >= 1.0):
+            reclaimer.last_attempt = now
+            manager.reclaim_for_shrink()
+
+
+class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
+    """Apply lowered kvcached limits while the SGLang scheduler is idle.
+
+    `kvctl limit` and set_memory_limit() only record a limit, and the next
+    allocation applies it, so an idle server kept its whole prefix cache
+    mapped. The idle hook runs on the scheduler thread, which owns the radix
+    cache. The prefix cache reclaimers are registered when the scheduler is
+    built.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_idle_limit"
+
+    def apply(self, sched_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_idle_hook(sched_mod)
+
+    @version_range(SGLANG_ALL_RANGE)
+    def patch_idle_hook(self, sched_mod: types.ModuleType) -> bool:
+        Scheduler = self._get_target_class(sched_mod)
+        if Scheduler is None:
+            return False
+        # SGLang 0.5.20 calls on_idle; earlier releases (e.g. 0.5.10) call
+        # self_check_during_idle.
+        name = next((name for name in ("on_idle", "self_check_during_idle")
+                     if callable(getattr(Scheduler, name, None))), None)
+        if name is None:
+            self.logger.warning("No SGLang scheduler idle hook found")
+            return False
+
+        original_init = Scheduler.__init__
+        init_marker = "__kvcached_scheduler_idle_limit_init__"
+        if not self._is_already_patched(original_init, init_marker):
+
+            @functools.wraps(original_init)
+            def _patched_init(sched_self: Any, *args: Any, **kwargs: Any) -> None:
+                original_init(sched_self, *args, **kwargs)
+                if enable_kvcached():
+                    _register_shrink_reclaimers(sched_self)
+
+            self._mark_as_patched(_patched_init, init_marker)
+            Scheduler.__init__ = _patched_init
+
+        original = getattr(Scheduler, name)
+        if self._is_already_patched(original):
+            return True
+
+        @functools.wraps(original)
+        def _wrapped(sched_self: Any, *args: Any, **kwargs: Any) -> Any:
+            if enable_kvcached():
+                _apply_kvcached_limits_on_idle(sched_self)
+            return original(sched_self, *args, **kwargs)
+
+        self._mark_as_patched(_wrapped)
+        setattr(Scheduler, name, _wrapped)
+        return True
 
 
 class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):

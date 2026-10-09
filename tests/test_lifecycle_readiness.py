@@ -121,7 +121,7 @@ class FakePageAllocator:
         return 4
 
     def get_resize_target(self) -> int:
-        return 0
+        return -1
 
 
 class FakeInternalPage:

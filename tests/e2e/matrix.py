@@ -205,14 +205,30 @@ class ElasticPair:
 
 
 @dataclass(frozen=True)
+class LimitTest:
+    """One kvcached server whose memory limit is lowered while its prefix
+    cache holds most of its KV memory (e2e/limit.py). The limit is set on the
+    server's first segment, so the model needs a single KV cache group.
+    """
+    engine: str
+    model: str
+
+    @property
+    def name(self) -> str:
+        return f"limit-{self.engine}-{self.model}"
+
+
+@dataclass(frozen=True)
 class Profile:
     groups: tuple[Group, ...]
     elastic: tuple[ElasticPair, ...] = ()
+    limit: tuple[LimitTest, ...] = ()
 
     @property
     def engines(self) -> tuple[str, ...]:
         names = [g.engine for g in self.groups]
         names += [e for pair in self.elastic for e in (pair.engine_a, pair.engine_b)]
+        names += [t.engine for t in self.limit]
         return tuple(dict.fromkeys(names))
 
 
@@ -230,6 +246,7 @@ PROFILES = {
         groups=groups(("vllm", "sglang"), ("qwen05b", "qwen35_4b", "gemma4e2b")),
         elastic=(ElasticPair("vllm", "qwen05b", "vllm", "qwen35_4b"),
                  ElasticPair("sglang", "qwen05b", "sglang", "qwen35_4b")),
+        limit=(LimitTest("vllm", "qwen05b"), LimitTest("sglang", "qwen05b")),
     ),
     # Two L4s.
     "weekly": Profile(

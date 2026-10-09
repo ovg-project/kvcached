@@ -510,7 +510,7 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
                 gpus: str, engines: dict[str, dict[str, Any]],
                 results: list[CaseResult]) -> None:
     """Record what this run tested, for the CI results issue (tools/ci/report.py)."""
-    from e2e import elastic
+    from e2e import elastic, limit
 
     setups = [{"name": r.name, **r.log["setup"]} for r in results if "setup" in r.log]
     hf_ids = {s["hf_id"] for s in setups if "hf_id" in s}
@@ -523,9 +523,11 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
         "stop_signal": os.environ.get("E2E_STOP_SIGNAL", "INT"),
         "model_revisions": {h: model_revision(hf_cache, h) for h in sorted(hf_ids)},
         "workload": WORKLOAD, "checks": CHECKS,
-        "cases": [s for s in setups if s.get("kind") != "elastic"],
+        "cases": [s for s in setups if s.get("kind") not in ("elastic", "limit")],
         "elastic": [s for s in setups if s.get("kind") == "elastic"],
         "elastic_workload": elastic.WORKLOAD, "elastic_checks": elastic.CHECKS,
+        "limit": [s for s in setups if s.get("kind") == "limit"],
+        "limit_workload": limit.WORKLOAD, "limit_checks": limit.CHECKS,
     }
     (out / "setup.json").write_text(json.dumps(setup, indent=1))
 
@@ -544,7 +546,9 @@ def main() -> int:
     ap.add_argument("--engines", nargs="*", help="subset of the profile's engines")
     ap.add_argument("--models", nargs="*", help="subset of the profile's models")
     ap.add_argument("--skip-elastic", action="store_true")
-    ap.add_argument("--skip-cases", action="store_true", help="run only the elastic tests")
+    ap.add_argument("--skip-limit", action="store_true")
+    ap.add_argument("--skip-cases", action="store_true",
+                    help="run only the elastic and limit tests")
     ap.add_argument("--local", action="store_true",
                     help="run the servers on this machine instead of in engine containers")
     ap.add_argument("--no-install", action="store_true",
@@ -618,6 +622,15 @@ def main() -> int:
                     results.append(run_elastic(ct_a, ct_b, pair, run_id, a.port,
                                                a.ready_timeout, a.elastic_gpu_mib))
                     report(results[-1])
+
+        if not a.skip_limit:
+            from e2e.limit import run_limit
+            for test in profile.limit:
+                host = containers.get(test.engine)
+                if host is None or (a.models and test.model not in a.models):
+                    continue
+                results.append(run_limit(host, test, run_id, a.port, a.ready_timeout))
+                report(results[-1])
     finally:
         for ct in containers.values():
             ct.remove()

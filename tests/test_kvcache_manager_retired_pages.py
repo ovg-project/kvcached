@@ -21,7 +21,7 @@ class FakeAllocator:
     def __init__(self):
         self.freed_pages = []
         self.resize = mock.Mock(return_value=True)
-        self.get_resize_target = mock.Mock(return_value=0)
+        self.get_resize_target = mock.Mock(return_value=-1)
         self.alloc_page = mock.Mock(side_effect=AssertionError("Mapped page must be reused"))
 
     def free_pages(self, page_ids):
