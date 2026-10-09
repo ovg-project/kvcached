@@ -45,14 +45,26 @@ SETUP: dict[str, Any] = {
 
 def args(**kw):
     base = dict(run_url="https://github.com/ovg-project/kvcached/actions/runs/1", sha="b" * 40,
-                subject="fix: something", prev="", artifact_url="", reason_file="")
+                subject="fix: something", prev="", artifact_url="", pr=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
 
-def write(tmp_path, cases):
-    (tmp_path / "setup.json").write_text(json.dumps(SETUP))
-    (tmp_path / "summary.json").write_text(json.dumps({"cases": cases}))
+def write(path, cases, setup=SETUP):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "setup.json").write_text(json.dumps(setup))
+    (path / "summary.json").write_text(json.dumps({"cases": cases}))
+    return path
+
+
+def sglang_part() -> dict[str, Any]:
+    """The setup of the SGLang half of a nightly run, on the second GPU."""
+    setup = json.loads(json.dumps(SETUP))
+    setup["engines"] = {"sglang": {"image": "lmsysorg/sglang:v0.5.20", "engine": "0.5.20",
+                                   "env": {}, "server": "python3 -m sglang.launch_server"}}
+    setup["cases"] = [dict(c, name=c["name"].replace("vllm", "sglang"), engine="sglang")
+                      for c in SETUP["cases"]]
+    return setup
 
 
 def test_splice_keeps_other_text_and_orders_sections():
@@ -72,7 +84,7 @@ def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
         {"name": "vllm-qwen05b-native", "ok": False,
          "checks": [{"name": "gen_seq_ok", "ok": False, "detail": "500 boom | x"}]},
     ])
-    text = report.correctness_comment("nightly", tmp_path, args(prev=f"{'c' * 40}:success"))
+    text = report.correctness_comment("nightly", [tmp_path], args(prev=f"{'c' * 40}:success"))
     assert "FAIL (1 of 2 cases)" in text
     assert "| vllm-qwen05b-native |" in text and "| vllm-qwen05b-kv_c1 |" not in text
     assert "native, TP 1, KV model dtype, `--block-size 1024`" in text
@@ -81,12 +93,38 @@ def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
 
 
 def test_correctness_comment_when_nothing_ran(tmp_path):
-    launch = tmp_path / "launch.log"
-    launch.write_text("No capacity in us-west1-a; trying the next zone\n"
-                      "No capacity in us-west1-b; trying the next zone\n")
-    text = report.correctness_comment("nightly", tmp_path, args(reason_file=str(launch)))
-    assert "DID NOT RUN" in text
-    assert "No L4 GPU was available" in text and "us-west1" not in text
+    text = report.correctness_comment("nightly", [tmp_path / "all"], args())
+    assert "DID NOT RUN" in text and "The tests did not finish" in text
+
+
+def test_parts_on_two_gpus_make_one_comment_and_setup(tmp_path):
+    ok = [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}]
+    vllm = write(tmp_path / "vllm", ok)
+    sglang = write(tmp_path / "sglang", [dict(ok[0], name="sglang-qwen05b-kv_c1")], sglang_part())
+    text = report.correctness_comment("nightly", [sglang, vllm], args())
+    assert "· PASS" in text and "All 2 cases passed." in text
+    assert "2x NVIDIA L4" in text and "SGLang and vLLM cases run at the same time" in text
+    setup = report.merge_setups([("vLLM", SETUP), ("SGLang", sglang_part())])
+    section = report.correctness_section("nightly", setup, args())
+    assert "| vllm-qwen05b-kv_c1 |" in section and "| sglang-qwen05b-kv_c1 |" in section
+    assert "`lmsysorg/sglang:v0.5.20`" in section and "`vllm/vllm-openai:v0.30.0`" in section
+
+
+def test_a_part_that_did_not_finish_fails_the_run(tmp_path):
+    vllm = write(tmp_path / "vllm", [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}])
+    text = report.correctness_comment("nightly", [vllm, tmp_path / "sglang"], args())
+    assert "FAIL (0 of 1 cases; the SGLang cases did not finish)" in text
+    assert "The SGLang cases did not finish" in text
+
+
+def test_pull_request_comment_carries_its_setup(tmp_path):
+    run = write(tmp_path / "all", [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}])
+    text = report.correctness_comment("weekly", [run], args(pr=12))
+    assert "<details><summary>Setup of every case</summary>" in text
+    assert "On request in a pull request" in text and "from the pull request merged into main" in text
+    # No issue description to point at: the workload and checks are spelled out.
+    assert "| check | passes when |" in text and "#nightly-correctness" not in text
+    assert "\n## Weekly correctness" not in text
 
 
 def test_correctness_section_describes_every_case(tmp_path):

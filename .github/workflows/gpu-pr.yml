@@ -1,0 +1,145 @@
+name: GPU CI on pull request
+
+# A maintainer (the admin or maintain role; write access is not enough)
+# comments `/ci run` on a pull request to run the nightly GPU correctness
+# cases on its head commit merged into main, or `/ci run weekly` for the
+# weekly ones. Both commits are fixed when the command is accepted; later
+# pushes need a new command. The results are commented on the pull request and set as the
+# commit's "GPU CI" status. The tests run on the machine of
+# gpu-correctness.yml, queued behind its runs; issue_comment always runs this
+# file as it is on main.
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: >-
+      github.repository == 'ovg-project/kvcached' && github.event.issue.pull_request &&
+      (github.event.comment.body == '/ci run' || github.event.comment.body == '/ci run weekly')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      statuses: write
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+      sha: ${{ steps.check.outputs.sha }}
+      profile: ${{ steps.check.outputs.profile }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          COMMAND: ${{ github.event.comment.body }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # role_name, not permission: permission reports the maintain role as write.
+          role=$(gh api "repos/$GH_REPO/collaborators/$ACTOR/permission" --jq .role_name || true)
+          if [ "$role" != admin ] && [ "$role" != maintain ]; then
+            gh pr comment "$PR" --body "Only maintainers (the admin or maintain role) can run the GPU CI."
+            echo allowed=false >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          profile=nightly
+          if [ "$COMMAND" = "/ci run weekly" ]; then
+            profile=weekly
+          fi
+          read -r state sha < <(gh api "repos/$GH_REPO/pulls/$PR" --jq '"\(.state) \(.head.sha)"')
+          if [ "$state" != open ]; then
+            gh pr comment "$PR" --body "The GPU CI runs only on open pull requests."
+            echo allowed=false >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/statuses/$sha" -f state=pending -f context="GPU CI ($profile)" \
+            -f target_url="$RUN_URL" -f description="Requested by @$ACTOR" > /dev/null
+          gh pr comment "$PR" --body "GPU CI ($profile) on $sha, requested by @$ACTOR: [run]($RUN_URL)"
+          { echo allowed=true; echo "sha=$sha"; echo "profile=$profile"; } >> "$GITHUB_OUTPUT"
+
+  e2e:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: [kvcached-gpu]
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      PROFILE: ${{ needs.authorize.outputs.profile }}
+    steps:
+      # main as of the command (this event's commit), with the pull request
+      # merged in, as it would land.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge the pull request
+        env:
+          SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          git fetch -q origin "$SHA"
+          git -c user.name="GPU CI" -c user.email=gpu-ci@users.noreply.github.com \
+            merge -q --no-edit "$SHA"
+
+      - name: Run the e2e suite
+        run: bash tools/ci/gpu-runner/run.sh "$PROFILE" "$RUNNER_TEMP/results"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-pr${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: [authorize, e2e]
+    if: always() && needs.authorize.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    env:
+      PROFILE: ${{ needs.authorize.outputs.profile }}
+      SHA: ${{ needs.authorize.outputs.sha }}
+      PR: ${{ github.event.issue.number }}
+    steps:
+      # report.py from main, not from the pull request: this job can write.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true  # none when the job did not get to run
+        with:
+          name: gpu-pr${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results
+
+      - name: Comment on the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          mkdir -p results
+          mapfile -t parts < <(find results -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ "${#parts[@]}" = 0 ]; then
+            parts=(results/all)
+          fi
+          python3 tools/ci/report.py correctness --results "${parts[@]}" --profile "$PROFILE" \
+            --pr "$PR" --run-url "$RUN_URL" --sha "$SHA" --subject "merged into main at ${GITHUB_SHA::7}" \
+            --artifact-url "$RUN_URL#artifacts" \
+            --comment comment.md --section section.md
+          gh pr comment "$PR" --body-file comment.md
+          state=failure
+          description="Failed or did not finish"
+          if [ "$E2E" = success ]; then
+            state=success
+            description="All cases passed"
+          fi
+          gh api "repos/$GH_REPO/statuses/$SHA" -f state="$state" -f context="GPU CI ($PROFILE)" \
+            -f target_url="$RUN_URL" -f description="$description" > /dev/null

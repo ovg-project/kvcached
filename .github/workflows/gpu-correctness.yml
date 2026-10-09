@@ -2,12 +2,14 @@ name: GPU Correctness
 # The profile in the run's title lets the next run find its predecessor.
 run-name: GPU Correctness (${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }})
 
-# Correctness on real GPUs: kvcached against the native engines, on a GCP
-# L4 VM created for the run and deleted afterwards. Nightly on one L4; weekly
-# on two L4s with tensor parallelism. Never runs for pull requests; the GCP
-# credentials can only be obtained from main. Every run comments its results
-# on the issue in the GPU_CI_RESULTS_ISSUE variable and keeps the setup of its
-# profile up to date in that issue's description.
+# Correctness on real GPUs: kvcached against the native engines, on the CI
+# machine with two L4s, a self-hosted runner set up by
+# tools/ci/gpu-runner/setup.sh. Nightly runs the vLLM and the SGLang cases at
+# the same time, one GPU each; weekly uses both GPUs for tensor parallelism.
+# The runner takes no job but this workflow's and gpu-pr.yml's from main
+# (tools/ci/gpu-runner/job_started.sh), and runs one job at a time. Every run
+# comments its results on the issue in the GPU_CI_RESULTS_ISSUE variable and
+# keeps the setup of its profile up to date in that issue's description.
 on:
   schedule:
     - cron: '0 8 * * *'     # nightly
@@ -21,80 +23,57 @@ on:
         options: [nightly, weekly, smoke]
 
 permissions:
-  actions: read
   contents: read
-  id-token: write
-  issues: write
 
-concurrency:
-  group: gpu-correctness
-  cancel-in-progress: false
+env:
+  PROFILE: ${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }}
 
 jobs:
   e2e:
     if: github.repository == 'ovg-project/kvcached'
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-    env:
-      VM_NAME: kvcached-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      PROFILE: ${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }}
-      GCE_IMAGE_FAMILY: ${{ vars.GCE_IMAGE_FAMILY }}
-      GCE_IMAGE_PROJECT: ${{ vars.GCE_IMAGE_PROJECT }}
-      RESULTS_ISSUE: ${{ vars.GPU_CI_RESULTS_ISSUE }}
+    runs-on: [kvcached-gpu]
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-
-      - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
-          project_id: ${{ vars.GCP_PROJECT }}
+          persist-credentials: false
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Create L4 VM
-        id: vm
-        run: |
-          machine=g2-standard-8      # one L4
-          if [ "$PROFILE" = weekly ]; then
-            machine=g2-standard-24   # two L4s
-          fi
-          bash tools/ci/gcp/launch.sh "$VM_NAME" "$machine" "${{ vars.GCP_L4_ZONES }}" 2>&1 |
-            tee launch.log
-
-      - name: Run the e2e suite on the VM
-        env:
-          ZONE: ${{ steps.vm.outputs.zone }}
-        run: bash tools/ci/gcp/remote.sh "$VM_NAME" "$ZONE" "$PROFILE" results
-
-      - name: Add results to the job summary
-        if: always()
-        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - name: Run the e2e suite
+        run: bash tools/ci/gpu-runner/run.sh "$PROFILE" "$RUNNER_TEMP/results"
 
       - name: Upload results
-        id: upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gpu-${{ env.PROFILE }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: results/
+          path: ${{ runner.temp }}/results/
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Delete VM
-        if: always() && steps.vm.outputs.zone != ''
-        env:
-          ZONE: ${{ steps.vm.outputs.zone }}
-        run: gcloud compute instances delete "$VM_NAME" --zone "$ZONE" --quiet
+  report:
+    needs: e2e
+    if: always() && needs.e2e.result != 'skipped' && vars.GPU_CI_RESULTS_ISSUE != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    env:
+      RESULTS_ISSUE: ${{ vars.GPU_CI_RESULTS_ISSUE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true  # none when the job did not get to run
+        with:
+          name: gpu-${{ env.PROFILE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results
 
       - name: Comment on the results issue
-        if: always() && env.RESULTS_ISSUE != ''
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
-          VM_OUTCOME: ${{ steps.vm.outcome }}
         run: |
           # The latest finished run of this profile, as SHA:CONCLUSION.
           prev=$(gh run list --workflow gpu-correctness.yml --branch main --limit 50 \
@@ -102,13 +81,15 @@ jobs:
             --jq ".[] | select(.status == \"completed\" and .databaseId != $GITHUB_RUN_ID
                     and .displayTitle == \"GPU Correctness ($PROFILE)\")
                   | \"\(.headSha):\(.conclusion)\"" | sed -n 1p)
-          reason=""
-          if [ "$VM_OUTCOME" != success ]; then
-            reason=launch.log
+          # One directory per part of the run; none if it never started.
+          mkdir -p results
+          mapfile -t parts < <(find results -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ "${#parts[@]}" = 0 ]; then
+            parts=(results/all)
           fi
-          python3 tools/ci/report.py correctness --results results --profile "$PROFILE" \
+          python3 tools/ci/report.py correctness --results "${parts[@]}" --profile "$PROFILE" \
             --run-url "$RUN_URL" --sha "$GITHUB_SHA" --subject "$(git log -1 --format=%s)" \
-            --prev "$prev" --artifact-url "$ARTIFACT_URL" --reason-file "$reason" \
+            --prev "$prev" --artifact-url "$RUN_URL#artifacts" \
             --comment comment.md --section section.md
           gh issue comment "$RESULTS_ISSUE" --body-file comment.md
           # Keep this profile's setup in the description; a smoke run only comments.
