@@ -59,6 +59,26 @@ def _worker_physical_release_barrier(worker: Any) -> bool:
     return True
 
 
+def _batch_queue_size(batch_queue: Any) -> int:
+    if batch_queue is None:
+        return 0
+    # Older PP schedulers use Queue; newer schedulers use deque.
+    # Only the engine thread adds/removes batches on either path.
+    if isinstance(batch_queue, Queue):
+        return batch_queue.qsize()
+    return len(batch_queue)
+
+
+def _release_retired_pages_if_idle(engine_core: Any, manager: Any) -> None:
+    """Drain retired pages when no later batch step will do it."""
+    if not getattr(manager, "defer_physical_release", False):
+        return
+    batch_queue = getattr(engine_core, "batch_queue", None)
+    if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
+        marker = manager.capture_physical_release_marker()
+        manager.release_retired_pages_through(marker)
+
+
 def _get_vllm_kv_cache_manager(engine_core: Any) -> Any:
     scheduler = getattr(engine_core, "scheduler", None)
     vllm_manager = getattr(scheduler, "kv_cache_manager", None)
@@ -737,6 +757,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if enable_caching and getattr(self.kv_cache_manager, "page_allocator", None) is not None
                     else None
                 )
+                register_reclaimer = getattr(
+                    self.kv_cache_manager, "_register_shrink_reclaimer", None)
+                if self._page_eviction is not None and register_reclaimer is not None:
+                    register_reclaimer(self._reclaim_for_shrink)
 
             def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
                 block = self._evictable_blocks.pop(block_id, None)
@@ -943,20 +967,38 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             if len(ordered) == num_to_evict:
                                 break
 
-                ids_to_free: list[int] = []
-                for bid in ordered:
+                return self._evict_block_ids(ordered)
+
+            def _evict_block_ids(self, block_ids: list[int]) -> int:
+                """Drop evictable blocks from the prefix cache, free to kvcached."""
+                for bid in block_ids:
                     block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._remove_cached_block(key, bid)
                     if block is not None:
                         _reset_block_hash(block)
-                    ids_to_free.append(bid)
-                if ids_to_free:
-                    self._free_block_ids(ids_to_free)
+                if block_ids:
+                    self._free_block_ids(block_ids)
                 if not self._evictable_blocks and self._page_eviction is not None:
                     self._page_eviction.clear()
-                return len(ids_to_free)
+                return len(block_ids)
+
+            def _reclaim_for_shrink(self) -> None:
+                """Evict the cached pages a lower kvcached limit waits for.
+
+                A shrink only completes once enough pages are empty, and
+                pages holding nothing but cached prefixes never empty on their
+                own: allocations reuse their slots one LRU victim at a time.
+                Evict whole pages, cheapest first. Pages that running requests
+                still use stay until those requests finish.
+                """
+                if self._page_eviction is None or not self._evictable_blocks:
+                    return
+                excess = self.kv_cache_manager.shrink_excess_pages()
+                if excess > 0:
+                    self._evict_block_ids(self._page_eviction.victims(
+                        len(self._evictable_blocks), max_pages=excess))
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -1066,6 +1108,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
+                if getattr(self.kv_cache_manager, "in_shrink", False) is True:
+                    # Finished requests may leave whole pages to cached prefixes.
+                    self._reclaim_for_shrink()
 
 
             def evict_blocks(self, block_ids: set[int]) -> None:
@@ -1259,6 +1304,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             result = original_init(self, vllm_config, *args, **kwargs)
             if enable_kvcached():
                 self._kvcached_install_ordered_unmap()
+                self._kvcached_start_limit_watch()
             return result
 
         patch_logger = self.logger
@@ -1309,9 +1355,57 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 expected_workers,
             )
 
+        def _kvcached_start_limit_watch(self) -> None:
+            """Apply lowered limits while the engine is idle.
+
+            `kvctl limit` and set_memory_limit() only record a limit; the next
+            allocation applies it and evicts cached prefixes. An idle engine
+            never allocates, so wake its input loop instead: idle-state
+            callbacks run on the engine thread, the only thread that may
+            change the block pool.
+            """
+            manager = _get_vllm_kv_cache_manager(self)
+            callbacks = getattr(self, "_idle_state_callbacks", None)
+            if manager is None or not isinstance(callbacks, list):
+                return
+            try:
+                from vllm.v1.engine import EngineCoreRequestType
+                wakeup = EngineCoreRequestType.WAKEUP
+            except (ImportError, AttributeError):
+                return
+
+            def apply_limit(engine_core: Any) -> None:
+                manager.apply_resize_target()
+                manager.reclaim_for_shrink()
+                _release_retired_pages_if_idle(engine_core, manager)
+
+            stop = threading.Event()
+
+            def limits() -> tuple[int, int]:
+                return (manager.page_allocator.get_resize_target(),
+                        getattr(manager, "_memory_limit_revision", -1))
+
+            def watch() -> None:
+                # -1 means no kvctl target and no set_memory_limit() revision.
+                # Starting there also applies a limit set during startup.
+                seen = (-1, -1)
+                while not stop.wait(0.2):
+                    current = limits()
+                    input_queue = getattr(self, "input_queue", None)
+                    if current == seen or input_queue is None:
+                        continue
+                    seen = current
+                    callbacks.append(apply_limit)
+                    input_queue.put_nowait((wakeup, None))
+
+            thread = threading.Thread(target=watch, name="kvcached-limit-watch", daemon=True)
+            self._kvcached_limit_watch = (stop, thread)
+            thread.start()
+
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
         EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
+        EngineCore._kvcached_start_limit_watch = _kvcached_start_limit_watch
         return True
 
     @version_range(VLLM_ALL_RANGE)
@@ -1327,15 +1421,6 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_step, "async_batch_lifetime"):
             self.logger.debug("EngineCore.step_with_batch_queue already patched")
             return True
-
-        def _batch_queue_size(batch_queue: Any) -> int:
-            if batch_queue is None:
-                return 0
-            # Older PP schedulers use Queue; newer schedulers use deque.
-            # Only the engine thread adds/removes batches on either path.
-            if isinstance(batch_queue, Queue):
-                return batch_queue.qsize()
-            return len(batch_queue)
 
         def _patched_step_with_batch_queue(self, *args: Any, **kwargs: Any):
             manager = _get_vllm_kv_cache_manager(self)
@@ -1361,15 +1446,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             def _patched_reset_prefix_cache(self, *args: Any, **kwargs: Any):
                 result = original_reset(self, *args, **kwargs)
                 manager = _get_vllm_kv_cache_manager(self)
-                if manager is None or not getattr(manager, "defer_physical_release", False):
-                    return result
-
-                batch_queue = getattr(self, "batch_queue", None)
-                if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
+                if manager is not None:
                     # Idle control operations have no subsequent batch step to
                     # drain retirements. Busy engines drain at the next step.
-                    marker = manager.capture_physical_release_marker()
-                    manager.release_retired_pages_through(marker)
+                    _release_retired_pages_if_idle(self, manager)
                 return result
 
             self._mark_as_patched(_patched_reset_prefix_cache, "async_batch_lifetime")
@@ -1406,6 +1486,12 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
+                limit_watch = getattr(self, "_kvcached_limit_watch", None)
+                if limit_watch is not None:
+                    # It reads the page allocator, which shutdown_kvcached() frees.
+                    stop, thread = limit_watch
+                    stop.set()
+                    thread.join(timeout=5)
                 if enable_kvcached():
                     try:
                         from kvcached.integration.vllm.interfaces import shutdown_kvcached

@@ -152,7 +152,7 @@ def test_alloc_fails_loud_instead_of_parking_an_empty_page(monkeypatch):
     manager.page_size = 4 * MIB
     manager.block_mem_size = 3211264
     manager.page_allocator = types.SimpleNamespace(
-        alloc_page=lambda: _EmptyPage(), get_resize_target=lambda: 0,
+        alloc_page=lambda: _EmptyPage(), get_resize_target=lambda: -1,
         get_num_free_pages=lambda: 10, get_avail_physical_pages=lambda: 10,
         get_num_reserved_pages=lambda: 0)
     manager.num_avail_blocks = 0
