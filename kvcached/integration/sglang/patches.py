@@ -5,10 +5,13 @@
 SGLang-specific patches using unified patch infrastructure.
 """
 
+import contextlib
 import functools
 import inspect
 import math
 import os
+import threading
+import time
 import types
 from abc import ABCMeta
 from typing import (
@@ -30,7 +33,11 @@ from kvcached.integration.version_utils import (
     VersionAwarePatch,
     version_range,
 )
-from kvcached.utils import MAX_CACHED_TOKENS, get_kvcached_logger
+from kvcached.utils import (
+    MAX_CACHED_TOKENS,
+    KVCachePoolExhausted,
+    get_kvcached_logger,
+)
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
@@ -108,6 +115,189 @@ class _ElasticAllocatorMeta(ABCMeta):
         native_cls = getattr(cls, "_native_allocator_cls", None)
         return (native_cls is not None and isinstance(instance, native_cls)
                 and getattr(instance, "_kvcached_zero_attention", False) is True)
+
+
+_SGLANG_BATCH_ALLOCATION = threading.local()
+
+
+@contextlib.contextmanager
+def _sglang_batch_allocation_zone():
+    """Mark the window in which an allocation miss is fatal to SGLang.
+
+    SGLang's allocators report a miss by returning None, and every caller
+    inside ``alloc_for_extend`` turns that None into a RuntimeError or an
+    assert, because native pools are static and the admission budget cannot
+    be wrong. Inside this window the elastic allocators raise
+    ``KVCachePoolExhausted`` instead, so the miss reaches the kvcached wrapper
+    before SGLang's error path prints the radix tree and exits the scheduler.
+    Outside the window the None contract is unchanged, which
+    ``alloc_group_begin`` and the lazy ping-pong slot rely on.
+    """
+    previous = getattr(_SGLANG_BATCH_ALLOCATION, "active", False)
+    _SGLANG_BATCH_ALLOCATION.active = True
+    try:
+        yield
+    finally:
+        _SGLANG_BATCH_ALLOCATION.active = previous
+
+
+def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
+                          pool: Any) -> None:
+    """Report that the kvcached pool behind ``owner`` cannot back a request.
+
+    Returns None outside the batch allocation window (the native allocator
+    contract, #545) and raises ``KVCachePoolExhausted`` inside it. The
+    manager returns None only for a capacity shortfall; its contract
+    violations and native fatal errors raise on their own and never reach
+    this call, which keeps the translation as narrow as the vLLM one (#453,
+    #511). ``pool`` is read for the message only, after the verdict.
+    """
+    if not getattr(_SGLANG_BATCH_ALLOCATION, "active", False):
+        return None
+    try:
+        available: Any = pool.available_size()
+    except Exception:
+        available = "unknown"
+    raise KVCachePoolExhausted(
+        f"{type(owner).__name__} cannot back {need_size} {unit}; "
+        f"available={available}")
+
+
+def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
+                                    num_tokens: int, need_blocks: int) -> bool:
+    """Decode capacity gate for the elastic allocators (SGLang 0.5.19+).
+
+    ``ScheduleBatch.check_decode_mem`` asks the allocator whether the next
+    decode step fits, and a False answer takes the native retract path. The
+    native gate evicts and compares ``available_size()``. Under kvcached that
+    count is a snapshot of device-wide free memory, so the allocation that
+    follows can still run out of physical pages, and a miss there is fatal
+    (``prepare_for_decode`` has already advanced the penalizer state, so it
+    cannot simply run again). Reserve the step's blocks here instead:
+    ``KVCacheManager.alloc`` serves reserved blocks first, so the following
+    ``alloc_for_decode`` cannot run out of pages inside this process, and a
+    shortfall surfaces where the scheduler retracts.
+    """
+    evict = getattr(allocator, "evict_to_free_tokens", None)
+    if evict is not None:
+        evict(tree_cache, num_tokens)
+    if need_blocks <= 0:
+        return True
+    return bool(allocator.kvcached_allocator.try_to_reserve(need_blocks))
+
+
+class SGLangPrefillCapacityMiss(KVCachePoolExhausted):
+    """A prefill batch could not be backed and its allocations are released.
+
+    Raised by the ``alloc_for_extend`` wrapper after it returned the request
+    rows, Mamba slots and ping-pong slots the call handed out. The scheduler
+    wrapper catches it, releases the admission state and returns the requests
+    to the waiting queue.
+    """
+
+    def __init__(self, batch: Any, cause: KVCachePoolExhausted) -> None:
+        super().__init__(str(cause))
+        self.batch = batch
+
+
+def _release_prefill_allocations(
+    pool: Any, held: Sequence[Tuple[Any, bool, bool, bool]]
+) -> None:
+    """Return what ``alloc_for_extend`` handed out before the miss.
+
+    ``HybridReqToTokenPool.alloc`` binds request rows to every fresh request
+    first and then walks the requests for a Mamba slot and the ping-pong
+    slots, so a miss leaves rows and some slots bound to requests that will
+    not run. Only state absent at entry is released: a chunked continuation
+    keeps the row and the slot it brought into the batch.
+    """
+    mamba_allocator = getattr(pool, "mamba_allocator", None)
+    for req, had_row, had_mamba, had_ping_pong in held:
+        kv = req.kv
+        buffer = kv.mamba_ping_pong_track_buffer
+        if (not had_ping_pong and buffer is not None
+                and mamba_allocator is not None):
+            mamba_allocator.free(buffer[buffer != -1])
+            kv.mamba_ping_pong_track_buffer = None
+            kv.mamba_next_track_idx = None
+            kv.mamba_last_track_idx = None
+        if not had_mamba and kv.holds_mamba and mamba_allocator is not None:
+            mamba_allocator.free(kv.mamba_pool_idx.unsqueeze(0))
+            kv.mamba_pool_idx = None
+            kv.mamba_needs_clear = False
+        if not had_row and kv.holds_kv:
+            pool.free(req)
+
+
+def _unwind_prefill_admission(scheduler: Any, batch: Any, chunked_before: Any,
+                              running_batch: Any) -> List[Any]:
+    """Release the admission state of a prefill batch that will not run.
+
+    Mirrors what the scheduler does for a candidate it did not add (the
+    Mamba revert at the end of its admission loop) plus the tree lock the
+    adder took at commit. A chunked continuation is not a candidate: it stays
+    the scheduler's chunked request, parked with nothing new to cache, and
+    the next round re-admits it the way the hybrid SWA early return does.
+    Returns the requests placed back at the head of the waiting queue.
+    """
+    tree_cache = scheduler.tree_cache
+    mamba_allocator = getattr(scheduler.req_to_token_pool, "mamba_allocator", None)
+    chunked_after = scheduler.chunked_req
+    requeue: List[Any] = []
+    for req in batch.reqs:
+        if req is chunked_before:
+            prefix_len = len(req.prefix_indices)
+            req.set_extend_range(prefix_len, prefix_len)
+            continue
+        receipt = getattr(req, "lock_receipt", None)
+        if receipt is None:
+            tree_cache.dec_lock_ref(req.last_node)
+        else:
+            tree_cache.dec_lock_ref(req.last_node, receipt)
+            req.lock_receipt = type(receipt)()
+        kv = req.kv
+        kv.mamba_cow_src_index = None
+        kv.mamba_needs_clear = False
+        if (kv.holds_mamba and not getattr(req, "session", None)
+                and mamba_allocator is not None):
+            mamba_allocator.free(kv.mamba_pool_idx.unsqueeze(-1))
+            kv.mamba_pool_idx = None
+        requeue.append(req)
+    if chunked_after is not None:
+        chunked_after.inflight_middle_chunks -= 1
+    scheduler.chunked_req = chunked_before
+    scheduler.waiting_queue[0:0] = requeue
+    if running_batch is not None:
+        running_batch.batch_is_full = False
+    return requeue
+
+
+@contextlib.contextmanager
+def _sglang_prefill_request_cap(cap: Optional[int]):
+    """Cap the requests the next ``PrefillAdder`` admits.
+
+    ``prefill_max_requests`` is read from the schedule config bag when the
+    adder is built, and the bag offers a scoped override for a window where
+    one caller's value differs from the process's. A user-set value stays
+    the ceiling.
+    """
+    override = None
+    if cap is not None:
+        try:
+            from sglang.srt.runtime_context import get_schedule
+
+            schedule = get_schedule()
+            current = getattr(schedule, "prefill_max_requests", None)
+            value = cap if current is None else min(int(current), cap)
+            override = schedule.override(prefill_max_requests=value)
+        except Exception as exc:
+            logger.debug("prefill request cap unavailable: %r", exc)
+            override = None
+    if override is None:
+        yield
+        return
+    with override:
+        yield
 
 
 def _reduce_sglang_world_min_bytes(torch: Any, local_bytes: int) -> int:
@@ -446,8 +636,16 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                 def alloc(self, need_size: int):
                     indices = self.kvcached_allocator.alloc(need_size)
                     if indices is None:
-                        return None
+                        return _sglang_capacity_miss(
+                            self, need_size, "tokens", self.kvcached_allocator)
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
+
+                def check_decode_capacity(self, *, num_tokens: int,
+                                          tree_cache: Any,
+                                          requests: Any = None,
+                                          spec_algorithm: Any = None) -> bool:
+                    return _sglang_reserve_decode_capacity(
+                        self, tree_cache, num_tokens, need_blocks=num_tokens)
 
                 def free(self, free_index):
                     if _sglang_free_immediately(self):
@@ -590,7 +788,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     num_pages = need_size // self.page_size
                     block_ids = self.kvcached_allocator.alloc(num_pages)
                     if block_ids is None:
-                        return None
+                        return _sglang_capacity_miss(
+                            self, num_pages, "pages", self.kvcached_allocator)
                     page_ids = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
                     out_indices = (
                         page_ids[:, None] * self.page_size
@@ -624,7 +823,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc(num_new_pages)
                         if block_ids is None:
-                            return None
+                            return _sglang_capacity_miss(
+                                self, num_new_pages, "pages",
+                                self.kvcached_allocator)
                         free_pages = torch.tensor(
                             block_ids, dtype=torch.int64, device=self.device
                         )
@@ -672,7 +873,9 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if num_new_pages > 0:
                         block_ids = self.kvcached_allocator.alloc_packed(num_new_pages)
                         if block_ids is None:
-                            return None
+                            return _sglang_capacity_miss(
+                                self, num_new_pages, "pages",
+                                self.kvcached_allocator)
                         free_pages = torch.tensor(
                             block_ids, dtype=torch.int64, device=self.device
                         )
@@ -689,6 +892,14 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         self.page_size,
                     )
                     return out_indices
+
+                def check_decode_capacity(self, *, num_tokens: int,
+                                          tree_cache: Any,
+                                          requests: Any = None,
+                                          spec_algorithm: Any = None) -> bool:
+                    need_blocks = -(-num_tokens // self.page_size)
+                    return _sglang_reserve_decode_capacity(
+                        self, tree_cache, num_tokens, need_blocks=need_blocks)
 
                 def free(self, free_index):
                     if free_index.numel() == 0:
@@ -798,7 +1009,53 @@ class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
     def apply(self, swa_alloc_mod: types.ModuleType) -> bool:
         if not self.initialize_version_info():
             return False
-        return self.alias_swa_sub_allocators(swa_alloc_mod)
+        success = self.alias_swa_sub_allocators(swa_alloc_mod)
+        if success and self.patch_swa_composite_misses in self.applicable_methods:
+            success &= self.patch_swa_composite_misses(swa_alloc_mod)
+        return success
+
+    @version_range(">=0.5.13")
+    def patch_swa_composite_misses(self, swa_alloc_mod: types.ModuleType) -> bool:
+        """Type the composite's own misses inside the batch allocation window.
+
+        ``SWATokenToKVPoolAllocator.alloc`` and ``alloc_extend`` compare the
+        request against each sub-allocator's ``available_size()`` and return
+        None when either is short, before any sub-allocator runs, and
+        ``alloc_decode`` returns None when a sub-allocator does. With elastic
+        sub-allocators those counts track device-wide free memory, so such a
+        None is the same capacity miss the sub-allocators raise for, and the
+        native caller would otherwise turn it into a fatal error.
+        """
+        composite = getattr(swa_alloc_mod, "SWATokenToKVPoolAllocator", None)
+        if composite is None:
+            return True
+        marker = "__kvcached_swa_composite_misses__"
+        if self._is_already_patched(composite, marker):
+            return True
+
+        def _has_elastic_sub_allocator(allocator: Any) -> bool:
+            return any(
+                hasattr(getattr(allocator, name, None), "kvcached_allocator")
+                for name in ("full_attn_allocator", "swa_attn_allocator"))
+
+        def _wrap(name: str) -> None:
+            original = getattr(composite, name, None)
+            if original is None:
+                return
+
+            @functools.wraps(original)
+            def _patched(self, *args: Any, **kwargs: Any) -> Any:
+                result = original(self, *args, **kwargs)
+                if result is None and _has_elastic_sub_allocator(self):
+                    return _sglang_capacity_miss(self, "the request", name, self)
+                return result
+
+            setattr(composite, name, _patched)
+
+        for name in ("alloc", "alloc_extend", "alloc_decode"):
+            _wrap(name)
+        self._mark_as_patched(composite, marker)
+        return True
 
     @version_range(">=0.5.13")
     def alias_swa_sub_allocators(self, swa_alloc_mod: types.ModuleType) -> bool:
@@ -1749,7 +2006,9 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 ):
                     block_ids = self.kvcached_allocator.alloc(need_size)
                     if block_ids is None:
-                        return None
+                        return _sglang_capacity_miss(
+                            self, need_size, "mamba slots",
+                            self.kvcached_allocator)
                     select_index = torch.tensor(
                         block_ids, dtype=torch.int64, device=self.device,
                     )
@@ -2011,7 +2270,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             def _do_alloc(self, need_size: int):
                 slots = self.mamba_pool.alloc(need_size)
                 if slots is None:
-                    return None
+                    return _sglang_capacity_miss(
+                        self, need_size, "mamba slots", self.mamba_pool)
                 self._free_ids.difference_update(slots.tolist())
                 return slots
 
@@ -2164,6 +2424,156 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias HybridLinearKVPool to elastic one: {e}")
             return False
+
+
+class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
+    """Turn a prefill allocation miss into a typed, rolled-back signal.
+
+    ``ScheduleBatch.prepare_for_extend`` allocates through the module-level
+    ``alloc_for_extend``: request rows and Mamba slots first, then token
+    slots. Every miss inside it is fatal by native design, because native
+    pools are static and the admission budget cannot be wrong. Under kvcached
+    the budget is a snapshot of device-wide physical memory that a second
+    pool in the same process or another process can consume first (#547,
+    #467). This wrapper runs the call inside the batch allocation window,
+    releases what the call handed out when a kvcached pool misses, and raises
+    ``SGLangPrefillCapacityMiss`` for the scheduler wrapper. Any other
+    exception propagates untouched.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.schedule_batch"
+    patch_name = "schedule_batch_capacity_miss"
+
+    def apply(self, batch_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if self.patch_alloc_for_extend not in self.applicable_methods:
+            return True
+        return self.patch_alloc_for_extend(batch_mod)
+
+    @version_range(">=0.5.20")
+    def patch_alloc_for_extend(self, batch_mod: types.ModuleType) -> bool:
+        original = getattr(batch_mod, "alloc_for_extend", None)
+        if original is None:
+            self.logger.warning(
+                "schedule_batch.alloc_for_extend was not found; a prefill "
+                "allocation miss will exit the scheduler")
+            return False
+        marker = "__kvcached_alloc_for_extend_patched__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        @functools.wraps(original)
+        def _patched_alloc_for_extend(batch: Any) -> Any:
+            if not enable_kvcached():
+                return original(batch)
+            held = [
+                (req, req.kv.holds_kv, req.kv.holds_mamba,
+                 req.kv.mamba_ping_pong_track_buffer is not None)
+                for req in batch.reqs
+            ]
+            try:
+                with _sglang_batch_allocation_zone():
+                    return original(batch)
+            except KVCachePoolExhausted as miss:
+                _release_prefill_allocations(batch.req_to_token_pool, held)
+                raise SGLangPrefillCapacityMiss(batch, miss) from miss
+
+        self._mark_as_patched(_patched_alloc_for_extend, marker)
+        setattr(batch_mod, "alloc_for_extend", _patched_alloc_for_extend)
+        return True
+
+
+class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
+    """Retry a prefill batch that the kvcached pools could not back.
+
+    vLLM has a scheduling-miss channel that #453 reuses. SGLang's channel is
+    retraction: requests leave the batch with their allocations released and
+    re-enter the waiting queue. ``Scheduler._get_new_batch_prefill_raw`` has
+    no such path for a batch whose allocation fails, so this wrapper adds one
+    for ``SGLangPrefillCapacityMiss``. The admission state of the batch is
+    released the way the scheduler releases a candidate it did not admit, the
+    requests return to the head of the waiting queue in order, and the next
+    prefill round admits at most one request fewer than the batch that
+    missed, so the retry shrinks instead of repeating the same batch. A round
+    that does not miss lifts the cap. Any other exception keeps exiting the
+    scheduler.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_capacity_miss"
+    log_interval_s = 10.0
+
+    def apply(self, sched_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if self.patch_prefill_batch_builder not in self.applicable_methods:
+            return True
+        return self.patch_prefill_batch_builder(sched_mod)
+
+    @version_range(">=0.5.20")
+    def patch_prefill_batch_builder(self, sched_mod: types.ModuleType) -> bool:
+        Scheduler = self._get_target_class(sched_mod)
+        if Scheduler is None:
+            return False
+        original = getattr(Scheduler, "_get_new_batch_prefill_raw", None)
+        if original is None:
+            self.logger.warning(
+                "Scheduler._get_new_batch_prefill_raw was not found; a "
+                "prefill allocation miss will exit the scheduler")
+            return False
+        marker = "__kvcached_prefill_capacity_miss_patched__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        logger = self.logger
+        log_interval = self.log_interval_s
+
+        def _log_miss(scheduler: Any, miss: Exception, batch_size: int,
+                      cap: int) -> None:
+            count = getattr(scheduler, "_kvcached_prefill_miss_count", 0) + 1
+            scheduler._kvcached_prefill_miss_count = count
+            now = time.monotonic()
+            last = getattr(scheduler, "_kvcached_prefill_miss_log_at", None)
+            if last is not None and now - last < log_interval:
+                return
+            scheduler._kvcached_prefill_miss_log_at = now
+            logger.warning(
+                "kvcached could not back a prefill batch of %d requests; "
+                "returned them to the waiting queue and capped the next "
+                "batch at %d requests (%d misses so far): %s",
+                batch_size, cap, count, miss)
+
+        @functools.wraps(original)
+        def _patched_get_new_batch_prefill_raw(self, *args: Any,
+                                               **kwargs: Any) -> Any:
+            if not enable_kvcached():
+                return original(self, *args, **kwargs)
+            running_batch = kwargs.get("running_batch")
+            if running_batch is None and args:
+                running_batch = args[-1]
+            chunked_before = self.chunked_req
+            cap = getattr(self, "_kvcached_prefill_request_cap", None)
+            with _sglang_prefill_request_cap(cap):
+                try:
+                    result = original(self, *args, **kwargs)
+                except SGLangPrefillCapacityMiss as miss:
+                    batch = miss.batch
+                    _unwind_prefill_admission(
+                        self, batch, chunked_before, running_batch)
+                    next_cap = max(1, len(batch.reqs) - 1)
+                    self._kvcached_prefill_request_cap = next_cap
+                    _log_miss(self, miss, len(batch.reqs), next_cap)
+                    return None, running_batch
+            self._kvcached_prefill_request_cap = None
+            return result
+
+        self._mark_as_patched(_patched_get_new_batch_prefill_raw, marker)
+        Scheduler._get_new_batch_prefill_raw = _patched_get_new_batch_prefill_raw
+        return True
 
 
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):

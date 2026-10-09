@@ -21,6 +21,8 @@ from kvcached.integration.sglang.patches import (
     ElasticSWAAllocatorPatch,
     MambaRadixCacheLimitPatch,
     RadixCacheLimitPatch,
+    ScheduleBatchCapacityMissPatch,
+    SchedulerCapacityMissPatch,
     SchedulerMemoryLeakPatch,
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
@@ -63,6 +65,11 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
             (SGLangVirtualKVCapacityPatch(), ">=0.5.16"),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
+            # A kvcached pool can miss after admission. These turn the
+            # miss into a retried prefill instead of a scheduler exit
+            # (#547); they read the 0.5.20 batch and request shapes.
+            (ScheduleBatchCapacityMissPatch(), ">=0.5.20"),
+            (SchedulerCapacityMissPatch(), ">=0.5.20"),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
