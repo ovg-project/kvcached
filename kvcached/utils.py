@@ -357,7 +357,10 @@ class IPCSegmentCleanup:
     """
 
     def __init__(self, segment: str) -> None:
+        from kvcached_reaper import enabled
+
         self.segment = segment
+        self._reaper_managed = enabled()
         self._lock = threading.Lock()
         self._file: Optional[BinaryIO]
         try:
@@ -372,6 +375,12 @@ class IPCSegmentCleanup:
 
     def _unlink(self) -> bool:
         if self._file is None:
+            return True
+        if self._reaper_managed:
+            # The public owner holds the lease. Parent exit hooks must not
+            # bypass it by unlinking while another process still uses it.
+            self._file.close()
+            self._file = None
             return True
         try:
             current = os.stat(self.segment)

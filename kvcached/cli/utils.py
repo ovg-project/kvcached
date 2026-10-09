@@ -12,6 +12,7 @@ import numpy as np
 import posix_ipc
 
 from kvcached.utils import SHM_DIR, get_tp_socket_dir
+from kvcached_reaper import Lease, enabled, remove
 
 
 def get_ipc_path(ipc_name: str) -> str:
@@ -72,29 +73,44 @@ class RwLockedShm:
         FileNotFoundError so the caller can decide what to do (usually treat
         as "no limit set yet").
         """
+        self._lease = (Lease(self.file_path, create=self.lock_type == self.WLOCK,
+                             register_owner=False) if enabled() else None)
         try:
-            self.file = open(self.file_path, self.mode)
-        except FileNotFoundError:
-            if self.lock_type != RwLockedShm.WLOCK:
-                raise
-            # Create the file and pre-size it
-            self.file = open(self.file_path, "w+b")
-            self.file.truncate(self.size)
+            try:
+                self.file = open(self.file_path, self.mode)
+            except FileNotFoundError:
+                if self.lock_type != RwLockedShm.WLOCK:
+                    raise
+                # Create the file and pre-size it
+                self.file = open(self.file_path, "w+b")
+                self.file.truncate(self.size)
 
-        # Ensure the file is large enough for the mapping size
-        stat_info = os.fstat(self.file.fileno())
-        if stat_info.st_size < self.size and self.lock_type == RwLockedShm.WLOCK:
-            self.file.truncate(self.size)
+            # Ensure the file is large enough for the mapping size
+            stat_info = os.fstat(self.file.fileno())
+            if stat_info.st_size < self.size and self.lock_type == RwLockedShm.WLOCK:
+                self.file.truncate(self.size)
 
-        fcntl.flock(self.file, self.lock_type)
-        access = mmap.ACCESS_READ if self.lock_type == fcntl.LOCK_SH else mmap.ACCESS_WRITE
-        self.mm = mmap.mmap(self.file.fileno(), self.size, access=access)
-        return self.mm
+            fcntl.flock(self.file, self.lock_type)
+            access = mmap.ACCESS_READ if self.lock_type == fcntl.LOCK_SH else mmap.ACCESS_WRITE
+            self.mm = mmap.mmap(self.file.fileno(), self.size, access=access)
+            return self.mm
+        except BaseException:
+            if hasattr(self, "file"):
+                self.file.close()
+            if self._lease is not None:
+                self._lease.close()
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.mm.close()
-        fcntl.flock(self.file, fcntl.LOCK_UN)
-        self.file.close()
+        try:
+            self.mm.close()
+        finally:
+            try:
+                fcntl.flock(self.file, fcntl.LOCK_UN)
+            finally:
+                self.file.close()
+                if self._lease is not None:
+                    self._lease.close()
 
 
 def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
@@ -102,11 +118,12 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     Set the kv cache limit for the current process.
     Creates a persistent shared memory file that remains even after the script exits.
     """
-    shm = posix_ipc.SharedMemory(get_ipc_name(ipc_name),
-                                 posix_ipc.O_CREAT,
-                                 size=MemInfoStruct.SHM_SIZE,
-                                 mode=0o666)
-    shm.close_fd()
+    if not enabled():
+        shm = posix_ipc.SharedMemory(get_ipc_name(ipc_name),
+                                     posix_ipc.O_CREAT,
+                                     size=MemInfoStruct.SHM_SIZE,
+                                     mode=0o666)
+        shm.close_fd()
 
     # Now we can safely memory map and write the values
     with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
@@ -166,6 +183,8 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
     found. Any other exception is propagated so callers can handle unexpected
     errors.
     """
+    if enabled():
+        return remove(get_ipc_path(get_ipc_name(ipc_name)))
     shm_name = get_ipc_name(ipc_name)
 
     removed = False

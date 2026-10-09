@@ -223,6 +223,34 @@ cd benchmarks/simple_bench
 
 The benchmark scripts automatically set `ENABLE_KVCACHED=true`. Please refer to each script for instructions on how to run inference with kvcached.
 
+### Optional control-file cleanup
+
+On Linux, an independent reaper can clean kvcached's `/dev/shm` control files
+after the last user exits, including `SIGKILL` or `os._exit`. Start it outside
+the model's process tree or termination group:
+
+```bash
+kvcached-reaper
+```
+
+Set `KVCACHED_IPC_CLEANUP=reaper` for the models and `kvctl`/`kvtop` processes
+sharing those files. The reaper and users must have the same UID and see the
+same `/dev/shm`. `KVCACHED_REAPER_DIR` optionally selects a shared, private,
+absolute directory instead of `/dev/shm/.kvcached-lifecycle-<uid>`; supply the
+same directory to the reaper with `--directory`.
+
+Users hold an OS usage lease; the reaper deletes only a registered, unused
+file whose original identity still matches. Its locks do not replace the
+existing data-read/write locks or enter the token allocation path. An
+unavailable reaper leaves the lease active and logs a warning. Restarting the
+reaper does not scan or adopt old files, and native users do not automatically
+re-register. Leftovers after a reaper restart require manual cleanup.
+
+The mode is opt-in and leaves the default cleanup behavior unchanged. Do not
+mix old code or cleanup modes under one IPC name. Control files must be
+directly in `/dev/shm`; Unix worker sockets and GPU memory are not cleaned by
+the reaper. `kvctl delete` in this mode refuses to delete a live leased file.
+
 > [!NOTE]
 > We haven’t fully tested kvcached with every version of SGLang and vLLM (there are too many!). If you run into issues with a specific version, please open an issue---we'll look into it and fix it within a few hours.
 

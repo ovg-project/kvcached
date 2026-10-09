@@ -16,6 +16,7 @@ from kvcached.cli.utils import (
     init_kv_cache_limit,
 )
 from kvcached.utils import DEFAULT_IPC_NAME
+from kvcached_reaper import Lease, enabled
 
 # Process-wide registry.  Per-tracker signal handlers would clobber each other
 # (signal.signal replaces, not chains), leaving segments from all but the last
@@ -26,6 +27,10 @@ _cleanup_installed: bool = False
 
 def _cleanup_all(*args):
     for tracker in list(_active_trackers):
+        # On a terminating signal, let the kernel release managed leases.
+        # Other threads can still be using the file before the signal lands.
+        if args and isinstance(args[0], int) and tracker._lease is not None:
+            continue
         tracker._unlink_segment()
     _active_trackers.clear()
     if args and isinstance(args[0], int):
@@ -60,7 +65,13 @@ class MemInfoTracker:
         """
         base = DEFAULT_IPC_NAME if group_id == 0 else f"{DEFAULT_IPC_NAME}_g{group_id}"
         self.ipc_name = get_ipc_name(base)
-        init_kv_cache_limit(self.ipc_name, total_mem_size)
+        self._lease = Lease(get_ipc_path(self.ipc_name)) if enabled() else None
+        try:
+            init_kv_cache_limit(self.ipc_name, total_mem_size)
+        except BaseException:
+            if self._lease is not None:
+                self._lease.close()
+            raise
         _active_trackers.append(self)
         _install_cleanup_handlers()
 
@@ -92,6 +103,9 @@ class MemInfoTracker:
 
     def _unlink_segment(self):
         """Remove the POSIX shared-memory segment and its backing file."""
+        if self._lease is not None:
+            self._lease.close()
+            return
         try:
             posix_ipc.unlink_shared_memory(self.ipc_name)
         except Exception:
