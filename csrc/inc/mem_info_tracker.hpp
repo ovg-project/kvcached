@@ -18,7 +18,6 @@
 #include <unistd.h>
 
 #include "gpu_utils.hpp"
-#include "ipc_cleanup.hpp"
 
 namespace kvcached {
 
@@ -220,10 +219,6 @@ public:
   // share an explicit IPC name; only the last stopped pool removes that inode.
   bool release_segment() {
     std::lock_guard<std::mutex> guard(segment_registry_mutex());
-    if (lease_) {
-      lease_->close();
-      return true;
-    }
     if (!released_) {
       if (cleanup_) {
         --cleanup_->users;
@@ -334,19 +329,6 @@ private:
 
   // Initialize kv cache limit in shared memory
   void init_kv_cache_limit(int64_t kv_cache_limit) {
-    if (ipc_cleanup::enabled()) {
-      lease_ = std::make_unique<ipc_cleanup::Lease>(ipc_name_);
-      if (!lease_->registered())
-        LOGGER(WARNING,
-               "Automatic IPC cleanup unavailable for %s; "
-               "keeping its usage lease",
-               ipc_name_.c_str());
-      RwLockedShm shm(ipc_name_, MemInfoStruct::SHM_SIZE, RwLockedShm::WLOCK);
-      if (!shm.open())
-        throw std::runtime_error("Cannot initialize leased control file");
-      shm.write_mem_info(MemInfoStruct(kv_cache_limit, 0, 0));
-      return;
-    }
     // Serialize local creation with last-owner release. No allocation or
     // memory-usage update takes this lifecycle-only lock.
     std::lock_guard<std::mutex> guard(segment_registry_mutex());
@@ -384,7 +366,6 @@ private:
 
   std::string ipc_name_;
   int64_t total_mem_size_;
-  std::unique_ptr<ipc_cleanup::Lease> lease_;
   std::shared_ptr<SegmentCleanup> cleanup_;
   std::string cleanup_path_;
   bool identity_capture_failed_ = false;

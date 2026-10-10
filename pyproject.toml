@@ -46,7 +46,6 @@ dependencies = [
 [project.scripts]
 kvctl = "kvcached.cli.kvctl:main"
 kvtop = "kvcached.cli.kvtop:main"
-kvcached-reaper = "kvcached_reaper:main"
 
 [project.urls]
 Homepage = "https://github.com/ovg-project/kvcached"
@@ -67,7 +66,6 @@ asyncio_mode = "auto"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["kvcached_reaper"]
 
 [tool.setuptools.packages.find]
 where = ["."]

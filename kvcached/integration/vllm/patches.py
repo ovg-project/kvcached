@@ -1473,6 +1473,14 @@ def _capture_engine_segment(owner: Any, processes: tuple[Any, ...],
                            "keeping the segment for manual cleanup")
             return
         owner._kvcached_ipc_cleanup = cleanup
+        # Default TERM skips Python teardown in embedded/headless owners too.
+        # Reuse the owner's real shutdown, never a frontend without ownership;
+        # existing application/uvicorn handlers remain authoritative.
+        from kvcached.utils import register_owner_sigterm_cleanup
+
+        shutdown = getattr(owner, "shutdown", None)
+        if getattr(shutdown, "__self__", None) is owner:
+            register_owner_sigterm_cleanup(shutdown)
     except Exception as e:
         if cleanup is not None:
             cleanup.close()
@@ -1719,6 +1727,15 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
         if original_monitor is not None:
             @wraps(original_monitor)
             def _patched_monitor(self, *args: Any, **kwargs: Any):
+                # Headless identity capture runs on its existing observer thread,
+                # which cannot install Python signal handlers. Register the real
+                # owner here on the caller's main thread before blocking. This
+                # only arranges child shutdown; unlink still requires the separate
+                # successful identity capture and confirmed child exits.
+                if enable_kvcached() and getattr(self, "processes", None):
+                    from kvcached.utils import register_owner_sigterm_cleanup
+
+                    register_owner_sigterm_cleanup(self.shutdown)
                 path = getattr(self, "_kvcached_headless_segment", None)
                 if path is not None and not hasattr(self, "_kvcached_ipc_cleanup"):
                     stop = threading.Event()

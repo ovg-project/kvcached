@@ -4,10 +4,12 @@
 import importlib.util
 import logging
 import os
+import signal
 import socket
 import threading
 import uuid
-from typing import BinaryIO, Optional, Tuple
+import weakref
+from typing import BinaryIO, Callable, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -357,10 +359,7 @@ class IPCSegmentCleanup:
     """
 
     def __init__(self, segment: str) -> None:
-        from kvcached_reaper import enabled
-
         self.segment = segment
-        self._reaper_managed = enabled()
         self._lock = threading.Lock()
         self._file: Optional[BinaryIO]
         try:
@@ -375,12 +374,6 @@ class IPCSegmentCleanup:
 
     def _unlink(self) -> bool:
         if self._file is None:
-            return True
-        if self._reaper_managed:
-            # The public owner holds the lease. Parent exit hooks must not
-            # bypass it by unlinking while another process still uses it.
-            self._file.close()
-            self._file = None
             return True
         try:
             current = os.stat(self.segment)
@@ -489,3 +482,126 @@ def get_kvcached_logger(name: str = "kvcached") -> logging.Logger:
         logger.propagate = False
 
     return logger
+
+
+# Default SIGTERM bypasses Python teardown. Only known process owners register;
+# existing application/event-loop handlers remain authoritative.
+_sigterm_owner_callbacks: list[tuple[int, weakref.WeakMethod]] = []
+_pending_owner_sigterm: Optional[Tuple[int, int, Tuple[Callable[[], None], ...]]] = None
+_sigterm_finalizer_pid: Optional[int] = None
+_owner_sigterm_loop_handler: Optional[Callable[..., None]] = None
+
+
+def _unwind_for_owner_sigterm(signum, frame) -> None:
+    global _pending_owner_sigterm
+    # Do not acquire a lock, log, join, or call shutdown in a signal handler:
+    # the interrupted frame may hold the very lock shutdown needs. Unwind the
+    # Python stack first, as SIGINT already does. A second TERM remains fatal.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    pid = os.getpid()
+    # Keep owners alive only during TERM unwinding: newer Python versions can
+    # release a function-local owner before process finalizers run.
+    callbacks = tuple(callback for owner_pid, ref in _sigterm_owner_callbacks
+                      if owner_pid == pid and (callback := ref()) is not None)
+    _pending_owner_sigterm = (pid, signum, callbacks)
+    raise SystemExit(128 + signum)
+
+
+def _finish_owner_sigterm() -> None:
+    global _pending_owner_sigterm
+    pending, _pending_owner_sigterm = _pending_owner_sigterm, None
+    if pending is None or pending[0] != os.getpid():
+        return
+    try:
+        for callback in pending[2]:
+            try:
+                callback()
+            except BaseException as error:
+                get_kvcached_logger().warning("Owner shutdown during SIGTERM failed: %s", error)
+    finally:
+        # Preserve WIFSIGNALED/SIGTERM, not a successful exit or exit code 143.
+        # This runs after stack unwinding, never recursively inside shutdown.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), pending[1])
+
+
+def register_owner_sigterm_cleanup(callback) -> bool:
+    """Arrange owner teardown for an otherwise-default SIGTERM.
+
+    Only the main thread may register a bound shutdown method, after capturing
+    process ownership. Never replace a custom/ignored/event-loop handler. Weak
+    callbacks do not retain owners during normal execution; a received TERM
+    holds them through stack unwinding. PID checks exclude inherited owners.
+    Applications that suppress SystemExit or bypass Python exit with os._exit
+    still own their shutdown policy. No thread, daemon, or polling is added.
+    """
+    global _sigterm_finalizer_pid
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    previous = signal.getsignal(signal.SIGTERM)
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    pid = os.getpid()
+    ref = weakref.WeakMethod(callback)
+    _sigterm_owner_callbacks[:] = [(owner_pid, item)
+                                  for owner_pid, item in _sigterm_owner_callbacks
+                                  if owner_pid == pid and item() is not None]
+    if (pid, ref) not in _sigterm_owner_callbacks:
+        _sigterm_owner_callbacks.append((pid, ref))
+    if _sigterm_finalizer_pid != pid:
+        # multiprocessing's fork bootstrap uses os._exit after its own
+        # finalizers, bypassing atexit. Cover that normal bootstrap too, before
+        # its automatic child joins. The pending marker makes dispatch one-shot.
+        from multiprocessing.util import Finalize
+
+        Finalize(None, _finish_owner_sigterm, exitpriority=1)
+        # CPython joins non-daemon threads before ordinary atexit callbacks.
+        # A serving thread may need owner.shutdown() to release it, so use the
+        # pre-join exit hook available on our supported Python >= 3.10 instead.
+        # Like Finalize, this runs after the main stack has unwound, not from
+        # the signal handler. Cover this private runtime contract in tests.
+        # SGLang 0.5.11/0.5.12 disable _register_atexit at import time,
+        # but CPython still drains this list before joining threads.
+        getattr(threading, "_threading_atexits").append(_finish_owner_sigterm)
+        _sigterm_finalizer_pid = pid
+    if previous is not _owner_sigterm_loop_handler:
+        signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+    return True
+
+
+def register_owner_sigterm_loop(loop, previous) -> bool:
+    """Preserve owner exit when SGLang's registered loop stops between requests.
+
+    Call only immediately after the framework installs its own loop handler.
+    A running loop keeps its original signal delivery and wakeup fd. A stopped
+    synchronous Engine loop cannot consume that delivery: unwind instead. Do
+    not adopt an application's custom/ignored prior disposition or a process
+    without registered ownership. No shutdown work runs in this handler.
+    """
+    global _owner_sigterm_loop_handler
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    if not any(pid == os.getpid() and ref() is not None
+               for pid, ref in _sigterm_owner_callbacks):
+        return False
+    original = signal.getsignal(signal.SIGTERM)
+    if not callable(original):
+        return False
+    loop_ref = weakref.ref(loop)
+
+    def handle(signum, frame):
+        active_loop = loop_ref()
+        if active_loop is not None and active_loop.is_running():
+            original(signum, frame)
+        else:
+            _unwind_for_owner_sigterm(signum, frame)
+
+    _owner_sigterm_loop_handler = handle
+    signal.signal(signal.SIGTERM, handle)
+    return True

@@ -7,9 +7,7 @@ import gc
 import os
 import shutil
 import subprocess
-import sys
 import threading
-import time
 import uuid
 from pathlib import Path
 
@@ -21,56 +19,6 @@ if not torch.cuda.is_available():
 
 from kvcached.utils import IPCSegmentCleanup  # noqa: E402
 from kvcached.vmm_ops import PageAllocator  # noqa: E402
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def test_reaper_tracks_actual_native_pools(tmp_path, monkeypatch, explicit):
-    root = tmp_path / "reaper"
-    root.mkdir(mode=0o700)
-    path = Path("/dev/shm") / f"kvcached-reaper-native-{uuid.uuid4().hex}"
-    monkeypatch.setenv("KVCACHED_IPC_CLEANUP", "reaper")
-    monkeypatch.setenv("KVCACHED_REAPER_DIR", str(root))
-    daemon = subprocess.Popen([
-        sys.executable, "-S", "-u", str(Path(__file__).resolve().parents[1] /
-                                        "kvcached_reaper.py"),
-        "--directory", str(root), "--interval", "0.01",
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert daemon.stdout is not None and daemon.stderr is not None
-    first = second = None
-    try:
-        import select
-
-        assert select.select([daemon.stdout], [], [], 5)[0]
-        assert b"reaper ready" in daemon.stdout.readline()
-        first = _allocator(str(path), 0)
-        second = _allocator(str(path), 1)
-        # Existing parent helpers must not bypass another native pool's lease.
-        cleanup = IPCSegmentCleanup(str(path))
-        assert cleanup.unlink()
-        assert path.exists()
-        if explicit:
-            first.stop_prealloc_thread()
-            assert first.release_shared_segment()
-        first = None
-        gc.collect()
-        assert path.exists()
-        if explicit:
-            second.stop_prealloc_thread()
-            assert second.release_shared_segment()
-        second = None
-        gc.collect()
-        deadline = time.monotonic() + 5
-        while path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert not path.exists()
-    finally:
-        first = second = None
-        gc.collect()
-        daemon.terminate()
-        daemon.wait(timeout=5)
-        daemon.stdout.close()
-        daemon.stderr.close()
-        path.unlink(missing_ok=True)
 
 
 def test_native_identity_syscall_failures_and_retries(tmp_path):

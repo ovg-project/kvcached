@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-import fcntl
 import multiprocessing
 import os
 import time
-import uuid
 from multiprocessing.synchronize import Barrier
 
 import pytest
@@ -208,99 +206,3 @@ def test_check_and_get_resize_target_returns_none_if_same():
     resize_target = tracker.check_and_get_resize_target(
         current_mem_size, num_layers)
     assert resize_target is None
-
-
-def test_reaper_python_tracker_and_tool_share_lifetime(tmp_path, monkeypatch):
-    import kvcached.mem_info_tracker as tracker_module
-    import kvcached_reaper as ipc
-
-    name = f"kvcached-reaper-python-{uuid.uuid4().hex}"
-    root = tmp_path / "reaper"
-    monkeypatch.setenv("KVCACHED_IPC_CLEANUP", "reaper")
-    monkeypatch.setenv("KVCACHED_REAPER_DIR", str(root))
-    monkeypatch.setattr(tracker_module, "DEFAULT_IPC_NAME", name)
-    tracker = MemInfoTracker(TOTAL_MEM)
-    state = ipc.Reaper(str(root))
-    assert tracker._lease is not None and tracker._lease.fd is not None
-    state.add(get_ipc_path(name), tracker._lease.fd)
-    try:
-        tracker.update_memory_usage(600, 900)
-        with RwLockedShm(name, SHM_SIZE, RwLockedShm.RLOCK) as mm:
-            tracker._unlink_segment()
-            state.tick()
-            assert os.path.exists(get_ipc_path(name))
-            assert MemInfoStruct.from_buffer(mm) == MemInfoStruct(TOTAL_MEM, 600, 900)
-            with pytest.raises(BlockingIOError):
-                ipc.remove(get_ipc_path(name))
-        state.tick()
-        assert not os.path.exists(get_ipc_path(name))
-    finally:
-        tracker._unlink_segment()
-        tracker_module._active_trackers.remove(tracker)
-        state.close()
-        if os.path.exists(get_ipc_path(name)):
-            os.unlink(get_ipc_path(name))
-
-
-def test_reaper_tool_mapping_failure_releases_lease(tmp_path, monkeypatch):
-    import kvcached.cli.utils as cli
-    import kvcached_reaper as ipc
-
-    name = f"kvcached-reaper-map-{uuid.uuid4().hex}"
-    root = tmp_path / "reaper"
-    monkeypatch.setenv("KVCACHED_IPC_CLEANUP", "reaper")
-    monkeypatch.setenv("KVCACHED_REAPER_DIR", str(root))
-    owner = ipc.Lease(get_ipc_path(name), register_owner=False)
-    state = ipc.Reaper(str(root))
-    assert owner.fd is not None
-    state.add(owner.path, owner.fd)
-
-    def fail(*args, **kwargs):
-        raise OSError("injected mapping failure")
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(cli.mmap, "mmap", fail)
-            with pytest.raises(OSError, match="injected mapping failure"):
-                with RwLockedShm(name, SHM_SIZE, RwLockedShm.RLOCK):
-                    pass
-        owner.close()
-        state.tick()
-        assert not os.path.exists(owner.path)
-    finally:
-        owner.close()
-        state.close()
-        if os.path.exists(owner.path):
-            os.unlink(owner.path)
-
-
-def test_reaper_signal_handler_keeps_lease_until_process_death(tmp_path, monkeypatch):
-    import kvcached.mem_info_tracker as tracker_module
-    import kvcached_reaper as ipc
-
-    name = f"kvcached-reaper-signal-{uuid.uuid4().hex}"
-    monkeypatch.setenv("KVCACHED_IPC_CLEANUP", "reaper")
-    monkeypatch.setenv("KVCACHED_REAPER_DIR", str(tmp_path / "reaper"))
-    monkeypatch.setattr(tracker_module, "DEFAULT_IPC_NAME", name)
-    tracker = MemInfoTracker(TOTAL_MEM)
-    probe = os.open(get_ipc_path(name), os.O_RDWR)
-    delivered = []
-
-    def deliver(pid, signum):
-        assert pid == os.getpid() and signum == tracker_module.signal.SIGTERM
-        with pytest.raises(BlockingIOError):
-            ipc.usage_lock(probe, fcntl.F_WRLCK)
-        delivered.append(signum)
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(tracker_module, "_active_trackers", [tracker])
-            patch.setattr(tracker_module.signal, "signal", lambda *args: None)
-            patch.setattr(tracker_module.os, "kill", deliver)
-            tracker_module._cleanup_all(tracker_module.signal.SIGTERM, None)
-        assert delivered == [tracker_module.signal.SIGTERM]
-    finally:
-        tracker._unlink_segment()
-        tracker_module._active_trackers.remove(tracker)
-        os.close(probe)
-        os.unlink(get_ipc_path(name))
