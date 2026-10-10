@@ -264,6 +264,35 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="34" />
 </p>
 
+### Control-file cleanup on shutdown
+
+KVCached cleans its control shared-memory files on normal teardown. For SGLang,
+the parent that launched the schedulers retains the exact control-file identities
+reported at readiness (including local TP/PP/DP workers and extra KV pools). Python
+Engine shutdown, `python -m sglang.launch_server`, and `sglang serve` share an
+owner-side fallback: it unlinks only after every recorded local child is confirmed
+exited. The vLLM EngineCore/client/supervisor fallback remains in place. Failed exit
+or identity checks preserve the files; an inode match alone is not proof of exit.
+
+For a ready owner with the default SIGTERM disposition, KVCached first unwinds
+Python frames, then runs the owner's existing shutdown at process finalization and
+re-raises SIGTERM. The signal handler itself never runs teardown. Custom/ignored
+signal handlers and SIGINT handling remain unchanged. A second SIGTERM
+retains its immediate-termination behavior. SGLang keeps its native signal delivery
+while its tokenizer loop runs; between synchronous Engine requests, a stopped loop
+uses the same owner-exit fallback. Applications that suppress SystemExit or call
+`os._exit` must arrange shutdown.
+
+No cleanup daemon, usage-lease protocol, or scan of arbitrary files is required.
+If both the owner and workers are SIGKILLed, no code can run to unlink their files.
+Startup failures before resource metadata reaches the owner, and resources created
+after readiness, also require explicit cleanup. After stopping the deployment and
+confirming all of its users have exited, use `kvctl delete <instance_name>` for that
+instance. Do not delete a live deployment's files. Independent deployments must use
+unique IPC names; same-name replacement protection is not a shared-ownership protocol.
+Shared/persistent `/dev/shm` mounts can retain files across container replacement.
+Cleanup does not revoke GPU mappings or terminate workers.
+
 ## Citation
 
 If you find kvcached useful, please cite our paper:

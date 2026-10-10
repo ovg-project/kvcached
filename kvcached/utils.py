@@ -4,10 +4,12 @@
 import importlib.util
 import logging
 import os
+import signal
 import socket
 import threading
 import uuid
-from typing import BinaryIO, Optional, Tuple
+import weakref
+from typing import BinaryIO, Callable, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -480,3 +482,196 @@ def get_kvcached_logger(name: str = "kvcached") -> logging.Logger:
         logger.propagate = False
 
     return logger
+
+
+# Default SIGTERM bypasses Python teardown. Only known process owners register;
+# existing application/event-loop handlers remain authoritative.
+_sigterm_owner_callbacks: list[tuple[int, weakref.WeakMethod]] = []
+_pending_owner_sigterm: Optional[Tuple[int, int, Tuple[Callable[[], None], ...]]] = None
+_sigterm_finalizer_pid: Optional[int] = None
+_owner_sigterm_loop_handler: Optional[Callable[..., None]] = None
+_owner_sigterm_loop_pid: Optional[int] = None
+_owner_sigterm_loop_wakeup: Optional[Tuple[
+    weakref.ReferenceType[socket.socket], int, os.stat_result, BinaryIO
+]] = None
+
+
+def _reset_owner_sigterm_after_fork() -> None:
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
+    if _owner_sigterm_loop_pid in (None, os.getpid()):
+        return
+    # CPython writes before invoking Python signal handlers. Redirect only
+    # the child's still-owned asyncio socket descriptor, never the process-
+    # global wakeup setting: another child hook may have installed a custom fd
+    # with an unreadable warn_on_full_buffer policy. dup2 leaves the parent's
+    # descriptors and shared selector unchanged. Do not close/drain the loop.
+    wakeup = _owner_sigterm_loop_wakeup
+    try:
+        if wakeup is not None:
+            socket_ref, fd, identity, sink = wakeup
+            inherited_socket = socket_ref()
+            if inherited_socket is not None and inherited_socket.fileno() == fd:
+                try:
+                    inherited = os.path.samestat(identity, os.fstat(fd))
+                except OSError:
+                    inherited = False
+                if inherited:
+                    os.dup2(sink.fileno(), fd, inheritable=False)
+    finally:
+        if signal.getsignal(signal.SIGTERM) is _owner_sigterm_loop_handler:
+            signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+        _owner_sigterm_loop_handler = None
+        _owner_sigterm_loop_pid = None
+        _owner_sigterm_loop_wakeup = None
+        if wakeup is not None:
+            wakeup[3].close()
+
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_owner_sigterm_after_fork)
+
+
+def _unwind_for_owner_sigterm(signum, frame) -> None:
+    global _pending_owner_sigterm
+    # Do not acquire a lock, log, join, or call shutdown in a signal handler:
+    # the interrupted frame may hold the very lock shutdown needs. Unwind the
+    # Python stack first, as SIGINT already does. A second TERM remains fatal.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    pid = os.getpid()
+    # Keep owners alive only during TERM unwinding: newer Python versions can
+    # release a function-local owner before process finalizers run.
+    callbacks = tuple(callback for owner_pid, ref in _sigterm_owner_callbacks
+                      if owner_pid == pid and (callback := ref()) is not None)
+    _pending_owner_sigterm = (pid, signum, callbacks)
+    raise SystemExit(128 + signum)
+
+
+def _finish_owner_sigterm() -> None:
+    global _pending_owner_sigterm
+    pending, _pending_owner_sigterm = _pending_owner_sigterm, None
+    if pending is None or pending[0] != os.getpid():
+        return
+    try:
+        for callback in pending[2]:
+            try:
+                callback()
+            except BaseException as error:
+                get_kvcached_logger().warning("Owner shutdown during SIGTERM failed: %s", error)
+    finally:
+        # Preserve WIFSIGNALED/SIGTERM, not a successful exit or exit code 143.
+        # This runs after stack unwinding, never recursively inside shutdown.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), pending[1])
+
+
+def register_owner_sigterm_cleanup(callback) -> bool:
+    """Arrange owner teardown for an otherwise-default SIGTERM.
+
+    Only the main thread may register a bound shutdown method, after capturing
+    process ownership. Never replace a custom/ignored/event-loop handler. Weak
+    callbacks do not retain owners during normal execution; a received TERM
+    holds them through stack unwinding. PID checks exclude inherited owners.
+    Applications that suppress SystemExit or bypass Python exit with os._exit
+    still own their shutdown policy. No thread, daemon, or polling is added.
+    """
+    global _sigterm_finalizer_pid
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    previous = signal.getsignal(signal.SIGTERM)
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    pid = os.getpid()
+    ref = weakref.WeakMethod(callback)
+    _sigterm_owner_callbacks[:] = [(owner_pid, item)
+                                  for owner_pid, item in _sigterm_owner_callbacks
+                                  if owner_pid == pid and item() is not None]
+    if (pid, ref) not in _sigterm_owner_callbacks:
+        _sigterm_owner_callbacks.append((pid, ref))
+    if _sigterm_finalizer_pid != pid:
+        # multiprocessing's fork bootstrap uses os._exit after its own
+        # finalizers, bypassing atexit. Cover that normal bootstrap too, before
+        # its automatic child joins. The pending marker makes dispatch one-shot.
+        from multiprocessing.util import Finalize
+
+        Finalize(None, _finish_owner_sigterm, exitpriority=1)
+        # CPython joins non-daemon threads before ordinary atexit callbacks.
+        # A serving thread may need owner.shutdown() to release it, so use the
+        # pre-join exit hook available on our supported Python >= 3.10 instead.
+        # Like Finalize, this runs after the main stack has unwound, not from
+        # the signal handler. Cover this private runtime contract in tests.
+        # SGLang 0.5.11/0.5.12 disable _register_atexit at import time,
+        # but CPython still drains this list before joining threads.
+        getattr(threading, "_threading_atexits").append(_finish_owner_sigterm)
+        _sigterm_finalizer_pid = pid
+    if previous is not _owner_sigterm_loop_handler:
+        signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+    return True
+
+
+def register_owner_sigterm_loop(loop, previous) -> bool:
+    """Preserve owner exit when SGLang's registered loop stops between requests.
+
+    Call only immediately after the framework installs its own loop handler.
+    A running loop keeps its original signal delivery and wakeup fd. A stopped
+    synchronous Engine loop cannot consume that delivery: unwind instead. Do
+    not adopt an application's custom/ignored prior disposition or a process
+    without registered ownership. No shutdown work runs in this handler.
+    """
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    if not any(pid == os.getpid() and ref() is not None
+               for pid, ref in _sigterm_owner_callbacks):
+        return False
+    original = signal.getsignal(signal.SIGTERM)
+    if not callable(original):
+        return False
+    loop_ref = weakref.ref(loop)
+    pid = os.getpid()
+    # Keep a weak ownership check as well as the kernel identity: an earlier
+    # child hook may detach, close or reuse this descriptor. Unknown loop types
+    # retain the existing bridge behavior but have no socket we can isolate.
+    wakeup = getattr(loop, "_csock", None)
+    wakeup_identity = None
+    if isinstance(wakeup, socket.socket) and hasattr(os, "register_at_fork"):
+        try:
+            fd = wakeup.fileno()
+            identity = os.fstat(fd)
+            # Allocate while registering, not in the fork child where the fd
+            # table may already be full. This one source fd is closed on bridge
+            # replacement or child reset; the target stays owned by its socket.
+            sink = open(os.devnull, "wb", buffering=0)
+            try:
+                os.set_blocking(sink.fileno(), False)
+            except BaseException:
+                sink.close()
+                raise
+            wakeup_identity = (weakref.ref(wakeup), fd, identity, sink)
+        except OSError as error:
+            get_kvcached_logger().warning(
+                "Cannot isolate inherited asyncio signal socket after fork: %s", error)
+
+    def handle(signum, frame):
+        active_loop = loop_ref()
+        if os.getpid() == pid and active_loop is not None and active_loop.is_running():
+            original(signum, frame)
+        else:
+            _unwind_for_owner_sigterm(signum, frame)
+
+    _owner_sigterm_loop_handler = handle
+    _owner_sigterm_loop_pid = pid
+    old_wakeup = _owner_sigterm_loop_wakeup
+    _owner_sigterm_loop_wakeup = wakeup_identity
+    if old_wakeup is not None:
+        old_wakeup[3].close()
+    signal.signal(signal.SIGTERM, handle)
+    return True

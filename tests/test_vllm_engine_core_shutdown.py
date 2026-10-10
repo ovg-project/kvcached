@@ -1996,5 +1996,106 @@ def test_client_reuses_supervisor_socket_capture(monkeypatch, vllm_modules):
     sockets.unlink.assert_called_once_with()
 
 
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX fork and SIGTERM")
+@pytest.mark.parametrize("boundary", ["client", "manager", "headless"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_default_sigterm_stops_real_owned_child_and_preserves_generation(
+    monkeypatch, tmp_path, vllm_modules, boundary, replacement
+):
+    """Exercise real TERM and process handles through the actual owner patches.
+
+    External vLLM constructors remain doubles. Headless capture really runs on
+    its observer thread, so registration there alone cannot pass this test.
+    """
+    import multiprocessing as mp
+    import signal
+    import time
+
+    _, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(kv_utils, "SHM_DIR", str(tmp_path))
+    monkeypatch.setattr(kv_utils, "DEFAULT_IPC_NAME", "signal_segment")
+    segment = tmp_path / "signal_segment"
+    context = mp.get_context("fork")
+    reader, writer = context.Pipe(duplex=False)
+
+    def run_worker():
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        time.sleep(60)
+
+    def run_owner():
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        worker = context.Process(target=run_worker)
+        worker.start()
+
+        def shutdown(self):
+            worker.kill()
+            worker.join(5)
+
+        def ready():
+            if replacement:
+                segment.unlink()
+                segment.write_bytes(b"replacement")
+            writer.send(worker.pid)
+            writer.close()
+            while True:
+                signal.pause()
+
+        if boundary == "headless":
+            class Manager:
+                def __init__(self, local_client=False):
+                    self.processes = [worker]
+
+                def monitor_engine_liveness(self):
+                    deadline = time.monotonic() + 5
+                    while getattr(self, "_kvcached_ipc_cleanup", None) is None:
+                        assert time.monotonic() < deadline
+                        time.sleep(.01)
+                    ready()
+
+            setattr(Manager, "shutdown", shutdown)
+            mod: Any = types.SimpleNamespace(CoreEngineProcManager=Manager)
+            assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(mod)
+            owner = mod.CoreEngineProcManager(local_client=False)
+            segment.write_bytes(b"original")
+            owner.monitor_engine_liveness()
+        else:
+            segment.write_bytes(b"original")
+            if boundary == "manager":
+                mod = _fake_engine_utils_module(shutdown)
+                assert patches.CoreEngineProcManagerPatch().patch_manager_shutdown(mod)
+                owner = mod.CoreEngineProcManager(processes=[worker])
+            else:
+                resources = types.SimpleNamespace(
+                    engine_manager=types.SimpleNamespace(processes=[worker]))
+                mod = _fake_client_module(shutdown, resources=resources)
+                assert patches.MPClientPatch().patch_client_shutdown(mod)
+                owner = mod.MPClient()
+            assert owner._kvcached_ipc_cleanup is not None
+            ready()
+
+    process = context.Process(target=run_owner)
+    process.start()
+    writer.close()
+    try:
+        assert reader.poll(15), "owner never became ready"
+        worker_pid = reader.recv()
+        assert process.pid is not None
+        os.kill(process.pid, signal.SIGTERM)
+        process.join(15)
+        assert process.exitcode == -signal.SIGTERM
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+        assert segment.exists() is replacement
+        if replacement:
+            assert segment.read_bytes() == b"replacement"
+    finally:
+        reader.close()
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
