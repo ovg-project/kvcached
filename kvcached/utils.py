@@ -490,6 +490,47 @@ _sigterm_owner_callbacks: list[tuple[int, weakref.WeakMethod]] = []
 _pending_owner_sigterm: Optional[Tuple[int, int, Tuple[Callable[[], None], ...]]] = None
 _sigterm_finalizer_pid: Optional[int] = None
 _owner_sigterm_loop_handler: Optional[Callable[..., None]] = None
+_owner_sigterm_loop_pid: Optional[int] = None
+_owner_sigterm_loop_wakeup: Optional[Tuple[
+    weakref.ReferenceType[socket.socket], int, os.stat_result, BinaryIO
+]] = None
+
+
+def _reset_owner_sigterm_after_fork() -> None:
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
+    if _owner_sigterm_loop_pid in (None, os.getpid()):
+        return
+    # CPython writes before invoking Python signal handlers. Redirect only
+    # the child's still-owned asyncio socket descriptor, never the process-
+    # global wakeup setting: another child hook may have installed a custom fd
+    # with an unreadable warn_on_full_buffer policy. dup2 leaves the parent's
+    # descriptors and shared selector unchanged. Do not close/drain the loop.
+    wakeup = _owner_sigterm_loop_wakeup
+    try:
+        if wakeup is not None:
+            socket_ref, fd, identity, sink = wakeup
+            inherited_socket = socket_ref()
+            if inherited_socket is not None and inherited_socket.fileno() == fd:
+                try:
+                    inherited = os.path.samestat(identity, os.fstat(fd))
+                except OSError:
+                    inherited = False
+                if inherited:
+                    os.dup2(sink.fileno(), fd, inheritable=False)
+    finally:
+        if signal.getsignal(signal.SIGTERM) is _owner_sigterm_loop_handler:
+            signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+        _owner_sigterm_loop_handler = None
+        _owner_sigterm_loop_pid = None
+        _owner_sigterm_loop_wakeup = None
+        if wakeup is not None:
+            wakeup[3].close()
+
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_owner_sigterm_after_fork)
 
 
 def _unwind_for_owner_sigterm(signum, frame) -> None:
@@ -580,7 +621,8 @@ def register_owner_sigterm_loop(loop, previous) -> bool:
     not adopt an application's custom/ignored prior disposition or a process
     without registered ownership. No shutdown work runs in this handler.
     """
-    global _owner_sigterm_loop_handler
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
     if threading.current_thread() is not threading.main_thread():
         return False
     if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
@@ -594,14 +636,42 @@ def register_owner_sigterm_loop(loop, previous) -> bool:
     if not callable(original):
         return False
     loop_ref = weakref.ref(loop)
+    pid = os.getpid()
+    # Keep a weak ownership check as well as the kernel identity: an earlier
+    # child hook may detach, close or reuse this descriptor. Unknown loop types
+    # retain the existing bridge behavior but have no socket we can isolate.
+    wakeup = getattr(loop, "_csock", None)
+    wakeup_identity = None
+    if isinstance(wakeup, socket.socket) and hasattr(os, "register_at_fork"):
+        try:
+            fd = wakeup.fileno()
+            identity = os.fstat(fd)
+            # Allocate while registering, not in the fork child where the fd
+            # table may already be full. This one source fd is closed on bridge
+            # replacement or child reset; the target stays owned by its socket.
+            sink = open(os.devnull, "wb", buffering=0)
+            try:
+                os.set_blocking(sink.fileno(), False)
+            except BaseException:
+                sink.close()
+                raise
+            wakeup_identity = (weakref.ref(wakeup), fd, identity, sink)
+        except OSError as error:
+            get_kvcached_logger().warning(
+                "Cannot isolate inherited asyncio signal socket after fork: %s", error)
 
     def handle(signum, frame):
         active_loop = loop_ref()
-        if active_loop is not None and active_loop.is_running():
+        if os.getpid() == pid and active_loop is not None and active_loop.is_running():
             original(signum, frame)
         else:
             _unwind_for_owner_sigterm(signum, frame)
 
     _owner_sigterm_loop_handler = handle
+    _owner_sigterm_loop_pid = pid
+    old_wakeup = _owner_sigterm_loop_wakeup
+    _owner_sigterm_loop_wakeup = wakeup_identity
+    if old_wakeup is not None:
+        old_wakeup[3].close()
     signal.signal(signal.SIGTERM, handle)
     return True
