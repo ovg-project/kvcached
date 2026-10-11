@@ -253,6 +253,9 @@ def _native_case(case):
         manager._lock = threading.RLock()
         manager._post_init_done = threading.Event()
         manager._post_init_done.set()
+        from kvcached.lifecycle import LifecycleState
+        manager._lifecycle = LifecycleState("vmm-policy-test")
+        manager._lifecycle.mark_ready()
         driver.kvcached_fault_arm(2, 3, 0)
         assert manager.alloc(1) is None
         assert driver.kvcached_fault_hits() == 2

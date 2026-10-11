@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Native hash semantics in the vLLM 0.29 image.
+"""Native hash semantics in the vLLM 0.26 through 0.29 images.
 
 Run this file separately in that image: older tests install process-wide vLLM
-stubs, which cannot validate inherited 0.29 metadata methods.
+stubs, which cannot validate inherited metadata methods.
 """
 
 from __future__ import annotations
@@ -21,6 +21,13 @@ class PhysicalPool:
         self.free_ids = list(range(1, size))
         self.allocated = set()
         self.reported_free = None
+        self.block_mem_size = 16 * 32
+        self.page_size = 4 * self.block_mem_size
+        self.page_allocator = object()
+
+    def get_page_occupancy(self, pages):
+        return {page: sum(bid // 4 == page for bid in self.allocated | {0})
+                for page in pages}
 
     def alloc(self, count):
         if count > len(self.free_ids):
@@ -44,13 +51,14 @@ def native_pool_factory(monkeypatch):
     try:
         installed_version = distribution_version("vllm")
     except PackageNotFoundError:
-        pytest.skip("Native metadata checks require the vLLM 0.29 image")
-    if not installed_version.startswith("0.29."):
-        pytest.skip("Native metadata checks target vLLM 0.29")
+        pytest.skip("Native metadata checks require vLLM 0.26 through 0.30")
+    supported_versions = ("0.26.", "0.27.", "0.28.", "0.29.", "0.30.")
+    if not installed_version.startswith(supported_versions):
+        pytest.skip("Native metadata checks target vLLM 0.26 through 0.30")
     vllm = importlib.import_module("vllm")
     version = getattr(vllm, "__version__", "")
-    if not isinstance(version, str) or not version.startswith("0.29."):
-        pytest.skip("Native metadata checks require real vLLM 0.29, not test stubs")
+    if not isinstance(version, str) or not version.startswith(supported_versions):
+        pytest.skip("Native metadata checks require real vLLM, not test stubs")
     native = importlib.import_module("vllm.v1.core.block_pool")
     if not isinstance(getattr(native, "__file__", None), str):
         pytest.skip("Run this file separately: other tests installed a vLLM stub")

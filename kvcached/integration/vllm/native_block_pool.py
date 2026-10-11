@@ -20,6 +20,7 @@ class NativeBlockPoolMixin:
     _evictable_blocks: OrderedDict[int, Any]
     _cached_blocks: dict[Any, dict[int, Any]]
     _evict_blocks_from_pool: Callable[[int], int]
+    _remove_evictable: Callable[[int], Any]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -31,6 +32,8 @@ class NativeBlockPoolMixin:
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[Any]] = {}
         self.metrics_collector = None
+        # vLLM 0.30 native methods read these; kvcached never pins blocks.
+        self._reuse_watchers: dict[int, Any] = {}
 
     def get_cached_block(self, block_hash: Any, kv_cache_group_ids: list[int]) -> Any:
         if not self.enable_prefix_cache:
@@ -74,12 +77,17 @@ class NativeBlockPoolMixin:
         block = self.blocks[block_id]
         return block if self._remove_cached_block_hashes(block) else None
 
+    def unpin_blocks(self, *args: Any, **kwargs: Any) -> None:
+        # Only HiSparse (rejected at startup) unpins blocks in vLLM 0.30.
+        raise NotImplementedError("kvcached does not support unpinned KV blocks")
+
     def touch(self, blocks: Sequence[Any]) -> None:
         for block in blocks:
             if block.is_null:
                 continue
             block.ref_cnt += 1
-            self._evictable_blocks.pop(block.block_id, None)
+            if self.enable_prefix_cache:
+                self._remove_evictable(block.block_id)
 
     def free_blocks(self, ordered_blocks: Iterable[Any], prepend: bool = False) -> None:
         if self.enable_prefix_cache:

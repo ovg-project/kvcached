@@ -29,7 +29,8 @@ public:
   std::vector<torch::stable::Tensor>
   create_kv_tensors(size_t size, torch::headeronly::ScalarType dtype,
                     const std::string &dev_str, int64_t num_layers,
-                    int64_t num_kv_buffers = 2, bool unified_pool = false);
+                    int64_t num_kv_buffers = 2, bool unified_pool = false,
+                    size_t page_size = 0);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   std::pair<bool, std::vector<offset_t>>
@@ -101,8 +102,10 @@ private:
   static bool g_contiguous_layout_;
 
   torch::stable::Device dev_;
+  size_t page_size_;
 
   int64_t num_layers_;
+  int64_t num_kv_buffers_; // 2 for separate K/V, 1 for a combined buffer.
   bool contiguous_layout_;
   bool unified_pool_;
   size_t kv_tensor_size_per_layer_;

@@ -1,0 +1,78 @@
+name: GPU Perf Weekly
+
+# Serving performance of vLLM with kvcached against native vLLM on an H100
+# Daytona sandbox, plus a correctness check of a model too large for the L4
+# runs. Never runs for pull requests. Every run comments its results on the
+# issue in the GPU_CI_RESULTS_ISSUE variable and keeps the setup up to date in
+# that issue's description.
+on:
+  schedule:
+    - cron: '0 10 * * 0'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: gpu-perf-weekly
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    if: github.repository == 'ovg-project/kvcached'
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    env:
+      RESULTS_ISSUE: ${{ vars.GPU_CI_RESULTS_ISSUE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the Daytona SDK
+        run: python -m pip install daytona
+
+      - name: Run in an H100 sandbox
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: python tools/ci/daytona/perf.py --out results
+
+      - name: Upload results
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Comment on the results issue
+        if: always() && env.RESULTS_ISSUE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          # The latest finished run, as SHA:CONCLUSION.
+          prev=$(gh run list --workflow gpu-perf-weekly.yml --branch main --limit 20 \
+            --json databaseId,headSha,status,conclusion \
+            --jq ".[] | select(.status == \"completed\" and .databaseId != $GITHUB_RUN_ID)
+                  | \"\(.headSha):\(.conclusion)\"" | sed -n 1p)
+          python3 tools/ci/report.py perf --results results --run-url "$RUN_URL" \
+            --sha "$GITHUB_SHA" --subject "$(git log -1 --format=%s)" --prev "$prev" \
+            --artifact-url "$ARTIFACT_URL" --comment comment.md --section section.md
+          gh issue comment "$RESULTS_ISSUE" --body-file comment.md
+          if [ -f section.md ]; then
+            gh issue view "$RESULTS_ISSUE" --json body --jq .body > body.md
+            python3 tools/ci/report.py splice --body body.md --name perf \
+              --section section.md --out new.md
+            if ! cmp -s body.md new.md; then
+              gh issue edit "$RESULTS_ISSUE" --body-file new.md
+            fi
+          fi
