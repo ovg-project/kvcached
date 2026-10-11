@@ -122,8 +122,8 @@ def run_command(
             try:
                 process.communicate(prompt, timeout=timeout)
                 code = process.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+                timed_out = isinstance(exc, subprocess.TimeoutExpired)
                 if sys.platform == "win32":
                     try:
                         terminated = subprocess.run(
@@ -143,13 +143,21 @@ def run_command(
                             process.wait(timeout=5)
                         except (OSError, subprocess.TimeoutExpired):
                             pass
-                        raise GateError("Could not confirm timed-out process tree termination")
+                        raise GateError("Could not confirm stopped process tree termination")
                 else:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        # The group may have exited between interruption and cleanup.
+                        pass
+                    except OSError as error:
+                        raise GateError("Could not stop process tree") from error
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired as exc:
-                    raise GateError("Timed-out process did not exit after termination") from exc
+                    raise GateError("Stopped process did not exit after termination") from exc
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
                 code = 124
         except OSError as exc:
             output.write(f"Could not run command: {exc}\n")
@@ -340,7 +348,15 @@ def repair(args: argparse.Namespace, result: Dict[str, Any]) -> None:
             continue
         # Include permitted new tests as well as tracked modifications.
         changed = sorted(name for name in current if current[name] != baseline.get(name))
-        git(source, "diff", "--binary", f"--output={output / 'candidate.patch'}", head)
+        git(
+            source,
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"--output={output / 'candidate.patch'}",
+            head,
+        )
         for name in changed:
             destination = output / "candidate-files" / name
             destination.parent.mkdir(parents=True, exist_ok=True)

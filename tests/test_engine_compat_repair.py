@@ -391,3 +391,113 @@ def test_existing_output_is_not_overwritten(case):
     completed = subprocess.run(command, capture_output=True)
     assert completed.returncode != 0
     assert sentinel.read_text() == "previous evidence"
+
+
+@pytest.mark.parametrize("driver", ["external", "textconv", "environment"])
+def test_patch_export_ignores_display_diff_drivers(monkeypatch, case, driver):
+    # A successful display driver can emit non-patch output (or no output at all).
+    if driver == "external":
+        repair.git(case.source, "config", "diff.external", "echo display-only")
+    elif driver == "environment":
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", "echo display-only")
+    else:
+        (case.source / ".gitattributes").write_text("*.py diff=display\n")
+        repair.git(case.source, "add", ".gitattributes")
+        repair.git(case.source, "commit", "-qm", "configure display driver")
+        repair.git(case.source, "config", "diff.display.textconv", "echo display-only")
+    agent(monkeypatch, case, lambda _: fix(case))
+
+    assert execute(case)["status"] == "validated-candidate"
+    patch = case.output / "candidate.patch"
+    assert "fixed" in patch.read_text()
+    repair.git(case.source, "apply", "--check", "--reverse", str(patch))
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_interruption_cleans_up_and_propagates(tmp_path, monkeypatch, platform):
+    process = mock.Mock(pid=1234)
+    process.communicate.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(repair.subprocess, "Popen", mock.Mock(return_value=process))
+    tree_kill = mock.Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(repair.subprocess, "run", tree_kill)
+    group_kill = mock.Mock()
+    monkeypatch.setattr(repair.os, "killpg", group_kill, raising=False)
+    monkeypatch.setattr(repair.sys, "platform", platform)
+
+    with pytest.raises(KeyboardInterrupt):
+        repair.run_command(["agent"], tmp_path, tmp_path / "interrupt.log", 30, {})
+
+    if platform == "win32":
+        assert tree_kill.call_args.args[0] == ["taskkill", "/PID", "1234", "/T", "/F"]
+        group_kill.assert_not_called()
+    else:
+        group_kill.assert_called_once_with(1234, repair.signal.SIGKILL)
+        tree_kill.assert_not_called()
+    process.wait.assert_called_once_with(timeout=5)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+@pytest.mark.parametrize("error", [ProcessLookupError, PermissionError])
+def test_interruption_cleanup_race_or_failure(tmp_path, monkeypatch, error):
+    process = mock.Mock(pid=1234)
+    process.communicate.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(repair.subprocess, "Popen", mock.Mock(return_value=process))
+    monkeypatch.setattr(repair.os, "killpg", mock.Mock(side_effect=error))
+    expected = KeyboardInterrupt if error is ProcessLookupError else repair.GateError
+    with pytest.raises(expected):
+        repair.run_command(["agent"], tmp_path, tmp_path / "interrupt.log", 30, {})
+    if error is ProcessLookupError:
+        process.wait.assert_called_once_with(timeout=5)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGINT and process groups")
+def test_sigint_stops_real_isolated_child(tmp_path):
+    import signal
+    import time
+
+    ready = tmp_path / "ready"
+    marker = tmp_path / "late"
+    child = (
+        "import os,time; from pathlib import Path; "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+        f"time.sleep(2); Path({str(marker)!r}).touch()"
+    )
+    controller = (
+        "import importlib.util,os; from pathlib import Path; "
+        f"spec=importlib.util.spec_from_file_location('repair', {repair.__file__!r}); "
+        "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+        f"module.run_command({[sys.executable, '-c', child]!r}, "
+        f"Path({str(tmp_path)!r}), Path({str(tmp_path / 'child.log')!r}), 30, dict(os.environ))"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", controller],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "test child did not start"
+        child_pid = int(ready.read_text())
+        assert os.getpgid(child_pid) == child_pid
+        process.send_signal(signal.SIGINT)  # Only this test's controller, never our group.
+        _, stderr = process.communicate(timeout=5)
+        assert b"KeyboardInterrupt" in stderr
+        assert process.returncode != 0
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)  # run_command must reap its direct child.
+        child_pid = None
+        time.sleep(2.1)
+        assert not marker.exists()
+    finally:
+        if child_pid is not None:
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
