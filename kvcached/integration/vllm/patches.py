@@ -1444,12 +1444,18 @@ def _client_engine_processes(client: Any) -> tuple[Any, ...]:
                  if getattr(engine, "proc_handle", None) is not None)
 
 
-def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
-    """Pin a ready, live engine's segment once, never from a late shutdown."""
+def _capture_engine_segment(owner: Any, processes: tuple[Any, ...],
+                            parallel_config: Any = None) -> None:
+    """Pin a ready, live engine's segment once, never from a late shutdown.
+
+    The ready deployment's worker sockets are remembered at the same time
+    (issue #510) when the parallel config that names them is known.
+    """
     if not enable_kvcached() or hasattr(owner, "_kvcached_ipc_cleanup"):
         return
     owner._kvcached_ipc_cleanup = None
     owner._kvcached_engine_processes = processes
+    owner._kvcached_worker_sockets = None
     cleanup = None
     try:
         if not processes:
@@ -1472,10 +1478,32 @@ def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
             cleanup.close()
         logger.warning("Cannot retain the ready engine's segment identity: %s; "
                        "parent cleanup is disabled for this engine", e)
+        return
+    try:
+        owner._kvcached_worker_sockets = _capture_worker_sockets(parallel_config)
+    except Exception as e:
+        logger.warning("Cannot remember the ready engine's worker sockets: %s; "
+                       "the socket directory is left to kvctl delete", e)
 
 
-def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> None:
-    """A shutdown return (or exception) does not prove the engines stopped."""
+def _capture_worker_sockets(parallel_config: Any) -> Any:
+    """Remember the ready deployment's worker sockets, w<rank>.sock for its
+    TP ranks in each PP stage directory; None without a parallel config."""
+    if parallel_config is None:
+        return None
+    from kvcached.utils import WorkerSocketCleanup, get_tp_socket_dir
+
+    return WorkerSocketCleanup(get_tp_socket_dir(),
+                               int(parallel_config.tensor_parallel_size),
+                               int(parallel_config.pipeline_parallel_size))
+
+
+def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...],
+                                   sockets: Any = None) -> None:
+    """A shutdown return (or exception) does not prove the engines stopped.
+
+    Once it is confirmed, remove the segment and, when they were remembered,
+    the worker sockets the killed engines' workers left (issue #510)."""
     try:
         # vLLM can return immediately after SIGKILL without reaping children.
         # Bound the extra wait across the whole group, including error paths.
@@ -1494,6 +1522,12 @@ def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> 
         cleanup.unlink()
     except Exception as e:
         logger.warning("Failed to remove the KV cache limit segment: %s", e)
+    if sockets is None:
+        return
+    try:
+        sockets.unlink()
+    except Exception as e:
+        logger.warning("Failed to remove the worker socket directory: %s", e)
 
 
 def _stop_headless_segment_watch(manager: Any) -> None:
@@ -1549,6 +1583,9 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         The supervisor
         that owns those engines has no MPClient at all;
         CoreEngineProcManagerPatch covers that boundary.
+
+        The worker sockets the killed engines' workers leave behind are
+        removed from the same place (issue #510, WorkerSocketCleanup).
         """
         MPClient = self._get_target_class(client_mod)
         if MPClient is None:
@@ -1573,8 +1610,11 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
             if manager is not None and hasattr(manager, "_kvcached_ipc_cleanup"):
                 self._kvcached_ipc_cleanup = manager._kvcached_ipc_cleanup
                 self._kvcached_engine_processes = manager._kvcached_engine_processes
+                self._kvcached_worker_sockets = getattr(manager, "_kvcached_worker_sockets", None)
             else:
-                _capture_engine_segment(self, _client_engine_processes(self))
+                parallel_config = getattr(getattr(self, "vllm_config", None),
+                                          "parallel_config", None)
+                _capture_engine_segment(self, _client_engine_processes(self), parallel_config)
 
         def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
             cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
@@ -1582,7 +1622,9 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
                 return original_shutdown(self, *args, **kwargs)
             finally:
                 if cleanup is not None:
-                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+                    _unlink_stopped_engine_segment(
+                        cleanup, self._kvcached_engine_processes,
+                        getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_client_shutdown, "shutdown")
         MPClient.__init__ = _patched_client_init  # type: ignore[assignment]
@@ -1652,9 +1694,12 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
         @wraps(original_init)
         def _patched_manager_init(self, *args: Any, **kwargs: Any):
             self._kvcached_headless_segment = None
+            self._kvcached_parallel_config = None
             if enable_kvcached():
                 try:
                     arguments = init_signature.bind(self, *args, **kwargs).arguments
+                    self._kvcached_parallel_config = getattr(
+                        arguments.get("vllm_config"), "parallel_config", None)
                     if arguments.get("local_client") is False:
                         from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
 
@@ -1685,7 +1730,8 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                                 if not processes or any(p.exitcode is not None for p in processes):
                                     return
                                 if os.path.exists(path):
-                                    _capture_engine_segment(self, processes)
+                                    _capture_engine_segment(
+                                        self, processes, self._kvcached_parallel_config)
                                     return
                                 stop.wait(0.05)
                         except Exception as e:
@@ -1718,7 +1764,9 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                     if manager is None:
                         manager = getattr(arguments.get("launch"), "engine_manager", None)
                     if isinstance(manager, CoreEngineProcManager):
-                        _capture_engine_segment(manager, tuple(manager.processes))
+                        _capture_engine_segment(
+                            manager, tuple(manager.processes),
+                            getattr(manager, "_kvcached_parallel_config", None))
                 except Exception as e:
                     logger.warning("Cannot retain startup segment identity: %s", e)
                 return result
@@ -1734,7 +1782,9 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                 return original_shutdown(self, *args, **kwargs)
             finally:
                 if cleanup is not None:
-                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+                    _unlink_stopped_engine_segment(
+                        cleanup, self._kvcached_engine_processes,
+                        getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_manager_shutdown, "shutdown")
         CoreEngineProcManager.__init__ = _patched_manager_init
