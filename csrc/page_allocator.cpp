@@ -17,6 +17,7 @@
 #include "gpu_utils.hpp"
 #include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
+#include "transaction_error.hpp"
 
 namespace kvcached {
 
@@ -109,7 +110,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              bool contiguous_layout, bool enable_page_prealloc,
                              int64_t num_kv_buffers, int64_t group_id,
                              const std::string &ipc_name)
-    : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
+    : num_layers_(num_layers), last_observed_mem_size_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
@@ -166,12 +167,16 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
 
   while (page_id == -1) {
+    if (transaction_failed_.load(std::memory_order_acquire)) {
+      throw StateConsistencyError(transaction_error_);
+    }
     // Fast path: allocate from reserved pages
     if (!reserved_page_list_.empty()) {
       page_id = reserved_page_list_.front();
@@ -221,6 +226,15 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   try {
     map_pages({page_id});
+  } catch (const MapQuarantinedError &e) {
+    std::lock_guard<std::mutex> guard(lock_);
+    quarantine_pages_unlocked({page_id}, e.what());
+    throw;
+  } catch (const StateConsistencyError &e) {
+    std::lock_guard<std::mutex> guard(lock_);
+    quarantine_pages_unlocked({page_id}, e.what());
+    transaction_failed_.store(true, std::memory_order_release);
+    throw;
   } catch (const std::exception &e) {
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
@@ -247,6 +261,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 }
 
 void PageAllocator::free_page(page_id_t page_id) {
+  throw_if_failed();
   {
     std::lock_guard<std::mutex> lock(lock_);
     num_free_pages_.fetch_add(1, std::memory_order_relaxed);
@@ -272,6 +287,7 @@ void PageAllocator::free_page(page_id_t page_id) {
 }
 
 void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<page_id_t> pages_to_unmap;
@@ -321,12 +337,22 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 bool PageAllocator::resize(int64_t new_mem_size) {
+  throw_if_failed();
   int64_t new_num_pages = new_mem_size / page_size_;
 
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
+
+    // Resizing must not recycle an ID whose physical state is quarantined.
+    if (!quarantined_page_ids_.empty()) {
+      if (new_num_pages == num_total_pages_.load(std::memory_order_relaxed)) {
+        return true;
+      }
+      throw QuarantinedResizeError(
+          "cannot resize a pool with quarantined pages");
+    }
 
     if (new_num_pages < get_num_inuse_pages_unlocked()) {
       return false;
@@ -415,6 +441,7 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 }
 
 void PageAllocator::trim() {
+  throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
@@ -441,6 +468,7 @@ void PageAllocator::trim() {
 }
 
 int64_t PageAllocator::get_num_free_pages() const {
+  throw_if_failed();
   return num_free_pages_.load(std::memory_order_relaxed);
 }
 
@@ -462,6 +490,39 @@ int64_t PageAllocator::get_num_reserved_pages() const {
 PageState PageAllocator::get_page_state() const {
   std::lock_guard<std::mutex> lock(lock_);
   return get_page_state_unlocked();
+}
+
+TransactionState PageAllocator::get_transaction_state() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return {quarantined_page_ids_, transaction_error_,
+          transaction_failed_.load(std::memory_order_relaxed),
+          static_cast<int64_t>(quarantined_page_ids_.size()) * page_size_ *
+              num_layers_ * num_kv_buffers_};
+}
+
+void PageAllocator::throw_if_failed() const {
+  if (transaction_failed_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(lock_);
+    throw StateConsistencyError(transaction_error_);
+  }
+}
+
+void PageAllocator::quarantine_pages_unlocked(
+    const std::vector<page_id_t> &page_ids, const std::string &reason) {
+  quarantined_page_ids_.insert(quarantined_page_ids_.end(), page_ids.begin(),
+                               page_ids.end());
+  transaction_error_ = reason;
+  update_memory_usage_unlocked();
+  cond_.notify_all();
+  LOGGER(ERROR, "KV map quarantined %zu unpublished pages: %s", page_ids.size(),
+         reason.c_str());
+}
+
+void PageAllocator::fail_pool(const std::string &reason) {
+  std::lock_guard<std::mutex> lock(lock_);
+  transaction_error_ = reason;
+  transaction_failed_.store(true, std::memory_order_release);
+  cond_.notify_all();
 }
 
 int64_t PageAllocator::get_num_inuse_pages_unlocked() const {
@@ -592,12 +653,14 @@ void PageAllocator::prealloc_worker() {
     std::unique_lock<std::mutex> lock(lock_);
 
     // Wait until preallocation is needed or thread is stopped
-    while (!prealloc_needed_ && prealloc_running_) {
+    while (!prealloc_needed_ && prealloc_running_ &&
+           !transaction_failed_.load(std::memory_order_acquire)) {
       cond_.wait(lock);
     }
 
     LOGGER(INFO, "prealloc worker triggered...");
-    if (!prealloc_running_) {
+    if (!prealloc_running_ ||
+        transaction_failed_.load(std::memory_order_acquire)) {
       break;
     }
 
@@ -649,6 +712,19 @@ void PageAllocator::prealloc_worker() {
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
+      } catch (const MapQuarantinedError &e) {
+        lock.lock();
+        // Pending prealloc pages are still included in the free counter.
+        num_free_pages_.fetch_sub(pages_to_reserve.size(),
+                                  std::memory_order_relaxed);
+        quarantine_pages_unlocked(pages_to_reserve, e.what());
+      } catch (const StateConsistencyError &e) {
+        lock.lock();
+        num_free_pages_.fetch_sub(pages_to_reserve.size(),
+                                  std::memory_order_relaxed);
+        quarantine_pages_unlocked(pages_to_reserve, e.what());
+        transaction_failed_.store(true, std::memory_order_release);
+        break;
       } catch (const std::exception &e) {
         lock.lock();
         free_page_list_.insert(free_page_list_.begin(),
@@ -669,6 +745,8 @@ void PageAllocator::prealloc_worker() {
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+  std::lock_guard<std::mutex> transaction(transaction_lock_);
+  throw_if_failed();
   std::vector<offset_t> offsets;
   offsets.reserve(page_ids.size());
 
@@ -682,22 +760,31 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) && broadcast_map_callback_) {
-    // Multi-process mode: execute map on all TP workers via broadcast callback
-    broadcast_map_callback_(world_size_, offsets);
-  } else {
-    // Single-process mode: directly call FTensorAllocator
-    auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->map_to_kv_tensors(offsets);
-    if (!success) {
-      throw std::runtime_error("Failed to map pages to KV tensors");
+  try {
+    if ((world_size_ > 1 || should_use_worker_ipc()) &&
+        broadcast_map_callback_) {
+      // Multi-process mode: execute map on all TP workers via broadcast
+      // callback
+      broadcast_map_callback_(world_size_, offsets);
+    } else {
+      // Single-process mode: directly call FTensorAllocator
+      auto allocator = FTensorAllocator::global_allocator(group_id_);
+      bool success = allocator->map_to_kv_tensors(offsets);
+      if (!success) {
+        throw std::runtime_error("Failed to map pages to KV tensors");
+      }
     }
+  } catch (const StateConsistencyError &e) {
+    fail_pool(e.what());
+    throw;
   }
 
   LOGGER(INFO, "Mapped %zu pages to KV tensors", page_ids.size());
 }
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+  std::lock_guard<std::mutex> transaction(transaction_lock_);
+  throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
@@ -713,21 +800,30 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     }
   }
 
-  if ((world_size_ > 1 || should_use_worker_ipc()) &&
-      broadcast_unmap_callback_) {
-    // Multi-process mode: execute unmap on all TP workers via broadcast
-    // callback
-    broadcast_unmap_callback_(world_size_, offsets);
-  } else {
-    // Need to synchronize first in async scheduling mode
-    if (async_sched_) {
-      CHECK_GPU(gpu_vmm::device_synchronize());
+  try {
+    if ((world_size_ > 1 || should_use_worker_ipc()) &&
+        broadcast_unmap_callback_) {
+      // Multi-process mode: execute unmap on all TP workers via broadcast
+      // callback
+      broadcast_unmap_callback_(world_size_, offsets);
+    } else {
+      // Need to synchronize first in async scheduling mode
+      if (async_sched_) {
+        CHECK_GPU(gpu_vmm::device_synchronize());
+      }
+      auto allocator = FTensorAllocator::global_allocator(group_id_);
+      bool success = allocator->unmap_from_kv_tensors(offsets);
+      if (!success) {
+        throw std::runtime_error("Failed to unmap pages from KV tensors");
+      }
     }
-    auto allocator = FTensorAllocator::global_allocator(group_id_);
-    bool success = allocator->unmap_from_kv_tensors(offsets);
-    if (!success) {
-      throw std::runtime_error("Failed to unmap pages from KV tensors");
-    }
+
+  } catch (const std::exception &e) {
+    // Logical free/trim callers cannot safely resume after a failed release.
+    const std::string reason =
+        std::string("KV unmap could not complete: ") + e.what();
+    fail_pool(reason);
+    throw StateConsistencyError(reason);
   }
 
   auto end_time = std::chrono::steady_clock::now();
@@ -841,8 +937,14 @@ void PageAllocator::resize_watcher() {
     }
     if (mem_info_tracker_) {
       int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
-      resize_target_.store(target, std::memory_order_relaxed);
+          last_observed_mem_size_, num_layers_, num_kv_buffers_);
+      if (target >= 0) {
+        // Observe quota changes, including a return to the startup value.
+        // Retain the latest request between polls so allocations can apply
+        // it later, including when an in-use page initially prevents shrink.
+        last_observed_mem_size_ = target;
+        resize_target_.store(target, std::memory_order_relaxed);
+      }
     }
   }
   LOGGER(INFO, "Resize watcher thread stopped");

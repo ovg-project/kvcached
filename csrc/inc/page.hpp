@@ -14,6 +14,7 @@ class Page {
 public:
   virtual ~Page() = default;
   virtual bool map(void *vaddr, bool set_access = true) = 0;
+  virtual void release() {}
   // unmap() is left for the caller to implement.
 };
 
@@ -21,6 +22,7 @@ class GPUPage : public Page {
 public:
   GPUPage(page_id_t page_id, int dev_idx, size_t page_size = 0);
   ~GPUPage();
+  void release() override;
 
   bool map(void *vaddr, bool set_access = true);
 
@@ -29,6 +31,7 @@ private:
   int dev_idx_;
   size_t page_size_;
   gpu_vmm::allocation_handle_t handle_;
+  bool released_ = false;
 };
 
 class CPUPage : public Page {

@@ -48,13 +48,25 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         if isinstance(version, ast.Constant):
             patch_versions[patch_name] = version.value
 
+    legacy_virtual_index = patch_names.index(
+        "SGLangLegacyVirtualKVCapacityPatch"
+    )
     virtual_index = patch_names.index("SGLangVirtualKVCapacityPatch")
+    assert patch_names.index("ElasticAllocatorPatch") < patch_names.index(
+        "ElasticSWAAllocatorPatch"
+    )
+    assert patch_versions["ElasticSWAAllocatorPatch"] == ">=0.5.13"
     for pool_patch in (
         "ElasticMemoryPoolPatch",
         "ElasticMLAMemoryPoolPatch",
         "ElasticMambaPoolPatch",
         "ElasticHybridLinearKVPoolPatch",
     ):
+        assert patch_names.index(pool_patch) < legacy_virtual_index
         assert patch_names.index(pool_patch) < virtual_index
 
-    assert patch_versions["SGLangVirtualKVCapacityPatch"] == ">=0.5.11"
+    assert (
+        patch_versions["SGLangLegacyVirtualKVCapacityPatch"]
+        == ">=0.5.11,<0.5.16"
+    )
+    assert patch_versions["SGLangVirtualKVCapacityPatch"] == ">=0.5.16"

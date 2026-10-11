@@ -56,6 +56,9 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
                                              SleepConfig.wakeup_on_request),
         min_sleep_duration=sleep_cfg_dict.get("min_sleep_duration",
                                               SleepConfig.min_sleep_duration),
+        vllm_sleep_mode=sleep_cfg_dict.get("vllm_sleep_mode", SleepConfig.vllm_sleep_mode),
+        vllm_sleep_timeout_seconds=sleep_cfg_dict.get(
+            "vllm_sleep_timeout_seconds", SleepConfig.vllm_sleep_timeout_seconds),
         vllm_models_config=sleep_cfg_dict.get("vllm_models_config", {}),
         sglang_models_config=sleep_cfg_dict.get("sglang_models_config", {}),
     )
@@ -613,6 +616,8 @@ async def main():
                         type=int,
                         default=8080,
                         help='Port to run the server on')
+    parser.add_argument('--vllm-sleep-mode', choices=('abort', 'wait'),
+                        help='Override sleep_manager.vllm_sleep_mode in YAML')
 
     args = parser.parse_args()
 
@@ -622,6 +627,9 @@ async def main():
 
     with cfg_path.open("r") as f:
         raw_cfg = yaml.safe_load(f)
+    if args.vllm_sleep_mode is not None:
+        raw_cfg["sleep_manager"] = raw_cfg.get("sleep_manager") or {}
+        raw_cfg["sleep_manager"]["vllm_sleep_mode"] = args.vllm_sleep_mode
 
     models_mapping = extract_models_mapping(raw_cfg)
     models_config = {"models": models_mapping}

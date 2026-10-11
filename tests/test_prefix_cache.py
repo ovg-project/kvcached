@@ -50,7 +50,10 @@ import pytest  # noqa: E402
 
 class MockBlockPool:
     """Minimal stand-in for vLLM's BlockPool base class."""
-    pass
+    enable_caching: bool
+
+    def native_cache_enabled(self):
+        return self.enable_caching
 
 
 class MockKVCacheBlock:
@@ -143,6 +146,49 @@ def test_set_block_hash_supports_legacy_writable_property():
     _set_block_hash(block, key)
 
     assert block.block_hash == key
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_pool_caching_attribute(pool_factory, enabled):
+    pool, _ = pool_factory(enable_caching=enabled)
+    assert pool.native_cache_enabled() is enabled
+    assert pool.enable_prefix_cache is enabled
+
+
+@pytest.mark.parametrize("num_cached_blocks", [0, 1])
+def test_legacy_pool_converts_fine_hashes_before_registering_blocks(
+    pool_factory, monkeypatch, num_cached_blocks
+):
+    pool, _ = pool_factory()
+    pool.hash_block_size = 4
+    blocks = pool.get_new_blocks(2)
+    req = MockRequest([f"h{i}" for i in range(8)])
+    converter = mock.Mock(return_value=["h3", "h7"])
+    utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    setattr(utils, "BlockHashListWithBlockSize", converter)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    pool.cache_full_blocks(req, blocks, num_cached_blocks, 2, 16, 0)
+
+    converter.assert_called_once_with(req.block_hashes, 4, 16)
+    for index in range(num_cached_blocks, 2):
+        assert pool.get_cached_block(f"h{(index + 1) * 4 - 1}", [0]) == [blocks[index]]
+    assert pool.get_cached_block("h0", [0]) is None
+    assert pool.get_cached_block("h1", [0]) is None
+
+
+def test_legacy_pool_rejects_missing_hash_converter(pool_factory, monkeypatch):
+    pool, _ = pool_factory()
+    pool.hash_block_size = 4
+    blocks = pool.get_new_blocks(1)
+    utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    with pytest.raises(RuntimeError, match="heterogeneous block-hash conversion"):
+        pool.cache_full_blocks(MockRequest([f"h{i}" for i in range(4)]), blocks, 0, 1, 16, 0)
+
+    assert blocks[0].block_hash is None
+    assert not pool._cached_blocks
 
 
 # ---------------------------------------------------------------------------

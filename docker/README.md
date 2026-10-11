@@ -10,18 +10,18 @@ We also provide a development image that has both vLLM and SGLang.
 
 | Engine | Public image | Default tag |
 | ------ | ------------ | ----------- |
-| vLLM   | `ghcr.io/ovg-project/vllm-v0.19.0-kvcached`     | `latest` |
-| SGLang | `ghcr.io/ovg-project/sglang-v0.5.10-kvcached`   | `latest` |
-| vLLM+SGLang | `ghcr.io/ovg-project/kvcached-dev`   | `latest` |
+| vLLM   | `ghcr.io/ovg-project/kvcached-vllm`   | `latest`, `kvcached-v0.1.6-vllm-v0.30.0` |
+| SGLang | `ghcr.io/ovg-project/kvcached-sglang` | `latest`, `kvcached-v0.1.6-sglang-v0.5.20` |
+| vLLM+SGLang | `ghcr.io/ovg-project/kvcached-dev` | `latest`, `v0.1.6` |
 
 ## 2. Pulling a pre-built image
 
 ```bash
 # vLLM engine
-docker pull ghcr.io/ovg-project/vllm-v0.19.0-kvcached:latest
+docker pull ghcr.io/ovg-project/kvcached-vllm:latest
 
 # SGLang engine
-docker pull ghcr.io/ovg-project/sglang-v0.5.10-kvcached:latest
+docker pull ghcr.io/ovg-project/kvcached-sglang:latest
 
 # vLLM+SGLang kvcached development
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
@@ -41,7 +41,7 @@ docker run -itd \
   --network=host \
   --privileged \
   --name kvcached-vllm \
-  ghcr.io/ovg-project/vllm-v0.19.0-kvcached \
+  ghcr.io/ovg-project/kvcached-vllm \
   bash
 ```
 
@@ -58,8 +58,6 @@ Then, you can use it as a normal vLLM container, e.g., running benchmarks.
 For example, you can run the following command to start a vLLM server and run benchmarks.
 
 ```bash
-export VLLM_USE_V1=1
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export ENABLE_KVCACHED=true
 export KVCACHED_AUTOPATCH=1
 vllm serve meta-llama/Llama-3.2-1B --no-enable-prefix-caching --port=12346 --tensor-parallel-size=1
@@ -69,16 +67,9 @@ vllm bench serve --model meta-llama/Llama-3.2-1B --request-rate 10 --num-prompts
 NOTE: If installed correctly, you should see that kvcached patches the vLLM:
 
 ```
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:98] Applying 6 patches for vllm
-INFO xx-xx xx:xx:xx [__init__.py:216] Automatically detected platform cuda.
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
-Wxxxx xx:xx:xx.xxxxxx xxx torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation.
-Wxxxx xx:xx:xx.xxxxxx xxx torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:189] Detected vllm version: 0.19.0
-[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:178] Successfully patched vllm: elastic_block_pool, engine_core, gpu_model_runner, gpu_worker, kv_cache_coordinator
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:98] Applying 16 patches for vllm
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][version_utils.py:199] Detected vllm version: 0.30.0
+[kvcached][INFO][xxxx-xx-xx xx:xx:xx][patch_base.py:178] Successfully patched vllm: nixl_connector_compat, elastic_block_pool, engine_core, mp_client, core_engine_proc_manager, model_runner_v2, kv_layout_v2, gpu_worker, hybrid_block_size_align, kv_cache_coordinator, allocate_slots, mamba_partial_tail
 ```
 
 Another way to verify is to check the memory consumption using `nvidia-smi`. With kvcached, you should see that the memory usage is closer to model weight size when there are no requests.
@@ -89,10 +80,10 @@ If you have modified the source code or want to build for a different base CUDA 
 
 ```bash
 # Build vLLM image
-docker build -f docker/Dockerfile.vllm -t vllm-[version]-kvcached .
+docker build -f docker/Dockerfile.vllm -t kvcached-vllm .
 
 # Build SGLang image
-docker build -f docker/Dockerfile.sglang -t sglang-[version]-kvcached .
+docker build -f docker/Dockerfile.sglang -t kvcached-sglang .
 
 # Build development image
 docker build -f docker/Dockerfile.dev -t kvcached-dev .

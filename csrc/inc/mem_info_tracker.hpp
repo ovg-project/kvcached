@@ -3,9 +3,13 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <signal.h>
 #include <string>
 #include <sys/file.h>
@@ -110,6 +114,9 @@ public:
   void *data() { return mapped_; }
   const void *data() const { return mapped_; }
 
+  const std::string &path() const { return file_path_; }
+  int duplicate_fd() const { return ::fcntl(fd_, F_DUPFD_CLOEXEC, 0); }
+
   // Read MemInfoStruct from mmap buffer
   MemInfoStruct read_mem_info() const {
     MemInfoStruct info;
@@ -170,7 +177,10 @@ public:
            ipc_name_.c_str(), total_mem_size_, group_id);
   }
 
-  ~MemInfoTracker() { cleanup(); }
+  ~MemInfoTracker() { release_segment(); }
+
+  MemInfoTracker(const MemInfoTracker &) = delete;
+  MemInfoTracker &operator=(const MemInfoTracker &) = delete;
 
   // Update memory usage info in shared memory
   void update_memory_usage(int64_t used_size, int64_t prealloc_size) {
@@ -205,23 +215,138 @@ public:
 
   const std::string &get_ipc_name() const { return ipc_name_; }
 
+  // All users of this tracker must be stopped first. Multiple local pools can
+  // share an explicit IPC name; only the last stopped pool removes that inode.
+  bool release_segment() {
+    std::lock_guard<std::mutex> guard(segment_registry_mutex());
+    if (!released_) {
+      if (cleanup_) {
+        --cleanup_->users;
+      } else if (identity_capture_failed_) {
+        auto &unknown = uncaptured_users();
+        if (--unknown.at(cleanup_path_) == 0)
+          unknown.erase(cleanup_path_);
+      }
+      released_ = true;
+    }
+    if (!cleanup_)
+      return !identity_capture_failed_;
+    if (uncaptured_users().count(cleanup_->path) != 0) {
+      LOGGER(WARNING,
+             "MemInfoTracker: keeping %s while a pool with an "
+             "unconfirmed identity is still active",
+             cleanup_->path.c_str());
+      return false;
+    }
+    return cleanup_->users != 0 || cleanup_->unlink_original();
+  }
+
 private:
+  static std::mutex &segment_registry_mutex() {
+    static std::mutex mutex;
+    return mutex;
+  }
+
+  static std::map<std::string, size_t> &uncaptured_users() {
+    static std::map<std::string, size_t> users;
+    return users;
+  }
+
+  struct SegmentCleanup {
+    explicit SegmentCleanup(std::string path, int fd)
+        : path(std::move(path)), fd(fd) {}
+    ~SegmentCleanup() {
+      if (fd >= 0)
+        ::close(fd);
+    }
+
+    // Called under the lifecycle mutex; failures retain the fd for retries.
+    bool unlink_original() {
+      if (fd < 0)
+        return true;
+      struct stat original;
+      struct stat current;
+      if (::fstat(fd, &original) < 0) {
+        LOGGER(WARNING,
+               "MemInfoTracker: cannot read retained identity for %s: %s",
+               path.c_str(), std::strerror(errno));
+        return false;
+      }
+      if (::stat(path.c_str(), &current) < 0) {
+        if (errno != ENOENT) {
+          LOGGER(WARNING,
+                 "MemInfoTracker: cannot verify shm identity for %s: %s",
+                 path.c_str(), std::strerror(errno));
+          return false;
+        }
+      } else if (original.st_dev == current.st_dev &&
+                 original.st_ino == current.st_ino &&
+                 ::unlink(path.c_str()) < 0 && errno != ENOENT) {
+        LOGGER(WARNING, "MemInfoTracker: failed to unlink shm %s: %s",
+               path.c_str(), std::strerror(errno));
+        return false;
+      }
+      ::close(fd);
+      fd = -1;
+      return true;
+    }
+
+    std::string path;
+    int fd;
+    size_t users = 0;
+  };
+
+  static std::shared_ptr<SegmentCleanup> retain_segment(RwLockedShm &shm) {
+    static std::map<std::pair<dev_t, ino_t>, std::weak_ptr<SegmentCleanup>>
+        registry;
+    const int fd = shm.duplicate_fd();
+    struct stat identity;
+    if (fd < 0 || ::fstat(fd, &identity) < 0) {
+      const int error = errno;
+      if (fd >= 0)
+        ::close(fd);
+      LOGGER(WARNING, "MemInfoTracker: cannot retain identity for %s: %s",
+             shm.path().c_str(), std::strerror(error));
+      return nullptr;
+    }
+    for (auto it = registry.begin(); it != registry.end();) {
+      if (it->second.expired())
+        it = registry.erase(it);
+      else
+        ++it;
+    }
+    auto &entry = registry[{identity.st_dev, identity.st_ino}];
+    auto cleanup = entry.lock();
+    if (!cleanup || cleanup->fd < 0) {
+      cleanup = std::make_shared<SegmentCleanup>(shm.path(), fd);
+      entry = cleanup;
+    } else {
+      ::close(fd);
+    }
+    ++cleanup->users;
+    return cleanup;
+  }
+
   // Initialize kv cache limit in shared memory
   void init_kv_cache_limit(int64_t kv_cache_limit) {
+    // Serialize local creation with last-owner release. No allocation or
+    // memory-usage update takes this lifecycle-only lock.
+    std::lock_guard<std::mutex> guard(segment_registry_mutex());
     RwLockedShm shm(ipc_name_, MemInfoStruct::SHM_SIZE, RwLockedShm::WLOCK);
     if (!shm.open()) {
       LOGGER(ERROR, "MemInfoTracker: failed to create shm: %s",
              ipc_name_.c_str());
       return;
     }
+    // Pin the opened inode, not a second lookup of a replaceable pathname.
+    cleanup_ = retain_segment(shm);
+    identity_capture_failed_ = !cleanup_;
+    if (identity_capture_failed_) {
+      cleanup_path_ = shm.path();
+      ++uncaptured_users()[cleanup_path_];
+    }
     MemInfoStruct info(kv_cache_limit, 0, 0);
     shm.write_mem_info(info);
-  }
-
-  // Cleanup shared memory
-  void cleanup() {
-    std::string path = std::string(SHM_DIR) + "/" + ipc_name_;
-    ::unlink(path.c_str());
   }
 
   // Get default IPC name (consistent with Python version logic)
@@ -241,6 +366,10 @@ private:
 
   std::string ipc_name_;
   int64_t total_mem_size_;
+  std::shared_ptr<SegmentCleanup> cleanup_;
+  std::string cleanup_path_;
+  bool identity_capture_failed_ = false;
+  bool released_ = false;
 };
 
 } // namespace kvcached

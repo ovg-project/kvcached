@@ -4,7 +4,9 @@
 import gc
 import importlib.util
 import json
+import os
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -12,16 +14,23 @@ from typing import Any
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
+from kvcached.errors import StateConsistencyError  # noqa: E402
 from kvcached.observability import (  # noqa: E402
+    KVCachePoolOperationSnapshot,
+    KVCachePoolSnapshot,
+    RuntimeSnapshot,
+    build_kv_cache_pool_operation_snapshot,
     build_kv_cache_pool_snapshot,
     build_runtime_snapshot,
     get_capabilities,
+    get_registered_kv_cache_pool_operation_snapshot_dicts,
     get_registered_kv_cache_pool_snapshot_dicts,
 )
 from kvcached.pool_registry import (  # noqa: E402
     clear_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
+from kvcached.utils import PAGE_SIZE  # noqa: E402
 
 
 class FakePageAllocator:
@@ -69,6 +78,22 @@ class FakeManager:
     in_shrink = False
     target_num_blocks = None
     page_allocator = FakePageAllocator()
+    _operation_counters = {
+        "allocation_requests_total": 7,
+        "allocation_successes_total": 5,
+        "allocation_failures_total": 2,
+        "capacity_exhausted_total": 1,
+        "allocated_blocks_total": 40,
+        "free_requests_total": 4,
+        "free_successes_total": 4,
+        "freed_blocks_total": 24,
+        "manager_page_allocations_total": 3,
+        "manager_page_releases_total": 2,
+        "operation_errors_total": 1,
+        "allocation_errors_total": 1,
+    }
+    _last_error_code = "allocation_failed"
+    _last_error_timestamp_ns = 123456789
 
     def available_size(self):
         return 64
@@ -80,6 +105,205 @@ class FakeManager:
         assert unit == "bytes"
         return 6 * self.num_layers * self.page_size * self.num_kv_buffers
 
+    def shutdown(self):
+        pass
+
+
+def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatch):
+    class FakeInternalPage:
+        page_id = 0
+
+        def __init__(self):
+            self.free_indices = list(range(8))
+
+        @staticmethod
+        def get_num_blocks(page_size, block_mem_size):
+            return 8
+
+        def init(self, block_mem_size):
+            assert block_mem_size > 0
+
+        def num_free_blocks(self):
+            return len(self.free_indices)
+
+        def alloc(self, count):
+            indices = self.free_indices[:count]
+            self.free_indices = self.free_indices[count:]
+            return indices
+
+        def free_batch(self, indices):
+            self.free_indices.extend(indices)
+            self.free_indices.sort()
+
+        def full(self):
+            return not self.free_indices
+
+        def empty(self):
+            return len(self.free_indices) == 8
+
+    class FakeOperationPageAllocator:
+        def __init__(self, *args, **kwargs):
+            self.page = FakeInternalPage()
+            self.page_inuse = False
+            self.fail_alloc = False
+
+        def set_should_use_worker_ipc_callback(self, callback):
+            self.should_use_worker_ipc = callback
+
+        def set_use_worker_ipc(self, use_worker_ipc):
+            self.use_worker_ipc = use_worker_ipc
+
+        def alloc_page(self):
+            if self.fail_alloc:
+                raise RuntimeError("injected allocation failure")
+            self.page_inuse = True
+            return self.page
+
+        def free_pages(self, page_ids):
+            assert page_ids == [0]
+            self.page_inuse = False
+
+        def group_indices_by_page(self, indices, block_mem_size):
+            return {0: indices}
+
+        def get_resize_target(self):
+            return 0
+
+        def resize(self, new_mem_size):
+            return True
+
+        def trim(self):
+            return None
+
+        def start_prealloc_thread(self):
+            return None
+
+        def get_num_free_pages(self):
+            return int(not self.page_inuse)
+
+        def get_avail_physical_pages(self):
+            return int(not self.page_inuse)
+
+        def get_num_reserved_pages(self):
+            return 0
+
+    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
+    setattr(vmm_ops_module, "InternalPage", FakeInternalPage)
+    setattr(vmm_ops_module, "PageAllocator", FakeOperationPageAllocator)
+    setattr(vmm_ops_module, "kv_tensors_created", lambda group_id=0: True)
+
+    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
+
+    vllm_interfaces_module = types.ModuleType("kvcached.integration.vllm.interfaces")
+    setattr(vllm_interfaces_module, "should_use_worker_ipc", lambda: False)
+
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "kvcached.integration.vllm.interfaces",
+        vllm_interfaces_module,
+    )
+
+    module_path = Path(__file__).parents[1] / "kvcached" / "kv_cache_manager.py"
+    spec = importlib.util.spec_from_file_location("_test_operation_manager", module_path)
+    assert spec is not None and spec.loader is not None
+    manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manager_module)
+
+    manager = manager_module.KVCacheManager(
+        num_blocks=8,
+        block_size=1,
+        cell_size=256,
+        num_layers=2,
+        pool_name="unit",
+    )
+    assert manager._post_init_done.wait(timeout=1)
+
+    assert manager.alloc(manager.available_size() + 1) is None
+    indices = manager.alloc(2)
+    assert indices == [0, 1]
+    manager.free(indices)
+    assert manager.resize(manager.mem_size) is True
+    manager.trim()
+
+    data = manager.operation_snapshot_dict(integration="test")
+    assert data["allocation_requests_total"] == 2
+    assert data["allocation_successes_total"] == 1
+    assert data["allocation_failures_total"] == 1
+    assert data["capacity_exhausted_total"] == 1
+    assert data["allocated_blocks_total"] == 2
+    assert data["free_requests_total"] == 1
+    assert data["free_successes_total"] == 1
+    assert data["freed_blocks_total"] == 2
+    assert data["manager_page_allocations_total"] == 1
+    assert data["manager_page_releases_total"] == 1
+    assert data["resize_successes_total"] == 1
+    assert data["trim_successes_total"] == 1
+
+    manager.page_allocator.fail_alloc = True
+    try:
+        allocation_result = manager.alloc(1)
+    except RuntimeError as error:
+        assert str(error) == "injected allocation failure"
+        expected_error_count = 1
+        expected_capacity_miss_count = 1
+    else:
+        assert allocation_result is None
+        expected_error_count = 0
+        expected_capacity_miss_count = 2
+
+    error_data = manager.operation_snapshot_dict()
+    assert error_data["manager_page_allocation_failures_total"] == 1
+    assert error_data["capacity_exhausted_total"] == expected_capacity_miss_count
+    assert error_data["operation_errors_total"] == expected_error_count
+    assert error_data["allocation_errors_total"] == expected_error_count
+    if expected_error_count:
+        assert error_data["last_error_code"] == "allocation_failed"
+        assert error_data["last_error_timestamp_ns"] is not None
+    else:
+        assert error_data["last_error_code"] is None
+        assert error_data["last_error_timestamp_ns"] is None
+
+    error_count_before = error_data["operation_errors_total"]
+    worker_count = 4
+    errors_per_worker = 1000
+
+    def record_errors():
+        for _ in range(errors_per_worker):
+            manager._record_operation_error(
+                "concurrent_failure",
+                "post_init_errors_total",
+            )
+
+    workers = [threading.Thread(target=record_errors) for _ in range(worker_count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    concurrent_data = manager.operation_snapshot_dict()
+    assert concurrent_data["operation_errors_total"] == (
+        error_count_before + worker_count * errors_per_worker
+    )
+    assert concurrent_data["post_init_errors_total"] == worker_count * errors_per_worker
+    assert concurrent_data["last_error_code"] == "concurrent_failure"
+
+    assert manager._get_operation_counter("operation_errors_total") == (
+        error_count_before + worker_count * errors_per_worker
+    )
+    assert manager._get_operation_counter("not_recorded") == 0
+
+    stub = object.__new__(manager_module.KVCacheManager)
+    stub._increment_operation_counter("allocation_requests_total")
+    stub._record_operation_error("allocation_failed", "allocation_errors_total")
+    assert stub._get_operation_counter("allocation_requests_total") == 0
+    assert stub._get_operation_observability_state() == ({}, None, None)
+
 
 def test_capabilities_are_json_serializable():
     capabilities = get_capabilities()
@@ -87,6 +311,14 @@ def test_capabilities_are_json_serializable():
     assert capabilities["schema_version"] == "kvcached.observability.v1"
     assert capabilities["features"]["read_only"] is True
     assert capabilities["features"]["policy_control"] is False
+    assert capabilities["features"]["kv_cache_pool_operation_snapshot"] is True
+    fields = capabilities["pool_operation_snapshot_fields"]
+    assert {
+        "manager_page_allocations_total",
+        "manager_page_allocation_failures_total",
+        "manager_page_releases_total",
+    } <= set(fields)
+    assert not any(name.startswith("physical_page_") for name in fields)
     json.dumps(capabilities)
 
 
@@ -105,6 +337,8 @@ def test_runtime_snapshot_dict():
     assert snapshot.to_dict() == {
         "schema_version": "kvcached.observability.v1",
         "engine": "vllm",
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
         "initialized": True,
         "device": "cuda:0",
         "world_size": 2,
@@ -138,6 +372,8 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["virtual_per_layer_bytes"] == 128 * 4096 * 2
     assert data["virtual_total_bytes"] == 128 * 4096 * 8 * 2
     assert data["mapped_bytes"] == 10 * 8 * (2 * 1024 * 1024) * 2
+    assert data["reserved_mapped_bytes"] == 2 * 8 * (2 * 1024 * 1024) * 2
+    assert data["total_mapped_bytes"] == 12 * 8 * (2 * 1024 * 1024) * 2
     assert data["total_pages"] == 20
     assert data["free_pages"] == 10
     assert data["inuse_pages"] == 10
@@ -145,8 +381,69 @@ def test_kv_cache_pool_snapshot_from_manager_like_object():
     assert data["available_physical_pages"] == 4
     assert data["effective_free_pages"] == 6
     assert data["resize_target_bytes"] == 0
+    # A manager-like object without a lifecycle reports no phase.
+    assert data["lifecycle_phase"] is None
     assert FakeManager.page_allocator.page_state_calls == 1
     json.dumps(data)
+
+
+def test_pool_snapshot_reports_allocator_health_details():
+    class HealthPageAllocator(FakePageAllocator):
+        def get_transaction_state(self):
+            return {
+                "state": "DEGRADED",
+                "quarantined_pages": 2,
+                "retained_bytes_upper_bound": 64 * 1024 * 1024,
+                "last_error": "map transaction aborted",
+            }
+
+    class HealthManager(FakeManager):
+        page_allocator = HealthPageAllocator()
+        lifecycle_error = RuntimeError("map transaction aborted")
+
+    data = build_kv_cache_pool_snapshot(HealthManager()).to_dict()
+
+    assert data["transaction_state"] == "DEGRADED"
+    assert data["quarantined_pages"] == 2
+    assert data["retained_bytes_upper_bound"] == 64 * 1024 * 1024
+    assert data["lifecycle_error"] == "map transaction aborted"
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
+    json.dumps(data)
+
+
+def test_pool_snapshot_omits_mapped_totals_after_failed_unmap():
+    class FailedUnmapPageAllocator(FakePageAllocator):
+        def get_page_state(self):
+            return {
+                "total_pages": 20,
+                "free_pages": 20,
+                "inuse_pages": 0,
+                "reserved_pages": 0,
+            }
+
+        def get_transaction_state(self):
+            return {
+                "state": "FAILED",
+                "quarantined_pages": 0,
+                "retained_bytes_upper_bound": 0,
+                "last_error": "KV unmap could not complete",
+            }
+
+    class FailedUnmapManager(FakeManager):
+        page_allocator = FailedUnmapPageAllocator()
+        lifecycle_phase = "failed"
+        lifecycle_error = StateConsistencyError("KV unmap could not complete")
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailedUnmapManager()).to_dict()
+
+    assert data["transaction_state"] == "FAILED"
+    assert data["mapped_bytes"] == 0
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
 
 
 def test_pool_snapshot_falls_back_for_older_page_allocator():
@@ -178,6 +475,37 @@ def test_pool_snapshot_falls_back_for_older_page_allocator():
     assert data["free_pages"] == 7
     assert data["inuse_pages"] == 5
     assert data["reserved_pages"] == 1
+    assert data["transaction_state"] is None
+    assert data["quarantined_pages"] is None
+    assert data["retained_bytes_upper_bound"] is None
+    assert data["lifecycle_error"] is None
+
+
+def test_pool_snapshot_omits_complete_mapping_when_reserved_pages_are_unknown():
+    class NoReservedPageAllocator:
+        def get_num_free_pages(self):
+            return 7
+
+        def get_num_inuse_pages(self):
+            return 5
+
+        def get_num_total_pages(self):
+            return 12
+
+        def get_avail_physical_pages(self):
+            return 3
+
+        def get_resize_target(self):
+            return -1
+
+    class NoReservedManager(FakeManager):
+        page_allocator: Any = NoReservedPageAllocator()
+
+    data = build_kv_cache_pool_snapshot(NoReservedManager()).to_dict()
+
+    assert data["reserved_pages"] is None
+    assert data["reserved_mapped_bytes"] is None
+    assert data["total_mapped_bytes"] is None
 
 
 def test_pool_snapshot_clamps_negative_block_gauges():
@@ -194,6 +522,30 @@ def test_pool_snapshot_clamps_negative_block_gauges():
     assert data["available_bytes"] == 0
     assert data["allocated_blocks"] == 0
     assert data["allocated_bytes"] == 0
+
+
+def test_pool_snapshot_reports_a_failed_pool_instead_of_raising():
+    """A FAILED pool fail-closes the free-page read behind available_size()
+    (``PageAllocator::throw_if_failed``), and the snapshot used to propagate
+    that raise, so the documented polling path lost the pool exactly when it
+    had to report the failure (#478 review). The gauge degrades to zero and
+    the getters a failed native pool still answers keep their values."""
+
+    class FailClosedManager(FakeManager):
+        lifecycle_phase = "failed"
+
+        def available_size(self):
+            raise StateConsistencyError("KV unmap could not complete")
+
+    data = build_kv_cache_pool_snapshot(FailClosedManager()).to_dict()
+
+    assert data["lifecycle_phase"] == "failed"
+    assert data["available_blocks"] == 0
+    assert data["available_bytes"] == 0
+    assert data["total_pages"] == 20
+    assert data["inuse_pages"] == 10
+    assert data["allocated_blocks"] == 16
+    json.dumps(data)
 
 
 def test_registered_pool_snapshot_uses_manager_snapshot_entrypoint():
@@ -216,6 +568,33 @@ def test_registered_pool_snapshot_uses_manager_snapshot_entrypoint():
     clear_registered_kv_cache_pools()
 
 
+def test_kv_cache_pool_operation_snapshot_from_manager_like_object():
+    snapshot = build_kv_cache_pool_operation_snapshot(
+        FakeManager(),
+        integration="sglang",
+    )
+    data = snapshot.to_dict()
+
+    assert data["integration"] == "sglang"
+    assert data["pool_name"] == "full_attention"
+    assert data["group_id"] == 3
+    assert data["allocation_requests_total"] == 7
+    assert data["allocation_successes_total"] == 5
+    assert data["allocation_failures_total"] == 2
+    assert data["capacity_exhausted_total"] == 1
+    assert data["allocated_blocks_total"] == 40
+    assert data["free_requests_total"] == 4
+    assert data["freed_blocks_total"] == 24
+    assert data["manager_page_allocations_total"] == 3
+    assert data["manager_page_allocation_failures_total"] == 0
+    assert data["manager_page_releases_total"] == 2
+    assert not any(name.startswith("physical_page_") for name in data)
+    assert data["resize_requests_total"] == 0
+    assert data["last_error_code"] == "allocation_failed"
+    assert data["last_error_timestamp_ns"] == 123456789
+    json.dumps(data)
+
+
 def test_registered_pool_snapshots_are_filtered_and_do_not_keep_managers_alive():
     clear_registered_kv_cache_pools()
     sglang_manager = FakeManager()
@@ -232,10 +611,15 @@ def test_registered_pool_snapshots_are_filtered_and_do_not_keep_managers_alive()
     )
 
     snapshots = get_registered_kv_cache_pool_snapshot_dicts(integration="sglang")
+    operation_snapshots = get_registered_kv_cache_pool_operation_snapshot_dicts(
+        integration="sglang"
+    )
 
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "sglang"
     assert snapshots[0]["pool_name"] == "mha"
+    assert len(operation_snapshots) == 1
+    assert operation_snapshots[0]["allocation_requests_total"] == 7
 
     del sglang_manager
     gc.collect()
@@ -262,6 +646,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs.get(
+                "defer_physical_release", False
+            )
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -269,11 +656,14 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 
@@ -286,6 +676,9 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     monkeypatch.setitem(sys.modules, "kvcached.kv_cache_manager", manager_module)
     monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
     monkeypatch.setitem(sys.modules, "kvcached.utils", utils_module)
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
 
     module_path = (
@@ -300,6 +693,7 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -310,16 +704,23 @@ def test_sglang_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
         pool_name="mha",
     )
     snapshots = interfaces.kv_cache_pool_snapshot_dicts()
+    operation_snapshots = interfaces.kv_cache_pool_operation_snapshot_dicts()
 
     assert manager.group_id == 4
     assert manager.pool_name == "mha"
+    assert manager.defer_physical_release is False
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "sglang"
     assert snapshots[0]["pool_name"] == "mha"
     assert snapshots[0]["group_id"] == 4
+    assert len(operation_snapshots) == 1
+    assert operation_snapshots[0]["integration"] == "sglang"
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+    assert interfaces.kv_cache_pool_operation_snapshot_dicts() == []
+
+
 def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     clear_registered_kv_cache_pools()
 
@@ -346,6 +747,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
             self.num_kv_buffers = kwargs["num_kv_buffers"]
             self.group_id = kwargs["group_id"]
             self.pool_name = kwargs["pool_name"]
+            self.defer_physical_release = kwargs["defer_physical_release"]
             self.mem_size = num_blocks * self.block_mem_size
             self.reserved_blocks = []
             self.page_allocator = FakePageAllocator()
@@ -354,11 +756,14 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     setattr(manager_module, "KVCacheManager", FakeKVCacheManager)
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
     setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
 
     utils_module = types.ModuleType("kvcached.utils")
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
+    setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
     setattr(utils_module, "get_kvcached_logger", lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
 
@@ -371,6 +776,9 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     monkeypatch.setitem(sys.modules, "kvcached.kv_cache_manager", manager_module)
     monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
     monkeypatch.setitem(sys.modules, "kvcached.utils", utils_module)
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
 
     module_path = (
@@ -385,6 +793,7 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
     interfaces = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(interfaces)
     setattr(interfaces, "_kvcached_initialized", True)
+    setattr(interfaces, "_async_sched", True)
 
     manager = interfaces.get_kv_cache_manager(
         128,
@@ -395,14 +804,210 @@ def test_vllm_manager_factory_registers_and_shutdown_clears_pool(monkeypatch):
         pool_name="unified",
     )
     snapshots = interfaces.kv_cache_pool_snapshot_dicts()
+    operation_snapshots = interfaces.kv_cache_pool_operation_snapshot_dicts()
 
     assert manager.group_id == 5
     assert manager.pool_name == "unified"
     assert manager.world_size == 1
+    assert manager.defer_physical_release is True
     assert len(snapshots) == 1
     assert snapshots[0]["integration"] == "vllm"
     assert snapshots[0]["pool_name"] == "unified"
     assert snapshots[0]["group_id"] == 5
+    assert len(operation_snapshots) == 1
+    assert operation_snapshots[0]["integration"] == "vllm"
 
     interfaces.shutdown_kvcached()
     assert interfaces.kv_cache_pool_snapshot_dicts() == []
+    assert interfaces.kv_cache_pool_operation_snapshot_dicts() == []
+
+
+def test_capabilities_distinguish_available_and_planned_surfaces():
+    """Unlanded surfaces are reported False, never omitted.
+
+    A consumer writes the detection once against a build that predates the
+    surface; the same code starts returning True when it ships.
+    """
+    features = get_capabilities()["features"]
+
+    assert features["operation_counters"] is True
+    assert features["runtime_reservation_reporting"] is False
+    # Landed in #414: the one write path on the surface.
+    assert features["instance_memory_limit"] is True
+    # Landed with #375 item (5): poll-only lifecycle readiness.
+    assert features["lifecycle_readiness"] is True
+
+
+def test_capabilities_expose_backend_and_integration_records():
+    capabilities = get_capabilities()
+
+    backends = capabilities["backends"]
+    assert backends["kv_pooling"] is True
+    assert backends["elastic_capacity"] is True
+    # kvcached accounts for non-KV memory but never manages it.
+    assert backends["non_kv_memory_management"] is False
+    # Named "default_" because it is this process's import-time env value, not
+    # a live engine's page size; consumers needing the runtime value read
+    # KVCachePoolSnapshot.page_size_bytes.
+    assert backends["default_page_size_bytes"] == PAGE_SIZE
+    assert "page_size_bytes" not in backends
+
+    integrations = capabilities["integrations"]
+    assert set(integrations) == {"vllm", "sglang"}
+    for entry in integrations.values():
+        assert "MHA" in entry["attention_types"]
+        assert "MLA" in entry["attention_types"]
+    assert integrations["vllm"]["kv_layouts"] == ["NHD", "HND"]
+    assert integrations["sglang"]["kv_layouts"] == ["NHD"]
+
+    # A real, code-level distinction between the two shims: only the vLLM
+    # integration accepts HYBRID_LINEAR through alloc_kv_cache(); SGLang
+    # allocates mamba state through a separate entry point.
+    assert "HYBRID_LINEAR" in integrations["vllm"]["attention_types"]
+    assert "HYBRID_LINEAR" not in integrations["sglang"]["attention_types"]
+
+
+def test_hybrid_linear_pooling_mode_distinguishes_the_two_shapes():
+    """The bool alone cannot answer "is that state in the pool snapshot?".
+
+    Both shims report hybrid_linear_state_pooling True, but vLLM carves the
+    state out of the KV pool (so it shows up in KVCachePoolSnapshot) while
+    SGLang allocates it separately (so it does not). Consumers branch on the
+    mode rather than parsing comments.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for entry in integrations.values():
+        assert entry["hybrid_linear_state_pooling"] is True
+
+    assert integrations["vllm"]["hybrid_linear_state_pooling_mode"] == "unified_pool"
+    assert (
+        integrations["sglang"]["hybrid_linear_state_pooling_mode"]
+        == "separate_allocation"
+    )
+
+
+def test_operation_counter_names_stay_coupled_to_their_feature_flag():
+    """The feature flag and enumerated counter contract must agree."""
+    capabilities = get_capabilities()
+
+    flag = capabilities["features"]["operation_counters"]
+    names = capabilities["operation_counter_names"]
+
+    assert bool(names) == flag
+    assert set(names) == {
+        name for name in KVCachePoolOperationSnapshot.__dataclass_fields__
+        if name.endswith("_total")
+    }
+
+
+def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
+    """Field lists must match the dataclasses consumers actually receive."""
+    capabilities = get_capabilities()
+
+    pool_fields = capabilities["pool_snapshot_fields"]
+    runtime_fields = capabilities["runtime_snapshot_fields"]
+
+    assert pool_fields == list(KVCachePoolSnapshot.__dataclass_fields__.keys())
+    assert runtime_fields == list(RuntimeSnapshot.__dataclass_fields__.keys())
+
+    snapshot = build_kv_cache_pool_snapshot(FakeManager(), integration="vllm")
+    assert set(snapshot.to_dict()) == set(pool_fields)
+
+    operation_fields = capabilities["pool_operation_snapshot_fields"]
+    assert operation_fields == list(KVCachePoolOperationSnapshot.__dataclass_fields__)
+    assert set(capabilities["operation_counter_names"]) <= set(operation_fields)
+    assert "last_error_code" not in capabilities["operation_counter_names"]
+    assert "last_error_timestamp_ns" not in capabilities["operation_counter_names"]
+
+
+def test_capabilities_record_is_json_serializable_and_stable():
+    """The whole record must survive an exporter round-trip unchanged."""
+    capabilities = get_capabilities()
+
+    assert json.loads(json.dumps(capabilities)) == capabilities
+    assert get_capabilities() == capabilities
+
+
+def test_capabilities_need_no_private_field_access():
+    """A consumer reads the record through public keys only.
+
+    Guards the contract in #375: integrations must not have to reach into
+    allocator internals or applied-patch attributes to learn what is supported.
+    """
+    capabilities = get_capabilities()
+
+    def assert_public(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert not key.startswith("_"), f"private key exposed: {key}"
+                assert_public(value)
+        elif isinstance(node, list):
+            for item in node:
+                assert_public(item)
+
+    assert_public(capabilities)
+    for field_name in capabilities["pool_snapshot_fields"]:
+        assert not field_name.startswith("_")
+
+
+
+def _load_shim_under_stubs(engine, monkeypatch):
+    """Import an engine shim with its heavy deps stubbed out.
+
+    Same approach as the factory tests above, reduced to what module import
+    needs: the shim's module-level constants, not a working engine.
+    """
+    torch = types.ModuleType("torch")
+    setattr(torch, "dtype", object)
+    setattr(torch, "Tensor", object)
+    setattr(torch, "cuda", types.SimpleNamespace(current_device=lambda: 0))
+
+    manager_module = types.ModuleType("kvcached.kv_cache_manager")
+    setattr(manager_module, "KVCacheManager", object)
+
+    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "resolve_gpu_device_index", lambda device: 0)
+    setattr(tp_ipc_module, "start_worker_listener_thread", lambda *args: None)
+    setattr(tp_ipc_module, "stop_worker_listener_threads", lambda: True)
+
+    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
+    setattr(vmm_ops_module, "create_kv_tensors", lambda *args, **kwargs: [])
+    setattr(vmm_ops_module, "init_kvcached", lambda *args, **kwargs: None)
+    setattr(vmm_ops_module, "shutdown_kvcached", lambda: None)
+
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "kvcached.kv_cache_manager", manager_module)
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+
+    module_path = (
+        Path(__file__).parents[1] / "kvcached" / "integration" / engine / "interfaces.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"_test_{engine}_interfaces_constants", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    return shim
+
+
+def test_reported_attention_types_match_the_shim_guards(monkeypatch):
+    """The record must not drift from the guards it claims to describe.
+
+    Both are derived from the shim's SUPPORTED_* constants, so adding an
+    attention type to a shim without updating the other side fails here
+    instead of silently shipping a stale record.
+    """
+    integrations = get_capabilities()["integrations"]
+
+    for engine in ("vllm", "sglang"):
+        shim = _load_shim_under_stubs(engine, monkeypatch)
+        assert integrations[engine]["attention_types"] == list(
+            shim.SUPPORTED_ATTENTION_TYPES
+        )
+        assert integrations[engine]["kv_layouts"] == list(shim.SUPPORTED_KV_LAYOUTS)

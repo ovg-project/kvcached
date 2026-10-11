@@ -113,3 +113,20 @@ def test_no_warning_when_budget_is_a_full_block(
     set_max_cached_tokens(16)
     assert _get_max_cached_blocks(16) == 1
     assert not captured_warnings
+
+
+@pytest.mark.parametrize("tokens,groups,expected", [
+    (16000, 1, 1000),
+    (16000, 6, 6000),  # Gemma-4-12B: one block per group for each cached block of tokens
+    (8, 3, 3),         # the one-block floor applies per group
+    (32, 0, 2),        # no group information: keep the single-group budget
+])
+def test_budget_scales_with_kv_cache_groups(set_max_cached_tokens, tokens, groups, expected):
+    set_max_cached_tokens(tokens)
+    assert _get_max_cached_blocks(16, groups) == expected
+
+
+@pytest.mark.parametrize("tokens,expected", [(-1, -1), (0, 0)])
+def test_unlimited_and_disabled_ignore_groups(set_max_cached_tokens, tokens, expected):
+    set_max_cached_tokens(tokens)
+    assert _get_max_cached_blocks(16, 6) == expected

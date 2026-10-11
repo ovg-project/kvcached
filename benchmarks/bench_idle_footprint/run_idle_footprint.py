@@ -9,13 +9,14 @@ memory comes back a page at a time, and only once every block on that page is
 free -- so what an idle instance holds is decided by how many pages its
 surviving blocks are spread over, not by how many blocks it kept.
 
-This drives a real vLLM server, then reads the number kvcached itself
+This drives a real vLLM or SGLang server, then reads the number kvcached itself
 publishes: `used_size` in its MemInfo shared-memory segment, which is
 `num_inuse_pages * num_layers * page_size * num_kv_buffers`. (nvidia-smi would
 be no good here -- it also counts weights and activations.)
 
 Usage:
     MODEL=/path/to/Qwen3-4B ./run_idle_footprint.py
+    MODEL=/path/to/Qwen3-4B ./run_idle_footprint.py --backend sglang
     ./run_idle_footprint.py --workload "--requests 1000 --concurrency 32"
 
 Run it once per branch and compare the "idle" line.
@@ -25,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -43,9 +45,12 @@ def http_text(url, timeout=10):
 
 
 def metric(text, name):
-    m = re.search(rf'^{re.escape(name)}\{{[^}}]*\}}\s+([0-9.e+-]+)$', text,
-                  re.MULTILINE)
-    return float(m.group(1)) if m else None
+    values = re.findall(
+        rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)$",
+        text,
+        re.MULTILINE,
+    )
+    return sum(map(float, values)) if values else None
 
 
 def _vllm_bin():
@@ -62,21 +67,39 @@ def _vllm_bin():
     return found
 
 
-def launch(model, port, log, extra):
+def launch(backend, model, port, log, extra):
     env = dict(os.environ)
+    python_bin_dir = os.path.dirname(sys.executable)
+    env["PATH"] = python_bin_dir + os.pathsep + env.get("PATH", "")
     env.setdefault("ENABLE_KVCACHED", "true")
     env.setdefault("KVCACHED_AUTOPATCH", "1")
-    env.setdefault("VLLM_USE_V1", "1")
-    # kvcached patches the V1 GPUModelRunner. vLLM picks the V2 runner by
-    # default for some models, and then kvcached's worker-side init hook never
-    # fires and KV init dies; keep it on the path kvcached supports.
-    env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
-    cmd = [_vllm_bin(), "serve", model, "--port", str(port),
-           "--served-model-name", "bench", "--max-model-len",
-           os.environ.get("MAX_MODEL_LEN", "8192")] + extra
+    if backend == "vllm":
+        env.setdefault("VLLM_USE_V1", "1")
+        # kvcached patches the V1 GPUModelRunner. vLLM picks the V2 runner by
+        # default for some models, and then kvcached's worker-side init hook
+        # never fires and KV init dies; keep it on the supported path.
+        env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+        cmd = [_vllm_bin(), "serve", model, "--port", str(port),
+               "--served-model-name", "bench", "--max-model-len",
+               os.environ.get("MAX_MODEL_LEN", "8192")] + extra
+    else:
+        cmd = [sys.executable, "-m", "sglang.launch_server", "--model", model,
+               "--port", str(port), "--served-model-name", "bench",
+               "--enable-metrics", "--trust-remote-code"] + extra
     with open(log, "w") as f:
         return subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
-                                env=env)
+                                env=env, start_new_session=True)
+
+
+def terminate(proc):
+    if proc.poll() is not None:
+        return
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
 
 
 def wait_ready(port, log, proc, timeout=900):
@@ -129,13 +152,19 @@ def snapshot(names):
             "prealloc_gb": sum(s["prealloc_gb"] for s in live)}
 
 
-def wait_idle(port, settle, timeout=600):
+def wait_idle(backend, port, settle, timeout=600):
+    names = {
+        "vllm": ("vllm:num_requests_running", "vllm:num_requests_waiting"),
+        "sglang": ("sglang:num_running_reqs", "sglang:num_queue_reqs"),
+    }
+    running_metric, waiting_metric = names[backend]
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
             text = http_text(f"http://127.0.0.1:{port}/metrics")
-            if (metric(text, "vllm:num_requests_running") or 0) == 0 and \
-               (metric(text, "vllm:num_requests_waiting") or 0) == 0:
+            running = metric(text, running_metric)
+            waiting = metric(text, waiting_metric)
+            if running == 0 and waiting == 0:
                 break
         except Exception:  # noqa: BLE001
             pass
@@ -143,8 +172,23 @@ def wait_idle(port, settle, timeout=600):
     time.sleep(settle)
 
 
+def prefix_cache_counters(backend, port, log):
+    if backend == "vllm":
+        text = http_text(f"http://127.0.0.1:{port}/metrics")
+        queries = metric(text, "vllm:prefix_cache_queries_total") or 0
+        hits = metric(text, "vllm:prefix_cache_hits_total") or 0
+        return queries, hits
+
+    with open(log, errors="ignore") as f:
+        text = f.read()
+    uncached = sum(map(int, re.findall(r"#new-token: (\d+)", text)))
+    cached = sum(map(int, re.findall(r"#cached-token: (\d+)", text)))
+    return uncached + cached, cached
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--backend", choices=("vllm", "sglang"), default="vllm")
     ap.add_argument("--model", default=os.environ.get("MODEL"))
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--idle-settle", type=float, default=25.0)
@@ -154,14 +198,15 @@ def main():
     ap.add_argument("--workload", default="",
                     help="extra args forwarded to workload.py")
     ap.add_argument("--serve-arg", action="append", default=[],
-                    help="extra args forwarded to `vllm serve`")
+                    help="extra args forwarded to the selected server")
     args = ap.parse_args()
     if not args.model:
         ap.error("pass --model or set MODEL")
 
-    log = os.path.join(HERE, "server.log")
+    backend_suffix = "" if args.backend == "vllm" else f"-{args.backend}"
+    log = os.path.join(HERE, f"server{backend_suffix}{args.tag}.log")
     before = set(detect_segments())
-    proc = launch(args.model, args.port, log, args.serve_arg)
+    proc = launch(args.backend, args.model, args.port, log, args.serve_arg)
     try:
         if not wait_ready(args.port, log, proc):
             print(f"server failed to start; see {log}")
@@ -174,7 +219,9 @@ def main():
         # eviction cannot free anything while requests are in flight (nearly
         # every page holds a live block), so its whole effect appears as a step
         # at the moment the last request drains.
-        timeline = os.path.join(HERE, f"timeline{args.tag}.jsonl")
+        timeline = os.path.join(
+            HERE, f"timeline{backend_suffix}{args.tag}.jsonl"
+        )
         sampler = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "probe_mem.py"),
              "--watch", "1", "--jsonl", timeline]
@@ -185,16 +232,15 @@ def main():
                         "--port", str(args.port), "--model", "bench"]
                        + args.workload.split(), check=False)
         after = snapshot(segs)
-        wait_idle(args.port, args.idle_settle)
+        wait_idle(args.backend, args.port, args.idle_settle)
         idle = snapshot(segs)
 
         sampler.terminate()
-        text = http_text(f"http://127.0.0.1:{args.port}/metrics")
-        q = metric(text, "vllm:prefix_cache_queries_total") or 0
-        h = metric(text, "vllm:prefix_cache_hits_total") or 0
+        q, h = prefix_cache_counters(args.backend, args.port, log)
 
         bpp = geo.get("bytes_per_page")
         result = {
+            "backend": args.backend,
             "after_workload_gb": round(after["used_gb"], 2),
             "idle_gb": round(idle["used_gb"], 2),
             "idle_prealloc_gb": round(idle["prealloc_gb"], 2),
@@ -209,11 +255,7 @@ def main():
             with open(args.out, "w") as f:
                 json.dump(result, f, indent=1)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        terminate(proc)
     return 0
 
 

@@ -4,6 +4,10 @@
 import importlib.util
 import logging
 import os
+import socket
+import threading
+import uuid
+from typing import BinaryIO, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -132,6 +136,26 @@ def _get_page_size() -> int:
 
 PAGE_SIZE = _get_page_size()
 
+
+def get_page_size_for_block(block_mem_size: int, configured_page_size: int) -> int:
+    """Resolve a KV pool's page size without changing process-wide defaults.
+
+    Explicit page settings keep their existing validation behavior. Resolve
+    from the final block geometry in both the scheduler and worker, before
+    constructing the manager or its backing tensors.
+    """
+    if (block_mem_size <= configured_page_size
+            or os.getenv("KVCACHED_PAGE_SIZE_MB") is not None):
+        return configured_page_size
+    from kvcached.kv_geometry import select_page_size
+
+    page_size = select_page_size(block_mem_size)
+    get_kvcached_logger().info(
+        "Default kvcached page (%d bytes) cannot hold the KV block (%d bytes); "
+        "using %d-byte pages for this pool", configured_page_size,
+        block_mem_size, page_size)
+    return page_size
+
 # Configuration constants for KVCacheManager
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
 PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
@@ -178,6 +202,200 @@ CONTIGUOUS_LAYOUT = _default_contiguous_layout()
 
 DEFAULT_IPC_NAME = _obtain_default_ipc_name()
 SHM_DIR = "/dev/shm"
+
+# Root of the per-instance TP worker socket directories (kvcached.tp_ipc_util).
+# The naming rule lives here, next to the IPC name, so tools that never load
+# the compiled extension (kvctl) can derive the directory from an IPC name.
+TP_SOCKET_DIR_ROOT = "/tmp"
+
+
+def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
+    """Return the TP worker socket directory for *ipc_name* (default: this
+    instance's DEFAULT_IPC_NAME).
+
+    The directory keeps the IPC name readable and appends a short
+    deterministic hash, so every worker of one engine instance agrees on it.
+    Unix domain socket paths are limited to 108 characters on Linux; the
+    caller validates the final socket path length.
+    """
+    name = DEFAULT_IPC_NAME if ipc_name is None else ipc_name
+    suffix = uuid.uuid5(uuid.NAMESPACE_DNS, name).hex[:8]
+    return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
+
+
+def get_tp_worker_socket_path(socket_dir: str, rank: int, pp_rank: int = 0) -> str:
+    """Return the socket path of TP worker *rank* in PP stage *pp_rank*
+    under *socket_dir*: w<rank>.sock, inside a pp<pp_rank> subdirectory for
+    every stage after the first so that stages starting concurrently never
+    bind the same path."""
+    if pp_rank > 0:
+        return os.path.join(socket_dir, f"pp{pp_rank}", f"w{rank}.sock")
+    return os.path.join(socket_dir, f"w{rank}.sock")
+
+
+def path_identity(path: str) -> Optional[Tuple[int, int]]:
+    """(st_dev, st_ino) of the node at *path*, or None when there is none.
+
+    The pathname alone does not identify a socket: a same-name restart
+    binds a new node at the same path."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def remove_dir_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Still holds another worker's socket, or already gone.
+        pass
+
+
+def _accepts_connections(path: str) -> Optional[bool]:
+    """Whether some process still accepts connections on the socket node at
+    *path*. A Unix stream socket node answers connect() only while the
+    process that bound it is alive (a stopped process still queues the
+    connection); once that process has exited the connection is refused.
+    None when the probe cannot tell."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:
+            return None
+    return True
+
+
+class WorkerSocketCleanup:
+    """Remember one deployment's worker sockets while its workers are live
+    and remove, later, only the ones no worker serves any more (issue #510).
+
+    A worker unlinks its own socket from Worker.shutdown(). On a process
+    group SIGTERM vLLM's process manager kills the engine tree before that
+    runs, so the parent that removes the segment the engines left removes
+    the sockets too, behind the same confirmed engine exit. A socket node
+    cannot be pinned by an open descriptor, so each one is remembered by
+    (st_dev, st_ino): a node that no longer matches belongs to a same-name
+    replacement and is kept. A remembered node is removed only once a
+    connect() to it is refused; a stopped or delayed worker still accepts
+    and keeps its socket for a later retry. The check-then-unlink window
+    of the worker's own listener stop applies here as well.
+
+    A directory is removed only by the call that removed one of the
+    deployment's nodes from it, and a completed cleanup is a no-op: a
+    same-name replacement creates the same directory again between its
+    makedirs() and bind(), and vLLM calls the owner's shutdown more than
+    once per teardown.
+    """
+
+    def __init__(self, socket_dir: str, tp_size: int, pp_size: int) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, Tuple[int, int]] = {}
+        for pp_rank in range(max(int(pp_size), 1)):
+            for rank in range(max(int(tp_size), 1)):
+                path = get_tp_worker_socket_path(socket_dir, rank, pp_rank)
+                identity = path_identity(path)
+                if identity is not None:
+                    self._pending[path] = identity
+        # Deepest first: a pp<k> directory before the deployment root, which
+        # is removed once empty like the worker's own stop removes it.
+        directories = {os.path.dirname(path) for path in self._pending}
+        if directories:
+            directories.add(socket_dir)
+        self._dirs = sorted(directories, key=len, reverse=True)
+
+    def unlink(self) -> bool:
+        """Remove the remembered sockets nobody serves and the directories
+        that leaves empty. Return True when nothing is left to retry."""
+        with self._lock:
+            if not self._pending:
+                return True
+            logger = get_kvcached_logger()
+            emptied: set[str] = set()
+            for path, identity in list(self._pending.items()):
+                current = path_identity(path)
+                if current is None or current != identity:
+                    del self._pending[path]  # gone, or a replacement's
+                    continue
+                served = _accepts_connections(path)
+                if served is None:
+                    logger.warning("Keeping worker socket %s: cannot tell whether "
+                                   "a worker still serves it", path)
+                    continue
+                if served:
+                    logger.warning("Keeping worker socket %s: a worker still "
+                                   "accepts connections on it", path)
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("Failed to remove worker socket %s: %s", path, e)
+                    continue
+                logger.info("Removed worker socket %s left by a killed worker", path)
+                del self._pending[path]
+                emptied.add(os.path.dirname(path))
+            for directory in self._dirs:
+                if any(target == directory or target.startswith(directory + os.sep)
+                       for target in emptied):
+                    remove_dir_if_empty(directory)
+            return not self._pending
+
+
+class IPCSegmentCleanup:
+    """Remember one segment across teardown and retry only its failed unlink.
+
+    Capture before stopping the engine: it may remove its own segment during
+    shutdown. The open file pins the inode, so a later file at the same path
+    cannot inherit its identity. No contents are read or modified. This is
+    a replacement check, not a lock against concurrent instance startup.
+    """
+
+    def __init__(self, segment: str) -> None:
+        self.segment = segment
+        self._lock = threading.Lock()
+        self._file: Optional[BinaryIO]
+        try:
+            self._file = open(segment, "rb")
+        except FileNotFoundError:
+            self._file = None
+
+    def unlink(self) -> bool:
+        """Return True when done; keep the original file open on failure."""
+        with self._lock:
+            return self._unlink()
+
+    def _unlink(self) -> bool:
+        if self._file is None:
+            return True
+        try:
+            current = os.stat(self.segment)
+            original = os.fstat(self._file.fileno())
+            if os.path.samestat(current, original):
+                os.unlink(self.segment)
+                get_kvcached_logger().info(
+                    "Unlinked KV cache limit segment %s", self.segment)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            get_kvcached_logger().warning(
+                "Failed to unlink %s on shutdown: %s", self.segment, e)
+            return False
+        self._file.close()
+        self._file = None
+        return True
+
+    def close(self) -> None:
+        """Discard an unconfirmed identity without deleting anything."""
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")

@@ -7,6 +7,14 @@
 #include <cstdint>
 #include <string_view>
 
+// Hidden visibility for internal classes, to match their torch::stable::*
+// members and silence GCC's -Wattributes warning.
+#if defined(__GNUC__) || defined(__clang__)
+#define KVCACHED_HIDDEN __attribute__((visibility("hidden")))
+#else
+#define KVCACHED_HIDDEN
+#endif
+
 namespace kvcached {
 
 using generic_ptr_t = void *;

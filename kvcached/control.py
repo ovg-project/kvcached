@@ -75,6 +75,8 @@ def set_instance_memory_limit(
         status = "conflict"
     elif "stale" in statuses:
         status = "stale"
+    elif "rejected" in statuses:
+        status = "rejected"
     elif "deferred" in statuses:
         status = "deferred"
     else:
@@ -84,6 +86,7 @@ def set_instance_memory_limit(
         "reason": {
             "deferred": "inuse_capacity_above_limit",
             "conflict": "revision_reused_with_different_limit",
+            "rejected": "quarantined_pages_prevent_resize",
         }.get(status, ""),
         "limit_bytes": limit_bytes,
         "effective_limit_bytes": effective,

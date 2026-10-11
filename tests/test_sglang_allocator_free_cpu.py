@@ -8,6 +8,8 @@ import types
 from typing import Any
 from unittest import mock
 
+import pytest
+
 
 class FakeTensor(list):
     def numel(self):
@@ -68,14 +70,17 @@ def _load_sglang_patches(monkeypatch):
     return patches
 
 
-def _make_paged_allocator(patches):
+def _make_paged_allocator(patches, modern=False):
     class BaseTokenToKVPoolAllocator:
         def __init__(self, size, page_size, _dtype, device, _kvcache):
             self.size = size
             self.page_size = page_size
             self.device = device
-            self.free_group = []
-            self.is_not_in_free_group = True
+            if modern:
+                self.free_group = None
+            else:
+                self.free_group = []
+                self.is_not_in_free_group = True
 
     class Kernel:
         def __call__(self, **_kwargs):
@@ -112,9 +117,10 @@ def _make_paged_allocator(patches):
     return paged, freed
 
 
-def test_elastic_paged_allocator_moves_small_free_to_cpu(monkeypatch):
+@pytest.mark.parametrize("modern", [False, True])
+def test_elastic_paged_allocator_moves_small_free_to_cpu(monkeypatch, modern):
     patches = _load_sglang_patches(monkeypatch)
-    paged, freed = _make_paged_allocator(patches)
+    paged, freed = _make_paged_allocator(patches, modern=modern)
 
     free_index = TrackingTensor([0, 16, 32, 48, 48])
     paged.free(free_index)
@@ -123,9 +129,10 @@ def test_elastic_paged_allocator_moves_small_free_to_cpu(monkeypatch):
     assert freed == [[0, 1, 2, 3]]
 
 
-def test_elastic_paged_allocator_reduces_large_free_before_cpu_copy(monkeypatch):
+@pytest.mark.parametrize("modern", [False, True])
+def test_elastic_paged_allocator_reduces_large_free_before_cpu_copy(monkeypatch, modern):
     patches = _load_sglang_patches(monkeypatch)
-    paged, freed = _make_paged_allocator(patches)
+    paged, freed = _make_paged_allocator(patches, modern=modern)
 
     free_index = TrackingTensor(
         [0, 16, 32, 48, 48],
