@@ -7,6 +7,7 @@ SGLang-specific patches using unified patch infrastructure.
 
 import contextlib
 import functools
+import importlib
 import inspect
 import math
 import os
@@ -132,13 +133,101 @@ def _sglang_batch_allocation_zone():
     before SGLang's error path prints the radix tree and exits the scheduler.
     Outside the window the None contract is unchanged, which
     ``alloc_group_begin`` and the lazy ping-pong slot rely on.
+
+    The window also journals every token block the elastic token allocators
+    hand out inside it. A composite allocator runs its sub-allocators in
+    turn, so a miss in the second leaves the first's blocks with nobody to
+    return them, and a TP peer's miss leaves this rank's whole allocation
+    without a batch. The journal is what gives those blocks back. Yields the
+    journal, a list of ``(manager, block_ids)`` in allocation order.
     """
     previous = getattr(_SGLANG_BATCH_ALLOCATION, "active", False)
+    previous_journal = getattr(_SGLANG_BATCH_ALLOCATION, "journal", None)
+    journal: List[Tuple[Any, List[int]]] = []
     _SGLANG_BATCH_ALLOCATION.active = True
+    _SGLANG_BATCH_ALLOCATION.journal = journal
     try:
-        yield
+        yield journal
     finally:
         _SGLANG_BATCH_ALLOCATION.active = previous
+        _SGLANG_BATCH_ALLOCATION.journal = previous_journal
+
+
+def _sglang_journal_blocks(manager: Any, block_ids: Any) -> None:
+    """Record token blocks a manager handed out inside the batch window."""
+    if not getattr(_SGLANG_BATCH_ALLOCATION, "active", False):
+        return
+    journal = getattr(_SGLANG_BATCH_ALLOCATION, "journal", None)
+    if journal is not None:
+        journal.append((manager, list(block_ids)))
+
+
+def _sglang_return_journaled_blocks(journal: List[Tuple[Any, List[int]]]) -> None:
+    """Give journaled blocks back to the managers that handed them out.
+
+    Newest first, at the manager level, with the ids the manager returned:
+    nothing has bound them yet, so no allocator-side bookkeeping exists to
+    undo, and a free group cannot defer them.
+    """
+    while journal:
+        manager, block_ids = journal.pop()
+        if block_ids:
+            manager.free(block_ids)
+
+
+def _sglang_queue_cpu_groups() -> List[Any]:
+    """CPU groups of the ranks that share this scheduler's waiting queue.
+
+    SGLang hands one request stream to every rank of an attention TP group
+    and, under context parallelism, along the attention CP group as well
+    (``attn_cp_tp_broadcast_pyobj``), while each of those ranks drives its
+    own local kvcached pool. ``get_attn_tp_group`` is the TP group itself
+    when DP attention is off. Empty when no peer shares the queue, which
+    includes a process without a parallel state.
+    """
+    try:
+        parallel_state = importlib.import_module(
+            "sglang.srt.distributed.parallel_state")
+    except ImportError:
+        return []
+    groups: List[Any] = []
+    for name in ("get_attn_tp_group", "get_attn_cp_group"):
+        getter = getattr(parallel_state, name, None)
+        if getter is None:
+            continue
+        try:
+            group = getter()
+        except AssertionError:  # the group is not initialized
+            continue
+        if int(group.world_size) <= 1:
+            continue
+        cpu_group = group.cpu_group
+        # The CP group aliases the TP group when their sizes coincide.
+        if all(cpu_group is not seen for seen in groups):
+            groups.append(cpu_group)
+    return groups
+
+
+def _sglang_group_capacity_miss(local_miss: bool) -> bool:
+    """Agree with the ranks sharing the waiting queue whether a step misses.
+
+    Every rank calls this once per prefill batch attempt and once per decode
+    gate, unconditionally, so the ranks issue the same number of collectives
+    and only the flag is rank-local. A MAX all-reduce over the CPU group of
+    each queue group turns a miss on any rank into the verdict of all, the
+    way ``_reduce_sglang_world_min_bytes`` shares one capacity at profile
+    time. Without a peer the local verdict stands and nothing is reduced.
+    """
+    groups = _sglang_queue_cpu_groups()
+    if not groups:
+        return local_miss
+    import torch
+
+    flag = torch.tensor(int(local_miss), dtype=torch.int64)
+    for cpu_group in groups:
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MAX, group=cpu_group)
+    return bool(flag.item())
 
 
 def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
@@ -177,13 +266,18 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     ``KVCacheManager.alloc`` serves reserved blocks first, so the following
     ``alloc_for_decode`` cannot run out of pages inside this process, and a
     shortfall surfaces where the scheduler retracts.
+
+    Under TP every rank reserves from its own pool, so the verdict is agreed
+    with the ranks sharing the queue: one short rank retracts everywhere. A
+    rank that reserved keeps its blocks, and the retract loop's next gate
+    re-reserves the same set.
     """
     evict = getattr(allocator, "evict_to_free_tokens", None)
     if evict is not None:
         evict(tree_cache, num_tokens)
-    if need_blocks <= 0:
-        return True
-    return bool(allocator.kvcached_allocator.try_to_reserve(need_blocks))
+    local_miss = need_blocks > 0 and not bool(
+        allocator.kvcached_allocator.try_to_reserve(need_blocks))
+    return not _sglang_group_capacity_miss(local_miss)
 
 
 class SGLangPrefillCapacityMiss(KVCachePoolExhausted):
@@ -200,20 +294,36 @@ class SGLangPrefillCapacityMiss(KVCachePoolExhausted):
         self.batch = batch
 
 
+def _prefill_entry_state(req: Any) -> Tuple[Any, bool, bool, bool, Tuple[Any, Any]]:
+    """What a request holds when ``alloc_for_extend`` starts."""
+    kv = req.kv
+    return (req, kv.holds_kv, kv.holds_mamba,
+            kv.mamba_ping_pong_track_buffer is not None,
+            (getattr(kv, "kv_allocated_len", None),
+             getattr(kv, "kv_committed_len", None)))
+
+
 def _release_prefill_allocations(
-    pool: Any, held: Sequence[Tuple[Any, bool, bool, bool]]
+    pool: Any, held: Sequence[Tuple[Any, bool, bool, bool, Tuple[Any, Any]]]
 ) -> None:
-    """Return what ``alloc_for_extend`` handed out before the miss.
+    """Return what ``alloc_for_extend`` handed out to the requests.
 
     ``HybridReqToTokenPool.alloc`` binds request rows to every fresh request
     first and then walks the requests for a Mamba slot and the ping-pong
     slots, so a miss leaves rows and some slots bound to requests that will
     not run. Only state absent at entry is released: a chunked continuation
-    keeps the row and the slot it brought into the batch.
+    keeps the row and the slot it brought into the batch. A call that ran to
+    the end, on a rank whose peer missed, also wrote the request's KV
+    lengths; they go back to their entry values.
     """
     mamba_allocator = getattr(pool, "mamba_allocator", None)
-    for req, had_row, had_mamba, had_ping_pong in held:
+    for req, had_row, had_mamba, had_ping_pong, kv_lens in held:
         kv = req.kv
+        allocated_len, committed_len = kv_lens
+        if allocated_len is not None:
+            kv.kv_allocated_len = allocated_len
+        if committed_len is not None:
+            kv.kv_committed_len = committed_len
         buffer = kv.mamba_ping_pong_track_buffer
         if (not had_ping_pong and buffer is not None
                 and mamba_allocator is not None):
@@ -638,6 +748,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if indices is None:
                         return _sglang_capacity_miss(
                             self, need_size, "tokens", self.kvcached_allocator)
+                    _sglang_journal_blocks(self.kvcached_allocator, indices)
                     return torch.tensor(indices, dtype=torch.int64, device=self.device)
 
                 def check_decode_capacity(self, *, num_tokens: int,
@@ -790,6 +901,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     if block_ids is None:
                         return _sglang_capacity_miss(
                             self, num_pages, "pages", self.kvcached_allocator)
+                    _sglang_journal_blocks(self.kvcached_allocator, block_ids)
                     page_ids = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
                     out_indices = (
                         page_ids[:, None] * self.page_size
@@ -826,6 +938,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             return _sglang_capacity_miss(
                                 self, num_new_pages, "pages",
                                 self.kvcached_allocator)
+                        _sglang_journal_blocks(self.kvcached_allocator, block_ids)
                         free_pages = torch.tensor(
                             block_ids, dtype=torch.int64, device=self.device
                         )
@@ -876,6 +989,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             return _sglang_capacity_miss(
                                 self, num_new_pages, "pages",
                                 self.kvcached_allocator)
+                        _sglang_journal_blocks(self.kvcached_allocator, block_ids)
                         free_pages = torch.tensor(
                             block_ids, dtype=torch.int64, device=self.device
                         )
@@ -1025,6 +1139,10 @@ class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
         sub-allocators those counts track device-wide free memory, so such a
         None is the same capacity miss the sub-allocators raise for, and the
         native caller would otherwise turn it into a fatal error.
+
+        A miss in the second sub-allocator after the first succeeded raises
+        from inside the composite, before the full-to-SWA mapping is written;
+        the batch window's journal returns the first sub-allocator's blocks.
         """
         composite = getattr(swa_alloc_mod, "SWATokenToKVPoolAllocator", None)
         if composite is None:
@@ -2439,6 +2557,14 @@ class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
     releases what the call handed out when a kvcached pool misses, and raises
     ``SGLangPrefillCapacityMiss`` for the scheduler wrapper. Any other
     exception propagates untouched.
+
+    Under TP every rank of the scheduler's queue group runs the same call on
+    its own pool, and a rank whose pool missed must not retry alone while a
+    peer carries the batch into the forward. After the local attempt the
+    ranks agree on one verdict (``_sglang_group_capacity_miss``); on a miss
+    anywhere every rank returns the blocks, rows and slots its own call
+    handed out and raises the same signal, so the scheduler wrapper's unwind,
+    requeue and cap run identically everywhere.
     """
 
     library = "sglang"
@@ -2468,17 +2594,26 @@ class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
         def _patched_alloc_for_extend(batch: Any) -> Any:
             if not enable_kvcached():
                 return original(batch)
-            held = [
-                (req, req.kv.holds_kv, req.kv.holds_mamba,
-                 req.kv.mamba_ping_pong_track_buffer is not None)
-                for req in batch.reqs
-            ]
-            try:
-                with _sglang_batch_allocation_zone():
-                    return original(batch)
-            except KVCachePoolExhausted as miss:
-                _release_prefill_allocations(batch.req_to_token_pool, held)
-                raise SGLangPrefillCapacityMiss(batch, miss) from miss
+            pool = batch.req_to_token_pool
+            held = [_prefill_entry_state(req) for req in batch.reqs]
+            local_miss: Optional[KVCachePoolExhausted] = None
+            result = None
+            with _sglang_batch_allocation_zone() as journal:
+                try:
+                    result = original(batch)
+                except KVCachePoolExhausted as miss:
+                    local_miss = miss
+                    _sglang_return_journaled_blocks(journal)
+                    _release_prefill_allocations(pool, held)
+                if _sglang_group_capacity_miss(local_miss is not None):
+                    if local_miss is None:
+                        local_miss = KVCachePoolExhausted(
+                            "a peer rank sharing this waiting queue could "
+                            "not back the batch")
+                        _sglang_return_journaled_blocks(journal)
+                        _release_prefill_allocations(pool, held)
+                    raise SGLangPrefillCapacityMiss(batch, local_miss) from local_miss
+            return result
 
         self._mark_as_patched(_patched_alloc_for_extend, marker)
         setattr(batch_mod, "alloc_for_extend", _patched_alloc_for_extend)

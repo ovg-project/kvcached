@@ -10,15 +10,20 @@ second pool in the same process (hybrid attention plus Mamba, #547) or another
 process (#467) can consume first. These tests pin the translation into
 SGLang's own retry path, retraction to the waiting queue, and pin that it
 stays as narrow as the vLLM one (#453, #511): only a kvcached capacity miss is
-translated, and only what the failed batch was handed out is released.
+translated, and only what the failed batch was handed out is released. Under
+TP every rank drives its own pool, so the ranks that share a waiting queue
+must reach one verdict before any of them runs the batch; the two-rank tests
+run each rank in its own thread over a rendezvous that stands in for the
+gloo all-reduce.
 """
 from __future__ import annotations
 
 import contextlib
 import inspect
 import sys
+import threading
 import types
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import pytest
 import torch
@@ -271,6 +276,40 @@ def test_token_allocator_miss_is_none_outside_and_typed_inside_the_window(
     assert manager.free_ids == []
 
 
+def test_window_journals_token_blocks_and_returns_them(cpu_tensors):
+    """Blocks handed out inside the window are journaled per manager, and a
+    rollback gives exactly those back, newest first."""
+    allocator, manager = _token_allocator(manager_size=8)
+    return_blocks = patches._sglang_return_journaled_blocks
+
+    with _sglang_batch_allocation_zone() as journal:
+        assert allocator.alloc(3).tolist() == [1, 2, 3]
+        assert allocator.alloc(2).tolist() == [4, 5]
+        assert journal == [(manager, [1, 2, 3]), (manager, [4, 5])]
+        return_blocks(journal)
+    assert journal == []
+    assert manager.free_calls == [[4, 5], [1, 2, 3]]
+    assert sorted(manager.free_ids) == list(range(1, 9))
+    # Outside the window nothing is journaled.
+    assert allocator.alloc(1).tolist() == [6]
+    assert getattr(patches._SGLANG_BATCH_ALLOCATION, "journal", None) is None
+
+
+def test_paged_window_journals_the_new_pages_only(monkeypatch, cpu_tensors):
+    """alloc_extend hands out token slots that continue the prefix's last
+    page; the journal holds the new page ids the manager returned, so a
+    rollback never touches the page the prefix already owns."""
+    allocator, manager = _paged_allocator(
+        monkeypatch, manager_size=4, page_size=4, num_new_pages=2)
+
+    with _sglang_batch_allocation_zone() as journal:
+        out = allocator.alloc_extend(
+            _lens(1), _lens(1), _lens(1), _lens(1), _lens(1), extend_num_tokens=6)
+        assert out.numel() == 6
+        assert journal == [(manager, [1, 2])]
+    assert manager.free_ids == [3, 4]
+
+
 def test_mamba_slot_allocator_miss_is_typed_only_inside_the_window(
         mamba_slot_allocator_cls):
     pool = FakeMambaPool(2)
@@ -366,6 +405,43 @@ def test_decode_gate_reports_a_shortfall_instead_of_allocating(cpu_tensors):
     assert manager.reserve_calls == [2]
 
 
+def _decode_gate(allocator: Any, num_tokens: int) -> Callable[[], bool]:
+    return lambda: allocator.check_decode_capacity(
+        num_tokens=num_tokens, tree_cache=None)
+
+
+def test_decode_gate_agrees_across_ranks(monkeypatch, cpu_tensors):
+    """Two ranks, the second one short: the gate says no on both, so both
+    take the native retract path instead of one running alloc_for_decode
+    into a miss while the other retracts."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [_token_allocator(manager_size=4), _token_allocator(manager_size=1)]
+
+    verdicts = _run_ranks([_decode_gate(allocator, 2) for allocator, _ in ranks])
+
+    assert verdicts == [False, False]
+    assert gloo.rounds == [[0, 1]]
+    # The rank that could reserve keeps its blocks; the next gate re-reserves
+    # the same set, and a rank with no need still joins the collective.
+    assert ranks[0][1].reserved == [1, 2]
+    assert ranks[1][1].reserved == []
+    verdicts = _run_ranks([_decode_gate(allocator, 0) for allocator, _ in ranks])
+    assert verdicts == [True, True]
+    assert gloo.rounds == [[0, 1], [0, 0]]
+
+
+def test_group_verdict_is_local_without_peers(monkeypatch, cpu_tensors):
+    """A group of one is tp_size == 1: no collective runs at all."""
+    _install_queue_groups(monkeypatch, None, world_size=1)
+    allocator, manager = _token_allocator(manager_size=4)
+
+    assert allocator.check_decode_capacity(num_tokens=2, tree_cache=None) is True
+    assert manager.reserved == [1, 2]
+    allocator, manager = _token_allocator(manager_size=1)
+    assert allocator.check_decode_capacity(num_tokens=2, tree_cache=None) is False
+
+
 # --------------------------------------------------------------------------
 # the scheduler path, mirrored from SGLang 0.5.20
 # --------------------------------------------------------------------------
@@ -382,6 +458,9 @@ class FakeKV:
         self.mamba_last_track_idx: Optional[int] = None
         self.mamba_needs_clear = False
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
+        # Written at the end of a successful alloc_for_extend (allocation.py).
+        self.kv_allocated_len = 0
+        self.kv_committed_len = 0
 
     @property
     def holds_kv(self) -> bool:
@@ -533,6 +612,10 @@ def _make_schedule_batch_module() -> Any:
         req_pool_indices = alloc_req_slots(
             batch.req_to_token_pool, batch.reqs, batch.tree_cache)
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        # The native tail: the request's KV lengths follow the allocation.
+        for req in batch.reqs:
+            end = req.extend_range[1] if req.extend_range is not None else 0
+            req.kv.kv_allocated_len = req.kv.kv_committed_len = end
         return out_cache_loc, req_pool_indices
 
     module.alloc_for_extend = alloc_for_extend
@@ -611,19 +694,116 @@ class FakeScheduler:
         return batch, running_batch
 
 
-def _install_runtime_context(monkeypatch, bag: FakeScheduleBag) -> None:
+_ACTIVE_BAG = threading.local()
+
+
+def _install_runtime_context(monkeypatch) -> None:
+    """``get_schedule`` answers with the bag of the pipeline whose round runs
+    on the calling thread, so two fake ranks keep separate config bags."""
     _install_sglang_utils(monkeypatch, 0)
     runtime_context: Any = types.ModuleType("sglang.srt.runtime_context")
-    runtime_context.get_schedule = lambda: bag
+
+    def get_schedule() -> Any:
+        return _ACTIVE_BAG.bag
+
+    runtime_context.get_schedule = get_schedule
     monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", runtime_context)
+
+
+class FakeGloo:
+    """The CPU group's all-reduce as a rendezvous between rank threads.
+
+    Each rank deposits its flag and waits; the barrier action reduces once
+    all ``world_size`` ranks have arrived and every rank reads the result.
+    A rank that never calls it leaves the others waiting, as a missing
+    collective would on a real group, which the timeout turns into a
+    failure instead of a hang.
+    """
+
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self.rounds: List[List[int]] = []
+        self._deposits: List[int] = []
+        self._result = 0
+        self._lock = threading.Lock()
+        self._barrier = threading.Barrier(world_size, action=self._reduce,
+                                          timeout=10)
+
+    def _reduce(self) -> None:
+        self._result = max(self._deposits)
+        self.rounds.append(list(self._deposits))
+        self._deposits = []
+
+    def all_reduce(self, tensor, op) -> None:
+        assert op == torch.distributed.ReduceOp.MAX
+        with self._lock:
+            self._deposits.append(int(tensor.item()))
+        self._barrier.wait()
+        tensor.fill_(self._result)
+
+
+def _install_queue_groups(monkeypatch, gloo: Optional[FakeGloo],
+                          world_size: int) -> None:
+    """A parallel state whose attention TP group has ``world_size`` ranks and
+    no CP group, as SGLang's without DP attention or context parallelism."""
+    _install_sglang_utils(monkeypatch, 0)
+    parallel_state: Any = types.ModuleType("sglang.srt.distributed.parallel_state")
+    group = types.SimpleNamespace(world_size=world_size, cpu_group=gloo)
+
+    def get_attn_tp_group() -> Any:
+        return group
+
+    def no_cp_group() -> Any:
+        raise AssertionError(
+            "attention context model parallel group is not initialized")
+
+    parallel_state.get_attn_tp_group = get_attn_tp_group
+    parallel_state.get_attn_cp_group = no_cp_group
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed",
+                        types.ModuleType("sglang.srt.distributed"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed.parallel_state",
+                        parallel_state)
+
+    def all_reduce(tensor, op, group):
+        assert group is not None, "all_reduce on a group of one"
+        group.all_reduce(tensor, op)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+
+def _run_ranks(steps: List[Callable[[], Any]]) -> List[Any]:
+    """Run one step per rank on its own thread and return their results."""
+    results: List[Any] = [None] * len(steps)
+    errors: List[Optional[BaseException]] = [None] * len(steps)
+
+    def run(index: int) -> None:
+        try:
+            results[index] = steps[index]()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            errors[index] = exc
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(steps))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "a rank hung"
+    for error in errors:
+        if error is not None:
+            raise error
+    return results
 
 
 class Pipeline:
     def __init__(self, monkeypatch, *, rows: int, mamba_slots: Optional[int],
                  tokens: int, prefill_max_requests: Optional[int] = None,
                  version: str = "0.5.20", patched: bool = True,
-                 mamba_slot_allocator_cls=None) -> None:
-        self.token_allocator, self.token_manager = _token_allocator(tokens)
+                 mamba_slot_allocator_cls=None,
+                 token_allocator: Optional[Tuple[Any, FakeManager]] = None) -> None:
+        if token_allocator is None:
+            token_allocator = _token_allocator(tokens)
+        self.token_allocator: Any = token_allocator[0]
+        self.token_manager: FakeManager = token_allocator[1]
         self.tree_cache = FakeTreeCache(self.token_allocator)
         if mamba_slots is None:
             self.mamba_manager = None
@@ -635,7 +815,7 @@ class Pipeline:
                 rows, mamba_slot_allocator_cls(mamba_slots, "cpu", mamba_pool))
         self.batch_module = _make_schedule_batch_module()
         self.bag = FakeScheduleBag(prefill_max_requests)
-        _install_runtime_context(monkeypatch, self.bag)
+        _install_runtime_context(monkeypatch)
         sched_module: Any = types.ModuleType("sglang.srt.managers.scheduler")
         # A fresh class per pipeline: the patch rebinds a class attribute.
         scheduler_cls = type("Scheduler", (FakeScheduler,), {})
@@ -658,8 +838,21 @@ class Pipeline:
         self.scheduler.waiting_queue.extend(reqs)
 
     def round(self):
+        _ACTIVE_BAG.bag = self.bag
         return self.scheduler._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=None, running_batch=self.running_batch)
+
+    def state(self, reqs: List[FakeReq], result=None):
+        """What one rank ends a round with, for comparing ranks."""
+        batch = None if result is None else result[0]
+        return {
+            "has_batch": batch is not None,
+            "batch": None if batch is None else [req.rid for req in batch.reqs],
+            "queued": [req.rid for req in self.scheduler.waiting_queue],
+            "holds_row": [req.kv.holds_kv for req in reqs],
+            "kv_allocated_len": [req.kv.kv_allocated_len for req in reqs],
+            "cap": getattr(self.scheduler, "_kvcached_prefill_request_cap", None),
+        }
 
     @property
     def mamba(self) -> FakeManager:
@@ -905,6 +1098,166 @@ def test_cap_keeps_a_user_ceiling(monkeypatch, cpu_tensors):
     assert pipeline.bag.prefill_max_requests == 2
 
 
+def test_tp_peer_miss_unwinds_every_rank(monkeypatch, cpu_tensors):
+    """shipiyouniao's asymmetric probe: only rank 1's token pool misses.
+
+    Without the group verdict rank 0 returns a batch and keeps its row while
+    rank 1 requeues, and the ranks walk into the forward with different
+    batches. With it both ranks requeue, return everything their own call
+    handed out, apply the same cap, and build the same batch once the
+    pressure on rank 1 lifts.
+    """
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=16),
+             Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=2)]
+    reqs = [[FakeReq("a"), FakeReq("b")] for _ in ranks]
+    for rank, rank_reqs in zip(ranks, reqs):
+        rank.enqueue(*rank_reqs)
+    before = [rank.free_state() for rank in ranks]
+
+    results = _run_ranks([rank.round for rank in ranks])
+
+    states = [rank.state(rank_reqs, result)
+              for rank, rank_reqs, result in zip(ranks, reqs, results)]
+    assert states[0] == states[1]
+    assert states[0]["has_batch"] is False
+    assert states[0]["queued"] == ["a", "b"]
+    assert states[0]["holds_row"] == [False, False]
+    assert states[0]["kv_allocated_len"] == [0, 0]
+    assert states[0]["cap"] == 1
+    assert [rank.free_state() for rank in ranks] == before
+    # One collective per attempt, rank 1 the only local miss; rank 0's own
+    # allocation of the batch's 4 tokens went back through the journal.
+    assert gloo.rounds == [[0, 1]]
+    assert ranks[0].token_manager.free_calls == [[1, 2, 3, 4]]
+    assert ranks[1].token_manager.free_calls == []
+    assert [rank.pool.freed for rank in ranks] == [[3, 4], [3, 4]]
+    # The pressure lifts on rank 1: the same capped batch runs on both.
+    ranks[1].token_manager.free_ids = list(range(1, 17))
+    results = _run_ranks([rank.round for rank in ranks])
+    states = [rank.state(rank_reqs, result)
+              for rank, rank_reqs, result in zip(ranks, reqs, results)]
+    assert states[0] == states[1]
+    assert states[0]["batch"] == ["a"]
+    assert states[0]["queued"] == ["b"]
+    assert states[0]["cap"] is None
+    assert gloo.rounds == [[0, 1], [0, 0]]
+
+
+def test_tp_peer_miss_unwinds_mamba_slots_too(
+        monkeypatch, cpu_tensors, mamba_slot_allocator_cls):
+    """The hybrid pools on the rank whose peer missed: rows, the Mamba slot
+    and the ping-pong pair go back along with the tokens."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=8, tokens=16,
+                      mamba_slot_allocator_cls=mamba_slot_allocator_cls),
+             Pipeline(monkeypatch, rows=4, mamba_slots=4, tokens=16,
+                      mamba_slot_allocator_cls=mamba_slot_allocator_cls)]
+    reqs = [[FakeReq("a"), FakeReq("b")] for _ in ranks]
+    for rank, rank_reqs in zip(ranks, reqs):
+        rank.enqueue(*rank_reqs)
+    before = [rank.free_state() for rank in ranks]
+
+    results = _run_ranks([rank.round for rank in ranks])
+
+    states = [rank.state(rank_reqs, result)
+              for rank, rank_reqs, result in zip(ranks, reqs, results)]
+    for state in states:
+        assert state["has_batch"] is False
+        assert state["queued"] == ["a", "b"]
+        assert state["holds_row"] == [False, False]
+        assert state["cap"] == 1
+    assert [rank.free_state() for rank in ranks] == before
+    for rank_reqs in reqs:
+        assert all(not req.kv.holds_mamba for req in rank_reqs)
+        assert all(req.kv.mamba_ping_pong_track_buffer is None for req in rank_reqs)
+    assert gloo.rounds == [[0, 1]]
+    assert ranks[0].token_manager.free_calls == [[1, 2, 3, 4]]
+
+
+class FakeSWAComposite:
+    """SWATokenToKVPoolAllocator.alloc at v0.5.20 (swa.py:219-232): the
+    pre-check reads both children's counts, then the full child allocates,
+    then the SWA child, and the full-to-SWA mapping is written after both."""
+
+    def __init__(self, full: Any, swa: Any) -> None:
+        self.full_attn_allocator = full
+        self.swa_attn_allocator = swa
+        self.page_size = 1
+        self.mapping_writes: List[Any] = []
+
+    def available_size(self) -> int:
+        return min(self.full_attn_allocator.available_size(),
+                   self.swa_attn_allocator.available_size())
+
+    def alloc(self, need_size: int):
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        if need_size > self.swa_attn_allocator.available_size():
+            return None
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+        self.mapping_writes.append(
+            (alloc_full_indices.tolist(), alloc_swa_indices.tolist()))
+        return alloc_full_indices
+
+    def free(self, free_index) -> None:
+        self.swa_attn_allocator.free(free_index)
+        self.full_attn_allocator.free(free_index)
+
+
+def test_swa_partial_allocation_is_returned_before_retry(monkeypatch, cpu_tensors):
+    """shipiyouniao's probe: the SWA child misses after the composite's
+    pre-check passed. Three retries used to leave the full child's blocks
+    allocated and unreachable, 16 to 12 to 8 to 4; now every retry returns
+    them, with the mapping untouched and both counts unchanged."""
+    full_allocator, full_manager = _token_allocator(manager_size=16)
+    swa_allocator, swa_manager = _token_allocator(manager_size=16)
+    taken: List[List[int]] = []
+    full_alloc = full_manager.alloc
+
+    def record_full_alloc(count):
+        ids = full_alloc(count)
+        taken.append(list(ids))
+        return ids
+
+    monkeypatch.setattr(full_manager, "alloc", record_full_alloc)
+    # Enough by the count, nothing by the pool: the miss after the pre-check.
+    monkeypatch.setattr(swa_manager, "alloc", lambda count: None)
+    swa_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator.swa")
+    swa_mod.SWATokenToKVPoolAllocator = FakeSWAComposite
+    assert ElasticSWAAllocatorPatch().patch_swa_composite_misses(swa_mod)
+    composite = FakeSWAComposite(full_allocator, swa_allocator)
+    pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=16,
+                        token_allocator=(composite, full_manager))
+    req = FakeReq("a")
+    pipeline.enqueue(req)
+
+    for attempt in range(1, 4):
+        assert pipeline.round() == (None, pipeline.running_batch)
+        assert pipeline.scheduler.waiting_queue == [req]
+        assert not req.kv.holds_kv
+        assert full_manager.available_size() == 16, attempt
+        assert swa_manager.available_size() == 16, attempt
+        # The full child's blocks from this very attempt went back, each time.
+        assert full_manager.free_calls == taken
+        assert [len(ids) for ids in taken] == [4] * attempt
+    assert composite.mapping_writes == []
+    # With the SWA child back, the same request runs and the mapping follows.
+    monkeypatch.undo()
+    monkeypatch.setattr(patches, "_is_supported_gpu_device", lambda device: True)
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
+    _install_runtime_context(monkeypatch)
+    batch, _ = pipeline.round()
+    assert [r.rid for r in batch.reqs] == ["a"]
+    assert len(composite.mapping_writes) == 1
+    assert full_manager.available_size() == 12
+
+
 @pytest.mark.parametrize("failure", [
     pytest.param("rows", id="static request rows exhausted"),
     pytest.param("value_error", id="contract violation"),
@@ -919,8 +1272,9 @@ def test_other_failures_still_exit_the_scheduler(
     expected: Any
     if failure == "value_error":
         pipeline.pool.free_slots = [1, 2]
-        pipeline.token_manager.alloc = lambda count: (_ for _ in ()).throw(
-            ValueError("invalid block metadata"))
+        monkeypatch.setattr(
+            pipeline.token_manager, "alloc",
+            lambda count: (_ for _ in ()).throw(ValueError("invalid block metadata")))
         expected, match = ValueError, "invalid block metadata"
     else:
         expected, match = RuntimeError, ROW_OOM
