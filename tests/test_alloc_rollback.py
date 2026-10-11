@@ -625,6 +625,30 @@ def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatc
     assert not manager._retired_pages
 
 
+def test_published_quota_is_applied_once_until_clear(monkeypatch):
+    manager = make_manager(fail_after=4)
+    manager.reserve_null_block = False
+    quota = 2 * BLOCKS_PER_PAGE
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        return True
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: quota)
+    assert manager.alloc(1) is not None
+    assert manager.alloc(1) is not None
+    # The watcher keeps reporting the quota; allocations apply it once.
+    assert calls == [quota]
+    for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim", "reset_free_page_order"):
+        monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
+    manager.clear()
+    # clear() dropped the pool state, so the quota is applied again.
+    assert manager.alloc(1) is not None
+    assert calls == [quota, quota]
+
+
 @pytest.mark.parametrize("pending_shrink", [False, True])
 def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatch, pending_shrink):
     from kvcached.errors import QuarantinedResizeError

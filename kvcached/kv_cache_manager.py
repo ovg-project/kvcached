@@ -313,6 +313,10 @@ class KVCacheManager:
         self.target_num_blocks: Optional[int] = None
         self._resize_rejected: bool = False
         self._rejected_resize_target: Optional[int] = None
+        # The native resize watcher keeps the last kvctl quota it observed, so
+        # alloc() sees it on every call. Remember the quota already applied so
+        # a later set_memory_limit() or resize() is not undone by it.
+        self._applied_resize_target: Optional[int] = None
         self._memory_limit_bytes: Optional[int] = None
         self._memory_limit_effective_bytes: Optional[int] = None
         self._memory_limit_revision = -1
@@ -676,6 +680,7 @@ class KVCacheManager:
 
         new_mem_size = self.page_allocator.get_resize_target()
         if (new_mem_size > 0 and
+                new_mem_size != getattr(self, "_applied_resize_target", None) and
                 new_mem_size != getattr(self, "_rejected_resize_target", None)):
             try:
                 self.resize(new_mem_size)
@@ -683,6 +688,8 @@ class KVCacheManager:
                 self._rejected_resize_target = new_mem_size
                 self._resize_rejected = True
                 logger.warning("Automatic resize rejected: pool has quarantined pages")
+            else:
+                self._applied_resize_target = new_mem_size
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -1515,6 +1522,9 @@ class KVCacheManager:
 
         self.target_num_blocks = None
         self.in_shrink = False
+        # A pending shrink was dropped with the pages; let the next alloc()
+        # apply the published quota again.
+        self._applied_resize_target = None
         # clear() freed every page and trimmed; drop the cached value so
         # the next available_size() re-reads the post-clear physical state.
         self._avail_physical_pages_cache = None
