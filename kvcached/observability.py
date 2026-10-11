@@ -10,6 +10,7 @@ can consume kvcached status without depending on private patch details.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,8 @@ class RuntimeSnapshot:
     async_sched: bool
     contiguous_layout: bool
     is_worker: Optional[bool] = None
+    pid: Optional[int] = None
+    ppid: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -359,6 +362,8 @@ def build_runtime_snapshot(
     return RuntimeSnapshot(
         schema_version=SCHEMA_VERSION,
         engine=engine,
+        pid=os.getpid(),
+        ppid=os.getppid(),
         initialized=initialized,
         device=device,
         world_size=world_size,

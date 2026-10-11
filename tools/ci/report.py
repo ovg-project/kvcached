@@ -2,17 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 """Write the GPU CI results issue: one comment per run, and the setup of
-each workflow in the issue description.
+each workflow in the issue description; and the comment of a run that a
+maintainer started on a pull request (--pr), which carries its own setup.
 
 Everything here is rendered from the files a run leaves in its results
-directory (setup.json and summary.json from tests/e2e/run.py and
+directories (setup.json and summary.json from tests/e2e/run.py and
 benchmarks/ci/perf.py), so the comment and the description describe what the
-run actually did.
+run actually did. A correctness run has one directory per part that ran on
+its own GPUs: vllm and sglang for nightly, all otherwise.
 
 Usage:
-    report.py correctness --results DIR --profile nightly --comment c.md --section s.md \\
-        --run-url URL --sha SHA [--subject S] [--prev SHA:CONCLUSION] \\
-        [--artifact-url URL] [--reason-file F]
+    report.py correctness --results DIR [DIR ...] --profile nightly --comment c.md \\
+        --section s.md --run-url URL --sha SHA [--subject S] [--prev SHA:CONCLUSION] \\
+        [--artifact-url URL] [--pr N]
     report.py perf --results DIR --comment c.md --section s.md --run-url URL --sha SHA ...
     report.py splice --body body.md --name nightly --section s.md --out new.md
 """
@@ -61,6 +63,15 @@ def cell(text: str) -> str:
 
 
 # --- setup -----------------------------------------------------------------
+
+def machine_line(setup: dict[str, Any]) -> str:
+    """The GPUs of a run, and how its parts shared them."""
+    line = gpus_line(setup.get("gpus", []))
+    parts = setup.get("parts", [])
+    if len(parts) > 1:
+        line += f"; the {' and '.join(parts)} cases run at the same time, one GPU each"
+    return line
+
 
 def gpus_line(gpus: list[dict[str, str]]) -> str:
     if not gpus:
@@ -170,15 +181,39 @@ def checks_table(checks: dict[str, str]) -> list[str]:
         f"| `{name}` | {cell(text)} |" for name, text in checks.items()]
 
 
+def part_name(results: Path) -> str:
+    """The part of a run a results directory holds: <dir>/vllm, sglang or all."""
+    return ENGINE_NAMES.get(results.name, results.name)
+
+
+def merge_setups(parts: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """One setup for a run whose parts ran at the same time on separate GPUs."""
+    setups = [s for _, s in parts]
+    merged = dict(setups[0])
+    merged["gpus"] = [g for s in setups for g in s.get("gpus", [])]
+    merged["engines"] = {k: v for s in setups for k, v in s.get("engines", {}).items()}
+    merged["model_revisions"] = {k: v for s in setups
+                                 for k, v in s.get("model_revisions", {}).items()}
+    for key in ("cases", "elastic"):
+        merged[key] = [c for s in setups for c in s.get(key, [])]
+    merged["parts"] = [name for name, _ in parts] if len(parts) > 1 else []
+    return merged
+
+
 def correctness_section(profile: str, setup: dict[str, Any], args: argparse.Namespace) -> str:
     # Only the setup: nothing that changes from run to run, so that the
     # description is edited only when the setup changes.
+    if args.pr:
+        when = f"On request in a pull request ([gpu-pr.yml]({REPO_URL}/blob/main/.github/workflows/gpu-pr.yml))"
+        source = "the pull request merged into main"
+    else:
+        when = (f"{SCHEDULES.get(profile, 'On demand')} ([{WORKFLOWS[profile]}]"
+                f"({REPO_URL}/blob/main/.github/workflows/{WORKFLOWS[profile]}))")
+        source = "the latest main"
     lines = [
         f"## {TITLES[profile]}",
         "",
-        f"{SCHEDULES.get(profile, 'On demand')} ([{WORKFLOWS[profile]}]"
-        f"({REPO_URL}/blob/main/.github/workflows/{WORKFLOWS[profile]})) on "
-        f"{gpus_line(setup.get('gpus', []))}. kvcached is installed from the latest main into "
+        f"{when} on {machine_line(setup)}. kvcached is installed from {source} into "
         "each engine's official image; each case starts one server in it.",
         "",
         *engines_table(setup),
@@ -193,8 +228,8 @@ def correctness_section(profile: str, setup: dict[str, Any], args: argparse.Name
         "",
     ]
     # The workload and checks come from the same code for every profile, so
-    # only the nightly section spells them out.
-    same = profile != "nightly"
+    # only the nightly section of the issue spells them out.
+    same = profile != "nightly" and not args.pr
     if same:
         lines += ["Each case runs the workload and checks described under "
                   "[Nightly correctness](#nightly-correctness)."]
@@ -251,32 +286,43 @@ def logs_line(args: argparse.Namespace, days: int) -> str:
             "with every request's tokens, setup.json, run.log, GPU state at the end.")
 
 
-def reason(args: argparse.Namespace, results: Path, gpu: str) -> str:
+def reason(results: Path, gpu: str) -> str:
     """Why a run produced no results, without the provider's details: those
     are in the run log."""
-    launch = Path(args.reason_file) if args.reason_file else None
-    if launch and launch.exists() and "No capacity in" in launch.read_text(errors="replace"):
-        return f"No {gpu} GPU was available; the run log has the details."
     if (results / "error.txt").exists():
         return f"No {gpu} GPU could be obtained; the run log has the details."
     return "The tests did not finish; the run log has the details."
 
 
-def correctness_comment(profile: str, results: Path, args: argparse.Namespace) -> str:
-    summary, setup = load(results / "summary.json"), load(results / "setup.json") or {}
+def correctness_comment(profile: str, dirs: list[Path], args: argparse.Namespace) -> str:
     title = TITLES.get(profile, profile)
-    if not summary:
+    parts = [(d, load(d / "summary.json"), load(d / "setup.json") or {}) for d in dirs]
+    ran = [(part_name(d), summary, setup) for d, summary, setup in parts if summary]
+    missing = [part_name(d) for d, summary, _ in parts if not summary]
+    if not ran:
         return "\n".join(header(title, "DID NOT RUN", args)
-                         + ["", reason(args, results, "L4")]) + "\n"
+                         + ["", reason(dirs[0], "L4")]) + "\n"
+    summary = {"cases": [c for _, run, _ in ran for c in run.get("cases", [])]}
+    setup = merge_setups([(name, setup) for name, _, setup in ran])
     # The <engine>-setup entries are the kvcached installs, not test cases.
-    cases = [c for c in summary.get("cases", []) if not c["name"].endswith("-setup")]
-    failed = [c for c in summary.get("cases", []) if not c.get("ok")]
-    verdict = f"FAIL ({len(failed)} of {len(cases)} cases)" if failed else "PASS"
-    env = gpus_line(setup.get("gpus", []))
+    cases = [c for c in summary["cases"] if not c["name"].endswith("-setup")]
+    failed = [c for c in summary["cases"] if not c.get("ok")]
+    not_run = "".join(f"; the {name} cases did not finish" for name in missing)
+    verdict = (f"FAIL ({len(failed)} of {len(cases)} cases{not_run})" if failed or missing
+               else "PASS")
     images = ", ".join(f"`{i.get('image')}`" for i in setup.get("engines", {}).values())
-    lines = header(title, verdict, args) + [f"{env} · {images}", ""]
+    lines = header(title, verdict, args) + [f"{machine_line(setup)} · {images}", ""]
+    if missing:
+        lines += [f"The {name} cases did not finish; the run log has the details."
+                  for name in missing] + [""]
     lines += failed_cases(summary, setup) if failed else [f"All {len(cases)} cases passed."]
-    lines += ["", "Setup of every case: the issue description. " + logs_line(args, 30)]
+    if args.pr:
+        # The pull request may change the cases, so its setup is its own.
+        section = correctness_section(profile, setup, args).split("\n", 2)[2]
+        lines += ["", "<details><summary>Setup of every case</summary>", "", section.strip(),
+                  "", "</details>", "", logs_line(args, 30)]
+    else:
+        lines += ["", "Setup of every case: the issue description. " + logs_line(args, 30)]
     return "\n".join(lines)[:MAX_COMMENT] + "\n"
 
 
@@ -321,7 +367,7 @@ def perf_comment(results: Path, args: argparse.Namespace) -> str:
     title = TITLES["perf"]
     if not perf:
         return "\n".join(header(title, "DID NOT RUN", args)
-                         + ["", reason(args, results, "H100")]) + "\n"
+                         + ["", reason(results, "H100")]) + "\n"
     setup = load(results / "perf" / "setup.json") or {}
     sandbox = load(results / "sandbox.json") or {}
     e2e, e2e_setup = load(results / "e2e" / "summary.json"), load(results / "e2e" / "setup.json")
@@ -421,7 +467,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("correctness", "perf"):
         p = sub.add_parser(name)
-        p.add_argument("--results", required=True, type=Path)
+        p.add_argument("--results", required=True, type=Path, nargs="+")
         p.add_argument("--comment", required=True, type=Path)
         p.add_argument("--section", required=True, type=Path)
         p.add_argument("--run-url", required=True)
@@ -429,9 +475,9 @@ def main() -> int:
         p.add_argument("--subject", default="")
         p.add_argument("--prev", default="", help="SHA:CONCLUSION of the previous run")
         p.add_argument("--artifact-url", default="")
-        p.add_argument("--reason-file", default="")
         if name == "correctness":
             p.add_argument("--profile", required=True)
+            p.add_argument("--pr", type=int, help="the pull request the run tested")
     p = sub.add_parser("splice")
     p.add_argument("--body", required=True, type=Path)
     p.add_argument("--name", required=True, choices=SECTIONS)
@@ -444,11 +490,13 @@ def main() -> int:
         return 0
     if a.cmd == "correctness":
         a.comment.write_text(correctness_comment(a.profile, a.results, a))
-        setup = load(a.results / "setup.json")
-        section = correctness_section(a.profile, setup, a) if setup else None
+        setups = [(part_name(d), load(d / "setup.json")) for d in a.results]
+        # Only a complete run describes the setup; otherwise keep the last one.
+        section = (correctness_section(a.profile, merge_setups(setups), a)
+                   if all(s for _, s in setups) else None)
     else:
-        a.comment.write_text(perf_comment(a.results, a))
-        section = perf_section(a.results, a)
+        a.comment.write_text(perf_comment(a.results[0], a))
+        section = perf_section(a.results[0], a)
     # No section when the run produced no setup: the description keeps the last one.
     if section:
         a.section.write_text(section)

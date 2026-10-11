@@ -78,9 +78,15 @@ def sh(cmd: list[str], timeout: Optional[float] = None, check: bool = False,
     return proc
 
 
-def gpu_processes() -> list[str]:
-    """Compute processes on any GPU of this host."""
-    out = sh(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"])
+def gpu_select(gpus: str) -> list[str]:
+    """nvidia-smi's selection of the GPUs a run uses: host indices, or all."""
+    return [] if gpus == "all" else ["-i", gpus]
+
+
+def gpu_processes(gpus: str = "all") -> list[str]:
+    """Compute processes on the GPUs a run uses."""
+    out = sh(["nvidia-smi", *gpu_select(gpus), "--query-compute-apps=pid",
+              "--format=csv,noheader"])
     return [x.strip() for x in out.stdout.decode().splitlines() if x.strip()]
 
 
@@ -103,19 +109,22 @@ class Container:
     # Where out_dir is visible to the processes the servers run in.
     out_path = OUT_IN_CONTAINER
 
-    def __init__(self, engine: EngineSpec, name: str, gpu: str, out_dir: Path,
+    def __init__(self, engine: EngineSpec, name: str, gpus: str, out_dir: Path,
                  hf_cache: Path) -> None:
         self.engine = engine
         self.name = name
-        # The GPU the single-GPU servers use; memory is sampled on it.
-        self.gpu = gpu
+        # The host GPUs of the run, comma-separated, or "all"; the container
+        # sees only these. TP cases span them; the others use the first, on
+        # which memory is sampled.
+        self.gpus = gpus
+        self.gpu = "0" if gpus == "all" else gpus.split(",")[0]
         self.out_dir = out_dir
 
         sh(DOCKER + ["rm", "-f", name])
         # --init reaps the engine's orphaned workers, so an exited server's
         # process group really disappears instead of lingering as zombies.
-        # All GPUs: TP cases span them; others use GPU 0 by default.
-        sh(DOCKER + ["run", "-d", "--init", "--name", name, "--gpus", "all",
+        device = "all" if gpus == "all" else f'"device={gpus}"'
+        sh(DOCKER + ["run", "-d", "--init", "--name", name, "--gpus", device,
                      "--ipc=host", "--network=host", "-v", f"{hf_cache}:/root/.cache/huggingface",
                      "-v", f"{out_dir}:{OUT_IN_CONTAINER}", "-e", "HF_TOKEN",
                      "--entrypoint", "sleep", engine.image, "infinity"], check=True)
@@ -229,10 +238,11 @@ class LocalHost(Container):
     """Run the servers directly on this machine, e.g. inside a sandbox built
     from the engine image, where there is no Docker."""
 
-    def __init__(self, engine: EngineSpec, name: str, gpu: str, out_dir: Path) -> None:
+    def __init__(self, engine: EngineSpec, name: str, gpus: str, out_dir: Path) -> None:
         self.engine = engine
         self.name = name
-        self.gpu = gpu
+        self.gpus = gpus
+        self.gpu = "0" if gpus == "all" else gpus.split(",")[0]
         self.out_dir = out_dir
         self.out_path = str(out_dir)
 
@@ -361,11 +371,11 @@ def stop_and_check(ct: Container, srv: Server, res: CaseResult, prefix: str = ""
                 f"{log['kvcached_lines']} [kvcached] lines")
 
 
-def check_gpu_released(res: CaseResult) -> None:
+def check_gpu_released(res: CaseResult, gpus: str) -> None:
     deadline = time.time() + 60
-    while gpu_processes() and time.time() < deadline:
+    while gpu_processes(gpus) and time.time() < deadline:
         time.sleep(2)
-    procs = gpu_processes()
+    procs = gpu_processes(gpus)
     res.add("no_gpu_process_left", not procs, ", ".join(procs))
 
 
@@ -394,7 +404,7 @@ CHECKS = {
     "kvcached_inactive": "the native server's log has no [kvcached] line",
     "shm_removed": "no /dev/shm segment of the server is left",
     "socket_dirs_removed": "no /tmp/kvcached-tp-* directory of the server is left",
-    "no_gpu_process_left": "no process is left on any GPU",
+    "no_gpu_process_left": "no process is left on the GPUs of the run",
     "<phase>_tokens_equal": "gen_seq and apc_0..2 give the same greedy tokens as native",
     "apc_<n>_cached_tokens_equal": "every request reports the same cached_tokens as native",
 }
@@ -424,7 +434,7 @@ def run_server_case(ct: Container, case: Case, run_id: str, port: int, timeout: 
         res.add("server_alive_after_load", ct.alive(pid))
 
     stop_and_check(ct, srv, res)
-    check_gpu_released(res)
+    check_gpu_released(res, ct.gpus)
     return res
 
 
@@ -471,8 +481,8 @@ def write_summary(out: Path, results: list[CaseResult]) -> bool:
     return ok
 
 
-def gpu_info() -> list[dict[str, str]]:
-    out = sh(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+def gpu_info(gpus: str = "all") -> list[dict[str, str]]:
+    out = sh(["nvidia-smi", *gpu_select(gpus), "--query-gpu=name,memory.total,driver_version",
               "--format=csv,noheader"])
     rows = [[x.strip() for x in line.split(",")] for line in out.stdout.decode().splitlines()]
     return [dict(zip(("name", "memory", "driver"), row)) for row in rows if len(row) == 3]
@@ -497,7 +507,8 @@ def kvcached_sha(repo: Path) -> Optional[str]:
 
 
 def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, port: int,
-                engines: dict[str, dict[str, Any]], results: list[CaseResult]) -> None:
+                gpus: str, engines: dict[str, dict[str, Any]],
+                results: list[CaseResult]) -> None:
     """Record what this run tested, for the CI results issue (tools/ci/report.py)."""
     from e2e import elastic
 
@@ -508,7 +519,7 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
         info.update(env=dict(ENGINES[engine].env),
                     server=shlex.join(server_argv(engine, "MODEL", (), port)))
     setup = {
-        "profile": profile, "kvcached_sha": sha, "gpus": gpu_info(), "engines": engines,
+        "profile": profile, "kvcached_sha": sha, "gpus": gpu_info(gpus), "engines": engines,
         "stop_signal": os.environ.get("E2E_STOP_SIGNAL", "INT"),
         "model_revisions": {h: model_revision(hf_cache, h) for h in sorted(hf_ids)},
         "workload": WORKLOAD, "checks": CHECKS,
@@ -527,7 +538,9 @@ def main() -> int:
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     ap.add_argument("--hf-cache", type=Path,
                     default=Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser())
-    ap.add_argument("--gpu", default="0", help="GPU index for the containers")
+    ap.add_argument("--gpus", default="all",
+                    help="host GPUs the run uses, comma-separated indices (default: all); "
+                         "the containers see only these, and single-GPU servers use the first")
     ap.add_argument("--engines", nargs="*", help="subset of the profile's engines")
     ap.add_argument("--models", nargs="*", help="subset of the profile's models")
     ap.add_argument("--skip-elastic", action="store_true")
@@ -556,8 +569,8 @@ def main() -> int:
         for engine in engines:
             spec = ENGINES[engine]
             name = f"kvcached-e2e-{engine}-{run_id}"
-            ct = (LocalHost(spec, name, a.gpu, out) if a.local
-                  else Container(spec, name, a.gpu, out, a.hf_cache))
+            ct = (LocalHost(spec, name, a.gpus, out) if a.local
+                  else Container(spec, name, a.gpus, out, a.hf_cache))
             setup = CaseResult(f"{engine}-setup")
             try:
                 if not a.no_install:
@@ -609,7 +622,8 @@ def main() -> int:
         for ct in containers.values():
             ct.remove()
 
-    write_setup(out, a.profile, kvcached_sha(a.repo), a.hf_cache, a.port, engine_info, results)
+    write_setup(out, a.profile, kvcached_sha(a.repo), a.hf_cache, a.port, a.gpus, engine_info,
+                results)
     ok = write_summary(out, results)
     return 0 if ok else 1
 

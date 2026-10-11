@@ -9,6 +9,9 @@ the fix from three sides: stopping the listener unlinks the socket and the
 directory, vLLM's Worker.shutdown() stops it, and kvctl delete removes the
 directory derived from an IPC name.
 
+The parent-side fallback for workers killed before that runs (issue #510)
+is WorkerSocketCleanup in kvcached.utils; its tests are at the end.
+
 CPU-only: the compiled extension is stubbed if absent.
 """
 
@@ -690,6 +693,176 @@ def test_delayed_stop_keeps_replacement_generation_socket(socket_root, monkeypat
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+def _bind_worker_socket(path):
+    """A listening socket at *path*, as a live worker binds it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen()
+    return server
+
+
+def _accepts_connection(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(5)
+        try:
+            probe.connect(path)
+        except ConnectionRefusedError:
+            return False
+    return True
+
+
+def test_worker_socket_paths_follow_the_listener_rule(socket_root):
+    for rank, pp_rank in ((0, 0), (1, 0), (0, 1), (3, 2)):
+        assert kvcached.utils.get_tp_worker_socket_path(
+            tp_ipc_util.SOCKET_DIR, rank, pp_rank
+        ) == tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+
+
+def test_parent_cleanup_removes_sockets_killed_workers_left(socket_root):
+    """The leftover of a process-group SIGTERM (issue #510): every node of
+    the deployment stays, nobody listens, Worker.shutdown() never ran."""
+    paths = [tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+             for pp_rank in range(2) for rank in range(2)]
+    for path in paths:
+        _bind_worker_socket(path).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=2, pp_size=2)
+
+    assert cleanup.unlink() is True
+
+    for path in paths:
+        assert not os.path.exists(path)
+    assert not os.path.exists(os.path.join(tp_ipc_util.SOCKET_DIR, "pp1"))
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+    assert cleanup.unlink() is True
+
+
+def test_parent_cleanup_keeps_a_socket_a_live_worker_still_serves(socket_root):
+    paths = [tp_ipc_util.get_worker_socket_path(rank) for rank in range(2)]
+    workers = [_bind_worker_socket(path) for path in paths]
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=2, pp_size=1)
+    workers[1].close()
+    try:
+        assert cleanup.unlink() is False
+        assert os.path.exists(paths[0])
+        assert _accepts_connection(paths[0])
+        assert not os.path.exists(paths[1])
+        assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+    finally:
+        workers[0].close()
+    assert cleanup.unlink() is True
+    assert not os.path.exists(paths[0])
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+
+
+@pytest.mark.parametrize("replacement_alive", [True, False])
+def test_parent_cleanup_keeps_a_replacement_generation_socket(socket_root, replacement_alive):
+    """A same-name restart binds a new node at the same path. The old
+    deployment's cleanup must not touch it, served or already dead."""
+    path = tp_ipc_util.get_worker_socket_path(0)
+    _bind_worker_socket(path).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=1, pp_size=1)
+    # Created beside the old node so it cannot reuse the old inode number,
+    # then renamed into place like the restart's unlink and bind.
+    replacement = _bind_worker_socket(path + ".new")
+    os.rename(path + ".new", path)
+    try:
+        if not replacement_alive:
+            replacement.close()
+        assert cleanup.unlink() is True
+        assert os.path.exists(path)
+        assert _accepts_connection(path) is replacement_alive
+        assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+    finally:
+        replacement.close()
+
+
+def test_parent_cleanup_remembers_only_nodes_present_at_capture(socket_root):
+    paths = [tp_ipc_util.get_worker_socket_path(rank) for rank in range(2)]
+    _bind_worker_socket(paths[0]).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=2, pp_size=1)
+    _bind_worker_socket(paths[1]).close()  # another generation's node
+
+    assert cleanup.unlink() is True
+
+    assert not os.path.exists(paths[0])
+    assert os.path.exists(paths[1])
+    assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+
+
+def test_parent_cleanup_leaves_a_foreign_rank_and_its_directory(socket_root):
+    """Only the deployment's own ranks are remembered: a w7.sock from some
+    earlier TP=8 generation is not this deployment's to remove."""
+    own = tp_ipc_util.get_worker_socket_path(0)
+    foreign = tp_ipc_util.get_worker_socket_path(7)
+    _bind_worker_socket(own).close()
+    _bind_worker_socket(foreign).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=1, pp_size=1)
+
+    assert cleanup.unlink() is True
+
+    assert not os.path.exists(own)
+    assert os.path.exists(foreign)
+    assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+
+
+def test_parent_cleanup_keeps_a_socket_it_cannot_probe(socket_root, monkeypatch):
+    path = tp_ipc_util.get_worker_socket_path(0)
+    _bind_worker_socket(path).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=1, pp_size=1)
+
+    class Probe(socket.socket):
+        def connect(self, address):
+            raise PermissionError("injected probe failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kvcached.utils.socket, "socket", Probe)
+        assert cleanup.unlink() is False
+    assert os.path.exists(path)
+    assert cleanup.unlink() is True
+    assert not os.path.exists(path)
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_completed_parent_cleanup_leaves_a_replacement_directory(socket_root, pp_rank):
+    """vLLM calls the owner's shutdown more than once per teardown. After
+    the first call removed everything, a same-name replacement paused
+    between its makedirs() and bind() must keep the directory it created,
+    so its bind cannot fail with ENOENT."""
+    path = tp_ipc_util.get_worker_socket_path(0, pp_rank)
+    _bind_worker_socket(path).close()
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=1, pp_size=2)
+    assert cleanup.unlink() is True
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+
+    os.makedirs(os.path.dirname(path))  # the replacement, before its bind
+    assert cleanup.unlink() is True
+
+    assert os.path.isdir(os.path.dirname(path))
+    _bind_worker_socket(path).close()  # the replacement's bind succeeds
+
+
+def test_parent_cleanup_retry_that_removes_nothing_leaves_directories_alone(socket_root):
+    """A retry kept for a live worker removes no directory once that
+    worker's own stop has removed its socket: the empty directory it finds
+    then belongs to whoever created it again."""
+    paths = [tp_ipc_util.get_worker_socket_path(rank) for rank in range(2)]
+    workers = [_bind_worker_socket(path) for path in paths]
+    cleanup = kvcached.utils.WorkerSocketCleanup(tp_ipc_util.SOCKET_DIR, tp_size=2, pp_size=1)
+    workers[0].close()
+    assert cleanup.unlink() is False  # w1 is still served
+    assert os.path.exists(paths[1])
+
+    workers[1].close()  # the worker's own stop: unlink, then rmdir
+    os.unlink(paths[1])
+    os.rmdir(tp_ipc_util.SOCKET_DIR)
+    os.makedirs(tp_ipc_util.SOCKET_DIR)  # a replacement, before its bind
+    assert cleanup.unlink() is True
+
+    assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
+    _bind_worker_socket(paths[1]).close()
 
 
 if __name__ == "__main__":

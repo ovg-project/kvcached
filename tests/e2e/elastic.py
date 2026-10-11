@@ -291,4 +291,4 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             stop_and_check(host, srv, res, prefix=f"{srv.case.name}_")
         if ballast is not None:
             ct_a.stop_server(ballast)
-        check_gpu_released(res)
+        check_gpu_released(res, ct_a.gpus)
