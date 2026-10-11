@@ -21,7 +21,12 @@ are spread over — not by how many blocks it kept.
 
 ```bash
 MODEL=/path/to/Qwen3-4B ./run_idle_footprint.py
+MODEL=/path/to/Qwen3-4B ./run_idle_footprint.py --backend sglang
 ```
+
+The default backend is vLLM. Both experiment runners accept
+`--backend {vllm,sglang}`. `--serve-arg` forwards one extra argument to the
+selected server; repeat it for multiple arguments.
 
 Run it once per branch and compare the `idle_gb` line. Useful knobs:
 

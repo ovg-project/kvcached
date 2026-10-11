@@ -11,10 +11,12 @@ runner's ``runner_only_attn_layers`` and never adds them to any tensor's
 ``shared_by``; direct-indexing them against the layer-to-tensor map was the
 KeyError reported in issue #417.
 """
+import sys
 from types import SimpleNamespace
 
 import pytest
 
+from kvcached.integration.vllm import patches
 from kvcached.integration.vllm.patches import (
     _alias_shared_kv_layers,
     _get_group_size,
@@ -107,7 +109,7 @@ class TestAliasSharedKvLayers:
 
 
 class TestSharingScenario:
-    """End-to-end over the helpers, shaped like the #417 report.
+    """Sharing helpers and patched reshape, shaped like the #417 report.
 
     Two attention groups of two tensor-backed layers each; vLLM appended two
     sharing layers to group 0's layer_names and registered them as
@@ -148,17 +150,29 @@ class TestSharingScenario:
                 for layer_name in grp.layer_names:
                     layer_to_tensor_cfg[layer_name]
 
-    def test_pool_binding_and_aliasing_cover_all_layers(self):
+    def test_patched_reshape_binds_shared_layers(self, monkeypatch):
+        class Runner(SimpleNamespace):
+            def _reshape_kv_cache_tensors(self, *args, **kwargs):
+                raise AssertionError("Expected the kvcached reshape path")
+
+        # This fixture contains attention layers only; no Mamba or dtype math.
+        monkeypatch.setattr(patches, "_is_mamba_spec", lambda spec: False)
+        monkeypatch.setitem(
+            sys.modules, "vllm.utils.torch_utils",
+            SimpleNamespace(get_dtype_size=lambda dtype: dtype.itemsize),
+        )
+        monkeypatch.setenv("ENABLE_KVCACHED", "true")
+        patch = patches.GPUModelRunnerPatch()
+        assert patch.add_reshape_methods(Runner)
+        assert patch.patch_reshape_methods(Runner)
+        runner = Runner(**vars(self.runner), kv_cache_config=self.cfg)
+
         runner_only = _get_runner_only_attn_layers(self.runner)
         pools = [object(), object()]
         assert _get_group_size(self.cfg, runner_only) == len(pools)
 
-        kv_caches = {}
-        for grp in self.cfg.kv_cache_groups:
-            for pool_idx, layer_name in enumerate(
-                    _tensor_backed_layer_names(grp, runner_only)):
-                kv_caches[layer_name] = pools[pool_idx]
-        _alias_shared_kv_layers(kv_caches, self.runner.shared_kv_cache_layers)
+        # vLLM >=0.20 passes raw pools and kernel block sizes, not the config.
+        kv_caches = runner._reshape_kv_cache_tensors(pools, [16, 16])
 
         assert set(kv_caches) == {"a0", "a1", "b0", "b1", "s0", "s1"}
         assert kv_caches["s0"] is kv_caches["a0"]
