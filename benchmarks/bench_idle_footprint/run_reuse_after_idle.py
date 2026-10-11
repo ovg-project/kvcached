@@ -17,6 +17,7 @@ prompts to draw from, so the second round re-requests what the first one cached
 and its hit rate reads out directly what the trim kept.
 
     MODEL=/path/to/Qwen3-4B ./run_reuse_after_idle.py
+    MODEL=/path/to/Qwen3-4B ./run_reuse_after_idle.py --backend sglang
 
 Run it once per branch and compare `hit_rate_after_idle` alongside `idle_gb`.
 """
@@ -33,22 +34,16 @@ sys.path.insert(0, HERE)
 from probe_mem import detect_segments  # noqa: E402
 from run_idle_footprint import (  # noqa: E402
     geometry,
-    http_text,
     launch,
-    metric,
     our_segments,
+    prefix_cache_counters,
     snapshot,
+    terminate,
     wait_idle,
     wait_ready,
 )
 
 GB = 1024**3
-
-
-def counters(port):
-    text = http_text(f"http://127.0.0.1:{port}/metrics")
-    return (metric(text, "vllm:prefix_cache_queries_total") or 0.0,
-            metric(text, "vllm:prefix_cache_hits_total") or 0.0)
 
 
 def send_traffic(port, workload, seed, hot_seed):
@@ -60,6 +55,7 @@ def send_traffic(port, workload, seed, hot_seed):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--backend", choices=("vllm", "sglang"), default="vllm")
     ap.add_argument("--model", default=os.environ.get("MODEL"))
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--gap", type=float, default=45.0,
@@ -82,10 +78,15 @@ def main():
               "prefixes, which every policy keeps, and hit rate will not move",
               file=sys.stderr)
 
-    log = os.path.join(HERE, "server.log")
+    log_suffix = "" if args.backend == "vllm" else f"-{args.backend}"
+    log = os.path.join(HERE, f"server{log_suffix}.log")
     before = set(detect_segments())
-    proc = launch(args.model, args.port, log, args.serve_arg)
-    result = {"gap_s": args.gap, "workload": args.workload}
+    proc = launch(args.backend, args.model, args.port, log, args.serve_arg)
+    result = {
+        "backend": args.backend,
+        "gap_s": args.gap,
+        "workload": args.workload,
+    }
     try:
         if not wait_ready(args.port, log, proc):
             print(f"server failed to start; see {log}")
@@ -95,10 +96,10 @@ def main():
         bpp = result["geometry"].get("bytes_per_page")
 
         # First round fills the cache from the pool.
-        q0, h0 = counters(args.port)
+        q0, h0 = prefix_cache_counters(args.backend, args.port, log)
         send_traffic(args.port, args.workload, seed=1234, hot_seed=99)
-        wait_idle(args.port, args.idle_settle)
-        q1, h1 = counters(args.port)
+        wait_idle(args.backend, args.port, args.idle_settle)
+        q1, h1 = prefix_cache_counters(args.backend, args.port, log)
         result["hit_rate_before_idle"] = round((h1 - h0) / (q1 - q0), 4) \
             if q1 > q0 else None
 
@@ -112,8 +113,8 @@ def main():
 
         # Second round re-requests the same pool: whatever the trim kept, hits.
         send_traffic(args.port, args.workload, seed=5678, hot_seed=99)
-        wait_idle(args.port, args.idle_settle)
-        q2, h2 = counters(args.port)
+        wait_idle(args.backend, args.port, args.idle_settle)
+        q2, h2 = prefix_cache_counters(args.backend, args.port, log)
         result["hit_rate_after_idle"] = round((h2 - h1) / (q2 - q1), 4) \
             if q2 > q1 else None
         result["hits_after_idle"] = int(h2 - h1)
@@ -123,11 +124,7 @@ def main():
             with open(args.out, "w") as f:
                 json.dump(result, f, indent=1)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        terminate(proc)
     return 0
 
 

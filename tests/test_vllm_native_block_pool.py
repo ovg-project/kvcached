@@ -21,6 +21,13 @@ class PhysicalPool:
         self.free_ids = list(range(1, size))
         self.allocated = set()
         self.reported_free = None
+        self.block_mem_size = 16 * 32
+        self.page_size = 4 * self.block_mem_size
+        self.page_allocator = object()
+
+    def get_page_occupancy(self, pages):
+        return {page: sum(bid // 4 == page for bid in self.allocated | {0})
+                for page in pages}
 
     def alloc(self, count):
         if count > len(self.free_ids):

@@ -12,7 +12,13 @@ from typing import Any, Dict, Optional, Tuple, cast
 
 from kvcached import vmm_ops
 from kvcached.errors import MapQuarantinedError, StateConsistencyError
-from kvcached.utils import get_tp_socket_dir, normalize_gpu_device
+from kvcached.utils import (
+    get_tp_socket_dir,
+    get_tp_worker_socket_path,
+    normalize_gpu_device,
+    path_identity,
+    remove_dir_if_empty,
+)
 
 kv_tensors_created = vmm_ops.kv_tensors_created
 map_to_kv_tensors = vmm_ops.map_to_kv_tensors
@@ -59,10 +65,7 @@ def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
 
     The full path is guaranteed to be <= 108 characters (Unix domain socket limit).
     """
-    if pp_rank > 0:
-        socket_path = os.path.join(SOCKET_DIR, f"pp{pp_rank}", f"w{rank}.sock")
-    else:
-        socket_path = os.path.join(SOCKET_DIR, f"w{rank}.sock")
+    socket_path = get_tp_worker_socket_path(SOCKET_DIR, rank, pp_rank)
 
     if len(socket_path) > 108:
         raise RuntimeError(
@@ -144,7 +147,7 @@ class _WorkerListener:
         # The pathname alone does not identify this listener: a same-name
         # restart can bind a new socket at the same path. Unlink only while
         # the path still refers to the inode this listener bound.
-        self.socket_id = _path_identity(socket_path)
+        self.socket_id = path_identity(socket_path)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self._conns: set[socket.socket] = set()
@@ -221,32 +224,16 @@ class _WorkerListener:
                 os.unlink(self.socket_path)
             except FileNotFoundError:
                 pass
-        _remove_dir_if_empty(self.socket_dir)
+        remove_dir_if_empty(self.socket_dir)
         if self.socket_dir != self.root_dir:
-            _remove_dir_if_empty(self.root_dir)
+            remove_dir_if_empty(self.root_dir)
         self._stopped = True
         removed = f", removed {self.socket_path}" if owned else ""
         print(f"Worker {self.rank} IPC listener stopped{removed}")
         return True
 
     def owns_path(self) -> bool:
-        return self.socket_id is not None and _path_identity(self.socket_path) == self.socket_id
-
-
-def _path_identity(path: str) -> Optional[Tuple[int, int]]:
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return None
-    return st.st_dev, st.st_ino
-
-
-def _remove_dir_if_empty(path: str) -> None:
-    try:
-        os.rmdir(path)
-    except OSError:
-        # Still holds another worker's socket, or already gone.
-        pass
+        return self.socket_id is not None and path_identity(self.socket_path) == self.socket_id
 
 
 _listeners: Dict[Tuple[int, int], _WorkerListener] = {}

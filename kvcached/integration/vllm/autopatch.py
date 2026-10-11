@@ -6,7 +6,11 @@ import types
 
 from wrapt.importer import when_imported
 
-from kvcached.integration.patch_base import PatchManager, log_patch_results
+from kvcached.integration.patch_base import (
+    PatchManager,
+    is_integration_version_supported,
+    log_patch_results,
+)
 from kvcached.integration.vllm.model_runner_v2 import KVLayoutV2Patch, ModelRunnerV2Patch
 from kvcached.integration.vllm.model_runner_v2_028 import (
     VLLM_028_MRV2_RANGE,
@@ -44,6 +48,9 @@ def _env_enabled() -> bool:
 def _patch_vllm(_vllm: types.ModuleType) -> None:
     if not _env_enabled():
         logger.debug("Disabled by KVCACHED_AUTOPATCH")
+        return
+
+    if not is_integration_version_supported("vllm", VLLM_ALL_RANGE):
         return
 
     # Create patch manager and register version-specific vLLM patches

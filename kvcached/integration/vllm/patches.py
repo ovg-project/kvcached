@@ -384,7 +384,10 @@ VLLM_V8_RANGE = ">=0.8.4,<0.9.0"  # vLLM 0.8.x versions, need to cover 0.8.5.pos
 VLLM_V9_PLUS_RANGE = ">=0.9.0"  # vLLM 0.9.x and 0.9+.x versions
 VLLM_V9_RANGE = ">=0.9.0,<=0.9.2"  # vLLM 0.9.x versions
 VLLM_V10_RANGE = ">0.9.2"  # vLLM 0.10.x+ versions, need to cover 0.10.0rc1
-VLLM_ALL_RANGE = ">=0.8.4"  # All supported versions
+# All supported versions. Autopatch leaves any other vLLM unpatched, so raise
+# the upper bound when a new release is supported. "<X.dev0" also keeps out
+# pre-release builds of X.
+VLLM_ALL_RANGE = ">=0.17.0,<0.31.0.dev0"
 VLLM_MRV2_RANGE = ">=0.29.0,<0.31.0"  # MRV2/native-cache adapter compatibility window
 
 
@@ -727,6 +730,24 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+                from kvcached.integration.vllm.page_eviction import PageEvictionIndex
+
+                self._page_eviction = (
+                    PageEvictionIndex(self.kv_cache_manager)
+                    if enable_caching and getattr(self.kv_cache_manager, "page_allocator", None) is not None
+                    else None
+                )
+
+            def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
+                block = self._evictable_blocks.pop(block_id, None)
+                if block is not None and self._page_eviction is not None:
+                    self._page_eviction.remove(block_id)
+                return block
+
+            def _free_block_ids(self, block_ids: list[int]) -> None:
+                self.kv_cache_manager.free(block_ids)
+                if self._page_eviction is not None:
+                    self._page_eviction.changed(block_ids)
 
             def _get_one_cached_block(self, key: Any) -> Optional[KVCacheBlock]:
                 blocks = self._cached_blocks.get(key)
@@ -882,33 +903,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 can empty outright, cheapest first; draining a page only part of
                 the way costs hit rate and frees nothing.
                 """
-                mgr = self.kv_cache_manager
-                allocator = getattr(mgr, "page_allocator", None)
-                if allocator is None:
+                if (self._page_eviction is None
+                        or getattr(self.kv_cache_manager, "page_allocator", None) is None):
                     return []
-
-                bids = list(self._evictable_blocks)
-                by_page = allocator.group_indices_by_page(
-                    bids, mgr.block_mem_size)
-                # Blocks held by running requests are absent from
-                # _evictable_blocks, so a page whose occupancy exceeds its
-                # evictable count cannot be emptied here -- skip it.
-                occupancy = mgr.get_page_occupancy(list(by_page))
-                lru_rank = {bid: i for i, bid in enumerate(bids)}
-
-                pages = [(len(ids), max(lru_rank[b] for b in ids), ids)
-                         for page_id, ids in by_page.items()
-                         if len(ids) >= occupancy.get(page_id, 0)]
-                # Cheapest page first; break ties on the page whose most
-                # recently used block is oldest, so hot pages are kept.
-                pages.sort(key=lambda page: (page[0], page[1]))
-
-                victims: list[int] = []
-                for cost, _rank, ids in pages:
-                    if len(victims) + cost > num_to_evict:
-                        break
-                    victims.extend(ids)
-                return victims
+                return self._page_eviction.victims(num_to_evict)
 
             def _evict_blocks_from_pool(self,
                                         num_to_evict: int,
@@ -925,8 +923,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 reuse the freed logical slot immediately (allocation shortage)
                 get no page benefit -- the page is neither unmapped nor
                 remapped -- so reordering victims by page only trades away a
-                newer prefix for an older one and pays for the full evictable
-                scan and page sort.
+                newer prefix for an older one.
 
                 Returns the number of blocks actually evicted.
                 """
@@ -934,19 +931,21 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if num_to_evict <= 0:
                     return 0
 
-                if page_aware:
-                    ordered = self._page_aligned_victims(num_to_evict)
-                    chosen = set(ordered)
-                    # Top up in LRU order: page alignment is best-effort, but
-                    # the caller still needs the count it asked for.
-                    ordered.extend(bid for bid in self._evictable_blocks
-                                   if bid not in chosen)
-                else:
-                    ordered = list(self._evictable_blocks)
+                ordered = (self._page_aligned_victims(num_to_evict)
+                           if page_aware and num_to_evict < len(self._evictable_blocks) else [])
+                chosen = set(ordered)
+                # Stop as soon as the budget is filled, including for pure LRU
+                # allocation shortages. Never copy the whole evictable pool.
+                if len(ordered) < num_to_evict:
+                    for bid in self._evictable_blocks:
+                        if bid not in chosen:
+                            ordered.append(bid)
+                            if len(ordered) == num_to_evict:
+                                break
 
                 ids_to_free: list[int] = []
-                for bid in ordered[:num_to_evict]:
-                    block = self._evictable_blocks.pop(bid, None)
+                for bid in ordered:
+                    block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._remove_cached_block(key, bid)
@@ -954,7 +953,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         _reset_block_hash(block)
                     ids_to_free.append(bid)
                 if ids_to_free:
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
+                if not self._evictable_blocks and self._page_eviction is not None:
+                    self._page_eviction.clear()
                 return len(ids_to_free)
 
             def get_new_blocks(
@@ -997,6 +998,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # contract violation rather than a recoverable runtime state.
                 assert len(block_ids) == num_blocks, (
                     f"alloc returned {len(block_ids)} blocks, expected {num_blocks}")
+                if self._page_eviction is not None:
+                    self._page_eviction.changed(block_ids)
 
                 blocks = []
                 for bid in block_ids:
@@ -1015,11 +1018,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         for block in block_list:
                             block.ref_cnt += 1
                             # Reactivate: remove from evictable pool
-                            self._evictable_blocks.pop(block.block_id, None)
+                            self._remove_evictable(block.block_id)
                 else:
                     for block in blocks:
                         block.ref_cnt += 1
-                        self._evictable_blocks.pop(block.block_id, None)
+                        self._remove_evictable(block.block_id)
 
             def free_blocks(
                 self,
@@ -1050,12 +1053,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         if block.block_id in self._block_id_to_key:
                             # Cached block: retain for cross-request reuse
                             self._evictable_blocks[block.block_id] = block
+                            if self._page_eviction is not None:
+                                self._page_eviction.add(block.block_id)
                         else:
                             # Uncached block (e.g. partial): free immediately
                             _reset_block_hash(block)
                             uncached_to_free.append(block.block_id)
                 if uncached_to_free:
-                    self.kv_cache_manager.free(uncached_to_free)
+                    self._free_block_ids(uncached_to_free)
 
                 if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
@@ -1077,12 +1082,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             _reset_block_hash(block)
                         removed += 1
                     if bid in self._evictable_blocks:
-                        block = self._evictable_blocks.pop(bid)
+                        block = self._remove_evictable(bid)
                         _reset_block_hash(block)
                         ids_to_free.append(bid)
 
                 if ids_to_free:
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
                 if removed:
                     logger.debug(f"Evicted {removed} blocks from prefix cache")
 
@@ -1096,7 +1101,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         _reset_block_hash(block)
                     ids_to_free = list(self._evictable_blocks.keys())
                     self._evictable_blocks.clear()
-                    self.kv_cache_manager.free(ids_to_free)
+                    self._free_block_ids(ids_to_free)
+
+                if self._page_eviction is not None:
+                    self._page_eviction.clear()
 
                 self._cached_blocks.clear()
                 self._block_id_to_key.clear()
@@ -1174,6 +1182,15 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
+                # OffloadingConnector allocates cross-layer KV tensors outside
+                # kvcached's VMM path (issue #267). Reject before any startup.
+                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
+                    raise KVCachedConfigError(
+                        "kvcached does not support vLLM CPU KV offloading "
+                        "(OffloadingConnector, --kv-offloading-size); "
+                        "remove --kv-offloading-size or disable kvcached"
+                    )
                 # Reject a partial integration before either allocator or the
                 # native executor starts. vLLM can select V1 automatically.
                 if detected_version and VersionRange(">=0.29.0").contains(detected_version):
@@ -1427,12 +1444,18 @@ def _client_engine_processes(client: Any) -> tuple[Any, ...]:
                  if getattr(engine, "proc_handle", None) is not None)
 
 
-def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
-    """Pin a ready, live engine's segment once, never from a late shutdown."""
+def _capture_engine_segment(owner: Any, processes: tuple[Any, ...],
+                            parallel_config: Any = None) -> None:
+    """Pin a ready, live engine's segment once, never from a late shutdown.
+
+    The ready deployment's worker sockets are remembered at the same time
+    (issue #510) when the parallel config that names them is known.
+    """
     if not enable_kvcached() or hasattr(owner, "_kvcached_ipc_cleanup"):
         return
     owner._kvcached_ipc_cleanup = None
     owner._kvcached_engine_processes = processes
+    owner._kvcached_worker_sockets = None
     cleanup = None
     try:
         if not processes:
@@ -1455,10 +1478,32 @@ def _capture_engine_segment(owner: Any, processes: tuple[Any, ...]) -> None:
             cleanup.close()
         logger.warning("Cannot retain the ready engine's segment identity: %s; "
                        "parent cleanup is disabled for this engine", e)
+        return
+    try:
+        owner._kvcached_worker_sockets = _capture_worker_sockets(parallel_config)
+    except Exception as e:
+        logger.warning("Cannot remember the ready engine's worker sockets: %s; "
+                       "the socket directory is left to kvctl delete", e)
 
 
-def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> None:
-    """A shutdown return (or exception) does not prove the engines stopped."""
+def _capture_worker_sockets(parallel_config: Any) -> Any:
+    """Remember the ready deployment's worker sockets, w<rank>.sock for its
+    TP ranks in each PP stage directory; None without a parallel config."""
+    if parallel_config is None:
+        return None
+    from kvcached.utils import WorkerSocketCleanup, get_tp_socket_dir
+
+    return WorkerSocketCleanup(get_tp_socket_dir(),
+                               int(parallel_config.tensor_parallel_size),
+                               int(parallel_config.pipeline_parallel_size))
+
+
+def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...],
+                                   sockets: Any = None) -> None:
+    """A shutdown return (or exception) does not prove the engines stopped.
+
+    Once it is confirmed, remove the segment and, when they were remembered,
+    the worker sockets the killed engines' workers left (issue #510)."""
     try:
         # vLLM can return immediately after SIGKILL without reaping children.
         # Bound the extra wait across the whole group, including error paths.
@@ -1477,6 +1522,12 @@ def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...]) -> 
         cleanup.unlink()
     except Exception as e:
         logger.warning("Failed to remove the KV cache limit segment: %s", e)
+    if sockets is None:
+        return
+    try:
+        sockets.unlink()
+    except Exception as e:
+        logger.warning("Failed to remove the worker socket directory: %s", e)
 
 
 def _stop_headless_segment_watch(manager: Any) -> None:
@@ -1532,6 +1583,9 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         The supervisor
         that owns those engines has no MPClient at all;
         CoreEngineProcManagerPatch covers that boundary.
+
+        The worker sockets the killed engines' workers leave behind are
+        removed from the same place (issue #510, WorkerSocketCleanup).
         """
         MPClient = self._get_target_class(client_mod)
         if MPClient is None:
@@ -1556,8 +1610,11 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
             if manager is not None and hasattr(manager, "_kvcached_ipc_cleanup"):
                 self._kvcached_ipc_cleanup = manager._kvcached_ipc_cleanup
                 self._kvcached_engine_processes = manager._kvcached_engine_processes
+                self._kvcached_worker_sockets = getattr(manager, "_kvcached_worker_sockets", None)
             else:
-                _capture_engine_segment(self, _client_engine_processes(self))
+                parallel_config = getattr(getattr(self, "vllm_config", None),
+                                          "parallel_config", None)
+                _capture_engine_segment(self, _client_engine_processes(self), parallel_config)
 
         def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
             cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
@@ -1565,7 +1622,9 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
                 return original_shutdown(self, *args, **kwargs)
             finally:
                 if cleanup is not None:
-                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+                    _unlink_stopped_engine_segment(
+                        cleanup, self._kvcached_engine_processes,
+                        getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_client_shutdown, "shutdown")
         MPClient.__init__ = _patched_client_init  # type: ignore[assignment]
@@ -1635,9 +1694,12 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
         @wraps(original_init)
         def _patched_manager_init(self, *args: Any, **kwargs: Any):
             self._kvcached_headless_segment = None
+            self._kvcached_parallel_config = None
             if enable_kvcached():
                 try:
                     arguments = init_signature.bind(self, *args, **kwargs).arguments
+                    self._kvcached_parallel_config = getattr(
+                        arguments.get("vllm_config"), "parallel_config", None)
                     if arguments.get("local_client") is False:
                         from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
 
@@ -1668,7 +1730,8 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                                 if not processes or any(p.exitcode is not None for p in processes):
                                     return
                                 if os.path.exists(path):
-                                    _capture_engine_segment(self, processes)
+                                    _capture_engine_segment(
+                                        self, processes, self._kvcached_parallel_config)
                                     return
                                 stop.wait(0.05)
                         except Exception as e:
@@ -1701,7 +1764,9 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                     if manager is None:
                         manager = getattr(arguments.get("launch"), "engine_manager", None)
                     if isinstance(manager, CoreEngineProcManager):
-                        _capture_engine_segment(manager, tuple(manager.processes))
+                        _capture_engine_segment(
+                            manager, tuple(manager.processes),
+                            getattr(manager, "_kvcached_parallel_config", None))
                 except Exception as e:
                     logger.warning("Cannot retain startup segment identity: %s", e)
                 return result
@@ -1717,7 +1782,9 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                 return original_shutdown(self, *args, **kwargs)
             finally:
                 if cleanup is not None:
-                    _unlink_stopped_engine_segment(cleanup, self._kvcached_engine_processes)
+                    _unlink_stopped_engine_segment(
+                        cleanup, self._kvcached_engine_processes,
+                        getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_manager_shutdown, "shutdown")
         CoreEngineProcManager.__init__ = _patched_manager_init

@@ -272,7 +272,9 @@ def test_missing_metadata_fails_before_copying_first_pool():
 def test_legacy_layout_copy_preserves_logical_blocks(monkeypatch, layout):
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "_contiguous_layout", layout == "contiguous")
-    monkeypatch.setattr(interfaces, "PAGE_SIZE", 256)
+    # Keep the synthetic page large enough for the combined K/V block so
+    # automatic page selection does not exceed the tiny mocked device budget.
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2048)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda _: SimpleNamespace(total_memory=24 * 1024))

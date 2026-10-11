@@ -20,6 +20,7 @@ class NativeBlockPoolMixin:
     _evictable_blocks: OrderedDict[int, Any]
     _cached_blocks: dict[Any, dict[int, Any]]
     _evict_blocks_from_pool: Callable[[int], int]
+    _remove_evictable: Callable[[int], Any]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -85,7 +86,8 @@ class NativeBlockPoolMixin:
             if block.is_null:
                 continue
             block.ref_cnt += 1
-            self._evictable_blocks.pop(block.block_id, None)
+            if self.enable_prefix_cache:
+                self._remove_evictable(block.block_id)
 
     def free_blocks(self, ordered_blocks: Iterable[Any], prepend: bool = False) -> None:
         if self.enable_prefix_cache:
