@@ -4,6 +4,7 @@
 import gc
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -336,6 +337,8 @@ def test_runtime_snapshot_dict():
     assert snapshot.to_dict() == {
         "schema_version": "kvcached.observability.v1",
         "engine": "vllm",
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
         "initialized": True,
         "device": "cuda:0",
         "world_size": 2,
