@@ -731,7 +731,9 @@ class FakeGloo:
 
     def _reduce(self) -> None:
         self._result = max(self._deposits)
-        self.rounds.append(list(self._deposits))
+        # Arrival order is thread scheduling; record the flags in rank order
+        # by value so the assertions do not depend on who deposited first.
+        self.rounds.append(sorted(self._deposits))
         self._deposits = []
 
     def all_reduce(self, tensor, op) -> None:
