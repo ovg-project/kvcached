@@ -8,6 +8,8 @@ real. A GPU is required because the prealloc worker queries free GPU memory.
 """
 
 import os
+import subprocess
+import sys
 import time
 import uuid
 
@@ -38,7 +40,7 @@ def wait_for_target(allocator, expected):
 def allocator_factory():
     allocators = []
 
-    def create(num_kv_buffers=2, extra_bytes=0):
+    def create(num_kv_buffers=2, extra_bytes=0, enable_prealloc=True):
         ipc_name = f"kvcached-resize-{os.getpid()}-{uuid.uuid4().hex}"
         startup_size = STARTUP_PAGES * PAGE_SIZE + extra_bytes
         allocator = PageAllocator(
@@ -49,7 +51,7 @@ def allocator_factory():
             pp_rank=0,
             async_sched=False,
             contiguous_layout=True,
-            enable_page_prealloc=True,
+            enable_page_prealloc=enable_prealloc,
             num_kv_buffers=num_kv_buffers,
             ipc_name=ipc_name,
         )
@@ -58,10 +60,11 @@ def allocator_factory():
         allocator.set_broadcast_map_callback(lambda world_size, offsets: None)
         allocator.set_broadcast_unmap_callback(lambda world_size, offsets: None)
         allocator.start_prealloc_thread()
-        deadline = time.monotonic() + 10
-        while allocator.get_num_reserved_pages() == 0 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert allocator.get_num_reserved_pages() > 0
+        if enable_prealloc:
+            deadline = time.monotonic() + 10
+            while allocator.get_num_reserved_pages() == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert allocator.get_num_reserved_pages() > 0
 
         def set_quota(per_pool_size):
             assert update_kv_cache_limit(
@@ -150,3 +153,47 @@ def test_cancel_pending_shrink_at_current_capacity(allocator_factory):
     wait_for_target(allocator, current_size)
     assert allocator.resize(current_size)
     allocator.free_pages([page.page_id for page in pages])
+
+
+def test_quota_watcher_without_preallocation_can_stop_and_restart(allocator_factory):
+    allocator, set_quota, _ = allocator_factory(enable_prealloc=False)
+    set_quota(3 * PAGE_SIZE)
+    wait_for_target(allocator, 3 * PAGE_SIZE)
+    assert allocator.get_num_reserved_pages() == 0
+
+    allocator.stop_prealloc_thread()
+    set_quota(2 * PAGE_SIZE)
+    time.sleep(0.3)
+    assert allocator.get_resize_target() == 3 * PAGE_SIZE
+
+    allocator.start_prealloc_thread()
+    wait_for_target(allocator, 2 * PAGE_SIZE)
+    assert allocator.get_num_reserved_pages() == 0
+
+
+def test_quota_watcher_without_preallocation_stops_on_destruction():
+    # A joinable native watcher must not outlive its allocator or abort Python.
+    scenario = """
+import gc
+import os
+from kvcached.vmm_ops import PageAllocator
+
+for i in range(5):
+    name = f"kvcached-watcher-destroy-{os.getpid()}-{i}"
+    allocator = PageAllocator(
+        num_layers=1, mem_size_per_layer=8 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, enable_page_prealloc=False,
+        num_kv_buffers=1, ipc_name=name,
+    )
+    allocator.start_prealloc_thread()
+    assert os.path.exists(f"/dev/shm/{name}")
+    del allocator
+    gc.collect()
+    assert not os.path.exists(f"/dev/shm/{name}")
+print("watcher cleanup complete")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", scenario], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "watcher cleanup complete" in result.stdout
