@@ -78,6 +78,12 @@ try:
         )
         assert logical_allocator.available_size() == 0
         assert logical_allocator.alloc(page_size) is None
+        # Physical quota growth must not enlarge the configured token budget,
+        # including geometries whose initial logical/backing counts are equal.
+        assert allocator.resize((physical_pages + 1) * allocator.page_size)
+        assert logical_allocator.available_size() == 0
+        assert logical_allocator.alloc(page_size) is None
+        assert allocator.resize(physical_pages * allocator.page_size)
         print(
             "  available_size after alloc: "
             f"{logical_allocator.available_size()}"
@@ -100,6 +106,14 @@ try:
             "  available_size after free: "
             f"{logical_allocator.available_size()}"
         )
+        allocator.clear()
+        assert allocator.null_block == [0]
+        assert logical_allocator.available_size() == size
+        refilled = logical_allocator.alloc(size)
+        assert refilled is not None and len(refilled) == size
+        assert logical_allocator.available_size() == 0
+        logical_allocator.free(refilled)
+        assert logical_allocator.available_size() == size
 
     print("\nAll tests passed!")
 

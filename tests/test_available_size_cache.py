@@ -19,6 +19,8 @@ import threading
 import time
 import types
 
+import pytest
+
 BLOCKS_PER_PAGE = 4
 
 
@@ -86,6 +88,7 @@ def make_manager() -> KVCacheManager:
     manager.num_avail_blocks = 0
     manager.avail_pages = {}
     manager.full_pages = {}
+    manager._logical_allocated_blocks = 0
     manager.reserved_blocks = []
     manager.null_block = None
     manager.in_shrink = False
@@ -111,9 +114,26 @@ def test_available_size_honors_logical_block_limit():
     manager = make_manager()
     manager.num_blocks = 10
     manager.logical_num_blocks = 5
-    manager._get_num_alloced_blocks = lambda: 2
+    manager._logical_allocated_blocks = 2
 
     assert manager.available_size() == 3
+
+
+@pytest.mark.parametrize("reserve_null_block", [False, True])
+def test_zero_logical_limit_is_validated_before_native_init(monkeypatch, reserve_null_block):
+    from unittest.mock import Mock
+
+    native = Mock(side_effect=RuntimeError("native init reached"))
+    monkeypatch.setattr(_kvc_mod, "PageAllocator", native)
+    error = ValueError if reserve_null_block else RuntimeError
+    message = "reserved null block" if reserve_null_block else "native init reached"
+    with pytest.raises(error, match=message):
+        KVCacheManager(512, 1, 4096, 1, reserve_null_block=reserve_null_block,
+                       logical_num_blocks=0)
+    if reserve_null_block:
+        native.assert_not_called()
+    else:
+        native.assert_called_once()
 
 
 def test_available_size_refetches_after_ttl_window(monkeypatch):
