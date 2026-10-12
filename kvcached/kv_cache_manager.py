@@ -673,16 +673,7 @@ class KVCacheManager:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
             self._wait_post_init()
-
-        new_mem_size = self.page_allocator.get_resize_target()
-        if (new_mem_size > 0 and
-                new_mem_size != getattr(self, "_rejected_resize_target", None)):
-            try:
-                self.resize(new_mem_size)
-            except QuarantinedResizeError:
-                self._rejected_resize_target = new_mem_size
-                self._resize_rejected = True
-                logger.warning("Automatic resize rejected: pool has quarantined pages")
+            self._apply_resize_target()
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -780,6 +771,18 @@ class KVCacheManager:
             remaining_need -= num_from_page
 
         return ret_index
+
+    def _apply_resize_target(self) -> None:
+        new_mem_size = self.page_allocator.get_resize_target()
+        # Native uses -1 for no update; zero is a valid quota.
+        if (new_mem_size >= 0 and
+                new_mem_size != getattr(self, "_rejected_resize_target", None)):
+            try:
+                self.resize(new_mem_size)
+            except QuarantinedResizeError:
+                self._rejected_resize_target = new_mem_size
+                self._resize_rejected = True
+                logger.warning("Automatic resize rejected: pool has quarantined pages")
 
     def _rollback_partial_alloc(self, ret_index: List[int],
                                 num_from_reserved: int) -> None:
@@ -1522,6 +1525,10 @@ class KVCacheManager:
 
         # Possibly reserve the first block as null block for padding tokens
         self._reserve_null_block()
+        # Rebuild the mandatory null block before reapplying a pending quota.
+        # The watcher is stopped here, so a zero target must not strand clear().
+        if not self._shutdown_requested.is_set():
+            self._apply_resize_target()
 
     # Private methods
     @synchronized

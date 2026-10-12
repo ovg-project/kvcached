@@ -84,7 +84,7 @@ class FakePageAllocator:
         return grouped
 
     def get_resize_target(self) -> int:
-        return 0
+        return -1
 
     def get_num_free_pages(self) -> int:
         return 100  # Logical capacity always looks ample (the race).
@@ -156,6 +156,21 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+
+
+@pytest.mark.parametrize("target", [-1, 0, BLOCKS_PER_PAGE])
+def test_published_resize_target_preserves_zero(monkeypatch, target):
+    from unittest.mock import Mock
+
+    manager = make_manager(fail_after=1)
+    resize = Mock(return_value=True)
+    monkeypatch.setattr(manager, "resize", resize)
+    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: target)
+    assert manager.alloc(0) == []
+    if target >= 0:
+        resize.assert_called_once_with(target)
+    else:
+        resize.assert_not_called()
 
 
 @pytest.mark.parametrize("indexed_before_reservation", [False, True])
