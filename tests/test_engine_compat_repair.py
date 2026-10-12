@@ -110,9 +110,14 @@ def test_repair_after_failed_probe(monkeypatch, case):
 
 
 @pytest.mark.parametrize(
-    "config", [("diff.noprefix", "true"), ("diff.mnemonicprefix", "true")]
+    "config", [
+        ("diff.noprefix", "true"),
+        ("diff.mnemonicprefix", "true"),
+        ("color.ui", "always"),
+        ("color.diff", "always"),
+    ]
 )
-def test_candidate_patch_ignores_display_prefix_config(monkeypatch, case, config):
+def test_candidate_patch_ignores_display_config(monkeypatch, case, config):
     repair.git(case.source, "config", *config)
     agent(monkeypatch, case, lambda _: fix(case))
 
