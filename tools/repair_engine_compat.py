@@ -354,6 +354,8 @@ def repair(args: argparse.Namespace, result: Dict[str, Any]) -> None:
             "--binary",
             "--no-ext-diff",
             "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             f"--output={output / 'candidate.patch'}",
             head,
         )

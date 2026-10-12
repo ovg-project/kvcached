@@ -109,6 +109,22 @@ def test_repair_after_failed_probe(monkeypatch, case):
     assert (case.output / "candidate-files/kvcached/compat.py").read_text() == "fixed"
 
 
+@pytest.mark.parametrize(
+    "config", [("diff.noprefix", "true"), ("diff.mnemonicprefix", "true")]
+)
+def test_candidate_patch_ignores_display_prefix_config(monkeypatch, case, config):
+    repair.git(case.source, "config", *config)
+    agent(monkeypatch, case, lambda _: fix(case))
+
+    assert execute(case)["status"] == "validated-candidate"
+
+    patch = case.output / "candidate.patch"
+    repair.git(case.source, "checkout", "--", "kvcached/compat.py")
+    repair.git(case.source, "apply", "--check", str(patch))
+    repair.git(case.source, "apply", str(patch))
+    assert (case.source / "kvcached/compat.py").read_text() == "fixed"
+
+
 def test_retry_receives_failed_check(monkeypatch, case):
     def edit(number):
         (case.source / "kvcached/compat.py").write_text("almost" if number == 1 else "fixed")
