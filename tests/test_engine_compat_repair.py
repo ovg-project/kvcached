@@ -422,6 +422,7 @@ def test_interruption_cleans_up_and_propagates(tmp_path, monkeypatch, platform):
     monkeypatch.setattr(repair.subprocess, "run", tree_kill)
     group_kill = mock.Mock()
     monkeypatch.setattr(repair.os, "killpg", group_kill, raising=False)
+    monkeypatch.setattr(repair.signal, "SIGKILL", 9, raising=False)
     monkeypatch.setattr(repair.sys, "platform", platform)
 
     with pytest.raises(KeyboardInterrupt):
