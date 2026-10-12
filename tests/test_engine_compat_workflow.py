@@ -239,7 +239,7 @@ def test_authentication_is_not_sent_to_gpu_or_cpu_validation():
 
 def test_full_candidate_ci_is_not_just_the_repair_probe():
     ci = workflow("engine-compat-ci.yml")["jobs"]["verify"]
-    assert ci["strategy"]["matrix"]["python"] == ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    assert ci["strategy"]["matrix"]["python"] == ["3.10", "3.11", "3.12", "3.13"]
     text = json.dumps(ci)
     for command in (
         "run_cpu_tests.sh",
