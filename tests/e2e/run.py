@@ -11,7 +11,7 @@ active, the server stays healthy, sequential greedy outputs and prefix-cache
 hits match the native run, and shutdown leaves no GPU process behind.
 
 Usage:
-    python3 tests/e2e/run.py --profile nightly --out /tmp/e2e
+    python3 tests/e2e/run.py --profile basic --out /tmp/e2e
 """
 
 from __future__ import annotations
@@ -524,7 +524,7 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", default="nightly", choices=sorted(PROFILES))
+    ap.add_argument("--profile", default="basic", choices=sorted(PROFILES))
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     ap.add_argument("--hf-cache", type=Path,
