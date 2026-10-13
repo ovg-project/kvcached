@@ -175,6 +175,8 @@ private:
   // Memory tracking
   std::atomic<int64_t> num_free_pages_;
   std::atomic<int64_t> num_total_pages_;
+  // Startup page count. Page IDs at or above it lie outside the KV tensors.
+  const int64_t max_num_pages_;
 
   // Page lists
   std::deque<page_id_t> free_page_list_;
