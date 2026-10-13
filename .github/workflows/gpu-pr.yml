@@ -66,7 +66,7 @@ jobs:
           ci_files=$(grep -E '^(tests/e2e|tools/ci)/|^\(300' <<< "$files" | sort -u || true)
           note=""
           if [ -n "$ci_files" ]; then
-            list=$(sed 's/.*/- `&`/' <<< "$ci_files")
+            list=$(while IFS= read -r f; do echo "- \`$f\`"; done <<< "$ci_files")
             if [ "$ACTOR" != "$CI_REVIEWER" ]; then
               gh pr comment "$PR" --body "$(printf '%s\n\n%s\n\n%s' \
                 "This pull request changes files that run on the GPU CI machine:" "$list" \
