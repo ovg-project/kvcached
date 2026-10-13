@@ -84,7 +84,7 @@ class FakePageAllocator:
         return grouped
 
     def get_resize_target(self) -> int:
-        return 0
+        return -1
 
     def get_num_free_pages(self) -> int:
         return 100  # Logical capacity always looks ample (the race).

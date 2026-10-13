@@ -23,12 +23,14 @@ from kvcached.integration.sglang.patches import (
     RadixCacheLimitPatch,
     ScheduleBatchCapacityMissPatch,
     SchedulerCapacityMissPatch,
+    SchedulerIdleLimitPatch,
     SchedulerMemoryLeakPatch,
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
     SWARadixCacheLimitPatch,
     UnifiedRadixCacheLimitPatch,
 )
+from kvcached.integration.sglang.shutdown import SGLangShutdownPatch
 from kvcached.utils import get_kvcached_logger
 
 logger = get_kvcached_logger()
@@ -70,6 +72,8 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # (#547); they read the 0.5.20 batch and request shapes.
             (ScheduleBatchCapacityMissPatch(), ">=0.5.20"),
             (SchedulerCapacityMissPatch(), ">=0.5.20"),
+            (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
+            (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
