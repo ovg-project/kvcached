@@ -264,34 +264,35 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="34" />
 </p>
 
-### Control-file cleanup on shutdown
+### Control-file lifetime
 
-KVCached cleans its control shared-memory files on normal teardown. For SGLang,
-the parent that launched the schedulers retains the exact control-file identities
-reported at readiness (including local TP/PP/DP workers and extra KV pools). Python
-Engine shutdown, `python -m sglang.launch_server`, and `sglang serve` share an
-owner-side fallback: it unlinks only after every recorded local child is confirmed
-exited. The vLLM EngineCore/client/supervisor fallback remains in place. Failed exit
-or identity checks preserve the files; an inode match alone is not proof of exit.
+On Linux, native and Python trackers hold an OFD shared usage lock on their
+retained control-file descriptor. Closing the last reference releases usage,
+including after SIGKILL; forked descendants and duplicated descriptors retain
+the lock until their own last close. No cleanup daemon or inference-path lock
+is added. Shutdown may leave small, unused control files intentionally.
 
-For a ready owner with the default SIGTERM disposition, KVCached first unwinds
-Python frames, then runs the owner's existing shutdown at process finalization and
-re-raises SIGTERM. The signal handler itself never runs teardown. Custom/ignored
-signal handlers and SIGINT handling remain unchanged. A second SIGTERM
-retains its immediate-termination behavior. SGLang keeps its native signal delivery
-while its tokenizer loop runs; between synchronous Engine requests, a stopped loop
-uses the same owner-exit fallback. Applications that suppress SystemExit or call
-`os._exit` must arrange shutdown.
+`kvctl list` and `kvtop` hide known unused files. Use `kvctl list --all` to find
+leftovers, then `kvctl delete <name>` to remove one. Delete acquires an exclusive
+usage lock and rechecks the opened inode against the path; active, legacy,
+unknown, or unverifiable files are not removed. Control deletion does not delete
+worker socket directories: existing engine owners retain their separate socket
+identity and worker-exit checks.
 
-No cleanup daemon, usage-lease protocol, or scan of arbitrary files is required.
-If both the owner and workers are SIGKILLed, no code can run to unlink their files.
-Startup failures before resource metadata reaches the owner, and resources created
-after readiness, also require explicit cleanup. After stopping the deployment and
-confirming all of its users have exited, use `kvctl delete <instance_name>` for that
-instance. Do not delete a live deployment's files. Independent deployments must use
-unique IPC names; same-name replacement protection is not a shared-ownership protocol.
-Shared/persistent `/dev/shm` mounts can retain files across container replacement.
-Cleanup does not revoke GPU mappings or terminate workers.
+**Upgrade all participants of one segment together.** Stop every process using
+that segment, including forked descendants, before upgrading its trackers and
+tools that write/delete it. Only then restart with the same name. New startup
+reinitializes that stale file and marks the lock protocol. Other segments or
+IPC namespaces can upgrade independently. The marker cannot protect against an
+old client that ignores locks. Independently live deployments need distinct
+names; arbitrary external rename/unlink of live paths is outside this protocol.
+
+Legacy files remain visible; remove them manually only after confirming their
+participants stopped. Non-Linux/no-OFD observation is conservative and safe
+deletion is unavailable. A Linux tracker that cannot acquire its required usage
+lock fails initialization instead of running unlocked. Engine child shutdown,
+listener/preallocation stop, socket cleanup, and GPU resource release remain
+separate responsibilities.
 
 ## Citation
 
