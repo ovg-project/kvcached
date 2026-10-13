@@ -48,7 +48,7 @@ class CountingPageAllocator:
         return 0
 
     def get_resize_target(self) -> int:
-        return 0
+        return -1
 
     def resize(self, new_mem_size: int) -> bool:
         # Mirror a successful C++ resize so KVCacheManager.resize() invalidates
