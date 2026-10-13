@@ -141,8 +141,8 @@ def shutdown_kvcached() -> bool:
     if not stop_worker_listener_threads():
         logger.warning("KV shutdown deferred: a worker IPC listener is still active")
         return False
-    # Pools first: each unlinks its /dev/shm segment while the process is
-    # still alive (issue #477), then the allocator.
+    # Pools first: stop their users and close control usage, then the
+    # allocator. Stale control files are removed by an explicit locked delete.
     pools_stopped = True
     for manager, _ in get_registered_kv_cache_pools(integration="vllm"):
         try:

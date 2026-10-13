@@ -1461,8 +1461,8 @@ class KVCacheManager:
     def shutdown(self) -> bool:
         """Release the state this pool keeps outside the process.
 
-        os._exit bypasses the native destructor (issue #477). Stop background
-        users, then ask the native owner to release its original segment.
+        Stop background users, then close the native control usage reference.
+        Process exit also releases usage; removing the file is a CLI operation.
         Return False if a step needs another attempt.
         Successful steps are not repeated and a replacement file is preserved.
         """
@@ -1483,8 +1483,8 @@ class KVCacheManager:
                     logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
                     return False
                 self._prealloc_stopped = True
-            # The native owner captured the inode when it created the segment.
-            # A shutdown-time pathname lookup could claim a replacement engine.
+            # Close only after all users stop. The native owner never unlinks a
+            # pathname, and inherited/duplicated references retain their lock.
             self._shut_down = self.page_allocator.release_shared_segment()
             return self._shut_down
 
