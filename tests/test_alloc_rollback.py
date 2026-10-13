@@ -38,6 +38,15 @@ class FakePage:
         out, self.free_list = self.free_list[:num], self.free_list[num:]
         return out
 
+    def get_free_blocks(self) -> List[int]:
+        return list(self.free_list)
+
+    def alloc_exact(self, ids: List[int]) -> bool:
+        if not set(ids) <= set(self.free_list):
+            return False
+        self.free_list = [idx for idx in self.free_list if idx not in ids]
+        return True
+
     def free_batch(self, idxs: List[int]) -> None:
         self.free_list.extend(idxs)
 
@@ -1338,3 +1347,45 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
     assert data["free_failures_total"] == 1
     assert data["last_error_code"] == "free_failed"
     assert data["last_error_timestamp_ns"] is not None
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_exact_and_count_allocations_share_logical_limit(packed):
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = manager._virtual_num_blocks = 8
+    manager.logical_num_blocks = 3
+    manager.reserve_null_block = False
+    manager._retired_pages = []
+    allocate = manager.alloc_packed if packed else manager.alloc
+    assert allocate(2) == [0, 1]
+    assert manager._logical_allocated_blocks == 2
+    assert manager.alloc_exact([3]) == [3]
+    assert manager._logical_allocated_blocks == 3
+    assert allocate(1) is None
+    manager.free([1])
+    assert manager._logical_allocated_blocks == 2
+    assert manager.alloc_exact([2]) == [2]
+    manager.free([0, 2, 3])
+    assert manager._logical_allocated_blocks == 0
+    assert manager.available_size() == 3
+
+
+def test_exact_and_count_allocations_share_reserved_ownership():
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = manager._virtual_num_blocks = 8
+    manager.logical_num_blocks = 3
+    manager.reserve_null_block = False
+    manager._retired_pages = []
+    assert manager.try_to_reserve(3)
+    assert manager.reserved_blocks == [0, 1, 2]
+    assert manager._logical_allocated_blocks == 3
+    # Aggregate availability comes from reservations, not unused logical quota.
+    assert manager.available_size() == 3
+    assert manager.alloc_exact([3]) is None
+    assert manager.alloc_exact([2, 0]) == [2, 0]
+    assert manager.alloc(1) == [1]
+    assert manager._logical_allocated_blocks == 3
+    assert manager.reserved_blocks == []
+    manager.free([0, 1, 2])
+    assert manager._logical_allocated_blocks == 0
+    assert manager.available_size() == 3
