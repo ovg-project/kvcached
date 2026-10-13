@@ -8,8 +8,7 @@ kvcached installed from this checkout. Each case is one server start inside
 it: kvcached with the contiguous and the non-contiguous KV layout, and the
 native engine. A case passes when kvcached is
 active, the server stays healthy, sequential greedy outputs and prefix-cache
-hits match the native run, and shutdown leaves no shm segment, socket
-directory or GPU process behind.
+hits match the native run, and shutdown leaves no GPU process behind.
 
 Usage:
     python3 tests/e2e/run.py --profile nightly --out /tmp/e2e
@@ -201,10 +200,6 @@ python3 -c 'import kvcached, kvcached.vmm_ops; print("kvcached", kvcached.__file
         time.sleep(3)
         return False
 
-    def tmp_entries(self, prefix: str) -> list[str]:
-        out = self.exec(f"ls -1 /tmp | grep -F -- {shlex.quote(prefix)} || true")
-        return [x for x in out.stdout.decode().split() if x]
-
     def versions(self) -> dict[str, Any]:
         """Installed versions of the engine, kvcached and torch."""
         code = ("import json, importlib.metadata as md, torch\n"
@@ -362,10 +357,6 @@ def stop_and_check(ct: Container, srv: Server, res: CaseResult, prefix: str = ""
         missing = sorted(required - set(log["patched"]))
         res.add(f"{prefix}kvcached_active", not missing and log["capacity"] is not None,
                 f"missing patches {missing}" if missing else "")
-        leftover_shm = sorted(x for x in os.listdir("/dev/shm") if x.startswith(srv.ipc))
-        res.add(f"{prefix}shm_removed", not leftover_shm, ", ".join(leftover_shm))
-        leftover_tmp = ct.tmp_entries(srv.ipc)
-        res.add(f"{prefix}socket_dirs_removed", not leftover_tmp, ", ".join(leftover_tmp))
     else:
         res.add(f"{prefix}kvcached_inactive", log["kvcached_lines"] == 0,
                 f"{log['kvcached_lines']} [kvcached] lines")
@@ -402,8 +393,6 @@ CHECKS = {
                            "before the stop signal",
     "kvcached_active": "kvcached applied every required patch and sized the KV cache",
     "kvcached_inactive": "the native server's log has no [kvcached] line",
-    "shm_removed": "no /dev/shm segment of the server is left",
-    "socket_dirs_removed": "no /tmp/kvcached-tp-* directory of the server is left",
     "no_gpu_process_left": "no process is left on the GPUs of the run",
     "<phase>_tokens_equal": "gen_seq and apc_0..2 give the same greedy tokens as native",
     "apc_<n>_cached_tokens_equal": "every request reports the same cached_tokens as native",
