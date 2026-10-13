@@ -21,6 +21,7 @@ from kvcached.integration.sglang.patches import (
     ElasticSWAAllocatorPatch,
     MambaRadixCacheLimitPatch,
     RadixCacheLimitPatch,
+    SchedulerIdleLimitPatch,
     SchedulerMemoryLeakPatch,
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
@@ -65,6 +66,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (SGLangVirtualKVCapacityPatch(), ">=0.5.16"),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
+            (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),

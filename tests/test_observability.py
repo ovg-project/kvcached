@@ -4,6 +4,7 @@
 import gc
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -166,7 +167,7 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
             return {0: indices}
 
         def get_resize_target(self):
-            return 0
+            return -1
 
         def resize(self, new_mem_size):
             return True
@@ -336,6 +337,8 @@ def test_runtime_snapshot_dict():
     assert snapshot.to_dict() == {
         "schema_version": "kvcached.observability.v1",
         "engine": "vllm",
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
         "initialized": True,
         "device": "cuda:0",
         "world_size": 2,
