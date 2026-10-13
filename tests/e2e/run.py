@@ -257,6 +257,48 @@ class LocalHost(Container):
         pass
 
 
+# Run in an engine container, which has huggingface_hub. Every model is
+# fetched (or found up to date), else its cached copy is used; only a model
+# that is neither fails, after retries, since the Hub rate-limits anonymous
+# requests (429).
+FETCH_MODELS = r"""
+import sys, time
+from huggingface_hub import snapshot_download
+failed = []
+for hf_id in sys.argv[1:]:
+    for attempt in range(4):
+        if attempt:
+            time.sleep(60 * attempt)
+        try:
+            print(hf_id, "at", snapshot_download(hf_id), flush=True)
+            break
+        except Exception as e:
+            print(hf_id, "fetch failed:", e, flush=True)
+        try:
+            print(hf_id, "cached at", snapshot_download(hf_id, local_files_only=True),
+                  flush=True)
+            break
+        except Exception:
+            pass
+    else:
+        failed.append(hf_id)
+print("not fetched:", " ".join(failed) or "none", flush=True)
+sys.exit(1 if failed else 0)
+"""
+
+
+def fetch_models(ct: Container, hf_ids: list[str], log: Path) -> CaseResult:
+    """Fetch the run's weights once, so that the servers can start offline."""
+    res = CaseResult("models-setup")
+    proc = ct.exec(f"cd /tmp && python3 -c {shlex.quote(FETCH_MODELS)} {shlex.join(hf_ids)}",
+                   timeout=7200)
+    log.write_bytes(proc.stdout + proc.stderr)
+    lines = proc.stdout.decode(errors="replace").strip().splitlines()
+    res.add("models_fetched", proc.returncode == 0,
+            "" if proc.returncode == 0 else f"{lines[-1] if lines else ''}; see {log.name}")
+    return res
+
+
 def server_argv(engine: str, model_id: str, args: tuple[str, ...], port: int) -> list[str]:
     if engine == "vllm":
         return ["vllm", "serve", model_id, "--served-model-name", "e2e", "--host", "127.0.0.1",
@@ -576,6 +618,22 @@ def main() -> int:
                 setup.add("install_kvcached", False, str(e))
                 ct.remove()
             results.append(setup)
+
+        # The models the cases, elastic and limit tests below will serve.
+        def wanted(engine: str, model: str) -> bool:
+            return engine in containers and (not a.models or model in a.models)
+        models = [] if a.skip_cases else [g.model for g in profile.groups
+                                           if wanted(g.engine, g.model)]
+        if not a.skip_limit:
+            models += [t.model for t in profile.limit if wanted(t.engine, t.model)]
+        if not a.skip_elastic:
+            models += [m for p in profile.elastic for m in (p.model_a, p.model_b)
+                       if p.engine_a in containers and p.engine_b in containers]
+        hf_ids = list(dict.fromkeys(MODELS[m].hf_id for m in models))
+        if hf_ids:
+            # One cache for the run: every container mounts it.
+            results.append(fetch_models(next(iter(containers.values())), hf_ids,
+                                        out / "models-fetch.log"))
 
         for group in [] if a.skip_cases else profile.groups:
             host = containers.get(group.engine)

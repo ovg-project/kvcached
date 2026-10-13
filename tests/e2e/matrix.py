@@ -24,6 +24,10 @@ class EngineSpec:
     env: tuple[tuple[str, str], ...] = ()
 
 
+# The servers never ask the Hub, which rate-limits anonymous requests: the run
+# fetches the weights once before any server starts (run.py fetch_models).
+OFFLINE = (("HF_HUB_OFFLINE", "1"),)
+
 ENGINES = {
     "vllm": EngineSpec(
         name="vllm",
@@ -34,7 +38,7 @@ ENGINES = {
         tokens_re=r"GPU KV cache size: ([\d,]+) tokens",
         # MRV2 explicitly, so an unsupported model fails instead of silently
         # falling back to the V1 runner. DEV_MODE enables /reset_prefix_cache.
-        env=(("VLLM_USE_V2_MODEL_RUNNER", "1"), ("VLLM_SERVER_DEV_MODE", "1")),
+        env=(*OFFLINE, ("VLLM_USE_V2_MODEL_RUNNER", "1"), ("VLLM_SERVER_DEV_MODE", "1")),
     ),
     "sglang": EngineSpec(
         name="sglang",
@@ -43,6 +47,7 @@ ENGINES = {
         required_patches=("elastic_allocator", "elastic_memory_pool"),
         capacity_re=r"max_total_num_tokens=(\d+)",
         tokens_re=r"max_total_num_tokens=(\d+)",
+        env=OFFLINE,
     ),
 }
 
