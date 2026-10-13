@@ -15,7 +15,7 @@ report = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(report)
 
 SETUP: dict[str, Any] = {
-    "profile": "nightly", "kvcached_sha": "a" * 40,
+    "profile": "basic", "kvcached_sha": "a" * 40,
     "gpus": [{"name": "NVIDIA L4", "memory": "23034 MiB", "driver": "580.178.04"}],
     "engines": {"vllm": {"image": "vllm/vllm-openai:v0.30.0",
                          "digest": "vllm/vllm-openai@sha256:0123456789abcdef", "engine": "0.30.0",
@@ -58,7 +58,7 @@ def write(path, cases, setup=SETUP):
 
 
 def sglang_part() -> dict[str, Any]:
-    """The setup of the SGLang half of a nightly run, on the second GPU."""
+    """The setup of the SGLang half of a basic run, on the second GPU."""
     setup = json.loads(json.dumps(SETUP))
     setup["engines"] = {"sglang": {"image": "lmsysorg/sglang:v0.5.20", "engine": "0.5.20",
                                    "env": {}, "server": "python3 -m sglang.launch_server"}}
@@ -69,13 +69,12 @@ def sglang_part() -> dict[str, Any]:
 
 def test_splice_keeps_other_text_and_orders_sections():
     body = report.splice("Notes by hand.\n", "perf", "## Perf\n")
-    body = report.splice(body, "nightly", "## Nightly v1\n")
-    body = report.splice(body, "weekly", "## Weekly\n")
-    body = report.splice(body, "nightly", "## Nightly v2\n")
+    body = report.splice(body, "weekly", "## Weekly v1\n")
+    body = report.splice(body, "weekly", "## Weekly v2\n")
     assert body.startswith("Notes by hand.")
-    assert "Nightly v1" not in body
-    assert body.index("Nightly v2") < body.index("## Weekly") < body.index("## Perf")
-    assert body.count(report.marker("nightly")) == 1
+    assert "Weekly v1" not in body
+    assert body.index("Weekly v2") < body.index("## Perf")
+    assert body.count(report.marker("weekly")) == 1
 
 
 def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
@@ -84,7 +83,7 @@ def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
         {"name": "vllm-qwen05b-native", "ok": False,
          "checks": [{"name": "gen_seq_ok", "ok": False, "detail": "500 boom | x"}]},
     ])
-    text = report.correctness_comment("nightly", [tmp_path], args(prev=f"{'c' * 40}:success"))
+    text = report.correctness_comment("basic", [tmp_path], args(prev=f"{'c' * 40}:success"))
     assert "FAIL (1 of 2 cases)" in text
     assert "| vllm-qwen05b-native |" in text and "| vllm-qwen05b-kv_c1 |" not in text
     assert "native, TP 1, KV model dtype, `--block-size 1024`" in text
@@ -93,7 +92,7 @@ def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
 
 
 def test_correctness_comment_when_nothing_ran(tmp_path):
-    text = report.correctness_comment("nightly", [tmp_path / "all"], args())
+    text = report.correctness_comment("basic", [tmp_path / "all"], args())
     assert "DID NOT RUN" in text and "The tests did not finish" in text
 
 
@@ -101,18 +100,18 @@ def test_parts_on_two_gpus_make_one_comment_and_setup(tmp_path):
     ok = [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}]
     vllm = write(tmp_path / "vllm", ok)
     sglang = write(tmp_path / "sglang", [dict(ok[0], name="sglang-qwen05b-kv_c1")], sglang_part())
-    text = report.correctness_comment("nightly", [sglang, vllm], args())
+    text = report.correctness_comment("basic", [sglang, vllm], args(pr=12))
     assert "· PASS" in text and "All 2 cases passed." in text
     assert "2x NVIDIA L4" in text and "SGLang and vLLM cases run at the same time" in text
     setup = report.merge_setups([("vLLM", SETUP), ("SGLang", sglang_part())])
-    section = report.correctness_section("nightly", setup, args())
+    section = report.correctness_section("basic", setup, args(pr=12))
     assert "| vllm-qwen05b-kv_c1 |" in section and "| sglang-qwen05b-kv_c1 |" in section
     assert "`lmsysorg/sglang:v0.5.20`" in section and "`vllm/vllm-openai:v0.30.0`" in section
 
 
 def test_a_part_that_did_not_finish_fails_the_run(tmp_path):
     vllm = write(tmp_path / "vllm", [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}])
-    text = report.correctness_comment("nightly", [vllm, tmp_path / "sglang"], args())
+    text = report.correctness_comment("basic", [vllm, tmp_path / "sglang"], args(pr=12))
     assert "FAIL (0 of 1 cases; the SGLang cases did not finish)" in text
     assert "The SGLang cases did not finish" in text
 
@@ -122,8 +121,7 @@ def test_pull_request_comment_carries_its_setup(tmp_path):
     text = report.correctness_comment("weekly", [run], args(pr=12))
     assert "<details><summary>Setup of every case</summary>" in text
     assert "On request in a pull request" in text and "from the pull request merged into main" in text
-    # No issue description to point at: the workload and checks are spelled out.
-    assert "| check | passes when |" in text and "#nightly-correctness" not in text
+    assert "| check | passes when |" in text
     assert "\n## Weekly correctness" not in text
 
 
@@ -131,10 +129,11 @@ def test_correctness_section_describes_every_case(tmp_path):
     # An older setup.json stores the engine env as [key, value] pairs.
     setup = json.loads(json.dumps(SETUP))
     setup["engines"]["vllm"]["env"] = [["VLLM_USE_V2_MODEL_RUNNER", "1"]]
-    assert report.correctness_section("nightly", setup, args()) == \
-        report.correctness_section("nightly", SETUP, args())
-    section = report.correctness_section("nightly", SETUP, args())
-    assert "Daily at 08:00 UTC" in section and "1x NVIDIA L4" in section
+    assert report.correctness_section("weekly", setup, args()) == \
+        report.correctness_section("weekly", SETUP, args())
+    section = report.correctness_section("weekly", SETUP, args())
+    assert "Saturdays at 12:00 UTC" in section and "1x NVIDIA L4" in section
+    assert "| check | passes when |" in section
     assert "`Qwen/Qwen2.5-0.5B-Instruct` @ [7ae5576]" in section
     for case in SETUP["cases"]:
         assert f"| {case['name']} |" in section
@@ -142,9 +141,6 @@ def test_correctness_section_describes_every_case(tmp_path):
     assert "kvcached cases add `ENABLE_KVCACHED=true`" in section
     assert "`KVCACHED_CONTIGUOUS_LAYOUT` follows the KV layout" in section
     assert "native cases add `ENABLE_KVCACHED=false`" in section
-    # Other profiles point at the nightly section's workload and checks.
-    weekly = report.correctness_section("weekly", SETUP, args())
-    assert "| check | passes when |" not in weekly and "(#nightly-correctness)" in weekly
 
 
 def test_perf_comment(tmp_path):

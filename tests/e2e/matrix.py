@@ -242,7 +242,8 @@ PROFILES = {
     "smoke": Profile(groups=groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",))),
     # Run inside the weekly H100 sandbox, next to the performance runs.
     "hopper": Profile(groups=(Group("vllm", "qwen38_27b", layouts=("c1",)),)),
-    "nightly": Profile(
+    # On pull requests, by /ci run.
+    "basic": Profile(
         groups=groups(("vllm", "sglang"), ("qwen05b", "qwen35_4b", "gemma4e2b")),
         elastic=(ElasticPair("vllm", "qwen05b", "vllm", "qwen35_4b"),
                  ElasticPair("sglang", "qwen05b", "sglang", "qwen35_4b")),
