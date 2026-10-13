@@ -87,3 +87,23 @@ def test_compare_with_native():
     assert failed == {"gen_seq_tokens_equal", "apc_0_tokens_equal",
                       "apc_1_tokens_equal", "apc_2_tokens_equal", "apc_0_cached_tokens_equal",
                       "apc_1_cached_tokens_equal", "apc_2_cached_tokens_equal"}
+
+
+def test_read_segments_reads_only_the_servers_segments(tmp_path):
+    from e2e.elastic import SEGMENT, read_segments
+
+    (tmp_path / "e2e_a").write_bytes(SEGMENT.pack(100, 7, 0) + b"KVCOFD01")  # since #546
+    (tmp_path / "e2e_a_g1000").write_bytes(SEGMENT.pack(100, 2, 0))
+    (tmp_path / "e2e_ab").write_bytes(SEGMENT.pack(100, 5, 0))  # another server
+    (tmp_path / "e2e_b").write_bytes(SEGMENT.pack(0, 3, 0))  # no limit
+    assert read_segments(["e2e_a", "e2e_b"], str(tmp_path)) == {"e2e_a": 7, "e2e_a_g1000": 2}
+
+
+def test_sglang_flush_retries_while_finished_requests_are_pending(monkeypatch):
+    statuses = [400, 400, 200]
+    monkeypatch.setattr(cl, "_post", lambda *args: (statuses.pop(0), {}, 0.0))
+    monkeypatch.setattr(cl.time, "sleep", lambda seconds: None)
+    assert cl.SGLangClient("127.0.0.1", 1).reset_prefix_cache()
+    assert statuses == []
+    monkeypatch.setattr(cl, "_post", lambda *args: (500, {}, 0.0))
+    assert not cl.SGLangClient("127.0.0.1", 1).reset_prefix_cache()
