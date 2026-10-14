@@ -623,7 +623,8 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
     assert manager.memory_limit_state()["status"] == "deferred"
 
 
-def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler):
+@pytest.mark.parametrize("hisparse", [False, True])
+def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler, hisparse):
     from kvcached.integration.sglang import patches
 
     scheduler = sglang_scheduler()
@@ -633,6 +634,11 @@ def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler)
         full_attn_allocator=SimpleNamespace(), swa_attn_allocator=SimpleNamespace(),
         _kvcached_dsv4_backing=SimpleNamespace(manager=manager),
     )
+    if hisparse:
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            logical_attn_allocator=scheduler.token_to_kv_pool_allocator,
+            hisparse_attn_allocator=SimpleNamespace(kvcached_allocator=object()),
+        )
     scheduler._kvcached_shrink_reclaimers = None
     assert patches._token_kv_managers(scheduler.token_to_kv_pool_allocator) == [manager]
     manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES

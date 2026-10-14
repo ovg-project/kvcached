@@ -630,7 +630,6 @@ class KVCacheManager:
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
 
-    @synchronized
     def alloc_exact(self, block_ids: Iterable[int]) -> Optional[List[int]]:
         """Claim the requested free block IDs, in caller order, or return None.
 
@@ -640,6 +639,13 @@ class KVCacheManager:
         preserves existing allocations and reservations. Mapping-consistency
         errors remain fatal. Integrations own any cross-pool transaction.
         """
+        # Null-block initialization needs the manager lock before it can
+        # signal readiness. Never wait for it while holding that lock.
+        self.wait_ready()
+        return self._alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _alloc_exact_ready(self, block_ids: Iterable[int]) -> Optional[List[int]]:
         counters = getattr(self, "_operation_counters", None)
         if counters is not None:
             self._increment_operation_counter("allocation_requests_total")
@@ -680,7 +686,6 @@ class KVCacheManager:
             if not start <= block_id < end:
                 raise ValueError("Exact block crosses a physical-page boundary")
             grouped.setdefault(page_id, []).append(block_id)
-        self._wait_post_init()
         if not requested:
             return []
 

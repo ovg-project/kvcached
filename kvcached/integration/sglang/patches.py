@@ -3299,6 +3299,9 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
     safe as SGLang's own evict-before-alloc. Mamba slots are allocated in the
     middle of tree operations.
     """
+    # DSV4 HiSparse keeps SWA IDs/backing on its logical allocator; its
+    # separate device-cache allocator remains owned by native SGLang.
+    allocator = getattr(allocator, "logical_attn_allocator", allocator)
     managers: List[Any] = []
     for alloc in (allocator, getattr(allocator, "full_attn_allocator", None),
                   getattr(allocator, "swa_attn_allocator", None)):

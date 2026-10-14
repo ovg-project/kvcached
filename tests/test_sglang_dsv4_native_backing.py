@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock
 from types import SimpleNamespace
 
 import pytest
@@ -313,6 +313,43 @@ def test_null_initialization_failure_prevents_mapping_publication(setup):
     assert not composite.mapping and not backing.live and not manager.claims
     with pytest.raises(RuntimeError, match="tear down"):
         composite.alloc()
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+def test_first_allocation_allows_null_initialization_to_take_manager_lock(setup, monkeypatch, method):
+    composite, backing = setup()
+    manager = backing.manager
+    lock, waiting, ready = RLock(), Event(), Event()
+
+    def wait_ready():
+        waiting.set()
+        assert ready.wait(3), "test initialization was not released"
+
+    def apply_resize_target():
+        # Match KVCacheManager's synchronized resize and post-init wait.
+        with lock:
+            wait_ready()
+
+    monkeypatch.setattr(manager, "wait_ready", wait_ready)
+    monkeypatch.setattr(manager, "apply_resize_target", apply_resize_target)
+    before = dict(composite.mapping)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(getattr(composite, method))
+        try:
+            assert waiting.wait(1)
+            assert not result.done() and composite.mapping == before
+            # The background null reservation must acquire this lock before
+            # it can signal readiness. Waiting inside resize deadlocks it.
+            acquired = lock.acquire(timeout=1)
+            try:
+                assert acquired, "allocation held the lock needed by initialization"
+            finally:
+                if acquired:
+                    lock.release()
+        finally:
+            ready.set()
+        assert result.result(timeout=1) is not None
+    assert composite.mapping[20] == 12
 
 
 @pytest.mark.parametrize("page_size", [1, 4])

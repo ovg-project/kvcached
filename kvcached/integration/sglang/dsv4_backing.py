@@ -148,6 +148,9 @@ def bind_native_swa(allocator: Any, backing: SWABacking) -> None:
                 return original(*args, **kwargs)
             pending = []
             try:
+                # Initialization reserves the null block under the manager
+                # lock. Wait before resize/reclaim acquire that same lock.
+                backing.manager.wait_ready()
                 # Reclaim before native IDs or backing reference snapshots are
                 # selected: eviction may release existing SWA backing leases.
                 backing.manager.apply_resize_target()
