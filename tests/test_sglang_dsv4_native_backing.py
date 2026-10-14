@@ -97,6 +97,7 @@ def test_backing_covers_crossing_and_shared_physical_pages():
     assert backing.manager.live == {1, 2}
     backing.release({2})
     assert backing.manager.live == {2}
+
     backing.release({3})
     assert not backing.manager.live
     assert not backing.live and not backing.refs
@@ -417,3 +418,116 @@ def test_shrink_reclaims_before_native_ids_and_backing_refs_are_selected(setup, 
     assert backing.live == {3}
     assert dict(backing.refs) == {2: 1}
     assert backing.manager.live == {2}
+
+
+
+@pytest.fixture
+def composite_backings(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values)))
+    composite = Composite(256)
+    swa = make_backing()
+    full = SWABacking(Manager(), native_pages=13,
+                      native_page_bytes=3, physical_page_bytes=8)
+    assert swa.acquire({1}) and full.acquire({2})
+    MODULE.bind_native_swa(composite, swa, full)
+    return composite, swa, full
+
+
+@pytest.mark.parametrize("method", ["alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("miss", ["full", "swa"])
+def test_c128_all_child_rollback_preserves_prefix(composite_backings, method, miss):
+    composite, swa, full = composite_backings
+    composite.full_attn_allocator.output.insert(0, 513)
+    composite.swa_attn_allocator.output.insert(0, 257)
+    failed = full if miss == "full" else swa
+    failed.manager.budget = len(failed.manager.live)
+    before = [(set(b.live), dict(b.refs), set(b.manager.live)) for b in (swa, full)]
+    assert getattr(composite, method)() is None
+    assert composite.mapping == {512: 256}
+    assert composite.full_attn_allocator.live == {2}
+    assert composite.swa_attn_allocator.live == {1}
+    assert before == [(set(b.live), dict(b.refs), set(b.manager.live)) for b in (swa, full)]
+    failed.manager.budget = 20
+    assert getattr(composite, method)() is not None
+    assert full.live == {2, 5} and swa.live == {1, 3}
+
+
+def test_c128_full_pages_outlive_swa_and_deferred_full_free(composite_backings):
+    composite, swa, full = composite_backings
+    assert composite.alloc() is not None
+    composite.swa_attn_allocator.free_page_ids(Tensor([3]))
+    assert swa.live == {1} and full.live == {2, 5}
+    native_full = composite.full_attn_allocator
+    native_full.free_group = []
+    native_full.free_page_ids(Tensor([5]))
+    assert full.live == {2, 5}
+    native_full.free_group_end()
+    assert full.live == {2}
+    native_full.clear()
+    assert not full.live and not full.manager.live
+
+
+def test_c128_limit_and_fatal_failure_are_composite_wide(composite_backings):
+    composite, swa, full = composite_backings
+    full.manager.budget = 0
+    assert composite.full_attn_allocator.available_size() < composite._conserve_full_available_size()
+    full.manager.fault = RuntimeError("C128 map failed")
+    with pytest.raises(RuntimeError, match="C128 map failed"):
+        composite.alloc()
+    for child in (composite.full_attn_allocator, composite.swa_attn_allocator):
+        with pytest.raises(RuntimeError, match="tear down"):
+            child.clear()
+
+
+def test_c128_capacity_rejected_before_binding(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    composite = Composite(256)
+    original_alloc = composite.full_attn_allocator.alloc
+    with pytest.raises(ValueError, match="cannot cover"):
+        MODULE.bind_native_swa(composite, make_backing(), make_backing())
+    assert composite.full_attn_allocator.alloc == original_alloc
+
+def _assert_all_backings_ready_before_resize(monkeypatch, composite, pools, waiting_pool, method):
+    lock, waiting, ready = RLock(), Event(), Event()
+    operations = []
+
+    def wait_ready():
+        waiting.set()
+        assert ready.wait(3), "test initialization was not released"
+
+    monkeypatch.setattr(waiting_pool.manager, "wait_ready", wait_ready)
+    for pool in pools:
+        original = pool.manager.apply_resize_target
+
+        def apply(original=original, pool=pool):
+            operations.append(pool)
+            with lock:
+                original()
+
+        monkeypatch.setattr(pool.manager, "apply_resize_target", apply)
+    before = dict(composite.mapping)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(getattr(composite, method))
+        try:
+            assert waiting.wait(1)
+            assert not result.done() and composite.mapping == before
+            acquired = lock.acquire(timeout=1)
+            try:
+                assert acquired, "a side pool held the initialization lock"
+                assert not operations, "resize started before all side pools were ready"
+            finally:
+                if acquired:
+                    lock.release()
+        finally:
+            ready.set()
+        assert result.result(timeout=1) is not None
+    assert set(operations) == set(pools)
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("waiting_side", ["swa", "full"])
+def test_c128_waits_for_both_managers_before_any_resize(composite_backings, monkeypatch, method, waiting_side):
+    composite, swa, full = composite_backings
+    _assert_all_backings_ready_before_resize(
+        monkeypatch, composite, (swa, full), swa if waiting_side == "swa" else full, method)

@@ -33,6 +33,7 @@ class FakeTensor:
 
 
 def _load_modules(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
     torch_mock = mock.MagicMock()
     torch_mock.__version__ = "2.6.0"
     torch_mock.uint8.itemsize = 1
@@ -435,7 +436,7 @@ def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
     assert managed.full.kind == "native-paged"
     assert managed.swa.kind == "native-paged"
     assert not hasattr(managed_cache, "full_kv_pool")
-    bind.assert_called_once_with(managed, managed_cache.swa_kv_pool._kvcached_dsv4_backing)
+    bind.assert_called_once_with(managed, managed_cache.swa_kv_pool._kvcached_dsv4_backing, None)
 
     native_cache = types.SimpleNamespace(
         full_kv_pool=object(), swa_kv_pool=object()
@@ -564,6 +565,50 @@ def test_alloc_dsv4_swa_cache_rejects_compound_layout(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("size,layers,managed", [(4096, 1, True), (64, 1, False), (4096, 0, False)])
+def test_c128_factory_selects_only_useful_supported_storage(monkeypatch, size, layers, managed):
+    interfaces, patches, _ = _load_modules(monkeypatch)
+    module = _make_dsv4_module()
+    monkeypatch.setattr(module.DeepSeekV4SingleKVPool, "get_bytes_per_token", lambda self: 584)
+    monkeypatch.setattr(interfaces, "init_kvcached", lambda **_: None)
+    monkeypatch.setattr(patches, "_resolve_sglang_parallel_context", lambda: (0, 1, 0))
+    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", lambda **_: ([FakeTensor(200)], []))
+    managers = []
+
+    def manager(_kvi, **kwargs):
+        managers.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(patches, "_new_tp_scoped_kvcached_allocator", manager)
+    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
+    pool = module.DeepSeekV4TokenToKVPool()
+    pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+    kwargs = dict(size=size, page_size=2, dtype=types.SimpleNamespace(itemsize=1),
+                  layer_num=layers, device="cuda:0", enable_memory_saver=False,
+                  global_page_size=256)
+    pool.c128_kv_pool = pool._make_kv_pool(**kwargs)
+    assert bool(getattr(pool.c128_kv_pool, "_kvcached_managed", False)) is managed
+    breakdown = patches._collect_dsv4_runtime_reservations(pool)
+    assert breakdown["dsv4.c128_kv_pool"] == (0 if managed else 101 * layers)
+    assert breakdown["dsv4.c4_kv_pool"] == 101
+    if managed:
+        assert managers[-1]["pool_name"] == "dsv4_c128_kv"
+        assert managers[0]["group_id"] != managers[1]["group_id"]
+        assert pool.c128_kv_pool.bytes_per_page_padded == 1728
+    token = patches._dsv4_pool_context.set((True, types.SimpleNamespace(
+        page_size=256, size_full=4096 * 128)))
+    try:
+        kwargs.update(size=4096, layer_num=1)
+        draft_pool = pool._make_kv_pool(**kwargs)
+        assert not hasattr(draft_pool, "_kvcached_managed")
+        assert patches._pool_buffer_nbytes(draft_pool, "kv_buffer") == 101
+        kwargs["size"] = 4094
+        with pytest.raises(patches.KVCachedConfigError, match="shared target full IDs"):
+            pool._make_kv_pool(**kwargs)
+    finally:
+        patches._dsv4_pool_context.reset(token)
+
+
 @pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (4, 1), (1, 2), (1, 4), (2, 2)])
 def test_dsv4_parallel_retains_native_storage_before_any_backing(monkeypatch, tp_size, pp_size):
     interfaces, patches, _ = _load_modules(monkeypatch)
@@ -594,4 +639,30 @@ def test_dsv4_unknown_topology_retains_native_storage(monkeypatch, error):
     pool = module.DeepSeekV4TokenToKVPool()
     assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
     assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.swa_kv_pool"] == 202
+    create.assert_not_called()
+
+@pytest.mark.parametrize("setting", [None, "false", "0"])
+def test_dsv4_disabled_autopatch_retains_native_storage(monkeypatch, setting):
+    interfaces, patches, _ = _load_modules(monkeypatch)
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "1")
+    if setting is None:
+        monkeypatch.delenv("ENABLE_KVCACHED", raising=False)
+    else:
+        monkeypatch.setenv("ENABLE_KVCACHED", setting)
+    monkeypatch.setattr(patches, "_dsv4_pool_context", ContextVar("disabled_dsv4", default=None))
+    create = mock.Mock(side_effect=AssertionError("Disabled storage must not initialize a manager"))
+    monkeypatch.setattr(interfaces, "init_kvcached", create)
+    monkeypatch.setattr(patches, "_new_tp_scoped_kvcached_allocator", create)
+    module = _make_dsv4_module()
+    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
+    pool = module.DeepSeekV4TokenToKVPool()
+    assert pool.swa_kv_pool.kv_buffer[0].nbytes == 101
+    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
+    assert not hasattr(pool.c4_kv_pool, "_kvcached_managed")
+    pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+    compressed = pool._make_kv_pool(
+        size=4096, page_size=2, dtype=object(), layer_num=1,
+        device="cuda:0", enable_memory_saver=False, global_page_size=256,
+    )
+    assert not hasattr(compressed, "_kvcached_managed")
     create.assert_not_called()

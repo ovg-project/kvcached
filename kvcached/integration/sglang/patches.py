@@ -2348,6 +2348,8 @@ def _resolve_sglang_parallel_context() -> tuple[int, int, int]:
 
 
 def _dsv4_single_rank_backing() -> bool:
+    if not enable_kvcached():
+        return False
     # A local backing miss must not split distributed allocation outcomes.
     # Keep native storage unless both dimensions are known to be single-rank.
     try:
@@ -2500,10 +2502,11 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
 
         class ElasticDeepSeekV4SWAKVPool(original_single):  # type: ignore[misc, valid-type]
             _next_group_id = 20_000
+            _pool_name = "dsv4_swa_kv"
 
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                self._group_id = type(self)._next_group_id
-                type(self)._next_group_id += 1
+                self._group_id = ElasticDeepSeekV4SWAKVPool._next_group_id
+                ElasticDeepSeekV4SWAKVPool._next_group_id += 1
                 super().__init__(*args, **kwargs)
 
             def _create_buffers(self) -> None:
@@ -2552,7 +2555,7 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                     reserve_null_block=True,
                     num_kv_buffers=1,
                     group_id=self._group_id,
-                    pool_name="dsv4_swa_kv",
+                    pool_name=self._pool_name,
                 )
                 self._kvcached_dsv4_backing = SWABacking(
                     self.kvcached_allocator,
@@ -2562,8 +2565,14 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                 )
                 self._kvcached_managed = True
 
+        class ElasticDeepSeekV4C128KVPool(ElasticDeepSeekV4SWAKVPool):
+            # Same padded byte layout; native full-page IDs address this pool.
+            _pool_name = "dsv4_c128_kv"
+
         class ElasticDeepSeekV4TokenToKVPool(original_top):  # type: ignore[misc, valid-type]
             def _make_kv_pool(self, *args: Any, **kwargs: Any) -> Any:
+                if not enable_kvcached():
+                    return original_make_pool_fn(self, *args, **kwargs)
                 bound = make_pool_signature.bind(self, *args, **kwargs)
                 bound.apply_defaults()
                 pool_class = bound.arguments["cls"]
@@ -2599,6 +2608,40 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                         "Leaving DeepSeek-V4 SWA KV runtime-owned because "
                         "the layout or parallel topology is not supported"
                     )
+                is_c128_pool = (
+                    int(bound.arguments["page_size"]) * 128
+                    == int(bound.arguments["global_page_size"])
+                    and pool_class is original_single
+                    and self.qk_nope_head_dim == 448
+                    and self.qk_rope_head_dim == 64
+                    and int(bound.arguments["size"]) > 0
+                    and int(bound.arguments["layer_num"]) > 0
+                )
+                if is_c128_pool and not CONTIGUOUS_LAYOUT:
+                    context = _dsv4_pool_context.get()
+                    if context is None:
+                        raise KVCachedConfigError("C128 construction requires runner ownership")
+                    is_draft, shared_allocator = context
+                    if is_draft and shared_allocator is not None:
+                        logical = getattr(shared_allocator, "logical_attn_allocator",
+                                          shared_allocator)
+                        if (int(bound.arguments["global_page_size"]) != logical.page_size
+                                or int(bound.arguments["size"]) * 128 < logical.size_full):
+                            raise KVCachedConfigError(
+                                "Draft C128 storage must cover the shared target full IDs")
+                    elif hasattr(getattr(self, "swa_kv_pool", None),
+                                 "_kvcached_dsv4_backing"):
+                        import kvcached.integration.sglang.interfaces as kvi
+
+                        # Small pools keep native storage: their entire payload
+                        # would fit in the permanently mapped padding page.
+                        native_page_size = int(bound.arguments["page_size"])
+                        page_bytes = math.ceil(native_page_size * 584 / 576) * 576
+                        num_pages = (int(bound.arguments["size"])
+                                     + native_page_size + 1) // native_page_size
+                        if num_pages * page_bytes >= kvi.get_page_size_for_block(
+                                page_bytes, kvi.PAGE_SIZE):
+                            bound.arguments["cls"] = ElasticDeepSeekV4C128KVPool
                 return original_make_pool_fn(*bound.args, **bound.kwargs)
 
         setattr(
@@ -2752,7 +2795,12 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
             if backing is not None:
                 from kvcached.integration.sglang.dsv4_backing import bind_native_swa
 
-                bind_native_swa(allocator_self, backing)
+                c128_pool = getattr(kvcache, "c128_kv_pool", None)
+                full_backing = getattr(c128_pool, "_kvcached_dsv4_backing", None)
+                if (full_backing is not None and c128_pool is not None
+                        and c128_pool.page_size * 128 != page_size):
+                    raise KVCachedConfigError("C128 and full allocator page geometry differs")
+                bind_native_swa(allocator_self, backing, full_backing)
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init
@@ -3308,10 +3356,11 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
         manager = getattr(alloc, "kvcached_allocator", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)
-    backing = getattr(allocator, "_kvcached_dsv4_backing", None)
-    manager = getattr(backing, "manager", None)
-    if manager is not None and all(manager is not m for m in managers):
-        managers.append(manager)
+    for name in ("_kvcached_dsv4_backing", "_kvcached_dsv4_full_backing"):
+        backing = getattr(allocator, name, None)
+        manager = getattr(backing, "manager", None)
+        if manager is not None and all(manager is not m for m in managers):
+            managers.append(manager)
     return managers
 
 

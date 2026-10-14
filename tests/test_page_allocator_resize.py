@@ -122,6 +122,19 @@ def test_failed_shrink_remains_pending_until_applied(allocator_factory):
     assert allocator.get_num_total_pages() == 2
 
 
+def test_regrow_is_capped_at_startup_size(allocator_factory):
+    allocator, _, _ = allocator_factory()
+    assert allocator.resize(3 * PAGE_SIZE)
+    # Growing past the startup size used to hand out reclaimed IDs twice.
+    assert allocator.resize(20 * PAGE_SIZE)
+    assert allocator.get_num_total_pages() == STARTUP_PAGES
+
+    pages = [allocator.alloc_page() for _ in range(STARTUP_PAGES)]
+    page_ids = [page.page_id for page in pages]
+    assert sorted(page_ids) == list(range(STARTUP_PAGES))
+    allocator.free_pages(page_ids)
+
+
 def test_direct_resize_does_not_reapply_unchanged_quota(allocator_factory):
     allocator, _, _ = allocator_factory()
     # The revisioned memory-limit API also calls resize() directly, without

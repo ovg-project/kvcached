@@ -135,7 +135,7 @@ class TestDeepSeekV4SyncCompatibility(unittest.TestCase):
             self.assertIs(managed.swa.pool, physical)
             self.assertIsNone(managed.full.pool)
             self.assertFalse(hasattr(managed_pool, "full_kv_pool"))
-            bind.assert_called_once_with(managed, physical._kvcached_dsv4_backing)
+            bind.assert_called_once_with(managed, physical._kvcached_dsv4_backing, None)
 
 
 if __name__ == "__main__":

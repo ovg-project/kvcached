@@ -137,7 +137,8 @@ def test_prepared_unmap_can_abort_or_commit(contiguous_layout, unified_pool):
 
 
 @pytest.mark.parametrize("preallocate", [False, True])
-def test_exact_placement_reuses_capacity_after_shrink(preallocate):
+@pytest.mark.parametrize("regrowth_pages", [8, 20])
+def test_exact_placement_reuses_capacity_after_shrink(preallocate, regrowth_pages):
     vmm_ops = _compiled_vmm_ops()
     page_size = 2 * 1024 * 1024
     vmm_ops.init_kvcached("cuda:0", page_size, False)
@@ -162,7 +163,8 @@ def test_exact_placement_reuses_capacity_after_shrink(preallocate):
         assert allocator.try_alloc_page_at(1).page_id == 1
         assert allocator.get_num_total_pages() == 2
         assert allocator.get_num_free_pages() == 0
-        assert allocator.resize(8 * page_size)
+        assert allocator.resize(regrowth_pages * page_size)
+        assert allocator.get_num_total_pages() == 8
         rest = [allocator.alloc_page().page_id for _ in range(6)]
         assert set(rest) == {0, 2, 3, 4, 5, 6}
         allocator.free_pages(rest + [1, 7])
