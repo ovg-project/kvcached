@@ -1639,7 +1639,24 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             group_id=self._group_id,
                         ),
                     )
-                    self.k_buffer, self.v_buffer = _kv_mha
+                    k_buffers, v_buffers = _kv_mha
+                    # alloc_kv_cache() sizes the virtual reservation from the
+                    # whole device and returns all of it, so the buffers can
+                    # lead with more rows than the size + page_size slots
+                    # native allocates. Nothing indexes past those slots --
+                    # the allocator and KVCacheManager are sized from
+                    # self.size -- but SGLang's _build_kv_buffer_descs()
+                    # requires exactly that many rows, since PD transfer
+                    # registers buffers by row. Hand it views of those rows:
+                    # same storage, base pointer and strides.
+                    rows = self.size + self.page_size
+                    # torch.Size is a tuple; anything else is not a tensor
+                    # this pool can slice, so it is passed through as is.
+                    if any(isinstance(t.shape, tuple) and t.shape[0] > rows
+                           for t in (*k_buffers, *v_buffers)):
+                        k_buffers = [t[:rows] for t in k_buffers]
+                        v_buffers = [t[:rows] for t in v_buffers]
+                    self.k_buffer, self.v_buffer = k_buffers, v_buffers
 
                 if has_buffer_seam:
                     # 0.5.16+: native _create_buffers() keeps running. Its

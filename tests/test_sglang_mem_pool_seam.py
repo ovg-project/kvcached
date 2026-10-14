@@ -375,6 +375,36 @@ def test_seam_layout_keeps_native_descriptor_tail(elastic_env):
     ]
 
 
+@pytest.mark.parametrize("env", ["elastic_env", "interleaved_elastic_env"])
+def test_seam_layout_trims_virtual_rows_to_native_slots(request, env):
+    """The real alloc_kv_cache() returns the whole device-sized reservation,
+    more rows than the size + page_size slots requested. SGLang's
+    _build_kv_buffer_descs() rejects that (#35594), so the pool must hand it
+    views of exactly the native rows over the same storage."""
+    calls = request.getfixturevalue(env)
+    stub: Any = sys.modules["kvcached.integration.sglang.interfaces"]
+    requested = stub.alloc_kv_cache
+
+    def oversized_alloc_kv_cache(**kwargs):
+        rows, *rest = kwargs["kvcache_shape"]
+        return requested(**{**kwargs, "kvcache_shape": (rows + 20, *rest)})
+
+    stub.alloc_kv_cache = oversized_alloc_kv_cache
+    module = _inject_mha(SeamMHATokenToKVPool)
+
+    pool = _make_mha_pool(module)
+
+    rows = pool.size + pool.page_size
+    backing_k, backing_v = calls["mha_buffers"]
+    assert all(t.shape[0] == rows + 20 for t in (*backing_k, *backing_v))
+    for view, backing in zip((*pool.k_buffer, *pool.v_buffer),
+                             (*backing_k, *backing_v)):
+        assert view.shape == (rows, *backing.shape[1:])
+        assert view.data_ptr() == backing.data_ptr()
+        assert view.stride() == backing.stride()
+    assert all(shape[0] == rows for shape in pool._kv_buffer_descs)
+
+
 def test_seam_layout_pins_quant_adjacent_attributes(elastic_env):
     module = _inject_mha(SeamMHATokenToKVPool)
 
