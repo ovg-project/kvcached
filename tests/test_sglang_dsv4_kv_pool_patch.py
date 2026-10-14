@@ -719,6 +719,94 @@ def test_c4_indexer_preserves_native_layout_and_ownership(monkeypatch, layout, m
     finally:
         patches._dsv4_pool_context.reset(token)
 
+
+@pytest.mark.parametrize("mode", ["managed", "small", "c128", "unified", "native_swa", "saver"])
+def test_c4_state_factory_groups_layers_and_preserves_native_constructor(monkeypatch, mode):
+    interfaces, _patches, _ = _load_modules(monkeypatch)
+    from test_sglang_dsv4_native_backing import Manager
+
+    from kvcached.integration.sglang.dsv4_state import install_c4_state_backing
+
+    native = types.ModuleType("test_native_dsv4_state")
+    managers: list[Any] = []
+    allocations: list[Any] = []
+
+    class KVAndScore:
+        def __init__(self, tensor):
+            self.kv_score = tensor
+
+        def __getitem__(self, index):
+            assert index == -1
+            return self
+
+        def clear(self):
+            # This represents the unchanged native constructor's sentinel write.
+            assert managers and 4 in managers[-1].live
+
+    class State:
+        kv_score_buffer: Any
+
+        def __init__(self, owner, ratio, head_dim, enable_memory_saver):
+            self.ratio, self.online, self.page_size = ratio, False, 1
+            self._size = 8 if mode == "small" else 40
+            self.ring_size, self.last_dim = 8, head_dim * 4
+            self._alloc_kv_score_buffer(dtype=owner.dtype, device="cuda:0",
+                                        enable_memory_saver=enable_memory_saver)
+            if getattr(self, "_kvcached_managed", False):
+                self.kv_score_buffer[-1].clear()
+
+        def _alloc_kv_score_buffer(self, **kwargs):
+            self.native_allocation = True
+
+    State.__module__ = native.__name__
+    setattr(native, "CompressStatePool", State)
+    setattr(native, "KVAndScore", KVAndScore)
+    setattr(native, "TorchMemorySaverAdapter", types.SimpleNamespace(create=lambda **_: object()))
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+
+    class Top:
+        compression_ratios = [4, 4]
+        _stage_start, _stage_end = 0, 2
+        dtype = object()
+        _unified_kv = mode == "unified"
+        swa_kv_pool = (None if mode == "native_swa" else types.SimpleNamespace(
+            _kvcached_dsv4_backing=types.SimpleNamespace(native_pages=5)))
+
+        def _make_compress_state_pool(self, ratio, *, head_dim, enable_memory_saver):
+            return State(self, ratio, head_dim, enable_memory_saver)
+
+    # Dtypes are hashable in the runtime.
+    Top.dtype = type("Dtype", (), {"itemsize": 2})()
+
+    def allocate(**kwargs):
+        allocations.append(kwargs)
+        return [FakeTensor() for _ in range(kwargs["num_layers"])], []
+
+    def manager(**kwargs):
+        result = Manager()
+        managers.append(result)
+        return result
+
+    monkeypatch.setattr(interfaces, "get_page_size_for_block", lambda *_: 256)
+    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", allocate)
+    monkeypatch.setattr(interfaces, "get_kv_cache_manager", manager)
+    install_c4_state_backing(native, Top, lambda: 25000)
+    owner = Top()
+    pools = [owner._make_compress_state_pool(128 if mode == "c128" else 4,
+                                            head_dim=4, enable_memory_saver=mode == "saver")
+             for _ in range(2)]
+    if mode == "managed":
+        assert len(managers) == len(allocations) == 1
+        assert allocations[0]["num_layers"] == 2
+        assert pools[0]._kvcached_dsv4_backing is pools[1]._kvcached_dsv4_backing
+        assert all(p.kv_score_buffer.kv_score.view_shape == (40, 16) for p in pools)
+        assert managers[0].live == {4}
+        with pytest.raises(RuntimeError, match="layer count"):
+            owner._make_compress_state_pool(4, head_dim=4, enable_memory_saver=False)
+    else:
+        assert all(p.native_allocation for p in pools)
+        assert not allocations and not managers
+
 @pytest.mark.parametrize("setting", [None, "false", "0"])
 def test_dsv4_disabled_autopatch_retains_native_storage(monkeypatch, setting):
     interfaces, patches, _ = _load_modules(monkeypatch)

@@ -2723,6 +2723,15 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
             "DeepSeekV4TokenToKVPool",
             ElasticDeepSeekV4TokenToKVPool,
         )
+        from kvcached.integration.sglang.dsv4_state import install_c4_state_backing
+
+        def next_state_group_id() -> int:
+            group_id = ElasticDeepSeekV4SWAKVPool._next_group_id
+            ElasticDeepSeekV4SWAKVPool._next_group_id += 1
+            return group_id
+
+        install_c4_state_backing(dsv4_pool_mod, ElasticDeepSeekV4TokenToKVPool,
+                                 next_state_group_id)
         self._mark_as_patched(dsv4_pool_mod, marker)
         self.logger.info("Enabled kvcached-backed DeepSeek-V4 SWA KV pool")
         return True
@@ -2872,9 +2881,11 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                         if pool.page_size * 4 != page_size:
                             raise KVCachedConfigError("C4 and full allocator page geometry differs")
                         other_backings.append(pool_backing)
-                if other_backings:
+                state_groups = getattr(kvcache, "_kvcached_c4_state_groups", {})
+                state_backings = tuple(group["backing"] for group in state_groups.values())
+                if other_backings or state_backings:
                     bind_native_swa(allocator_self, backing, full_backing,
-                                    full_backings=tuple(other_backings))
+                                    full_backings=tuple(other_backings), swa_backings=state_backings)
                 else:
                     bind_native_swa(allocator_self, backing, full_backing)
 
@@ -3435,6 +3446,7 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
     backings = [getattr(allocator, name, None) for name in (
         "_kvcached_dsv4_backing", "_kvcached_dsv4_full_backing")]
     backings.extend(getattr(allocator, "_kvcached_dsv4_full_backings", ()))
+    backings.extend(getattr(allocator, "_kvcached_dsv4_swa_backings", ()))
     for backing in backings:
         manager = getattr(backing, "manager", None)
         if manager is not None and all(manager is not m for m in managers):

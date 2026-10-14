@@ -14,7 +14,7 @@ from typing import Any
 
 class SWABacking:
     def __init__(self, manager: Any, *, native_pages: int, native_page_bytes: int,
-                 physical_page_bytes: int) -> None:
+                 physical_page_bytes: int, permanent_pages: frozenset[int] = frozenset({0})) -> None:
         if min(native_pages, native_page_bytes, physical_page_bytes) <= 0:
             raise ValueError("SWA backing dimensions must be positive")
         if native_page_bytes > physical_page_bytes:
@@ -23,15 +23,24 @@ class SWABacking:
         self.native_pages = native_pages
         self.native_page_bytes = native_page_bytes
         self.physical_page_bytes = physical_page_bytes
+        physical_pages = (native_pages * native_page_bytes + physical_page_bytes - 1) // physical_page_bytes
+        if 0 not in permanent_pages or any(p < 0 or p >= physical_pages for p in permanent_pages):
+            raise ValueError("Permanent backing pages must include padding and fit the reservation")
+        self.permanent_pages = permanent_pages
+        extra = sorted(permanent_pages - {0})
+        if extra:
+            manager.wait_ready()
+            if manager.alloc_exact(extra) is None:
+                raise RuntimeError("Cannot back the permanent DeepSeek-V4 state sentinel")
         self.live: set[int] = set()
         self.refs: Counter[int] = Counter()
 
-    def _span(self, page: int) -> range:
+    def _span(self, page: int) -> tuple[int, ...]:
         start = page * self.native_page_bytes // self.physical_page_bytes
         end = ((page + 1) * self.native_page_bytes - 1) // self.physical_page_bytes
         # Manager block zero permanently backs padding, including any live
         # native pages sharing that physical page.
-        return range(max(1, start), end + 1)
+        return tuple(p for p in range(start, end + 1) if p not in self.permanent_pages)
 
     def acquire(self, pages: set[int]) -> bool:
         if any(page <= 0 or page >= self.native_pages for page in pages):
@@ -63,7 +72,7 @@ class SWABacking:
 
     def available_pages(self) -> int:
         # An upper bound: placement can still fail for the exact native IDs.
-        physical = len(self.refs) + 1 + self.manager.available_size()
+        physical = len(self.refs) + len(self.permanent_pages) + self.manager.available_size()
         free_bytes = physical * self.physical_page_bytes
         free_bytes -= (len(self.live) + 1) * self.native_page_bytes
         return max(0, free_bytes // self.native_page_bytes)
@@ -75,7 +84,8 @@ class _BackingMiss(Exception):
 
 def bind_native_swa(allocator: Any, backing: SWABacking,
                     full_backing: SWABacking | None = None, *,
-                    full_backings: tuple[SWABacking, ...] = ()) -> None:
+                    full_backings: tuple[SWABacking, ...] = (),
+                    swa_backings: tuple[SWABacking, ...] = ()) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
@@ -103,12 +113,17 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         raise ValueError("Per-request SWA rings must retain native storage")
 
     selected_full = ((full_backing,) if full_backing is not None else ()) + full_backings
-    if len({id(item) for item in selected_full}) != len(selected_full):
+    selected_swa = (backing,) + swa_backings
+    selected = selected_full + selected_swa
+    if len({id(item) for item in selected}) != len(selected):
         raise ValueError("Duplicate compressed backing")
     for item in selected_full:
         if full.size // page_size >= item.native_pages:
             raise ValueError("Compressed storage cannot cover the native full allocator")
-    backings = {id(swa): (backing,), id(full): selected_full}
+    for item in swa_backings:
+        if swa.size // page_size >= item.native_pages:
+            raise ValueError("State storage cannot cover the native SWA allocator")
+    backings = {id(swa): selected_swa, id(full): selected_full}
 
     pending: list[tuple[Any, set[int]]] | None = None
     failed = False
@@ -289,3 +304,4 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     allocator._kvcached_dsv4_backing = backing
     allocator._kvcached_dsv4_full_backing = full_backing
     allocator._kvcached_dsv4_full_backings = selected_full
+    allocator._kvcached_dsv4_swa_backings = selected_swa

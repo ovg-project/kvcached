@@ -83,8 +83,9 @@ def test_dsv4_unsigned_views_and_null_block_lifecycle(
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
-@pytest.mark.parametrize("compress_ratio,fp4", [(4, False), (4, True), (128, False)])
-def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio, fp4):
+@pytest.mark.parametrize("compress_ratio,fp4,with_state",
+                         [(4, False, False), (4, True, False), (128, False, False), (4, False, True)])
+def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio, fp4, with_state):
     """Real SGLang pool construction and allocation; no model weights/kernels."""
     monkeypatch.setenv("ENABLE_KVCACHED", "true" if enabled else "false")
     _compiled_vmm_ops()
@@ -107,6 +108,9 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
     manager = None
     compressed_pools = []
+    state_pools = []
+    swa_size = 131072 if with_state else 16384
+    state_size = 8192 if with_state else 64
     full_size = 524288 if compress_ratio == 128 else 262144
     c128_size = full_size // 128
     c4_size = full_size // 4
@@ -182,12 +186,13 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.c4_state_dtype = runner.c128_state_dtype = torch.bfloat16
             runner.max_running_requests = 2
             runner.page_size = 256
-            runner.max_total_num_tokens = 16384
+            runner.max_total_num_tokens = swa_size
             runner.full_max_total_num_tokens = full_size
-            runner.swa_max_total_num_tokens = 16384
+            runner.swa_max_total_num_tokens = swa_size
             runner.c4_max_total_num_tokens = c4_size
             runner.c128_max_total_num_tokens = c128_size
-            runner.c4_state_pool_size = runner.c128_state_pool_size = 64
+            runner.c4_state_pool_size = state_size
+            runner.c128_state_pool_size = 64
             runner.num_effective_layers = 1
             runner.start_layer, runner.end_layer = 0, 1
             runner.is_hybrid_swa = runner.is_hybrid_swa_compress = True
@@ -209,10 +214,10 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.pre_model_load_memory = 0
             runner.memory_pool_config = (
                 copy.deepcopy(target.memory_pool_config) if target else MemoryPoolConfig(
-                    max_total_num_tokens=16384, max_running_requests=2,
-                    full_max_total_num_tokens=full_size, swa_max_total_num_tokens=16384,
+                    max_total_num_tokens=swa_size, max_running_requests=2,
+                    full_max_total_num_tokens=full_size, swa_max_total_num_tokens=swa_size,
                     c4_max_total_num_tokens=c4_size, c128_max_total_num_tokens=c128_size,
-                    c4_state_pool_size=64, c128_state_pool_size=64,
+                    c4_state_pool_size=state_size, c128_state_pool_size=64,
                 )
             )
             return runner
@@ -233,6 +238,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             return
         manager = target.token_to_kv_pool.swa_kv_pool.kvcached_allocator
         manager.wait_ready(timeout=8)
+        if with_state:
+            state_pools = [target.token_to_kv_pool.compress_state_pools[0],
+                           target.token_to_kv_pool.indexer_compress_state_pools[0]]
+            assert all(p._kvcached_managed for p in state_pools)
+            for pool in state_pools:
+                assert torch.all(pool.kv_score_buffer[-1].kv == 0).item()
+                assert torch.all(torch.isneginf(pool.kv_score_buffer[-1].score)).item()
+            breakdown = target.token_to_kv_pool._kvcached_runtime_reservation_breakdown
+            assert breakdown["dsv4.compress_state_pools"] == 0
+            assert breakdown["dsv4.indexer_compress_state_pools"] == 0
         compressed_names = (["c128_kv_pool"] if compress_ratio == 128 else
                             ["c4_kv_pool", "c4_indexer_kv_pool"])
         for name in compressed_names:
@@ -241,8 +256,8 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             pool.kvcached_allocator.wait_ready(timeout=8)
             assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
                 "dsv4." + name] == 0
-        assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
-            "dsv4.compress_state_pools"] > 0
+        assert (target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
+            "dsv4.compress_state_pools"] == 0) is with_state
         if compress_ratio == 4:
             indexer = target.token_to_kv_pool.c4_indexer_kv_pool
             assert indexer.use_fp4_indexer is fp4
@@ -274,7 +289,8 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert breakdown["dsv4." + name] == 0
             assert not hasattr(draft_pool, "kvcached_allocator")
         assert patches._token_kv_managers(shared) == [
-            manager, *(pool.kvcached_allocator for pool in compressed_pools)]
+            manager, *(pool.kvcached_allocator for pool in compressed_pools),
+            *(state._kvcached_dsv4_backing.manager for state in state_pools)]
         assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == (
             target_reservation + sum(breakdown.values())
         )
@@ -414,6 +430,40 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             shared.free_group_end()
             assert not compressed_backing.live and not compressed_backing.refs
 
+        for state in state_pools:
+            shared.clear()
+            backing = state._kvcached_dsv4_backing
+            state_manager = backing.manager
+            first_crossing = backing.physical_page_bytes // backing.native_page_bytes
+            count = (first_crossing + 1) * 256
+            prefix = torch.tensor([0], device="cuda", dtype=torch.int64)
+            seq = torch.tensor([count], device="cuda", dtype=torch.int64)
+            last = torch.tensor([-1], device="cuda", dtype=torch.int64)
+            mapping = shared.full_to_swa_index_mapping.clone()
+            capacity = logical.available_size()
+            with monkeypatch.context() as pressure:
+                miss = mock.Mock(return_value=None)
+                pressure.setattr(state_manager, "alloc_exact", miss)
+                assert shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, count) is None
+                assert miss.called
+            assert not backing.live and not backing.refs
+            assert logical.available_size() == capacity
+            assert torch.equal(shared.full_to_swa_index_mapping, mapping)
+            full = shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, count)
+            assert full is not None
+            swa = shared.translate_loc_from_full_to_swa(full)
+            locs = state.translate_from_swa_loc_to_state_loc(swa)
+            state.kv_score_buffer.kv_score[locs] = 29
+            torch.cuda.synchronize()
+            assert torch.all(state.kv_score_buffer.kv_score[locs] == 29).item()
+            shared.free_swa(full)
+            assert not backing.live and not backing.refs
+            # The native sentinel remains mapped after all live SWA rows retire.
+            state.kv_score_buffer[-1].clear()
+            torch.cuda.synchronize()
+            assert torch.all(torch.isneginf(state.kv_score_buffer[-1].score)).item()
+            shared.free_full(full)
+
         draft_owner = weakref.ref(draft.token_to_kv_pool)
         del draft
         gc.collect()
@@ -425,4 +475,6 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert manager.shutdown()
         for pool in compressed_pools:
             assert pool.kvcached_allocator.shutdown()
+        for state in state_pools:
+            assert state._kvcached_dsv4_backing.manager.shutdown()
         assert interfaces.shutdown_kvcached()
