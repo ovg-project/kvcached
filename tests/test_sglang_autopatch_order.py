@@ -48,6 +48,9 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         if isinstance(version, ast.Constant):
             patch_versions[patch_name] = version.value
 
+    assert patch_versions["DeepSeekV4PoolStatsPatch"] == ">=0.5.20"
+    assert patch_names.index("DeepSeekV4PoolStatsPatch") > patch_names.index("DeepSeekV4SWAAllocatorPatch")
+
     legacy_virtual_index = patch_names.index(
         "SGLangLegacyVirtualKVCapacityPatch"
     )

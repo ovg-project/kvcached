@@ -11,6 +11,7 @@ from kvcached.integration.patch_base import (
     is_integration_version_supported,
     log_patch_results,
 )
+from kvcached.integration.sglang.dsv4_pool_stats import DeepSeekV4PoolStatsPatch
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     DeepSeekV4KVPoolPatch,
@@ -75,6 +76,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4PoolStatsPatch(), ">=0.5.20"),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
