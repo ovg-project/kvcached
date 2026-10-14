@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Backing leases for native SGLang SWA and full/C128 page IDs.
+"""Backing leases for native SGLang SWA and compressed full-page IDs.
 
 The manager uses one block per VMM page. Native token pages can share or
 straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
@@ -74,13 +74,15 @@ class _BackingMiss(Exception):
 
 
 def bind_native_swa(allocator: Any, backing: SWABacking,
-                    full_backing: SWABacking | None = None) -> None:
+                    full_backing: SWABacking | None = None, *,
+                    full_backings: tuple[SWABacking, ...] = ()) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
     mappings. An expected miss returns only newly acquired pages via native
     free_page_ids; an unexpected error poisons this adapter until teardown.
-    Optional C128 backing follows full IDs independently of SWA retirement.
+    Compressed KV/indexer backing follows full IDs independently of SWA retirement.
+    Every selected pool must acquire its backing before native mappings publish.
     No native free list is read or assigned.
     """
     import torch
@@ -100,11 +102,13 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     if getattr(allocator, "swa_req_ring", False):
         raise ValueError("Per-request SWA rings must retain native storage")
 
-    backings = {id(swa): backing}
-    if full_backing is not None:
-        if full.size // page_size >= full_backing.native_pages:
-            raise ValueError("C128 storage cannot cover the native full allocator")
-        backings[id(full)] = full_backing
+    selected_full = ((full_backing,) if full_backing is not None else ()) + full_backings
+    if len({id(item) for item in selected_full}) != len(selected_full):
+        raise ValueError("Duplicate compressed backing")
+    for item in selected_full:
+        if full.size // page_size >= item.native_pages:
+            raise ValueError("Compressed storage cannot cover the native full allocator")
+    backings = {id(swa): (backing,), id(full): selected_full}
 
     pending: list[tuple[Any, set[int]]] | None = None
     failed = False
@@ -140,9 +144,9 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             pages = page_ids(result)
             new = pages - prior
             pending.append((child, new))
-            child_backing = backings.get(id(child))
-            if child_backing is not None and not child_backing.acquire(pages):
-                raise _BackingMiss
+            for child_backing in backings[id(child)]:
+                if not child_backing.acquire(pages):
+                    raise _BackingMiss
             return result
         return allocate
 
@@ -157,20 +161,21 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             try:
                 # All initialization must settle before resize/reclaim can
                 # acquire manager locks or release another pool's backing.
-                for child_backing in backings.values():
-                    child_backing.manager.wait_ready()
+                for child_backings in backings.values():
+                    for child_backing in child_backings:
+                        child_backing.manager.wait_ready()
                 # Reclaim before native IDs or backing reference snapshots are
                 # selected: eviction may release existing SWA backing leases.
-                for child_backing in backings.values():
-                    child_backing.manager.apply_resize_target()
-                    child_backing.manager.reclaim_for_shrink()
+                for child_backings in backings.values():
+                    for child_backing in child_backings:
+                        child_backing.manager.apply_resize_target()
+                        child_backing.manager.reclaim_for_shrink()
                 try:
                     return original(*args, **kwargs)
                 except _BackingMiss:
                     for child, pages in reversed(pending):
                         return_pages(child, pages)
-                        rollback_backing = backings.get(id(child))
-                        if rollback_backing is not None:
+                        for rollback_backing in reversed(backings[id(child)]):
                             rollback_backing.release(pages)
                     return None
             except Exception:
@@ -182,7 +187,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 pending = None
         return allocate
 
-    def bind_release(child: Any, child_backing: SWABacking) -> None:
+    def bind_release(child: Any, child_backings: tuple[SWABacking, ...]) -> None:
         release_depth = 0
         deferred: set[int] = set()
 
@@ -198,7 +203,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 try:
                     result = original(indices)
                     if child.free_group is None:
-                        child_backing.release(pages)
+                        for child_backing in child_backings:
+                            child_backing.release(pages)
                     else:
                         deferred.update(pages)
                     return result
@@ -216,7 +222,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             require_healthy()
             try:
                 original_group_end()
-                child_backing.release(deferred)
+                for child_backing in child_backings:
+                    child_backing.release(deferred)
                 deferred.clear()
             except Exception:
                 failed = True
@@ -229,7 +236,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             require_healthy()
             try:
                 original_clear()
-                child_backing.release(set(child_backing.live))
+                for child_backing in child_backings:
+                    child_backing.release(set(child_backing.live))
                 deferred.clear()
             except Exception:
                 failed = True
@@ -238,7 +246,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         def available_size() -> int:
             require_healthy()
             return min(native_available[id(child)](),
-                       child_backing.available_pages() * page_size)
+                       *(item.available_pages() * page_size for item in child_backings))
 
         child.free = wrap_release(child.free, page_size)
         child.free_page_ids = wrap_release(child.free_page_ids, 1)
@@ -270,9 +278,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         if original is not None:
             setattr(allocator, name, wrap_composite(original))
     for child in (full, swa):
-        child_backing = backings.get(id(child))
-        if child_backing is not None:
-            bind_release(child, child_backing)
+        if backings[id(child)]:
+            bind_release(child, backings[id(child)])
     # Slot conservation counts logical IDs, not the current physical budget.
     allocator._conserve_swa_available_size = native_available[id(swa)]
     allocator._conserve_full_available_size = native_available[id(full)]
@@ -281,3 +288,4 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     # pages, not the native token-page IDs used by page-aware eviction.
     allocator._kvcached_dsv4_backing = backing
     allocator._kvcached_dsv4_full_backing = full_backing
+    allocator._kvcached_dsv4_full_backings = selected_full

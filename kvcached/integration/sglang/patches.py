@@ -2500,6 +2500,57 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
             )
             return False
 
+        def allocate_byte_buffers(self: Any, page_bytes: int) -> Any:
+            import kvcached.integration.sglang.interfaces as kvi
+
+            num_pages = (self.size + self.page_size + 1) // self.page_size
+            tp_rank, tp_size, pp_rank = _resolve_sglang_parallel_context()
+            kvi.init_kvcached(
+                tp_rank=tp_rank,
+                world_size=tp_size,
+                pp_rank=pp_rank,
+                device=self.device,
+                async_sched=True,
+            )
+            buffers, self._kvcached_raw_tensors = (
+                kvi.alloc_dsv4_swa_cache(
+                    num_pages=num_pages,
+                    bytes_per_page=page_bytes,
+                    num_layers=self.layer_num,
+                    device=self.device,
+                    group_id=self._group_id,
+                )
+            )
+            from kvcached.integration.sglang.dsv4_backing import SWABacking
+
+            physical_page_bytes = kvi.get_page_size_for_block(
+                page_bytes, kvi.PAGE_SIZE
+            )
+            physical_pages = (
+                num_pages * page_bytes + physical_page_bytes - 1
+            ) // physical_page_bytes
+            self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
+                kvi,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                num_blocks=physical_pages,
+                block_size=1,
+                cell_size=physical_page_bytes,
+                num_layers=self.layer_num,
+                reserve_null_block=True,
+                num_kv_buffers=1,
+                group_id=self._group_id,
+                pool_name=self._pool_name,
+            )
+            self._kvcached_dsv4_backing = SWABacking(
+                self.kvcached_allocator,
+                native_pages=num_pages,
+                native_page_bytes=page_bytes,
+                physical_page_bytes=physical_page_bytes,
+            )
+            self._kvcached_managed = True
+            return buffers
+
         class ElasticDeepSeekV4SWAKVPool(original_single):  # type: ignore[misc, valid-type]
             _next_group_id = 20_000
             _pool_name = "dsv4_swa_kv"
@@ -2510,64 +2561,47 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                 super().__init__(*args, **kwargs)
 
             def _create_buffers(self) -> None:
-                import kvcached.integration.sglang.interfaces as kvi
-
                 bytes_per_token = int(self.get_bytes_per_token())
                 self.kv_cache_total_dim = bytes_per_token
                 unpadded_page_bytes = self.page_size * bytes_per_token
                 self.bytes_per_page_padded = (
                     math.ceil(unpadded_page_bytes / 576) * 576
                 )
-                num_pages = (self.size + self.page_size + 1) // self.page_size
-                tp_rank, tp_size, pp_rank = _resolve_sglang_parallel_context()
-                kvi.init_kvcached(
-                    tp_rank=tp_rank,
-                    world_size=tp_size,
-                    pp_rank=pp_rank,
-                    device=self.device,
-                    async_sched=True,
-                )
-                self.kv_buffer, self._kvcached_raw_tensors = (
-                    kvi.alloc_dsv4_swa_cache(
-                        num_pages=num_pages,
-                        bytes_per_page=self.bytes_per_page_padded,
-                        num_layers=self.layer_num,
-                        device=self.device,
-                        group_id=self._group_id,
-                    )
-                )
-                from kvcached.integration.sglang.dsv4_backing import SWABacking
-
-                physical_page_bytes = kvi.get_page_size_for_block(
-                    self.bytes_per_page_padded, kvi.PAGE_SIZE
-                )
-                physical_pages = (
-                    num_pages * self.bytes_per_page_padded + physical_page_bytes - 1
-                ) // physical_page_bytes
-                self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
-                    kvi,
-                    tp_rank=tp_rank,
-                    tp_size=tp_size,
-                    num_blocks=physical_pages,
-                    block_size=1,
-                    cell_size=physical_page_bytes,
-                    num_layers=self.layer_num,
-                    reserve_null_block=True,
-                    num_kv_buffers=1,
-                    group_id=self._group_id,
-                    pool_name=self._pool_name,
-                )
-                self._kvcached_dsv4_backing = SWABacking(
-                    self.kvcached_allocator,
-                    native_pages=num_pages,
-                    native_page_bytes=self.bytes_per_page_padded,
-                    physical_page_bytes=physical_page_bytes,
-                )
-                self._kvcached_managed = True
+                self.kv_buffer = allocate_byte_buffers(self, self.bytes_per_page_padded)
 
         class ElasticDeepSeekV4C128KVPool(ElasticDeepSeekV4SWAKVPool):
             # Same padded byte layout; native full-page IDs address this pool.
             _pool_name = "dsv4_c128_kv"
+
+        class ElasticDeepSeekV4C4KVPool(ElasticDeepSeekV4SWAKVPool):
+            _pool_name = "dsv4_c4_kv"
+
+        original_indexer = getattr(dsv4_pool_mod, "DeepSeekV4IndexerPool", None)
+        original_make_indexer = getattr(original_top, "_make_indexer_pool", None)
+        elastic_indexer_class: Any = None
+        if original_indexer is not None and callable(original_make_indexer):
+            class ElasticDeepSeekV4IndexerPool(original_indexer):  # type: ignore[misc, valid-type]
+                _pool_name = "dsv4_c4_indexer_kv"
+
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    self._group_id = ElasticDeepSeekV4SWAKVPool._next_group_id
+                    ElasticDeepSeekV4SWAKVPool._next_group_id += 1
+                    super().__init__(*args, **kwargs)
+
+                def _create_buffer(self) -> None:
+                    import kvcached.integration.sglang.interfaces as kvi
+
+                    page_bytes = self.page_size * int(self.get_bytes_per_token())
+                    num_pages = (self.size + self.page_size + 1) // self.page_size
+                    # CUDA keeps payload and scales together. AITER's split
+                    # FP4 buffers have an independent layout and remain native.
+                    if (self.uses_aiter_fp4_layout or self.index_head_dim != 128
+                            or num_pages * page_bytes < kvi.get_page_size_for_block(
+                                page_bytes, kvi.PAGE_SIZE)):
+                        return super()._create_buffer()
+                    self.index_k_with_scale_buffer = allocate_byte_buffers(self, page_bytes)
+
+            elastic_indexer_class = ElasticDeepSeekV4IndexerPool
 
         class ElasticDeepSeekV4TokenToKVPool(original_top):  # type: ignore[misc, valid-type]
             def _make_kv_pool(self, *args: Any, **kwargs: Any) -> Any:
@@ -2608,27 +2642,29 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                         "Leaving DeepSeek-V4 SWA KV runtime-owned because "
                         "the layout or parallel topology is not supported"
                     )
-                is_c128_pool = (
-                    int(bound.arguments["page_size"]) * 128
-                    == int(bound.arguments["global_page_size"])
+                native_page_size = int(bound.arguments["page_size"])
+                global_page_size = int(bound.arguments["global_page_size"])
+                ratio = global_page_size // max(1, native_page_size)
+                is_compressed_pool = (
+                    ratio in (4, 128) and native_page_size * ratio == global_page_size
                     and pool_class is original_single
                     and self.qk_nope_head_dim == 448
                     and self.qk_rope_head_dim == 64
                     and int(bound.arguments["size"]) > 0
                     and int(bound.arguments["layer_num"]) > 0
                 )
-                if is_c128_pool and not CONTIGUOUS_LAYOUT:
+                if is_compressed_pool and not CONTIGUOUS_LAYOUT:
                     context = _dsv4_pool_context.get()
                     if context is None:
-                        raise KVCachedConfigError("C128 construction requires runner ownership")
+                        raise KVCachedConfigError("Compressed KV construction requires runner ownership")
                     is_draft, shared_allocator = context
                     if is_draft and shared_allocator is not None:
                         logical = getattr(shared_allocator, "logical_attn_allocator",
                                           shared_allocator)
                         if (int(bound.arguments["global_page_size"]) != logical.page_size
-                                or int(bound.arguments["size"]) * 128 < logical.size_full):
+                                or int(bound.arguments["size"]) * ratio < logical.size_full):
                             raise KVCachedConfigError(
-                                "Draft C128 storage must cover the shared target full IDs")
+                                "Draft compressed storage must cover the shared target full IDs")
                     elif hasattr(getattr(self, "swa_kv_pool", None),
                                  "_kvcached_dsv4_backing"):
                         import kvcached.integration.sglang.interfaces as kvi
@@ -2641,8 +2677,36 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                                      + native_page_size + 1) // native_page_size
                         if num_pages * page_bytes >= kvi.get_page_size_for_block(
                                 page_bytes, kvi.PAGE_SIZE):
-                            bound.arguments["cls"] = ElasticDeepSeekV4C128KVPool
+                            bound.arguments["cls"] = (
+                                ElasticDeepSeekV4C128KVPool if ratio == 128
+                                else ElasticDeepSeekV4C4KVPool
+                            )
                 return original_make_pool_fn(*bound.args, **bound.kwargs)
+
+        if elastic_indexer_class is not None and callable(original_make_indexer):
+            original_make_indexer_fn = cast(Callable[..., Any], original_make_indexer)
+            indexer_signature = inspect.signature(original_make_indexer_fn)
+
+            def make_indexer(self: Any, *args: Any, **kwargs: Any) -> Any:
+                bound = indexer_signature.bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                context = _dsv4_pool_context.get()
+                c4 = getattr(self, "c4_kv_pool", None)
+                # The factory runs before the c4 alias is assigned in 0.5.20.
+                if c4 is None:
+                    c4 = getattr(self, "kv_pools", {}).get(4)
+                if (not CONTIGUOUS_LAYOUT and context is not None
+                        and not (context[0] and context[1] is not None)
+                        and c4 is not None and hasattr(c4, "_kvcached_dsv4_backing")
+                        and int(bound.arguments["size"]) > 0
+                        and int(bound.arguments["layer_num"]) > 0
+                        and int(bound.arguments["page_size"]) == c4.page_size):
+                    arguments = dict(bound.arguments)
+                    del arguments["self"]
+                    return elastic_indexer_class(**arguments)
+                return original_make_indexer_fn(*bound.args, **bound.kwargs)
+
+            ElasticDeepSeekV4TokenToKVPool._make_indexer_pool = make_indexer
 
         setattr(
             dsv4_pool_mod,
@@ -2800,7 +2864,19 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                 if (full_backing is not None and c128_pool is not None
                         and c128_pool.page_size * 128 != page_size):
                     raise KVCachedConfigError("C128 and full allocator page geometry differs")
-                bind_native_swa(allocator_self, backing, full_backing)
+                other_backings = []
+                for pool_name in ("c4_kv_pool", "c4_indexer_kv_pool"):
+                    pool = getattr(kvcache, pool_name, None)
+                    pool_backing = getattr(pool, "_kvcached_dsv4_backing", None)
+                    if pool_backing is not None and pool is not None:
+                        if pool.page_size * 4 != page_size:
+                            raise KVCachedConfigError("C4 and full allocator page geometry differs")
+                        other_backings.append(pool_backing)
+                if other_backings:
+                    bind_native_swa(allocator_self, backing, full_backing,
+                                    full_backings=tuple(other_backings))
+                else:
+                    bind_native_swa(allocator_self, backing, full_backing)
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init
@@ -3356,8 +3432,10 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
         manager = getattr(alloc, "kvcached_allocator", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)
-    for name in ("_kvcached_dsv4_backing", "_kvcached_dsv4_full_backing"):
-        backing = getattr(allocator, name, None)
+    backings = [getattr(allocator, name, None) for name in (
+        "_kvcached_dsv4_backing", "_kvcached_dsv4_full_backing")]
+    backings.extend(getattr(allocator, "_kvcached_dsv4_full_backings", ()))
+    for backing in backings:
         manager = getattr(backing, "manager", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)

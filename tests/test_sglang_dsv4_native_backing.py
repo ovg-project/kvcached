@@ -488,6 +488,73 @@ def test_c128_capacity_rejected_before_binding(monkeypatch):
         MODULE.bind_native_swa(composite, make_backing(), make_backing())
     assert composite.full_attn_allocator.alloc == original_alloc
 
+
+@pytest.fixture
+def all_backings(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values)))
+    composite = Composite(256)
+    swa = make_backing()
+    compressed = tuple(SWABacking(Manager(), native_pages=13,
+                                 native_page_bytes=width, physical_page_bytes=8)
+                       for width in (3, 6, 4))
+    assert swa.acquire({1})
+    for backing in compressed:
+        assert backing.acquire({2})
+    MODULE.bind_native_swa(composite, swa, compressed[0], full_backings=compressed[1:])
+    return composite, swa, compressed
+
+
+@pytest.mark.parametrize("method", ["alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("miss_index", [0, 1, 2, 3])
+def test_compressed_transaction_rolls_back_every_pool(all_backings, method, miss_index):
+    composite, swa, compressed = all_backings
+    pools = (*compressed, swa)
+    composite.full_attn_allocator.output.insert(0, 513)
+    composite.swa_attn_allocator.output.insert(0, 257)
+    failed = pools[miss_index]
+    failed.manager.budget = len(failed.manager.live)
+    before = [(set(b.live), dict(b.refs), set(b.manager.live)) for b in pools]
+    assert getattr(composite, method)() is None
+    assert composite.mapping == {512: 256}
+    assert composite.full_attn_allocator.live == {2}
+    assert composite.swa_attn_allocator.live == {1}
+    assert before == [(set(b.live), dict(b.refs), set(b.manager.live)) for b in pools]
+    failed.manager.budget = 20
+    assert getattr(composite, method)() is not None
+    assert all(b.live == {2, 5} for b in compressed)
+    assert swa.live == {1, 3}
+
+
+def test_compressed_lifetimes_and_minimum_capacity(all_backings):
+    composite, swa, compressed = all_backings
+    assert composite.alloc() is not None
+    composite.swa_attn_allocator.free_page_ids(Tensor([3]))
+    assert swa.live == {1}
+    assert all(b.live == {2, 5} for b in compressed)
+    native = composite.full_attn_allocator
+    for backing in compressed:
+        backing.manager.budget = len(backing.manager.live)
+    assert native.available_size() == min(b.available_pages() * 256 for b in compressed)
+    native.free_group = []
+    native.free_page_ids(Tensor([5]))
+    assert all(b.live == {2, 5} for b in compressed)
+    native.free_group_end()
+    assert all(b.live == {2} for b in compressed)
+    native.clear()
+    assert all(not b.live and not b.manager.live for b in compressed)
+
+
+def test_late_compressed_backend_error_poisons_all_children(all_backings):
+    composite, _swa, compressed = all_backings
+    compressed[-1].manager.fault = RuntimeError("indexer map failed")
+    with pytest.raises(RuntimeError, match="indexer map failed"):
+        composite.alloc()
+    assert composite.mapping == {512: 256}
+    for child in (composite.full_attn_allocator, composite.swa_attn_allocator):
+        with pytest.raises(RuntimeError, match="tear down"):
+            child.clear()
+
 def _assert_all_backings_ready_before_resize(monkeypatch, composite, pools, waiting_pool, method):
     lock, waiting, ready = RLock(), Event(), Event()
     operations = []
@@ -531,3 +598,11 @@ def test_c128_waits_for_both_managers_before_any_resize(composite_backings, monk
     composite, swa, full = composite_backings
     _assert_all_backings_ready_before_resize(
         monkeypatch, composite, (swa, full), swa if waiting_side == "swa" else full, method)
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("waiting_index", [1, 2])
+def test_additional_compressed_pools_settle_before_resize(all_backings, monkeypatch, method, waiting_index):
+    composite, swa, compressed = all_backings
+    _assert_all_backings_ready_before_resize(
+        monkeypatch, composite, (swa, *compressed), compressed[waiting_index], method)

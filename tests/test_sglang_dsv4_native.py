@@ -83,8 +83,8 @@ def test_dsv4_unsigned_views_and_null_block_lifecycle(
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
-@pytest.mark.parametrize("compress_ratio", [4, 128])
-def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio):
+@pytest.mark.parametrize("compress_ratio,fp4", [(4, False), (4, True), (128, False)])
+def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio, fp4):
     """Real SGLang pool construction and allocation; no model weights/kernels."""
     monkeypatch.setenv("ENABLE_KVCACHED", "true" if enabled else "false")
     _compiled_vmm_ops()
@@ -105,9 +105,11 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setattr("sglang.srt.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr("sglang.srt.distributed.get_pipeline_model_parallel_world_size", lambda: 1)
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
-    manager = c128_manager = None
-    full_size = 524288 if compress_ratio == 128 else 16384
+    manager = None
+    compressed_pools = []
+    full_size = 524288 if compress_ratio == 128 else 262144
     c128_size = full_size // 128
+    c4_size = full_size // 4
     try:
         # Match autopatch order: ModelRunner imports capture the pool aliases.
         for patch_class in (
@@ -133,6 +135,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         server_args = ServerArgs(model_path="unused-native-pool-fixture")
         monkeypatch.setattr(ServerArgs, "resolve_once", lambda self: None)
         server_args.page_size = 256
+        server_args.enable_deepseek_v4_fp4_indexer = fp4
         server_args.speculative_algorithm = "EAGLE"
         server_args.speculative_num_draft_tokens = 4
         server_args.speculative_eagle_topk = 1
@@ -182,7 +185,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.max_total_num_tokens = 16384
             runner.full_max_total_num_tokens = full_size
             runner.swa_max_total_num_tokens = 16384
-            runner.c4_max_total_num_tokens = 1024
+            runner.c4_max_total_num_tokens = c4_size
             runner.c128_max_total_num_tokens = c128_size
             runner.c4_state_pool_size = runner.c128_state_pool_size = 64
             runner.num_effective_layers = 1
@@ -208,7 +211,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                 copy.deepcopy(target.memory_pool_config) if target else MemoryPoolConfig(
                     max_total_num_tokens=16384, max_running_requests=2,
                     full_max_total_num_tokens=full_size, swa_max_total_num_tokens=16384,
-                    c4_max_total_num_tokens=1024, c128_max_total_num_tokens=c128_size,
+                    c4_max_total_num_tokens=c4_size, c128_max_total_num_tokens=c128_size,
                     c4_state_pool_size=64, c128_state_pool_size=64,
                 )
             )
@@ -230,15 +233,20 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             return
         manager = target.token_to_kv_pool.swa_kv_pool.kvcached_allocator
         manager.wait_ready(timeout=8)
-        if compress_ratio == 128:
-            c128_pool = target.token_to_kv_pool.c128_kv_pool
-            c128_manager = c128_pool.kvcached_allocator
-            c128_manager.wait_ready(timeout=8)
-            assert c128_pool.bytes_per_page_padded == 1728
+        compressed_names = (["c128_kv_pool"] if compress_ratio == 128 else
+                            ["c4_kv_pool", "c4_indexer_kv_pool"])
+        for name in compressed_names:
+            pool = getattr(target.token_to_kv_pool, name)
+            compressed_pools.append(pool)
+            pool.kvcached_allocator.wait_ready(timeout=8)
             assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
-                "dsv4.c128_kv_pool"] == 0
-            assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
-                "dsv4.compress_state_pools"] > 0
+                "dsv4." + name] == 0
+        assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
+            "dsv4.compress_state_pools"] > 0
+        if compress_ratio == 4:
+            indexer = target.token_to_kv_pool.c4_indexer_kv_pool
+            assert indexer.use_fp4_indexer is fp4
+            assert indexer.get_bytes_per_token() == (68 if fp4 else 132)
         target_reservation = interfaces.get_runtime_owned_reservation_bytes("cuda:0")
         shared = target.token_to_kv_pool_allocator
         undersized = make_runner(target)
@@ -260,12 +268,13 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             t.nbytes for t in draft.token_to_kv_pool.swa_kv_pool.kv_buffer
         )
         assert breakdown["dsv4.swa_kv_pool"] > 0
-        if compress_ratio == 128:
-            # Native MTP draft has no compressed layers in SGLang 0.5.20.
-            assert breakdown["dsv4.c128_kv_pool"] == 0
-            assert draft.token_to_kv_pool.c128_kv_pool.kv_buffer == []
-            assert not hasattr(draft.token_to_kv_pool.c128_kv_pool, "kvcached_allocator")
-            assert patches._token_kv_managers(shared) == [manager, c128_manager]
+        # Native MTP draft has no compressed layers in SGLang 0.5.20.
+        for name in compressed_names:
+            draft_pool = getattr(draft.token_to_kv_pool, name)
+            assert breakdown["dsv4." + name] == 0
+            assert not hasattr(draft_pool, "kvcached_allocator")
+        assert patches._token_kv_managers(shared) == [
+            manager, *(pool.kvcached_allocator for pool in compressed_pools)]
         assert interfaces.get_runtime_owned_reservation_bytes("cuda:0") == (
             target_reservation + sum(breakdown.values())
         )
@@ -349,12 +358,13 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             del runner, buffer
             shared.free(full)
 
-        if compress_ratio == 128:
+        for compressed_pool in compressed_pools:
             # Full pages and compressed history outlive the sliding window.
-            assert c128_manager is not None
+            compressed_manager = compressed_pool.kvcached_allocator
+            compressed_backing = compressed_pool._kvcached_dsv4_backing
+            page_bytes = compressed_backing.native_page_bytes
             shared.clear()
-            c128_backing = c128_pool._kvcached_dsv4_backing
-            first_crossing = c128_manager.page_size // c128_pool.bytes_per_page_padded
+            first_crossing = compressed_manager.page_size // page_bytes
             saved = []
             prefix = torch.tensor([0], device="cuda", dtype=torch.int64)
             last = torch.tensor([-1], device="cuda", dtype=torch.int64)
@@ -364,29 +374,32 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                 assert full is not None
                 saved.append(full)
                 shared.free_swa(full)
-            before = set(c128_backing.live)
+            before = set(compressed_backing.live)
             mapping = shared.full_to_swa_index_mapping.clone()
             capacity = logical.available_size()
             claims = []
 
-            def c128_miss(ids):
+            def compressed_miss(ids):
                 claims.append(ids)
                 return None
 
             with monkeypatch.context() as pressure:
-                pressure.setattr(c128_manager, "alloc_exact", c128_miss)
+                pressure.setattr(compressed_manager, "alloc_exact", compressed_miss)
                 assert shared.alloc_extend(
                     prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
-            assert claims and c128_backing.live == before
+            assert claims and compressed_backing.live == before
             assert logical.available_size() == capacity
             assert torch.equal(shared.full_to_swa_index_mapping, mapping)
             full = shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256)
             assert full is not None
             saved.append(full)
             pages = (full // 256).unique().tolist()
-            assert max(pages) * c128_pool.bytes_per_page_padded >= c128_manager.page_size
-            buffer = target.token_to_kv_pool.c128_kv_pool.kv_buffer[0]
-            assert buffer.dtype == torch.uint8 and buffer.stride() == (1728, 1)
+            assert max(pages) * page_bytes >= compressed_manager.page_size
+            buffers = getattr(compressed_pool, "kv_buffer", None)
+            if buffers is None:
+                buffers = compressed_pool.contiguous_page_row_buffers()
+            buffer = buffers[0]
+            assert buffer.dtype == torch.uint8 and buffer.stride() == (page_bytes, 1)
             for page in pages:
                 buffer[page].fill_(193)
             torch.cuda.synchronize()
@@ -397,9 +410,9 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             shared.free_group_begin()
             all_full = torch.cat(saved)
             shared.free_full(all_full)
-            assert c128_backing.live
+            assert compressed_backing.live
             shared.free_group_end()
-            assert not c128_backing.live and not c128_backing.refs
+            assert not compressed_backing.live and not compressed_backing.refs
 
         draft_owner = weakref.ref(draft.token_to_kv_pool)
         del draft
@@ -410,6 +423,6 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     finally:
         if manager is not None:
             assert manager.shutdown()
-        if c128_manager is not None:
-            assert c128_manager.shutdown()
+        for pool in compressed_pools:
+            assert pool.kvcached_allocator.shutdown()
         assert interfaces.shutdown_kvcached()
