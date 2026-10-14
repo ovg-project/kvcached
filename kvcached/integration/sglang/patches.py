@@ -2392,6 +2392,36 @@ def _new_tp_scoped_kvcached_allocator(
     )
 
 
+class DeepSeekV4RequestStatePatch(VersionAwarePatch, BasePatch):
+    """Bind supported C128 state before constructing the native token allocator."""
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.kv_cache_configurator"
+    patch_name = "deepseek_v4_request_state"
+
+    def apply(self, module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        from kvcached.integration.sglang.dsv4_request_state import install_request_state_context
+
+        return install_request_state_context(module)
+
+
+class DeepSeekV4RequestAdmissionPatch(VersionAwarePatch, BasePatch):
+    """Reserve C128 state for native request and pending beam-row admission."""
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    patch_name = "deepseek_v4_request_admission"
+
+    def apply(self, module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        from kvcached.integration.sglang.dsv4_request_state import install_request_admission
+
+        return install_request_admission(getattr(module, "Scheduler", None))
+
+
 class DeepSeekV4RunnerOwnershipPatch(VersionAwarePatch, BasePatch):
     """Carry the runner's allocation ownership into DeepSeek-V4 construction."""
 
@@ -2883,6 +2913,9 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                         other_backings.append(pool_backing)
                 state_groups = getattr(kvcache, "_kvcached_c4_state_groups", {})
                 state_backings = tuple(group["backing"] for group in state_groups.values())
+                request_state = getattr(kvcache, "_kvcached_dsv4_request_state", None)
+                if request_state is not None:
+                    allocator_self._kvcached_dsv4_request_state = request_state
                 if other_backings or state_backings:
                     bind_native_swa(allocator_self, backing, full_backing,
                                     full_backings=tuple(other_backings), swa_backings=state_backings)
@@ -3479,6 +3512,15 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
+    request_state = getattr(getattr(scheduler, "req_to_token_pool", None),
+                            "_kvcached_dsv4_request_state", None)
+    if request_state is not None:
+        pending_rows = getattr(getattr(scheduler, "beam_coordinator", None),
+                               "pending_member_rows", None)
+        # A beam can own promised backing before native member-row allocation.
+        # Unknown pending state conservatively retains the standby leases.
+        keep = not callable(pending_rows) or pending_rows(scheduler.running_batch) > 0
+        request_state.reclaim_on_idle(keep_standby=keep)
     now = time.monotonic()
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager

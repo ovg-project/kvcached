@@ -807,6 +807,80 @@ def test_c4_state_factory_groups_layers_and_preserves_native_constructor(monkeyp
         assert all(p.native_allocation for p in pools)
         assert not allocations and not managers
 
+
+@pytest.mark.parametrize("online", [False, True])
+@pytest.mark.parametrize("unsupported", [None, "hip", "coverage"])
+def test_c128_state_factory_preserves_native_shape_and_pins_banks(monkeypatch, online, unsupported):
+    interfaces, _patches, _ = _load_modules(monkeypatch)
+    from test_sglang_dsv4_native_backing import Manager
+
+    from kvcached.integration.sglang.dsv4_request_state import request_pool_context
+    from kvcached.integration.sglang.dsv4_state import install_c4_state_backing
+
+    native = types.ModuleType("test_native_c128_state")
+    managers: list[Any] = []
+    allocations: list[Any] = []
+
+    class State:
+        def __init__(self, owner):
+            self.ratio, self.online, self.page_size = 128, online, 1
+            self._size, self._logical_size = (90, 30) if online else (40, 40)
+            self.online_mtp_max_draft_tokens = 2 if online else 0
+            self.ring_size, self.last_dim = (1, 12) if online else (8, 8)
+            self._alloc_kv_score_buffer(dtype=owner.dtype, device="cuda:0", enable_memory_saver=False)
+
+        def _alloc_kv_score_buffer(self, **kwargs):
+            self.native_allocation = True
+
+    State.__module__ = native.__name__
+    setattr(native, "CompressStatePool", State)
+    setattr(native, "KVAndScore", lambda tensor: types.SimpleNamespace(kv_score=tensor))
+    setattr(native, "TorchMemorySaverAdapter", types.SimpleNamespace(create=lambda **_: object()))
+    setattr(native, "_is_hip", unsupported == "hip")
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+
+    class Top:
+        compression_ratios = [128, 128]
+        _stage_start, _stage_end = 0, 2
+        dtype = type("Dtype", (), {"itemsize": 2})()
+        _unified_kv = False
+        swa_kv_pool = types.SimpleNamespace(_kvcached_dsv4_backing=object())
+
+        def _make_compress_state_pool(self, *args, **kwargs):
+            return State(self)
+
+    def allocate(**kwargs):
+        allocations.append(kwargs)
+        return [FakeTensor() for _ in range(kwargs["num_layers"])], []
+
+    def manager(**kwargs):
+        result = Manager()
+        managers.append(result)
+        assert kwargs["pool_name"] == "dsv4_c128_state"
+        return result
+
+    monkeypatch.setattr(interfaces, "get_page_size_for_block", lambda *_: 256)
+    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", allocate)
+    monkeypatch.setattr(interfaces, "get_kv_cache_manager", manager)
+    install_c4_state_backing(native, Top, lambda: 25001)
+    token = request_pool_context.set(types.SimpleNamespace(size=100 if unsupported == "coverage" else 3))
+    try:
+        owner = Top()
+        pools = [owner._make_compress_state_pool() for _ in range(2)]
+    finally:
+        request_pool_context.reset(token)
+    if unsupported:
+        assert not allocations and all(p.native_allocation for p in pools)
+    else:
+        assert len(allocations) == len(managers) == 1
+        backing = pools[0]._kvcached_dsv4_backing
+        assert backing is pools[1]._kvcached_dsv4_backing
+        assert backing.permanent_pages == ({0, 2, 5, 8} if online else {0, 2})
+        assert managers[0].live == backing.permanent_pages - {0}
+        assert pools[0].kv_score_buffer.kv_score.view_shape == ((90, 12) if online else (40, 8))
+        group = next(iter(getattr(owner, "_kvcached_c128_state_groups").values()))
+        assert (group["bank_stride"], group["bank_count"]) == ((30, 3) if online else (0, 1))
+
 @pytest.mark.parametrize("setting", [None, "false", "0"])
 def test_dsv4_disabled_autopatch_retains_native_storage(monkeypatch, setting):
     interfaces, patches, _ = _load_modules(monkeypatch)

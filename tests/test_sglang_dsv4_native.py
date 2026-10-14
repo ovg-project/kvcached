@@ -83,9 +83,11 @@ def test_dsv4_unsigned_views_and_null_block_lifecycle(
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
-@pytest.mark.parametrize("compress_ratio,fp4,with_state",
-                         [(4, False, False), (4, True, False), (128, False, False), (4, False, True)])
-def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio, fp4, with_state):
+@pytest.mark.parametrize("compress_ratio,fp4,with_state,online",
+                         [(4, False, False, False), (4, True, False, False),
+                          (128, False, False, False), (4, False, True, False),
+                          (128, False, True, False), (128, False, True, True)])
+def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_ratio, fp4, with_state, online):
     """Real SGLang pool construction and allocation; no model weights/kernels."""
     monkeypatch.setenv("ENABLE_KVCACHED", "true" if enabled else "false")
     _compiled_vmm_ops()
@@ -106,11 +108,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setattr("sglang.srt.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr("sglang.srt.distributed.get_pipeline_model_parallel_world_size", lambda: 1)
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
+    monkeypatch.setenv("SGLANG_EXPERIMENTAL_ONLINE_C128_MTP", "1" if online else "0")
     manager = None
     compressed_pools = []
     state_pools = []
-    swa_size = 131072 if with_state else 16384
-    state_size = 8192 if with_state else 64
+    request_state_pools = []
+    request_state = with_state and compress_ratio == 128
+    request_count = (8192 if online else 32) if request_state else 2
+    swa_size = 131072 if with_state and not request_state else 16384
+    state_size = 8192 if with_state and not request_state else 64
+    request_state_size = request_count * (1 if online else 128) if request_state else 64
     full_size = 524288 if compress_ratio == 128 else 262144
     c128_size = full_size // 128
     c4_size = full_size // 4
@@ -120,10 +127,13 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             patches.ElasticAllocatorPatch, patches.ElasticSWAAllocatorPatch,
             patches.DeepSeekV4RuntimeReservationPatch, patches.DeepSeekV4KVPoolPatch,
             patches.DeepSeekV4SWAAllocatorPatch, patches.DeepSeekV4RunnerOwnershipPatch,
+            patches.DeepSeekV4RequestStatePatch, patches.DeepSeekV4RequestAdmissionPatch,
         ):
             patch = patch_class()
             assert patch.apply(importlib.import_module(patch.target_module))
 
+        pool_module = importlib.import_module("sglang.srt.mem_cache.deepseek_v4_memory_pool")
+        monkeypatch.setattr(pool_module, "ONLINE_C128", online)
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
@@ -148,6 +158,9 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         server_args.enable_page_major_kv_layout = False
         server_args.prefill_only_disable_kv_cache = False
         server_args.disaggregation_mode = "null"
+        # Preserve a native-state case through the unsupported preemption path.
+        server_args.enable_priority_scheduling = compress_ratio == 128 and not with_state
+        server_args.disable_priority_preemption = False
         set_global_server_args_for_scheduler(server_args)
 
         # Use the actual 0.5.20 runner/configurator construction path with a
@@ -172,7 +185,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.model_config = types.SimpleNamespace(
                 hf_config=hf_config, hf_text_config=hf_config,
                 linear_attn_registry_result=None,
-                context_len=32768, window_size=128, qk_nope_head_dim=448,
+                context_len=1024 if request_state else 32768, window_size=128, qk_nope_head_dim=448,
                 qk_rope_head_dim=64, index_head_dim=128, compress_ratios=[compress_ratio],
             )
             runner.is_draft_worker = target is not None
@@ -184,7 +197,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.dtype = torch.bfloat16
             runner.kv_cache_dtype = torch.float8_e4m3fn
             runner.c4_state_dtype = runner.c128_state_dtype = torch.bfloat16
-            runner.max_running_requests = 2
+            runner.max_running_requests = request_count
             runner.page_size = 256
             runner.max_total_num_tokens = swa_size
             runner.full_max_total_num_tokens = full_size
@@ -192,7 +205,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.c4_max_total_num_tokens = c4_size
             runner.c128_max_total_num_tokens = c128_size
             runner.c4_state_pool_size = state_size
-            runner.c128_state_pool_size = 64
+            runner.c128_state_pool_size = request_state_size
             runner.num_effective_layers = 1
             runner.start_layer, runner.end_layer = 0, 1
             runner.is_hybrid_swa = runner.is_hybrid_swa_compress = True
@@ -214,10 +227,10 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             runner.pre_model_load_memory = 0
             runner.memory_pool_config = (
                 copy.deepcopy(target.memory_pool_config) if target else MemoryPoolConfig(
-                    max_total_num_tokens=swa_size, max_running_requests=2,
+                    max_total_num_tokens=swa_size, max_running_requests=request_count,
                     full_max_total_num_tokens=full_size, swa_max_total_num_tokens=swa_size,
                     c4_max_total_num_tokens=c4_size, c128_max_total_num_tokens=c128_size,
-                    c4_state_pool_size=state_size, c128_state_pool_size=64,
+                    c4_state_pool_size=state_size, c128_state_pool_size=request_state_size,
                 )
             )
             return runner
@@ -238,7 +251,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             return
         manager = target.token_to_kv_pool.swa_kv_pool.kvcached_allocator
         manager.wait_ready(timeout=8)
-        if with_state:
+        if with_state and not request_state:
             state_pools = [target.token_to_kv_pool.compress_state_pools[0],
                            target.token_to_kv_pool.indexer_compress_state_pools[0]]
             assert all(p._kvcached_managed for p in state_pools)
@@ -248,6 +261,13 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             breakdown = target.token_to_kv_pool._kvcached_runtime_reservation_breakdown
             assert breakdown["dsv4.compress_state_pools"] == 0
             assert breakdown["dsv4.indexer_compress_state_pools"] == 0
+        if request_state:
+            request_state_pools = [target.token_to_kv_pool.compress_state_pools[0]]
+            assert all(p._kvcached_managed for p in request_state_pools)
+            assert target.req_to_token_pool._kvcached_dsv4_request_state is (
+                target.token_to_kv_pool._kvcached_dsv4_request_state)
+            assert target.token_to_kv_pool._kvcached_runtime_reservation_breakdown[
+                "dsv4.compress_state_pools"] == 0
         compressed_names = (["c128_kv_pool"] if compress_ratio == 128 else
                             ["c4_kv_pool", "c4_indexer_kv_pool"])
         for name in compressed_names:
@@ -464,6 +484,89 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert torch.all(torch.isneginf(state.kv_score_buffer[-1].score)).item()
             shared.free_full(full)
 
+        if request_state:
+            req_pool = target.req_to_token_pool
+            owner = req_pool._kvcached_dsv4_request_state
+            state = request_state_pools[0]
+            backing = state._kvcached_dsv4_backing
+            assert state.online is online
+            assert (state.online_mtp_max_draft_tokens > 0) is online
+            bank_count = 1 + state.online_mtp_max_draft_tokens if online else 1
+            bank_stride = state._logical_size if online else 0
+            req_pool.clear()
+            free_order = list(req_pool.free_slots)
+            count = min(req_pool.size, backing.physical_page_bytes // backing.native_page_bytes + 2)
+            owner.admission_rows = count
+            with monkeypatch.context() as pressure:
+                miss = mock.Mock(return_value=None)
+                pressure.setattr(backing.manager, "alloc_exact", miss)
+                admitted = owner.reserve(owner.admission_rows)
+                # The online layout's last row shares permanent sentinel pages.
+                # It remains admissible even when every new physical claim fails.
+                assert admitted == (1 if online else 0)
+                assert miss.called
+            assert req_pool.free_slots == free_order
+            assert owner.standby == (set(free_order[-admitted:]) if admitted else set())
+            assert not owner.active and not backing.refs
+            req_pool.clear()
+            assert not backing.live and not owner.active and not owner.standby
+            owner.admission_rows = count
+            assert owner.reserve(owner.admission_rows) == count
+            rows = req_pool.alloc_rows(count)
+            assert rows == free_order[-count:]
+            indices = [row + bank * bank_stride for bank in range(bank_count) for row in rows]
+            if not online:
+                indices = [row * state.ring_size + offset for row in rows
+                           for offset in range(state.ring_size)]
+            state.kv_score_buffer.kv_score[indices] = 53
+            torch.cuda.synchronize()
+            assert torch.all(state.kv_score_buffer.kv_score[indices] == 53).item()
+            owner.admission_rows = 1
+            req_pool.free_rows(rows)
+            assert req_pool.free_slots == free_order
+            assert owner.standby == {rows[-1]} and not owner.active
+            req_pool.clear()
+            assert not backing.live and not backing.refs
+            if not online:
+                state.kv_score_buffer[-1].clear()
+                torch.cuda.synchronize()
+                assert torch.all(torch.isneginf(state.kv_score_buffer[-1].score)).item()
+
+            scheduler_module = importlib.import_module("sglang.srt.managers.scheduler")
+            monkeypatch.setattr(scheduler_module, "get_parallel",
+                                lambda: types.SimpleNamespace(pp_max_micro_batch_size=4))
+            scheduler = types.SimpleNamespace(
+                req_to_token_pool=req_pool, running_batch=object(),
+                beam_coordinator=types.SimpleNamespace(pending_member_rows=lambda batch: 2))
+            assert scheduler_module.Scheduler.get_num_allocatable_reqs(scheduler, 0) == 4
+            assert len(owner.standby) == 6  # Four ordinary requests plus pending members.
+            assert scheduler_module.Scheduler.get_num_allocatable_reqs(scheduler, 0, 3) == 4
+            # Reserve four beam leaders, their members and previously pending rows.
+            selected = req_pool.alloc_rows(4) + req_pool.alloc_rows(2) + req_pool.alloc_rows(8)
+            assert len(set(selected)) == 14 and set(selected) == owner.active
+            req_pool.free_rows(selected)
+            req_pool.clear()
+            assert len(req_pool.free_slots) == req_pool.size
+            assert not backing.live and not backing.refs
+
+            class RequestKV:
+                req_pool_idx = None
+                kv_allocated_len = 1
+
+                @property
+                def holds_kv(self):
+                    return self.req_pool_idx is not None
+
+            req = types.SimpleNamespace(kv=RequestKV())
+            assert req_pool.available_size() == req_pool.size
+            assert owner.reserve(1) == 1
+            bound = req_pool.alloc([req])
+            assert bound == [req.kv.req_pool_idx] and owner.active == set(bound)
+            assert req_pool.alloc([req]) == bound  # Chunked prefill reuses its row.
+            req_pool.free(req)
+            assert req.kv.req_pool_idx is None and not owner.active
+            req_pool.clear()
+
         draft_owner = weakref.ref(draft.token_to_kv_pool)
         del draft
         gc.collect()
@@ -475,6 +578,6 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert manager.shutdown()
         for pool in compressed_pools:
             assert pool.kvcached_allocator.shutdown()
-        for state in state_pools:
+        for state in [*state_pools, *request_state_pools]:
             assert state._kvcached_dsv4_backing.manager.shutdown()
         assert interfaces.shutdown_kvcached()
