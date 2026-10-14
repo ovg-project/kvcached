@@ -1,32 +1,31 @@
 name: GPU Correctness
 # The profile in the run's title lets the next run find its predecessor.
-run-name: GPU Correctness (${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }})
+run-name: GPU Correctness (${{ inputs.profile || 'weekly' }})
 
 # Correctness on real GPUs: kvcached against the native engines, on the CI
 # machine with two L4s, a self-hosted runner set up by
-# tools/ci/gpu-runner/setup.sh. Nightly runs the vLLM and the SGLang cases at
-# the same time, one GPU each; weekly uses both GPUs for tensor parallelism.
+# tools/ci/gpu-runner/setup.sh. Weekly uses both GPUs for tensor parallelism;
+# the basic cases run on pull requests, by /ci run (gpu-pr.yml).
 # The runner takes no job but this workflow's and gpu-pr.yml's from main
 # (tools/ci/gpu-runner/job_started.sh), and runs one job at a time. Every run
 # comments its results on the issue in the GPU_CI_RESULTS_ISSUE variable and
 # keeps the setup of its profile up to date in that issue's description.
 on:
   schedule:
-    - cron: '0 8 * * *'     # nightly
-    - cron: '0 12 * * 6'    # weekly, Saturday
+    - cron: '0 12 * * 6'    # Saturday
   workflow_dispatch:
     inputs:
       profile:
         description: Test profile in tests/e2e/matrix.py
-        default: nightly
+        default: weekly
         type: choice
-        options: [nightly, weekly, smoke]
+        options: [weekly, smoke]
 
 permissions:
   contents: read
 
 env:
-  PROFILE: ${{ inputs.profile || (github.event.schedule == '0 12 * * 6' && 'weekly' || 'nightly') }}
+  PROFILE: ${{ inputs.profile || 'weekly' }}
 
 jobs:
   e2e:

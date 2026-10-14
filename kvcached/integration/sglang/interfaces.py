@@ -8,6 +8,7 @@ import torch
 
 from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.kv_geometry import check_page_geometry
 from kvcached.observability import (
     RuntimeReservationSnapshot,
     build_runtime_snapshot,
@@ -28,6 +29,7 @@ from kvcached.tp_ipc_util import (
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     PAGE_SIZE,
+    KVCachedConfigError,
     get_kvcached_logger,
     get_page_size_for_block,
     normalize_gpu_device,
@@ -317,6 +319,67 @@ def alloc_kv_cache(
             v_tensors.append(contiguous_tensor[:, i, 1, :, :])
 
     return k_tensors, v_tensors
+
+
+def alloc_dsv4_swa_cache(
+    *,
+    num_pages: int,
+    bytes_per_page: int,
+    num_layers: int,
+    device: str,
+    group_id: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Create per-layer VMM buffers for DeepSeek-V4 SWA KV."""
+    if not _kvcached_initialized:
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+    if _contiguous_layout:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling requires KVCACHED_CONTIGUOUS_LAYOUT=false"
+        )
+    if num_pages <= 0 or bytes_per_page <= 0 or num_layers <= 0:
+        raise ValueError(
+            "DeepSeek-V4 SWA dimensions must be positive: "
+            f"num_pages={num_pages}, bytes_per_page={bytes_per_page}, "
+            f"num_layers={num_layers}"
+        )
+
+    device = normalize_gpu_device(device)
+    page_size = get_page_size_for_block(bytes_per_page, PAGE_SIZE)
+    geometry_error = check_page_geometry(bytes_per_page, page_size, 1)
+    if geometry_error is not None:
+        raise KVCachedConfigError(geometry_error)
+    visible_bytes = num_pages * bytes_per_page
+    if visible_bytes < page_size:
+        raise ValueError(
+            "DeepSeek-V4 SWA pool must span at least one physical page to "
+            "reserve its null block: "
+            f"pool_bytes={visible_bytes}, page_bytes={page_size}. "
+            "Increase the SWA cache size or reduce KVCACHED_PAGE_SIZE_MB."
+        )
+    per_layer_bytes = ((visible_bytes + page_size - 1) // page_size) * page_size
+    raw_tensors = create_kv_tensors(
+        per_layer_bytes,
+        torch.uint8.itemsize,
+        device,
+        num_layers,
+        num_kv_buffers=1,
+        group_id=group_id,
+        unified_pool=True,
+        page_size=page_size,
+    )
+    if len(raw_tensors) != num_layers:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling expected one VMM tensor per layer, "
+            f"got {len(raw_tensors)} for {num_layers} layers"
+        )
+
+    buffers = [
+        tensor.view(dtype=torch.uint8)[:visible_bytes].view(num_pages, bytes_per_page)
+        for tensor in raw_tensors
+    ]
+    if not all(buffer.is_contiguous() for buffer in buffers):
+        raise RuntimeError("DeepSeek-V4 SWA VMM buffers are not contiguous")
+    return buffers, raw_tensors
 
 
 def alloc_mamba_states(

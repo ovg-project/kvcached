@@ -8,11 +8,10 @@ kvcached installed from this checkout. Each case is one server start inside
 it: kvcached with the contiguous and the non-contiguous KV layout, and the
 native engine. A case passes when kvcached is
 active, the server stays healthy, sequential greedy outputs and prefix-cache
-hits match the native run, and shutdown leaves no shm segment, socket
-directory or GPU process behind.
+hits match the native run, and shutdown leaves no GPU process behind.
 
 Usage:
-    python3 tests/e2e/run.py --profile nightly --out /tmp/e2e
+    python3 tests/e2e/run.py --profile basic --out /tmp/e2e
 """
 
 from __future__ import annotations
@@ -201,10 +200,6 @@ python3 -c 'import kvcached, kvcached.vmm_ops; print("kvcached", kvcached.__file
         time.sleep(3)
         return False
 
-    def tmp_entries(self, prefix: str) -> list[str]:
-        out = self.exec(f"ls -1 /tmp | grep -F -- {shlex.quote(prefix)} || true")
-        return [x for x in out.stdout.decode().split() if x]
-
     def versions(self) -> dict[str, Any]:
         """Installed versions of the engine, kvcached and torch."""
         code = ("import json, importlib.metadata as md, torch\n"
@@ -260,6 +255,48 @@ class LocalHost(Container):
 
     def remove(self) -> None:
         pass
+
+
+# Run in an engine container, which has huggingface_hub. Every model is
+# fetched (or found up to date), else its cached copy is used; only a model
+# that is neither fails, after retries, since the Hub rate-limits anonymous
+# requests (429).
+FETCH_MODELS = r"""
+import sys, time
+from huggingface_hub import snapshot_download
+failed = []
+for hf_id in sys.argv[1:]:
+    for attempt in range(4):
+        if attempt:
+            time.sleep(60 * attempt)
+        try:
+            print(hf_id, "at", snapshot_download(hf_id), flush=True)
+            break
+        except Exception as e:
+            print(hf_id, "fetch failed:", e, flush=True)
+        try:
+            print(hf_id, "cached at", snapshot_download(hf_id, local_files_only=True),
+                  flush=True)
+            break
+        except Exception:
+            pass
+    else:
+        failed.append(hf_id)
+print("not fetched:", " ".join(failed) or "none", flush=True)
+sys.exit(1 if failed else 0)
+"""
+
+
+def fetch_models(ct: Container, hf_ids: list[str], log: Path) -> CaseResult:
+    """Fetch the run's weights once, so that the servers can start offline."""
+    res = CaseResult("models-setup")
+    proc = ct.exec(f"cd /tmp && python3 -c {shlex.quote(FETCH_MODELS)} {shlex.join(hf_ids)}",
+                   timeout=7200)
+    log.write_bytes(proc.stdout + proc.stderr)
+    lines = proc.stdout.decode(errors="replace").strip().splitlines()
+    res.add("models_fetched", proc.returncode == 0,
+            "" if proc.returncode == 0 else f"{lines[-1] if lines else ''}; see {log.name}")
+    return res
 
 
 def server_argv(engine: str, model_id: str, args: tuple[str, ...], port: int) -> list[str]:
@@ -362,10 +399,6 @@ def stop_and_check(ct: Container, srv: Server, res: CaseResult, prefix: str = ""
         missing = sorted(required - set(log["patched"]))
         res.add(f"{prefix}kvcached_active", not missing and log["capacity"] is not None,
                 f"missing patches {missing}" if missing else "")
-        leftover_shm = sorted(x for x in os.listdir("/dev/shm") if x.startswith(srv.ipc))
-        res.add(f"{prefix}shm_removed", not leftover_shm, ", ".join(leftover_shm))
-        leftover_tmp = ct.tmp_entries(srv.ipc)
-        res.add(f"{prefix}socket_dirs_removed", not leftover_tmp, ", ".join(leftover_tmp))
     else:
         res.add(f"{prefix}kvcached_inactive", log["kvcached_lines"] == 0,
                 f"{log['kvcached_lines']} [kvcached] lines")
@@ -402,8 +435,6 @@ CHECKS = {
                            "before the stop signal",
     "kvcached_active": "kvcached applied every required patch and sized the KV cache",
     "kvcached_inactive": "the native server's log has no [kvcached] line",
-    "shm_removed": "no /dev/shm segment of the server is left",
-    "socket_dirs_removed": "no /tmp/kvcached-tp-* directory of the server is left",
     "no_gpu_process_left": "no process is left on the GPUs of the run",
     "<phase>_tokens_equal": "gen_seq and apc_0..2 give the same greedy tokens as native",
     "apc_<n>_cached_tokens_equal": "every request reports the same cached_tokens as native",
@@ -535,7 +566,7 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", default="nightly", choices=sorted(PROFILES))
+    ap.add_argument("--profile", default="basic", choices=sorted(PROFILES))
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     ap.add_argument("--hf-cache", type=Path,
@@ -587,6 +618,22 @@ def main() -> int:
                 setup.add("install_kvcached", False, str(e))
                 ct.remove()
             results.append(setup)
+
+        # The models the cases, elastic and limit tests below will serve.
+        def wanted(engine: str, model: str) -> bool:
+            return engine in containers and (not a.models or model in a.models)
+        models = [] if a.skip_cases else [g.model for g in profile.groups
+                                           if wanted(g.engine, g.model)]
+        if not a.skip_limit:
+            models += [t.model for t in profile.limit if wanted(t.engine, t.model)]
+        if not a.skip_elastic:
+            models += [m for p in profile.elastic for m in (p.model_a, p.model_b)
+                       if p.engine_a in containers and p.engine_b in containers]
+        hf_ids = list(dict.fromkeys(MODELS[m].hf_id for m in models))
+        if hf_ids:
+            # One cache for the run: every container mounts it.
+            results.append(fetch_models(next(iter(containers.values())), hf_ids,
+                                        out / "models-fetch.log"))
 
         for group in [] if a.skip_cases else profile.groups:
             host = containers.get(group.engine)

@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU-free checks of the e2e driver's parsing and comparison logic."""
 
+import sys
+import time
+import types
+
+import pytest
 from e2e import client as cl
 from e2e.matrix import ENGINES, PROFILES, Case, Group
 from e2e.run import CaseResult, compare_with_native, ipc_name, parse_log
@@ -87,3 +92,59 @@ def test_compare_with_native():
     assert failed == {"gen_seq_tokens_equal", "apc_0_tokens_equal",
                       "apc_1_tokens_equal", "apc_2_tokens_equal", "apc_0_cached_tokens_equal",
                       "apc_1_cached_tokens_equal", "apc_2_cached_tokens_equal"}
+
+
+def test_read_segments_reads_only_the_servers_segments(tmp_path):
+    from e2e.elastic import SEGMENT, read_segments
+
+    (tmp_path / "e2e_a").write_bytes(SEGMENT.pack(100, 7, 0) + b"KVCOFD01")  # since #546
+    (tmp_path / "e2e_a_g1000").write_bytes(SEGMENT.pack(100, 2, 0))
+    (tmp_path / "e2e_ab").write_bytes(SEGMENT.pack(100, 5, 0))  # another server
+    (tmp_path / "e2e_b").write_bytes(SEGMENT.pack(0, 3, 0))  # no limit
+    assert read_segments(["e2e_a", "e2e_b"], str(tmp_path)) == {"e2e_a": 7, "e2e_a_g1000": 2}
+
+
+def test_sglang_flush_retries_while_finished_requests_are_pending(monkeypatch):
+    statuses = [400, 400, 200]
+    monkeypatch.setattr(cl, "_post", lambda *args: (statuses.pop(0), {}, 0.0))
+    monkeypatch.setattr(cl.time, "sleep", lambda seconds: None)
+    assert cl.SGLangClient("127.0.0.1", 1).reset_prefix_cache()
+    assert statuses == []
+    monkeypatch.setattr(cl, "_post", lambda *args: (500, {}, 0.0))
+    assert not cl.SGLangClient("127.0.0.1", 1).reset_prefix_cache()
+
+
+def test_servers_start_offline():
+    from e2e.run import server_env
+
+    for engine in ENGINES:
+        for layout in ("c1", None):
+            assert server_env(Case(engine, "qwen05b", layout), "e2e_x")["HF_HUB_OFFLINE"] == "1"
+
+
+def test_fetch_models_falls_back_to_the_cache(monkeypatch, capsys):
+
+    from e2e.run import FETCH_MODELS
+
+    cached = {"cached/model"}
+
+    def snapshot_download(hf_id, local_files_only=False):
+        if hf_id == "online/model":
+            return "/hub/online"
+        if local_files_only and hf_id in cached:
+            return "/hub/cached"
+        raise OSError("429 Too Many Requests")
+
+    sleeps: list[float] = []
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = snapshot_download  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    monkeypatch.setattr(sys, "argv", ["-c", "online/model", "cached/model", "missing/model"])
+    with pytest.raises(SystemExit) as exit_info:
+        exec(FETCH_MODELS, {})
+    assert exit_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "online/model at /hub/online" in out and "cached/model cached at /hub/cached" in out
+    assert out.strip().endswith("not fetched: missing/model")
+    assert sleeps == [60, 120, 180]  # only the model that is not cached is retried
