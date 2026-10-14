@@ -82,6 +82,7 @@ def make_manager() -> KVCacheManager:
     manager = object.__new__(KVCacheManager)
     manager.page_size = BLOCKS_PER_PAGE
     manager.block_mem_size = 1
+    manager.mem_size = 1024 * BLOCKS_PER_PAGE
     manager.page_allocator = CountingPageAllocator()
     manager.num_avail_blocks = 0
     manager.avail_pages = {}

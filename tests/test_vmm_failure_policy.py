@@ -242,6 +242,7 @@ def _native_case(case):
         manager = object.__new__(KVCacheManager)
         manager.page_allocator = allocator
         manager.page_size = page_size
+        manager.mem_size = 4 * page_size
         manager.block_mem_size = page_size // 4
         manager.num_avail_blocks = 0
         manager.avail_pages = {}
@@ -262,7 +263,7 @@ def _native_case(case):
         driver.kvcached_fault_arm(0, 0, 0)
         assert manager.available_size() == 12
         with pytest.raises(QuarantinedResizeError):
-            manager.resize(5 * page_size)
+            manager.resize(3 * page_size)
         assert not manager.in_shrink
         assert manager.target_num_blocks is None
         assert manager.available_size() == 12
