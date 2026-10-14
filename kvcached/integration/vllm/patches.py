@@ -59,6 +59,26 @@ def _worker_physical_release_barrier(worker: Any) -> bool:
     return True
 
 
+def _batch_queue_size(batch_queue: Any) -> int:
+    if batch_queue is None:
+        return 0
+    # Older PP schedulers use Queue; newer schedulers use deque.
+    # Only the engine thread adds/removes batches on either path.
+    if isinstance(batch_queue, Queue):
+        return batch_queue.qsize()
+    return len(batch_queue)
+
+
+def _release_retired_pages_if_idle(engine_core: Any, manager: Any) -> None:
+    """Drain retired pages when no later batch step will do it."""
+    if not getattr(manager, "defer_physical_release", False):
+        return
+    batch_queue = getattr(engine_core, "batch_queue", None)
+    if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
+        marker = manager.capture_physical_release_marker()
+        manager.release_retired_pages_through(marker)
+
+
 def _get_vllm_kv_cache_manager(engine_core: Any) -> Any:
     scheduler = getattr(engine_core, "scheduler", None)
     vllm_manager = getattr(scheduler, "kv_cache_manager", None)
@@ -737,6 +757,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     if enable_caching and getattr(self.kv_cache_manager, "page_allocator", None) is not None
                     else None
                 )
+                register_reclaimer = getattr(
+                    self.kv_cache_manager, "_register_shrink_reclaimer", None)
+                if self._page_eviction is not None and register_reclaimer is not None:
+                    register_reclaimer(self._reclaim_for_shrink)
 
             def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
                 block = self._evictable_blocks.pop(block_id, None)
@@ -943,20 +967,38 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             if len(ordered) == num_to_evict:
                                 break
 
-                ids_to_free: list[int] = []
-                for bid in ordered:
+                return self._evict_block_ids(ordered)
+
+            def _evict_block_ids(self, block_ids: list[int]) -> int:
+                """Drop evictable blocks from the prefix cache, free to kvcached."""
+                for bid in block_ids:
                     block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)
                     if key is not None:
                         self._remove_cached_block(key, bid)
                     if block is not None:
                         _reset_block_hash(block)
-                    ids_to_free.append(bid)
-                if ids_to_free:
-                    self._free_block_ids(ids_to_free)
+                if block_ids:
+                    self._free_block_ids(block_ids)
                 if not self._evictable_blocks and self._page_eviction is not None:
                     self._page_eviction.clear()
-                return len(ids_to_free)
+                return len(block_ids)
+
+            def _reclaim_for_shrink(self) -> None:
+                """Evict the cached pages a lower kvcached limit waits for.
+
+                A shrink only completes once enough pages are empty, and
+                pages holding nothing but cached prefixes never empty on their
+                own: allocations reuse their slots one LRU victim at a time.
+                Evict whole pages, cheapest first. Pages that running requests
+                still use stay until those requests finish.
+                """
+                if self._page_eviction is None or not self._evictable_blocks:
+                    return
+                excess = self.kv_cache_manager.shrink_excess_pages()
+                if excess > 0:
+                    self._evict_block_ids(self._page_eviction.victims(
+                        len(self._evictable_blocks), max_pages=excess))
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -1066,6 +1108,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
+                if getattr(self.kv_cache_manager, "in_shrink", False) is True:
+                    # Finished requests may leave whole pages to cached prefixes.
+                    self._reclaim_for_shrink()
 
 
             def evict_blocks(self, block_ids: set[int]) -> None:
@@ -1259,6 +1304,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             result = original_init(self, vllm_config, *args, **kwargs)
             if enable_kvcached():
                 self._kvcached_install_ordered_unmap()
+                self._kvcached_start_limit_watch()
             return result
 
         patch_logger = self.logger
@@ -1309,9 +1355,57 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 expected_workers,
             )
 
+        def _kvcached_start_limit_watch(self) -> None:
+            """Apply lowered limits while the engine is idle.
+
+            `kvctl limit` and set_memory_limit() only record a limit; the next
+            allocation applies it and evicts cached prefixes. An idle engine
+            never allocates, so wake its input loop instead: idle-state
+            callbacks run on the engine thread, the only thread that may
+            change the block pool.
+            """
+            manager = _get_vllm_kv_cache_manager(self)
+            callbacks = getattr(self, "_idle_state_callbacks", None)
+            if manager is None or not isinstance(callbacks, list):
+                return
+            try:
+                from vllm.v1.engine import EngineCoreRequestType
+                wakeup = EngineCoreRequestType.WAKEUP
+            except (ImportError, AttributeError):
+                return
+
+            def apply_limit(engine_core: Any) -> None:
+                manager.apply_resize_target()
+                manager.reclaim_for_shrink()
+                _release_retired_pages_if_idle(engine_core, manager)
+
+            stop = threading.Event()
+
+            def limits() -> tuple[int, int]:
+                return (manager.page_allocator.get_resize_target(),
+                        getattr(manager, "_memory_limit_revision", -1))
+
+            def watch() -> None:
+                # -1 means no kvctl target and no set_memory_limit() revision.
+                # Starting there also applies a limit set during startup.
+                seen = (-1, -1)
+                while not stop.wait(0.2):
+                    current = limits()
+                    input_queue = getattr(self, "input_queue", None)
+                    if current == seen or input_queue is None:
+                        continue
+                    seen = current
+                    callbacks.append(apply_limit)
+                    input_queue.put_nowait((wakeup, None))
+
+            thread = threading.Thread(target=watch, name="kvcached-limit-watch", daemon=True)
+            self._kvcached_limit_watch = (stop, thread)
+            thread.start()
+
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
         EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
+        EngineCore._kvcached_start_limit_watch = _kvcached_start_limit_watch
         return True
 
     @version_range(VLLM_ALL_RANGE)
@@ -1327,15 +1421,6 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_step, "async_batch_lifetime"):
             self.logger.debug("EngineCore.step_with_batch_queue already patched")
             return True
-
-        def _batch_queue_size(batch_queue: Any) -> int:
-            if batch_queue is None:
-                return 0
-            # Older PP schedulers use Queue; newer schedulers use deque.
-            # Only the engine thread adds/removes batches on either path.
-            if isinstance(batch_queue, Queue):
-                return batch_queue.qsize()
-            return len(batch_queue)
 
         def _patched_step_with_batch_queue(self, *args: Any, **kwargs: Any):
             manager = _get_vllm_kv_cache_manager(self)
@@ -1361,15 +1446,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             def _patched_reset_prefix_cache(self, *args: Any, **kwargs: Any):
                 result = original_reset(self, *args, **kwargs)
                 manager = _get_vllm_kv_cache_manager(self)
-                if manager is None or not getattr(manager, "defer_physical_release", False):
-                    return result
-
-                batch_queue = getattr(self, "batch_queue", None)
-                if batch_queue is not None and _batch_queue_size(batch_queue) == 0:
+                if manager is not None:
                     # Idle control operations have no subsequent batch step to
                     # drain retirements. Busy engines drain at the next step.
-                    marker = manager.capture_physical_release_marker()
-                    manager.release_retired_pages_through(marker)
+                    _release_retired_pages_if_idle(self, manager)
                 return result
 
             self._mark_as_patched(_patched_reset_prefix_cache, "async_batch_lifetime")
@@ -1378,13 +1458,11 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_shutdown(self, engine_mod: types.ModuleType) -> bool:
-        """Patch EngineCore.shutdown to release kvcached state.
+        """Release kvcached resources after the engine's own teardown.
 
-        run_engine_core() always ends in EngineCore.shutdown(), after which
-        the forked EngineCore leaves through os._exit: no destructor runs,
-        so the /dev/shm segment created by the C++ MemInfoTracker was never
-        unlinked (issue #477). shutdown_kvcached() unlinks it while the
-        process is still alive, after vLLM's own teardown.
+        Stop the limit reader before releasing the allocator it accesses.
+        Tracker teardown closes usage descriptors; control files remain for
+        explicit deletion after their last user exits.
         """
         EngineCore = self._get_target_class(engine_mod)
         if EngineCore is None:
@@ -1406,6 +1484,12 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
+                limit_watch = getattr(self, "_kvcached_limit_watch", None)
+                if limit_watch is not None:
+                    # It reads the page allocator, which shutdown_kvcached() frees.
+                    stop, thread = limit_watch
+                    stop.set()
+                    thread.join(timeout=5)
                 if enable_kvcached():
                     try:
                         from kvcached.integration.vllm.interfaces import shutdown_kvcached
@@ -1420,18 +1504,11 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
 
 def _client_engine_processes(client: Any) -> tuple[Any, ...]:
-    """Capture the engine processes owned by this MPClient before teardown.
+    """Capture engine processes owned by this MPClient before teardown.
 
-    With --api-server-count > 1 every frontend has an MPClient, but the
-    engines belong to the supervisor: such a client's
-    ``resources.engine_manager`` is None and its shutdown only closes
-    client-side resources, so unlinking from it would remove the live
-    engines' segment while EngineCore and the other frontends still use
-    it. Current vLLM records ownership as ``resources.engine_manager``;
-    older supported versions instead carry per-engine process handles on
-    ``resources.core_engines``. A client whose resources match neither
-    is treated as a non-owner: leaking a segment is recoverable with
-    kvctl delete, removing a live one is not.
+    Multi-frontend clients have no engine_manager and must not claim the
+    supervisor's workers or sockets. Older versions expose proc_handle through
+    core_engines. Unknown ownership shapes conservatively return no processes.
     """
     resources = getattr(client, "resources", None)
     if resources is None:
@@ -1444,46 +1521,37 @@ def _client_engine_processes(client: Any) -> tuple[Any, ...]:
                  if getattr(engine, "proc_handle", None) is not None)
 
 
-def _capture_engine_segment(owner: Any, processes: tuple[Any, ...],
+def _capture_engine_resources(owner: Any, processes: tuple[Any, ...],
                             parallel_config: Any = None) -> None:
-    """Pin a ready, live engine's segment once, never from a late shutdown.
+    """Remember worker/socket ownership at readiness, never control files.
 
-    The ready deployment's worker sockets are remembered at the same time
-    (issue #510) when the parallel config that names them is known.
+    Keep the existing hook boundary for #543 and owner SIGTERM. Control lifetime
+    is now entirely tracker-owned; no identity fd or per-engine unlink remains.
     """
-    if not enable_kvcached() or hasattr(owner, "_kvcached_ipc_cleanup"):
+    if not enable_kvcached() or hasattr(owner, "_kvcached_owner_captured"):
         return
-    owner._kvcached_ipc_cleanup = None
+    owner._kvcached_owner_captured = False
     owner._kvcached_engine_processes = processes
     owner._kvcached_worker_sockets = None
-    cleanup = None
     try:
-        if not processes:
+        if not processes or any(process.exitcode is not None for process in processes):
             return
-        if any(process.exitcode is not None for process in processes):
-            logger.warning("Cannot retain segment identity after an owned engine exited; "
-                           "keeping the segment for manual cleanup")
-            return
-        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR, IPCSegmentCleanup
-
-        cleanup = IPCSegmentCleanup(os.path.join(SHM_DIR, DEFAULT_IPC_NAME))
-        if any(process.exitcode is not None for process in processes):
-            cleanup.close()
-            logger.warning("Engine exited during segment identity capture; "
-                           "keeping the segment for manual cleanup")
-            return
-        owner._kvcached_ipc_cleanup = cleanup
-    except Exception as e:
-        if cleanup is not None:
-            cleanup.close()
-        logger.warning("Cannot retain the ready engine's segment identity: %s; "
-                       "parent cleanup is disabled for this engine", e)
+        owner._kvcached_owner_captured = True
+        from kvcached.utils import register_owner_sigterm_cleanup
+        shutdown = getattr(owner, "shutdown", None)
+        if getattr(shutdown, "__self__", None) is owner:
+            register_owner_sigterm_cleanup(shutdown)
+    except Exception as error:
+        logger.warning("Cannot remember engine ownership: %s", error)
         return
+    # Socket discovery is best effort; it must not disable child shutdown on
+    # SIGTERM when a directory is missing or its identity cannot be captured.
     try:
-        owner._kvcached_worker_sockets = _capture_worker_sockets(parallel_config)
-    except Exception as e:
-        logger.warning("Cannot remember the ready engine's worker sockets: %s; "
-                       "the socket directory is left to kvctl delete", e)
+        sockets = _capture_worker_sockets(parallel_config)
+        if all(process.exitcode is None for process in processes):
+            owner._kvcached_worker_sockets = sockets
+    except Exception as error:
+        logger.warning("Cannot remember worker socket ownership: %s", error)
 
 
 def _capture_worker_sockets(parallel_config: Any) -> Any:
@@ -1498,12 +1566,12 @@ def _capture_worker_sockets(parallel_config: Any) -> Any:
                                int(parallel_config.pipeline_parallel_size))
 
 
-def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...],
+def _cleanup_stopped_engine_sockets(processes: tuple[Any, ...],
                                    sockets: Any = None) -> None:
     """A shutdown return (or exception) does not prove the engines stopped.
 
-    Once it is confirmed, remove the segment and, when they were remembered,
-    the worker sockets the killed engines' workers left (issue #510)."""
+    Once confirmed, remove only the remembered unused worker sockets (#510).
+    An engine-exit record is no longer used to unlink control segments."""
     try:
         # vLLM can return immediately after SIGKILL without reaping children.
         # Bound the extra wait across the whole group, including error paths.
@@ -1513,15 +1581,11 @@ def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...],
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
         if not processes or any(
                 not isinstance(process.exitcode, int) for process in processes):
-            logger.warning("Keeping the KV cache limit segment: engine exit is unconfirmed")
+            logger.warning("Keeping worker sockets: engine exit is unconfirmed")
             return
     except Exception as e:
-        logger.warning("Keeping the KV cache limit segment: cannot check engine exit: %s", e)
+        logger.warning("Keeping worker sockets: cannot check engine exit: %s", e)
         return
-    try:
-        cleanup.unlink()
-    except Exception as e:
-        logger.warning("Failed to remove the KV cache limit segment: %s", e)
     if sockets is None:
         return
     try:
@@ -1530,8 +1594,8 @@ def _unlink_stopped_engine_segment(cleanup: Any, processes: tuple[Any, ...],
         logger.warning("Failed to remove the worker socket directory: %s", e)
 
 
-def _stop_headless_segment_watch(manager: Any) -> None:
-    watch = getattr(manager, "_kvcached_segment_watch", None)
+def _stop_headless_socket_watch(manager: Any) -> None:
+    watch = getattr(manager, "_kvcached_socket_watch", None)
     if watch is None:
         return
     try:
@@ -1539,14 +1603,14 @@ def _stop_headless_segment_watch(manager: Any) -> None:
         stop.set()
         thread.join(timeout=1.0)
         if thread.is_alive():
-            logger.warning("Segment identity capture is still stopping; "
+            logger.warning("Socket identity capture is still stopping; "
                            "parent cleanup may require a retry")
     except Exception as e:
-        logger.warning("Failed to stop segment identity capture: %s", e)
+        logger.warning("Failed to stop socket identity capture: %s", e)
 
 
 class MPClientPatch(VersionAwarePatch, BasePatch):
-    """Patch MPClient.shutdown to remove the segment killed engines leave"""
+    """Preserve owner shutdown and clean up sockets after confirmed worker exit."""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core_client"
@@ -1562,30 +1626,11 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
 
     @version_range(VLLM_ALL_RANGE)
     def patch_client_shutdown(self, client_mod: types.ModuleType) -> bool:
-        """Patch MPClient.shutdown.
+        """Retain worker ownership at readiness and verify exits before socket cleanup.
 
-        The EngineCore-side unlink (EngineCorePatch) only runs when
-        EngineCore.shutdown() completes, and on a server-level SIGTERM it
-        usually cannot: run_engine_core() restores SIGTERM to SIG_DFL
-        before calling EngineCore.shutdown(), and MPClient.shutdown()'s
-        process manager terminate()s the engine during that teardown (with
-        --shutdown-timeout 0 a SIGKILL follows immediately), killing it
-        before the unlink runs (issue #477). The client outlives the
-        engines, so once the original shutdown has stopped them, remove
-        whatever segment they left behind.
-
-        Only the engine-owning client does this (_client_engine_processes):
-        under --api-server-count > 1 a frontend's shutdown stops no
-        engines, and unlinking from it would remove the live segment.
-        Identity is captured after engine startup, not during shutdown, and
-        retained for retries even if teardown clears the ownership markers.
-        An owning client reuses its supervisor's retained identity when present.
-        The supervisor
-        that owns those engines has no MPClient at all;
-        CoreEngineProcManagerPatch covers that boundary.
-
-        The worker sockets the killed engines' workers leave behind are
-        removed from the same place (issue #510, WorkerSocketCleanup).
+        A client reuses its supervisor's capture when available. Frontends that
+        own no engine processes cannot delete shared worker sockets. Captured
+        ownership survives teardown clearing vLLM resource fields.
         """
         MPClient = self._get_target_class(client_mod)
         if MPClient is None:
@@ -1594,7 +1639,7 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         original_shutdown = getattr(MPClient, "shutdown", None)
         if original_shutdown is None:
             self.logger.warning(
-                "MPClient.shutdown not found; segments left by killed engines are not removed")
+                "MPClient.shutdown not found; worker socket cleanup unavailable")
             return True
 
         if self._is_already_patched(original_shutdown, "shutdown"):
@@ -1607,23 +1652,23 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
         def _patched_client_init(self, *args: Any, **kwargs: Any):
             original_init(self, *args, **kwargs)
             manager = getattr(getattr(self, "resources", None), "engine_manager", None)
-            if manager is not None and hasattr(manager, "_kvcached_ipc_cleanup"):
-                self._kvcached_ipc_cleanup = manager._kvcached_ipc_cleanup
+            if manager is not None and hasattr(manager, "_kvcached_owner_captured"):
+                self._kvcached_owner_captured = manager._kvcached_owner_captured
                 self._kvcached_engine_processes = manager._kvcached_engine_processes
                 self._kvcached_worker_sockets = getattr(manager, "_kvcached_worker_sockets", None)
             else:
                 parallel_config = getattr(getattr(self, "vllm_config", None),
                                           "parallel_config", None)
-                _capture_engine_segment(self, _client_engine_processes(self), parallel_config)
+                _capture_engine_resources(self, _client_engine_processes(self), parallel_config)
 
         def _patched_client_shutdown(self, *args: Any, **kwargs: Any):
-            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
+            captured = getattr(self, "_kvcached_owner_captured", False) if enable_kvcached() else False
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
-                if cleanup is not None:
-                    _unlink_stopped_engine_segment(
-                        cleanup, self._kvcached_engine_processes,
+                if captured:
+                    _cleanup_stopped_engine_sockets(
+                        self._kvcached_engine_processes,
                         getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_client_shutdown, "shutdown")
@@ -1633,7 +1678,7 @@ class MPClientPatch(VersionAwarePatch, BasePatch):
 
 
 class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
-    """Patch CoreEngineProcManager.shutdown to remove the segment its engines leave"""
+    """Preserve supervisor shutdown and cleanup of its stopped workers' sockets."""
 
     library = "vllm"
     target_module = "vllm.v1.engine.utils"
@@ -1649,28 +1694,13 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
 
     @version_range(VLLM_ALL_RANGE)
     def patch_manager_shutdown(self, utils_mod: types.ModuleType) -> bool:
-        """Patch CoreEngineProcManager.shutdown.
+        """Capture supervisor worker ownership at the READY boundary.
 
-        With --api-server-count > 1 (and under vllm serve --headless) the
-        EngineCore processes are launched by a CoreEngineProcManager in
-        the supervisor process, not by any MPClient: every frontend's
-        client is a non-owner, and run_multi_api_server() calls this
-        manager's shutdown directly on exit. That shutdown terminate()s
-        the engines (with --shutdown-timeout 0 a SIGKILL follows) before
-        EngineCore's own unlink can run, and no owning client exists in
-        the supervisor to remove what they leave behind (issue #477).
-        The manager spawned the engine processes itself and its shutdown
-        joins or kills them. Check their exit codes after shutdown before
-        removing the segment: shutdown can fail, swallow an error, or return
-        early when another caller has already detached its finalizer.
-
-        The constructor only starts children, so capture is bound to the
-        completed READY handshake in wait_for_engine_startup. If startup never
-        completes, the parent has no verified identity and must not claim a
-        later file at shutdown. Native cleanup still handles graceful failures.
-        Headless has no parent READY handshake. Its startup observer can retain
-        a newly created segment while the owned children are live, provided the
-        name was absent before they started. It never claims a pre-existing name.
+        Multi-frontend and headless deployments have no owning MPClient. Their
+        manager must confirm engine exit before removing captured sockets.
+        Headless has no parent READY handshake: its existing startup observer
+        captures newly created sockets only when the directory was absent at
+        construction and every owned engine is still live.
         """
         CoreEngineProcManager = self._get_target_class(utils_mod)
         if CoreEngineProcManager is None:
@@ -1679,7 +1709,7 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
         original_shutdown = getattr(CoreEngineProcManager, "shutdown", None)
         if original_shutdown is None:
             self.logger.warning(
-                "CoreEngineProcManager.shutdown not found; segments left by killed engines are not removed")
+                "CoreEngineProcManager.shutdown not found; worker socket cleanup unavailable")
             return True
 
         if self._is_already_patched(original_shutdown, "shutdown"):
@@ -1693,7 +1723,7 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
 
         @wraps(original_init)
         def _patched_manager_init(self, *args: Any, **kwargs: Any):
-            self._kvcached_headless_segment = None
+            self._kvcached_headless_socket_dir = None
             self._kvcached_parallel_config = None
             if enable_kvcached():
                 try:
@@ -1701,26 +1731,32 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                     self._kvcached_parallel_config = getattr(
                         arguments.get("vllm_config"), "parallel_config", None)
                     if arguments.get("local_client") is False:
-                        from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
+                        from kvcached.utils import get_tp_socket_dir
 
-                        path = os.path.join(SHM_DIR, DEFAULT_IPC_NAME)
-                        # Headless has no parent READY handshake. Only observe
-                        # a fresh name, never adopt a pre-existing generation.
+                        # A pre-existing socket directory cannot be adopted by a
+                        # new headless owner. Preserve its conservative fallback.
+                        path = get_tp_socket_dir()
                         if not os.path.exists(path):
-                            self._kvcached_headless_segment = path
-                        else:
-                            logger.warning("Headless segment already exists; parent "
-                                           "cleanup cannot establish ownership of %s", path)
+                            self._kvcached_headless_socket_dir = path
                 except Exception as e:
-                    logger.warning("Cannot prepare headless segment capture: %s", e)
+                    logger.warning("Cannot prepare headless socket capture: %s", e)
             original_init(self, *args, **kwargs)
 
         original_monitor = getattr(CoreEngineProcManager, "monitor_engine_liveness", None)
         if original_monitor is not None:
             @wraps(original_monitor)
             def _patched_monitor(self, *args: Any, **kwargs: Any):
-                path = getattr(self, "_kvcached_headless_segment", None)
-                if path is not None and not hasattr(self, "_kvcached_ipc_cleanup"):
+                # Headless identity capture runs on its existing observer thread,
+                # which cannot install Python signal handlers. Register the real
+                # owner here on the caller's main thread before blocking. This
+                # only arranges child shutdown; unlink still requires the separate
+                # successful identity capture and confirmed child exits.
+                if enable_kvcached() and getattr(self, "processes", None):
+                    from kvcached.utils import register_owner_sigterm_cleanup
+
+                    register_owner_sigterm_cleanup(self.shutdown)
+                path = getattr(self, "_kvcached_headless_socket_dir", None)
+                if path is not None and not hasattr(self, "_kvcached_owner_captured"):
                     stop = threading.Event()
                     processes = tuple(self.processes)
 
@@ -1729,25 +1765,31 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                             while not stop.is_set():
                                 if not processes or any(p.exitcode is not None for p in processes):
                                     return
-                                if os.path.exists(path):
-                                    _capture_engine_segment(
+                                config = getattr(self, "_kvcached_parallel_config", None)
+                                from kvcached.utils import get_tp_worker_socket_path
+                                paths = [] if config is None else [
+                                    get_tp_worker_socket_path(path, rank, pp_rank)
+                                    for pp_rank in range(max(int(config.pipeline_parallel_size), 1))
+                                    for rank in range(max(int(config.tensor_parallel_size), 1))]
+                                if paths and all(os.path.exists(item) for item in paths):
+                                    _capture_engine_resources(
                                         self, processes, self._kvcached_parallel_config)
                                     return
                                 stop.wait(0.05)
                         except Exception as e:
-                            logger.warning("Headless segment identity capture failed: %s", e)
+                            logger.warning("Headless socket identity capture failed: %s", e)
 
                     thread = threading.Thread(target=capture_when_created,
-                                              name="kvcached-segment-owner", daemon=True)
+                                              name="kvcached-socket-owner", daemon=True)
                     try:
                         thread.start()
-                        self._kvcached_segment_watch = (stop, thread)
+                        self._kvcached_socket_watch = (stop, thread)
                     except Exception as e:
-                        logger.warning("Cannot start headless segment identity capture: %s", e)
+                        logger.warning("Cannot start headless socket identity capture: %s", e)
                 try:
                     return original_monitor(self, *args, **kwargs)
                 finally:
-                    _stop_headless_segment_watch(self)
+                    _stop_headless_socket_watch(self)
 
             CoreEngineProcManager.monitor_engine_liveness = _patched_monitor
 
@@ -1764,26 +1806,26 @@ class CoreEngineProcManagerPatch(VersionAwarePatch, BasePatch):
                     if manager is None:
                         manager = getattr(arguments.get("launch"), "engine_manager", None)
                     if isinstance(manager, CoreEngineProcManager):
-                        _capture_engine_segment(
+                        _capture_engine_resources(
                             manager, tuple(manager.processes),
                             getattr(manager, "_kvcached_parallel_config", None))
                 except Exception as e:
-                    logger.warning("Cannot retain startup segment identity: %s", e)
+                    logger.warning("Cannot retain startup socket identity: %s", e)
                 return result
 
             setattr(utils_mod, "wait_for_engine_startup", _patched_wait)
         else:
-            logger.warning("wait_for_engine_startup not found; READY-based segment capture disabled")
+            logger.warning("wait_for_engine_startup not found; READY-based socket capture disabled")
 
         def _patched_manager_shutdown(self, *args: Any, **kwargs: Any):
-            _stop_headless_segment_watch(self)
-            cleanup = getattr(self, "_kvcached_ipc_cleanup", None) if enable_kvcached() else None
+            _stop_headless_socket_watch(self)
+            captured = getattr(self, "_kvcached_owner_captured", False) if enable_kvcached() else False
             try:
                 return original_shutdown(self, *args, **kwargs)
             finally:
-                if cleanup is not None:
-                    _unlink_stopped_engine_segment(
-                        cleanup, self._kvcached_engine_processes,
+                if captured:
+                    _cleanup_stopped_engine_sockets(
+                        self._kvcached_engine_processes,
                         getattr(self, "_kvcached_worker_sockets", None))
 
         self._mark_as_patched(_patched_manager_shutdown, "shutdown")

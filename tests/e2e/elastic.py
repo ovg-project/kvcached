@@ -26,7 +26,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, Sequence
 
 from e2e import client as cl
 from e2e.matrix import BATCH_FLAG, ELASTIC_BATCH, Case, ElasticPair
@@ -83,18 +83,18 @@ def gpu_memory_mib(gpu: str) -> tuple[int, int]:
     return used, total
 
 
-def read_segments() -> dict[str, int]:
-    """Used KV bytes of every kvcached segment in /dev/shm, read as kvctl does:
-    three int64s (limit, used, preallocated) under a shared flock. /dev/shm
-    is shared with the containers (--ipc=host), and this is much faster than
+def read_segments(ipcs: Sequence[str], shm_dir: str = "/dev/shm") -> dict[str, int]:
+    """Used KV bytes of the servers' kvcached segments, read as kvctl does: the
+    leading three int64s (limit, used, preallocated) under a shared flock. A
+    server has one segment per KV cache group: <ipc>, <ipc>_g1, ... /dev/shm is
+    shared with the containers (--ipc=host), and this is much faster than
     running kvctl once a second."""
     used = {}
-    for name in os.listdir("/dev/shm"):
-        path = os.path.join("/dev/shm", name)
+    for name in os.listdir(shm_dir):
+        if not any(name == ipc or name.startswith(ipc + "_g") for ipc in ipcs):
+            continue
         try:
-            if os.path.getsize(path) != SEGMENT.size:
-                continue
-            with open(path, "rb") as f:
+            with open(os.path.join(shm_dir, name), "rb") as f:
                 fcntl.flock(f, fcntl.LOCK_SH)
                 limit, in_use, _ = SEGMENT.unpack(f.read(SEGMENT.size))
         except (OSError, struct.error):
@@ -105,10 +105,11 @@ def read_segments() -> dict[str, int]:
 
 
 class Usage:
-    """Sample the kvcached segments and the GPU's memory once a second."""
+    """Sample the servers' kvcached segments and the GPU's memory once a second."""
 
-    def __init__(self, gpu: str) -> None:
+    def __init__(self, gpu: str, ipcs: Sequence[str]) -> None:
         self.gpu = gpu
+        self.ipcs = tuple(ipcs)
         self.samples: list[tuple[float, int, dict[str, int]]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -121,11 +122,12 @@ class Usage:
                    if k == srv.ipc or k.startswith(srv.ipc + "_g"))
 
     def used(self, srv: Server) -> int:
-        return self.of(srv, read_segments())
+        return self.of(srv, read_segments(self.ipcs))
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.samples.append((time.time(), gpu_memory_mib(self.gpu)[0], read_segments()))
+            self.samples.append((time.time(), gpu_memory_mib(self.gpu)[0],
+                                 read_segments(self.ipcs)))
             time.sleep(1)
 
     def peak(self, srv: Server, since: float) -> int:
@@ -210,11 +212,10 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
         (_, a), (_, b) = started
         probes = cl.BASE_PROMPTS[:3]
         base = {s.ipc: s.client.run_phase("probe", probes, 32, 1) for _, s in started}
-        usage = Usage(gpu)
+        usage = Usage(gpu, (a.ipc, b.ipc))
         mem: dict[str, float] = {}
         res.log["memory_mib"] = mem
-        res.log["segments"] = {k: v for k, v in read_segments().items()
-                               if k.startswith((a.ipc, b.ipc))}
+        res.log["segments"] = read_segments((a.ipc, b.ipc))
 
         with ThreadPoolExecutor(max_workers=4 * ELASTIC_BATCH) as pool:
             # Calibrate: the KV memory one request of this shape holds.

@@ -264,6 +264,36 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="34" />
 </p>
 
+### Control-file lifetime
+
+On Linux, native and Python trackers hold an OFD shared usage lock on their
+retained control-file descriptor. Closing the last reference releases usage,
+including after SIGKILL; forked descendants and duplicated descriptors retain
+the lock until their own last close. No cleanup daemon or inference-path lock
+is added. Shutdown may leave small, unused control files intentionally.
+
+`kvctl list` and `kvtop` hide known unused files. Use `kvctl list --all` to find
+leftovers, then `kvctl delete <name>` to remove one. Delete acquires an exclusive
+usage lock and rechecks the opened inode against the path; active, legacy,
+unknown, or unverifiable files are not removed. Control deletion does not delete
+worker socket directories: existing engine owners retain their separate socket
+identity and worker-exit checks.
+
+**Upgrade all participants of one segment together.** Stop every process using
+that segment, including forked descendants, before upgrading its trackers and
+tools that write/delete it. Only then restart with the same name. New startup
+reinitializes that stale file and marks the lock protocol. Other segments or
+IPC namespaces can upgrade independently. The marker cannot protect against an
+old client that ignores locks. Independently live deployments need distinct
+names; arbitrary external rename/unlink of live paths is outside this protocol.
+
+Legacy files remain visible; remove them manually only after confirming their
+participants stopped. Non-Linux/no-OFD observation is conservative and safe
+deletion is unavailable. A Linux tracker that cannot acquire its required usage
+lock fails initialization instead of running unlocked. Engine child shutdown,
+listener/preallocation stop, socket cleanup, and GPU resource release remain
+separate responsibilities.
+
 ## Citation
 
 If you find kvcached useful, please cite our paper:

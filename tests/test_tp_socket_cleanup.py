@@ -6,8 +6,8 @@ Every engine launch created /tmp/kvcached-tp-<ipc>-<hash>/w<rank>.sock, at
 TP=1 too, and nothing removed it: the listener served the socket until the
 process died and kvctl delete only knew about /dev/shm. These tests pin down
 the fix from three sides: stopping the listener unlinks the socket and the
-directory, vLLM's Worker.shutdown() stops it, and kvctl delete removes the
-directory derived from an IPC name.
+directory, vLLM's Worker.shutdown() stops it, and kvctl delete preserves the
+separately owned socket directory.
 
 The parent-side fallback for workers killed before that runs (issue #510)
 is WorkerSocketCleanup in kvcached.utils; its tests are at the end.
@@ -591,7 +591,7 @@ def test_delete_tp_socket_dir_accepts_a_shm_path(socket_root):
     assert not os.path.exists(socket_dir)
 
 
-def test_kvctl_delete_reports_the_socket_dir(socket_root, monkeypatch, capsys):
+def test_kvctl_control_delete_preserves_the_socket_dir(socket_root, monkeypatch, capsys):
     from kvcached.cli import kvctl
 
     monkeypatch.setattr(cli_utils, "delete_kv_cache_segment", lambda name: False)
@@ -600,9 +600,9 @@ def test_kvctl_delete_reports_the_socket_dir(socket_root, monkeypatch, capsys):
     kvctl.cmd_delete(IPC_NAME)
 
     out = capsys.readouterr()
-    assert "Removed worker socket dir" in out.out
-    assert "not found" not in out.err
-    assert not os.path.exists(get_tp_socket_dir(IPC_NAME))
+    assert "Removed worker socket dir" not in out.out
+    assert "not found" in out.err
+    assert os.path.exists(get_tp_socket_dir(IPC_NAME))
 
 
 def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeypatch, capsys):

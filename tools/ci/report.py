@@ -9,14 +9,14 @@ Everything here is rendered from the files a run leaves in its results
 directories (setup.json and summary.json from tests/e2e/run.py and
 benchmarks/ci/perf.py), so the comment and the description describe what the
 run actually did. A correctness run has one directory per part that ran on
-its own GPUs: vllm and sglang for nightly, all otherwise.
+its own GPUs: vllm and sglang for basic, all otherwise.
 
 Usage:
-    report.py correctness --results DIR [DIR ...] --profile nightly --comment c.md \\
+    report.py correctness --results DIR [DIR ...] --profile weekly --comment c.md \\
         --section s.md --run-url URL --sha SHA [--subject S] [--prev SHA:CONCLUSION] \\
         [--artifact-url URL] [--pr N]
     report.py perf --results DIR --comment c.md --section s.md --run-url URL --sha SHA ...
-    report.py splice --body body.md --name nightly --section s.md --out new.md
+    report.py splice --body body.md --name weekly --section s.md --out new.md
 """
 
 from __future__ import annotations
@@ -30,13 +30,12 @@ from typing import Any, Optional
 
 REPO_URL = "https://github.com/ovg-project/kvcached"
 # Sections of the issue description, in this order, one per workflow.
-SECTIONS = ("nightly", "weekly", "perf")
-TITLES = {"nightly": "Nightly correctness", "weekly": "Weekly correctness",
+SECTIONS = ("weekly", "perf")
+TITLES = {"basic": "Basic correctness", "weekly": "Weekly correctness",
           "smoke": "Smoke correctness", "perf": "Weekly performance"}
-SCHEDULES = {"nightly": "Daily at 08:00 UTC", "weekly": "Saturdays at 12:00 UTC",
-             "perf": "Sundays at 10:00 UTC"}
-WORKFLOWS = {"nightly": "gpu-correctness.yml", "weekly": "gpu-correctness.yml",
-             "smoke": "gpu-correctness.yml", "perf": "gpu-perf-weekly.yml"}
+SCHEDULES = {"weekly": "Saturdays at 12:00 UTC", "perf": "Sundays at 10:00 UTC"}
+WORKFLOWS = {"weekly": "gpu-correctness.yml", "smoke": "gpu-correctness.yml",
+             "perf": "gpu-perf-weekly.yml"}
 ENGINE_NAMES = {"vllm": "vLLM", "sglang": "SGLang"}
 LAYOUTS = {"c1": "kvcached, contiguous", "c0": "kvcached, non-contiguous", None: "native"}
 MAX_FAILED_ROWS = 30
@@ -133,7 +132,8 @@ def env_lines(setup: dict[str, Any]) -> list[str]:
     """How every server of an engine is started, and what kvcached and
     native cases add to that."""
     lines = []
-    cases = setup.get("cases", []) + [s[k] for s in setup.get("elastic", []) for k in "ab"]
+    cases = (setup.get("cases", []) + [s[k] for s in setup.get("elastic", []) for k in "ab"]
+             + setup.get("limit", []))
     for name, info in setup.get("engines", {}).items():
         engine_env = dict(info.get("env") or {})  # a dict, or [key, value] pairs
         common = " ".join(f"{k}={v}" for k, v in engine_env.items())
@@ -176,6 +176,16 @@ def elastic_table(setup: dict[str, Any]) -> list[str]:
     return lines
 
 
+def limit_table(setup: dict[str, Any]) -> list[str]:
+    revisions = setup.get("model_revisions", {})
+    lines = ["| case | server |", "|---|---|"]
+    for s in setup.get("limit", []):
+        lines.append(f"| {s['name']} | {ENGINE_NAMES[s['engine']]}, "
+                     f"{revision_link(s['hf_id'], revisions.get(s['hf_id']))}, "
+                     f"{LAYOUTS[s.get('layout')]}, {model_flags(s)} |")
+    return lines
+
+
 def checks_table(checks: dict[str, str]) -> list[str]:
     return ["| check | passes when |", "|---|---|"] + [
         f"| `{name}` | {cell(text)} |" for name, text in checks.items()]
@@ -194,7 +204,7 @@ def merge_setups(parts: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     merged["engines"] = {k: v for s in setups for k, v in s.get("engines", {}).items()}
     merged["model_revisions"] = {k: v for s in setups
                                  for k, v in s.get("model_revisions", {}).items()}
-    for key in ("cases", "elastic"):
+    for key in ("cases", "elastic", "limit"):
         merged[key] = [c for s in setups for c in s.get(key, [])]
     merged["parts"] = [name for name, _ in parts] if len(parts) > 1 else []
     return merged
@@ -227,22 +237,16 @@ def correctness_section(profile: str, setup: dict[str, Any], args: argparse.Name
         *cases_table(setup),
         "",
     ]
-    # The workload and checks come from the same code for every profile, so
-    # only the nightly section of the issue spells them out.
-    same = profile != "nightly" and not args.pr
-    if same:
-        lines += ["Each case runs the workload and checks described under "
-                  "[Nightly correctness](#nightly-correctness)."]
-    else:
-        lines += ["Each case:", "", *[f"- {step}" for step in setup.get("workload", [])], "",
-                  *checks_table(setup.get("checks", {}))]
+    lines += ["Each case:", "", *[f"- {step}" for step in setup.get("workload", [])], "",
+              *checks_table(setup.get("checks", {}))]
     if setup.get("elastic"):
-        lines += ["", "### Elastic tests", "", *elastic_table(setup), ""]
-        if same:
-            lines += ["Phases and checks as under Nightly correctness."]
-        else:
-            lines += [*[f"- {step}" for step in setup.get("elastic_workload", [])], "",
-                      *checks_table(setup.get("elastic_checks", {}))]
+        lines += ["", "### Elastic tests", "", *elastic_table(setup), "",
+                  *[f"- {step}" for step in setup.get("elastic_workload", [])], "",
+                  *checks_table(setup.get("elastic_checks", {}))]
+    if setup.get("limit"):
+        lines += ["", "### Limit tests", "", *limit_table(setup), "",
+                  *[f"- {step}" for step in setup.get("limit_workload", [])], "",
+                  *checks_table(setup.get("limit_checks", {}))]
     return "\n".join(lines) + "\n"
 
 
@@ -267,7 +271,7 @@ def header(title: str, verdict: str, args: argparse.Namespace) -> list[str]:
 
 def failed_cases(summary: dict[str, Any], setup: dict[str, Any]) -> list[str]:
     briefs = {s["name"]: case_brief(s, setup)
-              for s in setup.get("cases", []) + setup.get("elastic", [])}
+              for s in setup.get("cases", []) + setup.get("elastic", []) + setup.get("limit", [])}
     failed = [c for c in summary.get("cases", []) if not c.get("ok")]
     lines = ["| case | setup | failed checks |", "|---|---|---|"]
     for case in failed[:MAX_FAILED_ROWS]:
