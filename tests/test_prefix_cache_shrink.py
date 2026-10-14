@@ -621,3 +621,21 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
     excess_pages = 9 - LIMIT_PAGES
     assert len(cache.cached) == 32 - excess_pages * BLOCKS_PER_PAGE
     assert manager.memory_limit_state()["status"] == "deferred"
+
+
+def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler):
+    from kvcached.integration.sglang import patches
+
+    scheduler = sglang_scheduler()
+    manager = scheduler.tree_cache.manager
+    # DSV4 keeps native child IDs, exposing only its physical backing manager.
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        full_attn_allocator=SimpleNamespace(), swa_attn_allocator=SimpleNamespace(),
+        _kvcached_dsv4_backing=SimpleNamespace(manager=manager),
+    )
+    scheduler._kvcached_shrink_reclaimers = None
+    assert patches._token_kv_managers(scheduler.token_to_kv_pool_allocator) == [manager]
+    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    scheduler.on_idle()
+    _assert_sglang_within_limit(scheduler)
+    assert len(getattr(scheduler, "_kvcached_shrink_reclaimers")) == 1
