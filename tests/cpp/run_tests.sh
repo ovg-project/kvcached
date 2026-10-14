@@ -15,3 +15,10 @@ trap 'rm -rf "${test_build_dir}"' EXIT
   -o "${test_build_dir}/test_math_utils"
 
 "${test_build_dir}/test_math_utils"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
+  -I"${repo_root}/csrc/inc" \
+  "${script_dir}/test_mapping_iteration.cpp" \
+  -o "${test_build_dir}/test_mapping_iteration"
+
+"${test_build_dir}/test_mapping_iteration"

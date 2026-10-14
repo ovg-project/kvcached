@@ -9,6 +9,7 @@
 #include "constants.hpp"
 #include "ftensor.hpp"
 #include "gpu_utils.hpp"
+#include "mapping_iteration.hpp"
 #include "page.hpp"
 
 namespace kvcached {
@@ -160,138 +161,52 @@ bool FTensorAllocator::kv_tensors_created() {
 
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
-  if (num_layers_ == 0) {
-    LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
-    return false;
-  }
-
-  if (contiguous_layout_) {
-    // In contiguous layout, use the single contiguous tensor for mapping
-    // Each offset maps a block that contains all layers
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
-
-    for (auto offset : offsets) {
-      // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
-    }
-  } else if (unified_pool_) {
-    // Unified pool: K and V share a single block-interleaved FTensor per
-    // layer. Each page id maps exactly one VMM page at pid * page_size.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->map(offset);
-      }
-    }
-  } else {
-    // Original per-layer mapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        auto koffset = offset;
-        auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
-      }
-    }
-  }
-  return true;
+  // Best-effort, unlike prepare/commit: this is the legacy single-call map
+  // path (the TP-worker IPC handler is its only remaining caller, and it
+  // discards this return value and reports success unconditionally either
+  // way -- see kvcached/tp_ipc_util.py). Short-circuiting here would leave
+  // every offset after the first failure unmapped while the IPC caller still
+  // reports success, which is strictly worse than the pre-existing
+  // best-effort behavior this path has always had.
+  bool ok = true;
+  bool created = for_each_mapping_(offsets, [&ok](FTensor *ft, offset_t off) {
+    ok &= ft->map(off);
+    return true; // never short-circuit; ok tracks the real result.
+  });
+  return created && ok;
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
     const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
-  if (num_layers_ == 0) {
-    LOGGER(ERROR,
-           "try to unmap from KV tensors when KV tensors are not created");
-    return false;
-  }
-
-  if (contiguous_layout_) {
-    // In contiguous layout, unmap using the single contiguous tensor
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
-
-    for (auto offset : offsets) {
-      // Unmap K and V regions for this block (covers all layers)
-      ftensor->unmap(offset);
-    }
-  } else if (unified_pool_) {
-    // Unified pool: single unmap per pid.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
-      }
-    }
-  } else {
-    // Original per-layer unmapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
-        ftensor->unmap(offset + v_base_offset);
-      }
-    }
-  }
-  return true;
+  // Best-effort, unlike prepare/commit: this is teardown, so a failure on one
+  // offset must not leave later offsets still mapped while PageAllocator is
+  // about to treat their pages as free. unmap()'s only false is "already
+  // unmapped" -- a no-op in terms of resulting VA state, even though it
+  // signals a caller-side bookkeeping bug -- so continuing past it is safe.
+  bool ok = true;
+  bool created = for_each_mapping_(offsets, [&ok](FTensor *ft, offset_t off) {
+    ok &= ft->unmap(off);
+    return true; // never short-circuit; ok tracks the real result.
+  });
+  return created && ok;
 }
 
 bool FTensorAllocator::for_each_mapping_(
     const std::vector<offset_t> &offsets,
     const std::function<bool(FTensor *, offset_t)> &op) {
   if (num_layers_ == 0) {
-    LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
+    LOGGER(ERROR, "KV tensors are not created");
     return false;
   }
-
-  if (contiguous_layout_) {
-    // Single contiguous tensor; each offset covers all layers.
-    auto ftensor = contiguous_kv_tensor_.get();
-    for (auto offset : offsets) {
-      op(ftensor, offset);
-    }
-  } else if (unified_pool_) {
-    // Unified pool: one block-interleaved FTensor per layer, one page per pid.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        op(ftensor, offset);
-      }
-    }
-  } else {
-    // Original per-layer layout: K and V are stacked at the 1st dim.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
-      for (auto offset : offsets) {
-        op(ftensor, offset);
-        op(ftensor, offset + v_base_offset);
-      }
-    }
-  }
-  return true;
+  return for_each_mapping_impl<FTensor *>(
+      contiguous_layout_, unified_pool_, num_layers_, offsets,
+      contiguous_kv_tensor_.get(),
+      [this](int64_t i) -> FTensor * {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        return ftensors_[kv_name].get();
+      },
+      [](FTensor *ft) { return get_v_base_offset(ft->get_tensor()); }, op);
 }
 
 bool FTensorAllocator::prepare_kv_tensors(

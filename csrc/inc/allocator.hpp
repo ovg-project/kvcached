@@ -33,11 +33,28 @@ public:
                                             int64_t num_kv_buffers = 2,
                                             bool unified_pool = false);
   bool kv_tensors_created();
+  // Best-effort: attempts every offset even if some fail to map. This is the
+  // legacy single-call map path (the TP-worker IPC handler is its only
+  // remaining caller, and it reports success unconditionally regardless of
+  // this return value), so it keeps the pre-existing best-effort behavior
+  // rather than adopting prepare_/commit_'s short-circuit -- see the
+  // definition for why short-circuiting here would be strictly worse for
+  // that caller. Returns false if any offset failed to map, or if KV tensors
+  // were never created.
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  // Best-effort: attempts every offset even if some fail, since this is
+  // teardown and a skipped unmap would leave a page mapped that PageAllocator
+  // is about to treat as free. Returns false if any offset failed to unmap
+  // (all are still attempted), or if KV tensors were never created.
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
   // Split of map_to_kv_tensors(): prepare_ allocates physical pages only (safe
   // off the main thread); commit_ does the VA edits (must be GPU-idle). See
-  // FTensor::prepare/commit.
+  // FTensor::prepare/commit. Unlike map_/unmap_, both short-circuit on the
+  // first offset that fails (see for_each_mapping_'s contract below) --
+  // their only caller (PageAllocator::prepare_pages/commit_pages) converts a
+  // false straight to a thrown exception, so there's no best-effort case to
+  // preserve, and stopping early avoids wasted GPU work and (for commit_)
+  // widening the partially-mapped window.
   bool prepare_kv_tensors(const std::vector<offset_t> &offsets);
   bool commit_kv_tensors(const std::vector<offset_t> &offsets);
 
@@ -65,8 +82,23 @@ private:
   at::Tensor create_ftensor_(size_t size, c10::ScalarType dtype,
                              const std::string &dev_str, std::string name = "");
   void free_ftensor_(at::Tensor &ftensor);
-  // Apply `op` (FTensor::prepare/commit) to every (ftensor, offset) slot
-  // implied by the current layout. Must be called with mtx_ held.
+  // Apply `op` (FTensor::map/unmap/prepare/commit) to every (ftensor, offset)
+  // slot implied by the current layout. Must be called with mtx_ held.
+  // Contract: returns false and stops at the first offset where `op` returns
+  // false (offsets after that point are never visited), or false immediately
+  // if KV tensors haven't been created. This short-circuit is only safe
+  // because every `op` this function is called with treats a `false` as a
+  // real failure it needs to see, not a signal to skip -- FTensor::prepare/
+  // commit/unmap's only false paths are all invariant violations on the
+  // caller's part (never "nothing to do here, move on"), so stopping never
+  // drops work that still needed to happen *for that op*. Whether stopping
+  // early is still the right call for the *batch as a whole* is a separate,
+  // per-caller question -- map_to_kv_tensors and unmap_from_kv_tensors both
+  // need every offset attempted regardless (see their own comments for why),
+  // so they wrap `op` to always return true here and track real failures
+  // themselves; only prepare_/commit_ pass `op` straight through and rely on
+  // this function's short-circuit. See csrc/inc/mapping_iteration.hpp for
+  // the pure iteration core and its CPU-only test.
   bool for_each_mapping_(const std::vector<offset_t> &offsets,
                          const std::function<bool(FTensor *, offset_t)> &op);
 
