@@ -15,3 +15,5 @@ trap 'rm -rf "${test_build_dir}"' EXIT
   -o "${test_build_dir}/test_math_utils"
 
 "${test_build_dir}/test_math_utils"
+
+"${PYTHON:-python3}" "${script_dir}/test_physical_capacity_device.py" "${test_build_dir}"

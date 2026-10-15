@@ -104,19 +104,47 @@ std::string physical_gpu_lock_path(int dev_idx) {
   return physical_gpu_lock_path(physical_gpu_identifier(dev_idx));
 }
 
+class ScopedDeviceGuard {
+public:
+  explicit ScopedDeviceGuard(int dev_idx)
+      : previous_device_(gpu_vmm::current_device()),
+        changed_(previous_device_ != dev_idx) {
+    if (changed_) {
+      const auto status = gpu_vmm::set_device(dev_idx);
+      if (!gpu_vmm::is_success(status)) {
+        throw std::runtime_error(
+            std::string("failed to select physical GPU: ") +
+            gpu_vmm::error_string(status));
+      }
+    }
+  }
+
+  ScopedDeviceGuard(const ScopedDeviceGuard &) = delete;
+  ScopedDeviceGuard &operator=(const ScopedDeviceGuard &) = delete;
+
+  ~ScopedDeviceGuard() noexcept {
+    if (changed_) {
+      // Continuing on an unknown device would corrupt subsequent GPU work.
+      CHECK_GPU(gpu_vmm::set_device(previous_device_));
+    }
+  }
+
+private:
+  int previous_device_;
+  bool changed_;
+};
+
 void validate_physical_capacity(int dev_idx, size_t required_bytes,
                                 PhysicalGrowthOperationStats *stats) {
-  auto status = gpu_vmm::set_device(dev_idx);
-  if (!gpu_vmm::is_success(status)) {
-    throw std::runtime_error(std::string("failed to select physical GPU: ") +
-                             gpu_vmm::error_string(status));
-  }
   size_t free_bytes = 0;
   size_t total_bytes = 0;
-  status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
-  if (!gpu_vmm::is_success(status)) {
-    throw std::runtime_error(std::string("GPU memory query failed: ") +
-                             gpu_vmm::error_string(status));
+  {
+    const ScopedDeviceGuard device_guard(dev_idx);
+    const auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+    if (!gpu_vmm::is_success(status)) {
+      throw std::runtime_error(std::string("GPU memory query failed: ") +
+                               gpu_vmm::error_string(status));
+    }
   }
   const size_t headroom = static_cast<size_t>(static_cast<double>(total_bytes) *
                                               (1.0 - gpu_utilization_limit()));

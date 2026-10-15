@@ -96,6 +96,41 @@ def _compiled_vmm_ops():
     return vmm_ops
 
 
+@pytest.mark.parametrize("outcome", ["success", "capacity", "invalid-utilization"])
+def test_prepared_growth_preserves_callers_cuda_device(monkeypatch, tmp_path, outcome):
+    import torch
+
+    native = _compiled_vmm_ops()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required for cross-device admission")
+    original_device = torch.cuda.current_device()
+    page = 2 * 1024 * 1024
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    native.init_kvcached("cuda:1", page, False)
+    try:
+        tensors = native.create_kv_tensors(4 * page, 1, "cuda:1", 1, 1, page_size=page)
+        torch.cuda.set_device(0)
+        utilization = {"success": "1", "capacity": "1e-20", "invalid-utilization": "invalid"}
+        monkeypatch.setenv("KVCACHED_GPU_UTILIZATION", utilization[outcome])
+        if outcome == "success":
+            assert native.prepare_map_to_kv_tensors("device-scope", [0], 0)["success"]
+            assert torch.cuda.current_device() == 0
+            assert native.commit_prepared_map("device-scope", 0)["success"]
+            tensors[0][:128].fill_(19)
+            torch.cuda.synchronize(1)
+            assert torch.all(tensors[0][:128] == 19).item()
+        else:
+            result = native.prepare_map_to_kv_tensors("device-scope", [0], 0)
+            assert not result["success"]
+            assert result["capacity_rejections"] == (1 if outcome == "capacity" else 0)
+            assert not native.has_prepared_map("device-scope", 0)
+        assert torch.cuda.current_device() == 0
+    finally:
+        torch.cuda.set_device(1)
+        native.shutdown_kvcached()
+        torch.cuda.set_device(original_device)
+
+
 def _create_layout(vmm_ops, contiguous_layout, unified_pool):
     page_size = 2 * 1024 * 1024
     num_layers = 2
