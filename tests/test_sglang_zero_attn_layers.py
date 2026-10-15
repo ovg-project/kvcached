@@ -208,6 +208,7 @@ def _load_interfaces_under_stubs(monkeypatch):
     setattr(utils_module, "CONTIGUOUS_LAYOUT", False)
     setattr(utils_module, "PAGE_SIZE", 2 * 1024 * 1024)
     setattr(utils_module, "get_page_size_for_block", lambda block, page: page)
+    setattr(utils_module, "KVCachedConfigError", RuntimeError)
     setattr(utils_module, "get_kvcached_logger",
             lambda: types.SimpleNamespace())
     setattr(utils_module, "normalize_gpu_device", lambda device: device)
