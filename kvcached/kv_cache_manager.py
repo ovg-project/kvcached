@@ -72,6 +72,17 @@ def synchronized(method):
     return synchronized_method
 
 
+def _after_post_init(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Wait before serialization; place outside ``@synchronized``."""
+
+    @functools.wraps(method)
+    def initialized_method(self, *args, **kwargs):
+        self._wait_post_init()
+        return method(self, *args, **kwargs)
+
+    return initialized_method
+
+
 def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
                    *, internal_page: Any = None) -> int:
     """Return the number of usable blocks on a page.
@@ -102,6 +113,9 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
 
 
 class KVCacheManager:
+    # The initializer may reenter resize while reserving the null block; it
+    # cannot wait for the completion event it is responsible for publishing.
+    _post_init_thread_id: Optional[int] = None
     # Cached get_avail_physical_pages() result + its monotonic timestamp.
     # Class-level defaults keep the no-__init__ test-stub pattern
     # (tests/test_alloc_rollback.py) working without each stub knowing
@@ -375,6 +389,8 @@ class KVCacheManager:
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
+        self._post_init_thread_id = threading.get_ident()
+
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
@@ -444,7 +460,14 @@ class KVCacheManager:
                 self._lifecycle.mark_failed("initialization cancelled by shutdown")
 
     def _wait_post_init(self):
-        if not self._post_init_done.is_set():
+        """Wait for setup unless this thread is performing that setup.
+
+        Foreground entry points call this before acquiring the manager lock.
+        This remains the legacy completion gate; ``wait_ready`` propagates
+        captured initialization failures.
+        """
+        if (not self._post_init_done.is_set()
+                and threading.get_ident() != self._post_init_thread_id):
             self._post_init_done.wait()
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
@@ -625,9 +648,12 @@ class KVCacheManager:
             return
 
 
+    @_after_post_init
     def alloc(self, need_size: int) -> Optional[List[int]]:
+        """Wait for initial setup without holding the lock, then allocate blocks."""
         return self._alloc(need_size)
 
+    @_after_post_init
     def alloc_packed(self, need_size: int) -> Optional[List[int]]:
         """Allocate by draining the smallest existing holes first.
 
@@ -635,7 +661,8 @@ class KVCacheManager:
         single request. Treating that request as one long run skips partially
         free pages that cannot fit the whole batch. Packed allocation preserves
         the placement of repeated one-block allocations while keeping one lock
-        acquisition and one capacity check.
+        acquisition and one capacity check. Waits for initial setup before
+        entering the manager lock.
         """
         return self._alloc(need_size, pack_pages=True)
 
@@ -855,6 +882,7 @@ class KVCacheManager:
             ref for ref in self._page_release_callbacks if ref() is not None
         ) + (weakref.WeakMethod(callback),)
 
+    @_after_post_init
     @synchronized
     def free(self, indices: List[int]):
         counters = getattr(self, "_operation_counters", None)
@@ -1050,6 +1078,7 @@ class KVCacheManager:
         self._retired_pages = still_retired
         self._maybe_finish_shrink()
 
+    @_after_post_init
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
         self._wait_post_init()
@@ -1084,6 +1113,7 @@ class KVCacheManager:
                 self._resize_rejected = True
                 logger.warning("Automatic resize rejected: pool has quarantined pages")
 
+    @_after_post_init
     @synchronized
     def apply_resize_target(self) -> None:
         """Apply the limit published through the shared segment (kvctl).
@@ -1093,6 +1123,7 @@ class KVCacheManager:
         self._wait_post_init()
         self._apply_resize_target()
 
+    @_after_post_init
     @synchronized
     def reclaim_for_shrink(self) -> None:
         """Evict cached pages a pending shrink waits for. Engine thread only.
@@ -1150,6 +1181,7 @@ class KVCacheManager:
             page_id for _, page_ids in getattr(self, "_retired_pages", [])
             for page_id in page_ids)
 
+    @_after_post_init
     @synchronized
     def resize(self, new_mem_size: int):
         self._increment_operation_counter("resize_requests_total")
@@ -1213,6 +1245,7 @@ class KVCacheManager:
         self.target_num_blocks = new_mem_size // self.block_mem_size
         return False
 
+    @_after_post_init
     @synchronized
     def trim(self) -> None:
         self._increment_operation_counter("trim_requests_total")
@@ -1242,14 +1275,13 @@ class KVCacheManager:
         # for the same grow-direction mutation, so trim() does too.
         self._avail_physical_pages_cache = None
 
-    @synchronized
     def set_memory_limit(
         self,
         limit_bytes: int,
         *,
         revision: int,
     ) -> Dict[str, Any]:
-        """Apply a revisioned memory limit through the existing resize path."""
+        """Validate a limit, wait for setup, then apply its revision atomically."""
         limit_bytes = int(limit_bytes)
         revision = int(revision)
         if limit_bytes < 0:
@@ -1257,6 +1289,13 @@ class KVCacheManager:
         if revision < 0:
             raise ValueError("revision must be non-negative")
 
+        # Validate before waiting, but keep the revision comparison and commit
+        # together under the lock after initialization has finished.
+        self._wait_post_init()
+        return self._set_memory_limit(limit_bytes, revision=revision)
+
+    @synchronized
+    def _set_memory_limit(self, limit_bytes: int, *, revision: int) -> Dict[str, Any]:
         current_revision = self._memory_limit_revision
         current_limit = self._memory_limit_bytes
         if revision < current_revision:
@@ -1518,6 +1557,7 @@ class KVCacheManager:
         return (counters, getattr(self, "_last_error_code", None),
                 getattr(self, "_last_error_timestamp_ns", None))
 
+    @_after_post_init
     @synchronized
     def clear(self):
         self._increment_operation_counter("clear_requests_total")

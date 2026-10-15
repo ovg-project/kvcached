@@ -91,7 +91,7 @@ def _make_manager(resize_return=False):
     manager.page_allocator = StubPageAllocator()
 
     freed = []
-    manager.free = lambda indices: freed.append(list(indices))
+    setattr(manager, "free", lambda indices: freed.append(list(indices)))
     return manager, freed
 
 
