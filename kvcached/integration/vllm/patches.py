@@ -673,6 +673,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger  # Capture logger in closure
 
+        native_kv_events = bool(
+            self.detected_version
+            and VersionRange(">=0.30.0,<0.31.0").contains(self.detected_version)
+        )
+
         class ElasticBlockPool(BlockPool):  # type: ignore
             """ElasticBlockPool that manages KVCacheBlocks using kvcached."""
 
@@ -696,8 +701,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
 
-                assert not enable_kv_cache_events, (
-                    "KV cache events are not supported in ElasticBlockPool")
+                if enable_kv_cache_events and not native_kv_events:
+                    raise KVCachedConfigError(
+                        "Elastic KV cache events require vLLM 0.30.x")
 
                 self.num_gpu_blocks = num_gpu_blocks
                 # Request.block_hashes are computed at hash_block_size, which
@@ -1890,6 +1896,9 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 return
 
         def _setup_kvcached_coordinator(self) -> None:
+            native_pool = getattr(self, "block_pool", None)
+            enable_kv_cache_events = bool(
+                getattr(native_pool, "enable_kv_cache_events", False))
             # vLLM 0.30 keeps the flag only on the native block pool.
             enable_caching = getattr(self, "enable_caching", None)
             if enable_caching is None:
@@ -1964,6 +1973,7 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 cell_size=cell_size,
                 num_layers=group_size,
                 enable_caching=enable_caching,
+                enable_kv_cache_events=enable_kv_cache_events,
                 num_kv_buffers=num_kv_buffers,
                 max_cached_blocks=_get_max_cached_blocks(
                     block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
