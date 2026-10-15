@@ -264,6 +264,43 @@ def test_changed_kvctl_target_after_an_api_limit_still_applies():
     assert not manager.in_shrink
 
 
+def test_deferred_kvctl_target_is_applied_again_until_it_completes():
+    manager = _manager(inuse_pages=9)
+    _kvctl_limit(manager, 4)
+    _allocate(manager)
+    assert manager.in_shrink
+
+    # The watcher keeps reporting 4 and every pass applies it again. That is
+    # what completes a shrink whose last in-use pages were freed by resize()
+    # itself (reserved blocks), where free() ran before in_shrink was set.
+    _allocate(manager)
+    assert manager.page_allocator.resize_calls == [4, 4]
+    assert manager.in_shrink
+
+    manager.page_allocator.inuse_pages = 3
+    _allocate(manager)
+
+    assert manager.page_allocator.resize_calls == [4, 4, 4]
+    assert manager.page_allocator.total_pages == 4
+    assert not manager.in_shrink
+
+
+def test_idle_pass_does_not_apply_the_kvctl_target_over_a_later_api_limit():
+    manager = _manager(inuse_pages=9)
+    page_bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 12)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == [12]
+
+    assert manager.set_memory_limit(page_bundle * 4, revision=1)["status"] == "deferred"
+    # The engine idle hooks call this as soon as the revision changes.
+    manager.apply_resize_target()
+
+    assert manager.page_allocator.resize_calls == [12, 4]
+    assert manager.in_shrink
+    assert manager.memory_limit_state()["status"] == "deferred"
+
+
 def test_limit_can_regrow_within_the_original_reservation():
     manager = _manager()
     page_bundle = manager._memory_limit_page_bundle_bytes()

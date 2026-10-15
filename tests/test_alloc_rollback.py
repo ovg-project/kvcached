@@ -625,7 +625,7 @@ def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatc
     assert not manager._retired_pages
 
 
-def test_published_quota_is_applied_once_until_clear(monkeypatch):
+def test_retained_quota_is_applied_until_a_later_resize(monkeypatch):
     manager = make_manager(fail_after=4)
     manager.reserve_null_block = False
     quota = 2 * BLOCKS_PER_PAGE
@@ -639,14 +639,48 @@ def test_published_quota_is_applied_once_until_clear(monkeypatch):
     monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: quota)
     assert manager.alloc(1) is not None
     assert manager.alloc(1) is not None
-    # The watcher keeps reporting the quota; allocations apply it once.
-    assert calls == [quota]
+    # The watcher keeps reporting the quota and every allocation applies it.
+    assert calls == [quota, quota]
+
+    # A later resize() is the latest published target; the quota stays out.
+    assert manager.resize(3 * BLOCKS_PER_PAGE)
+    assert manager.alloc(1) is not None
+    assert calls == [quota, quota, 3 * BLOCKS_PER_PAGE]
+
     for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim", "reset_free_page_order"):
         monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
     manager.clear()
-    # clear() dropped the pool state, so the quota is applied again.
+    # clear() publishes nothing, so the later resize() still wins.
     assert manager.alloc(1) is not None
-    assert calls == [quota, quota]
+    assert calls == [quota, quota, 3 * BLOCKS_PER_PAGE]
+
+
+def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
+    """shipiyouniao's probe on #558: with the reserved pages the only ones in
+    use, resize() refuses the quota, _resize() frees the reserved blocks and
+    only then enters the shrink, so that free() cannot complete it. The next
+    allocation applies the retained quota again and completes it."""
+    manager = make_manager(fail_after=4)
+    allocator = manager.page_allocator
+
+    def resize(new_mem_size):
+        # PageAllocator::resize's shrink rule: refuse below the pages in use.
+        inuse_pages = allocator.num_allocated - len(allocator.freed_pages)
+        return new_mem_size // BLOCKS_PER_PAGE >= inuse_pages
+
+    monkeypatch.setattr(allocator, "resize", resize, raising=False)
+    assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
+    assert len(manager.reserved_blocks) == 2 * BLOCKS_PER_PAGE
+
+    # kvctl publishes a one-page quota.
+    monkeypatch.setattr(allocator, "get_resize_target", lambda: BLOCKS_PER_PAGE)
+    assert manager.alloc(1) is None
+    assert manager.in_shrink
+    assert manager.reserved_blocks == []
+    assert allocator.freed_pages == [0, 1]
+
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
+    assert not manager.in_shrink
 
 
 @pytest.mark.parametrize("pending_shrink", [False, True])
