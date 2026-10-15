@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
+import operator
 import threading
 import time
 import weakref
@@ -155,6 +156,7 @@ class KVCacheManager:
                 Defaults to KVCACHED_PAGE_SIZE_MB.
         """
         self.num_blocks = num_blocks
+        self._virtual_num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -627,6 +629,158 @@ class KVCacheManager:
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
+
+    def alloc_exact(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        """Claim the requested free block IDs, in caller order, or return None.
+
+        This is an allocation, not a reference-count increment for live IDs.
+        Duplicates, null-block IDs, out-of-range IDs and blocks crossing a
+        physical-page boundary are rejected before a pool mutation. A miss
+        preserves existing allocations and reservations. Mapping-consistency
+        errors remain fatal. Integrations own any cross-pool transaction.
+        """
+        # Null-block initialization needs the manager lock before it can
+        # signal readiness. Never wait for it while holding that lock.
+        self.wait_ready()
+        return self._alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _alloc_exact_ready(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
+            self._increment_operation_counter("allocation_requests_total")
+        try:
+            result = self._alloc_exact_impl(block_ids)
+        except Exception:
+            if counters is not None:
+                self._record_operation_error(
+                    "allocation_failed", "allocation_errors_total",
+                    failure_counter="allocation_failures_total")
+            raise
+        if counters is not None:
+            if result is None:
+                self._increment_operation_counter("allocation_failures_total")
+                self._increment_operation_counter("capacity_exhausted_total")
+            else:
+                self._increment_operation_counter("allocation_successes_total")
+                self._increment_operation_counter("allocated_blocks_total", len(result))
+        return result
+
+    def _alloc_exact_impl(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        requested: List[int] = []
+        for value in block_ids:
+            if isinstance(value, bool):
+                raise TypeError("Exact block IDs must be integers, not bool")
+            requested.append(operator.index(value))
+        if len(set(requested)) != len(requested):
+            raise ValueError("Exact block IDs must be unique")
+        grouped: Dict[int, List[int]] = {}
+        for block_id in requested:
+            if block_id < 0 or block_id >= self._virtual_num_blocks:
+                raise ValueError("Exact block ID exceeds the pool's virtual backing")
+            if self.reserve_null_block and block_id == 0:
+                raise ValueError("The null block cannot be allocated explicitly")
+            page_id = block_id * self.block_mem_size // self.page_size
+            start, end = InternalPage.get_block_range(
+                page_id, self.page_size, self.block_mem_size)
+            if not start <= block_id < end:
+                raise ValueError("Exact block crosses a physical-page boundary")
+            grouped.setdefault(page_id, []).append(block_id)
+        if not requested:
+            return []
+
+        self._apply_resize_target()
+        if self.available_size() < len(requested):
+            return None
+
+        reserved = set(self.reserved_blocks)
+        shrinking = getattr(self, "in_shrink", False)
+        retiring = self._retiring_page_ids() if shrinking else frozenset()
+        # Check every existing page before mapping or claiming any new page.
+        for page_id, ids in grouped.items():
+            page = self.full_pages.get(page_id) or self.avail_pages.get(page_id)
+            if shrinking and (page_id in retiring or page is None):
+                return None
+            if page is not None:
+                free = set(page.get_free_blocks())
+                if any(i not in free and i not in reserved for i in ids):
+                    return None
+
+        # Sparse IDs can need one new physical page per requested block.
+        # The packed-block capacity estimate above is not sufficient for them.
+        needed_pages = sum(
+            page_id not in self.full_pages and page_id not in self.avail_pages
+            for page_id in grouped
+        )
+        if needed_pages > (self._get_cached_avail_physical_pages()
+                           + self.page_allocator.get_num_reserved_pages()):
+            return None
+
+        created: List[int] = []
+        for page_id in grouped:
+            if page_id in self.full_pages or page_id in self.avail_pages:
+                continue
+            try:
+                page = self.page_allocator.try_alloc_page_at(page_id)
+            except StateConsistencyError as exc:
+                self._increment_operation_counter("manager_page_allocation_failures_total")
+                self._lifecycle.mark_failed("exact allocation mapping is unsafe", exc)
+                raise
+            except RuntimeError as exc:
+                self._increment_operation_counter("manager_page_allocation_failures_total")
+                if self._record_native_fatal("alloc_exact", exc):
+                    raise
+                self._release_unclaimed_exact_pages(created)
+                return None
+            if page is None:
+                self._release_unclaimed_exact_pages(created)
+                return None
+            self._avail_physical_pages_cache = None
+            self._increment_operation_counter("manager_page_allocations_total")
+            page.init(self.block_mem_size)
+            self.avail_pages[page_id] = page
+            self.num_avail_blocks += page.num_free_blocks()
+            created.append(page_id)
+
+        # The manager lock and per-page preflight make these claims exclusive.
+        for page_id, ids in grouped.items():
+            page = self.full_pages.get(page_id) or self.avail_pages[page_id]
+            fresh = [i for i in ids if i not in reserved]
+            if not page.alloc_exact(fresh):
+                claim_error = StateConsistencyError("Exact block preflight and claim disagree")
+                self._lifecycle.mark_failed("exact allocation ledger is unsafe", claim_error)
+                raise claim_error
+            self.num_avail_blocks -= len(fresh)
+            if page.full():
+                self.avail_pages.pop(page_id, None)
+                self.full_pages[page_id] = page
+            else:
+                self.avail_pages[page_id] = page
+            # An empty retired page has become live again, as in alloc().
+            self._retired_pages = [
+                (epoch, remaining)
+                for epoch, pages in self._retired_pages
+                if (remaining := [pid for pid in pages if pid != page_id])
+            ]
+        claimed = set(requested)
+        self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
+        return requested
+
+    def _release_unclaimed_exact_pages(self, page_ids: List[int]) -> None:
+        if not page_ids:
+            return
+        # These pages have never handed a block to the caller. Existing pages
+        # and their deferred-release epochs are untouched by this rollback.
+        try:
+            self.page_allocator.free_pages(page_ids)
+        except Exception as exc:
+            self._record_native_fatal("alloc_exact rollback", exc)
+            raise
+        for page_id in page_ids:
+            page = self.avail_pages.pop(page_id)
+            self.num_avail_blocks -= page.num_free_blocks()
+        self._avail_physical_pages_cache = None
+        self._increment_operation_counter("manager_page_releases_total", len(page_ids))
 
     def alloc_packed(self, need_size: int) -> Optional[List[int]]:
         """Allocate by draining the smallest existing holes first.
