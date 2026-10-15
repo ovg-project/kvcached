@@ -1,0 +1,8 @@
+{
+  "task": "Preserve typed recoverable allocation misses when physical capacity changes after a scheduler precheck. Keep unrelated ValueError, invalid input, and fatal CUDA errors fatal. Preserve native block ownership and copy lifetimes. Do not add a retry policy, global lock or allocator redesign.",
+  "allow": ["kvcached/integration/vllm/patches.py", "tests/test_vllm_pool_exhaustion.py", "tests/test_vllm_native_block_lifetimes.py"],
+  "cpu_tests": ["tests/test_vllm_pool_exhaustion.py", "tests/test_vllm_native_block_lifetimes.py"],
+  "gpu_tests": ["tests/test_vllm_native_block_pool.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.29"]
+}
