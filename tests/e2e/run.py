@@ -128,6 +128,10 @@ class Container:
                      "-v", f"{out_dir}:{OUT_IN_CONTAINER}", "-e", "HF_TOKEN",
                      "--entrypoint", "sleep", engine.image, "infinity"], check=True)
 
+    def host_gpu(self, i: int) -> str:
+        """Host index of the run's i-th GPU, which the container sees as i."""
+        return str(i) if self.gpus == "all" else self.gpus.split(",")[i]
+
     def exec(self, script: str, timeout: Optional[float] = None,
              input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
         flags = ["-i"] if input_bytes is not None else []
@@ -361,13 +365,15 @@ def case_setup(case: Case) -> dict[str, Any]:
 
 
 def launch(ct: Container, case: Case, run_id: str, port: int,
-           extra_args: tuple[str, ...] = ()) -> Server:
+           extra_args: tuple[str, ...] = (),
+           extra_env: Optional[dict[str, str]] = None) -> Server:
     model = MODELS[case.model]
     case_dir = ct.out_dir / case.name
     case_dir.mkdir(parents=True, exist_ok=True)
 
     ipc = ipc_name(case.name, run_id)
     env = server_env(case, ipc)
+    env.update(extra_env or {})
     argv = server_argv(case.engine, model.hf_id, case.args() + extra_args, port)
     cmd = " ".join(f"{k}={v}" for k, v in env.items()) + " " + shlex.join(argv)
     (case_dir / "cmd.txt").write_text(cmd + "\n")
