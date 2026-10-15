@@ -1263,7 +1263,7 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
     manager.pp_rank = 0
     manager.group_id = 0
     manager._post_init_done.clear()
-    entered_init, entered_free, release_init = (threading.Event() for _ in range(3))
+    entered_init, entered_wait, release_init = (threading.Event() for _ in range(3))
     init_error = RuntimeError("injected initialization failure")
     free_error = RuntimeError("independent foreground free failure")
     init_globals = getattr(KVCacheManager._post_init, "__globals__")
@@ -1276,19 +1276,25 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
         raise init_error
 
     def free(*args, **kwargs):
-        entered_free.set()
         manager._wait_post_init()
         raise free_error
 
+    event_wait = manager._post_init_done.wait
+
+    def wait(timeout=None):
+        entered_wait.set()
+        return event_wait(timeout)
+
     monkeypatch.setattr(manager, "_reserve_null_block", reserve)
     monkeypatch.setattr(manager, "_free", free)
+    monkeypatch.setattr(manager._post_init_done, "wait", wait)
     with ThreadPoolExecutor(max_workers=2) as executor:
         initializing = executor.submit(manager._post_init)
         assert entered_init.wait(5)
         freeing = executor.submit(manager.free, [])
         try:
-            assert entered_free.wait(5)
-            assert manager.operation_snapshot_dict()["free_requests_total"] == 1
+            assert entered_wait.wait(5)
+            assert not freeing.done()
         finally:
             release_init.set()
         for future, expected in ((initializing, init_error), (freeing, free_error)):
@@ -1296,6 +1302,7 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
                 future.result(timeout=5)
             assert raised.value is expected
     data = manager.operation_snapshot_dict()
+    assert data["free_requests_total"] == 1
     assert data["operation_errors_total"] == 2
     assert data["post_init_errors_total"] == data["free_errors_total"] == 1
     assert data["free_failures_total"] == 1

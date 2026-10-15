@@ -78,6 +78,24 @@ ownership fields merely to make production cleanup pass.
 
 ## CPU regression matrix
 
+### Initialization lock order
+
+Foreground allocation and mutation entry points wait for initial pool setup
+before acquiring the manager lock. The initialization thread may enter its own
+guarded operations, including applying a resize target during null-block
+reservation. Keep the completion event unset until setup completes or exits;
+the existing `wait_ready()` API propagates captured initialization errors.
+
+`tests/test_init_lock_order.py` runs the real Python manager constructor and
+SGLang manager factory against CPU VMM stand-ins. It covers early operations,
+physical backing recovery, initializer resize, multiple waiters, serialized
+revision updates, and fatal initialization. Thread stacks are diagnostic
+evidence; the assertions require operations to complete, preserve the null
+block, and retain error and accounting contracts. This is controlled CPU
+validation, not a real engine/GPU startup reproduction.
+
+### Segment ownership and shutdown
+
 Tests live in `tests/test_vllm_engine_core_shutdown.py`, already in the CPU CI
 manifest. Existing tests and the new lifecycle matrix are both required.
 
