@@ -6,8 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.kv_geometry import check_page_geometry
 from kvcached.observability import (
+    RuntimeReservationSnapshot,
     build_runtime_snapshot,
     get_registered_kv_cache_pool_operation_snapshot_dicts,
     get_registered_kv_cache_pool_operation_snapshots,
@@ -26,6 +29,7 @@ from kvcached.tp_ipc_util import (
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     PAGE_SIZE,
+    KVCachedConfigError,
     get_kvcached_logger,
     get_page_size_for_block,
     normalize_gpu_device,
@@ -89,6 +93,7 @@ def shutdown_kvcached() -> bool:
     global _kvcached_initialized, _kvcached_device, _async_sched
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
+        runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
         return True
 
     if not stop_worker_listener_threads():
@@ -96,10 +101,47 @@ def shutdown_kvcached() -> bool:
         return False
     _shutdown_kvcached_impl()
     clear_registered_kv_cache_pools(integration="sglang")
+    runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
     return True
+
+
+def register_runtime_owned_reservation(
+    device: str, pool_name: str, num_bytes: int, *, owner: Any,
+) -> None:
+    """Report live runtime-owned bytes; registration does not resize KV pools."""
+    runtime_reservations.register_runtime_owned_reservation(
+        device, pool_name, num_bytes, owner=owner, integration="sglang")
+
+
+def get_runtime_owned_reservation_breakdown(device: str) -> Dict[str, int]:
+    """Return reported runtime bytes by pool category for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_breakdown(
+        device, integration="sglang")
+
+
+def get_runtime_owned_reservation_bytes(device: str) -> int:
+    """Return reported runtime bytes on one device for this integration."""
+    return runtime_reservations.get_runtime_owned_reservation_bytes(
+        device, integration="sglang")
+
+
+def runtime_reservation_snapshots(
+    device: Optional[str] = None,
+) -> List[RuntimeReservationSnapshot]:
+    """Return immutable runtime reservation reports for this integration."""
+    return runtime_reservations.get_runtime_reservation_snapshots(
+        integration="sglang", device=device)
+
+
+def runtime_reservation_snapshot_dicts(
+    device: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return JSON-serializable runtime reservation reports."""
+    return runtime_reservations.get_runtime_reservation_snapshot_dicts(
+        integration="sglang", device=device)
 
 
 def observability_snapshot():
@@ -185,6 +227,8 @@ def alloc_kv_cache(
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    if ":" not in device:
+        device = f"{device}:{resolve_gpu_device_index(device)}"
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
@@ -193,6 +237,18 @@ def alloc_kv_cache(
     physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
 
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    # This adapter accounts only for the DeepSeek-V4 pools it recognizes.
+    # Other shared reports may already be included by the engine profiler.
+    runtime_reserved_bytes = sum(
+        num_bytes for pool_name, num_bytes in get_runtime_owned_reservation_breakdown(device).items()
+        if pool_name.startswith("dsv4.")
+    )
+    if runtime_reserved_bytes:
+        gpu_mem_bytes = max(0, gpu_mem_bytes - runtime_reserved_bytes)
+        logger.info(
+            "Reserved %.2f GB for runtime-owned DeepSeek-V4 pools on %s; "
+            "remaining kvcached backing budget is %.2f GB",
+            runtime_reserved_bytes / (1024**3), device, gpu_mem_bytes / (1024**3))
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * physical_page_size for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
@@ -263,6 +319,67 @@ def alloc_kv_cache(
             v_tensors.append(contiguous_tensor[:, i, 1, :, :])
 
     return k_tensors, v_tensors
+
+
+def alloc_dsv4_swa_cache(
+    *,
+    num_pages: int,
+    bytes_per_page: int,
+    num_layers: int,
+    device: str,
+    group_id: int,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Create per-layer VMM buffers for DeepSeek-V4 SWA KV."""
+    if not _kvcached_initialized:
+        raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+    if _contiguous_layout:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling requires KVCACHED_CONTIGUOUS_LAYOUT=false"
+        )
+    if num_pages <= 0 or bytes_per_page <= 0 or num_layers <= 0:
+        raise ValueError(
+            "DeepSeek-V4 SWA dimensions must be positive: "
+            f"num_pages={num_pages}, bytes_per_page={bytes_per_page}, "
+            f"num_layers={num_layers}"
+        )
+
+    device = normalize_gpu_device(device)
+    page_size = get_page_size_for_block(bytes_per_page, PAGE_SIZE)
+    geometry_error = check_page_geometry(bytes_per_page, page_size, 1)
+    if geometry_error is not None:
+        raise KVCachedConfigError(geometry_error)
+    visible_bytes = num_pages * bytes_per_page
+    if visible_bytes < page_size:
+        raise ValueError(
+            "DeepSeek-V4 SWA pool must span at least one physical page to "
+            "reserve its null block: "
+            f"pool_bytes={visible_bytes}, page_bytes={page_size}. "
+            "Increase the SWA cache size or reduce KVCACHED_PAGE_SIZE_MB."
+        )
+    per_layer_bytes = ((visible_bytes + page_size - 1) // page_size) * page_size
+    raw_tensors = create_kv_tensors(
+        per_layer_bytes,
+        torch.uint8.itemsize,
+        device,
+        num_layers,
+        num_kv_buffers=1,
+        group_id=group_id,
+        unified_pool=True,
+        page_size=page_size,
+    )
+    if len(raw_tensors) != num_layers:
+        raise RuntimeError(
+            "DeepSeek-V4 SWA pooling expected one VMM tensor per layer, "
+            f"got {len(raw_tensors)} for {num_layers} layers"
+        )
+
+    buffers = [
+        tensor.view(dtype=torch.uint8)[:visible_bytes].view(num_pages, bytes_per_page)
+        for tensor in raw_tensors
+    ]
+    if not all(buffer.is_contiguous() for buffer in buffers):
+        raise RuntimeError("DeepSeek-V4 SWA VMM buffers are not contiguous")
+    return buffers, raw_tensors
 
 
 def alloc_mamba_states(
