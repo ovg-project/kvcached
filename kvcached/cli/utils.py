@@ -59,21 +59,23 @@ class RwLockedShm:
 
     def __init__(self, file_path: str, size: int, lock_type: int, *, retain_usage: bool = False, create: bool = True):
         self.file_path = get_ipc_path(file_path)
-        # Always use r+b mode for memory mapping
-        self.mode = "r+b"
+        # Readers open read-only so a segment owned by another user (e.g. root
+        # in a container sharing /dev/shm) stays readable; flock(LOCK_SH)
+        # works on a read-only fd.
+        self.mode = "rb" if lock_type == self.RLOCK else "r+b"
         self.size = size
         self.lock_type = lock_type
         self.retain_usage = retain_usage
         self.create = create
 
     def __enter__(self):
-        flags = os.O_RDWR | os.O_CLOEXEC
+        flags = (os.O_RDONLY if self.mode == "rb" else os.O_RDWR) | os.O_CLOEXEC
         if self.lock_type == self.WLOCK and self.create:
             flags |= os.O_CREAT
         if self.retain_usage:
             flags |= getattr(os, "O_NOFOLLOW", 0)
         for _ in range(4):
-            self.file = os.fdopen(os.open(self.file_path, flags, 0o666), "r+b")
+            self.file = os.fdopen(os.open(self.file_path, flags, 0o666), self.mode)
             try:
                 if self.retain_usage and sys.platform.startswith("linux"):
                     control_segment.lock(self.file.fileno())
