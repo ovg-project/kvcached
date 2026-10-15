@@ -64,3 +64,5 @@ pressure or the cache cap evicts entries, and a clear event after a successful
 cache reset, including when prefix caching is disabled. Events retain native
 group, hash and session metadata. Their order
 follows cache mutations; enabling events does not change cache retention limits.
+Idle limit changes and successful resets are published without waiting for
+another request.

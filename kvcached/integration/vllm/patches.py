@@ -86,6 +86,25 @@ def _get_vllm_kv_cache_manager(engine_core: Any) -> Any:
     return getattr(block_pool, "kv_cache_manager", None)
 
 
+def _publish_kv_cache_events_if_idle(engine_core: Any) -> None:
+    """Publish control-path cache mutations without waiting for model output."""
+    scheduler = engine_core.scheduler
+    manager = scheduler.kv_cache_manager
+    if not getattr(manager.block_pool, "enable_kv_cache_events", False):
+        return
+    # Preserve the native output boundary while requests or queued batches can
+    # still mutate cache state. Callers run on the engine thread, not the watcher.
+    if scheduler.has_requests() or _batch_queue_size(getattr(engine_core, "batch_queue", None)):
+        return
+    from vllm.distributed.kv_events import KVEventBatch
+
+    # The native manager annotates group/spec metadata before events reach the
+    # native publisher (which also supplies data-parallel rank metadata).
+    events = manager.take_events()
+    if events:
+        scheduler.kv_event_publisher.publish(KVEventBatch(ts=time.time(), events=events))
+
+
 def _is_attention_spec(spec: Any) -> bool:
     """Check if a KV cache spec is an attention-type spec.
 
@@ -1384,6 +1403,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 manager.apply_resize_target()
                 manager.reclaim_for_shrink()
                 _release_retired_pages_if_idle(engine_core, manager)
+                _publish_kv_cache_events_if_idle(engine_core)
 
             stop = threading.Event()
 
@@ -1456,6 +1476,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     # Idle control operations have no subsequent batch step to
                     # drain retirements. Busy engines drain at the next step.
                     _release_retired_pages_if_idle(self, manager)
+                    _publish_kv_cache_events_if_idle(self)
                 return result
 
             self._mark_as_patched(_patched_reset_prefix_cache, "async_batch_lifetime")

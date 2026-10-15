@@ -421,18 +421,31 @@ def test_unpublished_kvctl_limit_is_a_no_op(pool):
 
 
 @pytest.mark.parametrize("source", ["kvctl", "kvctl_during_startup", "set_memory_limit"])
-def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source):
+@pytest.mark.parametrize("events_enabled", [False, True])
+def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source, events_enabled):
     """An idle engine never allocates, so the limit watch wakes it and the
     engine thread evicts and drains the retired pages."""
     from kvcached.integration.vllm import patches
 
     wakeup = object()
+    event = object()
+    published: List[SimpleNamespace] = []
+    event_threads = []
+    pool.enable_kv_cache_events = events_enabled
+
+    def take_events():
+        event_threads.append(threading.current_thread().name)
+        return [event]
+
     engine_mod = types.ModuleType("vllm.v1.engine")
     engine_mod.EngineCoreRequestType = SimpleNamespace(WAKEUP=wakeup)  # type: ignore[attr-defined]
+    events_mod = types.ModuleType("vllm.distributed.kv_events")
+    events_mod.KVEventBatch = SimpleNamespace  # type: ignore[attr-defined]
     for name, module in (
         ("vllm", types.ModuleType("vllm")),
         ("vllm.v1", types.ModuleType("vllm.v1")),
         ("vllm.v1.engine", engine_mod),
+        ("vllm.distributed.kv_events", events_mod),
     ):
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
@@ -444,7 +457,11 @@ def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source):
             # An idle async engine: nothing left in its batch queue.
             self.batch_queue: queue.Queue = queue.Queue()
             self.model_executor = SimpleNamespace(collective_rpc=lambda method, args: [True])
-            self.scheduler = SimpleNamespace(kv_cache_manager=SimpleNamespace(block_pool=pool))
+            self.scheduler = SimpleNamespace(
+                kv_cache_manager=SimpleNamespace(block_pool=pool, take_events=take_events),
+                has_requests=lambda: False,
+                kv_event_publisher=SimpleNamespace(publish=published.append),
+            )
             self._idle_state_callbacks: list = []
             self.input_queue: queue.Queue = queue.Queue()
 
@@ -484,6 +501,8 @@ def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source):
 
     assert set(threads) == {threading.current_thread().name}
     _assert_within_limit(pool)
+    assert event_threads == ([threading.current_thread().name] if events_enabled else [])
+    assert [batch.events for batch in published] == ([[event]] if events_enabled else [])
 
 
 class FakeSGLangCache:
