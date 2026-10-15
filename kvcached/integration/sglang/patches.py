@@ -3394,9 +3394,15 @@ def _sglang_evict_params_cls() -> Optional[Callable[..., Any]]:
     return EvictParams
 
 
-def _evict_prefix_cache(cache: Any, num_tokens: int) -> None:
+def _evict_prefix_cache(cache: Any, num_tokens: int, *, component: str = "full") -> None:
     """Evict about ``num_tokens`` cached tokens, preferring whole pages."""
     evict_params_cls = _sglang_evict_params_cls()
+    if component == "swa":
+        # SWA can be evicted independently while the full prefix is locked.
+        # Older integer-only eviction APIs cannot express this request.
+        if evict_params_cls is not None:
+            cache.evict(evict_params_cls(num_tokens=0, swa_num_tokens=num_tokens))
+        return
     try:
         from sglang.srt.mem_cache.radix_cache import RadixCache
     except ImportError:
@@ -3427,30 +3433,39 @@ class _PrefixCacheShrinkReclaimer:
     def __init__(self, scheduler: Any, manager: Any) -> None:
         self._scheduler = weakref.ref(scheduler)
         self.manager = manager
+        allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+        self.components = tuple(
+            component for component in ("full", "swa")
+            if any(manager is candidate for candidate in
+                   _token_kv_managers(allocator, component=component)))
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
     def reclaim(self) -> None:
         cache = getattr(self._scheduler(), "tree_cache", None)
-        evictable = getattr(cache, "full_evictable_size", None) or getattr(
-            cache, "evictable_size", None)
-        if not callable(evictable):
-            return
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
         allocator = getattr(cache, "token_to_kv_pool_allocator", None)
-        excess = manager.shrink_excess_pages()
-        while excess > 0:
-            before = evictable()
-            if before <= 0:
-                return
-            _evict_prefix_cache(cache, excess * tokens_per_page)
-            if evictable() >= before or _frees_are_deferred(allocator):
-                # Nothing evicted, or the frees wait for the free group to
-                # end: the next allocation or idle pass continues.
-                return
+        for component in self.components:
+            evictable = getattr(cache, component + "_evictable_size", None)
+            if component == "full" and not callable(evictable):
+                evictable = getattr(cache, "evictable_size", None)
+            if not callable(evictable):
+                continue
             excess = manager.shrink_excess_pages()
+            while excess > 0:
+                before = evictable()
+                if before <= 0:
+                    break
+                _evict_prefix_cache(cache, excess * tokens_per_page, component=component)
+                if _frees_are_deferred(allocator):
+                    # The next allocation or idle pass continues after the
+                    # native free group releases its references.
+                    return
+                if evictable() >= before:
+                    break
+                excess = manager.shrink_excess_pages()
 
 
 def _sglang_parallel_size(scheduler: Any) -> int:
@@ -3459,7 +3474,7 @@ def _sglang_parallel_size(scheduler: Any) -> int:
             * int(getattr(ps, "pp_size", 1) or 1))
 
 
-def _token_kv_managers(allocator: Any) -> List[Any]:
+def _token_kv_managers(allocator: Any, *, component: Optional[str] = None) -> List[Any]:
     """kvcached managers behind the scheduler's token KV allocator.
 
     Only token KV pools: SGLang allocates those while preparing a batch,
@@ -3471,16 +3486,26 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
     # separate device-cache allocator remains owned by native SGLang.
     allocator = getattr(allocator, "logical_attn_allocator", allocator)
     managers: List[Any] = []
-    for alloc in (allocator, getattr(allocator, "full_attn_allocator", None),
-                  getattr(allocator, "swa_attn_allocator", None)):
+    for alloc, owner in (
+            (allocator, "full"),
+            (getattr(allocator, "full_attn_allocator", None), "full"),
+            (getattr(allocator, "swa_attn_allocator", None), "swa")):
+        if component is not None and component != owner:
+            continue
         manager = getattr(alloc, "kvcached_allocator", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)
-    backings = [getattr(allocator, name, None) for name in (
-        "_kvcached_dsv4_backing", "_kvcached_dsv4_full_backing")]
-    backings.extend(getattr(allocator, "_kvcached_dsv4_full_backings", ()))
-    backings.extend(getattr(allocator, "_kvcached_dsv4_swa_backings", ()))
-    for backing in backings:
+    backings = [
+        (getattr(allocator, "_kvcached_dsv4_backing", None), "swa"),
+        (getattr(allocator, "_kvcached_dsv4_full_backing", None), "full"),
+    ]
+    backings.extend((backing, "full") for backing in
+                    getattr(allocator, "_kvcached_dsv4_full_backings", ()))
+    backings.extend((backing, "swa") for backing in
+                    getattr(allocator, "_kvcached_dsv4_swa_backings", ()))
+    for backing, owner in backings:
+        if component is not None and component != owner:
+            continue
         manager = getattr(backing, "manager", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)

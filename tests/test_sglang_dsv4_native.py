@@ -567,6 +567,9 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert req.kv.req_pool_idx is None and not owner.active
             req_pool.clear()
 
+        if compress_ratio == 4 and not fp4 and not with_state:
+            _check_native_swa_component_shrink(monkeypatch, target)
+
         draft_owner = weakref.ref(draft.token_to_kv_pool)
         del draft
         gc.collect()
@@ -581,3 +584,76 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         for state in [*state_pools, *request_state_pools]:
             assert state._kvcached_dsv4_backing.manager.shutdown()
         assert interfaces.shutdown_kvcached()
+
+
+def _check_native_swa_component_shrink(monkeypatch, runner):
+    """A real unified cache can release SWA while its FULL prefix stays locked."""
+    import torch
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        EvictParams,
+        InsertParams,
+        MatchPrefixParams,
+    )
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    from kvcached.integration.sglang import patches
+
+    allocator = runner.token_to_kv_pool_allocator
+    backing = allocator._kvcached_dsv4_backing
+    manager = backing.manager
+    page = allocator.page_size
+    # Span multiple physical pages, retaining just the final native page as
+    # the active SWA window. No model weights or kernels are involved.
+    num_pages = 3 * manager.page_size // backing.native_page_bytes + 2
+    num_tokens = num_pages * page
+    assert num_tokens <= allocator.swa_available_size()
+    monkeypatch.setenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
+    cache = UnifiedRadixCache(CacheInitParams(
+        disable=False, req_to_token_pool=runner.req_to_token_pool,
+        token_to_kv_pool_allocator=allocator, page_size=page,
+        sliding_window_size=page, tree_components=(ComponentType.FULL, ComponentType.SWA),
+    ))
+    prefix = torch.zeros(1, dtype=torch.int64, device="cuda")
+    seq = torch.full_like(prefix, num_tokens)
+    last = torch.full_like(prefix, -1)
+    values = allocator.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, num_tokens)
+    assert values is not None
+    tokens = list(range(num_tokens))
+    cache.insert(InsertParams(key=RadixKey(tokens), value=values))
+    # Split off an internal old-window prefix before taking the active lock.
+    cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens[:-page])))
+    node = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
+    receipt = cache.inc_lock_ref(node)
+    assert cache.full_evictable_size() == 0
+    assert cache.swa_evictable_size() >= num_tokens - page
+    full_available = allocator.full_available_size()
+    occupied = len(manager.full_pages) + len(manager.avail_pages)
+    assert occupied >= 3
+
+    class Scheduler:
+        def __init__(self):
+            self.tree_cache = cache
+            self.token_to_kv_pool_allocator = allocator
+            self.ps = types.SimpleNamespace(tp_size=1, pp_size=1)
+
+    scheduler = Scheduler()
+    patches._register_shrink_reclaimers(scheduler)
+    revision = manager.memory_limit_state()["revision"] + 1
+    original_bytes = manager.mem_size * manager.num_layers * manager.num_kv_buffers
+    manager.set_memory_limit((occupied - 1) * manager.page_size, revision=revision)
+    try:
+        patches._apply_kvcached_limits_on_idle(scheduler)
+        assert manager.memory_limit_state()["status"] == "applied"
+        assert len(manager.full_pages) + len(manager.avail_pages) < occupied
+        assert cache.full_evictable_size() == 0
+        assert allocator.full_available_size() == full_available
+        assert backing.live  # The active last window is still backed.
+        assert not backing.permanent_pages.isdisjoint(manager.full_pages.keys() | manager.avail_pages.keys())
+    finally:
+        cache.dec_lock_ref(node, receipt.to_dec_params())
+        cache.evict(EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens))
+        manager.set_memory_limit(original_bytes, revision=revision + 1)
+        manager.apply_resize_target()
