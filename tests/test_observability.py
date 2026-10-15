@@ -4,6 +4,7 @@
 import gc
 import importlib.util
 import json
+import math
 import os
 import sys
 import threading
@@ -15,6 +16,7 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
 from kvcached.errors import StateConsistencyError  # noqa: E402
+from kvcached.kv_geometry import backing_blocks_for_capacity  # noqa: E402
 from kvcached.observability import (  # noqa: E402
     KVCachePoolOperationSnapshot,
     KVCachePoolSnapshot,
@@ -109,6 +111,43 @@ class FakeManager:
         pass
 
 
+def _load_manager_module(monkeypatch, name, *, internal_page, page_allocator):
+    """Load ``kvcached.kv_cache_manager`` over pure-Python allocator fakes.
+
+    The compiled extension, the TP broadcast and the vLLM worker-IPC probe
+    are stubbed, so a real ``KVCacheManager`` can run its allocation
+    accounting on a CPU runner.
+    """
+    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
+    setattr(vmm_ops_module, "InternalPage", internal_page)
+    setattr(vmm_ops_module, "PageAllocator", page_allocator)
+    setattr(vmm_ops_module, "kv_tensors_created", lambda group_id=0: True)
+
+    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
+    setattr(tp_ipc_module, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
+
+    vllm_interfaces_module = types.ModuleType("kvcached.integration.vllm.interfaces")
+    setattr(vllm_interfaces_module, "should_use_worker_ipc", lambda: False)
+
+    import kvcached
+
+    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
+    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "kvcached.integration.vllm.interfaces",
+        vllm_interfaces_module,
+    )
+
+    module_path = Path(__file__).parents[1] / "kvcached" / "kv_cache_manager.py"
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    assert spec is not None and spec.loader is not None
+    manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manager_module)
+    return manager_module
+
+
 def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatch):
     class FakeInternalPage:
         page_id = 0
@@ -187,33 +226,12 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
         def get_num_reserved_pages(self):
             return 0
 
-    vmm_ops_module = types.ModuleType("kvcached.vmm_ops")
-    setattr(vmm_ops_module, "InternalPage", FakeInternalPage)
-    setattr(vmm_ops_module, "PageAllocator", FakeOperationPageAllocator)
-    setattr(vmm_ops_module, "kv_tensors_created", lambda group_id=0: True)
-
-    tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
-    setattr(tp_ipc_module, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
-
-    vllm_interfaces_module = types.ModuleType("kvcached.integration.vllm.interfaces")
-    setattr(vllm_interfaces_module, "should_use_worker_ipc", lambda: False)
-
-    import kvcached
-
-    monkeypatch.setattr(kvcached, "vmm_ops", vmm_ops_module, raising=False)
-    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops_module)
-    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", tp_ipc_module)
-    monkeypatch.setitem(
-        sys.modules,
-        "kvcached.integration.vllm.interfaces",
-        vllm_interfaces_module,
+    manager_module = _load_manager_module(
+        monkeypatch,
+        "_test_operation_manager",
+        internal_page=FakeInternalPage,
+        page_allocator=FakeOperationPageAllocator,
     )
-
-    module_path = Path(__file__).parents[1] / "kvcached" / "kv_cache_manager.py"
-    spec = importlib.util.spec_from_file_location("_test_operation_manager", module_path)
-    assert spec is not None and spec.loader is not None
-    manager_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(manager_module)
 
     manager = manager_module.KVCacheManager(
         num_blocks=8,
@@ -522,6 +540,202 @@ def test_pool_snapshot_clamps_negative_block_gauges():
     assert data["available_bytes"] == 0
     assert data["allocated_blocks"] == 0
     assert data["allocated_bytes"] == 0
+
+
+def test_pool_snapshot_reports_logical_capacity_beside_the_backing_extent():
+    """jeff3071's #530 geometry: an SGLang MLA pool of size 1024 at page_size
+    64 asks for 17 logical blocks and, with 2 MiB physical pages, is backed
+    by 29 so that whole blocks still fit after page rounding. Once the null
+    block is reserved the snapshot reports 16 available, counted against the
+    17, while total_blocks keeps reporting the backing extent."""
+
+    class MLAManager(FakeManager):
+        num_blocks = 29
+        logical_num_blocks = 17
+        mem_size = num_blocks * FakeManager.block_mem_size
+        reserved_blocks = []
+
+        def available_size(self):
+            return 16
+
+        def _get_num_alloced_blocks(self):
+            return 1
+
+    data = build_kv_cache_pool_snapshot(MLAManager(), integration="sglang").to_dict()
+
+    assert data["total_blocks"] == 29
+    assert data["logical_blocks"] == 17
+    assert data["allocated_blocks"] == 1
+    assert data["available_blocks"] == 16
+    assert data["available_blocks"] == data["logical_blocks"] - data["allocated_blocks"]
+    assert data["virtual_per_layer_bytes"] == 29 * 4096 * 2
+    json.dumps(data)
+
+
+def test_pool_snapshot_logical_capacity_equals_the_backing_extent_without_a_limit():
+    """vLLM and the SGLang MHA pools size num_blocks to the capacity they
+    asked for, so the manager keeps logical_num_blocks unset and the two
+    fields agree. A manager-like without the attribute reads the same."""
+
+    class UnlimitedManager(FakeManager):
+        logical_num_blocks = None
+
+    for manager in (FakeManager(), UnlimitedManager()):
+        data = build_kv_cache_pool_snapshot(manager).to_dict()
+
+        assert data["logical_blocks"] == data["total_blocks"] == 128
+
+
+def test_manager_snapshot_counts_available_blocks_against_logical_capacity(monkeypatch):
+    """The same geometry through KVCacheManager's own accounting.
+
+    The shim's sizing rule gives 17 logical and 29 backing blocks, one 2 MiB
+    page holds 28 of them, and after the null block the page could still
+    hand out 27. The snapshot must report what alloc() will honor: 16, and
+    then 0 once the logical capacity is allocated while backing-only room
+    remains.
+    """
+    page_size = 2 * 1024 * 1024
+    token_page_size = 64
+    cell_size = (512 + 64) * 2  # kv_lora_rank + qk_rope_head_dim, bf16
+    block_mem_size = token_page_size * cell_size
+    logical_num_blocks = math.ceil(1024 / token_page_size) + 1
+    num_blocks = backing_blocks_for_capacity(logical_num_blocks, block_mem_size, page_size)
+    assert (logical_num_blocks, num_blocks) == (17, 29)
+    assert page_size // block_mem_size == 28
+
+    class FakeInternalPage:
+        def __init__(self, page_id):
+            self.page_id = page_id
+            self.free_indices: list[int] = []
+            self.capacity = 0
+
+        @staticmethod
+        def get_num_blocks(page_size, block_mem_size):
+            return page_size // block_mem_size
+
+        @staticmethod
+        def get_block_range(page_id, page_size, block_mem_size):
+            start = (page_id * page_size + block_mem_size - 1) // block_mem_size
+            end = (page_id + 1) * page_size // block_mem_size
+            return start, end
+
+        def init(self, block_mem_size):
+            start, end = self.get_block_range(self.page_id, page_size, block_mem_size)
+            self.free_indices = list(range(start, end))
+            self.capacity = end - start
+
+        def num_free_blocks(self):
+            return len(self.free_indices)
+
+        def alloc(self, count):
+            indices, self.free_indices = self.free_indices[:count], self.free_indices[count:]
+            return indices
+
+        def free_batch(self, indices):
+            self.free_indices.extend(indices)
+            self.free_indices.sort()
+
+        def full(self):
+            return not self.free_indices
+
+        def empty(self):
+            return len(self.free_indices) == self.capacity
+
+    class FakePageAllocator:
+        """One physical page, as the allocator floors 29 blocks of backing to."""
+
+        def __init__(self, num_layers, mem_size, page_size, *args, **kwargs):
+            self.total_pages = mem_size // page_size
+            self.inuse: dict[int, FakeInternalPage] = {}
+
+        def set_use_worker_ipc(self, use_worker_ipc):
+            self.use_worker_ipc = use_worker_ipc
+
+        def alloc_page(self):
+            for page_id in range(self.total_pages):
+                if page_id not in self.inuse:
+                    page = self.inuse[page_id] = FakeInternalPage(page_id)
+                    return page
+            raise RuntimeError("physical page pool exhausted")
+
+        def free_pages(self, page_ids):
+            for page_id in page_ids:
+                del self.inuse[page_id]
+
+        def group_indices_by_page(self, indices, block_mem_size):
+            grouped: dict[int, list[int]] = {}
+            for index in indices:
+                grouped.setdefault(index * block_mem_size // page_size, []).append(index)
+            return grouped
+
+        def get_page_state(self):
+            return {
+                "total_pages": self.total_pages,
+                "free_pages": self.total_pages - len(self.inuse),
+                "inuse_pages": len(self.inuse),
+                "reserved_pages": 0,
+            }
+
+        def get_num_free_pages(self):
+            return self.total_pages - len(self.inuse)
+
+        def get_avail_physical_pages(self):
+            return self.total_pages - len(self.inuse)
+
+        def get_num_reserved_pages(self):
+            return 0
+
+        def get_resize_target(self):
+            return -1
+
+        def start_prealloc_thread(self):
+            return None
+
+    manager_module = _load_manager_module(
+        monkeypatch,
+        "_test_logical_capacity_manager",
+        internal_page=FakeInternalPage,
+        page_allocator=FakePageAllocator,
+    )
+    manager = manager_module.KVCacheManager(
+        num_blocks,
+        token_page_size,
+        cell_size,
+        2,
+        reserve_null_block=True,
+        num_kv_buffers=1,
+        pool_name="mla",
+        page_size=page_size,
+        logical_num_blocks=logical_num_blocks,
+    )
+    manager.wait_ready(timeout=5)
+    assert manager.null_block == [0]
+    assert manager.num_avail_blocks == 27
+
+    data = manager.observability_snapshot_dict(integration="sglang")
+    assert data["total_blocks"] == 29
+    assert data["logical_blocks"] == 17
+    assert data["allocated_blocks"] == 1
+    assert data["available_blocks"] == 16
+    assert data["null_block_reserved"] is True
+    assert data["total_pages"] == data["inuse_pages"] == 1
+    assert data["lifecycle_phase"] == "ready"
+
+    indices = manager.alloc(16)
+    assert indices is not None and len(indices) == 16
+    assert manager.alloc(1) is None
+    data = manager.observability_snapshot_dict(integration="sglang")
+    assert data["allocated_blocks"] == 17
+    assert data["available_blocks"] == 0
+    # Backing-only room is not capacity.
+    assert data["total_blocks"] - data["allocated_blocks"] == 12
+    assert manager.num_avail_blocks == 11
+
+    manager.free(indices)
+    data = manager.observability_snapshot_dict(integration="sglang")
+    assert data["allocated_blocks"] == 1
+    assert data["available_blocks"] == 16
 
 
 def test_pool_snapshot_reports_a_failed_pool_instead_of_raising():
@@ -919,6 +1133,21 @@ def test_capabilities_enumerate_snapshot_fields_for_feature_detection():
     assert set(capabilities["operation_counter_names"]) <= set(operation_fields)
     assert "last_error_code" not in capabilities["operation_counter_names"]
     assert "last_error_timestamp_ns" not in capabilities["operation_counter_names"]
+
+
+def test_capabilities_announce_logical_capacity_as_an_additive_field():
+    """``logical_blocks`` is feature-detected through ``pool_snapshot_fields``
+    under the unchanged v1 schema, and a builder that predates it still
+    constructs a snapshot."""
+    capabilities = get_capabilities()
+
+    assert capabilities["schema_version"] == "kvcached.observability.v1"
+    assert "logical_blocks" in capabilities["pool_snapshot_fields"]
+
+    data = build_kv_cache_pool_snapshot(FakeManager()).to_dict()
+    assert data["logical_blocks"] == 128
+    del data["logical_blocks"]
+    assert KVCachePoolSnapshot(**data).logical_blocks is None
 
 
 def test_capabilities_record_is_json_serializable_and_stable():
