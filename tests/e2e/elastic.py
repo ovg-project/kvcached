@@ -13,6 +13,13 @@ fast requests finish:
   4. both get that load at once, more than fits: requests may queue, but all
      must finish and neither server may crash.
 Greedy probes before and after must give the same tokens on each server.
+
+With a TP server as A (ElasticPair.tp_a), A spans the run's first GPUs and B
+is pinned to one of them (gpu_b), where memory is sampled. Step 4 then lands
+A's load first and B's while A holds half of what it grew, so A's rank on that
+GPU runs short while its other ranks do not; B's prefix cache is reset and
+A's requests must still finish. A's log must show its ranks agreeing on
+every miss (tp_miss_checks).
 """
 
 from __future__ import annotations
@@ -21,10 +28,12 @@ import fcntl
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
@@ -32,10 +41,12 @@ from e2e import client as cl
 from e2e.matrix import BATCH_FLAG, ELASTIC_BATCH, Case, ElasticPair
 from e2e.run import (
     CaseResult,
+    Check,
     Container,
     Server,
     case_setup,
     check_gpu_released,
+    gpu_info,
     launch,
     stop_and_check,
 )
@@ -60,6 +71,10 @@ WORKLOAD = (
     f"calibration, at most {ELASTIC_BATCH} requests",
     "phases: (1) A gets its load; (2) A's prefix cache is reset; (3) B gets its load and "
     "its prefix cache is reset; (4) both get their loads at the same time",
+    "with a TP server as A (tp_a): A spans the run's first GPUs and B is pinned to one of "
+    "them (gpu_b), where memory is sampled; in phase (4) A gets its load first and B's lands "
+    "once A holds half of what it grew, then B's prefix cache is reset and A's requests must "
+    "finish",
     "3 greedy probe prompts of 32 tokens on each server before and after",
 )
 CHECKS = {
@@ -70,6 +85,13 @@ CHECKS = {
                          "what it grew",
     "b_reused_a_memory": "B's KV usage grows past what was free at A's peak",
     "contended_requests_ok": "every request succeeds while both loads run",
+    "a_pool_short": "with a TP server as A: under contention its log shows that kvcached "
+                    "could not back a prefill batch, or that SGLang retracted requests",
+    "a_miss_agreed": "every rank of A logs the first prefill miss with the same batch size "
+                     "and cap, and the ranks retract the same number of times",
+    "a_miss_on_one_rank": "a rank of A that could back a batch followed the verdict of the "
+                          "rank that could not (the asymmetric miss); passes when no prefill "
+                          "miss was logged",
     "<server>_probe_unchanged": "the probes give the same tokens before and after",
     "<server>_alive": "the server is still running at the end",
     "<server>_<shutdown check>": "the shutdown and cleanup checks of each server",
@@ -163,13 +185,14 @@ def drain(usage: Usage, srv: Server, timeout: float = 60) -> int:
     return last
 
 
-def start_ballast(ct: Container, mib: int) -> str:
-    """Hold `mib` of GPU memory, to emulate a smaller GPU when testing locally."""
+def start_ballast(ct: Container, mib: int, gpu: int = 0) -> str:
+    """Hold `mib` of the run's GPU `gpu`, to emulate a smaller GPU when testing locally."""
     (ct.out_dir / "elastic-ballast").mkdir(parents=True, exist_ok=True)
     code = ("import time, torch; "
             f"x = torch.empty({mib} << 20, dtype=torch.uint8, device='cuda'); "
             "print('ballast ready', flush=True); time.sleep(1e9)")
-    pid = ct.start_server("elastic-ballast", {}, ["python3", "-c", code])
+    pid = ct.start_server("elastic-ballast", {"CUDA_VISIBLE_DEVICES": str(gpu)},
+                          ["python3", "-c", code])
     deadline = time.time() + 120
     while time.time() < deadline:
         log = ct.out_dir / "elastic-ballast" / "serve.log"
@@ -179,19 +202,57 @@ def start_ballast(ct: Container, mib: int) -> str:
     raise RuntimeError("GPU ballast did not start")
 
 
+# What #554 logs on the rank whose pool missed (its allocator's cause) and on
+# the ranks that followed its verdict (the peer cause), at most once per 10 s
+# per rank; every rank's first miss carries count 1.
+MISS_RE = re.compile(r"kvcached could not back a prefill batch of (\d+) requests; returned "
+                     r"them to the waiting queue and capped the next batch at (\d+) requests "
+                     r"\((\d+) misses so far\): (.*)")
+PEER_CAUSE = "a peer rank sharing this waiting queue could not back the batch"
+# SGLang's retraction, logged by every rank under its TP prefix.
+RETRACT_RE = re.compile(r"\[[^\]]* TP(\d+)[^\]]*\] KV cache pool is full\. Retract requests\.")
+
+
+def tp_miss_checks(text: str, tp: int) -> list[Check]:
+    """Whether the tp ranks of a server agreed on every capacity miss in its
+    log. The ranks log into one file: the cause tells the rank that missed
+    from the ranks that followed it, and the TP prefix tells the retractions
+    apart."""
+    misses = [(int(n), int(cap), int(count), cause.strip())
+              for n, cap, count, cause in MISS_RE.findall(text)]
+    retracts = Counter(RETRACT_RE.findall(text))
+    first = {(n, cap) for n, cap, count, _ in misses if count == 1}
+    peers = sum(PEER_CAUSE in cause for _, _, _, cause in misses)
+    detail = (f"{len(misses)} prefill miss lines, {peers} with the peer cause; retractions "
+              f"per rank {dict(sorted(retracts.items())) or 'none'}")
+    first_agreed = not misses or (
+        sum(count == 1 for _, _, count, _ in misses) == tp and len(first) == 1)
+    retract_agreed = not retracts or (len(retracts) == tp and len(set(retracts.values())) == 1)
+    return [Check("a_pool_short", bool(misses or retracts), detail),
+            Check("a_miss_agreed", first_agreed and retract_agreed, detail),
+            Check("a_miss_on_one_rank", not misses or 0 < peers < len(misses), detail)]
+
+
 def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str,
                 base_port: int, timeout: float, emulate_gpu_mib: int = 0) -> CaseResult:
-    """Server A runs in ct_a and server B in ct_b; both use GPU ct_a.gpu."""
+    """Server A runs in ct_a and server B in ct_b. Both use the run's GPU
+    pair.gpu_b: B alone, and A with the rank it has there when it spans
+    several GPUs."""
     res = CaseResult(pair.name)
-    gpu = ct_a.gpu
+    if pair.gpu_b >= len(gpu_info(ct_a.gpus)):
+        res.add("gpus_available", False, f"B needs GPU {pair.gpu_b} of the run")
+        return res
+    gpu = ct_a.host_gpu(pair.gpu_b)
     ballast: Optional[str] = None
     if emulate_gpu_mib:
         _, total = gpu_memory_mib(gpu)
         if total > emulate_gpu_mib:
-            ballast = start_ballast(ct_a, total - emulate_gpu_mib)
+            ballast = start_ballast(ct_a, total - emulate_gpu_mib, pair.gpu_b)
             res.log["ballast_mib"] = total - emulate_gpu_mib
-    case_a = Case(pair.engine_a, pair.model_a, "c1", tag="elastic")
+    case_a = Case(pair.engine_a, pair.model_a, "c1", tag="elastic", tp=pair.tp_a)
     case_b = Case(pair.engine_b, pair.model_b, "c1", tag="elastic")
+    # A's ranks take the run's GPUs in order; B sees only its own.
+    env_b = {"CUDA_VISIBLE_DEVICES": str(pair.gpu_b)} if pair.gpu_b else {}
     setup = {"kind": "elastic", "gpu": gpu, "batch": ELASTIC_BATCH,
              "a": case_setup(case_a), "b": case_setup(case_b)}
     res.log["setup"] = setup
@@ -199,10 +260,11 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
     usage: Optional[Usage] = None
     try:
         # Start one after the other so the second sees the first's weights.
-        for host, case, port, extra in ((ct_a, case_a, base_port + 1, pair.extra_args_a),
-                                        (ct_b, case_b, base_port + 2, pair.extra_args_b)):
+        for host, case, port, extra, env in ((ct_a, case_a, base_port + 1, pair.extra_args_a, {}),
+                                             (ct_b, case_b, base_port + 2, pair.extra_args_b,
+                                              env_b)):
             batch = (BATCH_FLAG[case.engine], str(ELASTIC_BATCH))
-            srv = launch(host, case, run_id, port, extra_args=(*batch, *extra))
+            srv = launch(host, case, run_id, port, extra_args=(*batch, *extra), extra_env=env)
             setup["a" if case is case_a else "b"] = srv.setup
             started.append((host, srv))
             ready = srv.client.wait_ready(timeout, lambda: host.alive(srv.pid))
@@ -264,14 +326,29 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
                     "was free at A's peak")
             drain(usage, b)
 
-            # 4. Both at once.
+            # 4. Both at once. With a TP server as A, B's load lands while A
+            # holds half of what it grew, so that A's rank on B's GPU runs
+            # short while its other ranks do not; A must finish once B's
+            # prefix cache is reset.
             fa = pool.submit(burst, a, pool, n[a.ipc], 30_000)
-            fb = pool.submit(burst, b, pool, n[b.ipc], 40_000)
-            results = fa.result() + fb.result()
+            if pair.tp_a > 1:
+                deadline = time.time() + 120
+                while usage.used(a) - a_after < 0.5 * a_growth and time.time() < deadline:
+                    time.sleep(1)
+                mem["a_held_at_b_load"] = (usage.used(a) - a_after) / MIB
+                results = burst(b, pool, n[b.ipc], 40_000)
+                drain(usage, b)
+                results += fa.result()
+            else:
+                fb = pool.submit(burst, b, pool, n[b.ipc], 40_000)
+                results = fa.result() + fb.result()
             res.add("contended_requests_ok", all(r.ok for r in results),
                     f"{sum(not r.ok for r in results)}/{len(results)} failed")
             mem.update(a_growth=a_growth / MIB, a_after=(a_after - a_idle) / MIB,
                        free_at_a_peak=free_at_a_peak / MIB, b_growth=b_growth / MIB)
+        if pair.tp_a > 1:
+            log = ct_a.out_dir / case_a.name / "serve.log"
+            res.checks += tp_miss_checks(log.read_text(errors="replace"), pair.tp_a)
 
         for host, srv in started:
             after = srv.client.run_phase("probe", probes, 32, 1)
