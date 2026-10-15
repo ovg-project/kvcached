@@ -94,6 +94,20 @@ def test_compare_with_native():
                       "apc_1_cached_tokens_equal", "apc_2_cached_tokens_equal"}
 
 
+def test_tokens_differing_in_fewer_than_half_of_the_prompts_pass():
+    def case(name, differing):
+        res = CaseResult(name)
+        res.phases["gen_seq"] = cl.Phase("gen_seq", 1, [
+            cl.Result(200, [1, 9] if i < differing else [1, 2], "", 10, 0, 0.1)
+            for i in range(9)])
+        return res
+
+    native = case("native", 0)
+    check = compare_with_native(case("kv", 4), native)[0]
+    assert check.ok and check.detail.startswith("4 of 9 prompts differ: prompt 0:")
+    assert not compare_with_native(case("kv", 5), native)[0].ok
+
+
 def test_read_segments_reads_only_the_servers_segments(tmp_path):
     from e2e.elastic import SEGMENT, read_segments
 
