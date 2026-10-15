@@ -9,7 +9,7 @@ import socket
 import threading
 import uuid
 import weakref
-from typing import BinaryIO, Callable, Optional, Tuple
+from typing import BinaryIO, Callable, Iterable, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -235,6 +235,17 @@ def get_tp_worker_socket_path(socket_dir: str, rank: int, pp_rank: int = 0) -> s
     return os.path.join(socket_dir, f"w{rank}.sock")
 
 
+def get_tp_socket_dir_of(socket_path: str) -> str:
+    """The deployment directory a worker socket path belongs to, the inverse
+    of get_tp_worker_socket_path: the socket's directory, or that directory's
+    parent for a pp<k> stage socket."""
+    directory = os.path.dirname(socket_path)
+    stage = os.path.basename(directory)
+    if stage.startswith("pp") and stage[2:].isdigit():
+        return os.path.dirname(directory)
+    return directory
+
+
 def path_identity(path: str) -> Optional[Tuple[int, int]]:
     """(st_dev, st_ino) of the node at *path*, or None when there is none.
 
@@ -278,8 +289,8 @@ class WorkerSocketCleanup:
 
     A worker unlinks its own socket from Worker.shutdown(). On a process
     group SIGTERM vLLM's process manager kills the engine tree before that
-    runs, so the parent that removes the segment the engines left removes
-    the sockets too, behind the same confirmed engine exit. A socket node
+    runs, so the parent removes the sockets after confirmed engine exit.
+    Control-segment lifetime is managed separately by the OFD tracker. A socket node
     cannot be pinned by an open descriptor, so each one is remembered by
     (st_dev, st_ino): a node that no longer matches belongs to a same-name
     replacement and is kept. A remembered node is removed only once a
@@ -294,20 +305,34 @@ class WorkerSocketCleanup:
     once per teardown.
     """
 
+    _lock: threading.Lock
+    _pending: dict[str, Tuple[int, int]]
+    _dirs: list[str]
+
     def __init__(self, socket_dir: str, tp_size: int, pp_size: int) -> None:
+        self._remember(get_tp_worker_socket_path(socket_dir, rank, pp_rank)
+                       for pp_rank in range(max(int(pp_size), 1))
+                       for rank in range(max(int(tp_size), 1)))
+
+    @classmethod
+    def for_paths(cls, paths: Iterable[str]) -> "WorkerSocketCleanup":
+        """Remember the sockets at *paths*, the ones the workers reported
+        binding (issue #548), instead of deriving them from the sizes."""
+        cleanup = cls.__new__(cls)
+        cleanup._remember(paths)
+        return cleanup
+
+    def _remember(self, paths: Iterable[str]) -> None:
         self._lock = threading.Lock()
-        self._pending: dict[str, Tuple[int, int]] = {}
-        for pp_rank in range(max(int(pp_size), 1)):
-            for rank in range(max(int(tp_size), 1)):
-                path = get_tp_worker_socket_path(socket_dir, rank, pp_rank)
-                identity = path_identity(path)
-                if identity is not None:
-                    self._pending[path] = identity
+        self._pending = {}
+        for path in paths:
+            identity = path_identity(path)
+            if identity is not None:
+                self._pending[path] = identity
         # Deepest first: a pp<k> directory before the deployment root, which
         # is removed once empty like the worker's own stop removes it.
         directories = {os.path.dirname(path) for path in self._pending}
-        if directories:
-            directories.add(socket_dir)
+        directories.update(get_tp_socket_dir_of(path) for path in self._pending)
         self._dirs = sorted(directories, key=len, reverse=True)
 
     def unlink(self) -> bool:
