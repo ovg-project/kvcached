@@ -769,7 +769,7 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
     } else {
       // Single-process mode: directly call FTensorAllocator
       auto allocator = FTensorAllocator::global_allocator(group_id_);
-      bool success = allocator->map_to_kv_tensors(offsets);
+      bool success = allocator->map_local_kv_tensors(offsets);
       if (!success) {
         throw std::runtime_error("Failed to map pages to KV tensors");
       }

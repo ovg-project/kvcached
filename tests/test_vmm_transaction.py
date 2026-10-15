@@ -387,3 +387,130 @@ def test_physical_growth_lock_rejects_symlink(monkeypatch, tmp_path):
         assert not vmm_ops.has_prepared_map("symlink-lock", 0)
     finally:
         vmm_ops.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_local_growth_reserves_pool_geometry_and_preserves_zero_cost_reuse(
+    monkeypatch, tmp_path, contiguous, buffers
+):
+    import uuid
+
+    import torch
+
+    native = _compiled_vmm_ops()
+    page = 4 * 1024 * 1024
+    native.init_kvcached("cuda:0", 2 * 1024 * 1024, contiguous)
+    try:
+        tensors = native.create_kv_tensors(8 * page, 1, "cuda:0", 2, buffers, page_size=page)
+        allocator = native.PageAllocator(
+            2, 8 * page, page, contiguous_layout=contiguous,
+            enable_page_prealloc=False, num_kv_buffers=buffers,
+            ipc_name="LOCAL_" + uuid.uuid4().hex[:8],
+        )
+        monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+        monkeypatch.setenv("KVCACHED_GPU_UTILIZATION", "0")
+        before = allocator.get_num_free_pages()
+        with pytest.raises(RuntimeError, match="capacity_exhausted"):
+            allocator.alloc_page()
+        assert allocator.get_num_free_pages() == before
+        assert allocator.get_transaction_state()["state"] == "HEALTHY"
+
+        monkeypatch.setenv("KVCACHED_GPU_UTILIZATION", "0.95")
+        first = allocator.alloc_page()
+        assert first.page_id == 0
+        for tensor in tensors:
+            tensor[:128].fill_(7)
+        torch.cuda.synchronize()
+        assert len(list(tmp_path.glob("*.lock"))) == 1
+        assert not list(tmp_path.glob("*.ticket.*"))
+
+        # A mapped logical offset costs zero even when admission cannot run.
+        offset = page * 2 * buffers if contiguous else page
+        assert native.map_to_kv_tensors_with_result([offset], 0) == (True, [offset])
+        monkeypatch.setenv("KVCACHED_GPU_UTILIZATION", "0")
+        monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path / "missing"))
+        second = allocator.alloc_page()
+        assert second.page_id == 1
+        for tensor in tensors:
+            assert torch.all(tensor[:128] == 7).item()
+        torch.cuda.synchronize()
+    finally:
+        native.shutdown_kvcached()
+
+
+def _local_growth_worker(index, lock_dir, ready, start, release, results, limits):
+    import os
+
+    import torch
+
+    from kvcached import vmm_ops as native
+
+    os.environ["KVCACHED_PHYSICAL_GROWTH_LOCK_DIR"] = lock_dir
+    torch.cuda.set_device(0)
+    page = 64 * 1024 * 1024
+    native.init_kvcached("cuda:0", page, False)
+    tensors = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, page_size=page)
+    allocator = native.PageAllocator(
+        1, 4 * page, page, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=1, ipc_name=f"LOCAL_RACE_{os.getpid()}",
+    )
+    ready.put(index)
+    os.environ["KVCACHED_GPU_UTILIZATION"] = limits.get(timeout=30)
+    assert start.wait(30)
+    try:
+        try:
+            allocated = allocator.alloc_page()
+        except RuntimeError as exc:
+            assert "capacity_exhausted" in str(exc)
+            assert allocator.get_num_free_pages() == 4
+            assert allocator.get_transaction_state()["state"] == "HEALTHY"
+            results.put((index, "rejected"))
+        else:
+            tensors[0][:128].fill_(index + 1)
+            torch.cuda.synchronize()
+            results.put((index, "allocated"))
+            assert release.wait(30)
+            assert torch.all(tensors[0][:128] == index + 1).item()
+            allocator.free_page(allocated.page_id)
+    finally:
+        native.shutdown_kvcached()
+
+
+def test_local_processes_share_one_physical_admission_budget(tmp_path):
+    """Two independent local pools race for capacity sufficient for only one."""
+    import multiprocessing
+
+    import torch
+
+    _compiled_vmm_ops()
+    context = multiprocessing.get_context("spawn")
+    ready, results, limits = context.Queue(), context.Queue(), context.Queue()
+    start, release = context.Event(), context.Event()
+    processes = [context.Process(target=_local_growth_worker, args=(
+        index, str(tmp_path), ready, start, release, results, limits,
+    )) for index in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        assert {ready.get(timeout=60) for _ in processes} == {0, 1}
+        free, total = torch.cuda.mem_get_info()
+        budget = 96 * 1024 * 1024
+        assert free > budget
+        utilization = repr(1.0 - (free - budget) / total)
+        for _ in processes:
+            limits.put(utilization)
+        start.set()
+        outcomes = [results.get(timeout=60) for _ in processes]
+        assert sorted(outcome for _, outcome in outcomes) == ["allocated", "rejected"]
+        release.set()
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        assert not list(tmp_path.glob("*.ticket.*"))
+    finally:
+        release.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(timeout=10)

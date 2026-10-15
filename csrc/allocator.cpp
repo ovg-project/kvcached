@@ -54,9 +54,9 @@ double gpu_utilization_limit() {
   errno = 0;
   const double parsed = std::strtod(value, &end);
   if (errno != 0 || end == value || *end != '\0' || !std::isfinite(parsed) ||
-      parsed <= 0.0 || parsed > 1.0) {
+      parsed < 0.0 || parsed > 1.0) {
     throw std::runtime_error(
-        "KVCACHED_GPU_UTILIZATION must be in the range (0, 1]");
+        "KVCACHED_GPU_UTILIZATION must be in the range [0, 1]");
   }
   return parsed;
 }
@@ -559,6 +559,7 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
   prepared_map_transactions_.clear();
+  local_reserved_mappings_.clear();
   pending_unmap_.reset();
   finalized_unmap_transactions_.clear();
   finalized_unmap_order_.clear();
@@ -678,6 +679,101 @@ bool FTensorAllocator::kv_tensors_created() {
 
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   return map_to_kv_tensors_with_result(offsets).first;
+}
+
+bool FTensorAllocator::map_local_kv_tensors(
+    const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (num_layers_ == 0) {
+    return false;
+  }
+  if (!local_reserved_mappings_.empty()) {
+    throw StateConsistencyError("local KV reservation cleanup is pending");
+  }
+  reject_if_unmap_pending_locked_("map local KV tensors");
+  reject_if_map_overlaps_locked_(offsets);
+
+  using MappingTarget = std::pair<FTensor *, offset_t>;
+  std::vector<MappingTarget> targets;
+  std::unordered_set<offset_t> seen;
+  for (auto offset : offsets) {
+    if (!seen.insert(offset).second) {
+      continue;
+    }
+    auto group = mapping_targets_({offset});
+    size_t existing = 0;
+    for (const auto &[ftensor, target] : group) {
+      existing += ftensor->is_mapped(target) ? 1 : 0;
+    }
+    if (existing == group.size()) {
+      continue;
+    }
+    if (existing != 0) {
+      throw StateConsistencyError("state_inconsistency: logical KV offset is "
+                                  "only partially mapped: " +
+                                  std::to_string(offset));
+    }
+    targets.insert(targets.end(), group.begin(), group.end());
+  }
+
+  std::vector<MappingTarget> mapped;
+  mapped.reserve(targets.size());
+  bool new_mapping_damaged = false;
+  try {
+    // The shared guard covers one capacity check and handle reservation per
+    // growth batch. It is released before any virtual mapping is changed.
+    reserve_targets_(targets, local_reserved_mappings_, nullptr);
+    for (auto &mapping : local_reserved_mappings_) {
+      try {
+        if (!mapping.ftensor->map_reserved(mapping.offset, mapping.page)) {
+          throw std::runtime_error("reserved KV page map returned false");
+        }
+      } catch (const StateConsistencyError &) {
+        new_mapping_damaged = true;
+        throw;
+      }
+      mapped.emplace_back(mapping.ftensor, mapping.offset);
+    }
+    local_reserved_mappings_.clear();
+    return true;
+  } catch (const std::exception &error) {
+    std::string rollback_errors;
+    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
+      try {
+        if (!it->first->unmap(it->second)) {
+          throw std::runtime_error("physical page unmap returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        rollback_errors += std::string("; ") + rollback_error.what();
+      }
+    }
+    std::string release_errors;
+    for (auto &mapping : local_reserved_mappings_) {
+      if (!mapping.page) {
+        continue;
+      }
+      try {
+        mapping.page->release();
+        mapping.page.reset();
+      } catch (const std::exception &release_error) {
+        // Leave the handle in allocator-owned storage; a destructor must not
+        // silently turn an unconfirmed release into reusable capacity.
+        release_errors += std::string("; ") + release_error.what();
+      }
+    }
+    if (!release_errors.empty()) {
+      throw StateConsistencyError(std::string("local KV reservation cleanup "
+                                              "failed: ") +
+                                  error.what() + rollback_errors +
+                                  release_errors);
+    }
+    local_reserved_mappings_.clear();
+    if (!rollback_errors.empty() || new_mapping_damaged) {
+      throw MapQuarantinedError(std::string("local KV map rollback failed: ") +
+                                error.what() + rollback_errors);
+    }
+    throw;
+  }
 }
 
 std::pair<bool, std::vector<offset_t>>

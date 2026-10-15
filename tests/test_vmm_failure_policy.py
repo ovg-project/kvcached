@@ -33,7 +33,7 @@ def fault_library(tmp_path_factory):
     return library
 
 
-@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup"])
+@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup", "local-reserve", "local-map", "local-release"])
 def test_native_failure_policy(fault_library, case):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
                KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="0",
@@ -67,7 +67,34 @@ def _native_case(case):
     driver.kvcached_fault_arm.argtypes = [ctypes.c_int] * 3
     driver.kvcached_fault_hits.restype = ctypes.c_int
     driver.kvcached_fault_release.argtypes = [ctypes.c_int]
-    if case.startswith("abort-reserved-") or case in ("reserve-cleanup", "commit-cleanup"):
+    if case in ("local-reserve", "local-map", "local-release"):
+        # Keep an existing live page outside the failed growth batch.
+        first = allocator.alloc_page()
+        tensors[0][:128].fill_(7)
+        torch.cuda.synchronize(device)
+        before = allocator.get_num_free_pages()
+        driver.kvcached_fault_arm(3 if case != "local-map" else 0,
+                                  2 if case == "local-map" else 0, 0)
+        if case == "local-release":
+            driver.kvcached_fault_release(1)
+        with pytest.raises(StateConsistencyError if case == "local-release" else RuntimeError):
+            allocator.alloc_page()
+        assert driver.kvcached_fault_hits() == (2 if case == "local-release" else 1)
+        assert bool((tensors[0][:128] == 7).all())
+        if case == "local-release":
+            assert allocator.get_transaction_state()["state"] == "FAILED"
+            with pytest.raises(StateConsistencyError):
+                allocator.alloc_page()
+        else:
+            assert allocator.get_num_free_pages() == before
+            assert allocator.get_transaction_state()["state"] == "HEALTHY"
+            # No partial mapping may be adopted by the next local retry.
+            driver.kvcached_fault_arm(0, 0, 0)
+            second = allocator.alloc_page()
+            assert second.page_id == 1
+            assert driver.kvcached_create_count() == 4
+            allocator.free_pages([first.page_id, second.page_id])
+    elif case.startswith("abort-reserved-") or case in ("reserve-cleanup", "commit-cleanup"):
         driver.kvcached_fault_release_calls.restype = ctypes.c_int
         transaction_id = "cleanup-owner"
         if case.startswith("abort-reserved-"):
@@ -342,9 +369,9 @@ def _native_case(case):
         from kvcached.lifecycle import LifecycleState
         manager._lifecycle = LifecycleState("vmm-policy-test")
         manager._lifecycle.mark_ready()
-        driver.kvcached_fault_arm(2, 3, 0)
+        driver.kvcached_fault_arm(0, 2, 2)
         assert manager.alloc(1) is None
-        assert driver.kvcached_fault_hits() == 2
+        assert driver.kvcached_fault_hits() == 3
         driver.kvcached_fault_arm(0, 0, 0)
         assert manager.available_size() == 12
         with pytest.raises(QuarantinedResizeError):
@@ -368,8 +395,9 @@ def _native_case(case):
         with pytest.raises(StateConsistencyError):
             manager.alloc(1)
     else:
-        # K maps; V creation fails; rollback of K fails. Other calls are real VMM.
-        driver.kvcached_fault_arm(2, 0 if case == "rollback-release" else 3, 0)
+        # All handles are reserved first. K maps, V's zero-page removal fails,
+        # then restoring or releasing K fails. Other calls are real VMM.
+        driver.kvcached_fault_arm(0, 2, 0 if case == "rollback-release" else 2)
         if case == "rollback-release":
             driver.kvcached_fault_release(1)
         if case == "prealloc":
@@ -381,7 +409,7 @@ def _native_case(case):
         else:
             with pytest.raises(MapQuarantinedError):
                 allocator.alloc_page()
-        assert driver.kvcached_fault_hits() == 2
+        assert driver.kvcached_fault_hits() == (2 if case == "rollback-release" else 3)
         driver.kvcached_fault_arm(0, 0, 0)
         state = allocator.get_transaction_state()
         expected = [0, 1] if case == "prealloc" else [0]

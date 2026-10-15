@@ -52,6 +52,7 @@ public:
                     size_t page_size = 0);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  bool map_local_kv_tensors(const std::vector<offset_t> &offsets);
   std::pair<bool, std::vector<offset_t>>
   map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
   std::pair<bool, PhysicalGrowthOperationStats>
@@ -163,6 +164,8 @@ private:
   size_t physical_bytes_per_offset_ = 0;
   std::unordered_map<std::string, PreparedMapTransaction>
       prepared_map_transactions_;
+  // Unattached handles keep an owner if local rollback cannot release them.
+  std::vector<ReservedMapping> local_reserved_mappings_;
 
   mutable std::mutex mtx_;
   // For per-layer layout: one tensor per layer
