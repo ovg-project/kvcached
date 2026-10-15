@@ -36,6 +36,7 @@ extern "C" void kvcached_fault_release(int release_at) {
 }
 
 extern "C" int kvcached_fault_hits() { return injected.load(); }
+extern "C" int kvcached_fault_release_calls() { return release_count.load(); }
 extern "C" int kvcached_create_count() { return create_count.load(); }
 extern "C" int kvcached_release_count() { return release_count.load(); }
 
