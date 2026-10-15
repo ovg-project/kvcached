@@ -1207,6 +1207,9 @@ class KVCacheManager:
         # re-reads the driver instead of serving pre-resize data.
         self._avail_physical_pages_cache = None
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
+        # A kvctl quota can exceed the startup size, but the KV tensors only
+        # reserve mem_size, so the pool cannot grow past it.
+        new_mem_size = min(new_mem_size, self.mem_size)
         try:
             resized = self.page_allocator.resize(new_mem_size)
         except QuarantinedResizeError:

@@ -325,6 +325,18 @@ def test_limit_is_clamped_to_the_original_reservation():
     assert state["effective_limit_bytes"] == page_bundle * 16
 
 
+def test_kvctl_quota_is_clamped_to_the_original_reservation():
+    manager = _manager()
+    # kvctl publishes the raw quota, which may exceed the startup size.
+    manager.page_allocator.get_resize_target = lambda: manager.page_size * 32
+
+    assert manager.resize(manager.page_size * 3)
+    manager.apply_resize_target()
+
+    assert manager.page_allocator.resize_calls == [3, 16]
+    assert manager.page_allocator.total_pages == 16
+
+
 def test_zero_limit_drains_an_idle_pool():
     manager = _manager()
 
