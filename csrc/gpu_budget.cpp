@@ -67,6 +67,15 @@ int lease(int fd, short type, bool wait, off_t start = 0) {
 }
 // A separate open-file description owns the calibration lease. Closing it,
 // including on process death, releases admission without a persistent flag.
+// A sampler must not recursively wait on its own admission lease. Ordinary
+// contenders wait in the kernel, outside the budget data mutex, then retry the
+// real budget admission. The thread-local flag owns no teardown resources.
+thread_local bool inside_budget_sampler = false;
+struct SamplerScope {
+  bool previous = inside_budget_sampler;
+  SamplerScope() { inside_budget_sampler = true; }
+  ~SamplerScope() { inside_budget_sampler = previous; }
+};
 struct CalibrationLease {
   int fd;
   explicit CalibrationLease(const std::string &path)
@@ -341,9 +350,29 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   return result;
 }
 
-BudgetSnapshot GpuBudget::snapshot(size_t slot) {
+BudgetSnapshot GpuBudget::snapshot(size_t slot, const Sampler &sampler) {
+  bool sample_due = false;
+  if (sampler) {
+    Locked lock(*this);
+    constexpr uint64_t interval_ns = 1000000000ULL;
+    sample_due = !shared_->active &&
+                 monotonic_ns() - shared_->last_sample_ns >= interval_ns;
+  }
+  // Admission queries also refresh an exhausted budget: waiting for another
+  // grant would otherwise prevent a scheduler from observing recovered memory.
+  if (sample_due)
+    recalibrate(sampler);
   Locked lock(*this);
   return snapshot_locked(slot);
+}
+
+void GpuBudget::accounting_test_hook(int stage) {
+#ifdef KVCACHED_BUDGET_TESTING
+  if (accounting_test_hook_)
+    accounting_test_hook_(stage);
+#else
+  (void)stage;
+#endif
 }
 
 std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
@@ -352,12 +381,11 @@ std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
   auto result = std::make_unique<BudgetGrant>(shared_from_this(), slot, 0);
   bool attempted_sample = false;
   for (;;) {
-    bool sample_due = false;
+    bool sample_due = false, wait_for_calibration = false;
     {
       Locked lock(*this);
-      // This is a physical growth batch, never a token/block hot-path query.
-      // Check the clock under the same lock used for admission; ordinary
-      // grants incur no additional data-lock round trip.
+      // Check the clock under the admission lock; ordinary grants need no
+      // extra data-lock round trip.
       constexpr uint64_t interval_ns = 1000000000ULL;
       sample_due = sampler && !attempted_sample && !shared_->active &&
                    monotonic_ns() - shared_->last_sample_ns >= interval_ns;
@@ -365,36 +393,48 @@ std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
         const auto state = snapshot_locked(slot);
         if (observed)
           *observed = state;
-        if (calibration_active(fd_))
-          throw std::runtime_error(
-              "capacity_exhausted: KV budget calibration in progress");
-        if (state.charged_bytes > state.budget_bytes ||
-            bytes > state.budget_bytes - state.charged_bytes ||
-            state.instance_charged_bytes > state.instance_limit_bytes ||
-            bytes > state.instance_limit_bytes - state.instance_charged_bytes)
-          throw std::runtime_error(
-              "capacity_exhausted: shared KV budget would be exceeded");
-        // Only this owner's authoritative charge changes. There is no
-        // separately maintained total balance that could disagree after process
-        // interruption.
-        shared_->active = add(shared_->active, 1);
-        ++shared_->version;
-        publish(shared_->pools[slot].charged,
-                add(shared_->pools[slot].charged, bytes));
+        if (calibration_active(fd_)) {
+          if (inside_budget_sampler)
+            throw std::runtime_error(
+                "capacity_exhausted: KV budget calibration in progress");
+          wait_for_calibration = true;
+        } else {
+          if (state.charged_bytes > state.budget_bytes ||
+              bytes > state.budget_bytes - state.charged_bytes ||
+              state.instance_charged_bytes > state.instance_limit_bytes ||
+              bytes > state.instance_limit_bytes - state.instance_charged_bytes)
+            throw std::runtime_error(
+                "capacity_exhausted: shared KV budget would be exceeded"
+                " (requested=" +
+                std::to_string(bytes) +
+                ", budget=" + std::to_string(state.budget_bytes) +
+                ", charged=" + std::to_string(state.charged_bytes) + ")");
+          // The owner charge remains authoritative. Short-lock accounting
+          // derives totals from owner records, without CAS aggregate counters.
+          shared_->active = add(shared_->active, 1);
+          ++shared_->version;
+          publish(shared_->pools[slot].charged,
+                  add(shared_->pools[slot].charged, bytes));
 #ifdef KVCACHED_BUDGET_TESTING
-        if (grant_test_hook_)
-          grant_test_hook_();
+          if (grant_test_hook_)
+            grant_test_hook_();
 #endif
-        // Construction below cannot allocate. Activate the already-allocated
-        // grant.
-        result->unused_ = bytes;
-        result->active_ = true;
-        return result;
+          result->unused_ = bytes;
+          result->active_ = true;
+          return result;
+        }
       }
     }
+    if (wait_for_calibration) {
+      // Neither the local data mutex nor shared flock survives this boundary.
+      // Retry the complete limit check after the calibration lease is released.
+      accounting_test_hook(40);
+      CalibrationLease waiter(path_);
+      if (lease(waiter.fd, F_RDLCK, true, 1) < 0)
+        throw system_error("wait for KV budget calibration");
+      continue;
+    }
     attempted_sample = true;
-    // Another worker may win the lease or start physical work; then skip the
-    // sample and retain the previous conservative budget for this admission.
     recalibrate(sampler);
   }
 }
@@ -436,16 +476,17 @@ bool GpuBudget::recalibrate(const Sampler &sampler) {
       charged = add(charged, pool.charged);
     version = shared_->version;
   }
+  SamplerScope sampling;
   const int64_t free_budget = sampler();
   Locked lock(*this);
   if (shared_->active || shared_->version != version)
     return false;
-  // All grants have settled and releases completed. Pending promises must
-  // never be added to a driver sample, hence the active-mutation check above.
-  // The first implementation only lowers a live epoch's budget. Growing the
-  // epoch after non-KV usage falls is policy work, not implicit extra credit.
-  publish(shared_->budget,
-          std::min(shared_->budget, sampled_capacity(charged, free_budget)));
+  // The spendable credit is budget - charged. Retained dead-owner charges
+  // occur on both sides and cancel; never refund them speculatively. A stable
+  // sample therefore restores exactly sampled free capacity. Active/version
+  // checks exclude unfinished grants and releases, including crashed mutations.
+  // Preserve negative headroom until after combining it with charged bytes.
+  publish(shared_->budget, sampled_capacity(charged, free_budget));
   shared_->last_sample_ns = monotonic_ns();
   ++shared_->version;
   return true;

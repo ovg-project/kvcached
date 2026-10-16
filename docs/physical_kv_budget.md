@@ -8,7 +8,8 @@ acquire an additional budget lock or charge the same page again.
 Batch grants serialize the GPU balance, owner charge and instance limit under
 one short accounting lock. Existing local allocator synchronization remains.
 This PR provides native growth accounting and resource lifecycle handling.
-Engine admission and distributed transaction integration are separate work.
+A narrow SGLang prefill guard reserves existing manager blocks before request
+publication. Distributed admission and transaction integration remain separate work.
 No minimum reservation, priority, reclaim policy or CPU offload is introduced.
 
 ## Accounting and identity
@@ -50,19 +51,25 @@ the budget data lock is released before the CUDA call. Concurrent releases chang
 a version counter, causing that sample to be discarded. Active grants therefore
 cannot be mistaken for already resident memory and added back as extra credit.
 
-For this first version a live epoch can only lower its budget, using
-`min(previous_budget, max(0, charged_bytes + sampled_free_after_safety_margin))`.
-The sample retains negative headroom until after addition, so releasing pages
-cannot immediately regrant credit that is needed to restore the safety margin. Existing
-pages remain owned; a lower budget restricts new growth. Capacity is sampled afresh
-after all participants exit. A separate initialization lease serializes joining
-connections through the initial sample. If that initializer fails or exits, the
-next connector retries epoch ownership and samples afresh instead of accepting
-the old header. Increasing a live budget and recovering abandoned
-owner records online are deliberately not implemented. A crashed in-flight
-operation can prevent further calibration until the epoch ends; its credit is
-retained, never guessed free. A crashed calibration process releases its kernel
-lease and cannot leave a persistent admission flag set.
+A stable sample sets `budget = max(0, charged_bytes + sampled_free_after_safety_margin)`.
+The available credit is `budget - charged_bytes`: recovering external free memory
+therefore restores exactly the sampled capacity. Dead idle owners remain charged
+on both sides of this subtraction; their charges are never refunded or reclaimed
+online. Interrupted mutations still prevent calibration. Negative headroom is
+preserved until after addition so releasing pages cannot regrant credit needed
+to restore the safety margin.
+
+Single-process admission queries use both the GPU and instance budget and refresh
+at the same one-second cadence. Worker-IPC estimates remain driver-based because
+the ledger belongs to the workers. Estimates do not reserve capacity; grants are
+still authoritative. Grants racing calibration wait on its kernel lease outside
+the budget data mutex. A sampler cannot recursively wait on its own lease.
+
+A separate initialization lease serializes joining connections through the
+initial sample. Failed initialization cannot publish the previous epoch's header.
+A crashed in-flight operation retains its uncertain credit and may prevent
+calibration until all participants exit. A crashed sampler releases its kernel
+lease automatically.
 
 Unrelated CUDA work can consume memory after a sample. Real allocation failures
 must still roll back and return a miss where the engine supports it. This protocol
@@ -98,3 +105,17 @@ engine tags and collision suffixes. Direct dispatcher callers can pass an explic
 instance name; their fallback is process-local unless `KVCACHED_IPC_NAME` is set.
 If ledger access fails during teardown, native unmap/release is still attempted,
 but unconfirmed refunds remain charged to the old epoch.
+
+## SGLang prefill failure boundary
+
+For SGLang 0.5.20 single-rank page-size-one prefill, the adapter reserves physical
+KV and Mamba blocks before `prepare_for_extend` allocates request rows. A failed
+reservation releases unused reservations and returns unpublished fresh requests
+to the normal queue. An existing chunk retains its row, Mamba state and previous
+inflight count. No allocation retry runs inside the failed call.
+
+This guard excludes sessions, multi-rank/pipeline execution, speculative/dLLM,
+hierarchical caches and other page sizes. It does not catch errors from the
+original preparation function after publication begins. Native unsafe-state
+errors remain fatal. It is not a general transactional scheduler or a guarantee
+against unrelated CUDA OOM.

@@ -400,6 +400,23 @@ BudgetSnapshot FTensorAllocator::physical_budget_state() {
   return budget_ ? budget_->snapshot(budget_slot_) : BudgetSnapshot{};
 }
 
+uint64_t FTensorAllocator::available_physical_bytes() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  if (!budget_)
+    return UINT64_MAX;
+  const auto state = budget_->snapshot(
+      budget_slot_, [this] { return sample_budget_capacity_(); });
+  const auto gpu_free = state.budget_bytes > state.charged_bytes
+                            ? state.budget_bytes - state.charged_bytes
+                            : 0;
+  const auto instance_free =
+      state.instance_limit_bytes > state.instance_charged_bytes
+          ? state.instance_limit_bytes - state.instance_charged_bytes
+          : 0;
+  return std::min(gpu_free, instance_free);
+}
+
 std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
                                                         uint64_t revision) {
   std::lock_guard<std::mutex> lock(mtx_);

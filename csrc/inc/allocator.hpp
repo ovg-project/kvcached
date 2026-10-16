@@ -79,6 +79,7 @@ public:
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();
   BudgetSnapshot physical_budget_state();
+  uint64_t available_physical_bytes();
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
   bool recalibrate_physical_budget();
 

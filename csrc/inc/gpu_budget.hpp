@@ -93,7 +93,7 @@ public:
   std::unique_ptr<BudgetGrant> grant(size_t slot, uint64_t bytes,
                                      BudgetSnapshot *state = nullptr,
                                      const Sampler &sampler = {});
-  BudgetSnapshot snapshot(size_t slot);
+  BudgetSnapshot snapshot(size_t slot, const Sampler &sampler = {});
   // Returns applied, stale or conflict. Shrink may leave existing charges
   // above the target, in which case new grants are denied until release.
   std::string set_instance_limit(size_t slot, uint64_t bytes,
@@ -104,6 +104,9 @@ public:
   void refund(size_t slot, uint64_t bytes);
 #ifdef KVCACHED_BUDGET_TESTING
   void set_grant_test_hook(void (*hook)()) { grant_test_hook_ = hook; }
+  void set_accounting_test_hook(void (*hook)(int)) {
+    accounting_test_hook_ = hook;
+  }
 #endif
 
 private:
@@ -119,6 +122,7 @@ private:
   void reclaim_instances_locked();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   void return_locked(size_t slot, uint64_t bytes);
+  void accounting_test_hook(int stage);
   int fd_ = -1;
   Shared *shared_ = nullptr;
   std::string path_;
@@ -137,6 +141,7 @@ private:
   uint64_t sync_dead_owner_recoveries_ = 0;
 #ifdef KVCACHED_BUDGET_TESTING
   void (*grant_test_hook_)() = nullptr;
+  void (*accounting_test_hook_)(int) = nullptr;
 #endif
 };
 

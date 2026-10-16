@@ -452,6 +452,14 @@ def test_shared_budget_calibration_observes_external_cuda_allocation(monkeypatch
         after = native.physical_budget_state()
         assert after["budget_bytes"] < before["budget_bytes"]
         assert after["charged_bytes"] == page
+        del external
+        external = None
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        assert native.recalibrate_physical_budget()
+        recovered = native.physical_budget_state()
+        assert recovered["charged_bytes"] == page
+        assert recovered["budget_bytes"] >= after["budget_bytes"] + 32 * 1024 * 1024
         assert native.abort_prepared_map("resident", 0)
         assert native.physical_budget_state()["charged_bytes"] == 0
     finally:
@@ -477,4 +485,37 @@ def test_shared_budget_calibration_preserves_headroom_deficit(monkeypatch, tmp_p
         denied = native.prepare_map_to_kv_tensors("retry-deficit", [0], 0)
         assert not denied["success"] and denied["capacity_rejections"] == 1
     finally:
+        native.shutdown_kvcached()
+
+
+def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
+    import uuid
+
+    from kvcached.vmm_ops import PageAllocator
+
+    native = _compiled_vmm_ops()
+    page = 2 * 1024 * 1024
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    native.init_kvcached("cuda:0", page, False)
+    allocator = None
+    try:
+        native.create_kv_tensors(8 * page, 1, "cuda:0", 1, 1, 0)
+        allocator = PageAllocator(
+            num_layers=1, mem_size_per_layer=8 * page, page_size=page,
+            world_size=1, pp_rank=0, async_sched=False, contiguous_layout=False,
+            enable_page_prealloc=False, num_kv_buffers=1, group_id=0,
+            ipc_name="kvcached-budget-admission-" + uuid.uuid4().hex,
+        )
+        assert native.set_instance_budget_limit(2 * page, 1) == "applied"
+        assert allocator.get_avail_physical_pages() == 2
+        assert native.prepare_map_to_kv_tensors("admission-resident", [0], 0)["success"]
+        assert allocator.get_avail_physical_pages() == 1
+        assert native.set_instance_budget_limit(0, 2) == "applied"
+        assert allocator.get_avail_physical_pages() == 0
+        assert native.abort_prepared_map("admission-resident", 0)
+        assert allocator.get_avail_physical_pages() == 0
+        assert native.set_instance_budget_limit(3 * page, 3) == "applied"
+        assert allocator.get_avail_physical_pages() == 3
+    finally:
+        del allocator
         native.shutdown_kvcached()
