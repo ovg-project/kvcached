@@ -125,6 +125,12 @@ class KVCacheManager:
     _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
     _shrink_reclaimers: tuple[weakref.WeakMethod, ...] = ()
     _reclaiming_for_shrink = False
+    # The native resize watcher retains the last quota kvctl published and
+    # reports it on every read. _apply_resize_target() keeps applying it
+    # while it is the latest published target, which completes a deferred
+    # shrink, and skips it once resize() published a later one.
+    _kvctl_target: Optional[int] = None
+    _kvctl_target_is_latest = False
 
     def __init__(
         self,
@@ -1124,14 +1130,32 @@ class KVCacheManager:
     def _apply_resize_target(self) -> None:
         new_mem_size = self.page_allocator.get_resize_target()
         # -1 means nothing published; 0 is a valid limit.
-        if (new_mem_size >= 0 and
-                new_mem_size != getattr(self, "_rejected_resize_target", None)):
-            try:
-                self.resize(new_mem_size)
-            except QuarantinedResizeError:
-                self._rejected_resize_target = new_mem_size
-                self._resize_rejected = True
-                logger.warning("Automatic resize rejected: pool has quarantined pages")
+        if new_mem_size < 0:
+            return
+        if new_mem_size != self._kvctl_target:
+            # A changed value is a new kvctl publication; it wins over an
+            # earlier set_memory_limit() or resize().
+            self._kvctl_target = new_mem_size
+            self._kvctl_target_is_latest = True
+        elif not self._kvctl_target_is_latest:
+            # resize() published a later target. Applying the quota again
+            # would cancel it; in_shrink, free() and the reclaimers complete
+            # that resize instead.
+            return
+        if new_mem_size == getattr(self, "_rejected_resize_target", None):
+            return
+        try:
+            self.resize(new_mem_size)
+        except QuarantinedResizeError:
+            self._rejected_resize_target = new_mem_size
+            self._resize_rejected = True
+            logger.warning("Automatic resize rejected: pool has quarantined pages")
+        else:
+            # resize() marked its target as the latest; here that is the
+            # quota. The next pass applies a deferred shrink again, which is
+            # what completes it when _resize() freed the reserved blocks
+            # before entering the shrink.
+            self._kvctl_target_is_latest = True
 
     @_after_post_init
     @synchronized
@@ -1218,6 +1242,10 @@ class KVCacheManager:
             self._increment_operation_counter("resize_successes_total")
         else:
             self._increment_operation_counter("resize_deferred_total")
+        # The latest published target wins: the retained kvctl quota is not
+        # applied again over this one. _apply_resize_target() marks the quota
+        # as the latest when it is the caller.
+        self._kvctl_target_is_latest = False
         return resized
 
     def _resize(self, new_mem_size: int):
