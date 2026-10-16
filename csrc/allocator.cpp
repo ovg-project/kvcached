@@ -168,332 +168,6 @@ void validate_physical_capacity(int dev_idx, size_t required_bytes,
   }
 }
 
-class FairFileTicket {
-public:
-  explicit FairFileTicket(const std::string &resource_path)
-      : queue_path_(resource_path + ".queue"), ticket_fd_(-1),
-        ticket_number_(0), owner_token_(process_owner_token()),
-        turn_acquired_(false), wait_us_(0) {
-    const auto wait_started = std::chrono::steady_clock::now();
-    const int queue_fd = open(queue_path_.c_str(),
-                              O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0660);
-    if (queue_fd < 0) {
-      throw std::runtime_error("failed to open physical growth ticket queue " +
-                               queue_path_ + ": " + std::strerror(errno));
-    }
-
-    try {
-      issue_ticket(queue_fd, resource_path);
-    } catch (...) {
-      cleanup_ticket();
-      (void)close(queue_fd);
-      throw;
-    }
-
-    (void)close(queue_fd);
-    try {
-      wait_until_first(resource_path);
-      turn_acquired_ = true;
-      wait_us_ = elapsed_us(wait_started);
-    } catch (...) {
-      cleanup_ticket();
-      throw;
-    }
-  }
-
-  FairFileTicket(const FairFileTicket &) = delete;
-  FairFileTicket &operator=(const FairFileTicket &) = delete;
-
-  ~FairFileTicket() {
-    if (turn_acquired_) {
-      record_last_owner();
-    }
-    cleanup_ticket();
-  }
-
-  uint64_t wait_us() const { return wait_us_; }
-
-private:
-  struct QueueState {
-    uint64_t next_ticket = 0;
-    uint64_t last_owner = 0;
-  };
-
-  static uint64_t process_owner_token() {
-    static const uint64_t token = [] {
-      std::random_device random;
-      const uint64_t high = static_cast<uint64_t>(random()) << 32;
-      const uint64_t low = static_cast<uint64_t>(random());
-      return (high | low) ^ static_cast<uint64_t>(getpid());
-    }();
-    return token;
-  }
-
-  static uint64_t
-  elapsed_us(const std::chrono::steady_clock::time_point &started) {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - started)
-            .count());
-  }
-
-  QueueState read_queue_state(int queue_fd) const {
-    QueueState state;
-    const ssize_t read_bytes = pread(queue_fd, &state, sizeof(state), 0);
-    if (read_bytes < 0 ||
-        (read_bytes != 0 &&
-         read_bytes != static_cast<ssize_t>(sizeof(uint64_t)) &&
-         read_bytes != static_cast<ssize_t>(sizeof(state)))) {
-      throw std::runtime_error("failed to read physical growth ticket queue " +
-                               queue_path_);
-    }
-    // The previous format contained only next_ticket. Queue files survive
-    // process upgrades, so a legacy 8-byte record keeps last_owner unset.
-    if (read_bytes == static_cast<ssize_t>(sizeof(uint64_t))) {
-      state.last_owner = 0;
-    }
-    return state;
-  }
-
-  void write_queue_state(int queue_fd, const QueueState &state) const {
-    if (pwrite(queue_fd, &state, sizeof(state), 0) !=
-            static_cast<ssize_t>(sizeof(state)) ||
-        ftruncate(queue_fd, sizeof(state)) != 0) {
-      throw std::runtime_error(
-          "failed to update physical growth ticket queue " + queue_path_);
-    }
-  }
-
-  void lock_queue(int queue_fd) const {
-    if (flock(queue_fd, LOCK_EX) != 0) {
-      throw std::runtime_error("failed to lock physical growth ticket queue " +
-                               queue_path_ + ": " + std::strerror(errno));
-    }
-  }
-
-  void issue_ticket(int queue_fd, const std::string &resource_path) {
-    bool yielded_to_peer = false;
-    while (true) {
-      lock_queue(queue_fd);
-      QueueState state;
-      try {
-        state = read_queue_state(queue_fd);
-      } catch (...) {
-        (void)flock(queue_fd, LOCK_UN);
-        throw;
-      }
-
-      if (!yielded_to_peer && state.last_owner == owner_token_) {
-        (void)flock(queue_fd, LOCK_UN);
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
-        yielded_to_peer = true;
-        continue;
-      }
-      if (state.next_ticket == std::numeric_limits<uint64_t>::max()) {
-        (void)flock(queue_fd, LOCK_UN);
-        throw std::overflow_error("physical growth ticket counter overflow");
-      }
-
-      ticket_number_ = state.next_ticket++;
-      try {
-        write_queue_state(queue_fd, state);
-        ticket_path_ = ticket_path(resource_path, ticket_number_);
-        ticket_fd_ =
-            open(ticket_path_.c_str(),
-                 O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0660);
-        if (ticket_fd_ < 0) {
-          throw std::runtime_error("failed to create physical growth ticket " +
-                                   ticket_path_ + ": " + std::strerror(errno));
-        }
-        if (flock(ticket_fd_, LOCK_EX) != 0) {
-          throw std::runtime_error("failed to lock physical growth ticket " +
-                                   ticket_path_ + ": " + std::strerror(errno));
-        }
-      } catch (...) {
-        (void)flock(queue_fd, LOCK_UN);
-        throw;
-      }
-      (void)flock(queue_fd, LOCK_UN);
-      return;
-    }
-  }
-
-  static std::string ticket_path(const std::string &resource_path,
-                                 uint64_t number) {
-    std::ostringstream path;
-    path << resource_path << ".ticket." << std::setw(20) << std::setfill('0')
-         << number;
-    return path.str();
-  }
-
-  void wait_until_first(const std::string &resource_path) {
-    const auto slash = resource_path.find_last_of('/');
-    const std::string directory =
-        slash == std::string::npos ? "." : resource_path.substr(0, slash);
-    const std::string prefix =
-        (slash == std::string::npos ? resource_path
-                                    : resource_path.substr(slash + 1)) +
-        ".ticket.";
-
-    while (true) {
-      uint64_t first_active = ticket_number_;
-      std::string scan_error;
-      DIR *dir = opendir(directory.c_str());
-      if (dir == nullptr) {
-        throw std::runtime_error("failed to scan physical growth tickets in " +
-                                 directory + ": " + std::strerror(errno));
-      }
-
-      while (dirent *entry = readdir(dir)) {
-        const std::string name(entry->d_name);
-        if (name.compare(0, prefix.size(), prefix) != 0) {
-          continue;
-        }
-        const std::string suffix = name.substr(prefix.size());
-        if (suffix.empty() ||
-            !std::all_of(suffix.begin(), suffix.end(), [](unsigned char value) {
-              return std::isdigit(value);
-            })) {
-          continue;
-        }
-
-        uint64_t number = 0;
-        try {
-          number = std::stoull(suffix);
-        } catch (const std::exception &) {
-          continue;
-        }
-        if (number >= first_active || number == ticket_number_) {
-          continue;
-        }
-
-        const std::string path = directory + "/" + name;
-        const int fd = open(path.c_str(), O_CLOEXEC | O_NOFOLLOW | O_RDWR);
-        if (fd < 0) {
-          if (errno == ENOENT) {
-            continue;
-          }
-          scan_error = "failed to open physical growth ticket " + path + ": " +
-                       std::strerror(errno);
-          break;
-        }
-        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
-          (void)unlink(path.c_str());
-          (void)flock(fd, LOCK_UN);
-        } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-          first_active = std::min(first_active, number);
-        } else {
-          scan_error = "failed to inspect physical growth ticket " + path +
-                       ": " + std::strerror(errno);
-        }
-        (void)close(fd);
-        if (!scan_error.empty()) {
-          break;
-        }
-      }
-      (void)closedir(dir);
-
-      if (!scan_error.empty()) {
-        throw std::runtime_error(scan_error);
-      }
-
-      if (first_active == ticket_number_) {
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-
-  void cleanup_ticket() noexcept {
-    if (ticket_fd_ >= 0) {
-      (void)flock(ticket_fd_, LOCK_UN);
-      (void)close(ticket_fd_);
-      ticket_fd_ = -1;
-    }
-    if (!ticket_path_.empty()) {
-      (void)unlink(ticket_path_.c_str());
-      ticket_path_.clear();
-    }
-  }
-
-  void record_last_owner() noexcept {
-    const int queue_fd =
-        open(queue_path_.c_str(), O_CLOEXEC | O_NOFOLLOW | O_RDWR);
-    if (queue_fd < 0 || flock(queue_fd, LOCK_EX) != 0) {
-      if (queue_fd >= 0) {
-        (void)close(queue_fd);
-      }
-      return;
-    }
-    try {
-      QueueState state = read_queue_state(queue_fd);
-      state.last_owner = owner_token_;
-      write_queue_state(queue_fd, state);
-    } catch (const std::exception &) {
-      // Fairness metadata is advisory; the physical growth lock still
-      // preserves correctness if this best-effort update fails.
-    }
-    (void)flock(queue_fd, LOCK_UN);
-    (void)close(queue_fd);
-  }
-
-  std::string queue_path_;
-  int ticket_fd_;
-  uint64_t ticket_number_;
-  uint64_t owner_token_;
-  bool turn_acquired_;
-  uint64_t wait_us_;
-  std::string ticket_path_;
-};
-
-class PhysicalGrowthGuard {
-public:
-  PhysicalGrowthGuard(int dev_idx, size_t required_bytes,
-                      PhysicalGrowthOperationStats *stats)
-      : path_(physical_gpu_lock_path(dev_idx)), ticket_(path_), fd_(-1) {
-    if (stats != nullptr) {
-      stats->ticket_wait_us = ticket_.wait_us();
-    }
-    const std::string &path = path_;
-    fd_ = open(path.c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0660);
-    if (fd_ < 0) {
-      throw std::runtime_error("failed to open physical GPU growth lock " +
-                               path + ": " + std::strerror(errno));
-    }
-    if (flock(fd_, LOCK_EX) != 0) {
-      const int lock_errno = errno;
-      close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("failed to acquire physical GPU growth lock " +
-                               path + ": " + std::strerror(lock_errno));
-    }
-
-    try {
-      validate_physical_capacity(dev_idx, required_bytes, stats);
-    } catch (...) {
-      (void)flock(fd_, LOCK_UN);
-      (void)close(fd_);
-      fd_ = -1;
-      throw;
-    }
-  }
-
-  PhysicalGrowthGuard(const PhysicalGrowthGuard &) = delete;
-  PhysicalGrowthGuard &operator=(const PhysicalGrowthGuard &) = delete;
-
-  ~PhysicalGrowthGuard() {
-    if (fd_ >= 0) {
-      (void)flock(fd_, LOCK_UN);
-      (void)close(fd_);
-    }
-  }
-
-private:
-  std::string path_;
-  FairFileTicket ticket_;
-  int fd_;
-};
-
 size_t checked_transaction_bytes(size_t bytes_per_offset, size_t offset_count) {
   if (offset_count != 0 &&
       bytes_per_offset > std::numeric_limits<size_t>::max() / offset_count) {
@@ -512,6 +186,7 @@ std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
 std::mutex FTensorAllocator::g_allocator_mutex_;
 torch::stable::Device FTensorAllocator::g_device_(torch::headeronly::kCPU);
 bool FTensorAllocator::g_contiguous_layout_ = false;
+std::string FTensorAllocator::g_instance_name_;
 
 static inline std::shared_ptr<Page>
 make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
@@ -558,17 +233,36 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
+  std::optional<BudgetMutation> mutation;
+  try {
+    mutation.emplace(budget_);
+  } catch (const std::exception &error) {
+    // Accounting failure must not prevent native teardown. Page release keeps
+    // its receipt charged when the ledger cannot be safely updated.
+    LOGGER(ERROR, "KV teardown accounting unavailable: %s", error.what());
+  }
   prepared_map_transactions_.clear();
+  failed_map_cleanup_.clear();
   pending_unmap_.reset();
   finalized_unmap_transactions_.clear();
   finalized_unmap_order_.clear();
+  // A failed restore can leave a mapped page owned outside its FTensor.
+  // Return those owners before whole-tensor teardown confirms unmapping, so
+  // their receipts are refunded only after both unmap and release succeed.
+  for (auto &mapping : failed_unmap_retained_) {
+    if (mapping.page)
+      mapping.ftensor->failed_pages_.push_back(std::move(mapping.page));
+  }
+  failed_unmap_retained_.clear();
   ftensors_.clear();
   contiguous_kv_tensor_.reset();
   zero_page_.reset();
+  failed_unmap_retained_.clear();
 }
 
 void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
-                            bool contiguous_layout) {
+                            bool contiguous_layout,
+                            const std::string &instance_name) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (!g_allocators_.empty()) {
     LOGGER(ERROR, "FTensorAllocator has been initialized. Re-initializing...");
@@ -592,6 +286,11 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   torch::stable::Device device(dev_str);
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
+  const char *explicit_name = std::getenv("KVCACHED_IPC_NAME");
+  g_instance_name_ = !instance_name.empty() ? instance_name
+                     : explicit_name && *explicit_name
+                         ? std::string(explicit_name)
+                         : "kvcached_native_" + std::to_string(getpid());
   g_allocators_[0] =
       std::make_unique<FTensorAllocator>(device, contiguous_layout);
 }
@@ -606,6 +305,7 @@ FTensorAllocator *FTensorAllocator::global_allocator(int64_t group_id) {
            "FTensorAllocator::init() must be called first");
     g_allocators_[group_id] =
         std::make_unique<FTensorAllocator>(g_device_, g_contiguous_layout_);
+    g_allocators_[group_id]->group_id_ = group_id;
     return g_allocators_[group_id].get();
   }
   return it->second.get();
@@ -671,6 +371,51 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
   }
 }
 
+int64_t FTensorAllocator::sample_budget_capacity_() {
+  PhysicalGrowthOperationStats stats;
+  validate_physical_capacity(resolve_device_index(dev_), 0, &stats);
+  const bool deficit = stats.headroom_bytes > stats.free_bytes;
+  const auto difference = deficit ? stats.headroom_bytes - stats.free_bytes
+                                  : stats.free_bytes - stats.headroom_bytes;
+  if (difference > static_cast<uint64_t>(INT64_MAX))
+    throw std::overflow_error("GPU capacity sample exceeds signed byte range");
+  return deficit ? -static_cast<int64_t>(difference)
+                 : static_cast<int64_t>(difference);
+}
+
+void FTensorAllocator::ensure_budget_locked_() {
+  if (budget_ || !dev_.is_cuda())
+    return;
+  auto budget = GpuBudget::connect(
+      physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v1",
+      [this] { return sample_budget_capacity_(); });
+  const auto slot = budget->register_pool(g_instance_name_, group_id_);
+  budget_slot_ = slot;
+  budget_ = std::move(budget);
+}
+
+BudgetSnapshot FTensorAllocator::physical_budget_state() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  return budget_ ? budget_->snapshot(budget_slot_) : BudgetSnapshot{};
+}
+
+std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
+                                                        uint64_t revision) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  if (!budget_)
+    throw std::runtime_error("physical budget requires a GPU allocator");
+  return budget_->set_instance_limit(budget_slot_, bytes, revision);
+}
+
+bool FTensorAllocator::recalibrate_physical_budget() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  return budget_ &&
+         budget_->recalibrate([this] { return sample_budget_capacity_(); });
+}
+
 bool FTensorAllocator::kv_tensors_created() {
   std::lock_guard<std::mutex> lock(mtx_);
   return num_layers_ > 0;
@@ -691,95 +436,45 @@ FTensorAllocator::map_to_kv_tensors_with_result(
   reject_if_unmap_pending_locked_("map KV tensors");
   reject_if_map_overlaps_locked_(offsets);
 
-  using MappingTarget = std::pair<FTensor *, offset_t>;
-  struct MappingGroup {
-    offset_t logical_offset;
-    std::vector<MappingTarget> targets;
-  };
-
-  std::vector<MappingGroup> groups;
-  groups.reserve(offsets.size());
+  std::vector<offset_t> newly_mapped_offsets;
+  std::vector<std::pair<FTensor *, offset_t>> targets;
+  std::unordered_set<offset_t> seen;
   for (auto offset : offsets) {
-    MappingGroup group{offset, {}};
-    if (contiguous_layout_) {
-      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
-    } else {
-      for (int64_t i = 0; i < num_layers_; i++) {
-        auto kv_name = std::string(kv_prefix) + std::to_string(i);
-        auto ftensor = ftensors_[kv_name].get();
-        group.targets.emplace_back(ftensor, offset);
-        // MLA has one combined KV buffer, so it has no separate V region.
-        if (!unified_pool_ && num_kv_buffers_ != 1) {
-          auto v_base_offset =
-              get_v_base_offset(ftensor->get_tensor(), page_size_);
-          group.targets.emplace_back(ftensor, offset + v_base_offset);
-        }
-      }
-    }
-    groups.push_back(std::move(group));
+    if (!seen.insert(offset).second)
+      continue;
+    auto group = mapping_targets_({offset});
+    size_t existing = 0;
+    for (const auto &[tensor, target] : group)
+      existing += tensor->is_mapped(target) ? 1 : 0;
+    if (existing == group.size())
+      continue;
+    if (existing != 0)
+      throw StateConsistencyError(
+          "state_inconsistency: logical KV offset is only partially mapped: " +
+          std::to_string(offset));
+    newly_mapped_offsets.push_back(offset);
+    targets.insert(targets.end(), group.begin(), group.end());
   }
 
-  std::vector<MappingTarget> mapped;
-  std::vector<offset_t> newly_mapped_offsets;
-  bool new_mapping_damaged = false;
+  std::vector<ReservedMapping> reserved;
   try {
-    for (const auto &group : groups) {
-      size_t existing = 0;
-      for (const auto &[ftensor, offset] : group.targets) {
-        existing += ftensor->is_mapped_(offset) ? 1 : 0;
-      }
-      if (existing == group.targets.size()) {
-        continue;
-      }
-      if (existing != 0) {
-        throw StateConsistencyError("state_inconsistency: logical KV offset is "
-                                    "only partially mapped: " +
-                                    std::to_string(group.logical_offset));
-      }
-
-      for (const auto &[ftensor, offset] : group.targets) {
-        try {
-          if (!ftensor->map(offset)) {
-            throw std::runtime_error("physical page map returned false");
-          }
-        } catch (const StateConsistencyError &) {
-          new_mapping_damaged = true;
-          throw;
-        }
-        mapped.emplace_back(ftensor, offset);
-      }
-      newly_mapped_offsets.push_back(group.logical_offset);
-    }
+    reserve_targets_(targets, reserved, nullptr);
+    map_reserved_targets_(reserved, nullptr);
   } catch (const std::exception &error) {
-    std::vector<std::string> rollback_errors;
-    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
-      try {
-        if (!it->first->unmap(it->second)) {
-          rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                       " returned false");
-        }
-      } catch (const std::exception &rollback_error) {
-        rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                     ": " + rollback_error.what());
+    const bool damaged = dynamic_cast<const StateConsistencyError *>(&error);
+    try {
+      release_reserved_locked_(reserved);
+    } catch (const std::exception &cleanup) {
+      for (auto &mapping : reserved) {
+        if (mapping.page || mapping.attached || mapping.damaged)
+          failed_map_cleanup_.push_back(std::move(mapping));
       }
-    }
-    if (!rollback_errors.empty() || new_mapping_damaged) {
-      std::string message =
+      throw MapQuarantinedError(
           std::string("state_inconsistency: KV map failed: ") + error.what() +
-          "; rollback failed: ";
-      for (size_t i = 0; i < rollback_errors.size(); ++i) {
-        if (i != 0) {
-          message += "; ";
-        }
-        message += rollback_errors[i];
-      }
-      // A pre-existing partial mapping is not known to be unpublished.
-      if (!new_mapping_damaged &&
-          dynamic_cast<const StateConsistencyError *>(&error)) {
-        throw StateConsistencyError(message);
-      }
-      throw MapQuarantinedError(message);
+          "; rollback failed: " + cleanup.what());
     }
+    if (damaged)
+      throw MapQuarantinedError(error.what());
     throw;
   }
   return {true, std::move(newly_mapped_offsets)};
@@ -846,10 +541,9 @@ void FTensorAllocator::reserve_targets_(
   const auto admission_started = std::chrono::steady_clock::now();
   bool admission_finished = false;
   try {
-    // Reserve the physical CUDA handles while holding the process-shared fair
-    // turn. Mapping the already-resident handles into virtual addresses is
-    // local bookkeeping and intentionally happens after this critical section.
-    std::unique_ptr<PhysicalGrowthGuard> growth_guard;
+    // Charge the complete batch once. CUDA allocation and mapping never hold
+    // the process-shared accounting lock.
+    std::unique_ptr<BudgetGrant> grant;
     size_t required_bytes = 0;
     for (const auto &[ftensor, offset] : targets) {
       if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
@@ -862,8 +556,38 @@ void FTensorAllocator::reserve_targets_(
       required_bytes += ftensor->page_size_;
     }
     if (dev_.is_cuda() && required_bytes != 0) {
-      growth_guard = std::make_unique<PhysicalGrowthGuard>(
-          resolve_device_index(dev_), required_bytes, stats);
+      ensure_budget_locked_();
+      BudgetSnapshot state;
+      auto record_admission = [&] {
+        if (!stats)
+          return;
+        stats->required_bytes = required_bytes;
+        stats->capacity_checks = 1;
+        const auto gpu_available =
+            state.budget_bytes > state.charged_bytes
+                ? state.budget_bytes - state.charged_bytes
+                : 0;
+        const auto instance_available =
+            state.instance_limit_bytes > state.instance_charged_bytes
+                ? state.instance_limit_bytes - state.instance_charged_bytes
+                : 0;
+        stats->usable_bytes = std::min(gpu_available, instance_available);
+      };
+      try {
+        grant = budget_->grant(budget_slot_, required_bytes, &state,
+                               [this] { return sample_budget_capacity_(); });
+      } catch (const std::runtime_error &error) {
+        record_admission();
+        if (std::string(error.what()).find("capacity_exhausted:") == 0 &&
+            stats) {
+          stats->capacity_rejections = 1;
+          stats->shortfall_bytes = required_bytes > stats->usable_bytes
+                                       ? required_bytes - stats->usable_bytes
+                                       : 0;
+        }
+        throw;
+      }
+      record_admission();
     }
     if (stats != nullptr) {
       stats->admission_us = static_cast<uint64_t>(
@@ -878,10 +602,22 @@ void FTensorAllocator::reserve_targets_(
       if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
         reserved.push_back(ReservedMapping{ftensor, offset, nullptr});
       } else {
-        reserved.push_back(
-            ReservedMapping{ftensor, offset, ftensor->reserve_page(offset)});
+        auto receipt = grant ? grant->take(ftensor->page_size_) : nullptr;
+        std::unique_ptr<Page> page;
+        try {
+          page = ftensor->reserve_page(offset);
+        } catch (...) {
+          if (receipt)
+            receipt->release();
+          throw;
+        }
+        if (receipt)
+          page->attach_budget(std::move(receipt));
+        reserved.push_back(ReservedMapping{ftensor, offset, std::move(page)});
       }
     }
+    if (grant)
+      grant->finish();
   } catch (const std::exception &error) {
     if (stats != nullptr && !admission_finished) {
       stats->admission_us = static_cast<uint64_t>(
@@ -917,8 +653,15 @@ bool FTensorAllocator::map_reserved_targets_(
         }
         continue;
       }
-      if (!mapping.ftensor->map_reserved(mapping.offset, mapping.page)) {
-        throw std::runtime_error("Reserved KV page map returned false");
+      try {
+        if (!mapping.ftensor->map_reserved(mapping.offset, mapping.page))
+          throw std::runtime_error("Reserved KV page map returned false");
+        mapping.attached = true;
+      } catch (const StateConsistencyError &) {
+        // FTensor retains the uncertain resource. Do not erase this transaction
+        // or pretend that abort can safely make its credit available again.
+        mapping.damaged = true;
+        throw;
       }
     }
   } catch (const std::exception &error) {
@@ -928,7 +671,7 @@ bool FTensorAllocator::map_reserved_targets_(
               std::chrono::steady_clock::now() - map_started)
               .count());
     }
-    // Distributed commits retain mapped pages for reconciliation/adoption.
+    // The caller rolls back only this transaction's newly attached pages.
     // Preserve the native quarantine/state-consistency exception contract.
     throw;
   }
@@ -1011,8 +754,9 @@ FTensorAllocator::commit_prepared_map(const std::string &transaction_id) {
     prepared_map_transactions_.erase(found);
     return {success, stats};
   } catch (...) {
-    // Already-mapped pages belong to their FTensor and remain available for
-    // adoption. Release only handles that have not been attached to an address.
+    // Undo newly attached pages as well as unused handles. Adopted pages are
+    // never marked attached, so rollback preserves their previous ownership.
+    // A cleanup failure retains the transaction for a later abort retry.
     release_reserved_locked_(found->second.mappings);
     prepared_map_transactions_.erase(found);
     throw;
@@ -1033,12 +777,28 @@ bool FTensorAllocator::abort_prepared_map(const std::string &transaction_id) {
 
 void FTensorAllocator::release_reserved_locked_(
     std::vector<ReservedMapping> &reserved) {
+  BudgetMutation mutation(budget_);
+  bool damaged = false;
   for (auto &mapping : reserved) {
+    if (mapping.damaged) {
+      damaged = true;
+      continue;
+    }
+    if (mapping.attached) {
+      if (!mapping.ftensor->unmap_retain_(mapping.offset, mapping.page))
+        throw StateConsistencyError(
+            "prepared map rollback lost an attached page");
+      mapping.attached = false;
+    }
     if (mapping.page) {
       mapping.page->release();
       mapping.page.reset();
     }
   }
+  mutation.finish();
+  if (damaged)
+    throw StateConsistencyError("prepared map cleanup pending: uncertain VMM "
+                                "mapping requires allocator teardown");
 }
 
 bool FTensorAllocator::has_prepared_map(
@@ -1247,6 +1007,7 @@ void FTensorAllocator::restore_retained_locked_(
 
 void FTensorAllocator::release_retained_locked_(
     std::vector<RetainedMapping> &retained) {
+  BudgetMutation mutation(budget_);
   for (auto &mapping : retained) {
     if (mapping.page) {
       // Keep failed handles owned, including across an idempotent commit retry.

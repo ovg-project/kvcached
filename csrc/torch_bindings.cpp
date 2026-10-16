@@ -44,9 +44,9 @@ namespace kvcached {
 // ---------------------------------------------------------------------------
 
 void init_kvcached(std::string dev_str, int64_t page_size,
-                   bool contiguous_layout) {
+                   bool contiguous_layout, std::string instance_name) {
   FTensorAllocator::init(dev_str, static_cast<size_t>(page_size),
-                         contiguous_layout);
+                         contiguous_layout, instance_name);
 }
 
 void shutdown_kvcached() { FTensorAllocator::shutdown(); }
@@ -161,6 +161,41 @@ bool abort_prepared_map(const std::string &transaction_id,
   py::gil_scoped_release release;
   return FTensorAllocator::global_allocator(group_id)->abort_prepared_map(
       transaction_id);
+}
+
+py::dict physical_budget_state(int64_t group_id = 0) {
+  BudgetSnapshot state;
+  {
+    py::gil_scoped_release release;
+    state =
+        FTensorAllocator::global_allocator(group_id)->physical_budget_state();
+  }
+  py::dict result;
+  result["budget_bytes"] = state.budget_bytes;
+  result["charged_bytes"] = state.charged_bytes;
+  result["instance_charged_bytes"] = state.instance_charged_bytes;
+  result["instance_limit_bytes"] = state.instance_limit_bytes;
+  result["active_mutations"] = state.active_mutations;
+  result["sync_acquisitions"] = state.sync_acquisitions;
+  result["sync_contentions"] = state.sync_contentions;
+  result["sync_acquire_ns"] = state.sync_acquire_ns;
+  result["sync_wait_ns"] = state.sync_wait_ns;
+  result["sync_cas_retries"] = state.sync_cas_retries;
+  result["sync_dead_owner_recoveries"] = state.sync_dead_owner_recoveries;
+  return result;
+}
+
+std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision,
+                                      int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)
+      ->set_instance_budget_limit(bytes, revision);
+}
+
+bool recalibrate_physical_budget(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)
+      ->recalibrate_physical_budget();
 }
 
 bool has_prepared_map(const std::string &transaction_id, int64_t group_id = 0) {
@@ -347,7 +382,7 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 // Register the KV tensor ops in the "kvcached" dispatcher namespace.
 STABLE_TORCH_LIBRARY(kvcached, m) {
   m.def("init_kvcached(str dev_str, int page_size=0, bool "
-        "contiguous_layout=True) -> ()");
+        "contiguous_layout=True, str instance_name='') -> ()");
   m.def("shutdown_kvcached() -> ()");
   m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
         "num_layers, int num_kv_buffers=2, int group_id=0, bool "
@@ -383,6 +418,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("map_to_kv_tensors_with_result",
         &kvcached::map_to_kv_tensors_with_result,
         "map_to_kv_tensors_with_result", py::arg("offsets"),
+        py::arg("group_id") = 0);
+  m.def("physical_budget_state", &kvcached::physical_budget_state,
+        py::arg("group_id") = 0);
+  m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
+        py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);
+  m.def("recalibrate_physical_budget", &kvcached::recalibrate_physical_budget,
         py::arg("group_id") = 0);
   m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
         "prepare_map_to_kv_tensors", py::arg("transaction_id"),

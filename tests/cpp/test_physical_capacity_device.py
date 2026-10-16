@@ -23,7 +23,7 @@ def main() -> None:
     # Allow the identical regression to run against the pre-fix source.
     guard = (section(allocator, "class ScopedDeviceGuard {", "\nvoid validate_physical_capacity")
              if "class ScopedDeviceGuard {" in allocator else "")
-    capacity = section(allocator, "void validate_physical_capacity(", "\nclass FairFileTicket")
+    capacity = section(allocator, "void validate_physical_capacity(", "\nsize_t checked_transaction_bytes")
     mock_runtime = r'''
 #include <cassert>
 #include <cerrno>

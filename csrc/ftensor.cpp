@@ -111,6 +111,12 @@ FTensor::~FTensor() {
         LOGGER(ERROR, "mem_unmap during FTensor cleanup failed: %s",
                gpu_vmm::error_string(res));
       }
+      if (gpu_vmm::is_success(res)) {
+        for (auto &entry : mapping_)
+          entry.second->record_unmap();
+        for (auto &page : failed_pages_)
+          page->record_unmap();
+      }
       res = gpu_vmm::address_free(vaddr_, size_);
       if (!gpu_vmm::is_success(res)) {
         LOGGER(ERROR, "address_free during FTensor cleanup failed: %s",
@@ -167,6 +173,7 @@ bool FTensor::map(offset_t offset) {
         throw_rollback_error("physical page map", original_error,
                              gpu_vmm::error_string(status));
       }
+      page->record_unmap();
     }
     try {
       if (!map_(zero_page_.get(), offset)) {
@@ -241,6 +248,7 @@ bool FTensor::map_reserved(offset_t offset, std::unique_ptr<Page> &page) {
         throw_rollback_error("reserved physical page map", original_error,
                              gpu_vmm::error_string(status));
       }
+      page->record_unmap();
     }
     try {
       if (!map_(zero_page_.get(), offset)) {
@@ -300,6 +308,7 @@ bool FTensor::unmap_retain_(offset_t offset,
   if (dev_.is_cuda()) {
     throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
                        "physical page unmap");
+    mapping->second->record_unmap();
   }
 
   try {
@@ -360,6 +369,7 @@ bool FTensor::restore_mapping_(offset_t offset,
         throw_rollback_error("physical page restore", original_error,
                              gpu_vmm::error_string(status));
       }
+      retained_page->record_unmap();
     }
     try {
       if (!map_(zero_page_.get(), offset)) {

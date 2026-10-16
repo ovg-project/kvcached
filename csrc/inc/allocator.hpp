@@ -17,6 +17,7 @@
 
 #include "constants.hpp"
 #include "ftensor.hpp"
+#include "gpu_budget.hpp"
 #include "page.hpp"
 #include "torch_utils.hpp"
 
@@ -72,16 +73,22 @@ public:
   // global_allocator(group_id) returns the allocator for the given group,
   // lazily creating one if it doesn't exist yet.
   static void init(const std::string &dev_str, size_t page_size = 0,
-                   bool contiguous_layout = false);
+                   bool contiguous_layout = false,
+                   const std::string &instance_name = "");
   static void shutdown();
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();
+  BudgetSnapshot physical_budget_state();
+  std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
+  bool recalibrate_physical_budget();
 
 private:
   struct ReservedMapping {
     FTensor *ftensor;
     offset_t offset;
     std::unique_ptr<Page> page;
+    bool attached = false;
+    bool damaged = false;
   };
 
   struct PreparedMapTransaction {
@@ -113,7 +120,7 @@ private:
                    bool adopt_existing_mappings = false);
   bool map_reserved_targets_(std::vector<ReservedMapping> &reserved,
                              PhysicalGrowthOperationStats *stats);
-  static void release_reserved_locked_(std::vector<ReservedMapping> &reserved);
+  void release_reserved_locked_(std::vector<ReservedMapping> &reserved);
 
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
@@ -134,7 +141,7 @@ private:
   unmap_retain_locked_(const std::vector<offset_t> &offsets);
   void restore_retained_locked_(std::vector<RetainedMapping> &retained,
                                 const std::string &original_error);
-  static void release_retained_locked_(std::vector<RetainedMapping> &retained);
+  void release_retained_locked_(std::vector<RetainedMapping> &retained);
   void remember_unmap_outcome_locked_(const std::string &transaction_id,
                                       UnmapTransactionOutcome outcome);
   void reject_if_unmap_pending_locked_(const char *operation) const;
@@ -151,6 +158,7 @@ private:
   // Device and layout from init(), used to create new group allocators.
   static torch::stable::Device g_device_;
   static bool g_contiguous_layout_;
+  static std::string g_instance_name_;
 
   torch::stable::Device dev_;
   size_t page_size_;
@@ -159,11 +167,17 @@ private:
   int64_t num_kv_buffers_; // 2 for separate K/V, 1 for a combined buffer.
   bool contiguous_layout_;
   bool unified_pool_;
+  int64_t group_id_ = 0;
+  std::shared_ptr<GpuBudget> budget_;
+  size_t budget_slot_ = 0;
+  void ensure_budget_locked_();
+  int64_t sample_budget_capacity_();
   size_t kv_tensor_size_per_layer_;
   size_t physical_bytes_per_offset_ = 0;
   std::unordered_map<std::string, PreparedMapTransaction>
       prepared_map_transactions_;
 
+  std::vector<ReservedMapping> failed_map_cleanup_;
   mutable std::mutex mtx_;
   // For per-layer layout: one tensor per layer
   std::unordered_map<std::string, std::unique_ptr<FTensor>> ftensors_;

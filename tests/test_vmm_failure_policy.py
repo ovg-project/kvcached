@@ -33,9 +33,10 @@ def fault_library(tmp_path_factory):
     return library
 
 
-@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup"])
-def test_native_failure_policy(fault_library, case):
+@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup", "retained-teardown", "missing-ledger-teardown", "budget-identity"])
+def test_native_failure_policy(fault_library, case, tmp_path):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
+               KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path),
                KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="0",
                KVCACHED_IPC_NAME=f"f418-{os.getpid()}-{case}",
                ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0")
@@ -90,9 +91,7 @@ def _native_case(case):
             driver.kvcached_fault_release(2)
             with pytest.raises(StateConsistencyError, match="physical page release"):
                 vmm_ops.commit_prepared_map(transaction_id, 0)
-            remaining = 2
-            tensors[0][:128].fill_(7)
-            torch.cuda.synchronize(device)
+            remaining = 3
 
         hits = driver.kvcached_fault_hits()
         assert hits == (1 if case.startswith("abort-reserved-") else 2)
@@ -116,13 +115,12 @@ def _native_case(case):
         assert vmm_ops.abort_prepared_map(transaction_id, 0)
         assert driver.kvcached_fault_release_calls() == remaining
         assert not vmm_ops.has_prepared_map(transaction_id, 0)
+        assert vmm_ops.physical_budget_state()["charged_bytes"] == 0
 
         retry = vmm_ops.prepare_map_to_kv_tensors("retry", [0], 0)
         assert retry["success"]
-        assert retry["required_bytes"] == (3 if case == "commit-cleanup" else 4) * page_size
+        assert retry["required_bytes"] == 4 * page_size
         assert vmm_ops.commit_prepared_map("retry", 0)["success"]
-        if case == "commit-cleanup":
-            assert bool((tensors[0][:128] == 7).all())
         for tensor in tensors:
             for start in (0, tensor.numel() // 2):
                 tensor[start:start + 128].fill_(9)
@@ -130,6 +128,91 @@ def _native_case(case):
         torch.cuda.synchronize(device)
         assert vmm_ops.unmap_from_kv_tensors([0], 0)
         print(f"RESERVATION_CLEANUP case={case} hits={hits + 1} retained=1 recovered=1", flush=True)
+    elif case in ("missing-ledger-teardown", "budget-identity"):
+        from kvcached import utils
+
+        # A peer keeps the ledger epoch and its independent instance cap alive.
+        observer_code = """
+import sys
+from kvcached import utils, vmm_ops
+utils.DEFAULT_IPC_NAME = "resolved-peer"
+vmm_ops.init_kvcached("cuda:0", 2 * 1024 * 1024, False)
+assert vmm_ops.set_instance_budget_limit(0, 1) == "applied"
+print("READY", flush=True)
+expected = int(sys.stdin.readline())
+assert vmm_ops.physical_budget_state()["charged_bytes"] == expected
+vmm_ops.shutdown_kvcached()
+"""
+        observer = subprocess.Popen([sys.executable, "-c", observer_code],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        try:
+            assert observer.stdout is not None and observer.stdout.readline().strip() == "READY"
+            assert vmm_ops.physical_budget_state()["instance_limit_bytes"] == (1 << 64) - 1
+            assert vmm_ops.map_to_kv_tensors([0], 0)
+            if case == "missing-ledger-teardown":
+                paths = list(Path(os.environ["KVCACHED_PHYSICAL_GROWTH_LOCK_DIR"]).glob("*.budget*"))
+                assert len(paths) == 1
+                ledger = paths[0]
+                retained = ledger.with_name(ledger.name + ".retained")
+                ledger.rename(retained)
+                driver.kvcached_fault_release_calls.restype = ctypes.c_int
+                driver.kvcached_fault_arm(0, 0, 0)
+                try:
+                    vmm_ops.shutdown_kvcached()
+                    assert driver.kvcached_fault_release_calls() == 5
+                finally:
+                    retained.rename(ledger)
+                expected_charge = 4 * page_size  # Free succeeded; unconfirmed credit stays charged.
+            else:
+                vmm_ops.shutdown_kvcached()
+                utils.DEFAULT_IPC_NAME = "resolved-main-second"
+                vmm_ops.init_kvcached(f"cuda:{device}", page_size, False)
+                assert vmm_ops.physical_budget_state()["instance_limit_bytes"] == (1 << 64) - 1
+                assert vmm_ops.set_instance_budget_limit(page_size, 1) == "applied"
+                expected_charge = 0
+            stdout, stderr = observer.communicate(f"{expected_charge}\n", timeout=30)
+            assert observer.returncode == 0, stdout + stderr
+        finally:
+            if observer.poll() is None:
+                observer.kill()
+            observer.communicate()
+    elif case == "retained-teardown":
+        assert vmm_ops.map_to_kv_tensors([0], 0)
+        assert vmm_ops.prepare_unmap_from_kv_tensors([0], "retained", 0)
+        # Keep this ledger epoch alive across the allocator's shutdown.
+        observer_code = """
+import sys
+from kvcached import vmm_ops
+vmm_ops.init_kvcached("cuda:0", 2 * 1024 * 1024, False)
+vmm_ops.physical_budget_state()
+print("READY", flush=True)
+sys.stdin.readline()
+assert vmm_ops.physical_budget_state()["charged_bytes"] == 0
+vmm_ops.shutdown_kvcached()
+"""
+        observer = subprocess.Popen([sys.executable, "-c", observer_code],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        try:
+            assert observer.stdout is not None and observer.stdout.readline().strip() == "READY"
+            driver.kvcached_fault_access.argtypes = [ctypes.c_int]
+            # Restoration maps a real page, then access setup and rollback
+            # unmap fail. That page remains in failed_unmap_retained_.
+            driver.kvcached_fault_arm(0, 2, 0)
+            driver.kvcached_fault_access(1)
+            with pytest.raises(StateConsistencyError, match="rollback failed"):
+                vmm_ops.abort_unmap_from_kv_tensors("retained", 0)
+            assert driver.kvcached_fault_hits() == 2
+            assert vmm_ops.physical_budget_state()["charged_bytes"] == 4 * page_size
+            driver.kvcached_fault_arm(0, 0, 0)
+            vmm_ops.shutdown_kvcached()
+            stdout, stderr = observer.communicate("check\n", timeout=30)
+            assert observer.returncode == 0, stdout + stderr
+        finally:
+            if observer.poll() is None:
+                observer.kill()
+            observer.communicate()
     elif case == "reserved-map":
         assert vmm_ops.prepare_map_to_kv_tensors("partial", [0], 0)["success"]
         # K is mapped; removing V's zero page fails before V can be mapped.
@@ -138,21 +221,19 @@ def _native_case(case):
             vmm_ops.commit_prepared_map("partial", 0)
         assert driver.kvcached_fault_hits() == 1
         assert not vmm_ops.has_prepared_map("partial", 0)
-        tensors[0][:128].fill_(7)
-        torch.cuda.synchronize(device)
+        assert vmm_ops.physical_budget_state()["charged_bytes"] == 0
         driver.kvcached_fault_arm(0, 0, 0)
         retry = vmm_ops.prepare_map_to_kv_tensors("retry", [0], 0)
         assert retry["success"]
-        assert retry["required_bytes"] == 3 * page_size
+        assert retry["required_bytes"] == 4 * page_size
         assert vmm_ops.commit_prepared_map("retry", 0)["success"]
-        assert bool((tensors[0][:128] == 7).all())
         for tensor in tensors:
             for start in (0, tensor.numel() // 2):
                 tensor[start:start + 128].fill_(9)
                 assert bool((tensor[start:start + 128] == 9).all())
         torch.cuda.synchronize(device)
         assert vmm_ops.unmap_from_kv_tensors([0], 0)
-        print("RESERVED_MAP_FAULT hits=1 adopted=1 recovered=1", flush=True)
+        print("RESERVED_MAP_FAULT hits=1 rolled_back=1 recovered=1", flush=True)
     elif case.startswith("ipc-"):
         from kvcached import tp_ipc_util as ipc
 
@@ -342,7 +423,7 @@ def _native_case(case):
         from kvcached.lifecycle import LifecycleState
         manager._lifecycle = LifecycleState("vmm-policy-test")
         manager._lifecycle.mark_ready()
-        driver.kvcached_fault_arm(2, 3, 0)
+        driver.kvcached_fault_arm(0, 0, 2)
         assert manager.alloc(1) is None
         assert driver.kvcached_fault_hits() == 2
         driver.kvcached_fault_arm(0, 0, 0)
@@ -368,8 +449,9 @@ def _native_case(case):
         with pytest.raises(StateConsistencyError):
             manager.alloc(1)
     else:
-        # K maps; V creation fails; rollback of K fails. Other calls are real VMM.
-        driver.kvcached_fault_arm(2, 0 if case == "rollback-release" else 3, 0)
+        # Reservation precedes mapping. Either allocation plus release fails,
+        # or V mapping and its zero-page restoration fail. Other calls are real.
+        driver.kvcached_fault_arm(2, 0, 0) if case == "rollback-release" else driver.kvcached_fault_arm(0, 0, 2)
         if case == "rollback-release":
             driver.kvcached_fault_release(1)
         if case == "prealloc":
