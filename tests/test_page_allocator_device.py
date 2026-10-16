@@ -31,6 +31,7 @@ def device_probe(tmp_path_factory):
     compiler = shutil.which("c++")
     if compiler is None:
         pytest.skip("C++ compiler required")
+    assert compiler is not None
     root = Path(__file__).resolve().parents[1]
     allocator = (root / "csrc/allocator.cpp").read_text()
     pages = (root / "csrc/page_allocator.cpp").read_text()
