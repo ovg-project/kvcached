@@ -47,6 +47,10 @@ public:
   // lazily creating one if it doesn't exist yet.
   static void init(const std::string &dev_str, size_t page_size = 0,
                    bool contiguous_layout = false);
+  // All groups share the explicit device resolved by init(). Reading it must
+  // not lazily create a group allocator on the querying thread. Returns -1
+  // when there is no initialized GPU backend (standalone IPC allocators).
+  static int device_index();
   static void shutdown();
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();

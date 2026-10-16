@@ -542,8 +542,21 @@ PageState PageAllocator::get_page_state_unlocked() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
+  const int previous_device = gpu_vmm::current_device();
+  const int pool_device = FTensorAllocator::device_index();
+  const bool change_device = pool_device >= 0 && previous_device != pool_device;
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(pool_device));
+  }
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  const auto status =
+      gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size);
+  // Restore the caller's device even when the query reports an error, then
+  // preserve the existing fatal runtime-error contract.
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(previous_device));
+  }
+  CHECK_GPU(status);
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
