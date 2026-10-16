@@ -41,6 +41,7 @@ kvcached achieves this by decoupling GPU virtual addressing from physical memory
 - **Frontend router and sleep mode**: route requests to the target models and put models to sleep when idle.
 - **Support mainstream serving engines**: integrate with SGLang and vLLM.
 - **Prefix caching**: support automatic prefix caching (APC) with a configurable memory bound. See [the example doc](examples/09_prefix_caching) for details.
+- **Runtime memory reports**: report runtime-owned memory through a shared SGLang/vLLM API. See [runtime reservation reporting](examples/10_runtime_reservations).
 
 ## 📢 Updates
 
