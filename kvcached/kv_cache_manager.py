@@ -1678,6 +1678,7 @@ class KVCacheManager:
         # (which yields block 0 — the null block SGLang requires).
         self.page_allocator.reset_free_page_order()
 
+        pending_shrink_target = self.target_num_blocks
         self.target_num_blocks = None
         self.in_shrink = False
         # clear() freed every page and trimmed; drop the cached value so
@@ -1685,8 +1686,19 @@ class KVCacheManager:
         self._avail_physical_pages_cache = None
         self.num_avail_blocks = 0
 
-        # Possibly reserve the first block as null block for padding tokens
-        self._reserve_null_block()
+        # Rebuild padding before restoring the pending limit: in_shrink blocks
+        # allocation from new pages, including the page needed for block 0.
+        try:
+            self._reserve_null_block()
+        finally:
+            if pending_shrink_target is not None:
+                self.target_num_blocks = pending_shrink_target
+                self.in_shrink = True
+
+        if pending_shrink_target is not None and not self._shutdown_requested.is_set():
+            # A kvctl update may have arrived during null-block reservation.
+            self._apply_resize_target()
+            self._maybe_finish_shrink()
 
     # Private methods
     @synchronized

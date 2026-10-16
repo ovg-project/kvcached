@@ -138,6 +138,19 @@ class ShrinkablePageAllocator:
     def get_num_reserved_pages(self) -> int:
         return 0
 
+    def stop_prealloc_thread(self) -> None:
+        pass
+
+    def start_prealloc_thread(self) -> None:
+        pass
+
+    def trim(self) -> None:
+        pass
+
+    def reset_free_page_order(self) -> None:
+        # alloc_page() already chooses the lowest free ID.
+        pass
+
     def get_page_state(self):
         return {
             "total_pages": self.total_pages,
@@ -184,6 +197,164 @@ def _make_manager(defer_physical_release: bool) -> KVCacheManager:
     manager.null_block = manager.alloc(1)
     assert manager.null_block == [0]
     return manager
+
+
+@pytest.fixture
+def clear_manager(monkeypatch):
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    manager = _make_manager(defer_physical_release=False)
+    manager.num_blocks = manager.logical_num_blocks = NUM_BLOCKS
+    manager._logical_allocated_blocks = 1  # The existing null block.
+    manager.reserve_null_block = True
+    manager._shutdown_requested = threading.Event()
+    manager._shutdown_lock = threading.Lock()
+    return manager
+
+
+@pytest.mark.parametrize("mode", ["no_limit", "applied", "deferred", "free"])
+def test_clear_preserves_the_revisioned_limit(clear_manager, mode):
+    manager = clear_manager
+    target = manager.page_size
+    if mode == "applied":
+        assert manager.set_memory_limit(target, revision=1)["status"] == "applied"
+    blocks = manager.alloc(11 if mode in ("deferred", "free") else 3)
+    assert blocks is not None
+    if mode in ("deferred", "free"):
+        assert manager.set_memory_limit(target, revision=1)["status"] == "deferred"
+    if mode == "free":
+        manager.free(blocks)
+    for _ in range(3):
+        manager.clear()
+        assert manager.null_block == [0]
+        assert manager._logical_allocated_blocks == 1
+        state = manager.memory_limit_state()
+        assert state["status"] == "applied"
+        if mode != "no_limit":
+            assert state["revision"] == 1
+            assert state["effective_limit_bytes"] == target
+            assert state["current_capacity_bytes"] == target
+            assert state["overage_bytes"] == 0
+            assert manager.alloc(8) is None
+            assert manager.set_memory_limit(target, revision=1) == state
+    if mode == "no_limit":
+        assert manager.alloc(8) is not None
+    else:
+        assert manager.set_memory_limit(3 * target, revision=2)["status"] == "applied"
+        blocks = manager.alloc(8)
+        assert blocks is not None and len(set(blocks)) == 8 and 0 not in blocks
+
+
+@pytest.mark.parametrize("reserve_null", [False, True])
+def test_clear_keeps_zero_limit_pending_when_the_null_block_is_required(
+    clear_manager, reserve_null,
+):
+    manager = clear_manager
+    manager.reserve_null_block = reserve_null
+    assert manager.set_memory_limit(0, revision=1)["status"] == "deferred"
+    errors = []
+
+    def clear():
+        try:
+            manager.clear()
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=clear, daemon=True)
+    thread.start()
+    thread.join(timeout=2)
+    timed_out = thread.is_alive()
+    if timed_out:
+        manager._shutdown_requested.set()
+        thread.join(timeout=2)
+    assert not timed_out and not errors
+    state = manager.memory_limit_state()
+    assert state["revision"] == 1 and state["effective_limit_bytes"] == 0
+    assert state["status"] == ("deferred" if reserve_null else "applied")
+    assert manager.null_block == ([0] if reserve_null else None)
+    # A deferred limit can reuse holes on the protected null page; it must
+    # not map another page while waiting for the limit to become applicable.
+    assert manager.alloc(BLOCKS_PER_PAGE) is None
+    assert manager.set_memory_limit(manager.mem_size, revision=2)["status"] == "applied"
+    assert manager.alloc(8) is not None
+
+
+def test_clear_propagates_pending_resize_failure(clear_manager, monkeypatch):
+    manager = clear_manager
+    assert manager.alloc(11) is not None
+    assert manager.set_memory_limit(manager.page_size, revision=1)["status"] == "deferred"
+    error = RuntimeError("resize failed during clear")
+
+    def fail(_size):
+        raise error
+
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    with pytest.raises(RuntimeError) as caught:
+        manager.clear()
+    assert caught.value is error
+    assert manager.in_shrink and manager.target_num_blocks == BLOCKS_PER_PAGE
+    with pytest.raises(RuntimeError) as readiness:
+        manager.wait_ready()
+    assert readiness.value is error
+
+
+def test_clear_preserves_a_refused_shrink_until_retry(clear_manager, monkeypatch):
+    manager = clear_manager
+    assert manager.alloc(11) is not None
+    target = manager.page_size
+    assert manager.set_memory_limit(target, revision=1)["status"] == "deferred"
+    resize = manager.page_allocator.resize
+    monkeypatch.setattr(manager.page_allocator, "resize", lambda size: False)
+    manager.clear()
+    assert manager.null_block == [0]
+    assert manager.memory_limit_state()["status"] == "deferred"
+    assert manager.target_num_blocks == BLOCKS_PER_PAGE
+    assert manager.alloc(BLOCKS_PER_PAGE) is None
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    manager.clear()
+    state = manager.set_memory_limit(target, revision=1)
+    assert state["status"] == "applied"
+    assert state["current_capacity_bytes"] == target
+    assert state["overage_bytes"] == 0
+
+
+def test_clear_keeps_pending_target_if_padding_rebuild_fails(clear_manager, monkeypatch):
+    manager = clear_manager
+    assert manager.alloc(11) is not None
+    assert manager.set_memory_limit(manager.page_size, revision=1)["status"] == "deferred"
+
+    def fail():
+        raise RuntimeError("padding rebuild failed")
+
+    monkeypatch.setattr(manager, "_reserve_null_block", fail)
+    with pytest.raises(RuntimeError, match="padding rebuild failed"):
+        manager.clear()
+    assert manager.in_shrink and manager.target_num_blocks == BLOCKS_PER_PAGE
+
+
+def test_cancelled_clear_keeps_pending_target_without_resizing(clear_manager, monkeypatch):
+    manager = clear_manager
+    assert manager.alloc(11) is not None
+    assert manager.set_memory_limit(manager.page_size, revision=1)["status"] == "deferred"
+    calls = list(manager.page_allocator.resize_calls)
+    monkeypatch.setattr(manager, "_reserve_null_block", manager._shutdown_requested.set)
+    manager.clear()
+    assert manager.in_shrink and manager.target_num_blocks == BLOCKS_PER_PAGE
+    assert manager.page_allocator.resize_calls == calls
+    with pytest.raises(RuntimeError, match=r"clear\(\) cancelled by shutdown"):
+        manager.wait_ready()
+
+
+def test_clear_honors_a_kvctl_update_during_null_reservation(clear_manager, monkeypatch):
+    manager = clear_manager
+    assert manager.alloc(11) is not None
+    assert manager.set_memory_limit(manager.page_size, revision=1)["status"] == "deferred"
+    allocator = manager.page_allocator
+    monkeypatch.setattr(allocator, "reset_free_page_order",
+                        lambda: setattr(allocator, "resize_target", 6 * manager.page_size))
+    manager.clear()
+    assert manager.null_block == [0]
+    assert not manager.in_shrink
+    assert allocator.total_pages == 6
 
 
 class MockBlockPool:
