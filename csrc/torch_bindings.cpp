@@ -27,6 +27,7 @@
 
 #include "allocator.hpp"
 #include "constants.hpp"
+#include "gpu_vmm.hpp"
 #include "page_allocator.hpp"
 #include "torch_utils.hpp"
 #include "transaction_error.hpp"
@@ -43,9 +44,9 @@ namespace kvcached {
 // ---------------------------------------------------------------------------
 
 void init_kvcached(std::string dev_str, int64_t page_size,
-                   bool contiguous_layout) {
+                   bool contiguous_layout, std::string instance_name) {
   FTensorAllocator::init(dev_str, static_cast<size_t>(page_size),
-                         contiguous_layout);
+                         contiguous_layout, instance_name);
 }
 
 void shutdown_kvcached() { FTensorAllocator::shutdown(); }
@@ -91,6 +92,116 @@ map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors_with_result(offsets);
+}
+
+std::string current_device_pci_bus_id() {
+  py::gil_scoped_release release;
+  char pci_bus_id[64] = {};
+  const int device_index = gpu_vmm::current_device();
+  const auto status = gpu_vmm::device_get_pci_bus_id(
+      pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), device_index);
+  if (!gpu_vmm::is_success(status)) {
+    throw std::runtime_error(std::string("failed to resolve physical GPU: ") +
+                             gpu_vmm::error_string(status));
+  }
+  return std::string(pci_bus_id);
+}
+
+namespace {
+
+py::dict physical_growth_result(bool success,
+                                const PhysicalGrowthOperationStats &stats,
+                                bool include_reservation_timing) {
+  py::dict result;
+  result["success"] = success;
+  if (include_reservation_timing) {
+    result["ticket_wait_us"] = stats.ticket_wait_us;
+    result["admission_us"] = stats.admission_us;
+    result["reserve_us"] = stats.reserve_us;
+  }
+  result["map_us"] = stats.map_us;
+  result["offsets_count"] = stats.offsets_count;
+  result["targets_count"] = stats.targets_count;
+  result["capacity_checks"] = stats.capacity_checks;
+  result["capacity_rejections"] = stats.capacity_rejections;
+  result["required_bytes"] = stats.required_bytes;
+  result["free_bytes"] = stats.free_bytes;
+  result["total_bytes"] = stats.total_bytes;
+  result["headroom_bytes"] = stats.headroom_bytes;
+  result["usable_bytes"] = stats.usable_bytes;
+  result["shortfall_bytes"] = stats.shortfall_bytes;
+  return result;
+}
+
+} // namespace
+
+py::dict prepare_map_to_kv_tensors(const std::string &transaction_id,
+                                   const std::vector<offset_t> &offsets,
+                                   int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  auto [success, stats] =
+      allocator->prepare_map_to_kv_tensors(transaction_id, offsets);
+  py::gil_scoped_acquire acquire;
+  return physical_growth_result(success, stats, true);
+}
+
+py::dict commit_prepared_map(const std::string &transaction_id,
+                             int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto [success, stats] =
+      FTensorAllocator::global_allocator(group_id)->commit_prepared_map(
+          transaction_id);
+  py::gil_scoped_acquire acquire;
+  return physical_growth_result(success, stats, false);
+}
+
+bool abort_prepared_map(const std::string &transaction_id,
+                        int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)->abort_prepared_map(
+      transaction_id);
+}
+
+py::dict physical_budget_state(int64_t group_id = 0) {
+  BudgetSnapshot state;
+  {
+    py::gil_scoped_release release;
+    state =
+        FTensorAllocator::global_allocator(group_id)->physical_budget_state();
+  }
+  py::dict result;
+  result["budget_bytes"] = state.budget_bytes;
+  result["charged_bytes"] = state.charged_bytes;
+  result["instance_charged_bytes"] = state.instance_charged_bytes;
+  result["instance_limit_bytes"] = state.instance_limit_bytes;
+  result["active_mutations"] = state.active_mutations;
+  result["sync_acquisitions"] = state.sync_acquisitions;
+  result["sync_contentions"] = state.sync_contentions;
+  result["sync_acquire_ns"] = state.sync_acquire_ns;
+  result["sync_wait_ns"] = state.sync_wait_ns;
+  result["sync_cas_retries"] = state.sync_cas_retries;
+  result["sync_dead_owner_recoveries"] = state.sync_dead_owner_recoveries;
+  return result;
+}
+
+std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision,
+                                      int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)
+      ->set_instance_budget_limit(bytes, revision);
+}
+
+bool recalibrate_physical_budget(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)
+      ->recalibrate_physical_budget();
+}
+
+bool has_prepared_map(const std::string &transaction_id, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)->has_prepared_map(
+      transaction_id);
 }
 
 bool prepare_unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
@@ -271,7 +382,7 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 // Register the KV tensor ops in the "kvcached" dispatcher namespace.
 STABLE_TORCH_LIBRARY(kvcached, m) {
   m.def("init_kvcached(str dev_str, int page_size=0, bool "
-        "contiguous_layout=True) -> ()");
+        "contiguous_layout=True, str instance_name='') -> ()");
   m.def("shutdown_kvcached() -> ()");
   m.def("create_kv_tensors(int size, int dtype_size, str dev_str, int "
         "num_layers, int num_kv_buffers=2, int group_id=0, bool "
@@ -308,6 +419,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &kvcached::map_to_kv_tensors_with_result,
         "map_to_kv_tensors_with_result", py::arg("offsets"),
         py::arg("group_id") = 0);
+  m.def("physical_budget_state", &kvcached::physical_budget_state,
+        py::arg("group_id") = 0);
+  m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
+        py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);
+  m.def("recalibrate_physical_budget", &kvcached::recalibrate_physical_budget,
+        py::arg("group_id") = 0);
+  m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
+        "prepare_map_to_kv_tensors", py::arg("transaction_id"),
+        py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("commit_prepared_map", &kvcached::commit_prepared_map,
+        "commit_prepared_map", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("abort_prepared_map", &kvcached::abort_prepared_map,
+        "abort_prepared_map", py::arg("transaction_id"),
+        py::arg("group_id") = 0);
+  m.def("has_prepared_map", &kvcached::has_prepared_map, "has_prepared_map",
+        py::arg("transaction_id"), py::arg("group_id") = 0);
+  m.def("current_device_pci_bus_id", &kvcached::current_device_pci_bus_id,
+        "current_device_pci_bus_id");
   m.def("prepare_unmap_from_kv_tensors",
         &kvcached::prepare_unmap_from_kv_tensors,
         "prepare_unmap_from_kv_tensors", py::arg("offsets"),

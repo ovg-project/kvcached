@@ -3,6 +3,8 @@
 
 #include "page.hpp"
 
+#include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -42,15 +44,41 @@ GPUPage::~GPUPage() {
 }
 
 void GPUPage::release() {
-  if (released_) {
-    return;
+  std::optional<BudgetMutation> mutation;
+  std::exception_ptr accounting_error;
+  try {
+    mutation.emplace(budget_receipt_ ? budget_receipt_->budget() : nullptr);
+  } catch (...) {
+    accounting_error = std::current_exception();
   }
-  auto status = gpu_vmm::mem_release(handle_);
-  if (!gpu_vmm::is_success(status)) {
-    throw StateConsistencyError(
-        gpu_error(status, "physical page release").what());
+  if (!released_) {
+    auto status = gpu_vmm::mem_release(handle_);
+    if (!gpu_vmm::is_success(status)) {
+      throw StateConsistencyError(
+          gpu_error(status, "physical page release").what());
+    }
+    released_ = true;
   }
-  released_ = true;
+  // Native cleanup remains possible after the ledger is unavailable; do not
+  // return credit without a valid accounting scope.
+  if (accounting_error)
+    std::rethrow_exception(accounting_error);
+  // A handle can be released while its VMM mapping still retains memory.
+  // Failed teardown must therefore remain charged until unmap is confirmed.
+  if (budget_receipt_ && mappings_ == 0)
+    budget_receipt_->release();
+  mutation->finish();
+}
+
+void GPUPage::attach_budget(std::unique_ptr<BudgetReceipt> receipt) {
+  if (budget_receipt_)
+    throw std::logic_error("GPU page already has a budget receipt");
+  budget_receipt_ = std::move(receipt);
+}
+
+void GPUPage::record_unmap() {
+  if (mappings_)
+    --mappings_;
 }
 
 bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
@@ -59,6 +87,7 @@ bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
   if (!gpu_vmm::is_success(map_status)) {
     throw gpu_error(map_status, "physical page map");
   }
+  ++mappings_;
   if (set_access) {
     auto access_status =
         gpu_vmm::set_access(vaddr, page_size_, &access_desc, 1);
@@ -73,6 +102,7 @@ bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
         message += gpu_vmm::error_string(unmap_status);
         throw StateConsistencyError(message);
       }
+      record_unmap();
       throw std::runtime_error(message);
     }
   }
