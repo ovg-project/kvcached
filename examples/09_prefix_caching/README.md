@@ -48,21 +48,3 @@ vllm serve <model> --no-enable-prefix-caching
 # SGLang
 python -m sglang.launch_server --model <model> --disable-radix-cache
 ```
-
-## vLLM KV cache events
-
-On vLLM 0.30.x, elastic prefix caching supports the native KV event publisher,
-so external consumers can track which prefixes remain cached:
-
-```bash
-ENABLE_KVCACHED=true vllm serve <model> --enable-prefix-caching \
-  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557"}'
-```
-
-The publisher reports native store/reuse events, removals when elastic memory
-pressure or the cache cap evicts entries, and a clear event after a successful
-cache reset, including when prefix caching is disabled. Events retain native
-group, hash and session metadata. Their order
-follows cache mutations; enabling events does not change cache retention limits.
-Idle limit changes and successful resets are published without waiting for
-another request.
