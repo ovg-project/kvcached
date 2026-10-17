@@ -69,6 +69,13 @@ def _mamba_slots(batch):
     )
 
 
+def _reset_for_admission_retry(req):
+    """Discard selection state without recording a model-work retraction."""
+    retraction_state = (req.is_retracted, req.retracted_stain, req.retraction_count)
+    req.reset_for_retract()
+    req.is_retracted, req.retracted_stain, req.retraction_count = retraction_state
+
+
 def _requeue_unpublished(scheduler, batch, old_chunk, old_inflight):
     """Undo selection only; no request row or new token KV was published."""
     for req in batch.reqs:
@@ -85,8 +92,8 @@ def _requeue_unpublished(scheduler, batch, old_chunk, old_inflight):
             batch.req_to_token_pool.mamba_allocator.free(
                 req.kv.mamba_pool_idx.unsqueeze(-1))
             req.kv.mamba_pool_idx = None
-        req.reset_for_retract()
-        scheduler._add_request_to_queue(req, is_retracted=True)
+        _reset_for_admission_retry(req)
+        scheduler._add_request_to_queue(req, is_retracted=req.is_retracted)
     scheduler.chunked_req = old_chunk
     # Yield to the scheduler's normal loop and existing running work. There is
     # no in-call retry, sleep under a lock, or loop around allocation failure.

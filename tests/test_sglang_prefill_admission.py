@@ -53,6 +53,10 @@ class Request:
         self.lock_receipt = object()
         self.inflight_middle_chunks = 2 if chunk else 0
         self.reset_count = 0
+        self.is_retracted = False
+        self.retracted_stain = False
+        self.retraction_count = 0
+        self.cached_tokens = 0
 
     def get_fill_ids(self):
         return [0] * 6
@@ -60,7 +64,13 @@ class Request:
     def reset_for_retract(self):
         assert not self.kv.holds_kv
         self.reset_count += 1
+        self.retraction_count += 1
+        self.is_retracted = True
+        self.retracted_stain = True
+        self.kv.holds_mamba = False
         self.prefix_indices = []
+        self.last_node = None
+        self.lock_receipt = None
         self.inflight_middle_chunks = 0
 
 
@@ -107,6 +117,10 @@ def fixture(*, kv_capacity=100, mamba_capacity=None, chunk=False,
                 assert len(mamba_manager.reserved_blocks) == 2 * len(self.reqs)
                 mamba_manager.reserved_blocks.clear()
             for req in self.reqs:
+                # SGLang records initial prefix hits only before a real retract.
+                if not req.retracted_stain:
+                    req.cached_tokens += len(req.prefix_indices)
+                req.is_retracted = False
                 req.kv.holds_kv = True
 
     class DisaggregationMode(Enum):
@@ -121,15 +135,24 @@ def fixture(*, kv_capacity=100, mamba_capacity=None, chunk=False,
             self.chunked_req = old
             self.waiting_queue = [fresh]
             self.select_calls = 0
+            self.queued_retraction_flags = []
             self.batch = None
 
         def _add_request_to_queue(self, req, is_retracted=False):
-            assert is_retracted
+            self.queued_retraction_flags.append(is_retracted)
             self.waiting_queue.append(req)
 
         def _get_new_batch_prefill_raw(self, _delayer, running):
             self.select_calls += 1
             reqs, self.waiting_queue = self.waiting_queue, []
+            # Selection rematches the prefix after every admission retry.
+            for req in reqs:
+                req.prefix_indices = [10, 11]
+                req.last_node = object()
+                req.lock_receipt = object()
+                if mamba_manager is not None and req.kv.mamba_pool_idx is None:
+                    req.kv.holds_mamba = True
+                    req.kv.mamba_pool_idx = Slot()
             if old is not None:
                 if final_chunk:
                     self.chunked_req = None
@@ -196,12 +219,16 @@ def test_success_reserves_both_groups_before_any_request_row_is_published():
 def test_existing_chunk_keeps_its_row_state_and_previous_inflight_count(final_chunk):
     f = fixture(kv_capacity=0, mamba_capacity=100, chunk=True, final_chunk=final_chunk)
     slot = f.old.kv.mamba_pool_idx
+    old_node, old_receipt = f.old.last_node, f.old.lock_receipt
+    f.old.is_retracted, f.old.retracted_stain, f.old.retraction_count = False, True, 2
     assert f.scheduler._get_new_batch_prefill_raw(None, f.running) == (None, f.running)
     assert f.scheduler.chunked_req is f.old
     assert f.old.kv.holds_kv and f.old.kv.mamba_pool_idx is slot
     assert f.old.inflight_middle_chunks == 2 and f.old.reset_count == 0
     assert f.scheduler.waiting_queue == [f.fresh]
-    assert len(f.unlocked) == 1 and f.unlocked[0][0] is f.fresh.last_node
+    assert len(f.unlocked) == 1 and f.unlocked[0][0] is not old_node
+    assert f.old.last_node is old_node and f.old.lock_receipt is old_receipt
+    assert (f.old.is_retracted, f.old.retracted_stain, f.old.retraction_count) == (False, True, 2)
     assert slot not in f.freed_mamba
 
 
@@ -216,3 +243,31 @@ def test_unexpected_or_consistency_failure_is_never_converted_to_requeue(where):
     assert not f.unlocked and f.fresh.reset_count == 0
     assert f.scheduler.waiting_queue == []
     assert len(f.manager.reserved_blocks) == (4 if where == "prepare" else 0)
+
+
+@pytest.mark.parametrize("history", [(False, False, 0), (True, True, 3), (False, True, 2)])
+@pytest.mark.parametrize("miss", ["kv", "mamba"])
+def test_admission_retries_preserve_retraction_history_and_initial_cache_hits(history, miss):
+    f = fixture(kv_capacity=0 if miss == "kv" else 100,
+                mamba_capacity=0 if miss == "mamba" else None)
+    req = f.fresh
+    req.is_retracted, req.retracted_stain, req.retraction_count = history
+    req.cached_tokens = 7 if history[1] else 0
+    for attempt in range(2):
+        f.scheduler._kvcached_prefill_retry_at = 0
+        assert f.scheduler._get_new_batch_prefill_raw(None, f.running) == (None, f.running)
+        assert (req.is_retracted, req.retracted_stain, req.retraction_count) == history
+        assert f.scheduler.queued_retraction_flags == [history[0]] * (attempt + 1)
+        assert req.prefix_indices == [] and req.last_node is req.lock_receipt is None
+        assert not req.kv.holds_kv and req.inflight_middle_chunks == 0
+        assert f.scheduler.batch.prepare_calls == 0
+
+    f.manager.capacity = 100
+    if f.mamba_manager is not None:
+        f.mamba_manager.capacity = 100
+    f.scheduler._kvcached_prefill_retry_at = 0
+    batch, _ = f.scheduler._get_new_batch_prefill_raw(None, f.running)
+    assert batch.prepare_calls == 1 and req.kv.holds_kv
+    assert not req.is_retracted
+    assert (req.retracted_stain, req.retraction_count) == history[1:]
+    assert req.cached_tokens == (7 if history[1] else 2)
