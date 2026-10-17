@@ -18,10 +18,11 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473031ULL;
+constexpr uint64_t kMagic = 0x4b56425544473032ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
+constexpr off_t kPoolLeaseStart = 3;
 static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
               "shared budget needs lock-free aligned 64-bit publication");
 void publish(uint64_t &target, uint64_t value) {
@@ -244,6 +245,9 @@ GpuBudget::~GpuBudget() {
         // Unknown resources remain charged while any other participant lives.
         if (pool.owner == owner_ && pool.charged == 0)
           publish(pool.owner, 0);
+        if (pool.owner == 0 &&
+            lease(fd_, F_UNLCK, false, kPoolLeaseStart + slot) < 0)
+          throw system_error("release KV budget pool owner");
       }
       reclaim_instances_locked();
     } catch (const std::exception &error) {
@@ -278,11 +282,61 @@ void GpuBudget::reclaim_instances_locked() {
   }
 }
 
+// Retiring an owner is not a CUDA refund. Reduce the budget by the same
+// charge before removing accounting, so spendable GPU credit cannot increase.
+// A later coherent sample can recover capacity actually released by the driver.
+// Interrupted native/accounting mutations remain conservative until a new
+// epoch.
+void GpuBudget::retire_dead_pools() {
+  CalibrationLease exclusion(path_);
+  Locked lock(*this);
+  struct stat held{}, selected{};
+  if (fstat(fd_, &held) < 0 || fstat(exclusion.fd, &selected) < 0 ||
+      held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
+    throw std::runtime_error("KV budget retirement segment was replaced");
+  if (lease(exclusion.fd, F_WRLCK, false, 1) < 0) {
+    if (errno == EAGAIN || errno == EACCES)
+      return;
+    throw system_error("exclude grants during KV owner retirement");
+  }
+  if (shared_->active)
+    return;
+  for (size_t i = 0; i < kPools; ++i) {
+    auto &pool = shared_->pools[i];
+    if (!pool.owner || pool.owner == owner_)
+      continue;
+    struct flock owner_lock{};
+    owner_lock.l_type = F_WRLCK;
+    owner_lock.l_whence = SEEK_SET;
+    owner_lock.l_start = kPoolLeaseStart + i;
+    owner_lock.l_len = 1;
+    if (fcntl(fd_, F_OFD_GETLK, &owner_lock) < 0)
+      throw system_error("inspect KV budget pool owner");
+    if (owner_lock.l_type != F_UNLCK)
+      continue;
+    const auto charged = pool.charged;
+    const auto budget = shared_->budget;
+    ++shared_->active;
+    ++shared_->version;
+    publish(shared_->budget, budget > charged ? budget - charged : 0);
+    accounting_test_hook(60);
+    publish(pool.charged, 0);
+    accounting_test_hook(61);
+    publish(pool.owner, 0);
+    accounting_test_hook(62);
+    ++sync_dead_owner_recoveries_;
+    ++shared_->version;
+    --shared_->active;
+  }
+  reclaim_instances_locked();
+}
+
 size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
   if (instance.empty() || instance.size() >= kName ||
       instance.find('\0') != std::string::npos)
     throw std::invalid_argument(
         "KV budget instance name must contain 1..191 bytes");
+  retire_dead_pools();
   Locked lock(*this);
   // Also recover an instance published before pool registration was
   // interrupted.
@@ -318,6 +372,10 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
     auto &entry = shared_->pools[i];
     if (entry.owner == 0 && entry.charged == 0) {
       slots_.push_back(i); // allocate before publishing ownership
+      if (lease(fd_, F_WRLCK, false, kPoolLeaseStart + i) < 0) {
+        slots_.pop_back();
+        throw system_error("retain KV budget pool owner");
+      }
       entry.instance = instance_index;
       entry.group = group;
       publish(entry.owner, owner_);

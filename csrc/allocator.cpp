@@ -65,7 +65,7 @@ std::string physical_growth_lock_dir() {
   const char *configured_dir = std::getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR");
   std::string lock_dir = configured_dir != nullptr && *configured_dir != '\0'
                              ? configured_dir
-                             : "/tmp";
+                             : "/dev/shm";
   while (lock_dir.size() > 1 && lock_dir.back() == '/') {
     lock_dir.pop_back();
   }
@@ -387,7 +387,7 @@ void FTensorAllocator::ensure_budget_locked_() {
   if (budget_ || !dev_.is_cuda())
     return;
   auto budget = GpuBudget::connect(
-      physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v1",
+      physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v2",
       [this] { return sample_budget_capacity_(); });
   const auto slot = budget->register_pool(g_instance_name_, group_id_);
   budget_slot_ = slot;

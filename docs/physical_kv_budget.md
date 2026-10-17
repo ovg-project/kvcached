@@ -15,8 +15,11 @@ No minimum reservation, priority, reclaim policy or CPU offload is introduced.
 ## Accounting and identity
 
 All participating workers on one GPU must share the same underlying file, not
-merely matching pathnames in separate container mounts. The file uses the PCI bus
-ID and `KVCACHED_PHYSICAL_GROWTH_LOCK_DIR` (default `/tmp`). GPU partitions with
+merely matching pathnames in separate container mounts. In particular, private
+container `/dev/shm` mounts do not coordinate; configure a shared mount when needed.
+The v2 ledger protocol requires all participating workers to restart together;
+mixing v1 and v2 processes would create independent budgets. The file uses the PCI bus
+ID and `KVCACHED_PHYSICAL_GROWTH_LOCK_DIR` (default `/dev/shm`). GPU partitions with
 the same PCI identity are not separate accounting domains in this version.
 Use a consistent `KVCACHED_IPC_NAME` across an instance's workers. Its fallback is
 the existing process-group naming convention. Pool IDs remain separate records;
@@ -53,9 +56,11 @@ cannot be mistaken for already resident memory and added back as extra credit.
 
 A stable sample sets `budget = max(0, charged_bytes + sampled_free_after_safety_margin)`.
 The available credit is `budget - charged_bytes`: recovering external free memory
-therefore restores exactly the sampled capacity. Dead idle owners remain charged
-on both sides of this subtraction; their charges are never refunded or reclaimed
-online. Interrupted mutations still prevent calibration. Negative headroom is
+therefore restores exactly the sampled capacity. Pool registration can retire an idle dead owner after its kernel lease closes.
+Retirement subtracts the charge from both the budget (saturating at zero) and
+accounting, so it never increases available GPU credit. A later coherent sample
+recovers only capacity actually observed free. Live owner leases retain their
+charges and instance limits. Interrupted mutations still prevent calibration. Negative headroom is
 preserved until after addition so releasing pages cannot regrant credit needed
 to restore the safety margin.
 
@@ -97,7 +102,8 @@ The `sync_*` fields in `physical_budget_state()` are process-local counters for
 this budget connection. Acquisition time includes the synchronization primitive's
 uncontended cost. Wait time starts after its first contended attempt; it excludes
 the allocator's local mutex. Snapshot queries also acquire the accounting lock.
-`sync_cas_retries` and `sync_dead_owner_recoveries` are zero for the flock backend.
+`sync_cas_retries` is zero for the flock backend.
+`sync_dead_owner_recoveries` counts retired pool records, not confirmed CUDA frees.
 These counters describe accounting synchronization, not end-to-end token latency.
 
 Native pool registration uses the resolved Python IPC instance name, including

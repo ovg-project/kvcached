@@ -120,6 +120,7 @@ private:
   explicit GpuBudget(const std::string &path, const Sampler &sampler);
   void check_owner() const;
   void reclaim_instances_locked();
+  void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   void return_locked(size_t slot, uint64_t bytes);
   void accounting_test_hook(int stage);

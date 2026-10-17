@@ -376,7 +376,7 @@ def test_physical_growth_lock_rejects_symlink(monkeypatch, tmp_path):
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
     device_id = vmm_ops.current_device_pci_bus_id()
     safe_device_id = "".join(char if char.isalnum() else "_" for char in device_id)
-    lock_path = tmp_path / f"kvcached-physical-growth-{safe_device_id}.lock.budget-v1"
+    lock_path = tmp_path / f"kvcached-physical-growth-{safe_device_id}.lock.budget-v2"
     lock_path.symlink_to(tmp_path / "unrelated")
 
     try:
