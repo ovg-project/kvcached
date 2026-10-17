@@ -252,6 +252,92 @@ def test_native_event_cap_eviction_removes_primary_and_alias(event_pool_factory)
     assert block.block_hash is None
 
 
+@pytest.mark.parametrize("alias_tokens", [None, 8])
+def test_native_event_duplicate_owner_survives_cache_cap(event_pool_factory, alias_tokens):
+    from vllm.distributed.kv_events import BlockRemoved
+    from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+
+    pool = event_pool_factory(cache_cap=0)
+    short, long = pool.get_new_blocks(2)
+    for block in (short, long):
+        pool.cache_full_blocks(event_request(), [block], 0, 1, 16, 0)
+        if alias_tokens is not None:
+            pool.cache_partial_block(event_request(), block, alias_tokens, 0, 16)
+    pool.take_events()
+
+    pool.free_blocks([short])
+    assert short.block_hash is None and long.ref_cnt == 1
+    assert pool.kv_cache_manager.allocated == {long.block_id}
+    assert pool.get_cached_block(b"d", [0]) == [long]
+    if alias_tokens is not None:
+        assert pool.get_cached_block(b"b", [0]) == [long]
+    assert pool.take_events() == []
+
+    pool.free_blocks([long])
+    events = pool.take_events()
+    assert all(isinstance(event, BlockRemoved) for event in events)
+    expected = {maybe_convert_block_hash(b"d")}
+    if alias_tokens is not None:
+        expected.add(maybe_convert_block_hash(b"b"))
+    assert {h for event in events for h in event.block_hashes} == expected
+    assert len(events) == len(expected)
+    assert pool.get_cached_block(b"d", [0]) is None
+    assert not pool.kv_cache_manager.allocated
+
+
+def test_native_event_alias_survives_other_primary_eviction(event_pool_factory):
+    from vllm.distributed.kv_events import BlockRemoved
+    from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+
+    pool = event_pool_factory(cache_cap=0)
+    first, survivor = pool.get_new_blocks(2)
+    pool.cache_full_blocks(event_request(), [first], 0, 1, 16, 0)
+    pool.cache_partial_block(event_request(), first, 8, 0, 16)
+    pool.cache_partial_block(event_request(), survivor, 12, 0, 16)
+    pool.cache_partial_block(event_request(), survivor, 8, 0, 16)
+    pool.take_events()
+
+    pool.free_blocks([first])
+    events = pool.take_events()
+    assert len(events) == 1 and isinstance(events[0], BlockRemoved)
+    assert events[0].block_hashes == [maybe_convert_block_hash(b"d")]
+    assert pool.get_cached_block(b"b", [0]) == [survivor]
+    assert pool.get_cached_block(b"c", [0]) == [survivor]
+
+    pool.free_blocks([survivor])
+    assert {h for event in pool.take_events() for h in event.block_hashes} == {
+        maybe_convert_block_hash(b"b"), maybe_convert_block_hash(b"c")}
+
+
+def test_native_event_removal_is_scoped_to_group(event_pool_factory):
+    pool = event_pool_factory(cache_cap=0)
+    first, survivor = pool.get_new_blocks(2)
+    pool.cache_full_blocks(event_request(), [first], 0, 1, 16, 0)
+    pool.cache_full_blocks(event_request(), [survivor], 0, 1, 16, 1)
+    pool.take_events()
+    pool.free_blocks([first])
+    event, = pool.take_events()
+    assert event.group_idx == 0
+    assert pool.get_cached_block(b"d", [1]) == [survivor]
+    pool.free_blocks([survivor])
+    event, = pool.take_events()
+    assert event.group_idx == 1
+
+
+def test_native_event_partial_promotion_keeps_duplicate_owner(event_pool_factory):
+    from vllm.distributed.kv_events import BlockRemoved
+
+    pool = event_pool_factory()
+    first, survivor = pool.get_new_blocks(2)
+    for block in (first, survivor):
+        pool.cache_partial_block(event_request(), block, 8, 0, 16)
+    pool.take_events()
+    pool.cache_partial_block(event_request(), first, 12, 0, 16)
+    assert pool.get_cached_block(b"b", [0]) == [survivor]
+    assert not any(isinstance(event, BlockRemoved) for event in pool.take_events())
+    pool.free_blocks([first, survivor])
+
+
 def test_native_event_reset_waits_for_shared_references(event_pool_factory):
     from vllm.distributed.kv_events import AllBlocksCleared
 

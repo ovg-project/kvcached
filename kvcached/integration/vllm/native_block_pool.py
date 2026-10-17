@@ -23,7 +23,6 @@ class NativeBlockPoolMixin:
     _cached_blocks: dict[Any, dict[int, Any]]
     _evict_blocks_from_pool: Callable[[int], int]
     _remove_evictable: Callable[[int], Any]
-    _emit_block_removed_events: Callable[[list[Any]], None]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -77,6 +76,15 @@ class NativeBlockPoolMixin:
         removed = self._native_block_pool._remove_cached_block_hashes(self, block)
         self._block_id_to_key.pop(block.block_id, None)
         return removed
+
+    def _emit_block_removed_events(self, block_hashes: list[Any]) -> None:
+        if not self.enable_kv_cache_events:
+            return
+        # Removing one physical owner does not end a hash/group's residency.
+        # The native index includes both primary keys and partial-block aliases.
+        unowned = [key for key in block_hashes
+                   if self.cached_block_hash_to_block.get_one_block(key) is None]
+        self._native_block_pool._emit_block_removed_events(self, unowned)
 
     def _remove_cached_block(self, key: Any, block_id: int) -> Any:
         # Elastic eviction calls this after removing its primary ownership marker.
