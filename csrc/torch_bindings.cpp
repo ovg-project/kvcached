@@ -175,12 +175,10 @@ py::dict physical_budget_state(int64_t group_id = 0) {
   result["charged_bytes"] = state.charged_bytes;
   result["instance_charged_bytes"] = state.instance_charged_bytes;
   result["instance_limit_bytes"] = state.instance_limit_bytes;
-  result["active_mutations"] = state.active_mutations;
   result["sync_acquisitions"] = state.sync_acquisitions;
   result["sync_contentions"] = state.sync_contentions;
   result["sync_acquire_ns"] = state.sync_acquire_ns;
   result["sync_wait_ns"] = state.sync_wait_ns;
-  result["sync_cas_retries"] = state.sync_cas_retries;
   result["sync_dead_owner_recoveries"] = state.sync_dead_owner_recoveries;
   return result;
 }

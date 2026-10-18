@@ -1032,6 +1032,7 @@ void FTensorAllocator::release_retained_locked_(
       mapping.page.reset();
     }
   }
+  mutation.finish();
 }
 
 void FTensorAllocator::remember_unmap_outcome_locked_(

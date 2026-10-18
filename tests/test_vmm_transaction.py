@@ -426,7 +426,6 @@ def test_shared_budget_covers_local_prepared_growth_and_multiple_pools(monkeypat
         assert native.physical_budget_state()["charged_bytes"] == page
         assert native.unmap_from_kv_tensors([0], 1000)
         assert native.physical_budget_state()["charged_bytes"] == 0
-        assert native.physical_budget_state()["active_mutations"] == 0
         assert native.recalibrate_physical_budget()
     finally:
         native.shutdown_kvcached()

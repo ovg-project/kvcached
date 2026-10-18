@@ -18,7 +18,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473032ULL;
+constexpr uint64_t kMagic = 0x4b56425544473033ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -66,17 +66,9 @@ int lease(int fd, short type, bool wait, off_t start = 0) {
   return -1;
 #endif
 }
-// A separate open-file description owns the calibration lease. Closing it,
-// including on process death, releases admission without a persistent flag.
-// A sampler must not recursively wait on its own admission lease. Ordinary
-// contenders wait in the kernel, outside the budget data mutex, then retry the
-// real budget admission. The thread-local flag owns no teardown resources.
-thread_local bool inside_budget_sampler = false;
-struct SamplerScope {
-  bool previous = inside_budget_sampler;
-  SamplerScope() { inside_budget_sampler = true; }
-  ~SamplerScope() { inside_budget_sampler = previous; }
-};
+// Serialize only samplers from sample start through publication. Grants,
+// refunds and owner retirement never inspect or wait on this lease. Process
+// death releases it, so a crashed sampler cannot leave a persistent gate.
 struct CalibrationLease {
   int fd;
   explicit CalibrationLease(const std::string &path)
@@ -86,16 +78,6 @@ struct CalibrationLease {
   }
   ~CalibrationLease() { close(fd); }
 };
-bool calibration_active(int fd) {
-  struct flock lock{};
-  lock.l_type = F_RDLCK;
-  lock.l_whence = SEEK_SET;
-  lock.l_start = 1;
-  lock.l_len = 1;
-  if (fcntl(fd, F_OFD_GETLK, &lock) < 0)
-    throw system_error("inspect calibration lease");
-  return lock.l_type != F_UNLCK;
-}
 uint64_t monotonic_ns() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -107,8 +89,6 @@ uint64_t monotonic_ns() {
 struct GpuBudget::Shared {
   uint64_t magic;
   uint64_t budget;
-  uint64_t active;
-  uint64_t version;
   uint64_t last_sample_ns;
   struct Instance {
     char name[kName];
@@ -284,23 +264,10 @@ void GpuBudget::reclaim_instances_locked() {
 
 // Retiring an owner is not a CUDA refund. Reduce the budget by the same
 // charge before removing accounting, so spendable GPU credit cannot increase.
-// A later coherent sample can recover capacity actually released by the driver.
-// Interrupted native/accounting mutations remain conservative until a new
-// epoch.
+// A later sample can recover capacity actually observed free. Every shared
+// change stays under the same short accounting lock.
 void GpuBudget::retire_dead_pools() {
-  CalibrationLease exclusion(path_);
   Locked lock(*this);
-  struct stat held{}, selected{};
-  if (fstat(fd_, &held) < 0 || fstat(exclusion.fd, &selected) < 0 ||
-      held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
-    throw std::runtime_error("KV budget retirement segment was replaced");
-  if (lease(exclusion.fd, F_WRLCK, false, 1) < 0) {
-    if (errno == EAGAIN || errno == EACCES)
-      return;
-    throw system_error("exclude grants during KV owner retirement");
-  }
-  if (shared_->active)
-    return;
   for (size_t i = 0; i < kPools; ++i) {
     auto &pool = shared_->pools[i];
     if (!pool.owner || pool.owner == owner_)
@@ -316,8 +283,6 @@ void GpuBudget::retire_dead_pools() {
       continue;
     const auto charged = pool.charged;
     const auto budget = shared_->budget;
-    ++shared_->active;
-    ++shared_->version;
     publish(shared_->budget, budget > charged ? budget - charged : 0);
     accounting_test_hook(60);
     publish(pool.charged, 0);
@@ -325,8 +290,6 @@ void GpuBudget::retire_dead_pools() {
     publish(pool.owner, 0);
     accounting_test_hook(62);
     ++sync_dead_owner_recoveries_;
-    ++shared_->version;
-    --shared_->active;
   }
   reclaim_instances_locked();
 }
@@ -392,12 +355,10 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   const auto instance = shared_->pools[slot].instance;
   result.budget_bytes = shared_->budget;
   result.instance_limit_bytes = shared_->instances[instance].limit;
-  result.active_mutations = shared_->active;
   result.sync_acquisitions = sync_acquisitions_;
   result.sync_contentions = sync_contentions_;
   result.sync_acquire_ns = sync_acquire_ns_;
   result.sync_wait_ns = sync_wait_ns_;
-  result.sync_cas_retries = sync_cas_retries_;
   result.sync_dead_owner_recoveries = sync_dead_owner_recoveries_;
   for (const auto &entry : shared_->pools) {
     result.charged_bytes = add(result.charged_bytes, entry.charged);
@@ -413,8 +374,7 @@ BudgetSnapshot GpuBudget::snapshot(size_t slot, const Sampler &sampler) {
   if (sampler) {
     Locked lock(*this);
     constexpr uint64_t interval_ns = 1000000000ULL;
-    sample_due = !shared_->active &&
-                 monotonic_ns() - shared_->last_sample_ns >= interval_ns;
+    sample_due = monotonic_ns() - shared_->last_sample_ns >= interval_ns;
   }
   // Admission queries also refresh an exhausted budget: waiting for another
   // grant would otherwise prevent a scheduler from observing recovered memory.
@@ -439,60 +399,40 @@ std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
   auto result = std::make_unique<BudgetGrant>(shared_from_this(), slot, 0);
   bool attempted_sample = false;
   for (;;) {
-    bool sample_due = false, wait_for_calibration = false;
     {
       Locked lock(*this);
-      // Check the clock under the admission lock; ordinary grants need no
-      // extra data-lock round trip.
       constexpr uint64_t interval_ns = 1000000000ULL;
-      sample_due = sampler && !attempted_sample && !shared_->active &&
-                   monotonic_ns() - shared_->last_sample_ns >= interval_ns;
+      const bool sample_due =
+          sampler && !attempted_sample &&
+          monotonic_ns() - shared_->last_sample_ns >= interval_ns;
       if (!sample_due) {
         const auto state = snapshot_locked(slot);
         if (observed)
           *observed = state;
-        if (calibration_active(fd_)) {
-          if (inside_budget_sampler)
-            throw std::runtime_error(
-                "capacity_exhausted: KV budget calibration in progress");
-          wait_for_calibration = true;
-        } else {
-          if (state.charged_bytes > state.budget_bytes ||
-              bytes > state.budget_bytes - state.charged_bytes ||
-              state.instance_charged_bytes > state.instance_limit_bytes ||
-              bytes > state.instance_limit_bytes - state.instance_charged_bytes)
-            throw std::runtime_error(
-                "capacity_exhausted: shared KV budget would be exceeded"
-                " (requested=" +
-                std::to_string(bytes) +
-                ", budget=" + std::to_string(state.budget_bytes) +
-                ", charged=" + std::to_string(state.charged_bytes) + ")");
-          // The owner charge remains authoritative. Short-lock accounting
-          // derives totals from owner records, without CAS aggregate counters.
-          shared_->active = add(shared_->active, 1);
-          ++shared_->version;
-          publish(shared_->pools[slot].charged,
-                  add(shared_->pools[slot].charged, bytes));
+        if (state.charged_bytes > state.budget_bytes ||
+            bytes > state.budget_bytes - state.charged_bytes ||
+            state.instance_charged_bytes > state.instance_limit_bytes ||
+            bytes > state.instance_limit_bytes - state.instance_charged_bytes)
+          throw std::runtime_error(
+              "capacity_exhausted: shared KV budget would be exceeded"
+              " (requested=" +
+              std::to_string(bytes) +
+              ", budget=" + std::to_string(state.budget_bytes) +
+              ", charged=" + std::to_string(state.charged_bytes) + ")");
+        publish(shared_->pools[slot].charged,
+                add(shared_->pools[slot].charged, bytes));
 #ifdef KVCACHED_BUDGET_TESTING
-          if (grant_test_hook_)
-            grant_test_hook_();
+        if (grant_test_hook_)
+          grant_test_hook_();
 #endif
-          result->unused_ = bytes;
-          result->active_ = true;
-          return result;
-        }
+        result->unused_ = bytes;
+        result->active_ = true;
+        return result;
       }
     }
-    if (wait_for_calibration) {
-      // Neither the local data mutex nor shared flock survives this boundary.
-      // Retry the complete limit check after the calibration lease is released.
-      accounting_test_hook(40);
-      CalibrationLease waiter(path_);
-      if (lease(waiter.fd, F_RDLCK, true, 1) < 0)
-        throw system_error("wait for KV budget calibration");
-      continue;
-    }
     attempted_sample = true;
+    // A concurrent sampler may win. Admission still proceeds against the last
+    // published budget instead of waiting for that sampler.
     recalibrate(sampler);
   }
 }
@@ -509,13 +449,10 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
   publish(entry.limit, bytes);
   entry.revision = revision;
   entry.has_revision = 1;
-  ++shared_->version;
   return "applied";
 }
 
 bool GpuBudget::recalibrate(const Sampler &sampler) {
-  uint64_t charged = 0;
-  uint64_t version = 0;
   CalibrationLease calibration(path_);
   {
     Locked lock(*this);
@@ -528,43 +465,28 @@ bool GpuBudget::recalibrate(const Sampler &sampler) {
         return false;
       throw system_error("lock calibration lease");
     }
-    if (shared_->active)
-      return false;
-    for (const auto &pool : shared_->pools)
-      charged = add(charged, pool.charged);
-    version = shared_->version;
   }
-  SamplerScope sampling;
   const int64_t free_budget = sampler();
   Locked lock(*this);
-  if (shared_->active || shared_->version != version)
-    return false;
-  // The spendable credit is budget - charged. Retained dead-owner charges
-  // occur on both sides and cancel; never refund them speculatively. A stable
-  // sample therefore restores exactly sampled free capacity. Active/version
-  // checks exclude unfinished grants and releases, including crashed mutations.
-  // Preserve negative headroom until after combining it with charged bytes.
+  uint64_t charged = 0;
+  for (const auto &pool : shared_->pools)
+    charged = add(charged, pool.charged);
+  // Sum at publication, including any concurrent grant/refund/retirement.
+  // This is an estimate: unmaterialized grants, released-but-unrefunded bytes
+  // and changes since the driver sample can temporarily overstate capacity.
+  // Negative headroom remains signed until combined with current charges.
   publish(shared_->budget, sampled_capacity(charged, free_budget));
   shared_->last_sample_ns = monotonic_ns();
-  ++shared_->version;
   return true;
 }
 
 void GpuBudget::begin_mutation() {
   check_owner();
   std::lock_guard<std::mutex> mutation_lock(mutation_mutex_);
-  const auto thread = std::this_thread::get_id();
-  auto &local = mutations_[thread];
-  if (local.depth++ != 0)
-    return;
-  try {
-    Locked lock(*this);
-    shared_->active = add(shared_->active, 1);
-    ++shared_->version;
-  } catch (...) {
-    mutations_.erase(thread);
-    throw;
-  }
+  auto &local = mutations_[std::this_thread::get_id()];
+  if (local.depth == 0)
+    flush_refunds(local); // retry a previous scope's failed completion
+  ++local.depth;
 }
 
 void GpuBudget::return_locked(size_t slot, uint64_t bytes) {
@@ -574,6 +496,24 @@ void GpuBudget::return_locked(size_t slot, uint64_t bytes) {
   publish(shared_->pools[slot].charged, shared_->pools[slot].charged - bytes);
 }
 
+void GpuBudget::flush_refunds(LocalMutation &local) {
+  if (!local.bytes)
+    return;
+  Locked lock(*this);
+  accounting_test_hook(50);
+  // Validate everything before publishing. A failed lock or validation keeps
+  // the queued receipts owned here and retryable, with no partial refund.
+  for (const auto &[slot, bytes] : local.refunds) {
+    if (slot >= kPools || shared_->pools[slot].owner != owner_ ||
+        bytes > shared_->pools[slot].charged)
+      throw std::runtime_error("state_inconsistency: invalid KV budget refund");
+  }
+  for (const auto &[slot, bytes] : local.refunds)
+    return_locked(slot, bytes);
+  local.refunds.clear();
+  local.bytes = 0;
+}
+
 void GpuBudget::refund(size_t slot, uint64_t bytes) {
   if (!bytes)
     return;
@@ -581,15 +521,24 @@ void GpuBudget::refund(size_t slot, uint64_t bytes) {
   {
     std::lock_guard<std::mutex> mutation_lock(mutation_mutex_);
     const auto found = mutations_.find(std::this_thread::get_id());
-    if (found != mutations_.end() && found->second.depth) {
-      auto &total = found->second.refunds[slot];
-      total = add(total, bytes);
-      return;
+    if (found != mutations_.end()) {
+      auto &local = found->second;
+      if (!local.depth || bytes >= kBudgetRefundBatchBytes - local.bytes)
+        flush_refunds(local);
+      if (local.depth && bytes < kBudgetRefundBatchBytes) {
+        auto &total = local.refunds[slot];
+        total = add(total, bytes);
+        local.bytes += bytes;
+        return;
+      }
+      // Larger handles refund immediately. If flushing previous receipts
+      // failed, the incoming receipt was not enqueued and still owns its bytes.
+      if (!local.depth)
+        mutations_.erase(found);
     }
   }
   Locked lock(*this);
   return_locked(slot, bytes);
-  ++shared_->version;
 }
 
 void GpuBudget::end_mutation() {
@@ -598,25 +547,12 @@ void GpuBudget::end_mutation() {
   auto found = mutations_.find(std::this_thread::get_id());
   if (found == mutations_.end() || !found->second.depth)
     throw std::runtime_error("unbalanced KV budget mutation");
-  if (found->second.depth > 1) {
-    --found->second.depth;
+  if (--found->second.depth != 0)
     return;
-  }
-  Locked lock(*this);
-  if (!shared_->active)
-    throw std::runtime_error("unbalanced shared KV mutation");
-  // Validate the entire refund before publishing any part. A failed lock or
-  // validation leaves the outer scope retryable, without a partial refund.
-  for (const auto &[slot, bytes] : found->second.refunds) {
-    if (slot >= kPools || shared_->pools[slot].owner != owner_ ||
-        bytes > shared_->pools[slot].charged)
-      throw std::runtime_error("state_inconsistency: invalid KV budget refund");
-  }
-  for (const auto &[slot, bytes] : found->second.refunds)
-    return_locked(slot, bytes);
+  // Close the scope even when flushing fails. Keep its pending bytes for the
+  // next scope/refund rather than leaving a permanently nested outer scope.
+  flush_refunds(found->second);
   mutations_.erase(found);
-  --shared_->active;
-  ++shared_->version;
 }
 
 BudgetReceipt::BudgetReceipt(std::shared_ptr<GpuBudget> budget, size_t slot,
@@ -649,13 +585,9 @@ std::unique_ptr<BudgetReceipt> BudgetGrant::take(uint64_t bytes) {
 void BudgetGrant::finish() {
   if (!active_)
     return;
-  GpuBudget::Locked lock(*budget_);
-  budget_->return_locked(slot_, unused_);
+  if (unused_)
+    budget_->refund(slot_, unused_);
   unused_ = 0;
-  if (!budget_->shared_->active)
-    throw std::runtime_error("unbalanced KV grant");
-  --budget_->shared_->active;
-  ++budget_->shared_->version;
   active_ = false;
 }
 BudgetMutation::BudgetMutation(std::shared_ptr<GpuBudget> budget)
@@ -672,8 +604,10 @@ BudgetMutation::~BudgetMutation() {
   }
 }
 void BudgetMutation::finish() {
-  if (active_ && budget_)
-    budget_->end_mutation();
+  if (!active_)
+    return;
   active_ = false;
+  if (budget_)
+    budget_->end_mutation();
 }
 } // namespace kvcached

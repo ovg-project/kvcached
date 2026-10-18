@@ -19,12 +19,10 @@ struct BudgetSnapshot {
   uint64_t charged_bytes = 0;
   uint64_t instance_charged_bytes = 0;
   uint64_t instance_limit_bytes = UINT64_MAX;
-  uint64_t active_mutations = 0;
   uint64_t sync_acquisitions = 0;
   uint64_t sync_contentions = 0;
   uint64_t sync_acquire_ns = 0;
   uint64_t sync_wait_ns = 0;
-  uint64_t sync_cas_retries = 0;
   uint64_t sync_dead_owner_recoveries = 0;
 };
 
@@ -65,8 +63,14 @@ private:
   bool active_ = true;
 };
 
-// Batch physical changes and refunds. Nested scopes on this thread reuse the
-// outer scope, so releasing many handles needs one accounting completion.
+// Batch confirmed refunds on this thread, flushing before another receipt
+// would reach this byte threshold. A larger indivisible handle refunds
+// directly. This is a per-thread batching bound, not a bound on global sampling
+// error.
+inline constexpr uint64_t kBudgetRefundBatchBytes = 64 * 1024 * 1024;
+
+// Nested scopes share a bounded refund batch. They never gate calibration or
+// publish a shared in-flight flag. Physical release must precede refund().
 class BudgetMutation {
 public:
   explicit BudgetMutation(std::shared_ptr<GpuBudget> budget);
@@ -115,6 +119,7 @@ private:
   struct Locked;
   struct LocalMutation {
     size_t depth = 0;
+    uint64_t bytes = 0;
     std::unordered_map<size_t, uint64_t> refunds;
   };
   explicit GpuBudget(const std::string &path, const Sampler &sampler);
@@ -123,6 +128,7 @@ private:
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   void return_locked(size_t slot, uint64_t bytes);
+  void flush_refunds(LocalMutation &local);
   void accounting_test_hook(int stage);
   int fd_ = -1;
   Shared *shared_ = nullptr;
@@ -138,7 +144,6 @@ private:
   uint64_t sync_contentions_ = 0;
   uint64_t sync_acquire_ns_ = 0;
   uint64_t sync_wait_ns_ = 0;
-  uint64_t sync_cas_retries_ = 0;
   uint64_t sync_dead_owner_recoveries_ = 0;
 #ifdef KVCACHED_BUDGET_TESTING
   void (*grant_test_hook_)() = nullptr;

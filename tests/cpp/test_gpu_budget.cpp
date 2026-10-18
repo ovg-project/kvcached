@@ -119,147 +119,100 @@ static void check_interrupted_initialization(const std::string &path) {
                "publish stale state\n";
 }
 
-#ifdef KVCACHED_BUDGET_CAS_ACCOUNTING
-static int race_begin[2], race_entered[2], race_finish[2], race_refunded[2],
-    race_resume[2];
-static void calibration_race_hook(int stage) {
-  if (stage == 20) {
-    signal_pipe(race_begin[1]);
-    await_pipe(race_entered[0]);
-  }
-  if (stage == 30) {
-    signal_pipe(race_refunded[1]);
-    await_pipe(race_resume[0]);
-  }
-}
-static void check_cas_calibration_race(const std::string &path) {
-  auto keeper = GpuBudget::connect(path, [] { return 3 * page; });
-  const auto slot = keeper->register_pool("calibration-race", 0);
-  int ready[2];
-  assert(pipe(ready) == 0 && pipe(race_begin) == 0 && pipe(race_entered) == 0 &&
-         pipe(race_finish) == 0 && pipe(race_refunded) == 0 &&
-         pipe(race_resume) == 0);
-  auto child = fork();
-  assert(child >= 0);
-  if (!child) {
-    auto owner = GpuBudget::connect(path, [] { return 0; });
-    const auto own = owner->register_pool("calibration-race", 1000);
-    auto grant = owner->grant(own, 2 * page);
-    auto receipt = grant->take(2 * page);
-    grant->finish();
-    signal_pipe(ready[1]);
-    await_pipe(race_begin[0]);
-    BudgetMutation mutation(owner);
-    signal_pipe(race_entered[1]);
-    await_pipe(race_finish[0]);
-    owner->set_accounting_test_hook(calibration_race_hook);
-    receipt->release();
-    mutation.finish();
-    _exit(0);
-  }
-  await_pipe(ready[0]);
-  keeper->set_accounting_test_hook(calibration_race_hook);
-  const bool applied = keeper->recalibrate([] {
-    signal_pipe(race_finish[1]);
-    await_pipe(race_refunded[0]);
-    return 2 * page;
-  });
-  signal_pipe(race_resume[1]);
-  child_ok(child);
-  keeper->set_accounting_test_hook(nullptr);
-  assert(!applied); // The driver sample crossed a real release.
-  assert(keeper->snapshot(slot).charged_bytes == 0);
-  assert(keeper->recalibrate([] { return 2 * page; }));
-  assert(keeper->snapshot(slot).budget_bytes == 2 * page);
-  for (auto pair : {ready, race_begin, race_entered, race_finish, race_refunded,
-                    race_resume})
-    for (int i = 0; i < 2; ++i)
-      close(pair[i]);
-  std::cout << "PASS CAS calibration: release completion cannot validate a "
-               "torn sample\n";
-}
-static int crash_stage = 0;
-static void exit_at_stage(int stage) {
-  if (stage == crash_stage)
-    _exit(0);
-}
-static void check_cas_interruption(const std::string &path) {
-  for (int stage : {1, 2, 3, 4, 10, 11, 12, 13}) {
-    auto keeper = GpuBudget::connect(path, [] { return 3 * page; });
-    const auto slot = keeper->register_pool("cas-crash", 0);
-    const auto child = fork();
-    assert(child >= 0);
-    if (!child) {
-      auto owner = GpuBudget::connect(path, [] { return 0; });
-      const auto own = owner->register_pool("cas-crash", 1000);
-      crash_stage = stage;
-      if (stage < 10)
-        owner->set_accounting_test_hook(exit_at_stage);
-      auto grant = owner->grant(own, 2 * page);
-      auto receipt = grant->take(2 * page);
-      grant->finish();
-      owner->set_accounting_test_hook(exit_at_stage);
-      receipt->release();
-      _exit(3);
-    }
-    child_ok(child);
-    const auto state = keeper->snapshot(slot);
-    const uint64_t gpu = (stage <= 2 || stage == 13) ? 0 : 2 * page;
-    const uint64_t instance = (stage == 1 || stage >= 12) ? 0 : 2 * page;
-    assert(state.charged_bytes == gpu);
-    assert(state.instance_charged_bytes == instance);
-    assert(!keeper->recalibrate([] { return 3 * page; }));
-    // Surviving workers can still use the unambiguous remaining credit.
-    keeper->grant(slot, page)->finish();
-    assert(keeper->snapshot(slot).charged_bytes == gpu);
-  }
-  {
-    auto budget = GpuBudget::connect(path, [] { return 3 * page; });
-    const auto a = budget->register_pool("first", 0);
-    const auto b = budget->register_pool("second", 0);
-    auto first = budget->grant(a, 2 * page);
-    rejected([&] { budget->grant(b, 2 * page); });
-    assert(budget->snapshot(b).instance_charged_bytes == 0);
-    auto second = budget->grant(b, page);
-    first->finish();
-    second->finish();
-    assert(budget->snapshot(a).charged_bytes == 0);
-  }
-  std::cout << "PASS CAS accounting: eight interrupted debit/refund stages and "
-               "partial reservation rollback\n";
-}
-#endif
-
-static int calibration_wait_entered[2];
-static void calibration_wait_hook(int stage) {
-  if (stage == 40)
-    signal_pipe(calibration_wait_entered[1]);
-}
-static void check_calibration_wait(const std::string &path) {
+static void check_calibration_progress(const std::string &path) {
   auto budget = GpuBudget::connect(path, [] { return 3 * page; });
   auto contender = GpuBudget::connect(path, [] { return 0; });
   const auto slot = contender->register_pool("calibration-contender", 0);
-  assert(pipe(calibration_wait_entered) == 0);
-  contender->set_accounting_test_hook(calibration_wait_hook);
-  std::thread worker;
+  bool sampled = false;
   assert(budget->recalibrate([&] {
-    // A recursive sampler call is rejected instead of deadlocking itself.
-    rejected([&] { contender->grant(slot, page); });
-    worker = std::thread([&] { contender->grant(slot, page)->finish(); });
-    await_pipe(calibration_wait_entered[0]);
-    // A transient calibration must not become an engine-visible allocation
-    // miss. The waiter holds neither a data lock nor a pending charge.
-    const auto state = contender->snapshot(slot);
-    assert(state.charged_bytes == 0 && state.active_mutations == 0);
+    // Neither recursive nor concurrent grants/refunds wait on the sampler.
+    contender->grant(slot, page)->finish();
+    std::thread worker([&] {
+      auto grant = contender->grant(slot, page);
+      auto receipt = grant->take(page);
+      grant->finish();
+      receipt->release();
+    });
+    worker.join();
+    assert(!contender->recalibrate([&] {
+      sampled = true;
+      return page;
+    }));
+    assert(!sampled);
+    assert(contender->snapshot(slot).charged_bytes == 0);
     return 2 * page;
   }));
-  worker.join();
-  contender->set_accounting_test_hook(nullptr);
-  assert(contender->snapshot(slot).charged_bytes == 0);
-  for (int fd : calibration_wait_entered)
-    close(fd);
+  // The competing sample did not run, so it cannot publish out of order.
+  assert(contender->recalibrate([] { return page; }));
+  assert(contender->snapshot(slot).budget_bytes == page);
+  std::cout << "PASS calibration: only samplers exclude each other\n";
+}
+
+static void check_bounded_refunds(const std::string &path) {
+  auto budget = GpuBudget::connect(path, [] { return 512 * page; });
+  const auto a = budget->register_pool("refund-batch", 0);
+  const auto b = budget->register_pool("refund-batch", 1);
+  std::vector<std::unique_ptr<BudgetReceipt>> receipts;
+  const uint64_t total = 96 * page;
+  for (auto slot : {a, b}) {
+    auto grant = budget->grant(slot, total / 2);
+    for (int i = 0; i < 48; ++i)
+      receipts.push_back(grant->take(page));
+    grant->finish();
+  }
+  BudgetMutation outer(budget);
+  uint64_t released = 0;
+  for (auto &receipt : receipts) {
+    BudgetMutation nested(budget);
+    receipt->release();
+    released += page;
+    nested.finish();
+    const auto charged = budget->snapshot(a).charged_bytes;
+    assert(charged >= total - released);
+    assert(charged - (total - released) < kBudgetRefundBatchBytes);
+  }
+  assert(budget->snapshot(a).charged_bytes != total);
+  outer.finish();
+  assert(budget->snapshot(a).charged_bytes == 0);
+  auto large = budget->grant(a, 2 * kBudgetRefundBatchBytes);
+  auto handle = large->take(2 * kBudgetRefundBatchBytes);
+  large->finish();
+  BudgetMutation batch(budget);
+  handle->release(); // an indivisible handle can exceed the batch threshold
+  assert(budget->snapshot(a).charged_bytes == 0);
+  batch.finish();
   std::cout
-      << "PASS calibration contention: wait without a false capacity miss\n";
+      << "PASS refunds: bounded bytes across nested scopes and large handles\n";
+}
+
+static void check_refund_failure(const std::string &path) {
+  auto budget = GpuBudget::connect(path, [] { return 512 * page; });
+  const auto slot = budget->register_pool("failed-refund", 0);
+  auto grant = budget->grant(slot, kBudgetRefundBatchBytes + page);
+  auto first = grant->take(page);
+  auto incoming = grant->take(kBudgetRefundBatchBytes);
+  grant->finish();
+  BudgetMutation batch(budget);
+  first->release();
+  budget->set_accounting_test_hook([](int stage) {
+    if (stage == 50)
+      throw std::runtime_error("injected refund publication failure");
+  });
+  rejected([&] { incoming->release(); });
+  rejected([&] { batch.finish(); });
+  assert(budget->snapshot(slot).charged_bytes ==
+         kBudgetRefundBatchBytes + page);
+  // A failure cannot freeze sampling or silently discard the queued refund.
+  assert(budget->recalibrate([] { return 2 * page; }));
+  budget->set_accounting_test_hook(nullptr);
+  BudgetMutation retry(budget);
+  assert(budget->snapshot(slot).charged_bytes == kBudgetRefundBatchBytes);
+  incoming->release();
+  first->release();
+  retry.finish();
+  assert(budget->snapshot(slot).charged_bytes == 0);
+  std::cout << "PASS refund failure: retained backlog and incoming receipt "
+               "retry once\n";
 }
 
 static void check_capacity_recovery(const std::string &path) {
@@ -322,12 +275,13 @@ static void check_capacity_recovery(const std::string &path) {
     rejected([&] { keeper->grant(slot, 1); });
     full_free->finish();
     assert(keeper->snapshot(slot).charged_bytes == 2 * page);
-    // A later external allocation consumes one physical page. No stale-owner
-    // credit may mask it, and pending promises cannot trigger recalibration.
+    // Sampling is allowed with pending promises. Their bytes can be counted
+    // both in the ledger and in the driver's free sample until materialized.
     assert(keeper->recalibrate([] { return 2 * page; }));
     auto pending = keeper->grant(slot, 2 * page);
-    assert(!keeper->recalibrate([] { return 3 * page; }));
-    rejected([&] { keeper->grant(slot, 1); });
+    assert(keeper->recalibrate([] { return 3 * page; }));
+    assert(keeper->snapshot(slot).budget_bytes == 7 * page);
+    keeper->grant(slot, 3 * page)->finish();
     pending->finish();
     for (int fd : {ready[0], ready[1], finish[0], finish[1]})
       close(fd);
@@ -390,7 +344,8 @@ static void check_owner_retirement(const std::string &path) {
     BudgetMutation mutation(budget);
     receipt->release(); // physical free precedes the deferred ledger refund
     assert(budget->snapshot(slot).charged_bytes == 4 * page);
-    assert(!budget->recalibrate([] { return 8 * page; }));
+    assert(budget->recalibrate([] { return 8 * page; }));
+    assert(budget->snapshot(slot).budget_bytes == 12 * page);
     mutation.finish();
     assert(budget->recalibrate([] { return 8 * page; }));
     assert(budget->snapshot(slot).budget_bytes == 8 * page);
@@ -432,10 +387,11 @@ static void check_retirement_crash(const std::string &path) {
     assert(after.budget_bytes == 4 * page);
     assert(after.charged_bytes <= 2 * page);
     assert(after.budget_bytes - after.charged_bytes <= 4 * page);
-    assert(after.active_mutations > 0);
-    assert(!keeper->recalibrate([] { return 6 * page; }));
     keeper->register_pool("later-registration", 0);
     rejected([&] { keeper->grant(slot, 5 * page); });
+    assert(keeper->recalibrate([] { return 6 * page; }));
+    assert(keeper->snapshot(slot).charged_bytes == 0);
+    keeper->grant(slot, 6 * page)->finish();
   }
   std::cout << "PASS retirement crash: all publication stages retain "
                "conservative credit\n";
@@ -469,7 +425,7 @@ int main() {
     rejected([&] { same_gpu->grant(b, page); });
     auto unrelated = same_gpu->grant(c, 2 * page);
     rejected([&] { budget->grant(a, page); });
-    assert(!budget->recalibrate([] { return 0; }));
+    assert(budget->recalibrate([] { return 0; }));
     unrelated->finish();
     assert(budget->set_instance_limit(a, page, 8) == "applied");
     rejected([&] { same_gpu->grant(b, page); });
@@ -484,12 +440,11 @@ int main() {
     }
     other->release();
     assert(budget->snapshot(a).charged_bytes == 0);
-    assert(budget->snapshot(a).active_mutations == 0);
     assert(budget->set_instance_limit(a, 6 * page, 9) == "applied");
     assert(budget->recalibrate([&] {
-      // Sampling does not hold the data lock, but grants cannot race it.
+      // Sampling does not hold the data lock or exclude grants.
       assert(same_gpu->snapshot(c).charged_bytes == 0);
-      rejected([&] { same_gpu->grant(c, page); });
+      same_gpu->grant(c, page)->finish();
       return 5 * page;
     }));
     assert(budget->snapshot(a).budget_bytes == 5 * page);
@@ -500,10 +455,10 @@ int main() {
     });
     auto recovered = same_gpu->grant(c, page);
     recovered->finish();
-    // A release racing a sample changes the generation; no stale budget update.
-    assert(!budget->recalibrate([&] {
+    // A local refund scope no longer rejects an otherwise valid sample.
+    assert(budget->recalibrate([&] {
       BudgetMutation mutation(same_gpu);
-      return 0;
+      return 5 * page;
     }));
     assert(budget->snapshot(a).budget_bytes == 5 * page);
     const auto child = fork();
@@ -530,7 +485,7 @@ int main() {
     assert(samples == 1 && budget->snapshot(a).budget_bytes == 4 * page);
     auto resident = budget->grant(a, 2 * page);
     auto physical = resident->take(2 * page);
-    assert(!budget->recalibrate([] { return page; }));
+    assert(budget->recalibrate([] { return page; }));
     resident->finish();
     assert(budget->recalibrate([] { return page; }));
     assert(budget->snapshot(a).budget_bytes == 3 * page);
@@ -614,7 +569,7 @@ int main() {
     assert(keeper->snapshot(slot).charged_bytes == 2 * page);
     keeper->grant(slot, page)->finish(); // recovered exclusion remains usable
     rejected([&] { keeper->grant(slot, 2 * page); });
-    assert(!keeper->recalibrate([] { return 3 * page; }));
+    assert(keeper->recalibrate([] { return 3 * page; }));
   }
   {
     // Only a new epoch, after all participant leases close, discards old
@@ -656,12 +611,9 @@ int main() {
   check_capacity_recovery(path);
   check_owner_retirement(path);
   check_retirement_crash(path);
-  check_calibration_wait(path);
-
-#ifdef KVCACHED_BUDGET_CAS_ACCOUNTING
-  check_cas_interruption(path);
-  check_cas_calibration_race(path);
-#endif
+  check_calibration_progress(path);
+  check_bounded_refunds(path);
+  check_refund_failure(path);
   // A real static owner keeps its ledger alive through process teardown.
   exit_cleanup.path = dir + "/exit-budget";
   exit_cleanup.directory = dir;

@@ -3,8 +3,6 @@
 
 #include "page.hpp"
 
-#include <exception>
-#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -44,13 +42,6 @@ GPUPage::~GPUPage() {
 }
 
 void GPUPage::release() {
-  std::optional<BudgetMutation> mutation;
-  std::exception_ptr accounting_error;
-  try {
-    mutation.emplace(budget_receipt_ ? budget_receipt_->budget() : nullptr);
-  } catch (...) {
-    accounting_error = std::current_exception();
-  }
   if (!released_) {
     auto status = gpu_vmm::mem_release(handle_);
     if (!gpu_vmm::is_success(status)) {
@@ -59,15 +50,10 @@ void GPUPage::release() {
     }
     released_ = true;
   }
-  // Native cleanup remains possible after the ledger is unavailable; do not
-  // return credit without a valid accounting scope.
-  if (accounting_error)
-    std::rethrow_exception(accounting_error);
   // A handle can be released while its VMM mapping still retains memory.
   // Failed teardown must therefore remain charged until unmap is confirmed.
   if (budget_receipt_ && mappings_ == 0)
     budget_receipt_->release();
-  mutation->finish();
 }
 
 void GPUPage::attach_budget(std::unique_ptr<BudgetReceipt> receipt) {
