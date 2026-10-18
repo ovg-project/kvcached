@@ -482,8 +482,9 @@ def test_engine_core_rejects_kv_offloading_before_initialization(
     (None, True, True),    # 0.30: only the native pool has it
     (None, False, False),
 ])
+@pytest.mark.parametrize("events", [False, True])
 def test_coordinator_reads_caching_flag(
-    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected
+    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected, events
 ):
     interfaces, patches = vllm_modules
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
@@ -509,10 +510,12 @@ def test_coordinator_reads_caching_flag(
                 self.enable_caching = coordinator_flag
             self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
             self.single_type_managers = [types.SimpleNamespace()]
-            self.block_pool = types.SimpleNamespace(hash_block_size=16, enable_caching=pool_flag)
+            self.block_pool = types.SimpleNamespace(
+                hash_block_size=16, enable_caching=pool_flag, enable_kv_cache_events=events)
 
     kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
     setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
     assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
     coordinator = kvcoord_mod.KVCacheCoordinator()
     assert coordinator.block_pool.kwargs["enable_caching"] is expected
+    assert coordinator.block_pool.kwargs.get("enable_kv_cache_events", False) is events
