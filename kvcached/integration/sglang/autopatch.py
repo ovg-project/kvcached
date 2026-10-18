@@ -11,7 +11,6 @@ from kvcached.integration.patch_base import (
     is_integration_version_supported,
     log_patch_results,
 )
-from kvcached.integration.sglang.admission import SchedulerPrefillAdmissionPatch
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     ElasticAllocatorPatch,
@@ -63,7 +62,6 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # module globals, so apply these only after every pool alias.
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
             (SGLangVirtualKVCapacityPatch(), ">=0.5.16"),
-            (SchedulerPrefillAdmissionPatch(), ">=0.5.20,<0.5.21"),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
