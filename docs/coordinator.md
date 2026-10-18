@@ -73,6 +73,7 @@ All kvcached processes on a GPU must see the same `/dev/shm`.
 | `min` | not reclaimed below this | 0 |
 | priority | order of watermarks and reclaim | equal |
 | `headroom` | reserve kept from lower priorities | 0 |
+| preemption | whether reclaim may preempt running requests | off |
 
 With the defaults, behavior is today's: first come, first served.
 
@@ -85,12 +86,15 @@ in the engine.
 ### 2.4 Reclaim
 
 An instance short of memory posts its `shortfall`. Lower-priority instances
-above their `min` shrink: free pre-mapped pages, then evict prefix cache.
+above their `min` shrink: free pre-mapped pages, then evict prefix cache,
+then, if allowed, preempt running requests through the engine's own
+preemption.
 
 ### 2.5 CPU tier
 
-Evicted prefixes go to host memory through the engines' own offloading (vLLM
-KV connectors, SGLang HiCache) instead of being dropped.
+Evicted prefixes and the KV of preempted requests go to host memory through
+the engines' own offloading (vLLM KV connectors, SGLang HiCache) instead of
+being dropped.
 
 ## 3. Coordination
 
@@ -98,8 +102,8 @@ KV connectors, SGLang HiCache) instead of being dropped.
 
 Planned. A coordinator such as AIBrix sets each instance's controls, reads its
 usage, limits and pending reclaim, and asks it to shrink or grow, with
-separate acknowledgements for accepted and completed. Today it has
-`kvctl limit`.
+separate acknowledgements for accepted and completed. Reads take no lock and
+promise no consistency across fields. Today it has `kvctl limit`.
 
 ### 3.2 Local coordinator
 
