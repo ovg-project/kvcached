@@ -234,6 +234,23 @@ def _sglang_group_capacity_miss(local_miss: bool) -> bool:
     return bool(flag.item())
 
 
+def _sglang_pipeline_stages() -> int:
+    """Pipeline stages of this process's model; 1 without a parallel state.
+
+    The verdict above is agreed within a stage only. The stages of a pipeline
+    build their batches apart, so a miss recovered on one stage would leave
+    the others waiting on its sends. Until a stage-wide verdict exists, a
+    pipeline keeps SGLang's own behaviour: a prefill miss is fatal and the
+    decode gate is native.
+    """
+    try:
+        parallel_state = importlib.import_module(
+            "sglang.srt.distributed.parallel_state")
+        return int(parallel_state.get_pipeline_model_parallel_world_size())
+    except (ImportError, AttributeError, AssertionError):
+        return 1
+
+
 def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
                           pool: Any) -> None:
     """Report that the kvcached pool behind ``owner`` cannot back a request.
@@ -257,7 +274,8 @@ def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
 
 
 def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
-                                    num_tokens: int, need_blocks: int) -> bool:
+                                    num_tokens: int, need_blocks: int,
+                                    packed: bool = False) -> bool:
     """Decode capacity gate for the elastic allocators (SGLang 0.5.19+).
 
     ``ScheduleBatch.check_decode_mem`` asks the allocator whether the next
@@ -269,7 +287,10 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     cannot simply run again). Reserve the step's blocks here instead:
     ``KVCacheManager.alloc`` serves reserved blocks first, so the following
     ``alloc_for_decode`` cannot run out of pages inside this process, and a
-    shortfall surfaces where the scheduler retracts.
+    shortfall surfaces where the scheduler retracts. Since that allocation
+    takes the reserved blocks as they are, they are placed the way it would
+    place them: ``packed`` for an allocator that decodes with
+    ``alloc_packed``.
 
     Under TP every rank reserves from its own pool, so the verdict is agreed
     with the ranks sharing the queue: one short rank retracts everywhere. A
@@ -280,7 +301,7 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     if evict is not None:
         evict(tree_cache, num_tokens)
     local_miss = need_blocks > 0 and not bool(
-        allocator.kvcached_allocator.try_to_reserve(need_blocks))
+        allocator.kvcached_allocator.try_to_reserve(need_blocks, packed=packed))
     return not _sglang_group_capacity_miss(local_miss)
 
 
@@ -759,6 +780,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           tree_cache: Any,
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
+                    if _sglang_pipeline_stages() > 1:
+                        return super().check_decode_capacity(
+                            num_tokens=num_tokens, tree_cache=tree_cache,
+                            requests=requests, spec_algorithm=spec_algorithm)
                     return _sglang_reserve_decode_capacity(
                         self, tree_cache, num_tokens, need_blocks=num_tokens)
 
@@ -1021,9 +1046,15 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           tree_cache: Any,
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
+                    if _sglang_pipeline_stages() > 1:
+                        return super().check_decode_capacity(
+                            num_tokens=num_tokens, tree_cache=tree_cache,
+                            requests=requests, spec_algorithm=spec_algorithm)
                     need_blocks = -(-num_tokens // self.page_size)
+                    # This allocator's alloc_decode allocates with alloc_packed.
                     return _sglang_reserve_decode_capacity(
-                        self, tree_cache, num_tokens, need_blocks=need_blocks)
+                        self, tree_cache, num_tokens, need_blocks=need_blocks,
+                        packed=True)
 
                 def free(self, free_index):
                     if free_index.numel() == 0:
@@ -2612,7 +2643,7 @@ class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
 
         @functools.wraps(original)
         def _patched_alloc_for_extend(batch: Any) -> Any:
-            if not enable_kvcached():
+            if not enable_kvcached() or _sglang_pipeline_stages() > 1:
                 return original(batch)
             pool = batch.req_to_token_pool
             held = [_prefill_entry_state(req) for req in batch.reqs]
@@ -2705,7 +2736,7 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         @functools.wraps(original)
         def _patched_get_new_batch_prefill_raw(self, *args: Any,
                                                **kwargs: Any) -> Any:
-            if not enable_kvcached():
+            if not enable_kvcached() or _sglang_pipeline_stages() > 1:
                 return original(self, *args, **kwargs)
             running_batch = kwargs.get("running_batch")
             if running_batch is None and args:

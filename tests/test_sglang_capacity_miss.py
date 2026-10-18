@@ -59,6 +59,7 @@ class FakeManager:
         self.alloc_calls: List[int] = []
         self.free_calls: List[List[int]] = []
         self.reserve_calls: List[int] = []
+        self.reserve_packed: List[bool] = []
 
     def available_size(self) -> int:
         return len(self.free_ids) + len(self.reserved)
@@ -82,8 +83,9 @@ class FakeManager:
         self.free_calls.append(ids)
         self.free_ids.extend(ids)
 
-    def try_to_reserve(self, need: int) -> bool:
+    def try_to_reserve(self, need: int, packed: bool = False) -> bool:
         self.reserve_calls.append(need)
+        self.reserve_packed.append(packed)
         got = self.alloc(need)
         if got is None:
             return False
@@ -132,6 +134,12 @@ class FakeBaseTokenToKVPoolAllocator:
     def evict_to_free_tokens(self, tree_cache, num_tokens):
         # The 0.5.19+ base helper the decode gate calls before deciding.
         self.evicted.append((tree_cache, num_tokens))
+
+    def check_decode_capacity(self, *, num_tokens, tree_cache, requests=None,
+                              spec_algorithm=None):
+        # SGLang 0.5.19+'s native gate: evict, then compare the free count.
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens  # type: ignore[attr-defined]
 
 
 class FakeKernelFn:
@@ -440,6 +448,41 @@ def test_group_verdict_is_local_without_peers(monkeypatch, cpu_tensors):
     assert manager.reserved == [1, 2]
     allocator, manager = _token_allocator(manager_size=1)
     assert allocator.check_decode_capacity(num_tokens=2, tree_cache=None) is False
+
+
+def test_decode_gate_reserves_as_the_decode_allocation_places(
+        monkeypatch, cpu_tensors):
+    """The decode allocation takes the reserved blocks as they are, so the
+    gate reserves them the way that allocation would place them: packed for
+    the paged allocator, which decodes with alloc_packed."""
+    paged, paged_manager = _paged_allocator(
+        monkeypatch, manager_size=3, page_size=4, num_new_pages=1)
+    token, token_manager = _token_allocator(manager_size=4)
+
+    assert paged.check_decode_capacity(num_tokens=4, tree_cache=None)
+    assert token.check_decode_capacity(num_tokens=2, tree_cache=None)
+    assert paged_manager.reserve_packed == [True]
+    assert token_manager.reserve_packed == [False]
+
+
+def _install_pipeline_stages(monkeypatch, stages: int) -> None:
+    """A parallel state with ``stages`` pipeline stages of one rank each."""
+    _install_queue_groups(monkeypatch, None, world_size=1)
+    parallel_state = sys.modules["sglang.srt.distributed.parallel_state"]
+    parallel_state.get_pipeline_model_parallel_world_size = (  # type: ignore[attr-defined]
+        lambda: stages)
+
+
+def test_pipeline_keeps_the_native_decode_gate(monkeypatch, cpu_tensors):
+    """No verdict is agreed across pipeline stages, so a pipeline neither
+    reserves nor agrees: the gate is SGLang's own."""
+    _install_pipeline_stages(monkeypatch, 2)
+    allocator, manager = _token_allocator(manager_size=1)
+
+    assert allocator.check_decode_capacity(num_tokens=1, tree_cache=None) is True
+    assert allocator.check_decode_capacity(num_tokens=2, tree_cache=None) is False
+    assert manager.reserve_calls == []
+    assert allocator.evicted == [(None, 1), (None, 2)]
 
 
 # --------------------------------------------------------------------------
@@ -1292,6 +1335,19 @@ def test_passthrough_when_kvcached_is_disabled(
     pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=4, tokens=16,
                         mamba_slot_allocator_cls=mamba_slot_allocator_cls)
     monkeypatch.setenv("ENABLE_KVCACHED", "false")
+    pipeline.enqueue(FakeReq("a"), FakeReq("b"))
+
+    with pytest.raises(AssertionError, match=MAMBA_PING_PONG):
+        pipeline.round()
+
+
+def test_pipeline_keeps_a_prefill_miss_fatal(
+        monkeypatch, cpu_tensors, mamba_slot_allocator_cls):
+    """A miss recovered on one stage alone would leave the other stages
+    waiting on its sends, so a pipeline keeps SGLang's own behaviour."""
+    pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=4, tokens=16,
+                        mamba_slot_allocator_cls=mamba_slot_allocator_cls)
+    _install_pipeline_stages(monkeypatch, 2)
     pipeline.enqueue(FakeReq("a"), FakeReq("b"))
 
     with pytest.raises(AssertionError, match=MAMBA_PING_PONG):
