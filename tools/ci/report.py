@@ -9,14 +9,14 @@ Everything here is rendered from the files a run leaves in its results
 directories (setup.json and summary.json from tests/e2e/run.py and
 benchmarks/ci/perf.py), so the comment and the description describe what the
 run actually did. A correctness run has one directory per part that ran on
-its own GPUs: vllm and sglang for nightly, all otherwise.
+its own GPUs: vllm and sglang for basic, all otherwise.
 
 Usage:
-    report.py correctness --results DIR [DIR ...] --profile nightly --comment c.md \\
+    report.py correctness --results DIR [DIR ...] --profile weekly --comment c.md \\
         --section s.md --run-url URL --sha SHA [--subject S] [--prev SHA:CONCLUSION] \\
         [--artifact-url URL] [--pr N]
     report.py perf --results DIR --comment c.md --section s.md --run-url URL --sha SHA ...
-    report.py splice --body body.md --name nightly --section s.md --out new.md
+    report.py splice --body body.md --name weekly --section s.md --out new.md
 """
 
 from __future__ import annotations
@@ -24,22 +24,24 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 REPO_URL = "https://github.com/ovg-project/kvcached"
 # Sections of the issue description, in this order, one per workflow.
-SECTIONS = ("nightly", "weekly", "perf")
-TITLES = {"nightly": "Nightly correctness", "weekly": "Weekly correctness",
+SECTIONS = ("weekly", "perf")
+TITLES = {"basic": "Basic correctness", "weekly": "Weekly correctness",
           "smoke": "Smoke correctness", "perf": "Weekly performance"}
-SCHEDULES = {"nightly": "Daily at 08:00 UTC", "weekly": "Saturdays at 12:00 UTC",
-             "perf": "Sundays at 10:00 UTC"}
-WORKFLOWS = {"nightly": "gpu-correctness.yml", "weekly": "gpu-correctness.yml",
-             "smoke": "gpu-correctness.yml", "perf": "gpu-perf-weekly.yml"}
+SCHEDULES = {"weekly": "Saturdays at 12:00 UTC", "perf": "Sundays at 10:00 UTC"}
+WORKFLOWS = {"weekly": "gpu-correctness.yml", "smoke": "gpu-correctness.yml",
+             "perf": "gpu-perf-weekly.yml"}
 ENGINE_NAMES = {"vllm": "vLLM", "sglang": "SGLang"}
 LAYOUTS = {"c1": "kvcached, contiguous", "c0": "kvcached, non-contiguous", None: "native"}
 MAX_FAILED_ROWS = 30
+# Token checks that pass with some prompts differing (tests/e2e/run.py).
+TOKENS_EQUAL = re.compile(r"(gen_seq|apc_\d+)_tokens_equal")
 MAX_COMMENT = 60000  # GitHub's limit is 65536 characters
 
 
@@ -238,29 +240,16 @@ def correctness_section(profile: str, setup: dict[str, Any], args: argparse.Name
         *cases_table(setup),
         "",
     ]
-    # The workload and checks come from the same code for every profile, so
-    # only the nightly section of the issue spells them out.
-    same = profile != "nightly" and not args.pr
-    if same:
-        lines += ["Each case runs the workload and checks described under "
-                  "[Nightly correctness](#nightly-correctness)."]
-    else:
-        lines += ["Each case:", "", *[f"- {step}" for step in setup.get("workload", [])], "",
-                  *checks_table(setup.get("checks", {}))]
+    lines += ["Each case:", "", *[f"- {step}" for step in setup.get("workload", [])], "",
+              *checks_table(setup.get("checks", {}))]
     if setup.get("elastic"):
-        lines += ["", "### Elastic tests", "", *elastic_table(setup), ""]
-        if same:
-            lines += ["Phases and checks as under Nightly correctness."]
-        else:
-            lines += [*[f"- {step}" for step in setup.get("elastic_workload", [])], "",
-                      *checks_table(setup.get("elastic_checks", {}))]
+        lines += ["", "### Elastic tests", "", *elastic_table(setup), "",
+                  *[f"- {step}" for step in setup.get("elastic_workload", [])], "",
+                  *checks_table(setup.get("elastic_checks", {}))]
     if setup.get("limit"):
-        lines += ["", "### Limit tests", "", *limit_table(setup), ""]
-        if same:
-            lines += ["Phases and checks as under Nightly correctness."]
-        else:
-            lines += [*[f"- {step}" for step in setup.get("limit_workload", [])], "",
-                      *checks_table(setup.get("limit_checks", {}))]
+        lines += ["", "### Limit tests", "", *limit_table(setup), "",
+                  *[f"- {step}" for step in setup.get("limit_workload", [])], "",
+                  *checks_table(setup.get("limit_checks", {}))]
     return "\n".join(lines) + "\n"
 
 
@@ -296,6 +285,22 @@ def failed_cases(summary: dict[str, Any], setup: dict[str, Any]) -> list[str]:
     if len(failed) > MAX_FAILED_ROWS:
         lines.append(f"\nand {len(failed) - MAX_FAILED_ROWS} more; see the run's job summary.")
     return lines
+
+
+def token_mismatches(summary: dict[str, Any]) -> list[str]:
+    """The prompts whose greedy tokens differ from native in cases that still
+    pass, since fewer than half of their phase's prompts differ."""
+    rows = [(case["name"], c["name"], c["detail"]) for case in summary.get("cases", [])
+            for c in case.get("checks", [])
+            if c.get("ok") and c.get("detail") and TOKENS_EQUAL.fullmatch(c["name"])]
+    if not rows:
+        return []
+    return ["", "These cases pass, though some prompts' greedy tokens differ from native: "
+            "fewer than half of each phase's prompts, which is most likely numerical. Greedy "
+            "decoding flips between near-tied tokens, and the engines also do this between "
+            "their own runs.",
+            "", "| case | check | prompts that differ |", "|---|---|---|",
+            *[f"| {case} | `{name}` | {cell(detail[:300])} |" for case, name, detail in rows]]
 
 
 def logs_line(args: argparse.Namespace, days: int) -> str:
@@ -334,6 +339,7 @@ def correctness_comment(profile: str, dirs: list[Path], args: argparse.Namespace
         lines += [f"The {name} cases did not finish; the run log has the details."
                   for name in missing] + [""]
     lines += failed_cases(summary, setup) if failed else [f"All {len(cases)} cases passed."]
+    lines += token_mismatches(summary)
     if args.pr:
         # The pull request may change the cases, so its setup is its own.
         section = correctness_section(profile, setup, args).split("\n", 2)[2]
@@ -411,6 +417,7 @@ def perf_comment(results: Path, args: argparse.Namespace) -> str:
         lines += ["", "Hopper correctness:", "", *failed_cases(e2e, e2e_setup or {})]
     else:
         lines += ["", f"Hopper correctness: all {len(e2e.get('cases', []))} cases passed."]
+    lines += token_mismatches(e2e or {})
     lines += ["", "Setup: the issue description. " + logs_line(args, 90)]
     return "\n".join(lines)[:MAX_COMMENT] + "\n"
 

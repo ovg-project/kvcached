@@ -102,7 +102,7 @@ def run_limit(ct: Container, test: LimitTest, run_id: str, port: int,
             return res
         probes = cl.BASE_PROMPTS[:3]
         base = srv.client.run_phase("probe", probes, 32, 1)
-        usage = Usage(ct.gpu)
+        usage = Usage(ct.gpu, (srv.ipc,))
         mem: dict[str, float] = {}
         res.log["memory_mib"] = mem
 
