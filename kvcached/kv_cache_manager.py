@@ -1100,11 +1100,17 @@ class KVCacheManager:
 
     @_after_post_init
     @synchronized
-    def try_to_reserve(self, need_size: int) -> bool:
+    def try_to_reserve(self, need_size: int, packed: bool = False) -> bool:
+        """Set aside blocks that the next allocation takes first.
+
+        ``packed`` places them as ``alloc_packed`` would, for a caller whose
+        next allocation is an ``alloc_packed`` call.
+        """
         self._wait_post_init()
         if self.available_size() < need_size:
             return False
-        reserved = self.alloc(need_size)
+        reserved = (self.alloc_packed(need_size) if packed
+                    else self.alloc(need_size))
         if reserved is None:
             logger.warning("Failed to reserve blocks.")
             return False
