@@ -63,11 +63,6 @@ return `unavailable` because that process has a different pool registry. The
 transport that delivers assignments to the engine process (for example, RPC or
 a Unix socket) is intentionally left to the production integration.
 
-The control published last is in force. A `kvctl limit` replaces an earlier API
-assignment, and the next assignment replaces the quota. Repeating a `kvctl
-limit` value that is already published is not observed, so only a changed value
-takes the limit back.
-
 Use a monotonically increasing, non-negative revision for each new assignment:
 
 | Status | Meaning | Controller action |
