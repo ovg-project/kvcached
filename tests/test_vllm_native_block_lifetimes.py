@@ -35,6 +35,7 @@ def bare_pool():
     pool = object.__new__(Mixin)
     pool.blocks = [Block(0, is_null=True), Block(1, ref_cnt=1)]
     pool.enable_prefix_cache = False
+    pool.enable_kv_cache_events = False
     pool._evictable_blocks = OrderedDict()
     pool.kv_cache_manager = types.SimpleNamespace(free=Mock())
     pool._block_id_to_key = {}

@@ -16,6 +16,8 @@ class NativeBlockPoolMixin:
     kv_block_pool: list[Any]
     kv_cache_manager: Any
     enable_prefix_cache: bool
+    enable_kv_cache_events: bool
+    kv_event_queue: list[Any]
     _block_id_to_key: dict[int, Any]
     _evictable_blocks: OrderedDict[int, Any]
     _cached_blocks: dict[Any, dict[int, Any]]
@@ -34,6 +36,10 @@ class NativeBlockPoolMixin:
         self.metrics_collector = None
         # vLLM 0.30 native methods read these; kvcached never pins blocks.
         self._reuse_watchers: dict[int, Any] = {}
+        if self.enable_kv_cache_events:
+            from vllm.distributed.kv_events import MEDIUM_GPU
+
+            self.medium = MEDIUM_GPU
 
     def get_cached_block(self, block_hash: Any, kv_cache_group_ids: list[int]) -> Any:
         if not self.enable_prefix_cache:
@@ -71,11 +77,26 @@ class NativeBlockPoolMixin:
         self._block_id_to_key.pop(block.block_id, None)
         return removed
 
+    def _emit_block_removed_events(self, block_hashes: list[Any]) -> None:
+        if not self.enable_kv_cache_events:
+            return
+        # Removing one physical owner does not end a hash/group's residency.
+        # The native index includes both primary keys and partial-block aliases.
+        unowned = [key for key in block_hashes
+                   if self.cached_block_hash_to_block.get_one_block(key) is None]
+        self._native_block_pool._emit_block_removed_events(self, unowned)
+
     def _remove_cached_block(self, key: Any, block_id: int) -> Any:
         # Elastic eviction calls this after removing its primary ownership marker.
         # Evict every native alias before the physical slot can be reused.
         block = self.blocks[block_id]
-        return block if self._remove_cached_block_hashes(block) else None
+        removed = self._remove_cached_block_hashes(block)
+        if self.enable_kv_cache_events:
+            self._emit_block_removed_events(removed)
+        return block if removed else None
+
+    def take_events(self) -> list[Any]:
+        return self._native_block_pool.take_events(self)
 
     def unpin_blocks(self, *args: Any, **kwargs: Any) -> None:
         # Only HiSparse (rejected at startup) unpins blocks in vLLM 0.30.
@@ -109,17 +130,20 @@ class NativeBlockPoolMixin:
             self.kv_cache_manager.free(block_ids)
 
     def reset_prefix_cache(self) -> bool:
-        if not self.enable_prefix_cache:
-            return True
-        # Physical availability is not a count of logical free slots: use live
-        # references, including pending worker copies, to decide whether reset is safe.
-        if any(block.ref_cnt > 0 for block in self.blocks if not block.is_null):
-            return False
-        self._evict_blocks_from_pool(len(self._evictable_blocks))
-        self.cached_block_hash_to_block = type(self.cached_block_hash_to_block)()
-        self.cached_block_hashes_by_block.clear()
-        self._block_id_to_key.clear()
-        self._cached_blocks.clear()
-        for block in self.blocks:
-            block.reset_hash()
+        if self.enable_prefix_cache:
+            # Physical availability is not a count of logical free slots: use live
+            # references, including pending worker copies, to decide whether reset is safe.
+            if any(block.ref_cnt > 0 for block in self.blocks if not block.is_null):
+                return False
+            self._evict_blocks_from_pool(len(self._evictable_blocks))
+            self.cached_block_hash_to_block = type(self.cached_block_hash_to_block)()
+            self.cached_block_hashes_by_block.clear()
+            self._block_id_to_key.clear()
+            self._cached_blocks.clear()
+            for block in self.blocks:
+                block.reset_hash()
+        if self.enable_kv_cache_events:
+            from vllm.distributed.kv_events import AllBlocksCleared
+
+            self.kv_event_queue.append(AllBlocksCleared())
         return True

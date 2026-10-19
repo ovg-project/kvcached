@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Readiness keeps child/signal ownership, never control-file metadata."""
+"""Readiness keeps child/signal ownership and sockets, never control-file metadata."""
 
 import os
 import types
@@ -32,7 +32,12 @@ def test_readiness_keeps_native_payload_and_registers_only_owned_children(
             self.all_child_pids = [os.getpid()] if children else []
             self.wait_for_ready = lambda: "ready"
 
-    kill = Mock()
+    kill_calls = Mock()
+
+    def kill(parent_pid, include_parent=True, skip_pid=None, wait_timeout=60):
+        kill_calls(parent_pid, include_parent=include_parent)
+
+    monkeypatch.setattr(shutdown, "_bound_worker_sockets", list)
     controller = Mock()
     engine = types.SimpleNamespace(
         Engine=type("Engine", (), {}),
@@ -42,21 +47,20 @@ def test_readiness_keeps_native_payload_and_registers_only_owned_children(
     )
     scheduler = types.SimpleNamespace(Scheduler=Scheduler)
     tokenizer = types.SimpleNamespace(kill_process_tree=kill)
-    original_info = Scheduler.get_init_info
     patch = shutdown.SGLangShutdownPatch()
     assert patch.patch_shutdown(engine, scheduler, tokenizer)
     assert patch.patch_shutdown(engine, scheduler, tokenizer)
     result = InitResult()
     assert result.wait_for_ready() == "ready"
-    assert Scheduler.get_init_info is original_info
     assert Scheduler().get_init_info() is payload
     assert result.scheduler_infos == [payload]
-    assert engine.run_data_parallel_controller_process is controller
-    assert engine.kill_process_tree is kill and tokenizer.kill_process_tree is kill
+    assert "_kvcached_ipc_names" not in payload
+    assert payload.get(shutdown._SOCKETS_KEY) == ([] if enabled else None)
+    assert engine.run_data_parallel_controller_process is shutdown._run_data_parallel_controller_process
     assert len(callbacks) == int(enabled and children)
     if callbacks:
         callbacks[0]()
-        kill.assert_called_once_with(os.getpid(), include_parent=False)
+        kill_calls.assert_called_once_with(os.getpid(), include_parent=False)
 
 
 def test_inherited_owner_never_stops_child_process_tree(monkeypatch):

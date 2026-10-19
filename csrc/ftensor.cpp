@@ -111,6 +111,12 @@ FTensor::~FTensor() {
         LOGGER(ERROR, "mem_unmap during FTensor cleanup failed: %s",
                gpu_vmm::error_string(res));
       }
+      if (gpu_vmm::is_success(res)) {
+        for (auto &entry : mapping_)
+          entry.second->record_unmap();
+        for (auto &page : failed_pages_)
+          page->record_unmap();
+      }
       res = gpu_vmm::address_free(vaddr_, size_);
       if (!gpu_vmm::is_success(res)) {
         LOGGER(ERROR, "address_free during FTensor cleanup failed: %s",
@@ -167,6 +173,7 @@ bool FTensor::map(offset_t offset) {
         throw_rollback_error("physical page map", original_error,
                              gpu_vmm::error_string(status));
       }
+      page->record_unmap();
     }
     try {
       if (!map_(zero_page_.get(), offset)) {
@@ -183,6 +190,82 @@ bool FTensor::map(offset_t offset) {
                            rollback_error.what());
     }
     throw std::runtime_error("physical page map failed: " + original_error);
+  }
+  return true;
+}
+
+bool FTensor::is_mapped(offset_t offset) const { return is_mapped_(offset); }
+
+std::unique_ptr<Page> FTensor::reserve_page(offset_t offset) const {
+  validate_offset_(offset);
+  assert(offset % page_size_ == 0);
+  if (is_mapped_(offset)) {
+    throw std::runtime_error("page is already mapped");
+  }
+  return make_unique_page(dev_, offset / page_size_, page_size_);
+}
+
+bool FTensor::map_reserved(offset_t offset, std::unique_ptr<Page> &page) {
+  validate_offset_(offset);
+  assert(offset % page_size_ == 0);
+  const page_id_t page_id = offset / page_size_;
+  if (!page) {
+    throw std::invalid_argument("reserved page must not be null");
+  }
+  if (is_mapped_(offset)) {
+    LOGGER(ERROR, "Page %ld is already mapped.", page_id);
+    return false;
+  }
+
+  auto vaddr = reinterpret_cast<generic_ptr_t>(
+      reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  if (dev_.is_cuda()) {
+    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                       "zero page unmap");
+  }
+
+  bool physical_page_mapped = false;
+  try {
+    if (!page->map(vaddr)) {
+      throw std::runtime_error("physical page map returned false");
+    }
+    physical_page_mapped = true;
+    mapping_.emplace(page_id, std::move(page));
+  } catch (const std::exception &error) {
+    const std::string original_error = error.what();
+    if (dynamic_cast<const StateConsistencyError *>(&error)) {
+      if (page) {
+        failed_pages_.push_back(std::move(page));
+      }
+      throw;
+    }
+    if (physical_page_mapped && dev_.is_cuda()) {
+      const auto status = gpu_vmm::mem_unmap(vaddr, page_size_);
+      if (!gpu_vmm::is_success(status)) {
+        if (page) {
+          failed_pages_.push_back(std::move(page));
+        }
+        throw_rollback_error("reserved physical page map", original_error,
+                             gpu_vmm::error_string(status));
+      }
+      page->record_unmap();
+    }
+    try {
+      if (!map_(zero_page_.get(), offset)) {
+        throw std::runtime_error("zero page map returned false");
+      }
+      if (page) {
+        page->release();
+      }
+    } catch (const std::exception &rollback_error) {
+      if (page) {
+        failed_pages_.push_back(std::move(page));
+      }
+      throw_rollback_error("reserved physical page map", original_error,
+                           rollback_error.what());
+    }
+    throw std::runtime_error("reserved physical page map failed: " +
+                             original_error);
   }
   return true;
 }
@@ -225,6 +308,7 @@ bool FTensor::unmap_retain_(offset_t offset,
   if (dev_.is_cuda()) {
     throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
                        "physical page unmap");
+    mapping->second->record_unmap();
   }
 
   try {
@@ -285,6 +369,7 @@ bool FTensor::restore_mapping_(offset_t offset,
         throw_rollback_error("physical page restore", original_error,
                              gpu_vmm::error_string(status));
       }
+      retained_page->record_unmap();
     }
     try {
       if (!map_(zero_page_.get(), offset)) {

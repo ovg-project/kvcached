@@ -86,22 +86,21 @@ def setup_kvcache():
 
 
 def test_basic_alloc_free(setup_kvcache):
-    # instantiate a kv cache manager with known size
     manager = setup_kvcache
-
-    # initial available blocks
+    # Isolate exact accounting from a background page's map-to-reserve transfer.
+    # Concurrent preallocation is covered by the separate preallocator tests.
+    manager._wait_post_init()
+    manager.page_allocator.stop_prealloc_thread()
     initial_available = manager.available_size()
 
-    # allocate some blocks
     n_blocks = 256
     handle = manager.alloc(n_blocks)
-    after_alloc = manager.available_size()
-    assert after_alloc + n_blocks == initial_available
+    assert handle is not None
+    assert len(handle) == n_blocks
+    assert manager.available_size() + n_blocks == initial_available
 
-    # free the allocated blocks
     manager.free(handle)
-    after_free = manager.available_size()
-    assert after_free == initial_available
+    assert manager.available_size() == initial_available
 
 
 def test_over_allocation_fails(setup_kvcache):

@@ -62,6 +62,18 @@ class KVCachePoolSnapshot:
     Block accounting (these fields are NOT mutually exclusive -- do not sum
     them):
 
+    * ``total_blocks`` -- the backing extent: every block id the pool's
+      virtual reservation and page space are sized for. An integration may
+      size it above the capacity it asked for, so that whole blocks still
+      fit after backing bytes round up to physical pages and blocks that
+      straddle a page boundary drop out (the SGLang MLA pool, #530).
+    * ``logical_blocks`` -- the allocation capacity: the most blocks
+      ``alloc()`` hands out at once, counting any reserved null block.
+      Equal to ``total_blocks`` when the integration set no separate limit.
+      ``available_blocks`` is counted against this field, not against
+      ``total_blocks``: a pool backed by 29 blocks for 17 logical ones
+      reports 16 available once the null block is reserved, so
+      ``total_blocks - allocated_blocks`` is not the remaining capacity.
     * ``allocated_blocks`` -- blocks currently handed out of their pages.
       Includes ``reserved_blocks``.
     * ``reserved_blocks`` -- the subset of ``allocated_blocks`` held on the
@@ -82,7 +94,8 @@ class KVCachePoolSnapshot:
       across all of its KV buffers (K and V for MHA, the single combined
       buffer for MLA).
     * ``virtual_total_bytes`` -- the whole pool, i.e.
-      ``virtual_per_layer_bytes * num_layers``.
+      ``virtual_per_layer_bytes * num_layers``. Both cover the backing
+      extent, ``total_blocks``.
 
     The page-count fields are captured atomically with respect to allocator
     mutations. Other fields remain best-effort and may come from marginally
@@ -140,6 +153,9 @@ class KVCachePoolSnapshot:
     lifecycle_error: Optional[str] = None
     reserved_mapped_bytes: Optional[int] = None
     total_mapped_bytes: Optional[int] = None
+    # Allocation capacity beside the backing extent (#530); optional so older
+    # builders keep working.
+    logical_blocks: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -452,6 +468,13 @@ def build_kv_cache_pool_snapshot(
         available_blocks = 0
     allocated_blocks = max(int(manager._get_num_alloced_blocks()), 0)
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
+    total_blocks = _int_attr(manager, "num_blocks") or 0
+    # KVCacheManager.logical_num_blocks is the capacity alloc() enforces when
+    # the integration sized num_blocks above it (#530). A manager without the
+    # attribute, or with it unset, hands out every backing block.
+    logical_blocks = _int_attr(manager, "logical_num_blocks")
+    if logical_blocks is None:
+        logical_blocks = total_blocks
 
     return KVCachePoolSnapshot(
         schema_version=SCHEMA_VERSION,
@@ -463,7 +486,7 @@ def build_kv_cache_pool_snapshot(
         num_kv_buffers=num_kv_buffers,
         page_size_bytes=page_size_bytes,
         block_size_bytes=block_size_bytes,
-        total_blocks=_int_attr(manager, "num_blocks") or 0,
+        total_blocks=total_blocks,
         available_blocks=available_blocks,
         allocated_blocks=allocated_blocks,
         reserved_blocks=reserved_blocks,
@@ -498,6 +521,7 @@ def build_kv_cache_pool_snapshot(
         lifecycle_error=(str(lifecycle_error) if lifecycle_error is not None else None),
         reserved_mapped_bytes=reserved_mapped_bytes,
         total_mapped_bytes=total_mapped_bytes,
+        logical_blocks=logical_blocks,
     )
 
 
