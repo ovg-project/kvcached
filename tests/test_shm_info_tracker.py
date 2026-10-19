@@ -206,3 +206,14 @@ def test_check_and_get_resize_target_returns_none_if_same():
     resize_target = tracker.check_and_get_resize_target(
         current_mem_size, num_layers)
     assert resize_target is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_reader_without_write_permission():
+    # Engines running as root in a container create segments that a host
+    # user can read but not write; kvctl list and kvtop must still see them.
+    os.chmod(IPC_PATH, 0o444)
+
+    mem_info = get_kv_cache_limit(IPC_NAME)
+    assert mem_info is not None
+    assert mem_info.total_size == TOTAL_MEM

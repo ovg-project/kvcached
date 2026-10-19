@@ -61,7 +61,9 @@ class PageEvictionIndex:
         self.candidates.clear()
         self.heap.clear()
 
-    def victims(self, budget: int) -> list[int]:
+    def victims(self, budget: int, max_pages: int | None = None) -> list[int]:
+        """Blocks of the cheapest whole pages, at most `budget` blocks and
+        `max_pages` pages."""
         dirty, self.dirty = self.dirty, set()
         occupancy = self.manager.get_page_occupancy(
             [page for page in dirty if page in self.pages]) if dirty else {}
@@ -81,8 +83,8 @@ class PageEvictionIndex:
             heapq.heapify(self.heap)
 
         victims: list[int] = []
-        selected = []
-        while self.heap:
+        selected: list[tuple[int, int, int, int]] = []
+        while self.heap and (max_pages is None or len(selected) < max_pages):
             entry = self.heap[0]
             cost, _, page, _ = entry
             if self.candidates.get(page) != entry:

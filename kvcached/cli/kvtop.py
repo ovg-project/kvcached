@@ -7,10 +7,11 @@ import os
 import time
 from typing import List, Optional, Union
 
+from kvcached import control_segment
 from kvcached.cli.utils import SHM_DIR, MemInfoStruct, RwLockedShm, _format_size, get_ipc_name
 
 
-def _detect_kvcache_ipc_names() -> List[str]:
+def _detect_kvcache_ipc_names(include_inactive: bool = False) -> List[str]:
     """Detect all shared memory segments that look like KVCacheManager info."""
     candidates: List[str] = []
     try:
@@ -21,7 +22,9 @@ def _detect_kvcache_ipc_names() -> List[str]:
             except Exception:
                 continue
             # Heuristic: MemInfoStruct segments have fixed size
-            if st.st_size != MemInfoStruct.SHM_SIZE:
+            if st.st_size not in (MemInfoStruct.SHM_SIZE, control_segment.SEGMENT_SIZE):
+                continue
+            if not include_inactive and control_segment.active(path) is False:
                 continue
             try:
                 with RwLockedShm(fname, MemInfoStruct.SHM_SIZE,
@@ -108,6 +111,8 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
             if current_row >= height - 4:  # Reserve some rows for footer/GPU
                 break
 
+            if control_segment.active(os.path.join(SHM_DIR, get_ipc_name(name))) is False:
+                continue
             # Fetch memory info for this IPC
             try:
                 with RwLockedShm(get_ipc_name(name), MemInfoStruct.SHM_SIZE,

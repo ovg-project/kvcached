@@ -4,9 +4,12 @@
 import importlib.util
 import logging
 import os
+import signal
+import socket
 import threading
 import uuid
-from typing import BinaryIO, Optional
+import weakref
+from typing import BinaryIO, Callable, Iterable, Optional, Tuple
 
 
 class KVCachedConfigError(RuntimeError):
@@ -222,55 +225,154 @@ def get_tp_socket_dir(ipc_name: Optional[str] = None) -> str:
     return os.path.join(TP_SOCKET_DIR_ROOT, f"kvcached-tp-{name}-{suffix}")
 
 
-class IPCSegmentCleanup:
-    """Remember one segment across teardown and retry only its failed unlink.
+def get_tp_worker_socket_path(socket_dir: str, rank: int, pp_rank: int = 0) -> str:
+    """Return the socket path of TP worker *rank* in PP stage *pp_rank*
+    under *socket_dir*: w<rank>.sock, inside a pp<pp_rank> subdirectory for
+    every stage after the first so that stages starting concurrently never
+    bind the same path."""
+    if pp_rank > 0:
+        return os.path.join(socket_dir, f"pp{pp_rank}", f"w{rank}.sock")
+    return os.path.join(socket_dir, f"w{rank}.sock")
 
-    Capture before stopping the engine: it may remove its own segment during
-    shutdown. The open file pins the inode, so a later file at the same path
-    cannot inherit its identity. No contents are read or modified. This is
-    a replacement check, not a lock against concurrent instance startup.
+
+def get_tp_socket_dir_of(socket_path: str) -> str:
+    """The deployment directory a worker socket path belongs to, the inverse
+    of get_tp_worker_socket_path: the socket's directory, or that directory's
+    parent for a pp<k> stage socket."""
+    directory = os.path.dirname(socket_path)
+    stage = os.path.basename(directory)
+    if stage.startswith("pp") and stage[2:].isdigit():
+        return os.path.dirname(directory)
+    return directory
+
+
+def path_identity(path: str) -> Optional[Tuple[int, int]]:
+    """(st_dev, st_ino) of the node at *path*, or None when there is none.
+
+    The pathname alone does not identify a socket: a same-name restart
+    binds a new node at the same path."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def remove_dir_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Still holds another worker's socket, or already gone.
+        pass
+
+
+def _accepts_connections(path: str) -> Optional[bool]:
+    """Whether some process still accepts connections on the socket node at
+    *path*. A Unix stream socket node answers connect() only while the
+    process that bound it is alive (a stopped process still queues the
+    connection); once that process has exited the connection is refused.
+    None when the probe cannot tell."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:
+            return None
+    return True
+
+
+class WorkerSocketCleanup:
+    """Remember one deployment's worker sockets while its workers are live
+    and remove, later, only the ones no worker serves any more (issue #510).
+
+    A worker unlinks its own socket from Worker.shutdown(). On a process
+    group SIGTERM vLLM's process manager kills the engine tree before that
+    runs, so the parent removes the sockets after confirmed engine exit.
+    Control-segment lifetime is managed separately by the OFD tracker. A socket node
+    cannot be pinned by an open descriptor, so each one is remembered by
+    (st_dev, st_ino): a node that no longer matches belongs to a same-name
+    replacement and is kept. A remembered node is removed only once a
+    connect() to it is refused; a stopped or delayed worker still accepts
+    and keeps its socket for a later retry. The check-then-unlink window
+    of the worker's own listener stop applies here as well.
+
+    A directory is removed only by the call that removed one of the
+    deployment's nodes from it, and a completed cleanup is a no-op: a
+    same-name replacement creates the same directory again between its
+    makedirs() and bind(), and vLLM calls the owner's shutdown more than
+    once per teardown.
     """
 
-    def __init__(self, segment: str) -> None:
-        self.segment = segment
+    _lock: threading.Lock
+    _pending: dict[str, Tuple[int, int]]
+    _dirs: list[str]
+
+    def __init__(self, socket_dir: str, tp_size: int, pp_size: int) -> None:
+        self._remember(get_tp_worker_socket_path(socket_dir, rank, pp_rank)
+                       for pp_rank in range(max(int(pp_size), 1))
+                       for rank in range(max(int(tp_size), 1)))
+
+    @classmethod
+    def for_paths(cls, paths: Iterable[str]) -> "WorkerSocketCleanup":
+        """Remember the sockets at *paths*, the ones the workers reported
+        binding (issue #548), instead of deriving them from the sizes."""
+        cleanup = cls.__new__(cls)
+        cleanup._remember(paths)
+        return cleanup
+
+    def _remember(self, paths: Iterable[str]) -> None:
         self._lock = threading.Lock()
-        self._file: Optional[BinaryIO]
-        try:
-            self._file = open(segment, "rb")
-        except FileNotFoundError:
-            self._file = None
+        self._pending = {}
+        for path in paths:
+            identity = path_identity(path)
+            if identity is not None:
+                self._pending[path] = identity
+        # Deepest first: a pp<k> directory before the deployment root, which
+        # is removed once empty like the worker's own stop removes it.
+        directories = {os.path.dirname(path) for path in self._pending}
+        directories.update(get_tp_socket_dir_of(path) for path in self._pending)
+        self._dirs = sorted(directories, key=len, reverse=True)
 
     def unlink(self) -> bool:
-        """Return True when done; keep the original file open on failure."""
+        """Remove the remembered sockets nobody serves and the directories
+        that leaves empty. Return True when nothing is left to retry."""
         with self._lock:
-            return self._unlink()
+            if not self._pending:
+                return True
+            logger = get_kvcached_logger()
+            emptied: set[str] = set()
+            for path, identity in list(self._pending.items()):
+                current = path_identity(path)
+                if current is None or current != identity:
+                    del self._pending[path]  # gone, or a replacement's
+                    continue
+                served = _accepts_connections(path)
+                if served is None:
+                    logger.warning("Keeping worker socket %s: cannot tell whether "
+                                   "a worker still serves it", path)
+                    continue
+                if served:
+                    logger.warning("Keeping worker socket %s: a worker still "
+                                   "accepts connections on it", path)
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("Failed to remove worker socket %s: %s", path, e)
+                    continue
+                logger.info("Removed worker socket %s left by a killed worker", path)
+                del self._pending[path]
+                emptied.add(os.path.dirname(path))
+            for directory in self._dirs:
+                if any(target == directory or target.startswith(directory + os.sep)
+                       for target in emptied):
+                    remove_dir_if_empty(directory)
+            return not self._pending
 
-    def _unlink(self) -> bool:
-        if self._file is None:
-            return True
-        try:
-            current = os.stat(self.segment)
-            original = os.fstat(self._file.fileno())
-            if os.path.samestat(current, original):
-                os.unlink(self.segment)
-                get_kvcached_logger().info(
-                    "Unlinked KV cache limit segment %s", self.segment)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            get_kvcached_logger().warning(
-                "Failed to unlink %s on shutdown: %s", self.segment, e)
-            return False
-        self._file.close()
-        self._file = None
-        return True
-
-    def close(self) -> None:
-        """Discard an unconfirmed identity without deleting anything."""
-        with self._lock:
-            if self._file is not None:
-                self._file.close()
-                self._file = None
 
 LOG_USE_COLOR = os.getenv("KVCACHED_LOG_COLOR", "true").lower() == "true"
 _UNIFORM_COLOR = os.getenv("KVCACHED_LOG_COLOR_CODE", "\033[36m")
@@ -355,3 +457,196 @@ def get_kvcached_logger(name: str = "kvcached") -> logging.Logger:
         logger.propagate = False
 
     return logger
+
+
+# Default SIGTERM bypasses Python teardown. Only known process owners register;
+# existing application/event-loop handlers remain authoritative.
+_sigterm_owner_callbacks: list[tuple[int, weakref.WeakMethod]] = []
+_pending_owner_sigterm: Optional[Tuple[int, int, Tuple[Callable[[], None], ...]]] = None
+_sigterm_finalizer_pid: Optional[int] = None
+_owner_sigterm_loop_handler: Optional[Callable[..., None]] = None
+_owner_sigterm_loop_pid: Optional[int] = None
+_owner_sigterm_loop_wakeup: Optional[Tuple[
+    weakref.ReferenceType[socket.socket], int, os.stat_result, BinaryIO
+]] = None
+
+
+def _reset_owner_sigterm_after_fork() -> None:
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
+    if _owner_sigterm_loop_pid in (None, os.getpid()):
+        return
+    # CPython writes before invoking Python signal handlers. Redirect only
+    # the child's still-owned asyncio socket descriptor, never the process-
+    # global wakeup setting: another child hook may have installed a custom fd
+    # with an unreadable warn_on_full_buffer policy. dup2 leaves the parent's
+    # descriptors and shared selector unchanged. Do not close/drain the loop.
+    wakeup = _owner_sigterm_loop_wakeup
+    try:
+        if wakeup is not None:
+            socket_ref, fd, identity, sink = wakeup
+            inherited_socket = socket_ref()
+            if inherited_socket is not None and inherited_socket.fileno() == fd:
+                try:
+                    inherited = os.path.samestat(identity, os.fstat(fd))
+                except OSError:
+                    inherited = False
+                if inherited:
+                    os.dup2(sink.fileno(), fd, inheritable=False)
+    finally:
+        if signal.getsignal(signal.SIGTERM) is _owner_sigterm_loop_handler:
+            signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+        _owner_sigterm_loop_handler = None
+        _owner_sigterm_loop_pid = None
+        _owner_sigterm_loop_wakeup = None
+        if wakeup is not None:
+            wakeup[3].close()
+
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_owner_sigterm_after_fork)
+
+
+def _unwind_for_owner_sigterm(signum, frame) -> None:
+    global _pending_owner_sigterm
+    # Do not acquire a lock, log, join, or call shutdown in a signal handler:
+    # the interrupted frame may hold the very lock shutdown needs. Unwind the
+    # Python stack first, as SIGINT already does. A second TERM remains fatal.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    pid = os.getpid()
+    # Keep owners alive only during TERM unwinding: newer Python versions can
+    # release a function-local owner before process finalizers run.
+    callbacks = tuple(callback for owner_pid, ref in _sigterm_owner_callbacks
+                      if owner_pid == pid and (callback := ref()) is not None)
+    _pending_owner_sigterm = (pid, signum, callbacks)
+    raise SystemExit(128 + signum)
+
+
+def _finish_owner_sigterm() -> None:
+    global _pending_owner_sigterm
+    pending, _pending_owner_sigterm = _pending_owner_sigterm, None
+    if pending is None or pending[0] != os.getpid():
+        return
+    try:
+        for callback in pending[2]:
+            try:
+                callback()
+            except BaseException as error:
+                get_kvcached_logger().warning("Owner shutdown during SIGTERM failed: %s", error)
+    finally:
+        # Preserve WIFSIGNALED/SIGTERM, not a successful exit or exit code 143.
+        # This runs after stack unwinding, never recursively inside shutdown.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), pending[1])
+
+
+def register_owner_sigterm_cleanup(callback) -> bool:
+    """Arrange owner teardown for an otherwise-default SIGTERM.
+
+    Only the main thread may register a bound shutdown method, after capturing
+    process ownership. Never replace a custom/ignored/event-loop handler. Weak
+    callbacks do not retain owners during normal execution; a received TERM
+    holds them through stack unwinding. PID checks exclude inherited owners.
+    Applications that suppress SystemExit or bypass Python exit with os._exit
+    still own their shutdown policy. No thread, daemon, or polling is added.
+    """
+    global _sigterm_finalizer_pid
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    previous = signal.getsignal(signal.SIGTERM)
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    pid = os.getpid()
+    ref = weakref.WeakMethod(callback)
+    _sigterm_owner_callbacks[:] = [(owner_pid, item)
+                                  for owner_pid, item in _sigterm_owner_callbacks
+                                  if owner_pid == pid and item() is not None]
+    if (pid, ref) not in _sigterm_owner_callbacks:
+        _sigterm_owner_callbacks.append((pid, ref))
+    if _sigterm_finalizer_pid != pid:
+        # multiprocessing's fork bootstrap uses os._exit after its own
+        # finalizers, bypassing atexit. Cover that normal bootstrap too, before
+        # its automatic child joins. The pending marker makes dispatch one-shot.
+        from multiprocessing.util import Finalize
+
+        Finalize(None, _finish_owner_sigterm, exitpriority=1)
+        # CPython joins non-daemon threads before ordinary atexit callbacks.
+        # A serving thread may need owner.shutdown() to release it, so use the
+        # pre-join exit hook available on our supported Python >= 3.10 instead.
+        # Like Finalize, this runs after the main stack has unwound, not from
+        # the signal handler. Cover this private runtime contract in tests.
+        # SGLang 0.5.11/0.5.12 disable _register_atexit at import time,
+        # but CPython still drains this list before joining threads.
+        getattr(threading, "_threading_atexits").append(_finish_owner_sigterm)
+        _sigterm_finalizer_pid = pid
+    if previous is not _owner_sigterm_loop_handler:
+        signal.signal(signal.SIGTERM, _unwind_for_owner_sigterm)
+    return True
+
+
+def register_owner_sigterm_loop(loop, previous) -> bool:
+    """Preserve owner exit when SGLang's registered loop stops between requests.
+
+    Call only immediately after the framework installs its own loop handler.
+    A running loop keeps its original signal delivery and wakeup fd. A stopped
+    synchronous Engine loop cannot consume that delivery: unwind instead. Do
+    not adopt an application's custom/ignored prior disposition or a process
+    without registered ownership. No shutdown work runs in this handler.
+    """
+    global _owner_sigterm_loop_handler, _owner_sigterm_loop_pid
+    global _owner_sigterm_loop_wakeup
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    if (previous not in (signal.SIG_DFL, _unwind_for_owner_sigterm)
+            and (previous is not _owner_sigterm_loop_handler
+                 or _owner_sigterm_loop_handler is None)):
+        return False
+    if not any(pid == os.getpid() and ref() is not None
+               for pid, ref in _sigterm_owner_callbacks):
+        return False
+    original = signal.getsignal(signal.SIGTERM)
+    if not callable(original):
+        return False
+    loop_ref = weakref.ref(loop)
+    pid = os.getpid()
+    # Keep a weak ownership check as well as the kernel identity: an earlier
+    # child hook may detach, close or reuse this descriptor. Unknown loop types
+    # retain the existing bridge behavior but have no socket we can isolate.
+    wakeup = getattr(loop, "_csock", None)
+    wakeup_identity = None
+    if isinstance(wakeup, socket.socket) and hasattr(os, "register_at_fork"):
+        try:
+            fd = wakeup.fileno()
+            identity = os.fstat(fd)
+            # Allocate while registering, not in the fork child where the fd
+            # table may already be full. This one source fd is closed on bridge
+            # replacement or child reset; the target stays owned by its socket.
+            sink = open(os.devnull, "wb", buffering=0)
+            try:
+                os.set_blocking(sink.fileno(), False)
+            except BaseException:
+                sink.close()
+                raise
+            wakeup_identity = (weakref.ref(wakeup), fd, identity, sink)
+        except OSError as error:
+            get_kvcached_logger().warning(
+                "Cannot isolate inherited asyncio signal socket after fork: %s", error)
+
+    def handle(signum, frame):
+        active_loop = loop_ref()
+        if os.getpid() == pid and active_loop is not None and active_loop.is_running():
+            original(signum, frame)
+        else:
+            _unwind_for_owner_sigterm(signum, frame)
+
+    _owner_sigterm_loop_handler = handle
+    _owner_sigterm_loop_pid = pid
+    old_wakeup = _owner_sigterm_loop_wakeup
+    _owner_sigterm_loop_wakeup = wakeup_identity
+    if old_wakeup is not None:
+        old_wakeup[3].close()
+    signal.signal(signal.SIGTERM, handle)
+    return True

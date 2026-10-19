@@ -76,6 +76,7 @@ def _make_manager(resize_return=False):
     manager = object.__new__(KVCacheManager)
     manager._lock = NoOpLock()
     manager.block_mem_size = 1024
+    manager.mem_size = 8 * manager.block_mem_size
     manager.reserved_blocks = [1, 2, 3]
     manager.in_shrink = False
     manager.target_num_blocks = None
@@ -90,7 +91,7 @@ def _make_manager(resize_return=False):
     manager.page_allocator = StubPageAllocator()
 
     freed = []
-    manager.free = lambda indices: freed.append(list(indices))
+    setattr(manager, "free", lambda indices: freed.append(list(indices)))
     return manager, freed
 
 
@@ -135,6 +136,7 @@ def test_free_reserved_survives_sanity_check():
     manager = object.__new__(KVCacheManager)
     manager._lock = NoOpLock()
     manager.block_mem_size = 1024
+    manager.mem_size = 8 * manager.block_mem_size
     manager.reserved_blocks = [1, 2, 3]
     manager.in_shrink = False
     manager.target_num_blocks = None
