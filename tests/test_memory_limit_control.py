@@ -123,6 +123,7 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager.block_mem_size = manager.page_size
     manager.avail_pages = {}
     manager.full_pages = {}
+    manager._get_num_alloced_blocks = lambda: manager.page_allocator.inuse_pages
     manager._avail_physical_pages_cache = None
     manager._avail_physical_pages_ts = 0.0
     return manager
@@ -327,14 +328,68 @@ def test_limit_is_clamped_to_the_original_reservation():
 
 def test_kvctl_quota_is_clamped_to_the_original_reservation():
     manager = _manager()
+    assert manager.resize(manager.page_size * 3)
     # kvctl publishes the raw quota, which may exceed the startup size.
     manager.page_allocator.get_resize_target = lambda: manager.page_size * 32
-
-    assert manager.resize(manager.page_size * 3)
     manager.apply_resize_target()
 
     assert manager.page_allocator.resize_calls == [3, 16]
     assert manager.page_allocator.total_pages == 16
+
+
+@pytest.mark.parametrize("earlier_quota", [None, 8])
+@pytest.mark.parametrize("pending_quota", [0, 12])
+def test_api_takes_over_watcher_value_not_yet_consumed(earlier_quota, pending_quota):
+    """Construct the native-watch/engine-poll window, not a serving repro."""
+    manager = _manager()
+    if earlier_quota is not None:
+        _kvctl_limit(manager, earlier_quota)
+        manager.apply_resize_target()
+    _kvctl_limit(manager, pending_quota)
+    bundle = manager._memory_limit_page_bundle_bytes()
+    manager.set_memory_limit(4 * bundle, revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.total_pages == 4
+    assert manager.memory_limit_state()["effective_limit_bytes"] == 4 * bundle
+    _kvctl_limit(manager, 6)
+    manager.apply_resize_target()
+    assert manager.page_allocator.total_pages == 6
+
+
+@pytest.mark.parametrize("from_kvctl", [False, True])
+def test_watcher_change_during_resize_is_not_acknowledged(monkeypatch, from_kvctl):
+    manager = _manager()
+    _kvctl_limit(manager, 8)
+    original = manager.page_allocator.resize
+
+    def resize(size):
+        _kvctl_limit(manager, 12)
+        return original(size)
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    if from_kvctl:
+        manager.apply_resize_target()
+    else:
+        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == ([8, 12] if from_kvctl else [4, 12])
+
+
+def test_failed_api_does_not_acknowledge_pending_quota(monkeypatch):
+    manager = _manager()
+    _kvctl_limit(manager, 12)
+    original = manager.page_allocator.resize
+
+    def fail(size):
+        raise ValueError("injected resize failure")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    with pytest.raises(ValueError, match="injected"):
+        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
+    monkeypatch.setattr(manager.page_allocator, "resize", original)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == [12]
+    assert manager._memory_limit_revision == -1
 
 
 def test_zero_limit_drains_an_idle_pool():

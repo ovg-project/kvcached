@@ -85,6 +85,9 @@ def _make_manager(resize_return=False):
 
     class StubPageAllocator:
 
+        def get_resize_target(self):
+            return -1
+
         def resize(self, new_mem_size):
             return resize_return
 
@@ -145,6 +148,9 @@ def test_free_reserved_survives_sanity_check():
     manager.num_avail_blocks = 0
 
     class StubPageAllocator:
+
+        def get_resize_target(self):
+            return -1
 
         def resize(self, new_mem_size):
             return False

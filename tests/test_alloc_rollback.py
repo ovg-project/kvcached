@@ -832,8 +832,8 @@ def test_retained_quota_is_applied_until_a_later_resize(monkeypatch):
 def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
     """shipiyouniao's probe on #558: with the reserved pages the only ones in
     use, resize() refuses the quota, _resize() frees the reserved blocks and
-    only then enters the shrink, so that free() cannot complete it. The next
-    allocation applies the retained quota again and completes it."""
+    only then enters the shrink, so that free() cannot complete it. The
+    engine reclaim pass must finish the shrink before allocating again."""
     manager = make_manager(fail_after=4)
     allocator = manager.page_allocator
 
@@ -846,15 +846,45 @@ def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
     assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
     assert len(manager.reserved_blocks) == 2 * BLOCKS_PER_PAGE
 
-    # kvctl publishes a one-page quota.
+    # kvctl publishes a one-page quota. The engine pass retries after release.
     monkeypatch.setattr(allocator, "get_resize_target", lambda: BLOCKS_PER_PAGE)
-    assert manager.alloc(1) is None
-    assert manager.in_shrink
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
+    assert not manager.in_shrink
     assert manager.reserved_blocks == []
     assert allocator.freed_pages == [0, 1]
 
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE + 1]
+    assert not manager.in_shrink
+
+
+@pytest.mark.parametrize("observed_quota", [False, True])
+@pytest.mark.parametrize("idle", [False, True])
+def test_api_shrink_progresses_after_reserved_release(monkeypatch, observed_quota, idle):
+    """Real manager bookkeeping with a constructed allocator and poll window."""
+    manager = make_manager(fail_after=4)
+    allocator = manager.page_allocator
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        inuse = allocator.num_allocated - len(allocator.freed_pages)
+        return size // BLOCKS_PER_PAGE >= inuse
+
+    monkeypatch.setattr(allocator, "resize", resize, raising=False)
+    if observed_quota:
+        monkeypatch.setattr(allocator, "get_resize_target", lambda: 4 * BLOCKS_PER_PAGE)
+        manager.apply_resize_target()
+    assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
+    assert not manager.resize(BLOCKS_PER_PAGE)
+    assert manager.reserved_blocks == []
+    assert manager.in_shrink
+    calls.clear()
+    if idle:
+        manager.apply_resize_target()
+        manager.reclaim_for_shrink()
     assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
     assert not manager.in_shrink
+    assert calls == [BLOCKS_PER_PAGE]
 
 
 @pytest.mark.parametrize("pending_shrink", [False, True])

@@ -1157,6 +1157,9 @@ class KVCacheManager:
             self._resize_rejected = True
             logger.warning("Automatic resize rejected: pool has quarantined pages")
         else:
+            # resize() snapshots the watcher for API takeover. Keep the value
+            # actually applied here so a concurrent watcher change is not lost.
+            self._kvctl_target = new_mem_size
             # resize() marked its target as the latest; here that is the
             # quota. The next pass applies a deferred shrink again, which is
             # what completes it when _resize() freed the reserved blocks
@@ -1209,6 +1212,11 @@ class KVCacheManager:
                 callback = ref()
                 if callback is not None and self.in_shrink:
                     callback()
+            # resize() may have released the last reserved blocks before it
+            # entered shrink. Complete that target on the engine thread even
+            # when there are no cache owners left to free anything. Retired
+            # pages still wait for their existing physical-release barrier.
+            self._maybe_finish_shrink()
         finally:
             self._reclaiming_for_shrink = False
 
@@ -1236,6 +1244,10 @@ class KVCacheManager:
     def resize(self, new_mem_size: int):
         self._increment_operation_counter("resize_requests_total")
         try:
+            # A watcher value already visible at API entry is older than this
+            # target, even if the engine has not applied it yet. Commit the
+            # snapshot only after a successful (possibly deferred) resize.
+            observed_target = self.page_allocator.get_resize_target()
             resized = self._resize(new_mem_size)
         except Exception:
             self._record_operation_error(
@@ -1251,6 +1263,7 @@ class KVCacheManager:
         # The latest published target wins: the retained kvctl quota is not
         # applied again over this one. _apply_resize_target() marks the quota
         # as the latest when it is the caller.
+        self._kvctl_target = observed_target
         self._kvctl_target_is_latest = False
         return resized
 
