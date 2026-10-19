@@ -26,6 +26,29 @@ struct BudgetSnapshot {
   uint64_t sync_dead_owner_recoveries = 0;
 };
 
+// Observations are forecasts, never admission authority. Fields can come from
+// different updates; charged includes reservations and unconfirmed releases.
+struct BudgetPoolObservation {
+  uint64_t generation = 0;
+  std::string instance;
+  int64_t group = 0;
+  uint64_t charged_bytes = 0;
+  uint64_t limit_bytes = 0;
+  uint64_t revision = 0;
+  bool has_revision = false;
+};
+struct BudgetObservation {
+  uint64_t budget_bytes = 0;
+  uint64_t last_sample_ns = 0;
+  // A slot changed identity during this pass and was omitted. No retries.
+  bool incomplete = false;
+  std::vector<BudgetPoolObservation> pools;
+};
+// Internal path-based reader. Does not create files, sample, acquire the ledger
+// flock, or retain a connection after returning. Throws for unavailable,
+// initializing, replaced or incompatible ledgers. Names/layout stay private.
+BudgetObservation observe_gpu_budget(const std::string &path);
+
 class GpuBudget;
 
 // A receipt never refunds itself: destroying an owner is not proof that a
@@ -115,6 +138,7 @@ public:
 
 private:
   friend class BudgetGrant;
+  friend BudgetObservation observe_gpu_budget(const std::string &path);
   struct Shared;
   struct Locked;
   struct LocalMutation {

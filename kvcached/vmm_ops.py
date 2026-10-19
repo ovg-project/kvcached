@@ -34,6 +34,7 @@ prepare_map_to_kv_tensors = _C.prepare_map_to_kv_tensors
 commit_prepared_map = _C.commit_prepared_map
 abort_prepared_map = _C.abort_prepared_map
 has_prepared_map = _C.has_prepared_map
+observe_physical_budget = _C.observe_physical_budget
 physical_budget_state = _C.physical_budget_state
 set_instance_budget_limit = _C.set_instance_budget_limit
 recalibrate_physical_budget = _C.recalibrate_physical_budget
@@ -58,6 +59,7 @@ __all__ = [
     "kv_tensors_created",
     "map_to_kv_tensors",
     "map_to_kv_tensors_with_result",
+    "observe_physical_budget",
     "physical_budget_state",
     "set_instance_budget_limit",
     "recalibrate_physical_budget",
