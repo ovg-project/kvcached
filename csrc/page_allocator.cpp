@@ -547,8 +547,17 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  const size_t usable_phy_mem_size =
+  size_t usable_phy_mem_size =
       saturating_subtract(avail_phy_mem_size, headroom);
+  // The local scheduler must honor the same GPU/instance limits as grants.
+  // Worker-IPC allocators own their ledgers in the workers, not this process.
+  // This remains an estimate; the actual map still performs atomic admission.
+  if (world_size_ == 1 && !should_use_worker_ipc()) {
+    auto allocator = FTensorAllocator::global_allocator(group_id_);
+    if (allocator->kv_tensors_created())
+      usable_phy_mem_size =
+          std::min(usable_phy_mem_size, allocator->available_physical_bytes());
+  }
 
   // Calculate available pages considering layers and KV buffers
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
