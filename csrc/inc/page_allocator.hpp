@@ -79,6 +79,9 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page();
+  // Reuse reserved pages first; map all new pages in one callback. On failure,
+  // restore ID ownership and propagate the map protocol's original exception.
+  std::vector<std::shared_ptr<InternalPage>> alloc_pages(int64_t num_pages);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
 
@@ -95,6 +98,7 @@ public:
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
+  int64_t get_num_retryable_pages() const;
   PageState get_page_state() const;
   TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
@@ -145,6 +149,8 @@ private:
 
   // Internal methods
   void map_pages(const std::vector<page_id_t> &page_ids);
+  bool retry_retained_pages();
+  int64_t get_num_retryable_pages_unlocked() const;
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
   PageState get_page_state_unlocked() const;
@@ -181,6 +187,9 @@ private:
   // Page lists
   std::deque<page_id_t> free_page_list_;
   std::deque<page_id_t> reserved_page_list_;
+  // Keep the exact callback payload: orphan adoption is batch-specific.
+  std::deque<std::vector<page_id_t>> retained_page_batches_;
+  int64_t retry_pages_in_flight_ = 0;
   std::deque<page_id_t> reclaimed_page_list_;
   std::vector<page_id_t> quarantined_page_ids_;
   std::string transaction_error_;

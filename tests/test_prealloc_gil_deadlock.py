@@ -61,8 +61,13 @@ alloc.stop_prealloc_thread()
 """
 
 
-def test_alloc_page_does_not_deadlock_against_prealloc_worker():
-    proc = subprocess.run([sys.executable, "-c", SCENARIO],
+@pytest.mark.parametrize("batch", [False, True])
+def test_alloc_page_does_not_deadlock_against_prealloc_worker(batch):
+    scenario = SCENARIO
+    if batch:
+        scenario = scenario.replace("page = alloc.alloc_page()",
+                                    "page = alloc.alloc_pages(5)[0]")
+    proc = subprocess.run([sys.executable, "-c", scenario],
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, (
         f"scenario failed\nstdout: {proc.stdout}\nstderr: {proc.stderr}")

@@ -4,6 +4,73 @@
 import pytest
 
 
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase, num_pages):
+    """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.errors import StateConsistencyError
+
+    vmm_ops = _compiled_vmm_ops()
+    offsets, _ = _create_layout(vmm_ops, False, False)
+    allocator = vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=8 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=2, group_id=0, ipc_name="UNKNOWN_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+    allocator.set_broadcast_map_callback(ipc.broadcast_map_to_kv_tensors)
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", {})
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {(0, 0): "gpu-0"})
+    transactions = []
+    commands = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        commands.append(command)
+        transaction = message["transaction_id"]
+        if command == "prepare_map_to_kv_tensors":
+            transactions.append(transaction)
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction, message["offsets"], 0)["success"]
+            if phase == "prepare":
+                raise ConnectionError("lost prepare response")
+            return {"status": "success", "transaction_state": "reserved"}
+        if command == "commit_prepared_map":
+            assert vmm_ops.commit_prepared_map(transaction, 0)["success"]
+            raise ConnectionError("lost commit response")
+        if command == "get_map_transaction_state":
+            raise ConnectionError("lost state query response")
+        pytest.fail(f"unexpected cleanup or retry: {command}")
+
+    monkeypatch.setattr(ipc, "_send_and_receive_message", exchange)
+    try:
+        with pytest.raises(StateConsistencyError, match="restart"):
+            allocator.alloc_pages(num_pages)
+        state = allocator.get_transaction_state()
+        assert state["state"] == "FAILED"
+        assert state["quarantined_page_ids"] == list(range(num_pages))
+        with pytest.raises(StateConsistencyError):
+            allocator.get_num_free_pages()
+        assert len(transactions) == 1
+        assert commands.count("get_map_transaction_state") == 2
+        calls = len(commands)
+        with pytest.raises(StateConsistencyError):
+            allocator.alloc_pages(num_pages)
+        assert len(commands) == calls
+        if phase == "prepare":
+            assert vmm_ops.has_prepared_map(transactions[0], 0)
+        else:
+            # Idempotent native map reports no newly mapped offsets: the
+            # original mapping was retained, not silently rolled back.
+            assert vmm_ops.map_to_kv_tensors_with_result([offsets[0]], 0) == (True, [])
+    finally:
+        del allocator
+        vmm_ops.shutdown_kvcached()
+
+
 @pytest.mark.parametrize("page_mib", [2, 4])
 @pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
 def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguous, buffers):
@@ -65,6 +132,206 @@ def test_native_allocator_preserves_recoverable_callback_error():
         allocator.alloc_page()
     assert allocator.get_num_free_pages() == before
     assert allocator.get_num_inuse_pages() == 0
+
+
+def test_background_unknown_outcome_reaches_manager_capacity_check():
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserved-page settings are captured when the extension loads.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES="1", KVCACHED_MAX_RESERVED_PAGES="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import runpy, sys; "
+         "runpy.run_path(sys.argv[1])['_check_background_unknown_outcome']()", __file__],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _batch_allocator(vmm_ops, *, contiguous_layout=False):
+    import uuid
+
+    page_size = 2 * 1024 * 1024
+    return vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=4 * page_size,
+        page_size=page_size, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=contiguous_layout,
+        enable_page_prealloc=False, num_kv_buffers=2,
+        group_id=0, ipc_name="BATCH_" + uuid.uuid4().hex[:8],
+    )
+
+
+@pytest.mark.parametrize("contiguous_layout", [False, True])
+def test_native_batch_maps_all_new_offsets_once_and_reuses_reserved(contiguous_layout):
+    _run_reserved_batch_case("_check_batch_reuse", contiguous_layout)
+
+
+def _run_reserved_batch_case(name, argument):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES="0", KVCACHED_MAX_RESERVED_PAGES="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import json, runpy, sys; "
+         "runpy.run_path(sys.argv[1])[sys.argv[2]](json.loads(sys.argv[3]))",
+         __file__, name, json.dumps(argument)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_batch_reuse(contiguous_layout):
+    v = _compiled_vmm_ops()
+    page_size = 2 * 1024 * 1024
+    v.init_kvcached("cuda:0", page_size, contiguous_layout)
+    # create_kv_tensors takes the per-layer K+V size, whereas PageAllocator
+    # takes the size of one buffer. Reserve four pages for each K/V buffer.
+    v.create_kv_tensors(8 * page_size, 2, "cuda:0", 2, 2, 0, False)
+    allocator = _batch_allocator(v, contiguous_layout=contiguous_layout)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    stride = 2 * 1024 * 1024 * (4 if contiguous_layout else 1)
+
+    def map_batch(world_size, offsets):
+        calls.append(list(offsets))
+        assert v.map_to_kv_tensors_with_result(offsets, 0) == (True, list(offsets))
+
+    allocator.set_broadcast_map_callback(map_batch)
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: v.unmap_from_kv_tensors(offsets, 0))
+    try:
+        pages = allocator.alloc_pages(2)
+        assert [p.page_id for p in pages] == [0, 1]
+        assert calls == [[0, stride]]
+        allocator.free_page(0)
+        assert allocator.get_num_reserved_pages() == 1
+        pages = allocator.alloc_pages(3)
+        assert [p.page_id for p in pages] == [0, 2, 3]
+        assert calls == [[0, stride], [2 * stride, 3 * stride]]
+        assert allocator.get_num_free_pages() == 0
+        # Every offset is already mapped, including the reused reserved page.
+        assert v.map_to_kv_tensors_with_result([i * stride for i in range(4)], 0) == (True, [])
+        allocator.free_pages([0, 1, 2, 3])
+        allocator.trim()
+        assert allocator.get_num_free_pages() == 4
+    finally:
+        del allocator
+        v.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("failure", ["recoverable", "quarantined", "unknown"])
+def test_native_batch_failure_restores_only_safe_page_ids(failure):
+    _run_reserved_batch_case("_check_batch_failure", failure)
+
+
+def _check_batch_failure(failure):
+    from kvcached.errors import MapQuarantinedError, StateConsistencyError
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls, unmaps = [], []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    allocator.set_broadcast_unmap_callback(lambda ws, offsets: unmaps.append(list(offsets)))
+    allocator.alloc_pages(2)
+    allocator.free_page(0)
+    error_type = {"recoverable": RuntimeError, "quarantined": MapQuarantinedError,
+                  "unknown": MapTransactionOutcomeUnknownError}[failure]
+    expected_type = StateConsistencyError if failure == "unknown" else error_type
+
+    def fail(ws, offsets):
+        raise error_type("injected batch failure")
+
+    allocator.set_broadcast_map_callback(fail)
+    with pytest.raises(expected_type, match="injected batch failure"):
+        allocator.alloc_pages(3)
+    assert allocator.get_num_reserved_pages() == 1
+    assert unmaps == []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    if failure == "recoverable":
+        assert allocator.get_num_free_pages() == 3
+        assert allocator.get_num_inuse_pages() == 1
+        assert [p.page_id for p in allocator.alloc_pages(3)] == [0, 2, 3]
+        assert len(calls[-1]) == 2
+    else:
+        assert allocator.get_transaction_state()["quarantined_page_ids"] == [2, 3]
+        if failure == "unknown":
+            with pytest.raises(StateConsistencyError):
+                allocator.alloc_page()
+        else:
+            assert allocator.get_num_free_pages() == 1
+            assert allocator.alloc_page().page_id == 0
+            with pytest.raises(RuntimeError, match="free pages"):
+                allocator.alloc_page()
+
+
+def test_native_batch_invalid_or_exhausted_request_does_not_mutate_state():
+    v = _compiled_vmm_ops()
+    allocator = _batch_allocator(v)
+    allocator.set_use_worker_ipc(True)
+    calls = []
+    allocator.set_broadcast_map_callback(lambda ws, offsets: calls.append(list(offsets)))
+    assert allocator.alloc_pages(0) == []
+    with pytest.raises(ValueError, match="non-negative"):
+        allocator.alloc_pages(-1)
+    with pytest.raises(RuntimeError, match="free pages"):
+        allocator.alloc_pages(5)
+    assert allocator.get_num_free_pages() == 4
+    assert allocator.get_num_reserved_pages() == 0
+    assert calls == []
+    assert [p.page_id for p in allocator.alloc_pages(4)] == list(range(4))
+    assert len(calls) == 1
+
+
+def _check_background_unknown_outcome():
+    import threading
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.kv_cache_manager import KVCacheManager
+    from kvcached.lifecycle import LifecyclePhase, LifecycleState
+    from kvcached.locks import NoOpLock
+
+    vmm_ops = _compiled_vmm_ops()
+    entered = threading.Event()
+    allocator = vmm_ops.PageAllocator(
+        num_layers=1, mem_size_per_layer=16 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=True,
+        num_kv_buffers=2, group_id=0, ipc_name="BACKGROUND_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+
+    def fail(*args):
+        try:
+            ipc._fail_unresolved_map_transaction("background", [0], 0, "prepare", ["lost"])
+        finally:
+            entered.set()
+
+    allocator.set_broadcast_map_callback(fail)
+    manager = object.__new__(KVCacheManager)
+    manager._lock = NoOpLock()
+    manager.page_allocator = allocator
+    manager.num_avail_blocks = 0
+    manager.reserved_blocks = []
+    manager.in_shrink = False
+    manager._lifecycle = LifecycleState("background-unknown")
+    manager._lifecycle.mark_ready()
+    try:
+        allocator.start_prealloc_thread()
+        assert entered.wait(10), "preallocator did not exercise the callback"
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="background"):
+            manager.available_size()
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+            manager.wait_ready()
+    finally:
+        allocator.stop_prealloc_thread()
 
 
 def _compiled_vmm_ops():
@@ -518,3 +785,125 @@ def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
     finally:
         del allocator
         native.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("page", [2 * 1024 * 1024, 4 * 1024 * 1024])
+@pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_local_growth_reserves_pool_geometry_and_preserves_zero_cost_reuse(
+    monkeypatch, tmp_path, contiguous, buffers, page
+):
+    import uuid
+
+    import torch
+
+    native = _compiled_vmm_ops()
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("KVCACHED_IPC_NAME", "geometry-" + uuid.uuid4().hex)
+    native.init_kvcached("cuda:0", 2 * 1024 * 1024, contiguous)
+    try:
+        tensors = native.create_kv_tensors(8 * page, 1, "cuda:0", 2, buffers, page_size=page)
+        allocator = native.PageAllocator(
+            2, 8 * page, page, contiguous_layout=contiguous,
+            enable_page_prealloc=False, num_kv_buffers=buffers,
+            ipc_name="LOCAL_" + uuid.uuid4().hex[:8],
+        )
+        assert native.set_instance_budget_limit(0, 1) == "applied"
+        before = allocator.get_num_free_pages()
+        with pytest.raises(RuntimeError, match="capacity_exhausted"):
+            allocator.alloc_page()
+        assert allocator.get_num_free_pages() == before
+        assert allocator.get_transaction_state()["state"] == "HEALTHY"
+
+        charge = page * 2 * buffers
+        assert native.set_instance_budget_limit(2 * charge, 2) == "applied"
+        first = allocator.alloc_page()
+        assert first.page_id == 0
+        for tensor in tensors:
+            tensor[:128].fill_(7)
+        torch.cuda.synchronize()
+        assert native.physical_budget_state()["charged_bytes"] == charge
+
+        # A mapped logical offset costs zero even when admission cannot run.
+        offset = page * 2 * buffers if contiguous else page
+        assert native.map_to_kv_tensors_with_result([offset], 0) == (True, [offset])
+        assert native.physical_budget_state()["charged_bytes"] == 2 * charge
+        assert native.set_instance_budget_limit(0, 3) == "applied"
+        second = allocator.alloc_page()
+        assert second.page_id == 1
+        assert native.physical_budget_state()["charged_bytes"] == 2 * charge
+        for tensor in tensors:
+            assert torch.all(tensor[:128] == 7).item()
+        torch.cuda.synchronize()
+    finally:
+        native.shutdown_kvcached()
+
+
+def _local_growth_worker(index, lock_dir, ready, start, release, results):
+    import os
+
+    import torch
+
+    from kvcached import vmm_ops as native
+
+    os.environ["KVCACHED_PHYSICAL_GROWTH_LOCK_DIR"] = lock_dir
+    os.environ["KVCACHED_IPC_NAME"] = "local-race-shared-instance"
+    torch.cuda.set_device(0)
+    page = 64 * 1024 * 1024
+    native.init_kvcached("cuda:0", page, False)
+    tensors = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, page_size=page)
+    allocator = native.PageAllocator(
+        1, 4 * page, page, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=1, ipc_name=f"LOCAL_RACE_{os.getpid()}",
+    )
+    if index == 0:
+        assert native.set_instance_budget_limit(page, 1) == "applied"
+    ready.put(index)
+    assert start.wait(30)
+    try:
+        try:
+            allocated = allocator.alloc_page()
+        except RuntimeError as exc:
+            assert "capacity_exhausted" in str(exc)
+            assert allocator.get_num_free_pages() == 4
+            assert allocator.get_transaction_state()["state"] == "HEALTHY"
+            results.put((index, "rejected"))
+        else:
+            tensors[0][:128].fill_(index + 1)
+            torch.cuda.synchronize()
+            results.put((index, "allocated"))
+            assert release.wait(30)
+            assert torch.all(tensors[0][:128] == index + 1).item()
+            allocator.free_page(allocated.page_id)
+    finally:
+        native.shutdown_kvcached()
+
+
+def test_local_processes_share_one_physical_admission_budget(tmp_path):
+    """Independent processes share one instance limit sufficient for one page."""
+    import multiprocessing
+
+    _compiled_vmm_ops()
+    context = multiprocessing.get_context("spawn")
+    ready, results = context.Queue(), context.Queue()
+    start, release = context.Event(), context.Event()
+    processes = [context.Process(target=_local_growth_worker, args=(
+        index, str(tmp_path), ready, start, release, results,
+    )) for index in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        assert {ready.get(timeout=60) for _ in processes} == {0, 1}
+        start.set()
+        outcomes = [results.get(timeout=60) for _ in processes]
+        assert sorted(outcome for _, outcome in outcomes) == ["allocated", "rejected"]
+        release.set()
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+    finally:
+        release.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(timeout=10)
