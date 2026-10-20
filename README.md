@@ -165,7 +165,7 @@ We prepare an all-in-one docker for developers:
 docker pull ghcr.io/ovg-project/kvcached-dev:latest
 ```
 
-More instructions can be found [here](https://github.com/ovg-project/kvcached/blob/main/docker/README.md). GB200 dockers are on the way.
+More instructions can be found [here](https://github.com/ovg-project/kvcached/blob/main/docker/README.md).
 
 ## Documentation
 
@@ -204,10 +204,6 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct --request-rate 10 --nu
 > If you prefer to disable prefix caching, use `--no-enable-prefix-caching` for vLLM and `--disable-radix-cache` for SGLang.
 >
 > When kvcached is enabled, there is NO need to set memory utilization limit (e.g., using `--gpu-memory-utilization`) as kvcached will automatically manage the memory.
-
-For vLLM, leaving `KVCACHED_PAGE_SIZE_MB` unset lets kvcached choose a larger physical page when a KV block exceeds the default 2 MiB page. Hybrid block alignment is applied before allocation, and the selected page size is logged. Automatic selection tries multiples of 2 MiB in ascending order, reusing hybrid block alignment where possible, and stops as soon as every page can hold a whole block. It does not require exact tiling or enlarge an already sufficient default page; existing geometry validation still applies. An explicit `KVCACHED_PAGE_SIZE_MB` is preserved and validated as before.
-
-SGLang also selects a larger physical page when `KVCACHED_PAGE_SIZE_MB` is unset and an attention block or Mamba state slot exceeds 2 MiB. Attention blocks keep their token size and use the smallest safe 2 MiB multiple. Mamba retains its existing slot padding: an oversized slot uses the next 2 MiB multiple, then is padded to a divisor of that page. Each pool uses its own page size, so a larger Mamba page does not enlarge the attention pool's pages. The selected size is logged; explicit page settings and blocks that fit the default retain their existing behavior. SGLang's `--page-size` still specifies tokens per attention block, not the physical page size.
 
 > [!NOTE]
 > **AMD / ROCm:** on ROCm (HIP) builds, kvcached automatically defaults to the **non-contiguous** KV-cache layout. The contiguous layout (the default on NVIDIA) hands vLLM's ROCm attention backend strided per-layer KV tensors it cannot read correctly, whereas non-contiguous matches the layout the backend expects. You can override with `KVCACHED_CONTIGUOUS_LAYOUT=true|false`, but contiguous is not recommended on ROCm.
@@ -263,36 +259,6 @@ kvcached is developed by many contributors from the community. The best way to c
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Moreh_Logo.png" alt="Moreh" height="34" />&nbsp;&nbsp;&nbsp;
   <img src="https://raw.githubusercontent.com/ovg-project/kvcached/refs/heads/main/assets/adopted_by/Parasail_Logo.png" alt="Parasail" height="34" />
 </p>
-
-### Control-file lifetime
-
-On Linux, native and Python trackers hold an OFD shared usage lock on their
-retained control-file descriptor. Closing the last reference releases usage,
-including after SIGKILL; forked descendants and duplicated descriptors retain
-the lock until their own last close. No cleanup daemon or inference-path lock
-is added. Shutdown may leave small, unused control files intentionally.
-
-`kvctl list` and `kvtop` hide known unused files. Use `kvctl list --all` to find
-leftovers, then `kvctl delete <name>` to remove one. Delete acquires an exclusive
-usage lock and rechecks the opened inode against the path; active, legacy,
-unknown, or unverifiable files are not removed. Control deletion does not delete
-worker socket directories: existing engine owners retain their separate socket
-identity and worker-exit checks.
-
-**Upgrade all participants of one segment together.** Stop every process using
-that segment, including forked descendants, before upgrading its trackers and
-tools that write/delete it. Only then restart with the same name. New startup
-reinitializes that stale file and marks the lock protocol. Other segments or
-IPC namespaces can upgrade independently. The marker cannot protect against an
-old client that ignores locks. Independently live deployments need distinct
-names; arbitrary external rename/unlink of live paths is outside this protocol.
-
-Legacy files remain visible; remove them manually only after confirming their
-participants stopped. Non-Linux/no-OFD observation is conservative and safe
-deletion is unavailable. A Linux tracker that cannot acquire its required usage
-lock fails initialization instead of running unlocked. Engine child shutdown,
-listener/preallocation stop, socket cleanup, and GPU resource release remain
-separate responsibilities.
 
 ## Citation
 
