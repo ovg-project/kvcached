@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Publish zero quotas through real shared memory and exercise real CUDA pages."""
 
+import os
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -24,20 +26,30 @@ BLOCK_BYTES = PAGE_SIZE // 4
 @pytest.mark.parametrize("keep_live_block", [False, True])
 @pytest.mark.parametrize("reserve_null_block", [False, True])
 @pytest.mark.parametrize("enable_prealloc", [False, True])
+@pytest.mark.parametrize("api_takeover", [False, True])
 def test_zero_quota_rejects_growth_then_recovers(
-    keep_live_block, reserve_null_block, enable_prealloc,
+    keep_live_block, reserve_null_block, enable_prealloc, api_takeover,
 ):
-    result = subprocess.run(
-        [sys.executable, __file__, str(int(keep_live_block)),
-         str(int(reserve_null_block)), str(int(enable_prealloc))],
-        capture_output=True, text=True, timeout=30,
-    )
+    ipc_name = f"kvcached-zero-{os.getpid()}-{uuid.uuid4().hex}"
+    env = dict(os.environ, KVCACHED_IPC_NAME=ipc_name)
+    try:
+        result = subprocess.run(
+            [sys.executable, __file__, str(int(keep_live_block)),
+             str(int(reserve_null_block)), str(int(enable_prealloc)),
+             str(int(api_takeover))],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        # Native shutdown closes the segment; the test owns its deletion.
+        path = f"/dev/shm/{ipc_name}"
+        if os.path.exists(path):
+            os.unlink(path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "zero quota recovery complete" in result.stdout
 
 
 def _exercise_zero_quota(
-    monkeypatch, keep_live_block, reserve_null_block, enable_prealloc,
+    monkeypatch, keep_live_block, reserve_null_block, enable_prealloc, api_takeover,
 ):
     import kvcached.kv_cache_manager as kcm
 
@@ -67,7 +79,7 @@ def _exercise_zero_quota(
         if not enable_prealloc:
             time.sleep(0.2)
             assert manager.page_allocator.get_num_reserved_pages() == 0
-        for _ in range(3):
+        for cycle in range(3):
             blocks = manager.alloc(1)
             assert blocks is not None
             start = blocks[0] * BLOCK_BYTES
@@ -83,8 +95,13 @@ def _exercise_zero_quota(
             mapped_free = manager.num_avail_blocks + len(manager.reserved_blocks)
             assert manager.alloc(mapped_free + 1) is None
             assert manager.available_size() == mapped_free
+            reused = manager.alloc(mapped_free)
+            assert reused is not None
+            assert manager.alloc(1) is None
             if keep_live_block:
                 assert torch.all(view == 37).item()
+            manager.free(reused)
+            if keep_live_block:
                 manager.free(blocks)
             if reserve_null_block:
                 # The null block remains mapped; zero is a pending limit,
@@ -93,11 +110,23 @@ def _exercise_zero_quota(
             else:
                 assert manager.page_allocator.get_num_total_pages() == 0
 
-            # clear() must finish while the quota is still zero, including
+            if api_takeover:
+                state = manager.set_memory_limit(2 * PAGE_SIZE, revision=cycle)
+                assert state["status"] == "applied"
+
+            # clear() must finish while the watcher still retains zero, including
             # rebuilding the null block while the quota watcher is stopped.
             manager.clear()
             assert manager.null_block == ([0] if reserve_null_block else None)
-            assert manager.in_shrink == reserve_null_block
+            assert manager.in_shrink == (reserve_null_block and not api_takeover)
+            if api_takeover:
+                assert manager.page_allocator.get_resize_target() == 0
+                assert manager.page_allocator.get_num_total_pages() == 2
+                assert manager.alloc(0) == []
+                assert manager.page_allocator.get_num_total_pages() == 2
+            else:
+                mapped_free = manager.num_avail_blocks
+                assert manager.alloc(mapped_free + 1) is None
 
             publish(NUM_PAGES * PAGE_SIZE)
             recovered = manager.alloc(1)
@@ -109,7 +138,7 @@ def _exercise_zero_quota(
             manager.free(recovered)
             assert not manager.in_shrink
     finally:
-        # clear() re-reserves the null block, so lift a pending zero quota first.
+        # Leave the pool at its startup capacity before teardown.
         publish(NUM_PAGES * PAGE_SIZE)
         manager.alloc(0)
         manager.clear()

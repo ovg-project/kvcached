@@ -118,6 +118,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       gpu_utilization_(GPU_UTILIZATION),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
+      max_num_pages_(mem_size_per_layer / page_size),
       min_reserved_pages_(std::min(
           num_free_pages_.load(std::memory_order_relaxed), MIN_RESERVED_PAGES)),
       max_reserved_pages_(std::min(
@@ -336,7 +337,10 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
 
 bool PageAllocator::resize(int64_t new_mem_size) {
   throw_if_failed();
-  int64_t new_num_pages = new_mem_size / page_size_;
+  // Growing past the startup size would reuse every reclaimed ID and then
+  // number "new" pages from current_total_pages, duplicating reclaimed IDs.
+  const int64_t new_num_pages =
+      std::min(new_mem_size / page_size_, max_num_pages_);
 
   std::vector<page_id_t> pages_to_unmap;
 
@@ -541,8 +545,17 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  const size_t usable_phy_mem_size =
+  size_t usable_phy_mem_size =
       saturating_subtract(avail_phy_mem_size, headroom);
+  // The local scheduler must honor the same GPU/instance limits as grants.
+  // Worker-IPC allocators own their ledgers in the workers, not this process.
+  // This remains an estimate; the actual map still performs atomic admission.
+  if (world_size_ == 1 && !should_use_worker_ipc()) {
+    auto allocator = FTensorAllocator::global_allocator(group_id_);
+    if (allocator->kv_tensors_created())
+      usable_phy_mem_size =
+          std::min(usable_phy_mem_size, allocator->available_physical_bytes());
+  }
 
   // Calculate available pages considering layers and KV buffers
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;

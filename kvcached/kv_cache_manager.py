@@ -72,6 +72,17 @@ def synchronized(method):
     return synchronized_method
 
 
+def _after_post_init(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Wait before serialization; place outside ``@synchronized``."""
+
+    @functools.wraps(method)
+    def initialized_method(self, *args, **kwargs):
+        self._wait_post_init()
+        return method(self, *args, **kwargs)
+
+    return initialized_method
+
+
 def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
                    *, internal_page: Any = None) -> int:
     """Return the number of usable blocks on a page.
@@ -102,6 +113,9 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
 
 
 class KVCacheManager:
+    # The initializer may reenter resize while reserving the null block; it
+    # cannot wait for the completion event it is responsible for publishing.
+    _post_init_thread_id: Optional[int] = None
     # Cached get_avail_physical_pages() result + its monotonic timestamp.
     # Class-level defaults keep the no-__init__ test-stub pattern
     # (tests/test_alloc_rollback.py) working without each stub knowing
@@ -109,6 +123,14 @@ class KVCacheManager:
     _avail_physical_pages_cache: Optional[int] = None
     _avail_physical_pages_ts: float = 0.0
     _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
+    _shrink_reclaimers: tuple[weakref.WeakMethod, ...] = ()
+    _reclaiming_for_shrink = False
+    # The native resize watcher retains the last quota kvctl published and
+    # reports it on every read. _apply_resize_target() keeps applying it
+    # while it is the latest published target, which completes a deferred
+    # shrink, and skips it once resize() published a later one.
+    _kvctl_target: Optional[int] = None
+    _kvctl_target_is_latest = False
 
     def __init__(
         self,
@@ -126,6 +148,7 @@ class KVCacheManager:
         defer_physical_release: bool = False,
         own_segment: bool = False,
         page_size: Optional[int] = None,
+        logical_num_blocks: Optional[int] = None,
     ):
         """
         Args:
@@ -151,8 +174,23 @@ class KVCacheManager:
                 one, for pools whose sizes differ (SGLang SWA and Mamba pools).
             page_size: Physical page size, matching this pool's backing tensors.
                 Defaults to KVCACHED_PAGE_SIZE_MB.
+            logical_num_blocks: Optional allocation limit when ``num_blocks``
+                includes extra backing for physical-page rounding and packing.
+                The limit includes any reserved null block.
         """
+        if logical_num_blocks is not None and not (
+            0 <= logical_num_blocks <= num_blocks
+        ):
+            raise ValueError(
+                "logical_num_blocks must be between 0 and num_blocks"
+            )
+        if reserve_null_block and logical_num_blocks == 0:
+            raise ValueError("logical_num_blocks must include the reserved null block")
         self.num_blocks = num_blocks
+        self.logical_num_blocks = logical_num_blocks
+        # Blocks handed out of pages, including the null block and reservations.
+        # Keep logical admission independent of resident-page scans and resize.
+        self._logical_allocated_blocks = 0
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -373,6 +411,8 @@ class KVCacheManager:
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
+        self._post_init_thread_id = threading.get_ident()
+
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
@@ -442,7 +482,14 @@ class KVCacheManager:
                 self._lifecycle.mark_failed("initialization cancelled by shutdown")
 
     def _wait_post_init(self):
-        if not self._post_init_done.is_set():
+        """Wait for setup unless this thread is performing that setup.
+
+        Foreground entry points call this before acquiring the manager lock.
+        This remains the legacy completion gate; ``wait_ready`` propagates
+        captured initialization failures.
+        """
+        if (not self._post_init_done.is_set()
+                and threading.get_ident() != self._post_init_thread_id):
             self._post_init_done.wait()
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
@@ -623,9 +670,12 @@ class KVCacheManager:
             return
 
 
+    @_after_post_init
     def alloc(self, need_size: int) -> Optional[List[int]]:
+        """Wait for initial setup without holding the lock, then allocate blocks."""
         return self._alloc(need_size)
 
+    @_after_post_init
     def alloc_packed(self, need_size: int) -> Optional[List[int]]:
         """Allocate by draining the smallest existing holes first.
 
@@ -633,7 +683,8 @@ class KVCacheManager:
         single request. Treating that request as one long run skips partially
         free pages that cannot fit the whole batch. Packed allocation preserves
         the placement of repeated one-block allocations while keeping one lock
-        acquisition and one capacity check.
+        acquisition and one capacity check. Waits for initial setup before
+        entering the manager lock.
         """
         return self._alloc(need_size, pack_pages=True)
 
@@ -675,10 +726,19 @@ class KVCacheManager:
             self._wait_post_init()
             self._apply_resize_target()
 
+        if getattr(self, "in_shrink", False):
+            # alloc() runs on the engine thread, which may evict cached
+            # prefixes; resize() may not, see reclaim_for_shrink().
+            self._reclaim_for_shrink()
+
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
                            f"need_size={need_size}")
             return None
+        # A pending shrink waits for retired pages to be released; reusing
+        # them would undo the pages its reclaimers just emptied.
+        retiring = (self._retiring_page_ids()
+                    if getattr(self, "in_shrink", False) else frozenset())
 
         ret_index = []
         page: Optional[InternalPage] = None
@@ -749,7 +809,7 @@ class KVCacheManager:
                 self.num_avail_blocks += page.num_free_blocks()
             else:
                 page = self._pick_avail_page(
-                    1 if pack_pages else remaining_need)
+                    1 if pack_pages else remaining_need, skip=retiring)
                 if getattr(self, "_retired_pages", None) and page.empty():
                     # Reusing logical blocks does not revoke their mapping.
                     # Worker queue order protects reuse; cancel the old unmap
@@ -761,6 +821,8 @@ class KVCacheManager:
                     ]
             num_from_page = min(page.num_free_blocks(), remaining_need)
             alloced_index = page.alloc(num_from_page)
+            if getattr(self, "logical_num_blocks", None) is not None:
+                self._logical_allocated_blocks += len(alloced_index)
             ret_index.extend(alloced_index)
             if page.full():
                 self.full_pages[page.page_id] = page
@@ -771,18 +833,6 @@ class KVCacheManager:
             remaining_need -= num_from_page
 
         return ret_index
-
-    def _apply_resize_target(self) -> None:
-        new_mem_size = self.page_allocator.get_resize_target()
-        # Native uses -1 for no update; zero is a valid quota.
-        if (new_mem_size >= 0 and
-                new_mem_size != getattr(self, "_rejected_resize_target", None)):
-            try:
-                self.resize(new_mem_size)
-            except QuarantinedResizeError:
-                self._rejected_resize_target = new_mem_size
-                self._resize_rejected = True
-                logger.warning("Automatic resize rejected: pool has quarantined pages")
 
     def _rollback_partial_alloc(self, ret_index: List[int],
                                 num_from_reserved: int) -> None:
@@ -802,7 +852,8 @@ class KVCacheManager:
         if reserved_blocks:
             self.reserved_blocks = reserved_blocks + self.reserved_blocks
 
-    def _pick_avail_page(self, remaining_need: int) -> InternalPage:
+    def _pick_avail_page(self, remaining_need: int,
+                         skip: Iterable[int] = ()) -> InternalPage:
         """Pick the available page this allocation fits into best.
 
         `avail_pages.popitem()` hands back the most recently touched page, and
@@ -822,12 +873,16 @@ class KVCacheManager:
         block; measured at ~7us for 100 available pages, with no throughput
         change on a 96-way serving workload. Bucketing pages by free-block
         count would make it independent of pool size if that ever matters.
+
+        Pages in `skip` are not considered.
         """
         best_id: Optional[int] = None
         best_free: Optional[int] = None
         fallback_id: Optional[int] = None
         fallback_free = -1
         for page_id, page in self.avail_pages.items():
+            if page_id in skip:
+                continue
             free = page.num_free_blocks()
             if free >= remaining_need:
                 if best_free is None or free < best_free:
@@ -851,6 +906,7 @@ class KVCacheManager:
             ref for ref in self._page_release_callbacks if ref() is not None
         ) + (weakref.WeakMethod(callback),)
 
+    @_after_post_init
     @synchronized
     def free(self, indices: List[int]):
         counters = getattr(self, "_operation_counters", None)
@@ -925,6 +981,8 @@ class KVCacheManager:
 
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
+            if getattr(self, "logical_num_blocks", None) is not None:
+                self._logical_allocated_blocks -= len(idxs)
             freed_blocks += len(idxs)
             if counters is not None:
                 # Later pages, unmap, or deferred resize may still fail.
@@ -1046,12 +1104,19 @@ class KVCacheManager:
         self._retired_pages = still_retired
         self._maybe_finish_shrink()
 
+    @_after_post_init
     @synchronized
-    def try_to_reserve(self, need_size: int) -> bool:
+    def try_to_reserve(self, need_size: int, packed: bool = False) -> bool:
+        """Set aside blocks that the next allocation takes first.
+
+        ``packed`` places them as ``alloc_packed`` would, for a caller whose
+        next allocation is an ``alloc_packed`` call.
+        """
         self._wait_post_init()
         if self.available_size() < need_size:
             return False
-        reserved = self.alloc(need_size)
+        reserved = (self.alloc_packed(need_size) if packed
+                    else self.alloc(need_size))
         if reserved is None:
             logger.warning("Failed to reserve blocks.")
             return False
@@ -1068,10 +1133,121 @@ class KVCacheManager:
             blocks, self.reserved_blocks = self.reserved_blocks, []
             self.free(blocks)
 
+    def _apply_resize_target(self) -> None:
+        new_mem_size = self.page_allocator.get_resize_target()
+        # -1 means nothing published; 0 is a valid limit.
+        if new_mem_size < 0:
+            return
+        if new_mem_size != self._kvctl_target:
+            # A changed value is a new kvctl publication; it wins over an
+            # earlier set_memory_limit() or resize().
+            self._kvctl_target = new_mem_size
+            self._kvctl_target_is_latest = True
+        elif not self._kvctl_target_is_latest:
+            # resize() published a later target. Applying the quota again
+            # would cancel it; in_shrink, free() and the reclaimers complete
+            # that resize instead.
+            return
+        if new_mem_size == getattr(self, "_rejected_resize_target", None):
+            return
+        try:
+            self.resize(new_mem_size)
+        except QuarantinedResizeError:
+            self._rejected_resize_target = new_mem_size
+            self._resize_rejected = True
+            logger.warning("Automatic resize rejected: pool has quarantined pages")
+        else:
+            # resize() snapshots the watcher for API takeover. Keep the value
+            # actually applied here so a concurrent watcher change is not lost.
+            self._kvctl_target = new_mem_size
+            # resize() marked its target as the latest; here that is the
+            # quota. The next pass applies a deferred shrink again, which is
+            # what completes it when _resize() freed the reserved blocks
+            # before entering the shrink.
+            self._kvctl_target_is_latest = True
+
+    @_after_post_init
+    @synchronized
+    def apply_resize_target(self) -> None:
+        """Apply the limit published through the shared segment (kvctl).
+
+        alloc() applies it as well, so an engine only needs this while idle.
+        """
+        self._wait_post_init()
+        self._apply_resize_target()
+
+    @_after_post_init
+    @synchronized
+    def reclaim_for_shrink(self) -> None:
+        """Evict cached pages a pending shrink waits for. Engine thread only.
+
+        resize() and set_memory_limit() only record a shrink: a controller
+        may call them from its own thread, and only the engine thread may
+        change the caches that own those pages. alloc() reclaims as well, so
+        an engine only needs this while idle.
+        """
+        self._wait_post_init()
+        if self.in_shrink:
+            self._reclaim_for_shrink()
+
+    @synchronized
+    def _register_shrink_reclaimer(self, callback: Callable[[], None]) -> None:
+        """Register a cache owner that can evict pages for a pending shrink.
+
+        Callbacks must be bound methods. They run under the manager lock on
+        the engine thread, from alloc() and reclaim_for_shrink() while a
+        shrink is pending, and should evict whole pages until
+        shrink_excess_pages() is 0 or nothing more can be evicted.
+        """
+        self._shrink_reclaimers = tuple(
+            ref for ref in self._shrink_reclaimers if ref() is not None
+        ) + (weakref.WeakMethod(callback),)
+
+    def _reclaim_for_shrink(self) -> None:
+        if self._reclaiming_for_shrink:
+            return
+        self._reclaiming_for_shrink = True
+        try:
+            for ref in self._shrink_reclaimers:
+                callback = ref()
+                if callback is not None and self.in_shrink:
+                    callback()
+            # resize() may have released the last reserved blocks before it
+            # entered shrink. Complete that target on the engine thread even
+            # when there are no cache owners left to free anything. Retired
+            # pages still wait for their existing physical-release barrier.
+            self._maybe_finish_shrink()
+        finally:
+            self._reclaiming_for_shrink = False
+
+    @synchronized
+    def shrink_excess_pages(self) -> int:
+        """Return how many more pages must empty before a pending shrink ends.
+
+        Retired pages are already empty and only wait for physical release.
+        """
+        if not self.in_shrink or self.target_num_blocks is None:
+            return 0
+        target_pages = (self.target_num_blocks * self.block_mem_size
+                        // self.page_size)
+        retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
+        occupied = len(self.full_pages) + len(self.avail_pages) - retiring
+        return max(0, occupied - target_pages)
+
+    def _retiring_page_ids(self) -> frozenset:
+        return frozenset(
+            page_id for _, page_ids in getattr(self, "_retired_pages", [])
+            for page_id in page_ids)
+
+    @_after_post_init
     @synchronized
     def resize(self, new_mem_size: int):
         self._increment_operation_counter("resize_requests_total")
         try:
+            # A watcher value already visible at API entry is older than this
+            # target, even if the engine has not applied it yet. Commit the
+            # snapshot only after a successful (possibly deferred) resize.
+            observed_target = self.page_allocator.get_resize_target()
             resized = self._resize(new_mem_size)
         except Exception:
             self._record_operation_error(
@@ -1084,6 +1260,11 @@ class KVCacheManager:
             self._increment_operation_counter("resize_successes_total")
         else:
             self._increment_operation_counter("resize_deferred_total")
+        # The latest published target wins: the retained kvctl quota is not
+        # applied again over this one. _apply_resize_target() marks the quota
+        # as the latest when it is the caller.
+        self._kvctl_target = observed_target
+        self._kvctl_target_is_latest = False
         return resized
 
     def _resize(self, new_mem_size: int):
@@ -1097,6 +1278,9 @@ class KVCacheManager:
         # re-reads the driver instead of serving pre-resize data.
         self._avail_physical_pages_cache = None
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
+        # A kvctl quota can exceed the startup size, but the KV tensors only
+        # reserve mem_size, so the pool cannot grow past it.
+        new_mem_size = min(new_mem_size, self.mem_size)
         try:
             resized = self.page_allocator.resize(new_mem_size)
         except QuarantinedResizeError:
@@ -1128,6 +1312,7 @@ class KVCacheManager:
         self.target_num_blocks = new_mem_size // self.block_mem_size
         return False
 
+    @_after_post_init
     @synchronized
     def trim(self) -> None:
         self._increment_operation_counter("trim_requests_total")
@@ -1157,14 +1342,13 @@ class KVCacheManager:
         # for the same grow-direction mutation, so trim() does too.
         self._avail_physical_pages_cache = None
 
-    @synchronized
     def set_memory_limit(
         self,
         limit_bytes: int,
         *,
         revision: int,
     ) -> Dict[str, Any]:
-        """Apply a revisioned memory limit through the existing resize path."""
+        """Validate a limit, wait for setup, then apply its revision atomically."""
         limit_bytes = int(limit_bytes)
         revision = int(revision)
         if limit_bytes < 0:
@@ -1172,6 +1356,13 @@ class KVCacheManager:
         if revision < 0:
             raise ValueError("revision must be non-negative")
 
+        # Validate before waiting, but keep the revision comparison and commit
+        # together under the lock after initialization has finished.
+        self._wait_post_init()
+        return self._set_memory_limit(limit_bytes, revision=revision)
+
+    @synchronized
+    def _set_memory_limit(self, limit_bytes: int, *, revision: int) -> Dict[str, Any]:
         current_revision = self._memory_limit_revision
         current_limit = self._memory_limit_bytes
         if revision < current_revision:
@@ -1243,6 +1434,12 @@ class KVCacheManager:
     @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
+        if self.in_shrink:
+            # alloc() does not reuse pages retired for a pending shrink.
+            for page_id in self._retiring_page_ids():
+                page = self.avail_pages.get(page_id)
+                if page is not None:
+                    avail_blocks -= page.num_free_blocks()
         # Also surfaces a fatal background-preallocation failure during shrink.
         try:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
@@ -1272,7 +1469,17 @@ class KVCacheManager:
             # (a C++ change, out of scope).
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        available = avail_blocks + blocks_from_free_pages
+        logical_num_blocks = getattr(self, "logical_num_blocks", None)
+        if logical_num_blocks is not None:
+            # Reserved blocks have left their pages but remain available for
+            # the next alloc(), just as in the physical capacity above.
+            logical_available = max(
+                0, logical_num_blocks - self._logical_allocated_blocks
+                + len(self.reserved_blocks)
+            )
+            available = min(available, logical_available)
+        return available
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().
@@ -1373,8 +1580,8 @@ class KVCacheManager:
     def shutdown(self) -> bool:
         """Release the state this pool keeps outside the process.
 
-        os._exit bypasses the native destructor (issue #477). Stop background
-        users, then ask the native owner to release its original segment.
+        Stop background users, then close the native control usage reference.
+        Process exit also releases usage; removing the file is a CLI operation.
         Return False if a step needs another attempt.
         Successful steps are not repeated and a replacement file is preserved.
         """
@@ -1395,8 +1602,8 @@ class KVCacheManager:
                     logger.warning("Failed to stop the prealloc thread on shutdown: %s", e)
                     return False
                 self._prealloc_stopped = True
-            # The native owner captured the inode when it created the segment.
-            # A shutdown-time pathname lookup could claim a replacement engine.
+            # Close only after all users stop. The native owner never unlinks a
+            # pathname, and inherited/duplicated references retain their lock.
             self._shut_down = self.page_allocator.release_shared_segment()
             return self._shut_down
 
@@ -1427,6 +1634,7 @@ class KVCacheManager:
         return (counters, getattr(self, "_last_error_code", None),
                 getattr(self, "_last_error_timestamp_ns", None))
 
+    @_after_post_init
     @synchronized
     def clear(self):
         self._increment_operation_counter("clear_requests_total")
@@ -1504,6 +1712,7 @@ class KVCacheManager:
         self._retired_pages = []
         self.avail_pages.clear()
         self.full_pages.clear()
+        self._logical_allocated_blocks = 0
         self.null_block = None
 
         # Trim the page allocator to free up reserved pages

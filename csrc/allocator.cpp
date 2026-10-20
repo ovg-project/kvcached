@@ -1,13 +1,33 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -17,6 +37,147 @@
 #include "transaction_error.hpp"
 
 namespace kvcached {
+namespace {
+
+int resolve_device_index(const torch::stable::Device &device) {
+  return device.index() >= 0 ? device.index() : gpu_vmm::current_device();
+}
+
+double gpu_utilization_limit() {
+  constexpr double kDefaultUtilization = 0.95;
+  const char *value = std::getenv("KVCACHED_GPU_UTILIZATION");
+  if (value == nullptr || *value == '\0') {
+    return kDefaultUtilization;
+  }
+
+  char *end = nullptr;
+  errno = 0;
+  const double parsed = std::strtod(value, &end);
+  if (errno != 0 || end == value || *end != '\0' || !std::isfinite(parsed) ||
+      parsed <= 0.0 || parsed > 1.0) {
+    throw std::runtime_error(
+        "KVCACHED_GPU_UTILIZATION must be in the range (0, 1]");
+  }
+  return parsed;
+}
+
+std::string physical_growth_lock_dir() {
+  const char *configured_dir = std::getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR");
+  std::string lock_dir = configured_dir != nullptr && *configured_dir != '\0'
+                             ? configured_dir
+                             : "/dev/shm";
+  while (lock_dir.size() > 1 && lock_dir.back() == '/') {
+    lock_dir.pop_back();
+  }
+  return lock_dir;
+}
+
+std::string sanitize_physical_device(std::string key) {
+  if (key.empty()) {
+    throw std::invalid_argument("physical GPU identifier must not be empty");
+  }
+  for (char &value : key) {
+    if (!std::isalnum(static_cast<unsigned char>(value))) {
+      value = '_';
+    }
+  }
+  return key;
+}
+
+std::string physical_gpu_lock_path(const std::string &physical_device) {
+  return physical_growth_lock_dir() + "/kvcached-physical-growth-" +
+         sanitize_physical_device(physical_device) + ".lock";
+}
+
+std::string physical_gpu_identifier(int dev_idx) {
+  char pci_bus_id[64] = {};
+  const auto status = gpu_vmm::device_get_pci_bus_id(
+      pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), dev_idx);
+  if (!gpu_vmm::is_success(status)) {
+    throw std::runtime_error(std::string("failed to resolve physical GPU: ") +
+                             gpu_vmm::error_string(status));
+  }
+  return std::string(pci_bus_id);
+}
+
+std::string physical_gpu_lock_path(int dev_idx) {
+  return physical_gpu_lock_path(physical_gpu_identifier(dev_idx));
+}
+
+class ScopedDeviceGuard {
+public:
+  explicit ScopedDeviceGuard(int dev_idx)
+      : previous_device_(gpu_vmm::current_device()),
+        changed_(previous_device_ != dev_idx) {
+    if (changed_) {
+      const auto status = gpu_vmm::set_device(dev_idx);
+      if (!gpu_vmm::is_success(status)) {
+        throw std::runtime_error(
+            std::string("failed to select physical GPU: ") +
+            gpu_vmm::error_string(status));
+      }
+    }
+  }
+
+  ScopedDeviceGuard(const ScopedDeviceGuard &) = delete;
+  ScopedDeviceGuard &operator=(const ScopedDeviceGuard &) = delete;
+
+  ~ScopedDeviceGuard() noexcept {
+    if (changed_) {
+      // Continuing on an unknown device would corrupt subsequent GPU work.
+      CHECK_GPU(gpu_vmm::set_device(previous_device_));
+    }
+  }
+
+private:
+  int previous_device_;
+  bool changed_;
+};
+
+void validate_physical_capacity(int dev_idx, size_t required_bytes,
+                                PhysicalGrowthOperationStats *stats) {
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  {
+    const ScopedDeviceGuard device_guard(dev_idx);
+    const auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+    if (!gpu_vmm::is_success(status)) {
+      throw std::runtime_error(std::string("GPU memory query failed: ") +
+                               gpu_vmm::error_string(status));
+    }
+  }
+  const size_t headroom = static_cast<size_t>(static_cast<double>(total_bytes) *
+                                              (1.0 - gpu_utilization_limit()));
+  const size_t usable_bytes = free_bytes > headroom ? free_bytes - headroom : 0;
+  if (stats != nullptr) {
+    stats->capacity_checks = 1;
+    stats->required_bytes = static_cast<uint64_t>(required_bytes);
+    stats->free_bytes = static_cast<uint64_t>(free_bytes);
+    stats->total_bytes = static_cast<uint64_t>(total_bytes);
+    stats->headroom_bytes = static_cast<uint64_t>(headroom);
+    stats->usable_bytes = static_cast<uint64_t>(usable_bytes);
+  }
+  if (required_bytes > usable_bytes) {
+    const size_t shortfall = required_bytes - usable_bytes;
+    if (stats != nullptr) {
+      stats->capacity_rejections = 1;
+      stats->shortfall_bytes = static_cast<uint64_t>(shortfall);
+    }
+    throw std::runtime_error(
+        "capacity_exhausted: physical GPU headroom would be crossed");
+  }
+}
+
+size_t checked_transaction_bytes(size_t bytes_per_offset, size_t offset_count) {
+  if (offset_count != 0 &&
+      bytes_per_offset > std::numeric_limits<size_t>::max() / offset_count) {
+    throw std::overflow_error("KV mapping transaction size overflow");
+  }
+  return bytes_per_offset * offset_count;
+}
+
+} // namespace
+
 // Global configurable page size
 size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 
@@ -25,6 +186,7 @@ std::unordered_map<int64_t, std::unique_ptr<FTensorAllocator>>
 std::mutex FTensorAllocator::g_allocator_mutex_;
 torch::stable::Device FTensorAllocator::g_device_(torch::headeronly::kCPU);
 bool FTensorAllocator::g_contiguous_layout_ = false;
+std::string FTensorAllocator::g_instance_name_;
 
 static inline std::shared_ptr<Page>
 make_shared_page(const torch::stable::Device &dev, page_id_t page_id,
@@ -61,7 +223,7 @@ FTensorAllocator::FTensorAllocator(const torch::stable::Device &device,
                                    bool contiguous_layout)
     : dev_(device), page_size_(kPageSize), num_layers_(0), num_kv_buffers_(2),
       contiguous_layout_(contiguous_layout), unified_pool_(false),
-      kv_tensor_size_per_layer_(0) {
+      kv_tensor_size_per_layer_(0), physical_bytes_per_offset_(0) {
   if (dev_.is_cuda()) {
     init_gpu_();
   }
@@ -71,16 +233,36 @@ FTensorAllocator::~FTensorAllocator() { destroy(); }
 
 void FTensorAllocator::destroy() {
   std::lock_guard<std::mutex> lock(mtx_);
+  std::optional<BudgetMutation> mutation;
+  try {
+    mutation.emplace(budget_);
+  } catch (const std::exception &error) {
+    // Accounting failure must not prevent native teardown. Page release keeps
+    // its receipt charged when the ledger cannot be safely updated.
+    LOGGER(ERROR, "KV teardown accounting unavailable: %s", error.what());
+  }
+  prepared_map_transactions_.clear();
+  failed_map_cleanup_.clear();
   pending_unmap_.reset();
   finalized_unmap_transactions_.clear();
   finalized_unmap_order_.clear();
+  // A failed restore can leave a mapped page owned outside its FTensor.
+  // Return those owners before whole-tensor teardown confirms unmapping, so
+  // their receipts are refunded only after both unmap and release succeed.
+  for (auto &mapping : failed_unmap_retained_) {
+    if (mapping.page)
+      mapping.ftensor->failed_pages_.push_back(std::move(mapping.page));
+  }
+  failed_unmap_retained_.clear();
   ftensors_.clear();
   contiguous_kv_tensor_.reset();
   zero_page_.reset();
+  failed_unmap_retained_.clear();
 }
 
 void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
-                            bool contiguous_layout) {
+                            bool contiguous_layout,
+                            const std::string &instance_name) {
   std::lock_guard<std::mutex> lock(g_allocator_mutex_);
   if (!g_allocators_.empty()) {
     LOGGER(ERROR, "FTensorAllocator has been initialized. Re-initializing...");
@@ -104,6 +286,11 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   torch::stable::Device device(dev_str);
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
+  const char *explicit_name = std::getenv("KVCACHED_IPC_NAME");
+  g_instance_name_ = !instance_name.empty() ? instance_name
+                     : explicit_name && *explicit_name
+                         ? std::string(explicit_name)
+                         : "kvcached_native_" + std::to_string(getpid());
   g_allocators_[0] =
       std::make_unique<FTensorAllocator>(device, contiguous_layout);
 }
@@ -118,6 +305,7 @@ FTensorAllocator *FTensorAllocator::global_allocator(int64_t group_id) {
            "FTensorAllocator::init() must be called first");
     g_allocators_[group_id] =
         std::make_unique<FTensorAllocator>(g_device_, g_contiguous_layout_);
+    g_allocators_[group_id]->group_id_ = group_id;
     return g_allocators_[group_id].get();
   }
   return it->second.get();
@@ -146,6 +334,10 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
   page_size_ = resolved_page_size;
 
   assert(num_layers_ == 0 || num_layers_ == num_layers);
+  if (num_layers <= 0 || num_kv_buffers <= 0) {
+    throw std::invalid_argument(
+        "num_layers and num_kv_buffers must both be positive");
+  }
   num_layers_ = num_layers;
   num_kv_buffers_ = num_kv_buffers;
   unified_pool_ = unified_pool;
@@ -157,6 +349,9 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
            size, page_size_, aligned_size);
   }
   kv_tensor_size_per_layer_ = aligned_size;
+  physical_bytes_per_offset_ = checked_transaction_bytes(
+      checked_transaction_bytes(page_size_, static_cast<size_t>(num_layers)),
+      static_cast<size_t>(num_kv_buffers));
 
   if (contiguous_layout_) {
     // For contiguous layout, we use compound page which groups all layers
@@ -174,6 +369,68 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
   }
+}
+
+int64_t FTensorAllocator::sample_budget_capacity_() {
+  PhysicalGrowthOperationStats stats;
+  validate_physical_capacity(resolve_device_index(dev_), 0, &stats);
+  const bool deficit = stats.headroom_bytes > stats.free_bytes;
+  const auto difference = deficit ? stats.headroom_bytes - stats.free_bytes
+                                  : stats.free_bytes - stats.headroom_bytes;
+  if (difference > static_cast<uint64_t>(INT64_MAX))
+    throw std::overflow_error("GPU capacity sample exceeds signed byte range");
+  return deficit ? -static_cast<int64_t>(difference)
+                 : static_cast<int64_t>(difference);
+}
+
+void FTensorAllocator::ensure_budget_locked_() {
+  if (budget_ || !dev_.is_cuda())
+    return;
+  auto budget = GpuBudget::connect(
+      physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v2",
+      [this] { return sample_budget_capacity_(); });
+  const auto slot = budget->register_pool(g_instance_name_, group_id_);
+  budget_slot_ = slot;
+  budget_ = std::move(budget);
+}
+
+BudgetSnapshot FTensorAllocator::physical_budget_state() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  return budget_ ? budget_->snapshot(budget_slot_) : BudgetSnapshot{};
+}
+
+uint64_t FTensorAllocator::available_physical_bytes() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  if (!budget_)
+    return UINT64_MAX;
+  const auto state = budget_->snapshot(
+      budget_slot_, [this] { return sample_budget_capacity_(); });
+  const auto gpu_free = state.budget_bytes > state.charged_bytes
+                            ? state.budget_bytes - state.charged_bytes
+                            : 0;
+  const auto instance_free =
+      state.instance_limit_bytes > state.instance_charged_bytes
+          ? state.instance_limit_bytes - state.instance_charged_bytes
+          : 0;
+  return std::min(gpu_free, instance_free);
+}
+
+std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
+                                                        uint64_t revision) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  if (!budget_)
+    throw std::runtime_error("physical budget requires a GPU allocator");
+  return budget_->set_instance_limit(budget_slot_, bytes, revision);
+}
+
+bool FTensorAllocator::recalibrate_physical_budget() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  return budget_ &&
+         budget_->recalibrate([this] { return sample_budget_capacity_(); });
 }
 
 bool FTensorAllocator::kv_tensors_created() {
@@ -194,99 +451,378 @@ FTensorAllocator::map_to_kv_tensors_with_result(
     return {false, {}};
   }
   reject_if_unmap_pending_locked_("map KV tensors");
+  reject_if_map_overlaps_locked_(offsets);
 
-  using MappingTarget = std::pair<FTensor *, offset_t>;
-  struct MappingGroup {
-    offset_t logical_offset;
-    std::vector<MappingTarget> targets;
-  };
-
-  std::vector<MappingGroup> groups;
-  groups.reserve(offsets.size());
+  std::vector<offset_t> newly_mapped_offsets;
+  std::vector<std::pair<FTensor *, offset_t>> targets;
+  std::unordered_set<offset_t> seen;
   for (auto offset : offsets) {
-    MappingGroup group{offset, {}};
-    if (contiguous_layout_) {
-      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
-    } else {
-      for (int64_t i = 0; i < num_layers_; i++) {
-        auto kv_name = std::string(kv_prefix) + std::to_string(i);
-        auto ftensor = ftensors_[kv_name].get();
-        group.targets.emplace_back(ftensor, offset);
-        // MLA has one combined KV buffer, so it has no separate V region.
-        if (!unified_pool_ && num_kv_buffers_ != 1) {
-          auto v_base_offset =
-              get_v_base_offset(ftensor->get_tensor(), page_size_);
-          group.targets.emplace_back(ftensor, offset + v_base_offset);
-        }
-      }
-    }
-    groups.push_back(std::move(group));
+    if (!seen.insert(offset).second)
+      continue;
+    auto group = mapping_targets_({offset});
+    size_t existing = 0;
+    for (const auto &[tensor, target] : group)
+      existing += tensor->is_mapped(target) ? 1 : 0;
+    if (existing == group.size())
+      continue;
+    if (existing != 0)
+      throw StateConsistencyError(
+          "state_inconsistency: logical KV offset is only partially mapped: " +
+          std::to_string(offset));
+    newly_mapped_offsets.push_back(offset);
+    targets.insert(targets.end(), group.begin(), group.end());
   }
 
-  std::vector<MappingTarget> mapped;
-  std::vector<offset_t> newly_mapped_offsets;
-  bool new_mapping_damaged = false;
+  std::vector<ReservedMapping> reserved;
   try {
-    for (const auto &group : groups) {
-      size_t existing = 0;
-      for (const auto &[ftensor, offset] : group.targets) {
-        existing += ftensor->is_mapped_(offset) ? 1 : 0;
-      }
-      if (existing == group.targets.size()) {
-        continue;
-      }
-      if (existing != 0) {
-        throw StateConsistencyError("state_inconsistency: logical KV offset is "
-                                    "only partially mapped: " +
-                                    std::to_string(group.logical_offset));
-      }
-
-      for (const auto &[ftensor, offset] : group.targets) {
-        try {
-          if (!ftensor->map(offset)) {
-            throw std::runtime_error("physical page map returned false");
-          }
-        } catch (const StateConsistencyError &) {
-          new_mapping_damaged = true;
-          throw;
-        }
-        mapped.emplace_back(ftensor, offset);
-      }
-      newly_mapped_offsets.push_back(group.logical_offset);
-    }
+    reserve_targets_(targets, reserved, nullptr);
+    map_reserved_targets_(reserved, nullptr);
   } catch (const std::exception &error) {
-    std::vector<std::string> rollback_errors;
-    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
-      try {
-        if (!it->first->unmap(it->second)) {
-          rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                       " returned false");
-        }
-      } catch (const std::exception &rollback_error) {
-        rollback_errors.emplace_back("offset " + std::to_string(it->second) +
-                                     ": " + rollback_error.what());
+    const bool damaged = dynamic_cast<const StateConsistencyError *>(&error);
+    try {
+      release_reserved_locked_(reserved);
+    } catch (const std::exception &cleanup) {
+      for (auto &mapping : reserved) {
+        if (mapping.page || mapping.attached || mapping.damaged)
+          failed_map_cleanup_.push_back(std::move(mapping));
       }
-    }
-    if (!rollback_errors.empty() || new_mapping_damaged) {
-      std::string message =
+      throw MapQuarantinedError(
           std::string("state_inconsistency: KV map failed: ") + error.what() +
-          "; rollback failed: ";
-      for (size_t i = 0; i < rollback_errors.size(); ++i) {
-        if (i != 0) {
-          message += "; ";
-        }
-        message += rollback_errors[i];
-      }
-      // A pre-existing partial mapping is not known to be unpublished.
-      if (!new_mapping_damaged &&
-          dynamic_cast<const StateConsistencyError *>(&error)) {
-        throw StateConsistencyError(message);
-      }
-      throw MapQuarantinedError(message);
+          "; rollback failed: " + cleanup.what());
     }
+    if (damaged)
+      throw MapQuarantinedError(error.what());
     throw;
   }
   return {true, std::move(newly_mapped_offsets)};
+}
+
+std::vector<std::pair<FTensor *, offset_t>>
+FTensorAllocator::mapping_targets_(const std::vector<offset_t> &offsets) {
+  std::vector<std::pair<FTensor *, offset_t>> targets;
+
+  if (contiguous_layout_) {
+    // In contiguous layout, use the single contiguous tensor for mapping
+    // Each offset maps a block that contains all layers
+    auto ftensor = contiguous_kv_tensor_.get();
+    auto tensor = ftensor->get_tensor();
+
+    for (auto offset : offsets) {
+      // Map K and V regions for this block (covers all layers)
+      targets.emplace_back(ftensor, offset);
+    }
+  } else if (unified_pool_ || num_kv_buffers_ == 1) {
+    // Single-buffer pool: K and V share a single block-interleaved FTensor per
+    // layer. Each page id maps exactly one VMM page at pid * page_size.
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      for (auto offset : offsets) {
+        targets.emplace_back(ftensor, offset);
+      }
+    }
+  } else {
+    // Original per-layer mapping
+    for (int64_t i = 0; i < num_layers_; i++) {
+      auto kv_name = std::string(kv_prefix) + std::to_string(i);
+      auto ftensor = ftensors_[kv_name].get();
+      /**
+       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
+       * dim. This is used for calculating the offset of the V tensor.
+       * FIXME: (YIFAN) we may support other KV cache layouts later.
+       */
+      auto tensor = ftensor->get_tensor();
+      auto v_base_offset = get_v_base_offset(tensor, page_size_);
+      for (auto offset : offsets) {
+        auto koffset = offset;
+        auto voffset = offset + v_base_offset;
+        targets.emplace_back(ftensor, koffset);
+        targets.emplace_back(ftensor, voffset);
+      }
+    }
+  }
+  return targets;
+}
+
+void FTensorAllocator::reserve_targets_(
+    const std::vector<std::pair<FTensor *, offset_t>> &targets,
+    std::vector<ReservedMapping> &reserved, PhysicalGrowthOperationStats *stats,
+    bool adopt_existing_mappings) {
+  reserved.reserve(targets.size());
+  if (stats != nullptr) {
+    stats->targets_count = static_cast<uint64_t>(targets.size());
+  }
+
+  std::chrono::steady_clock::time_point reserve_started;
+  bool reserve_started_set = false;
+  const auto admission_started = std::chrono::steady_clock::now();
+  bool admission_finished = false;
+  try {
+    // Charge the complete batch once. CUDA allocation and mapping never hold
+    // the process-shared accounting lock.
+    std::unique_ptr<BudgetGrant> grant;
+    size_t required_bytes = 0;
+    for (const auto &[ftensor, offset] : targets) {
+      if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
+        continue;
+      }
+      if (required_bytes >
+          std::numeric_limits<size_t>::max() - ftensor->page_size_) {
+        throw std::overflow_error("KV mapping transaction size overflow");
+      }
+      required_bytes += ftensor->page_size_;
+    }
+    if (dev_.is_cuda() && required_bytes != 0) {
+      ensure_budget_locked_();
+      BudgetSnapshot state;
+      auto record_admission = [&] {
+        if (!stats)
+          return;
+        stats->required_bytes = required_bytes;
+        stats->capacity_checks = 1;
+        const auto gpu_available =
+            state.budget_bytes > state.charged_bytes
+                ? state.budget_bytes - state.charged_bytes
+                : 0;
+        const auto instance_available =
+            state.instance_limit_bytes > state.instance_charged_bytes
+                ? state.instance_limit_bytes - state.instance_charged_bytes
+                : 0;
+        stats->usable_bytes = std::min(gpu_available, instance_available);
+      };
+      try {
+        grant = budget_->grant(budget_slot_, required_bytes, &state,
+                               [this] { return sample_budget_capacity_(); });
+      } catch (const std::runtime_error &error) {
+        record_admission();
+        if (std::string(error.what()).find("capacity_exhausted:") == 0 &&
+            stats) {
+          stats->capacity_rejections = 1;
+          stats->shortfall_bytes = required_bytes > stats->usable_bytes
+                                       ? required_bytes - stats->usable_bytes
+                                       : 0;
+        }
+        throw;
+      }
+      record_admission();
+    }
+    if (stats != nullptr) {
+      stats->admission_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - admission_started)
+              .count());
+    }
+    admission_finished = true;
+    reserve_started = std::chrono::steady_clock::now();
+    reserve_started_set = true;
+    for (const auto &[ftensor, offset] : targets) {
+      if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
+        reserved.push_back(ReservedMapping{ftensor, offset, nullptr});
+      } else {
+        auto receipt = grant ? grant->take(ftensor->page_size_) : nullptr;
+        std::unique_ptr<Page> page;
+        try {
+          page = ftensor->reserve_page(offset);
+        } catch (...) {
+          if (receipt)
+            receipt->release();
+          throw;
+        }
+        if (receipt)
+          page->attach_budget(std::move(receipt));
+        reserved.push_back(ReservedMapping{ftensor, offset, std::move(page)});
+      }
+    }
+    if (grant)
+      grant->finish();
+  } catch (const std::exception &error) {
+    if (stats != nullptr && !admission_finished) {
+      stats->admission_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - admission_started)
+              .count());
+    }
+    if (stats != nullptr && reserve_started_set) {
+      stats->reserve_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - reserve_started)
+              .count());
+    }
+    throw;
+  }
+  if (stats != nullptr && reserve_started_set) {
+    stats->reserve_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - reserve_started)
+            .count());
+  }
+}
+
+bool FTensorAllocator::map_reserved_targets_(
+    std::vector<ReservedMapping> &reserved,
+    PhysicalGrowthOperationStats *stats) {
+  const auto map_started = std::chrono::steady_clock::now();
+  try {
+    for (auto &mapping : reserved) {
+      if (mapping.page == nullptr) {
+        if (!mapping.ftensor->is_mapped(mapping.offset)) {
+          throw std::runtime_error("Adopted KV page is no longer mapped");
+        }
+        continue;
+      }
+      try {
+        if (!mapping.ftensor->map_reserved(mapping.offset, mapping.page))
+          throw std::runtime_error("Reserved KV page map returned false");
+        mapping.attached = true;
+      } catch (const StateConsistencyError &) {
+        // FTensor retains the uncertain resource. Do not erase this transaction
+        // or pretend that abort can safely make its credit available again.
+        mapping.damaged = true;
+        throw;
+      }
+    }
+  } catch (const std::exception &error) {
+    if (stats != nullptr) {
+      stats->map_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - map_started)
+              .count());
+    }
+    // The caller rolls back only this transaction's newly attached pages.
+    // Preserve the native quarantine/state-consistency exception contract.
+    throw;
+  }
+  if (stats != nullptr) {
+    stats->map_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - map_started)
+            .count());
+  }
+  return true;
+}
+
+std::pair<bool, PhysicalGrowthOperationStats>
+FTensorAllocator::prepare_map_to_kv_tensors(
+    const std::string &transaction_id, const std::vector<offset_t> &offsets) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  PhysicalGrowthOperationStats stats;
+  std::vector<offset_t> unique_offsets;
+  std::unordered_set<offset_t> seen;
+  for (auto offset : offsets) {
+    if (seen.insert(offset).second) {
+      unique_offsets.push_back(offset);
+    }
+  }
+  stats.offsets_count = static_cast<uint64_t>(unique_offsets.size());
+  if (transaction_id.empty() || num_layers_ == 0 || offsets.empty()) {
+    return {false, stats};
+  }
+  reject_if_unmap_pending_locked_("prepare KV map");
+  const auto existing = prepared_map_transactions_.find(transaction_id);
+  if (existing != prepared_map_transactions_.end()) {
+    if (!existing->second.ready) {
+      throw StateConsistencyError("prepared map cleanup pending: " +
+                                  transaction_id);
+    }
+    return {existing->second.offsets == unique_offsets, stats};
+  }
+  reject_if_map_overlaps_locked_(unique_offsets);
+
+  // Own handles before reserving them, so even a failed cleanup has a stable
+  // transaction owner. Only a fully reserved transaction may be committed.
+  auto [entry, inserted] = prepared_map_transactions_.emplace(
+      transaction_id, PreparedMapTransaction{unique_offsets, {}});
+  (void)inserted;
+  try {
+    auto targets = mapping_targets_(unique_offsets);
+    reserve_targets_(targets, entry->second.mappings, &stats, true);
+    entry->second.ready = true;
+    return {true, stats};
+  } catch (const std::exception &error) {
+    release_reserved_locked_(entry->second.mappings);
+    prepared_map_transactions_.erase(entry);
+    if (dynamic_cast<const StateConsistencyError *>(&error)) {
+      throw;
+    }
+    if (stats.capacity_rejections == 0) {
+      LOGGER(ERROR, "Failed to prepare physical KV pages: %s", error.what());
+    }
+    return {false, stats};
+  }
+}
+
+std::pair<bool, PhysicalGrowthOperationStats>
+FTensorAllocator::commit_prepared_map(const std::string &transaction_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  PhysicalGrowthOperationStats stats;
+  const auto found = prepared_map_transactions_.find(transaction_id);
+  if (found == prepared_map_transactions_.end()) {
+    return {false, stats};
+  }
+  if (!found->second.ready) {
+    throw StateConsistencyError("prepared map cleanup pending: " +
+                                transaction_id);
+  }
+  stats.offsets_count = static_cast<uint64_t>(found->second.offsets.size());
+  stats.targets_count = static_cast<uint64_t>(found->second.mappings.size());
+  found->second.ready = false;
+  try {
+    const bool success = map_reserved_targets_(found->second.mappings, &stats);
+    prepared_map_transactions_.erase(found);
+    return {success, stats};
+  } catch (...) {
+    // Undo newly attached pages as well as unused handles. Adopted pages are
+    // never marked attached, so rollback preserves their previous ownership.
+    // A cleanup failure retains the transaction for a later abort retry.
+    release_reserved_locked_(found->second.mappings);
+    prepared_map_transactions_.erase(found);
+    throw;
+  }
+}
+
+bool FTensorAllocator::abort_prepared_map(const std::string &transaction_id) {
+  std::unique_lock<std::mutex> lock(mtx_);
+  const auto found = prepared_map_transactions_.find(transaction_id);
+  if (found == prepared_map_transactions_.end()) {
+    return false;
+  }
+  found->second.ready = false;
+  release_reserved_locked_(found->second.mappings);
+  prepared_map_transactions_.erase(found);
+  return true;
+}
+
+void FTensorAllocator::release_reserved_locked_(
+    std::vector<ReservedMapping> &reserved) {
+  BudgetMutation mutation(budget_);
+  bool damaged = false;
+  for (auto &mapping : reserved) {
+    if (mapping.damaged) {
+      damaged = true;
+      continue;
+    }
+    if (mapping.attached) {
+      if (!mapping.ftensor->unmap_retain_(mapping.offset, mapping.page))
+        throw StateConsistencyError(
+            "prepared map rollback lost an attached page");
+      mapping.attached = false;
+    }
+    if (mapping.page) {
+      mapping.page->release();
+      mapping.page.reset();
+    }
+  }
+  mutation.finish();
+  if (damaged)
+    throw StateConsistencyError("prepared map cleanup pending: uncertain VMM "
+                                "mapping requires allocator teardown");
+}
+
+bool FTensorAllocator::has_prepared_map(
+    const std::string &transaction_id) const {
+  std::unique_lock<std::mutex> lock(mtx_);
+  return prepared_map_transactions_.find(transaction_id) !=
+         prepared_map_transactions_.end();
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
@@ -297,6 +833,8 @@ bool FTensorAllocator::unmap_from_kv_tensors(
            "try to unmap from KV tensors when KV tensors are not created");
     return false;
   }
+  reject_if_map_overlaps_locked_(offsets);
+
   reject_if_unmap_pending_locked_("unmap KV tensors");
   auto retained = unmap_retain_locked_(offsets);
   try {
@@ -322,6 +860,7 @@ bool FTensorAllocator::prepare_unmap_from_kv_tensors(
     LOGGER(ERROR, "try to prepare unmap when KV tensors are not created");
     return false;
   }
+  reject_if_map_overlaps_locked_(offsets);
   if (pending_unmap_) {
     if (pending_unmap_->id == transaction_id) {
       return true;
@@ -408,8 +947,6 @@ bool FTensorAllocator::abort_unmap_from_kv_tensors(
                              transaction_id);
   }
 
-  // Prepare may not have reached this worker. Recording the abort prevents a
-  // delayed prepare from reopening the transaction.
   remember_unmap_outcome_locked_(transaction_id,
                                  UnmapTransactionOutcome::ABORTED);
   return true;
@@ -417,50 +954,23 @@ bool FTensorAllocator::abort_unmap_from_kv_tensors(
 
 std::vector<FTensorAllocator::RetainedMapping>
 FTensorAllocator::unmap_retain_locked_(const std::vector<offset_t> &offsets) {
-
-  using MappingTarget = std::pair<FTensor *, offset_t>;
-  struct MappingGroup {
-    offset_t logical_offset;
-    std::vector<MappingTarget> targets;
-  };
-  std::vector<MappingGroup> groups;
-  groups.reserve(offsets.size());
-  for (auto offset : offsets) {
-    MappingGroup group{offset, {}};
-    if (contiguous_layout_) {
-      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
-    } else {
-      for (int64_t i = 0; i < num_layers_; i++) {
-        auto kv_name = std::string(kv_prefix) + std::to_string(i);
-        auto ftensor = ftensors_[kv_name].get();
-        group.targets.emplace_back(ftensor, offset);
-        if (!unified_pool_ && num_kv_buffers_ != 1) {
-          auto v_base_offset =
-              get_v_base_offset(ftensor->get_tensor(), page_size_);
-          group.targets.emplace_back(ftensor, offset + v_base_offset);
-        }
-      }
-    }
-    groups.push_back(std::move(group));
-  }
-
   std::vector<RetainedMapping> retained;
   try {
-    for (const auto &group : groups) {
+    for (auto logical_offset : offsets) {
+      const auto targets = mapping_targets_({logical_offset});
       size_t existing = 0;
-      for (const auto &[ftensor, offset] : group.targets) {
+      for (const auto &[ftensor, offset] : targets) {
         existing += ftensor->is_mapped_(offset) ? 1 : 0;
       }
       if (existing == 0) {
         continue;
       }
-      if (existing != group.targets.size()) {
+      if (existing != targets.size()) {
         throw StateConsistencyError("state_inconsistency: logical KV offset is "
                                     "only partially mapped: " +
-                                    std::to_string(group.logical_offset));
+                                    std::to_string(logical_offset));
       }
-
-      for (const auto &[ftensor, offset] : group.targets) {
+      for (const auto &[ftensor, offset] : targets) {
         std::unique_ptr<Page> page;
         if (!ftensor->unmap_retain_(offset, page) || !page) {
           throw std::runtime_error("physical page unmap returned no page");
@@ -514,6 +1024,7 @@ void FTensorAllocator::restore_retained_locked_(
 
 void FTensorAllocator::release_retained_locked_(
     std::vector<RetainedMapping> &retained) {
+  BudgetMutation mutation(budget_);
   for (auto &mapping : retained) {
     if (mapping.page) {
       // Keep failed handles owned, including across an idempotent commit retry.
@@ -521,6 +1032,7 @@ void FTensorAllocator::release_retained_locked_(
       mapping.page.reset();
     }
   }
+  mutation.finish();
 }
 
 void FTensorAllocator::remember_unmap_outcome_locked_(
@@ -544,6 +1056,19 @@ void FTensorAllocator::reject_if_unmap_pending_locked_(
     throw std::runtime_error(
         std::string("cannot ") + operation +
         " while unmap transaction is pending: " + pending_unmap_->id);
+  }
+}
+
+void FTensorAllocator::reject_if_map_overlaps_locked_(
+    const std::vector<offset_t> &offsets) const {
+  for (const auto &[id, transaction] : prepared_map_transactions_) {
+    for (auto offset : offsets) {
+      if (std::find(transaction.offsets.begin(), transaction.offsets.end(),
+                    offset) != transaction.offsets.end()) {
+        throw std::runtime_error(
+            "cannot modify a KV offset with a prepared map: " + id);
+      }
+    }
   }
 }
 

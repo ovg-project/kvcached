@@ -1,18 +1,22 @@
 name: GPU CI on pull request
 
 # A maintainer (the admin or maintain role; write access is not enough)
-# comments `/ci run` on a pull request to run the nightly GPU correctness
+# comments `/ci run` on a pull request to run the basic GPU correctness
 # cases on its head commit merged into main, or `/ci run weekly` for the
 # weekly ones. Both commits are fixed when the command is accepted; later
-# pushes need a new command. The results are commented on the pull request and set as the
-# commit's "GPU CI" status. The tests run on the machine of
+# pushes need a new command. The results are commented on the pull request
+# and set as the commit's "GPU CI" status. The tests run on the machine of
 # gpu-correctness.yml, queued behind its runs; issue_comment always runs this
-# file as it is on main.
+# file as it is on main. tests/e2e and tools/ci run on that machine itself,
+# so a pull request that changes them runs only on CI_REVIEWER's command.
 on:
   issue_comment:
     types: [created]
 
 permissions: {}
+
+env:
+  CI_REVIEWER: RixinLiu
 
 jobs:
   authorize:
@@ -44,7 +48,7 @@ jobs:
             echo allowed=false >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          profile=nightly
+          profile=basic
           if [ "$COMMAND" = "/ci run weekly" ]; then
             profile=weekly
           fi
@@ -54,9 +58,27 @@ jobs:
             echo allowed=false >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # What merging $sha brings into main, renames included. The compare
+          # API lists at most 300 files; a longer list counts as changing them.
+          files=$(gh api "repos/$GH_REPO/compare/$GITHUB_SHA...$sha" \
+            --jq 'if (.files | length) >= 300 then "(300 or more files)"
+                  else .files[] | .filename, (.previous_filename // empty) end')
+          ci_files=$(grep -E '^(tests/e2e|tools/ci)/|^\(300' <<< "$files" | sort -u || true)
+          note=""
+          if [ -n "$ci_files" ]; then
+            list=$(while IFS= read -r f; do echo "- \`$f\`"; done <<< "$ci_files")
+            if [ "$ACTOR" != "$CI_REVIEWER" ]; then
+              gh pr comment "$PR" --body "$(printf '%s\n\n%s\n\n%s' \
+                "This pull request changes files that run on the GPU CI machine:" "$list" \
+                "@$CI_REVIEWER, please review them and comment \`$COMMAND\` to run it.")"
+              echo allowed=false >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            note=$(printf '\n\nIt changes files that run on the GPU CI machine:\n\n%s' "$list")
+          fi
           gh api "repos/$GH_REPO/statuses/$sha" -f state=pending -f context="GPU CI ($profile)" \
             -f target_url="$RUN_URL" -f description="Requested by @$ACTOR" > /dev/null
-          gh pr comment "$PR" --body "GPU CI ($profile) on $sha, requested by @$ACTOR: [run]($RUN_URL)"
+          gh pr comment "$PR" --body "GPU CI ($profile) on $sha, requested by @$ACTOR: [run]($RUN_URL)$note"
           { echo allowed=true; echo "sha=$sha"; echo "profile=$profile"; } >> "$GITHUB_OUTPUT"
 
   e2e:

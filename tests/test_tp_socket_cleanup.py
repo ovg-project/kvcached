@@ -6,8 +6,8 @@ Every engine launch created /tmp/kvcached-tp-<ipc>-<hash>/w<rank>.sock, at
 TP=1 too, and nothing removed it: the listener served the socket until the
 process died and kvctl delete only knew about /dev/shm. These tests pin down
 the fix from three sides: stopping the listener unlinks the socket and the
-directory, vLLM's Worker.shutdown() stops it, and kvctl delete removes the
-directory derived from an IPC name.
+directory, vLLM's Worker.shutdown() stops it, and kvctl delete preserves the
+separately owned socket directory.
 
 The parent-side fallback for workers killed before that runs (issue #510)
 is WorkerSocketCleanup in kvcached.utils; its tests are at the end.
@@ -591,7 +591,7 @@ def test_delete_tp_socket_dir_accepts_a_shm_path(socket_root):
     assert not os.path.exists(socket_dir)
 
 
-def test_kvctl_delete_reports_the_socket_dir(socket_root, monkeypatch, capsys):
+def test_kvctl_control_delete_preserves_the_socket_dir(socket_root, monkeypatch, capsys):
     from kvcached.cli import kvctl
 
     monkeypatch.setattr(cli_utils, "delete_kv_cache_segment", lambda name: False)
@@ -600,9 +600,9 @@ def test_kvctl_delete_reports_the_socket_dir(socket_root, monkeypatch, capsys):
     kvctl.cmd_delete(IPC_NAME)
 
     out = capsys.readouterr()
-    assert "Removed worker socket dir" in out.out
-    assert "not found" not in out.err
-    assert not os.path.exists(get_tp_socket_dir(IPC_NAME))
+    assert "Removed worker socket dir" not in out.out
+    assert "not found" in out.err
+    assert os.path.exists(get_tp_socket_dir(IPC_NAME))
 
 
 def test_kvctl_delete_reports_not_found_when_nothing_exists(socket_root, monkeypatch, capsys):
@@ -863,6 +863,34 @@ def test_parent_cleanup_retry_that_removes_nothing_leaves_directories_alone(sock
 
     assert os.path.isdir(tp_ipc_util.SOCKET_DIR)
     _bind_worker_socket(paths[1]).close()
+
+
+def test_socket_dir_of_a_path_inverts_the_listener_rule(socket_root):
+    for rank, pp_rank in ((0, 0), (1, 0), (0, 1), (3, 2)):
+        path = tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+        assert kvcached.utils.get_tp_socket_dir_of(path) == tp_ipc_util.SOCKET_DIR
+
+
+def test_parent_cleanup_from_reported_paths_removes_them_and_their_directories(socket_root):
+    """The SGLang schedulers report the sockets their listeners bound (issue
+    #548); the deployment root and a pp stage directory go once empty, as
+    the worker's own stop removes them."""
+    paths = [tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+             for pp_rank in range(2) for rank in range(2)]
+    for path in paths:
+        _bind_worker_socket(path).close()
+    absent = tp_ipc_util.get_worker_socket_path(2)
+    cleanup = kvcached.utils.WorkerSocketCleanup.for_paths([*paths, absent])
+
+    assert cleanup.unlink() is True
+
+    for path in paths:
+        assert not os.path.exists(path)
+    assert not os.path.exists(os.path.join(tp_ipc_util.SOCKET_DIR, "pp1"))
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+    _bind_worker_socket(absent).close()  # a node created after the capture
+    assert cleanup.unlink() is True
+    assert os.path.exists(absent)
 
 
 if __name__ == "__main__":
