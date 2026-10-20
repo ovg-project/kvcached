@@ -70,3 +70,11 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         == ">=0.5.11,<0.5.16"
     )
     assert patch_versions["SGLangVirtualKVCapacityPatch"] == ">=0.5.16"
+
+    # The capacity-miss wrappers read the 0.5.20 batch and request shapes
+    # and must run after the pool aliases they rely on.
+    for miss_patch in ("ScheduleBatchCapacityMissPatch", "SchedulerCapacityMissPatch"):
+        assert patch_versions[miss_patch] == ">=0.5.20"
+        assert patch_names.index(miss_patch) > patch_names.index(
+            "ElasticHybridLinearKVPoolPatch"
+        )

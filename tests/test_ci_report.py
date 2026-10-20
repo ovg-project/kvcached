@@ -91,6 +91,18 @@ def test_correctness_comment_lists_failed_cases_with_setup(tmp_path):
     assert f"compare/{'c' * 40}...{'b' * 40}" in text and "(PASS)" in text
 
 
+def test_correctness_comment_lists_token_mismatches_of_passing_cases(tmp_path):
+    write(tmp_path, [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": [
+        {"name": "gen_seq_tokens_equal", "ok": True,
+         "detail": "1 of 9 prompts differ: prompt 5: {'index': 24, 'a': 6576, 'b': 413}"},
+        {"name": "apc_0_cached_tokens_equal", "ok": True, "detail": "kvcached [0] vs native [0]"},
+    ]}])
+    text = report.correctness_comment("basic", [tmp_path], args())
+    assert "· PASS" in text and "most likely numerical" in text
+    assert "| vllm-qwen05b-kv_c1 | `gen_seq_tokens_equal` | 1 of 9 prompts differ" in text
+    assert "apc_0_cached_tokens_equal" not in text
+
+
 def test_correctness_comment_when_nothing_ran(tmp_path):
     text = report.correctness_comment("basic", [tmp_path / "all"], args())
     assert "DID NOT RUN" in text and "The tests did not finish" in text

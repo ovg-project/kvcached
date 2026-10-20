@@ -865,5 +865,33 @@ def test_parent_cleanup_retry_that_removes_nothing_leaves_directories_alone(sock
     _bind_worker_socket(paths[1]).close()
 
 
+def test_socket_dir_of_a_path_inverts_the_listener_rule(socket_root):
+    for rank, pp_rank in ((0, 0), (1, 0), (0, 1), (3, 2)):
+        path = tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+        assert kvcached.utils.get_tp_socket_dir_of(path) == tp_ipc_util.SOCKET_DIR
+
+
+def test_parent_cleanup_from_reported_paths_removes_them_and_their_directories(socket_root):
+    """The SGLang schedulers report the sockets their listeners bound (issue
+    #548); the deployment root and a pp stage directory go once empty, as
+    the worker's own stop removes them."""
+    paths = [tp_ipc_util.get_worker_socket_path(rank, pp_rank)
+             for pp_rank in range(2) for rank in range(2)]
+    for path in paths:
+        _bind_worker_socket(path).close()
+    absent = tp_ipc_util.get_worker_socket_path(2)
+    cleanup = kvcached.utils.WorkerSocketCleanup.for_paths([*paths, absent])
+
+    assert cleanup.unlink() is True
+
+    for path in paths:
+        assert not os.path.exists(path)
+    assert not os.path.exists(os.path.join(tp_ipc_util.SOCKET_DIR, "pp1"))
+    assert not os.path.exists(tp_ipc_util.SOCKET_DIR)
+    _bind_worker_socket(absent).close()  # a node created after the capture
+    assert cleanup.unlink() is True
+    assert os.path.exists(absent)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

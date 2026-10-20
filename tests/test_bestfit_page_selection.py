@@ -195,6 +195,21 @@ class TestPackedAllocationFillsDecodeHoles:
         assert mgr.avail_pages[41].num_free_blocks() == 1
         assert mgr.avail_pages[42].num_free_blocks() == 40
 
+    def test_a_packed_reservation_keeps_the_packed_placement(self):
+        """SGLang's decode gate reserves the step's blocks before
+        alloc_packed runs, and alloc_packed takes the reserved blocks first,
+        so the reservation must place them as alloc_packed would."""
+        mgr = _make_manager(
+            [FakePage(40, 3), FakePage(41, 5), FakePage(42, 40)]
+        )
+
+        assert mgr.try_to_reserve(7, packed=True)
+        block_ids = mgr.alloc_packed(7)
+
+        assert block_ids is not None and len(block_ids) == 7
+        assert _pages_touched(block_ids) == {40, 41}
+        assert mgr.avail_pages[42].num_free_blocks() == 40
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

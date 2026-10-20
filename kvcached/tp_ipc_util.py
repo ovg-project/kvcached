@@ -241,6 +241,13 @@ _listeners_lock = threading.Lock()
 _atexit_registered = False
 
 
+def worker_socket_paths() -> list[str]:
+    """The socket paths this process's registered IPC listeners bound, for
+    the launching process to remember (issue #548)."""
+    with _listeners_lock:
+        return sorted(listener.socket_path for listener in _listeners.values())
+
+
 def stop_worker_listener_threads(
         drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
     """Stop every worker IPC listener started in this process: cancel reads
