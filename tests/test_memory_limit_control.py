@@ -58,6 +58,21 @@ class FakeAllocator:
         self.inuse_pages = inuse_pages
         self.reserved_pages = reserved_pages
         self.resize_calls: list[int] = []
+        # What the native resize watcher reports: the last kvctl quota it
+        # observed, kept until a new one lands, or -1 before the first.
+        self.resize_target = -1
+
+    def get_resize_target(self):
+        return self.resize_target
+
+    def get_num_free_pages(self):
+        return max(0, self.total_pages - self.inuse_pages)
+
+    def get_num_reserved_pages(self):
+        return self.reserved_pages
+
+    def get_avail_physical_pages(self):
+        return self.get_num_free_pages()
 
     def resize(self, new_mem_size):
         target_pages = new_mem_size // self.page_size
@@ -106,7 +121,22 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager.in_shrink = False
     manager.target_num_blocks = None
     manager.block_mem_size = manager.page_size
+    manager.avail_pages = {}
+    manager.full_pages = {}
+    manager._get_num_alloced_blocks = lambda: manager.page_allocator.inuse_pages
+    manager._avail_physical_pages_cache = None
+    manager._avail_physical_pages_ts = 0.0
     return manager
+
+
+def _kvctl_limit(manager, pages):
+    manager.page_allocator.resize_target = pages * manager.page_size
+
+
+def _allocate(manager):
+    # alloc() applies the published quota before it touches a page. Zero
+    # blocks keeps the fake, which has no pages to hand out, on that path.
+    assert manager.alloc(0) == []
 
 
 def test_idle_limit_applies_immediately_through_resize():
@@ -172,6 +202,106 @@ def test_active_limit_defers_without_revoking_and_converges_on_release():
     assert not manager.in_shrink
 
 
+def test_retained_kvctl_target_does_not_cancel_a_later_api_shrink():
+    manager = _manager(inuse_pages=9)
+    page_bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 12)
+    _allocate(manager)
+    assert manager.page_allocator.resize_calls == [12]
+
+    deferred = manager.set_memory_limit(page_bundle * 4, revision=1)
+    assert deferred["status"] == "deferred"
+
+    # The watcher still reports 12. Allocations must not apply it again.
+    _allocate(manager)
+    _allocate(manager)
+
+    assert manager.page_allocator.resize_calls == [12, 4]
+    assert manager.in_shrink
+    assert manager.memory_limit_state()["status"] == "deferred"
+
+    # Requests finish; the free() path completes the pending shrink.
+    manager.page_allocator.inuse_pages = 4
+    manager._maybe_finish_shrink()
+    _allocate(manager)
+
+    state = manager.memory_limit_state()
+    assert manager.page_allocator.resize_calls == [12, 4, 4]
+    assert manager.page_allocator.total_pages == 4
+    assert state["status"] == "applied"
+    assert state["overage_bytes"] == 0
+
+
+def test_retained_kvctl_target_does_not_undo_a_later_api_grow():
+    manager = _manager(inuse_pages=9)
+    page_bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 4)
+    _allocate(manager)
+    assert manager.in_shrink
+
+    grown = manager.set_memory_limit(page_bundle * 16, revision=1)
+    assert grown["status"] == "applied"
+    assert not manager.in_shrink
+
+    _allocate(manager)
+
+    assert manager.page_allocator.resize_calls == [4, 16]
+    assert not manager.in_shrink
+    assert manager.memory_limit_state()["status"] == "applied"
+
+
+def test_changed_kvctl_target_after_an_api_limit_still_applies():
+    manager = _manager(inuse_pages=9)
+    page_bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 12)
+    _allocate(manager)
+    assert manager.set_memory_limit(page_bundle * 4, revision=1)["status"] == "deferred"
+
+    _kvctl_limit(manager, 16)
+    _allocate(manager)
+
+    assert manager.page_allocator.resize_calls == [12, 4, 16]
+    assert manager.page_allocator.total_pages == 16
+    assert not manager.in_shrink
+
+
+def test_deferred_kvctl_target_is_applied_again_until_it_completes():
+    manager = _manager(inuse_pages=9)
+    _kvctl_limit(manager, 4)
+    _allocate(manager)
+    assert manager.in_shrink
+
+    # The watcher keeps reporting 4 and every pass applies it again. That is
+    # what completes a shrink whose last in-use pages were freed by resize()
+    # itself (reserved blocks), where free() ran before in_shrink was set.
+    _allocate(manager)
+    assert manager.page_allocator.resize_calls == [4, 4]
+    assert manager.in_shrink
+
+    manager.page_allocator.inuse_pages = 3
+    _allocate(manager)
+
+    assert manager.page_allocator.resize_calls == [4, 4, 4]
+    assert manager.page_allocator.total_pages == 4
+    assert not manager.in_shrink
+
+
+def test_idle_pass_does_not_apply_the_kvctl_target_over_a_later_api_limit():
+    manager = _manager(inuse_pages=9)
+    page_bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 12)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == [12]
+
+    assert manager.set_memory_limit(page_bundle * 4, revision=1)["status"] == "deferred"
+    # The engine idle hooks call this as soon as the revision changes.
+    manager.apply_resize_target()
+
+    assert manager.page_allocator.resize_calls == [12, 4]
+    assert manager.in_shrink
+    assert manager.memory_limit_state()["status"] == "deferred"
+
+
 def test_limit_can_regrow_within_the_original_reservation():
     manager = _manager()
     page_bundle = manager._memory_limit_page_bundle_bytes()
@@ -198,14 +328,68 @@ def test_limit_is_clamped_to_the_original_reservation():
 
 def test_kvctl_quota_is_clamped_to_the_original_reservation():
     manager = _manager()
+    assert manager.resize(manager.page_size * 3)
     # kvctl publishes the raw quota, which may exceed the startup size.
     manager.page_allocator.get_resize_target = lambda: manager.page_size * 32
-
-    assert manager.resize(manager.page_size * 3)
     manager.apply_resize_target()
 
     assert manager.page_allocator.resize_calls == [3, 16]
     assert manager.page_allocator.total_pages == 16
+
+
+@pytest.mark.parametrize("earlier_quota", [None, 8])
+@pytest.mark.parametrize("pending_quota", [0, 12])
+def test_api_takes_over_watcher_value_not_yet_consumed(earlier_quota, pending_quota):
+    """Construct the native-watch/engine-poll window, not a serving repro."""
+    manager = _manager()
+    if earlier_quota is not None:
+        _kvctl_limit(manager, earlier_quota)
+        manager.apply_resize_target()
+    _kvctl_limit(manager, pending_quota)
+    bundle = manager._memory_limit_page_bundle_bytes()
+    manager.set_memory_limit(4 * bundle, revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.total_pages == 4
+    assert manager.memory_limit_state()["effective_limit_bytes"] == 4 * bundle
+    _kvctl_limit(manager, 6)
+    manager.apply_resize_target()
+    assert manager.page_allocator.total_pages == 6
+
+
+@pytest.mark.parametrize("from_kvctl", [False, True])
+def test_watcher_change_during_resize_is_not_acknowledged(monkeypatch, from_kvctl):
+    manager = _manager()
+    _kvctl_limit(manager, 8)
+    original = manager.page_allocator.resize
+
+    def resize(size):
+        _kvctl_limit(manager, 12)
+        return original(size)
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    if from_kvctl:
+        manager.apply_resize_target()
+    else:
+        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == ([8, 12] if from_kvctl else [4, 12])
+
+
+def test_failed_api_does_not_acknowledge_pending_quota(monkeypatch):
+    manager = _manager()
+    _kvctl_limit(manager, 12)
+    original = manager.page_allocator.resize
+
+    def fail(size):
+        raise ValueError("injected resize failure")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    with pytest.raises(ValueError, match="injected"):
+        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
+    monkeypatch.setattr(manager.page_allocator, "resize", original)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == [12]
+    assert manager._memory_limit_revision == -1
 
 
 def test_zero_limit_drains_an_idle_pool():
