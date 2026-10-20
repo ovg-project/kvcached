@@ -4,6 +4,72 @@
 import pytest
 
 
+@pytest.mark.parametrize("phase", ["prepare", "commit"])
+def test_unknown_map_outcome_survives_native_callback_without_unmap(monkeypatch, phase):
+    """Exercise Python -> C++ alloc_page -> Python IPC -> C++ -> Python."""
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.errors import StateConsistencyError
+
+    vmm_ops = _compiled_vmm_ops()
+    offsets, _ = _create_layout(vmm_ops, False, False)
+    allocator = vmm_ops.PageAllocator(
+        num_layers=2, mem_size_per_layer=8 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=2, group_id=0, ipc_name="UNKNOWN_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+    allocator.set_broadcast_map_callback(ipc.broadcast_map_to_kv_tensors)
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", {})
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {(0, 0): "gpu-0"})
+    transactions = []
+    commands = []
+
+    async def exchange(rank, message, pp_rank=0):
+        command = message["cmd"]
+        commands.append(command)
+        transaction = message["transaction_id"]
+        if command == "prepare_map_to_kv_tensors":
+            transactions.append(transaction)
+            assert vmm_ops.prepare_map_to_kv_tensors(transaction, message["offsets"], 0)["success"]
+            if phase == "prepare":
+                raise ConnectionError("lost prepare response")
+            return {"status": "success", "transaction_state": "reserved"}
+        if command == "commit_prepared_map":
+            assert vmm_ops.commit_prepared_map(transaction, 0)["success"]
+            raise ConnectionError("lost commit response")
+        if command == "get_map_transaction_state":
+            raise ConnectionError("lost state query response")
+        pytest.fail(f"unexpected cleanup or retry: {command}")
+
+    monkeypatch.setattr(ipc, "_send_and_receive_message", exchange)
+    try:
+        with pytest.raises(StateConsistencyError, match="restart"):
+            allocator.alloc_page()
+        state = allocator.get_transaction_state()
+        assert state["state"] == "FAILED"
+        assert state["quarantined_page_ids"] == [0]
+        with pytest.raises(StateConsistencyError):
+            allocator.get_num_free_pages()
+        assert len(transactions) == 1
+        assert commands.count("get_map_transaction_state") == 2
+        calls = len(commands)
+        with pytest.raises(StateConsistencyError):
+            allocator.alloc_page()
+        assert len(commands) == calls
+        if phase == "prepare":
+            assert vmm_ops.has_prepared_map(transactions[0], 0)
+        else:
+            # Idempotent native map reports no newly mapped offsets: the
+            # original mapping was retained, not silently rolled back.
+            assert vmm_ops.map_to_kv_tensors_with_result([offsets[0]], 0) == (True, [])
+    finally:
+        del allocator
+        vmm_ops.shutdown_kvcached()
+
+
 @pytest.mark.parametrize("page_mib", [2, 4])
 @pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
 def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguous, buffers):
@@ -65,6 +131,153 @@ def test_native_allocator_preserves_recoverable_callback_error():
         allocator.alloc_page()
     assert allocator.get_num_free_pages() == before
     assert allocator.get_num_inuse_pages() == 0
+
+
+def test_background_unknown_outcome_reaches_manager_capacity_check():
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserved-page settings are captured when the extension loads.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES="1", KVCACHED_MAX_RESERVED_PAGES="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import runpy, sys; "
+         "runpy.run_path(sys.argv[1])['_check_background_unknown_outcome']()", __file__],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_background_unknown_outcome():
+    import threading
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.kv_cache_manager import KVCacheManager
+    from kvcached.lifecycle import LifecyclePhase, LifecycleState
+    from kvcached.locks import NoOpLock
+
+    vmm_ops = _compiled_vmm_ops()
+    entered = threading.Event()
+    allocator = vmm_ops.PageAllocator(
+        num_layers=1, mem_size_per_layer=16 * 1024 * 1024,
+        page_size=2 * 1024 * 1024, world_size=1, pp_rank=0,
+        async_sched=False, contiguous_layout=False, enable_page_prealloc=True,
+        num_kv_buffers=2, group_id=0, ipc_name="BACKGROUND_" + uuid.uuid4().hex[:8],
+    )
+    allocator.set_use_worker_ipc(True)
+
+    def fail(*args):
+        try:
+            ipc._fail_unresolved_map_transaction("background", [0], 0, "prepare", ["lost"])
+        finally:
+            entered.set()
+
+    allocator.set_broadcast_map_callback(fail)
+    manager = object.__new__(KVCacheManager)
+    manager._lock = NoOpLock()
+    manager.page_allocator = allocator
+    manager.num_avail_blocks = 0
+    manager.reserved_blocks = []
+    manager.in_shrink = False
+    manager._lifecycle = LifecycleState("background-unknown")
+    manager._lifecycle.mark_ready()
+    try:
+        allocator.start_prealloc_thread()
+        assert entered.wait(10), "preallocator did not exercise the callback"
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError, match="background"):
+            manager.available_size()
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+        with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+            manager.wait_ready()
+    finally:
+        allocator.stop_prealloc_thread()
+
+
+@pytest.mark.parametrize("reserved", [0, 1])
+def test_deferred_native_release_notifies_a_waiting_manager(reserved):
+    import os
+    import subprocess
+    import sys
+
+    _compiled_vmm_ops()
+    # Native reserve limits are captured at extension load, not constructor time.
+    env = dict(os.environ, KVCACHED_MIN_RESERVED_PAGES=str(reserved),
+               KVCACHED_MAX_RESERVED_PAGES=str(reserved))
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import runpy, sys, tempfile; from pathlib import Path; import pytest; "
+         "check = runpy.run_path(sys.argv[1])['_check_deferred_capacity_notification']; "
+         "\nwith tempfile.TemporaryDirectory() as root, pytest.MonkeyPatch.context() as mp:\n"
+         "    check(mp, Path(root), int(sys.argv[2]))",
+         __file__, str(reserved)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _check_deferred_capacity_notification(monkeypatch, tmp_path, reserved):
+    import tempfile
+    import time
+    import uuid
+
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.integration.vllm import interfaces
+    from kvcached.kv_cache_manager import KVCacheManager
+
+    vmm_ops = _compiled_vmm_ops()
+    _create_layout(vmm_ops, False, False)
+    import kvcached.kv_cache_manager as manager_module
+
+    page_size = 2 * 1024 * 1024
+    monkeypatch.setattr(manager_module, "PAGE_SIZE", page_size)
+    monkeypatch.setattr(manager_module, "PAGE_PREALLOC_ENABLED", False)
+    monkeypatch.setattr(manager_module, "CONTIGUOUS_LAYOUT", False)
+    monkeypatch.setattr(manager_module, "DEFAULT_IPC_NAME", "epoch-" + uuid.uuid4().hex[:8])
+    monkeypatch.setattr(interfaces, "should_use_worker_ipc", lambda: True)
+    monkeypatch.setattr(ipc, "_PHYSICAL_DEVICE_ID_CACHE", {})
+    socket_root = tempfile.TemporaryDirectory(prefix="kv-epoch-", dir="/tmp")
+    monkeypatch.setattr(ipc, "SOCKET_DIR", socket_root.name)
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    ipc.start_worker_listener_thread(0, device_index=0)
+    manager = None
+    try:
+        manager = KVCacheManager(4, 1, page_size, 2, defer_physical_release=True)
+        blocks = manager.alloc(1)
+        assert blocks == [0]
+        waiter = object.__new__(KVCacheManager)
+        waiter._operation_counters = {}
+        waiter._physical_growth_capacity_epoch_provider = lambda: ipc.physical_growth_capacity_epoch(1)
+        waiter._record_physical_growth_result(
+            {"physical_growth_capacity_rejections_total": 1},
+            capacity_epoch=ipc.physical_growth_capacity_epoch(1))
+        waiter._physical_growth_retry_after = time.monotonic() + 5
+        assert waiter._physical_growth_retry_is_blocked()
+
+        before = ipc.physical_growth_capacity_epoch(1)
+        manager.free(blocks)
+        assert ipc.physical_growth_capacity_epoch(1) == before
+        assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
+        manager.release_retired_pages_through(manager.capture_physical_release_marker())
+        if reserved:
+            # Retirement alone may keep an idle page mapped for reuse.
+            assert ipc.physical_growth_capacity_epoch(1) == before
+            assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 0
+            manager.trim()
+        assert ipc.physical_growth_capacity_epoch(1) != before
+        assert manager._get_operation_counter("physical_growth_capacity_notifications_total") == 1
+        waiter._physical_growth_epoch_next_check = 0
+        assert not waiter._physical_growth_retry_is_blocked()
+        assert waiter._get_operation_counter("physical_growth_capacity_wakeups_total") == 1
+        assert waiter._get_operation_counter("physical_growth_retry_probes_total") == 0
+        assert manager.alloc(1) is not None
+    finally:
+        if manager is not None:
+            manager.shutdown()
+        assert ipc.stop_worker_listener_threads()
+        vmm_ops.shutdown_kvcached()
+        socket_root.cleanup()
 
 
 def _compiled_vmm_ops():
@@ -518,3 +731,125 @@ def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
     finally:
         del allocator
         native.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("page", [2 * 1024 * 1024, 4 * 1024 * 1024])
+@pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_local_growth_reserves_pool_geometry_and_preserves_zero_cost_reuse(
+    monkeypatch, tmp_path, contiguous, buffers, page
+):
+    import uuid
+
+    import torch
+
+    native = _compiled_vmm_ops()
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("KVCACHED_IPC_NAME", "geometry-" + uuid.uuid4().hex)
+    native.init_kvcached("cuda:0", 2 * 1024 * 1024, contiguous)
+    try:
+        tensors = native.create_kv_tensors(8 * page, 1, "cuda:0", 2, buffers, page_size=page)
+        allocator = native.PageAllocator(
+            2, 8 * page, page, contiguous_layout=contiguous,
+            enable_page_prealloc=False, num_kv_buffers=buffers,
+            ipc_name="LOCAL_" + uuid.uuid4().hex[:8],
+        )
+        assert native.set_instance_budget_limit(0, 1) == "applied"
+        before = allocator.get_num_free_pages()
+        with pytest.raises(RuntimeError, match="capacity_exhausted"):
+            allocator.alloc_page()
+        assert allocator.get_num_free_pages() == before
+        assert allocator.get_transaction_state()["state"] == "HEALTHY"
+
+        charge = page * 2 * buffers
+        assert native.set_instance_budget_limit(2 * charge, 2) == "applied"
+        first = allocator.alloc_page()
+        assert first.page_id == 0
+        for tensor in tensors:
+            tensor[:128].fill_(7)
+        torch.cuda.synchronize()
+        assert native.physical_budget_state()["charged_bytes"] == charge
+
+        # A mapped logical offset costs zero even when admission cannot run.
+        offset = page * 2 * buffers if contiguous else page
+        assert native.map_to_kv_tensors_with_result([offset], 0) == (True, [offset])
+        assert native.physical_budget_state()["charged_bytes"] == 2 * charge
+        assert native.set_instance_budget_limit(0, 3) == "applied"
+        second = allocator.alloc_page()
+        assert second.page_id == 1
+        assert native.physical_budget_state()["charged_bytes"] == 2 * charge
+        for tensor in tensors:
+            assert torch.all(tensor[:128] == 7).item()
+        torch.cuda.synchronize()
+    finally:
+        native.shutdown_kvcached()
+
+
+def _local_growth_worker(index, lock_dir, ready, start, release, results):
+    import os
+
+    import torch
+
+    from kvcached import vmm_ops as native
+
+    os.environ["KVCACHED_PHYSICAL_GROWTH_LOCK_DIR"] = lock_dir
+    os.environ["KVCACHED_IPC_NAME"] = "local-race-shared-instance"
+    torch.cuda.set_device(0)
+    page = 64 * 1024 * 1024
+    native.init_kvcached("cuda:0", page, False)
+    tensors = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, page_size=page)
+    allocator = native.PageAllocator(
+        1, 4 * page, page, contiguous_layout=False, enable_page_prealloc=False,
+        num_kv_buffers=1, ipc_name=f"LOCAL_RACE_{os.getpid()}",
+    )
+    if index == 0:
+        assert native.set_instance_budget_limit(page, 1) == "applied"
+    ready.put(index)
+    assert start.wait(30)
+    try:
+        try:
+            allocated = allocator.alloc_page()
+        except RuntimeError as exc:
+            assert "capacity_exhausted" in str(exc)
+            assert allocator.get_num_free_pages() == 4
+            assert allocator.get_transaction_state()["state"] == "HEALTHY"
+            results.put((index, "rejected"))
+        else:
+            tensors[0][:128].fill_(index + 1)
+            torch.cuda.synchronize()
+            results.put((index, "allocated"))
+            assert release.wait(30)
+            assert torch.all(tensors[0][:128] == index + 1).item()
+            allocator.free_page(allocated.page_id)
+    finally:
+        native.shutdown_kvcached()
+
+
+def test_local_processes_share_one_physical_admission_budget(tmp_path):
+    """Independent processes share one instance limit sufficient for one page."""
+    import multiprocessing
+
+    _compiled_vmm_ops()
+    context = multiprocessing.get_context("spawn")
+    ready, results = context.Queue(), context.Queue()
+    start, release = context.Event(), context.Event()
+    processes = [context.Process(target=_local_growth_worker, args=(
+        index, str(tmp_path), ready, start, release, results,
+    )) for index in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        assert {ready.get(timeout=60) for _ in processes} == {0, 1}
+        start.set()
+        outcomes = [results.get(timeout=60) for _ in processes]
+        assert sorted(outcome for _, outcome in outcomes) == ["allocated", "rejected"]
+        release.set()
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+    finally:
+        release.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(timeout=10)

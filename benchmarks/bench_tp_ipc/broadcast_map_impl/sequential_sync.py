@@ -2,22 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import socket
-from typing import Any, Dict
 
-from kvcached.tp_ipc_util import get_worker_socket_path, recv_msg, send_msg
-
-Message = Dict[str, Any]
+from kvcached.tp_ipc_util import IPC_TIMEOUT_S, Message, get_worker_socket_path, recv_msg, send_msg
 
 
-def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
-    for rank in range(tp_size):
-        socket_path = get_worker_socket_path(rank)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        try:
-            send_msg(sock, {"cmd": "map_to_kv_tensors", "offsets": offsets})
-            response: Message = recv_msg(sock)
-            if response.get("status") != "success":
-                raise RuntimeError(f"Worker {rank} failed to map: {response}")
-        finally:
-            sock.close()
+def exchange(rank: int, message: Message, pp_rank: int = 0) -> Message:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(IPC_TIMEOUT_S if IPC_TIMEOUT_S > 0 else None)
+        sock.connect(get_worker_socket_path(rank, pp_rank))
+        send_msg(sock, message)
+        return recv_msg(sock)
+
+
+async def send_and_receive_message(rank: int, message: Message, pp_rank: int = 0) -> Message:
+    # Blocking in the coordinator loop intentionally serializes each phase.
+    return exchange(rank, message, pp_rank)
