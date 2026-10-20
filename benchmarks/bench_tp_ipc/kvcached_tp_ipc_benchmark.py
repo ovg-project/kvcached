@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-import asyncio
-import inspect
 import multiprocessing as mp
 import os
 import socket
 import sys
+import threading
 import time
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -19,6 +18,7 @@ import torch
 from kvcached.tp_ipc_util import recv_msg, send_msg
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
+_protocol_lock = threading.Lock()
 
 
 def get_broadcast_impl(name: str):
@@ -57,19 +57,21 @@ def get_broadcast_impl(name: str):
     module = module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    fn = module.broadcast_map_to_kv_tensors
+    from kvcached import tp_ipc_util
 
-    if inspect.iscoroutinefunction(fn):
+    def broadcast(tp_size: int, offsets: list[int]) -> None:
+        # This isolated benchmark controller has no serving/prealloc threads.
+        # Compare transports while keeping production prepare/commit/reconcile
+        # semantics identical. Serialize invocations and always restore the hook.
+        with _protocol_lock:
+            previous = tp_ipc_util._send_and_receive_message
+            tp_ipc_util._send_and_receive_message = module.send_and_receive_message
+            try:
+                tp_ipc_util.broadcast_map_to_kv_tensors(tp_size, offsets)
+            finally:
+                tp_ipc_util._send_and_receive_message = previous
 
-        def wrapper(*args, **kwargs):
-            """Sync wrapper so caller doesn't need to know this is async."""
-            return asyncio.run(fn(*args, **kwargs))
-
-        wrapper.__name__ = fn.__name__
-        wrapper.__doc__ = f"[wrapped async] {fn.__doc__ or ''}"
-        return wrapper
-
-    return fn
+    return broadcast
 
 
 def wait_for_all_worker_sockets(tp_size: int, timeout_sec=10) -> None:

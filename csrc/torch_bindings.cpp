@@ -347,6 +347,9 @@ void page_allocator_set_broadcast_map_callback(
           if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
             throw MapQuarantinedError(error.what());
           }
+          if (error.matches(errors.attr("MapRetainedError").ptr())) {
+            throw MapRetainedError(error.what());
+          }
           throw;
         }
       });
@@ -404,12 +407,16 @@ STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
   auto errors = py::module_::import("kvcached.errors");
+  py::register_exception<kvcached::MapRetainedError>(
+      m, "MapRetainedError", errors.attr("MapRetainedError").ptr());
   py::register_exception<kvcached::MapQuarantinedError>(
       m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
   py::register_exception<kvcached::StateConsistencyError>(
       m, "StateConsistencyError", errors.attr("StateConsistencyError").ptr());
   py::register_exception<kvcached::QuarantinedResizeError>(
       m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
+  py::register_exception<kvcached::RetainedResizeError>(
+      m, "RetainedResizeError", errors.attr("RetainedResizeError").ptr());
 
   // Torch-free transactional ops (the six core ops are on the stable
   // dispatcher; see STABLE_TORCH_LIBRARY above).
@@ -505,12 +512,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("trim", &kvcached::page_allocator_trim,
            py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
-           &kvcached::page_allocator_reset_free_page_order)
+           &kvcached::page_allocator_reset_free_page_order,
+           py::call_guard<py::gil_scoped_release>())
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
       .def("get_num_inuse_pages", &kvcached::page_allocator_get_num_inuse_pages)
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_num_retryable_pages",
+           &kvcached::PageAllocator::get_num_retryable_pages)
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
