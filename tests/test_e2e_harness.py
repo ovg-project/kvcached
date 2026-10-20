@@ -68,9 +68,11 @@ def test_case_arguments_for_tp_and_fp8_kv():
 def test_elastic_pair_with_a_tp_server():
     from e2e.matrix import ElasticPair
 
-    pair = ElasticPair("sglang", "qwen35_4b", "sglang", "qwen35_4b", tp_a=2, gpu_b=1)
-    assert pair.name == "elastic-sglang-qwen35_4b-tp2+sglang-qwen35_4b-gpu1"
-    assert pair in PROFILES["weekly"].elastic
+    pair = ElasticPair("sglang", "qwen35_4b", "vllm", "qwen35_4b", tp_a=2, gpu_b=1)
+    assert pair.name == "elastic-sglang-qwen35_4b-tp2+vllm-qwen35_4b-gpu1"
+    # Weekly's one elastic case: a starved TP rank, and two engines on a GPU.
+    assert PROFILES["weekly"].elastic == (pair,)
+    assert PROFILES["weekly"].engines == ("vllm", "sglang")
     assert (ElasticPair("vllm", "qwen05b", "sglang", "qwen35_4b").name
             == "elastic-vllm-qwen05b+sglang-qwen35_4b")
     case = Case(pair.engine_a, pair.model_a, "c1", tag="elastic", tp=pair.tp_a)
@@ -83,6 +85,28 @@ def test_host_gpu_is_the_runs_gpu_at_the_container_index(tmp_path):
 
     assert LocalHost(ENGINES["sglang"], "x", "all", tmp_path).host_gpu(1) == "1"
     assert LocalHost(ENGINES["sglang"], "x", "1,0", tmp_path).host_gpu(1) == "0"
+
+
+def test_servers_are_pinned_to_the_selected_gpus(tmp_path):
+    from e2e.run import Container, LocalHost, launch
+
+    # A local run with --gpus 2,3: B goes to host GPU 3, A's ranks to 2 and 3,
+    # whatever CUDA_VISIBLE_DEVICES the run inherited.
+    local = LocalHost(ENGINES["vllm"], "x", "2,3", tmp_path)
+    captured: dict[str, str] = {}
+    local.start_server = lambda case_dir, env, argv: captured.update(env) or "1"  # type: ignore[method-assign]
+    launch(local, Case("vllm", "qwen35_4b", "c1", tag="elastic"), "1", 1,
+           extra_env=local.gpu_env(1))
+    assert captured["CUDA_VISIBLE_DEVICES"] == local.host_gpu(1) == "3"
+    assert local.gpu_env() == {"CUDA_VISIBLE_DEVICES": "2,3"}
+    assert LocalHost(ENGINES["vllm"], "x", "all", tmp_path).gpu_env() == {}
+    assert LocalHost(ENGINES["vllm"], "x", "all", tmp_path).gpu_env(1) == {
+        "CUDA_VISIBLE_DEVICES": "1"}
+    # A container sees the run's GPUs as 0, 1, ...
+    docker = Container.__new__(Container)
+    docker.gpus = "2,3"
+    assert docker.gpu_env(1) == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert docker.gpu_env() == {}
 
 
 TP_MISS_LOG = """\
@@ -102,12 +126,14 @@ requests (4 misses so far): a peer rank sharing this waiting queue could not bac
 """
 
 
-def test_tp_miss_checks_read_both_ranks():
+def _failed_tp_miss_checks(text, tp=2):
     from e2e.elastic import tp_miss_checks
 
-    def failed(text, tp=2):
-        return {c.name for c in tp_miss_checks(text, tp) if not c.ok}
+    return {c.name for c in tp_miss_checks(text, tp) if not c.ok}
 
+
+def test_tp_miss_checks_read_both_ranks():
+    failed = _failed_tp_miss_checks
     assert failed(TP_MISS_LOG) == set()
     lines = TP_MISS_LOG.splitlines(keepends=True)
     # Only one rank logged the first miss, and only one rank retracted.
@@ -120,6 +146,35 @@ def test_tp_miss_checks_read_both_ranks():
     assert failed(lines[0] * 2) == {"a_miss_on_one_rank"}
     # Nothing ran short.
     assert failed("[2026-10-14 10:00:00 TP0] Prefill batch, #new-seq: 1\n") == {"a_pool_short"}
+
+
+def test_tp_miss_checks_take_the_lowest_lifetime_count_as_the_first_miss():
+    failed = _failed_tp_miss_checks
+    # The ranks missed three times before this part of the log; their fourth
+    # miss is the first one here, and they agree on it.
+    later = TP_MISS_LOG.replace("(1 misses so far)", "(3 misses so far)")
+    assert failed(later) == set()
+    # One rank's count is ahead of the other's: they did not agree on every
+    # miss before, and the lines with the lowest count are one rank's.
+    lines = later.splitlines(keepends=True)
+    assert failed(lines[0] + lines[1].replace("(3 misses", "(5 misses")) == {"a_miss_agreed"}
+
+
+def test_tp_miss_checks_read_only_the_contention_phase(tmp_path):
+    from e2e.elastic import phase_log
+
+    lines = TP_MISS_LOG.splitlines(keepends=True)
+    # Calibration and A's solo load retracted once on each rank; nothing ran
+    # short once B's load landed.
+    log = tmp_path / "serve.log"
+    log.write_text(lines[2] + lines[3])
+    contention_start = log.stat().st_size
+    log.write_text(lines[2] + lines[3] + "[2026-10-14 10:05:00 TP0] Decode batch, #running-req: 2\n")
+    assert _failed_tp_miss_checks(log.read_text()) == set()  # the whole log passes
+    assert _failed_tp_miss_checks(phase_log(log, contention_start)) == {"a_pool_short"}
+    # The same misses after the boundary count.
+    log.write_text(lines[2] + lines[3] + TP_MISS_LOG)
+    assert _failed_tp_miss_checks(phase_log(log, contention_start)) == set()
 
 
 def test_ipc_name_is_shm_safe():

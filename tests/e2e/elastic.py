@@ -16,10 +16,10 @@ Greedy probes before and after must give the same tokens on each server.
 
 With a TP server as A (ElasticPair.tp_a), A spans the run's first GPUs and B
 is pinned to one of them (gpu_b), where memory is sampled. Step 4 then lands
-A's load first and B's while A holds half of what it grew, so A's rank on that
-GPU runs short while its other ranks do not; B's prefix cache is reset and
-A's requests must still finish. A's log must show its ranks agreeing on
-every miss (tp_miss_checks).
+A's load first and B's once A holds half of what it grew (a_held_at_b_load),
+so A's rank on that GPU runs short while its other ranks do not; B's prefix
+cache is reset and A's requests must still finish. A's log from the start of
+step 4 must show its ranks agreeing on every miss (tp_miss_checks).
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional, Sequence
 
 from e2e import client as cl
@@ -74,7 +75,7 @@ WORKLOAD = (
     "with a TP server as A (tp_a): A spans the run's first GPUs and B is pinned to one of "
     "them (gpu_b), where memory is sampled; in phase (4) A gets its load first and B's lands "
     "once A holds half of what it grew, then B's prefix cache is reset and A's requests must "
-    "finish",
+    "finish; the miss checks read A's log from where phase (4) started",
     "3 greedy probe prompts of 32 tokens on each server before and after",
 )
 CHECKS = {
@@ -85,10 +86,13 @@ CHECKS = {
                          "what it grew",
     "b_reused_a_memory": "B's KV usage grows past what was free at A's peak",
     "contended_requests_ok": "every request succeeds while both loads run",
-    "a_pool_short": "with a TP server as A: under contention its log shows that kvcached "
-                    "could not back a prefill batch, or that SGLang retracted requests",
-    "a_miss_agreed": "every rank of A logs the first prefill miss with the same batch size "
-                     "and cap, and the ranks retract the same number of times",
+    "a_held_at_b_load": "with a TP server as A: when B's load lands in phase (4), A holds at "
+                        "least half of what it grew in phase (1), the pressure the next "
+                        "checks need",
+    "a_pool_short": "with a TP server as A: in phase (4) its log shows that kvcached could "
+                    "not back a prefill batch, or that SGLang retracted requests",
+    "a_miss_agreed": "every rank of A logs its first prefill miss of phase (4) with the same "
+                     "batch size and cap, and the ranks retract the same number of times",
     "a_miss_on_one_rank": "a rank of A that could back a batch followed the verdict of the "
                           "rank that could not (the asymmetric miss); passes when no prefill "
                           "miss was logged",
@@ -191,8 +195,7 @@ def start_ballast(ct: Container, mib: int, gpu: int = 0) -> str:
     code = ("import time, torch; "
             f"x = torch.empty({mib} << 20, dtype=torch.uint8, device='cuda'); "
             "print('ballast ready', flush=True); time.sleep(1e9)")
-    pid = ct.start_server("elastic-ballast", {"CUDA_VISIBLE_DEVICES": str(gpu)},
-                          ["python3", "-c", code])
+    pid = ct.start_server("elastic-ballast", ct.gpu_env(gpu), ["python3", "-c", code])
     deadline = time.time() + 120
     while time.time() < deadline:
         log = ct.out_dir / "elastic-ballast" / "serve.log"
@@ -204,7 +207,8 @@ def start_ballast(ct: Container, mib: int, gpu: int = 0) -> str:
 
 # What #554 logs on the rank whose pool missed (its allocator's cause) and on
 # the ranks that followed its verdict (the peer cause), at most once per 10 s
-# per rank; every rank's first miss carries count 1.
+# per rank. The count is the rank's misses over the process's lifetime, and
+# every rank counts every agreed miss.
 MISS_RE = re.compile(r"kvcached could not back a prefill batch of (\d+) requests; returned "
                      r"them to the waiting queue and capped the next batch at (\d+) requests "
                      r"\((\d+) misses so far\): (.*)")
@@ -213,20 +217,29 @@ PEER_CAUSE = "a peer rank sharing this waiting queue could not back the batch"
 RETRACT_RE = re.compile(r"\[[^\]]* TP(\d+)[^\]]*\] KV cache pool is full\. Retract requests\.")
 
 
+def phase_log(path: Path, start: int) -> str:
+    """A server's log from byte `start`, its size when a phase began."""
+    return path.read_bytes()[start:].decode(errors="replace")
+
+
 def tp_miss_checks(text: str, tp: int) -> list[Check]:
-    """Whether the tp ranks of a server agreed on every capacity miss in its
-    log. The ranks log into one file: the cause tells the rank that missed
-    from the ranks that followed it, and the TP prefix tells the retractions
-    apart."""
+    """Whether the tp ranks of a server agreed on every capacity miss in this
+    part of its log. The ranks log into one file: the cause tells the rank
+    that missed from the ranks that followed it, and the TP prefix tells the
+    retractions apart. The ranks' lines for the first miss in the text are
+    those with its lowest count, since the counts are lifetime counts that
+    agreeing ranks keep equal."""
     misses = [(int(n), int(cap), int(count), cause.strip())
               for n, cap, count, cause in MISS_RE.findall(text)]
     retracts = Counter(RETRACT_RE.findall(text))
-    first = {(n, cap) for n, cap, count, _ in misses if count == 1}
+    counts = [count for _, _, count, _ in misses]
+    first = [(n, cap) for n, cap, count, _ in misses if count == min(counts, default=0)]
     peers = sum(PEER_CAUSE in cause for _, _, _, cause in misses)
-    detail = (f"{len(misses)} prefill miss lines, {peers} with the peer cause; retractions "
-              f"per rank {dict(sorted(retracts.items())) or 'none'}")
-    first_agreed = not misses or (
-        sum(count == 1 for _, _, count, _ in misses) == tp and len(first) == 1)
+    detail = (f"{len(misses)} prefill miss lines"
+              + (f" (misses {min(counts)} to {max(counts)})" if counts else "")
+              + f", {peers} with the peer cause; retractions per rank "
+              f"{dict(sorted(retracts.items())) or 'none'}")
+    first_agreed = not misses or (len(first) == tp and len(set(first)) == 1)
     retract_agreed = not retracts or (len(retracts) == tp and len(set(retracts.values())) == 1)
     return [Check("a_pool_short", bool(misses or retracts), detail),
             Check("a_miss_agreed", first_agreed and retract_agreed, detail),
@@ -251,8 +264,6 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             res.log["ballast_mib"] = total - emulate_gpu_mib
     case_a = Case(pair.engine_a, pair.model_a, "c1", tag="elastic", tp=pair.tp_a)
     case_b = Case(pair.engine_b, pair.model_b, "c1", tag="elastic")
-    # A's ranks take the run's GPUs in order; B sees only its own.
-    env_b = {"CUDA_VISIBLE_DEVICES": str(pair.gpu_b)} if pair.gpu_b else {}
     setup = {"kind": "elastic", "gpu": gpu, "batch": ELASTIC_BATCH,
              "a": case_setup(case_a), "b": case_setup(case_b)}
     res.log["setup"] = setup
@@ -260,9 +271,11 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
     usage: Optional[Usage] = None
     try:
         # Start one after the other so the second sees the first's weights.
-        for host, case, port, extra, env in ((ct_a, case_a, base_port + 1, pair.extra_args_a, {}),
+        # A's ranks take the run's GPUs in order; B sees only its own.
+        for host, case, port, extra, env in ((ct_a, case_a, base_port + 1, pair.extra_args_a,
+                                              ct_a.gpu_env()),
                                              (ct_b, case_b, base_port + 2, pair.extra_args_b,
-                                              env_b)):
+                                              ct_b.gpu_env(pair.gpu_b))):
             batch = (BATCH_FLAG[case.engine], str(ELASTIC_BATCH))
             srv = launch(host, case, run_id, port, extra_args=(*batch, *extra), extra_env=env)
             setup["a" if case is case_a else "b"] = srv.setup
@@ -326,16 +339,23 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
                     "was free at A's peak")
             drain(usage, b)
 
-            # 4. Both at once. With a TP server as A, B's load lands while A
+            # 4. Both at once. With a TP server as A, B's load lands once A
             # holds half of what it grew, so that A's rank on B's GPU runs
             # short while its other ranks do not; A must finish once B's
-            # prefix cache is reset.
+            # prefix cache is reset. A's log from here on is the evidence
+            # for the miss checks; what it logged before is not.
+            log_a = ct_a.out_dir / case_a.name / "serve.log"
+            contention_start = log_a.stat().st_size if log_a.exists() else 0
             fa = pool.submit(burst, a, pool, n[a.ipc], 30_000)
             if pair.tp_a > 1:
                 deadline = time.time() + 120
                 while usage.used(a) - a_after < 0.5 * a_growth and time.time() < deadline:
                     time.sleep(1)
-                mem["a_held_at_b_load"] = (usage.used(a) - a_after) / MIB
+                held = usage.used(a) - a_after
+                mem["a_held_at_b_load"] = held / MIB
+                res.add("a_held_at_b_load", held >= 0.5 * a_growth,
+                        f"A held {held / MIB:.0f} of the {a_growth / MIB:.0f} MiB it grew "
+                        "when B's load landed")
                 results = burst(b, pool, n[b.ipc], 40_000)
                 drain(usage, b)
                 results += fa.result()
@@ -347,8 +367,8 @@ def run_elastic(ct_a: Container, ct_b: Container, pair: ElasticPair, run_id: str
             mem.update(a_growth=a_growth / MIB, a_after=(a_after - a_idle) / MIB,
                        free_at_a_peak=free_at_a_peak / MIB, b_growth=b_growth / MIB)
         if pair.tp_a > 1:
-            log = ct_a.out_dir / case_a.name / "serve.log"
-            res.checks += tp_miss_checks(log.read_text(errors="replace"), pair.tp_a)
+            res.log["a_log_contention_offset"] = contention_start
+            res.checks += tp_miss_checks(phase_log(log_a, contention_start), pair.tp_a)
 
         for host, srv in started:
             after = srv.client.run_phase("probe", probes, 32, 1)

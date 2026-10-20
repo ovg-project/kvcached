@@ -267,9 +267,10 @@ PROFILES = {
                     tp=2),
             *groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",), fp8_kv=True),
         ),
-        # Two different engines sharing GPU 0, and a TP=2 server whose rank 1
-        # shares GPU 1 with a second server, so that only that rank runs short.
-        elastic=(ElasticPair("vllm", "qwen05b", "sglang", "qwen35_4b"),
-                 ElasticPair("sglang", "qwen35_4b", "sglang", "qwen35_4b", tp_a=2, gpu_b=1)),
+        # A TP=2 server whose rank 1 shares GPU 1 with a vLLM server, so that
+        # only that rank runs short, and two engines share a GPU. B's weights
+        # leave GPU 1 little room, so the loads the harness sizes to it
+        # exceed what is free once both are on it (#577 has the numbers).
+        elastic=(ElasticPair("sglang", "qwen35_4b", "vllm", "qwen35_4b", tp_a=2, gpu_b=1),),
     ),
 }

@@ -132,6 +132,12 @@ class Container:
         """Host index of the run's i-th GPU, which the container sees as i."""
         return str(i) if self.gpus == "all" else self.gpus.split(",")[i]
 
+    def gpu_env(self, i: Optional[int] = None) -> dict[str, str]:
+        """Environment that puts a server on the run's i-th GPU, or, with
+        None, on all of the run's GPUs in their order. The container sees
+        only the run's GPUs, as 0, 1, ...; a local server sees the host's."""
+        return {} if i is None else {"CUDA_VISIBLE_DEVICES": str(i)}
+
     def exec(self, script: str, timeout: Optional[float] = None,
              input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
         flags = ["-i"] if input_bytes is not None else []
@@ -244,6 +250,11 @@ class LocalHost(Container):
         self.gpu = "0" if gpus == "all" else gpus.split(",")[0]
         self.out_dir = out_dir
         self.out_path = str(out_dir)
+
+    def gpu_env(self, i: Optional[int] = None) -> dict[str, str]:
+        if i is None:
+            return {} if self.gpus == "all" else {"CUDA_VISIBLE_DEVICES": self.gpus}
+        return {"CUDA_VISIBLE_DEVICES": self.host_gpu(i)}
 
     def exec(self, script: str, timeout: Optional[float] = None,
              input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
