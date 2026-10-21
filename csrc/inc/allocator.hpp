@@ -82,6 +82,13 @@ public:
   uint64_t available_physical_bytes();
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
   bool recalibrate_physical_budget();
+  InstanceControl configure_instance_control(bool can_shrink,
+                                             uint64_t expected_participants,
+                                             uint64_t startup_pages);
+  InstanceControl instance_control_state();
+  bool acknowledge_instance_control(uint64_t revision);
+  std::string instance_control_path();
+  static std::string instance_control_name() { return g_instance_name_; }
 
 private:
   struct ReservedMapping {

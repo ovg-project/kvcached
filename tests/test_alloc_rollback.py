@@ -126,6 +126,8 @@ def make_manager(fail_after: int,
     """Build a KVCacheManager around fakes without running __init__ (which
     needs the C++ extension, KV tensors, and background threads)."""
     manager = object.__new__(KVCacheManager)
+    manager.group_id = 0
+    manager.num_layers = manager.num_kv_buffers = 1
     manager.page_size = BLOCKS_PER_PAGE
     manager.block_mem_size = 1
     manager.mem_size = 1024 * BLOCKS_PER_PAGE
@@ -146,6 +148,17 @@ def make_manager(fail_after: int,
     manager._lifecycle = LifecycleState("rollback-test")
     manager._lifecycle.mark_ready()
     return manager
+
+
+def publish_limit(manager, monkeypatch, limit):
+    if getattr(manager, "_runtime_control", None) is None:
+        from runtime_control_fake import attach_control
+        allocator = manager.page_allocator
+        monkeypatch.setattr(allocator, "get_page_state", lambda: dict(
+            inuse_pages=allocator.num_allocated - len(allocator.freed_pages),
+            reserved_pages=0), raising=False)
+        attach_control(manager, monkeypatch)
+    return manager.set_memory_limit(limit)
 
 
 def enable_operation_counters(manager: KVCacheManager) -> None:
@@ -182,11 +195,11 @@ def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_ta
         return size >= inuse * BLOCKS_PER_PAGE
 
     def reset():
-        allocator.num_allocated = 0
+        allocator.num_allocated = 1
         allocator.freed_pages.clear()
 
     monkeypatch.setattr(allocator, "resize", resize, raising=False)
-    monkeypatch.setattr(allocator, "get_resize_target", lambda: 0)
+    publish_limit(manager, monkeypatch, 0)
     monkeypatch.setattr(allocator, "reset_free_page_order", reset, raising=False)
     for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim"):
         monkeypatch.setattr(allocator, method, lambda: None, raising=False)
@@ -194,14 +207,15 @@ def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_ta
     manager.apply_resize_target()
     assert manager.in_shrink
     if api_takeover:
-        assert manager.resize(2 * BLOCKS_PER_PAGE)
+        publish_limit(manager, monkeypatch, 2 * BLOCKS_PER_PAGE)
+        manager.apply_resize_target()
     calls.clear()
     manager.clear()
     assert manager.null_block == [0]
     assert manager.in_shrink == (not api_takeover)
-    assert calls == ([] if api_takeover else [0])
+    assert calls == ([2 * BLOCKS_PER_PAGE] if api_takeover else [0])
     # A later positive CLI publication can still take control.
-    monkeypatch.setattr(allocator, "get_resize_target", lambda: 3 * BLOCKS_PER_PAGE)
+    publish_limit(manager, monkeypatch, 3 * BLOCKS_PER_PAGE)
     manager.apply_resize_target()
     assert not manager.in_shrink
     assert calls[-1] == 3 * BLOCKS_PER_PAGE
@@ -855,23 +869,23 @@ def test_retained_quota_is_applied_until_a_later_resize(monkeypatch):
         return True
 
     monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
-    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: quota)
+    publish_limit(manager, monkeypatch, quota)
     assert manager.alloc(1) is not None
     assert manager.alloc(1) is not None
     # The watcher keeps reporting the quota and every allocation applies it.
-    assert calls == [quota, quota]
+    assert calls == [quota]
 
-    # A later resize() is the latest published target; the quota stays out.
-    assert manager.resize(3 * BLOCKS_PER_PAGE)
+    # A later native publication replaces the earlier target.
+    publish_limit(manager, monkeypatch, 3 * BLOCKS_PER_PAGE)
     assert manager.alloc(1) is not None
-    assert calls == [quota, quota, 3 * BLOCKS_PER_PAGE]
+    assert calls == [quota, 3 * BLOCKS_PER_PAGE]
 
     for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim", "reset_free_page_order"):
         monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
     manager.clear()
-    # clear() publishes nothing, so the later resize() still wins.
+    # clear() reapplies the accepted target without publishing a revision.
     assert manager.alloc(1) is not None
-    assert calls == [quota, quota, 3 * BLOCKS_PER_PAGE]
+    assert calls == [quota, 3 * BLOCKS_PER_PAGE, 3 * BLOCKS_PER_PAGE]
 
 
 def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
@@ -892,7 +906,7 @@ def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
     assert len(manager.reserved_blocks) == 2 * BLOCKS_PER_PAGE
 
     # kvctl publishes a one-page quota. The engine pass retries after release.
-    monkeypatch.setattr(allocator, "get_resize_target", lambda: BLOCKS_PER_PAGE)
+    publish_limit(manager, monkeypatch, BLOCKS_PER_PAGE)
     assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
     assert not manager.in_shrink
     assert manager.reserved_blocks == []
@@ -917,10 +931,11 @@ def test_api_shrink_progresses_after_reserved_release(monkeypatch, observed_quot
 
     monkeypatch.setattr(allocator, "resize", resize, raising=False)
     if observed_quota:
-        monkeypatch.setattr(allocator, "get_resize_target", lambda: 4 * BLOCKS_PER_PAGE)
+        publish_limit(manager, monkeypatch, 4 * BLOCKS_PER_PAGE)
         manager.apply_resize_target()
     assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
-    assert not manager.resize(BLOCKS_PER_PAGE)
+    publish_limit(manager, monkeypatch, BLOCKS_PER_PAGE)
+    manager.apply_resize_target()
     assert manager.reserved_blocks == []
     assert manager.in_shrink
     calls.clear()
@@ -947,12 +962,13 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
         raise QuarantinedResizeError("quarantined pages")
 
     monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
-    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: target[0])
+    publish_limit(manager, monkeypatch, target[0])
     assert manager.alloc(1) is not None
     assert manager.alloc(1) is not None
     assert calls == [1000]
     assert manager._resize_rejected
     target[0] = 2000
+    publish_limit(manager, monkeypatch, target[0])
     assert manager.alloc(1) is not None
     assert calls == [1000, 2000]
     assert not manager.in_shrink

@@ -8,7 +8,14 @@ import time
 from typing import List, Optional, Union
 
 from kvcached import control_segment
-from kvcached.cli.utils import SHM_DIR, MemInfoStruct, RwLockedShm, _format_size, get_ipc_name
+from kvcached.cli.utils import (
+    SHM_DIR,
+    MemInfoStruct,
+    RwLockedShm,
+    _format_size,
+    get_ipc_name,
+    get_segment_control,
+)
 
 
 def _detect_kvcache_ipc_names(include_inactive: bool = False) -> List[str]:
@@ -29,9 +36,7 @@ def _detect_kvcache_ipc_names(include_inactive: bool = False) -> List[str]:
             try:
                 with RwLockedShm(fname, MemInfoStruct.SHM_SIZE,
                                  RwLockedShm.RLOCK) as mm:
-                    total_size = MemInfoStruct.from_buffer(mm).total_size
-                    if total_size <= 0:
-                        continue
+                    MemInfoStruct.from_buffer(mm)
                 candidates.append(fname)
             except Exception:
                 # Skip files we cannot map / lock
@@ -106,6 +111,7 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
 
         bar_width = max(10, width - 2)
 
+        seen = set()
         # Iterate over each detected/selected IPC name
         for idx, name in enumerate(names_to_show):
             if current_row >= height - 4:  # Reserve some rows for footer/GPU
@@ -113,16 +119,15 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
 
             if control_segment.active(os.path.join(SHM_DIR, get_ipc_name(name))) is False:
                 continue
-            # Fetch memory info for this IPC
-            try:
-                with RwLockedShm(get_ipc_name(name), MemInfoStruct.SHM_SIZE,
-                                 RwLockedShm.RLOCK) as mm:
-                    mem_info = MemInfoStruct.from_buffer(mm)
-                    total = int(mem_info.total_size)
-                    used = int(mem_info.used_size)
-                    prealloc = int(mem_info.prealloc_size)
-            except FileNotFoundError:
-                total = used = prealloc = 0
+            state = get_segment_control(name)
+            if not state["gpus"] or state["instance"] in seen:
+                continue
+            name = state["instance"]
+            seen.add(name)
+            total = sum(gpu["effective_limit_bytes"] for gpu in state["gpus"])
+            # The ledger charges both used and reserved physical pages.
+            used = sum(gpu["charged_bytes"] for gpu in state["gpus"])
+            prealloc = 0
 
             free = max(total - used - prealloc, 0)
             percent_total = ((used + prealloc) / total * 100) if total else 0
@@ -143,7 +148,7 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
             bar_free = "-" * (bar_width - prealloc_only_width - used_width)
 
             # Section header per IPC
-            stdscr.addstr(current_row, 0, f"IPC: {name}", header_attr)
+            stdscr.addstr(current_row, 0, f"Instance: {name}", header_attr)
             current_row += 1
 
             stdscr.addstr(current_row, 0, "[", header_attr)
@@ -165,7 +170,7 @@ def _draw_kvtop(stdscr: "curses._CursesWindow", ipc_names: Optional[List[str]],
             stdscr.addstr(
                 current_row,
                 0,
-                f"Prealloc: {_format_size(prealloc)} | Used: {_format_size(used)} / {_format_size(total)} ({percent_total:.1f}%) | Free: {_format_size(free)}"[:
+                f"Physical: {_format_size(used)} / {_format_size(total)} ({percent_total:.1f}%) | Headroom: {_format_size(free)}"[:
                                                                                                                                                                width
                                                                                                                                                                -
                                                                                                                                                                1],

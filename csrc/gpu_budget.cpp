@@ -18,7 +18,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473033ULL;
+constexpr uint64_t kMagic = 0x4b56425544473034ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -90,18 +90,29 @@ struct GpuBudget::Shared {
   uint64_t magic;
   uint64_t budget;
   uint64_t last_sample_ns;
+  uint64_t next_generation;
   struct Instance {
     char name[kName];
     uint64_t limit;
     uint64_t revision;
     uint64_t has_revision;
     uint64_t valid;
+    uint64_t participants;
+    uint64_t generation;
+    uint64_t expected_participants;
   } instances[kInstances];
   struct Pool {
     uint64_t owner;
     uint64_t instance;
     int64_t group;
     alignas(8) uint64_t charged;
+    uint64_t capacity;
+    uint64_t page_bundle;
+    uint64_t ready;
+    uint64_t can_shrink;
+    uint64_t target;
+    uint64_t acknowledged_revision;
+    uint64_t acknowledged;
   } pools[kPools];
 };
 
@@ -142,6 +153,48 @@ struct GpuBudget::Locked {
 std::shared_ptr<GpuBudget> GpuBudget::connect(const std::string &path,
                                               const Sampler &sampler) {
   return std::shared_ptr<GpuBudget>(new GpuBudget(path, sampler));
+}
+
+std::shared_ptr<GpuBudget> GpuBudget::open_control(const std::string &path) {
+  return std::shared_ptr<GpuBudget>(new GpuBudget(path));
+}
+
+GpuBudget::GpuBudget(const std::string &path) : path_(path), pid_(getpid()) {
+  fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  if (fd_ < 0)
+    throw system_error("open live KV control");
+  try {
+    // Serialize with epoch initialization, then require an existing user.
+    if (lease(fd_, F_WRLCK, true, 2) < 0)
+      throw system_error("lock KV control attachment");
+    if (lease(fd_, F_WRLCK, false) == 0)
+      throw std::runtime_error("KV control instance is not running");
+    if (errno != EAGAIN && errno != EACCES)
+      throw system_error("inspect live KV control");
+    if (lease(fd_, F_RDLCK, true) < 0)
+      throw system_error("retain live KV control");
+    {
+      Locked lock(*this);
+      struct stat info{};
+      if (fstat(fd_, &info) < 0 ||
+          info.st_size != static_cast<off_t>(sizeof(Shared)))
+        throw std::runtime_error("incompatible live KV control layout");
+      void *address = mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd_, 0);
+      if (address == MAP_FAILED)
+        throw system_error("map live KV control");
+      shared_ = static_cast<Shared *>(address);
+      if (shared_->magic != kMagic)
+        throw std::runtime_error("incompatible live KV control protocol");
+    }
+    if (lease(fd_, F_UNLCK, false, 2) < 0)
+      throw system_error("unlock KV control attachment");
+  } catch (...) {
+    if (shared_)
+      munmap(shared_, sizeof(Shared));
+    close(fd_);
+    throw;
+  }
 }
 
 GpuBudget::GpuBudget(const std::string &path, const Sampler &sampler)
@@ -198,6 +251,7 @@ GpuBudget::GpuBudget(const std::string &path, const Sampler &sampler)
       std::memset(shared_, 0, sizeof(Shared));
       shared_->budget = initial_budget;
       shared_->last_sample_ns = monotonic_ns();
+      shared_->next_generation = shared_->last_sample_ns;
       publish(shared_->magic, kMagic);
       if (lease(fd_, F_RDLCK, false) < 0)
         throw system_error("retain initialized KV budget");
@@ -318,6 +372,8 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
         std::memset(&entry, 0, sizeof(entry));
         std::memcpy(entry.name, instance.c_str(), instance.size() + 1);
         entry.limit = UINT64_MAX;
+        entry.generation = add(shared_->next_generation, 1);
+        shared_->next_generation = entry.generation;
         publish(entry.valid, 1);
         instance_index = i;
         break;
@@ -331,6 +387,9 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
     if (entry.instance == instance_index && entry.group == group)
       return slot;
   }
+  if (shared_->instances[instance_index].participants)
+    throw std::runtime_error(
+        "dynamic KV pool registration after control is unsupported");
   for (size_t i = 0; i < kPools; ++i) {
     auto &entry = shared_->pools[i];
     if (entry.owner == 0 && entry.charged == 0) {
@@ -339,6 +398,7 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
         slots_.pop_back();
         throw system_error("retain KV budget pool owner");
       }
+      std::memset(&entry, 0, sizeof(entry));
       entry.instance = instance_index;
       entry.group = group;
       publish(entry.owner, owner_);
@@ -442,6 +502,18 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
   Locked lock(*this);
   (void)snapshot_locked(slot);
   auto &entry = shared_->instances[shared_->pools[slot].instance];
+  // The legacy grant-only entry point remains usable until engine registration
+  // supplies geometry. Once unified control is active it cannot bypass target
+  // publication or acknowledgement invalidation.
+  bool configured = entry.participants != 0;
+  for (const auto &pool : shared_->pools)
+    configured |= pool.owner &&
+                  pool.instance == shared_->pools[slot].instance &&
+                  pool.page_bundle;
+  if (configured)
+    return publish_control_locked(shared_->pools[slot].instance, bytes,
+                                  revision)
+        .status;
   if (entry.has_revision && revision < entry.revision)
     return "stale";
   if (entry.has_revision && revision == entry.revision)
@@ -450,6 +522,202 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
   entry.revision = revision;
   entry.has_revision = 1;
   return "applied";
+}
+
+void GpuBudget::configure_control_pool(size_t slot, uint64_t capacity,
+                                       uint64_t page_bundle, bool can_shrink,
+                                       uint64_t expected_participants) {
+  if (!page_bundle || capacity % page_bundle)
+    throw std::invalid_argument(
+        "KV control capacity must contain whole page bundles");
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  auto &pool = shared_->pools[slot];
+  if (pool.ready || shared_->instances[pool.instance].participants)
+    throw std::runtime_error("KV control geometry is already frozen");
+  auto &instance = shared_->instances[pool.instance];
+  if (instance.expected_participants &&
+      instance.expected_participants != expected_participants)
+    throw std::runtime_error("inconsistent KV control participant topology");
+  instance.expected_participants = expected_participants;
+  pool.capacity = capacity;
+  pool.page_bundle = page_bundle;
+  pool.can_shrink = can_shrink;
+}
+
+void GpuBudget::ready_control_pool(size_t slot) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  auto &pool = shared_->pools[slot];
+  if (!pool.page_bundle)
+    throw std::runtime_error("KV control pool has no geometry");
+  pool.ready = 1;
+}
+
+InstanceControl GpuBudget::control_state_locked(size_t instance,
+                                                size_t slot) const {
+  const auto &entry = shared_->instances[instance];
+  InstanceControl state;
+  state.published = entry.has_revision;
+  state.generation = entry.generation;
+  state.revision = entry.revision;
+  state.requested_bytes = entry.limit;
+  state.participants = entry.participants;
+  state.expected_participants = entry.expected_participants;
+  state.status = entry.has_revision ? "pending" : "unpublished";
+  bool unsupported = false;
+  uint64_t live = 0;
+  for (size_t i = 0; i < kPools; ++i) {
+    const auto &pool = shared_->pools[i];
+    if (!pool.owner || pool.instance != instance)
+      continue;
+    state.charged_bytes = add(state.charged_bytes, pool.charged);
+    state.effective_bytes =
+        add(state.effective_bytes,
+            entry.has_revision ? pool.target : pool.capacity);
+    // Check liveness only: a control query never refunds or repairs a worker.
+    struct flock owner_lock{};
+    owner_lock.l_type = F_WRLCK;
+    owner_lock.l_whence = SEEK_SET;
+    owner_lock.l_start = kPoolLeaseStart + i;
+    owner_lock.l_len = 1;
+    if (pool.owner != owner_) {
+      if (fcntl(fd_, F_OFD_GETLK, &owner_lock) < 0)
+        throw system_error("inspect KV control participant");
+      if (owner_lock.l_type == F_UNLCK)
+        continue;
+    }
+    ++live;
+    if (i == slot) {
+      state.pool_slot = i;
+      state.pool_owner = pool.owner;
+      state.pool_target_bytes = pool.target;
+      state.pool_capacity_bytes = pool.capacity;
+      state.page_bundle_bytes = pool.page_bundle;
+      state.can_shrink = pool.can_shrink;
+      state.ready = pool.ready;
+    }
+    unsupported |= !pool.can_shrink && pool.target < pool.capacity;
+    if (pool.acknowledged && pool.acknowledged_revision == entry.revision &&
+        pool.charged <= pool.target)
+      ++state.completed;
+  }
+  if (entry.has_revision) {
+    if (live != entry.participants)
+      state.status = "unavailable";
+    else if (unsupported)
+      state.status = "unsupported";
+    else if (state.completed == entry.participants)
+      state.status = "converged";
+  }
+  state.registered_participants = live;
+  state.convergence = state.status;
+  return state;
+}
+
+InstanceControl
+GpuBudget::publish_control_locked(size_t instance, uint64_t bytes,
+                                  std::optional<uint64_t> revision) {
+  auto &entry = shared_->instances[instance];
+  auto rejected = [&](const char *status) {
+    auto state = control_state_locked(instance);
+    state.status = status;
+    return state;
+  };
+  if (revision && entry.has_revision) {
+    if (*revision < entry.revision)
+      return rejected("stale");
+    if (*revision == entry.revision) {
+      if (entry.limit != bytes)
+        return rejected("conflict");
+      if (entry.participants)
+        return rejected("idempotent");
+    }
+  }
+  if (!revision && entry.has_revision && entry.revision == UINT64_MAX)
+    return rejected("revision_exhausted");
+  uint64_t capacity = 0, participants = 0;
+  for (const auto &pool : shared_->pools) {
+    if (!pool.owner || pool.instance != instance)
+      continue;
+    if (!pool.ready || !pool.page_bundle)
+      return rejected("not_ready");
+    capacity = add(capacity, pool.capacity);
+    ++participants;
+  }
+  if (!participants || !capacity ||
+      (entry.participants && participants != entry.participants))
+    return rejected("unavailable");
+  // Proportional startup-capacity shares, independently rounded DOWN to each
+  // pool's physical page bundle. The remainder stays unassigned. No pool can
+  // independently consume the whole instance cap and rounding cannot raise it.
+  const auto bounded = std::min(bytes, capacity);
+  for (auto &pool : shared_->pools) {
+    if (!pool.owner || pool.instance != instance)
+      continue;
+    const auto share = static_cast<uint64_t>(
+        static_cast<unsigned __int128>(bounded) * pool.capacity / capacity);
+    pool.target = share / pool.page_bundle * pool.page_bundle;
+    pool.acknowledged = 0;
+  }
+  publish(entry.limit, bytes);
+  entry.revision =
+      revision.value_or(entry.has_revision ? entry.revision + 1 : 1);
+  entry.has_revision = 1;
+  entry.participants = participants;
+  auto state = control_state_locked(instance);
+  state.status = "accepted";
+  return state;
+}
+
+InstanceControl GpuBudget::publish_control(const std::string &instance,
+                                           uint64_t bytes, uint64_t generation,
+                                           std::optional<uint64_t> revision) {
+  retire_dead_pools();
+  Locked lock(*this);
+  for (size_t i = 0; i < kInstances; ++i) {
+    if (shared_->instances[i].valid && instance == shared_->instances[i].name) {
+      if (shared_->instances[i].generation != generation) {
+        auto state = control_state_locked(i);
+        state.status = "instance_changed";
+        return state;
+      }
+      return publish_control_locked(i, bytes, revision);
+    }
+  }
+  InstanceControl state;
+  state.status = "unavailable";
+  return state;
+}
+
+InstanceControl GpuBudget::query_control(const std::string &instance,
+                                         size_t slot) {
+  Locked lock(*this);
+  for (size_t i = 0; i < kInstances; ++i) {
+    if (shared_->instances[i].valid && instance == shared_->instances[i].name)
+      return control_state_locked(i, slot);
+  }
+  InstanceControl state;
+  state.status = "unavailable";
+  return state;
+}
+
+InstanceControl GpuBudget::control_state(size_t slot) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  return control_state_locked(shared_->pools[slot].instance, slot);
+}
+
+bool GpuBudget::acknowledge_control(size_t slot, uint64_t revision) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  auto &pool = shared_->pools[slot];
+  const auto &entry = shared_->instances[pool.instance];
+  if (!entry.has_revision || revision != entry.revision)
+    return false;
+  pool.acknowledged_revision = revision;
+  pool.acknowledged = 1;
+  return true;
 }
 
 bool GpuBudget::recalibrate(const Sampler &sampler) {
