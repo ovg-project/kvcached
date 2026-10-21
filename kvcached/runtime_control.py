@@ -77,10 +77,21 @@ class RuntimeControl:
             except QuarantinedResizeError:
                 manager._resize_rejected = True
                 self.executing = states
+                self.fail()
                 return
             self.executing = states
         if not manager.in_shrink and not getattr(manager, "_resize_rejected", False):
             self.acknowledge()
+
+    def fail(self) -> None:
+        """Report the executing revision, even if a newer one was published."""
+        from kvcached import _C  # type: ignore[attr-defined]
+
+        for source, state in zip(self.sources, self.executing):
+            if state["published"]:
+                _C.fail_instance_control(
+                    source["gpu"], source["instance"], source["pool_slot"],
+                    source["pool_owner"], state["generation"], state["revision"])
 
     def acknowledge(self) -> None:
         from kvcached import _C  # type: ignore[attr-defined]

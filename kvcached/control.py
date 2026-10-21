@@ -31,8 +31,9 @@ def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any
     complete = (len(expected) == 1 and next(iter(expected)) > 0
                 and sum(state["registered_participants"] for state in states) == next(iter(expected)))
     converged = complete and all(state["convergence"] == "converged" for state in states)
-    return {"instance": name, "status": "converged" if converged else
-            "pending" if complete else "unavailable", "complete_membership": complete,
+    failed = any(state["convergence"] == "failed" for state in states)
+    return {"instance": name, "status": "unavailable" if not complete else
+            "failed" if failed else "converged" if converged else "pending", "complete_membership": complete,
             "converged": converged, "gpus": states, "discovery_errors": errors}
 
 

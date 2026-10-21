@@ -18,6 +18,8 @@ namespace kvcached {
 struct InstanceControl {
   std::string status;
   std::string convergence;
+  std::string failure_reason;
+  uint64_t failed = 0;
   uint64_t generation = 0;
   uint64_t revision = 0;
   uint64_t requested_bytes = 0;
@@ -138,6 +140,8 @@ public:
                                   std::optional<uint64_t> revision = {});
   InstanceControl control_state(size_t slot);
   bool acknowledge_control(size_t slot, uint64_t revision);
+  bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
+                    uint64_t generation, uint64_t revision);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();

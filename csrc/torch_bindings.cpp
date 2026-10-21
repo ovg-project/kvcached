@@ -379,6 +379,8 @@ py::dict control_dict(const InstanceControl &state) {
   py::dict result;
   result["status"] = state.status;
   result["convergence"] = state.convergence;
+  result["failed"] = state.failed;
+  result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
   result["limit_bytes"] = state.requested_bytes;
@@ -443,6 +445,14 @@ py::dict publish_instance_control(const std::string &path,
   return control_dict(state);
 }
 
+bool fail_instance_control(const std::string &path, const std::string &name,
+                           size_t slot, uint64_t owner, uint64_t generation,
+                           uint64_t revision) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->fail_control(name, slot, owner,
+                                                     generation, revision);
+}
+
 bool acknowledge_instance_control(int64_t group_id, uint64_t revision) {
   py::gil_scoped_release release;
   return FTensorAllocator::global_allocator(group_id)
@@ -493,6 +503,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("publish_instance_control", &kvcached::publish_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("bytes"),
         py::arg("generation"), py::arg("revision") = py::none());
+  m.def("fail_instance_control", &kvcached::fail_instance_control,
+        py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
+        py::arg("generation"), py::arg("revision"));
   m.def("acknowledge_instance_control", &kvcached::acknowledge_instance_control,
         py::arg("group_id"), py::arg("revision"));
   // Torch-free transactional ops (the six core ops are on the stable

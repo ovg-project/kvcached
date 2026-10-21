@@ -1035,6 +1035,9 @@ class KVCacheManager:
                     self._resize_rejected = True
                     self.in_shrink = False
                     self.target_num_blocks = None
+                    control = getattr(self, "_runtime_control", None)
+                    if control is not None:
+                        control.fail()
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can

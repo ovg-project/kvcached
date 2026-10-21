@@ -18,7 +18,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473034ULL;
+constexpr uint64_t kMagic = 0x4b56425544473035ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -113,6 +113,8 @@ struct GpuBudget::Shared {
     uint64_t target;
     uint64_t acknowledged_revision;
     uint64_t acknowledged;
+    uint64_t failed_revision;
+    uint64_t failed;
   } pools[kPools];
 };
 
@@ -597,6 +599,10 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
       state.can_shrink = pool.can_shrink;
       state.ready = pool.ready;
     }
+    if (pool.failed && pool.failed_revision == entry.revision) {
+      ++state.failed;
+      state.failure_reason = "quarantined_pages_prevent_resize";
+    }
     unsupported |= !pool.can_shrink && pool.target < pool.capacity;
     if (pool.acknowledged && pool.acknowledged_revision == entry.revision &&
         pool.charged <= pool.target)
@@ -605,6 +611,8 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
   if (entry.has_revision) {
     if (live != entry.participants)
       state.status = "unavailable";
+    else if (state.failed)
+      state.status = "failed";
     else if (unsupported)
       state.status = "unsupported";
     else if (state.completed == entry.participants)
@@ -659,6 +667,7 @@ GpuBudget::publish_control_locked(size_t instance, uint64_t bytes,
         static_cast<unsigned __int128>(bounded) * pool.capacity / capacity);
     pool.target = share / pool.page_bundle * pool.page_bundle;
     pool.acknowledged = 0;
+    pool.failed = 0;
   }
   publish(entry.limit, bytes);
   entry.revision =
@@ -717,6 +726,26 @@ bool GpuBudget::acknowledge_control(size_t slot, uint64_t revision) {
     return false;
   pool.acknowledged_revision = revision;
   pool.acknowledged = 1;
+  return true;
+}
+
+bool GpuBudget::fail_control(const std::string &instance, size_t slot,
+                             uint64_t owner, uint64_t generation,
+                             uint64_t revision) {
+  Locked lock(*this);
+  if (slot >= kPools || !owner)
+    return false;
+  auto &pool = shared_->pools[slot];
+  if (pool.owner != owner)
+    return false;
+  const auto &entry = shared_->instances[pool.instance];
+  if (!entry.valid || instance != entry.name ||
+      entry.generation != generation || !entry.has_revision ||
+      entry.revision != revision)
+    return false;
+  pool.failed_revision = revision;
+  pool.failed = 1;
+  pool.acknowledged = 0;
   return true;
 }
 

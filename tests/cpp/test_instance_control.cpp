@@ -227,6 +227,40 @@ int main() {
             ->publish_control("restart", 60, before.generation, before.revision)
             .status == "instance_changed");
   }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("failure", 0);
+    budget->configure_control_pool(slot, 120, 12, true);
+    budget->ready_control_pool(slot);
+    auto participant = budget->control_state(slot);
+    auto writer = GpuBudget::open_control(path);
+    auto first = writer->publish_control("failure", 60, participant.generation);
+    assert(!writer->fail_control("failure", slot, participant.pool_owner + 1,
+                                 first.generation, first.revision));
+    assert(!writer->fail_control("failure", slot, participant.pool_owner,
+                                 first.generation + 1, first.revision));
+    assert(!writer->fail_control("other", slot, participant.pool_owner,
+                                 first.generation, first.revision));
+    assert(writer->fail_control("failure", slot, participant.pool_owner,
+                                first.generation, first.revision));
+    auto failed = writer->query_control("failure");
+    assert(failed.status == "failed" && failed.failed == 1);
+    assert(failed.failure_reason == "quarantined_pages_prevent_resize");
+    assert(failed.requested_bytes == 60 && failed.effective_bytes == 60);
+    assert(budget->snapshot(slot).instance_limit_bytes == 60);
+    assert(budget->acknowledge_control(slot, first.revision));
+    assert(writer->query_control("failure").status == "failed");
+    assert(
+        writer->publish_control("failure", 60, first.generation, first.revision)
+            .convergence == "failed");
+    auto next = writer->publish_control("failure", 120, first.generation);
+    assert(next.convergence == "pending" && next.failed == 0);
+    assert(next.failure_reason.empty());
+    assert(!writer->fail_control("failure", slot, participant.pool_owner,
+                                 first.generation, first.revision));
+    assert(budget->acknowledge_control(slot, next.revision));
+    assert(writer->query_control("failure").status == "converged");
+  }
   unlink(path.c_str());
   rmdir(directory);
 }

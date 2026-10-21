@@ -176,6 +176,15 @@ class NativeControlFake:
                      pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
         return dict(state, status="accepted")
 
+    def fail_instance_control(self, path, instance, slot, owner, generation, revision):
+        state = self.states[path]
+        if (slot, owner, generation, revision) != tuple(
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+            return False
+        state.update(status="failed", convergence="failed", failed=1,
+                     failure_reason="quarantined_pages_prevent_resize")
+        return True
+
     def local_instance_control(self, group_id):
         return dict(self.states["gpu-a"])
 
@@ -399,3 +408,80 @@ def test_listing_groups_uses_one_physical_instance_row(monkeypatch, capsys):
     assert rows[0]["ipc"] == "model"
     assert rows[0]["used_bytes"] == 120
     assert rows[0]["limit_bytes"] == 200
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_quarantine_failure_is_queryable_without_retry(controls, monkeypatch, deferred):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager, native, control = controls
+    bundle = manager._memory_limit_page_bundle_bytes()
+    control.set_instance_memory_limit(4 * bundle)
+    if deferred:
+        manager.page_allocator.inuse_pages = 6
+        manager.apply_resize_target()
+        assert manager.in_shrink
+        manager.page_allocator.inuse_pages = 2
+    attempts = []
+
+    def fail(size):
+        attempts.append(size)
+        raise QuarantinedResizeError("injected quarantine")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    monkeypatch.setattr(manager, "_record_operation_error", lambda *args: None)
+    if deferred:
+        manager._maybe_finish_shrink()
+    else:
+        manager.apply_resize_target()
+    for _ in range(3):
+        manager.apply_resize_target()
+    state = control.get_instance_memory_limit()
+    assert state["status"] == "failed" and not state["converged"]
+    assert state["gpus"][0]["failure_reason"] == "quarantined_pages_prevent_resize"
+    assert state["gpus"][0]["limit_bytes"] == 4 * bundle
+    assert len(attempts) == 1 and not manager.in_shrink and native.acks == []
+
+
+def test_deferred_failure_does_not_poison_new_publication(controls, monkeypatch):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager, native, control = controls
+    bundle = manager._memory_limit_page_bundle_bytes()
+    manager.page_allocator.inuse_pages = 6
+    control.set_instance_memory_limit(4 * bundle)
+    manager.apply_resize_target()
+    old = manager._runtime_control.executing
+    control.set_instance_memory_limit(12 * bundle)
+    manager.page_allocator.inuse_pages = 2
+
+    def fail(size):
+        raise QuarantinedResizeError("injected quarantine")
+
+    resize = manager.page_allocator.resize
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    monkeypatch.setattr(manager, "_record_operation_error", lambda *args: None)
+    manager._maybe_finish_shrink()
+    assert native.states["gpu-a"]["convergence"] == "pending"
+    assert native.states["gpu-a"]["revision"] == 2
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
+    assert native.acks == [2] and not manager._resize_rejected
+    manager._runtime_control.executing = old
+    manager._runtime_control.fail()
+    assert native.states["gpu-a"]["convergence"] == "pending"
+
+
+def test_worker_control_failure_reports_each_bound_participant(controls):
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    runtime.worker_ipc = True
+    runtime.sources += (dict(native.states["gpu-b"], gpu="gpu-b", instance="model"),)
+    control.set_instance_memory_limit(0)
+    runtime.executing = runtime.poll(force=True)
+    # A replacement participant must not receive an old worker's failure.
+    native.states["gpu-b"]["pool_owner"] += 1
+    runtime.fail()
+    assert native.states["gpu-a"]["convergence"] == "failed"
+    assert native.states["gpu-b"]["convergence"] == "pending"

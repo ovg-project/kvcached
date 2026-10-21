@@ -18,12 +18,14 @@ def attach_control(manager, monkeypatch):
                  page_bundle_bytes=bundle, expected_participants=1,
                  registered_participants=1, effective_limit_bytes=0, charged_bytes=0)
     acked = [-1]
+    failed = [-1]
 
     def query(*args):
         pages = manager.page_allocator.get_page_state()
         state["charged_bytes"] = (pages["inuse_pages"] + pages["reserved_pages"]) * bundle
         if state["published"]:
             state["status"] = state["convergence"] = (
+                "failed" if failed[0] == state["revision"] else
                 "converged" if acked[0] == state["revision"] and
                 state["charged_bytes"] <= state["pool_target_bytes"] else "pending")
         return dict(state)
@@ -42,9 +44,18 @@ def attach_control(manager, monkeypatch):
         acked[0] = revision
         return True
 
+    def fail(path, name, slot, owner, generation, revision):
+        if (slot, owner, generation, revision) != tuple(
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+            return False
+        failed[0] = revision
+        state["failure_reason"] = "quarantined_pages_prevent_resize"
+        return True
+
     monkeypatch.setattr(kvcached, "_C", SimpleNamespace(
         local_instance_control=query, query_instance_control=query,
-        publish_instance_control=publish, acknowledge_instance_control=ack), raising=False)
+        publish_instance_control=publish, acknowledge_instance_control=ack,
+        fail_instance_control=fail), raising=False)
     monkeypatch.setattr(control.glob, "glob", lambda _: ["test-gpu"])
     runtime = RuntimeControl(manager, worker_ipc=False, can_shrink=True, expected_participants=1)
     poll = runtime.poll

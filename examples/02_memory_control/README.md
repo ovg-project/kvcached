@@ -40,59 +40,83 @@ evict at different steps, so cached prefixes still hold a lower limit back.
 instead apply a revisioned instance budget through the Python API:
 
 ```python
-from typing import Any
+from kvcached.control import get_instance_memory_limit, set_instance_memory_limit
 
-from kvcached.control import set_instance_memory_limit
+instance = "my-model"  # The engine's KVCACHED_IPC_NAME.
+snapshot = get_instance_memory_limit(instance)
+if not snapshot["complete_membership"]:
+    raise RuntimeError("instance participants are unavailable")
 
+generations = {gpu["gpu"]: gpu["generation"] for gpu in snapshot["gpus"]}
+revisions = {gpu["gpu"]: gpu["revision"] + 1 for gpu in snapshot["gpus"]}
+result = set_instance_memory_limit(
+    4 * 1024**3, instance_name=instance,
+    revision=revisions, generations=generations,
+)
+for gpu in result["gpus"]:
+    print(gpu["gpu"], gpu["status"])  # Per-GPU publication result.
+if result["status"] != "accepted":
+    # partial: some GPUs accepted; rejected: none accepted.
+    # Reconcile the per-GPU results before retrying selected GPUs.
+    raise RuntimeError(f"publication incomplete: {result['status']}")
 
-def apply_memory_assignment(limit_bytes: int, revision: int) -> dict[str, Any]:
-    result = set_instance_memory_limit(limit_bytes, revision=revision)
-
-    if result["status"] not in {"applied", "deferred"}:
-        raise RuntimeError(
-            "memory assignment was not accepted: "
-            f"{result['reason'] or result['status']}"
-        )
-    return result
+# Query again on later controller ticks; acceptance is not convergence.
+progress = get_instance_memory_limit(instance)
+if not progress["complete_membership"] or any(
+    gpu["generation"] != generations.get(gpu["gpu"])
+    or gpu["revision"] != revisions.get(gpu["gpu"])
+    for gpu in progress["gpus"]
+):
+    raise RuntimeError("membership or assignment changed; reconcile")
+if progress["status"] == "failed":
+    for gpu in progress["gpus"]:
+        if gpu["failed"]:
+            print(gpu["gpu"], gpu["revision"], gpu["failure_reason"])
+elif progress["converged"]:
+    print("assignment converged")
+else:
+    print([(gpu["gpu"], gpu["convergence"]) for gpu in progress["gpus"]])
 ```
 
-This API is process-local. Call it from a control handler running in the same
-process as the vLLM EngineCore or SGLang scheduler after kvcached has registered
-its live KV pools. Calling it from a separate sidecar or controller process will
-return `unavailable` because that process has a different pool registry. The
-transport that delivers assignments to the engine process (for example, RPC or
-a Unix socket) is intentionally left to the production integration.
+The API uses the shared physical-GPU ledger. A separate controller process can
+query and publish limits when it can access the same ledger directory
+(`KVCACHED_PHYSICAL_GROWTH_LOCK_DIR`, default `/dev/shm`) and instance name.
+Initialize the engine and wait for all runtime-control participants first.
+The engine thread performs the resize; publication does not resize synchronously.
 
-Use a monotonically increasing, non-negative revision for each new assignment:
+Explicit revisions require the per-GPU generations from a query. Use increasing
+revisions for new assignments and preserve the original generations and revisions
+when retrying an assignment. Omitting `revision` allocates a new revision on each
+selected GPU, even when the limit is unchanged. GPUs publish independently;
+`partial` does not roll back the GPUs that accepted. Inspect each result and use
+`gpu_ids` to retry selected GPUs with their original tuple where appropriate.
 
-| Status | Meaning | Controller action |
+| Publication status | Meaning | Controller action |
 | --- | --- | --- |
-| `applied` | The aligned limit is active. | Record the acknowledgement. |
-| `deferred` | Mapped pages still exceed the new limit. The engine thread evicts cached prefixes for it shortly after; pages that running requests use are released as those requests finish, never revoked. | Poll the same limit and revision for completion; handle a later `rejected` status as failure. |
-| `rejected` | Quarantined pages prevented a deferred resize from completing (`quarantined_pages_prevent_resize`). | Do not acknowledge completion or poll indefinitely. Inspect the pool state and resolve the quarantine before requesting another resize. |
-| `stale` | A newer revision is already active. | Discard this response and reconcile with the newer assignment. |
-| `conflict` | The same revision was reused with a different limit. | Allocate a new revision; do not retry the conflicting tuple. |
-| `unavailable` | No live KV pool is registered in this process. | Wait for engine initialization or fix the control-handler placement. |
+| `accepted` | All selected GPUs accepted or returned `idempotent`. | Query progress for the accepted generations and revisions. |
+| `partial` | Some selected GPUs accepted. | Reconcile each GPU; do not assume an atomic instance update. |
+| `rejected` | No selected GPU accepted. | Inspect per-GPU `stale`, `conflict`, `instance_changed`, or error details. |
+| `unavailable` | Complete instance membership was not discovered. | Wait for readiness or inspect participant availability. |
 
-Retries of an accepted `(limit_bytes, revision)` tuple return its current state;
-they do not execute `resize()` again. A deferred lower limit completes once the
-engine has evicted its cached prefixes and its running requests have finished,
-but a deferred resize can become `rejected` if
-quarantined pages prevent it from completing.
-Do not assume that retrying the same tuple will eventually return `applied`.
+| Query convergence | Meaning | Controller action |
+| --- | --- | --- |
+| `pending` | Execution or release of active KV pages is still outstanding. | Query again, checking generation and revision. |
+| `converged` | Every participant acknowledged and charges fit its target. | Record completion. |
+| `failed` | A resize encountered quarantined pages. | Inspect `failed` participant count and `failure_reason` (`quarantined_pages_prevent_resize`); stop waiting for this revision. |
+| `unsupported` | A participant cannot safely perform the requested shrink. | Inspect per-GPU convergence and choose a supported assignment. |
+| `unavailable` | A participant disappeared or membership is incomplete. | Reconcile membership before publishing again. |
 
-An immediate resize rejection can instead raise `QuarantinedResizeError` before
-that pool accepts the new revision. The example intentionally propagates this
-exception: report the assignment failure rather than acknowledging success.
-Changing the revision alone does not repair quarantined pages.
+Both immediate and deferred quarantine failures are bound to the executing
+generation, revision, and participant. The accepted cap remains in force and
+continues to restrict growth; a failure does not roll it back. Retrying the same
+tuple does not rerun the failed resize or clear the failure. A new revision clears
+the previous revision's progress, but does not repair quarantine.
 
-After resolving the rejection, use a higher revision for a new assignment. A
-higher limit can regrow the pool within its original reservation. The returned
-`pools` list reports each pool's aligned target, actual `current_capacity_bytes`,
-and current mapped bytes. Multiple pools are updated sequentially, not atomically;
-an instance-level failure does not imply that every pool stayed unchanged.
-The instance budget is split deterministically in proportion to the pools'
-original capacities.
+Limits are bytes per instance per GPU. Each GPU divides its budget in proportion
+to its pools' original capacities, rounding each pool's target down to physical
+page bundles. Query `gpus` for the requested `limit_bytes`, aligned
+`effective_limit_bytes`, `charged_bytes`, and convergence. A higher limit can
+regrow a pool within its original reservation.
 
 kvcached applies the assigned budget but does not choose it. Quota policy,
 fairness, admission, and cross-instance arbitration remain the responsibility
