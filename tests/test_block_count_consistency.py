@@ -243,7 +243,7 @@ def test_free_keeps_shrink_pending_when_allocator_refuses_resize():
     manager.reserved_blocks = []
     manager.null_block = None
     manager.in_shrink = True
-    manager.target_num_blocks = 100  # gate: _get_num_alloced (0) <= 100 passes
+    manager.target_num_pages = 100  # gate: _get_num_alloced (0) <= 100 passes
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
 
@@ -252,7 +252,7 @@ def test_free_keeps_shrink_pending_when_allocator_refuses_resize():
     assert manager.page_allocator.resize_calls == 1
     # The shrink must stay pending, not be silently dropped.
     assert manager.in_shrink is True
-    assert manager.target_num_blocks == 100
+    assert manager.target_num_pages == 100
 
 
 if __name__ == "__main__":

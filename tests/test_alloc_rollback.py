@@ -137,7 +137,7 @@ def make_manager(fail_after: int,
     manager._logical_allocated_blocks = len(manager.reserved_blocks)
     manager.null_block = None
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._lock = NoOpLock()
     manager._shutdown_lock = threading.Lock()
     manager._shutdown_requested = threading.Event()
@@ -175,7 +175,7 @@ def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_ta
     def resize(size):
         # Applying zero during the internal reservation would leave it waiting
         # forever with the watcher stopped. Fail fast instead of hanging CI.
-        if size == 0:
+        if size == BLOCKS_PER_PAGE:
             assert manager.null_block == [0]
         calls.append(size)
         inuse = allocator.num_allocated - len(allocator.freed_pages)
@@ -192,14 +192,14 @@ def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_ta
         monkeypatch.setattr(allocator, method, lambda: None, raising=False)
 
     manager.apply_resize_target()
-    assert manager.in_shrink
+    assert not manager.in_shrink
     if api_takeover:
         assert manager.resize(2 * BLOCKS_PER_PAGE)
     calls.clear()
     manager.clear()
     assert manager.null_block == [0]
-    assert manager.in_shrink == (not api_takeover)
-    assert calls == ([] if api_takeover else [0])
+    assert not manager.in_shrink
+    assert calls == ([] if api_takeover else [BLOCKS_PER_PAGE])
     # A later positive CLI publication can still take control.
     monkeypatch.setattr(allocator, "get_resize_target", lambda: 3 * BLOCKS_PER_PAGE)
     manager.apply_resize_target()
@@ -550,7 +550,7 @@ def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected
     manager.defer_physical_release = defer_release
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     manager.in_shrink = True
-    manager.target_num_blocks = BLOCKS_PER_PAGE
+    manager.target_num_pages = 1
 
     def resize(_size):
         if rejected:
@@ -574,11 +574,11 @@ def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected
         assert manager.operation_snapshot_dict()["resize_errors_total"] == 1
         assert manager._resize_rejected
         assert not manager.in_shrink
-        assert manager.target_num_blocks is None
+        assert manager.target_num_pages is None
         assert manager.alloc(1) is not None
     else:
         assert manager.in_shrink
-        assert manager.target_num_blocks == BLOCKS_PER_PAGE
+        assert manager.target_num_pages == 1
 
 
 def test_deferred_resize_completion_is_counted_once(monkeypatch):
@@ -586,7 +586,7 @@ def test_deferred_resize_completion_is_counted_once(monkeypatch):
     enable_operation_counters(manager)
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     manager.in_shrink = True
-    manager.target_num_blocks = BLOCKS_PER_PAGE
+    manager.target_num_pages = 1
     resize_calls = []
 
     def resize(size):
@@ -599,7 +599,7 @@ def test_deferred_resize_completion_is_counted_once(monkeypatch):
 
     assert resize_calls == [BLOCKS_PER_PAGE * manager.block_mem_size]
     assert not manager.in_shrink
-    assert manager.target_num_blocks is None
+    assert manager.target_num_pages is None
     assert manager._operation_counters["resize_completions_total"] == 1
 
 
@@ -614,7 +614,7 @@ def test_caller_free_progress_survives_later_allocator_failure(
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     page = manager.full_pages[0]
     manager.in_shrink = failure_stage == "resize"
-    manager.target_num_blocks = BLOCKS_PER_PAGE if manager.in_shrink else None
+    manager.target_num_pages = 1 if manager.in_shrink else None
     error_type = StateConsistencyError if fatal else RuntimeError
     error = error_type("injected allocator failure")
 
@@ -740,7 +740,7 @@ def test_deferred_release_failure_keeps_logical_free_accounting(monkeypatch, sta
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     assert blocks is not None
     manager.in_shrink = True
-    manager.target_num_blocks = 0
+    manager.target_num_pages = 0
     manager.free(blocks)
     error = (StateConsistencyError if fatal else RuntimeError)("release failed")
 
@@ -938,7 +938,7 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
 
     manager = make_manager(fail_after=4)
     manager.in_shrink = pending_shrink
-    manager.target_num_blocks = BLOCKS_PER_PAGE if pending_shrink else None
+    manager.target_num_pages = 1 if pending_shrink else None
     target = [1000]
     calls = []
 
@@ -956,7 +956,7 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
     assert manager.alloc(1) is not None
     assert calls == [1000, 2000]
     assert not manager.in_shrink
-    assert manager.target_num_blocks is None
+    assert manager.target_num_pages is None
     with pytest.raises(QuarantinedResizeError):
         manager.resize(2000)
 

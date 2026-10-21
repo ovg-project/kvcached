@@ -348,7 +348,7 @@ class KVCacheManager:
         self.null_block: Optional[list[int]] = None
 
         self.in_shrink: bool = False
-        self.target_num_blocks: Optional[int] = None
+        self.target_num_pages: Optional[int] = None
         self._resize_rejected: bool = False
         self._rejected_resize_target: Optional[int] = None
         self._memory_limit_bytes: Optional[int] = None
@@ -1027,17 +1027,18 @@ class KVCacheManager:
             # physically mapped for an in-flight worker batch.
             return
         if self.in_shrink:
-            assert self.target_num_blocks is not None
-            if self._get_num_alloced_blocks() <= self.target_num_blocks:
+            assert self.target_num_pages is not None
+            target_blocks = self.target_num_pages * self.page_size // self.block_mem_size
+            if self._get_num_alloced_blocks() <= target_blocks:
                 try:
                     resized = self.page_allocator.resize(
-                        self.target_num_blocks * self.block_mem_size)
+                        self.target_num_pages * self.page_size)
                 except QuarantinedResizeError:
                     # Reject the pending limit without blocking healthy pages.
                     self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
                     self.in_shrink = False
-                    self.target_num_blocks = None
+                    self.target_num_pages = None
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can
@@ -1052,12 +1053,12 @@ class KVCacheManager:
                         # footprint and this toggle bypasses resize(), so drop the
                         # cached value so available_size() re-reads the driver.
                         self._avail_physical_pages_cache = None
-                        self.target_num_blocks = None
+                        self.target_num_pages = None
                     else:
                         logger.warning(
-                            "shrink to %d blocks refused by allocator "
+                            "shrink to %d pages refused by allocator "
                             "(in-use pages above target); keeping shrink pending",
-                            self.target_num_blocks)
+                            self.target_num_pages)
 
     @synchronized
     def capture_physical_release_marker(self) -> int:
@@ -1226,13 +1227,19 @@ class KVCacheManager:
 
         Retired pages are already empty and only wait for physical release.
         """
-        if not self.in_shrink or self.target_num_blocks is None:
+        if not self.in_shrink or self.target_num_pages is None:
             return 0
-        target_pages = (self.target_num_blocks * self.block_mem_size
-                        // self.page_size)
         retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
         occupied = len(self.full_pages) + len(self.avail_pages) - retiring
-        return max(0, occupied - target_pages)
+        return max(0, occupied - self.target_num_pages)
+
+    @property
+    def target_num_blocks(self) -> Optional[int]:
+        """Block equivalent for diagnostics; shrink execution uses whole pages."""
+        target_pages = getattr(self, "target_num_pages", None)
+        if target_pages is None:
+            return None
+        return target_pages * self.page_size // self.block_mem_size
 
     def _retiring_page_ids(self) -> frozenset:
         return frozenset(
@@ -1281,12 +1288,17 @@ class KVCacheManager:
         # A kvctl quota can exceed the startup size, but the KV tensors only
         # reserve mem_size, so the pool cannot grow past it.
         new_mem_size = min(new_mem_size, self.mem_size)
+        # The permanent null block pins one page. Keep the control limit
+        # unchanged, but give the allocator a reachable physical target so
+        # it reclaims every other page before background preallocation resumes.
+        target_pages = max(int(getattr(self, "null_block", None) is not None),
+                           new_mem_size // self.page_size)
         try:
-            resized = self.page_allocator.resize(new_mem_size)
+            resized = self.page_allocator.resize(target_pages * self.page_size)
         except QuarantinedResizeError:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
                 self._resize_rejected = True
             raise
         except Exception as e:
@@ -1299,7 +1311,7 @@ class KVCacheManager:
         if resized:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
             return True  # Successfully resized.
         # Failed to resize due to too many in-use blocks. Free any
         # outstanding reserved blocks before entering the lazy shrink wait.
@@ -1309,7 +1321,7 @@ class KVCacheManager:
         assert (len(self.reserved_blocks) == 0
                 ), "Reserved blocks must be freed before resizing."
         self.in_shrink = True
-        self.target_num_blocks = new_mem_size // self.block_mem_size
+        self.target_num_pages = target_pages
         return False
 
     @_after_post_init
@@ -1396,15 +1408,26 @@ class KVCacheManager:
         mapped_pages = (int(page_state["inuse_pages"])
                         + int(page_state["reserved_pages"]))
         mapped_bytes = mapped_pages * page_bundle_bytes
+        limit_bytes = self._memory_limit_bytes
         effective_limit_bytes = self._memory_limit_effective_bytes
+        if self._kvctl_target_is_latest and self._kvctl_target is not None:
+            # Report the controlling quota, including a retained zero whose
+            # physical target was floored for the null page. An API takeover
+            # clears this flag without changing the watcher's remembered value.
+            limit_bytes = self._kvctl_target * self.num_layers * self.num_kv_buffers
+            effective_limit_bytes = (
+                min(self._kvctl_target, self.mem_size) // self.page_size
+                * page_bundle_bytes)
+        overage_bytes = (0 if effective_limit_bytes is None else
+                         max(0, mapped_bytes - effective_limit_bytes))
         if status is None:
             status = ("rejected" if getattr(self, "_resize_rejected", False) else
-                      "deferred" if self.in_shrink else "applied")
+                      "deferred" if self.in_shrink or overage_bytes else "applied")
         return {
             "status": status,
             "pool_name": str(self.pool_name or ""),
             "group_id": self.group_id,
-            "limit_bytes": self._memory_limit_bytes,
+            "limit_bytes": limit_bytes,
             "effective_limit_bytes": effective_limit_bytes,
             "current_capacity_bytes": (
                 int(page_state["total_pages"]) * page_bundle_bytes
@@ -1415,10 +1438,7 @@ class KVCacheManager:
                 None if effective_limit_bytes is None else
                 max(0, effective_limit_bytes - mapped_bytes)
             ),
-            "overage_bytes": (
-                0 if effective_limit_bytes is None else
-                max(0, mapped_bytes - effective_limit_bytes)
-            ),
+            "overage_bytes": overage_bytes,
             "reason": {
                 "deferred": "inuse_capacity_above_limit",
                 "rejected": "quarantined_pages_prevent_resize",
@@ -1725,7 +1745,7 @@ class KVCacheManager:
         # (which yields block 0 — the null block SGLang requires).
         self.page_allocator.reset_free_page_order()
 
-        self.target_num_blocks = None
+        self.target_num_pages = None
         self.in_shrink = False
         # clear() freed every page and trimmed; drop the cached value so
         # the next available_size() re-reads the post-clear physical state.

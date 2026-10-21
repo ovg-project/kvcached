@@ -119,7 +119,7 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager.num_avail_blocks = 0
     manager.reserved_blocks = []
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager.block_mem_size = manager.page_size
     manager.avail_pages = {}
     manager.full_pages = {}
@@ -153,6 +153,40 @@ def test_idle_limit_applies_immediately_through_resize():
     assert state["effective_limit_bytes"] == page_bundle * 3
     assert state["current_capacity_bytes"] == page_bundle * 3
     assert state["revision"] == 7
+
+
+@pytest.mark.parametrize("limit_bytes", [0, 123])
+@pytest.mark.parametrize("reserve_null", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_subpage_limit_keeps_only_null_page_with_exact_geometry(
+    limit_bytes, reserve_null, deferred,
+):
+    manager = _manager(inuse_pages=3 if deferred else int(reserve_null),
+                       reserved_pages=2)
+    manager.null_block = [0] if reserve_null else None
+    manager.block_mem_size = manager.page_size // 3
+    bundle = manager._memory_limit_page_bundle_bytes()
+    allocator = manager.page_allocator
+    # Sparse live pages require page accounting, even with few live blocks.
+    manager.avail_pages = dict.fromkeys(range(allocator.inuse_pages))
+    state = manager.set_memory_limit(limit_bytes, revision=1)
+    assert state["limit_bytes"] == limit_bytes
+    assert state["effective_limit_bytes"] == 0
+    if deferred:
+        assert manager.in_shrink
+        assert manager.target_num_pages == int(reserve_null)
+        assert manager.shrink_excess_pages() == 3 - int(reserve_null)
+        allocator.inuse_pages = int(reserve_null)
+        manager.avail_pages = dict.fromkeys(range(allocator.inuse_pages))
+        manager._maybe_finish_shrink()
+    state = manager.memory_limit_state()
+    assert not manager.in_shrink
+    assert allocator.total_pages == int(reserve_null)
+    assert allocator.reserved_pages == 0
+    assert state["mapped_bytes"] == state["overage_bytes"] == int(reserve_null) * bundle
+    assert state["status"] == ("deferred" if reserve_null else "applied")
+    assert manager.set_memory_limit(2 * bundle, revision=2)["status"] == "applied"
+    assert allocator.total_pages == 2
 
 
 def test_quarantined_resize_rejection_does_not_accept_revision(monkeypatch):
@@ -263,6 +297,38 @@ def test_changed_kvctl_target_after_an_api_limit_still_applies():
     assert manager.page_allocator.resize_calls == [12, 4, 16]
     assert manager.page_allocator.total_pages == 16
     assert not manager.in_shrink
+
+
+def test_null_overage_follows_kvctl_and_api_takeover():
+    manager = _manager(inuse_pages=1)
+    manager.null_block = [0]
+    bundle = manager._memory_limit_page_bundle_bytes()
+    _kvctl_limit(manager, 0)
+    manager.apply_resize_target()
+    state = manager.memory_limit_state()
+    assert not manager.in_shrink
+    assert state["status"] == "deferred"
+    assert state["limit_bytes"] == state["effective_limit_bytes"] == 0
+    assert state["overage_bytes"] == bundle
+
+    assert manager.set_memory_limit(2 * bundle, revision=1)["status"] == "applied"
+    manager.apply_resize_target()
+    assert manager.memory_limit_state()["effective_limit_bytes"] == 2 * bundle
+    assert manager.page_allocator.resize_target == 0
+
+    # A new quota supersedes the API; neither its bytes nor its overage may
+    # continue to describe the older API target.
+    manager.page_allocator.resize_target = manager.page_size // 2
+    manager.apply_resize_target()
+    state = manager.memory_limit_state()
+    assert state["status"] == "deferred"
+    assert state["limit_bytes"] == bundle // 2
+    assert state["effective_limit_bytes"] == 0
+    assert state["overage_bytes"] == bundle
+    _kvctl_limit(manager, 3)
+    manager.apply_resize_target()
+    assert manager.memory_limit_state()["status"] == "applied"
+    assert manager.memory_limit_state()["effective_limit_bytes"] == 3 * bundle
 
 
 def test_deferred_kvctl_target_is_applied_again_until_it_completes():
