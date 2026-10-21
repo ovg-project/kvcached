@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <set>
+#include <stdexcept>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
