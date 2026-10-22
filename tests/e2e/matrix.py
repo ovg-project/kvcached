@@ -195,7 +195,9 @@ class Group:
 class ElasticPair:
     """Two kvcached servers sharing one GPU. Both run with a batch limit of
     ELASTIC_BATCH, so that their load can fill most of the free GPU memory;
-    the extra arguments are appended after it.
+    the extra arguments are appended after it. With tp_a, A spans the run's
+    first tp_a GPUs and B is pinned to the run's GPU gpu_b, the one whose
+    memory they contend for: a shortfall there reaches one rank of A only.
     """
     engine_a: str
     model_a: str
@@ -203,10 +205,14 @@ class ElasticPair:
     model_b: str
     extra_args_a: tuple[str, ...] = ()
     extra_args_b: tuple[str, ...] = ()
+    tp_a: int = 1
+    gpu_b: int = 0
 
     @property
     def name(self) -> str:
-        return f"elastic-{self.engine_a}-{self.model_a}+{self.engine_b}-{self.model_b}"
+        a = f"{self.engine_a}-{self.model_a}" + (f"-tp{self.tp_a}" if self.tp_a > 1 else "")
+        b = f"{self.engine_b}-{self.model_b}" + (f"-gpu{self.gpu_b}" if self.gpu_b else "")
+        return f"elastic-{a}+{b}"
 
 
 @dataclass(frozen=True)
@@ -261,7 +267,10 @@ PROFILES = {
                     tp=2),
             *groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",), fp8_kv=True),
         ),
-        # Two different engines sharing GPU 0.
-        elastic=(ElasticPair("vllm", "qwen05b", "sglang", "qwen35_4b"),),
+        # A TP=2 server whose rank 1 shares GPU 1 with a vLLM server, so that
+        # only that rank runs short, and two engines share a GPU. B's weights
+        # leave GPU 1 little room, so the loads the harness sizes to it
+        # exceed what is free once both are on it (#577 has the numbers).
+        elastic=(ElasticPair("sglang", "qwen35_4b", "vllm", "qwen35_4b", tp_a=2, gpu_b=1),),
     ),
 }
