@@ -169,9 +169,6 @@ def _make_manager(defer_physical_release: bool) -> KVCacheManager:
     manager.target_num_pages = None
     manager._resize_rejected = False
     manager._rejected_resize_target = None
-    manager._memory_limit_bytes = None
-    manager._memory_limit_effective_bytes = None
-    manager._memory_limit_revision = -1
     manager._avail_physical_pages_cache = None
     manager._avail_physical_pages_ts = 0.0
     manager._page_release_callbacks = ()
@@ -202,6 +199,10 @@ class MockKVCacheBlock:
 def pool(request, monkeypatch):
     monkeypatch.setattr(kcm, "InternalPage", FakePage)
     manager = _make_manager(defer_physical_release=request.param)
+    from runtime_control_fake import attach_control
+    attach_control(manager, monkeypatch)
+    monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls",
+                        lambda *args, **kwargs: (manager,))
     mod = types.ModuleType("mock_block_pool")
     mod.BlockPool = MockBlockPool  # type: ignore[attr-defined]
     mod.KVCacheBlock = MockKVCacheBlock  # type: ignore[attr-defined]
@@ -285,7 +286,7 @@ def _limit_report(pool) -> str:
 
 def _assert_within_limit(pool) -> None:
     assert _mapped_pages(pool) <= LIMIT_PAGES, _limit_report(pool)
-    assert pool.kv_cache_manager.memory_limit_state()["status"] == "applied"
+    assert pool.kv_cache_manager.memory_limit_state()["status"] == "converged"
 
 
 def _record_eviction_threads(pool, monkeypatch) -> List[str]:
@@ -305,7 +306,7 @@ def _set_limit_from_controller(manager, revision: int = 1) -> dict:
     result: dict = {}
 
     def handler():
-        result.update(manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=revision))
+        result.update(manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=revision, generations={"test-gpu": 42}))
 
     thread = threading.Thread(target=handler, name="control-handler")
     thread.start()
@@ -323,9 +324,10 @@ def test_set_memory_limit_leaves_eviction_to_the_engine_thread(pool, monkeypatch
     state = _set_limit_from_controller(manager)
 
     assert threads == []
-    assert state["status"] == "deferred"
+    assert state["status"] == "accepted"
     assert _mapped_pages(pool) == 9
 
+    manager.apply_resize_target()
     manager.reclaim_for_shrink()  # what the engine thread does next
     _end_step(pool)
 
@@ -341,7 +343,7 @@ def test_kvctl_limit_converges_under_traffic(pool):
     rng = random.Random(0)
     _fill_prefix_cache(pool)
     manager = pool.kv_cache_manager
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
     failures = 0
     for _ in range(50):
@@ -364,10 +366,11 @@ def test_running_request_defers_shrink_until_it_finishes(pool):
     # Six pages' worth: with the null block's page this alone exceeds the limit.
     running = _start(pool, full_blocks=6 * BLOCKS_PER_PAGE)
 
-    manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=1)
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=1, generations={"test-gpu": 42})
+    manager.apply_resize_target()
     manager.reclaim_for_shrink()
     _end_step(pool)
-    assert manager.memory_limit_state()["status"] == "deferred"
+    assert manager.memory_limit_state()["status"] == "pending"
 
     _finish(pool, *running)
 
@@ -379,7 +382,8 @@ def test_shrink_does_not_reallocate_retiring_pages(pool):
     ends; a pending shrink must not hand them out again meanwhile."""
     _fill_prefix_cache(pool)
     manager = pool.kv_cache_manager
-    manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=1)
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES, revision=1, generations={"test-gpu": 42})
+    manager.apply_resize_target()
     manager.reclaim_for_shrink()
     retiring = manager._retiring_page_ids()
     assert bool(retiring) == manager.defer_physical_release
@@ -396,7 +400,7 @@ def test_zero_kvctl_limit_is_applied(pool):
     block's page remains over quota; every other page is evicted."""
     _fill_prefix_cache(pool)
     manager = pool.kv_cache_manager
-    manager.page_allocator.resize_target = 0
+    manager.set_memory_limit(0)
 
     manager.apply_resize_target()
     manager.reclaim_for_shrink()
@@ -408,10 +412,7 @@ def test_zero_kvctl_limit_is_applied(pool):
     assert not manager.in_shrink
     # Blocks sharing the null block's page cannot free it and stay cached.
     assert {bid // BLOCKS_PER_PAGE for bid in pool._evictable_blocks} == {0}
-    state = manager.memory_limit_state()
-    assert state["status"] == "deferred"
-    assert state["limit_bytes"] == state["effective_limit_bytes"] == 0
-    assert state["mapped_bytes"] == state["overage_bytes"] == manager.page_size
+    assert manager.memory_limit_state()["status"] == "pending"
 
 
 def test_unpublished_kvctl_limit_is_a_no_op(pool):
@@ -425,7 +426,7 @@ def test_unpublished_kvctl_limit_is_a_no_op(pool):
     assert not manager.in_shrink
 
 
-@pytest.mark.parametrize("source", ["kvctl", "kvctl_during_startup", "set_memory_limit"])
+@pytest.mark.parametrize("source", ["kvctl", "set_memory_limit"])
 @pytest.mark.parametrize("events_enabled", [False, True])
 def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source, events_enabled):
     """An idle engine never allocates, so the limit watch wakes it and the
@@ -479,7 +480,7 @@ def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source, events_
     defer = manager.defer_physical_release
     threads = _record_eviction_threads(pool, monkeypatch)
     if source == "kvctl_during_startup":
-        manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+        manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
     engine = EngineCore(
         SimpleNamespace(
             parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
@@ -494,7 +495,7 @@ def test_vllm_idle_engine_applies_lower_limit(pool, monkeypatch, source, events_
         if source == "set_memory_limit":
             _set_limit_from_controller(manager)
         else:
-            manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+            manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
         # What EngineCore._process_input_queue does with a wakeup while idle.
         assert engine.input_queue.get(timeout=5) == (wakeup, None)
@@ -545,6 +546,12 @@ def sglang_scheduler(monkeypatch):
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(kcm, "InternalPage", FakePage)
     manager = _make_manager(defer_physical_release=False)
+    from runtime_control_fake import attach_control
+    attach_control(manager, monkeypatch)
+    def initialize(*args, **kwargs):
+        getattr(manager, "_runtime_control").test_state["can_shrink"] = kwargs["can_shrink"](manager)
+        return (manager,)
+    monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls", initialize)
     cache = FakeSGLangCache(manager)
     for _ in range(8):
         blocks = manager.alloc(BLOCKS_PER_PAGE)
@@ -579,14 +586,14 @@ def _assert_sglang_within_limit(scheduler) -> None:
     cache = scheduler.tree_cache
     manager = cache.manager
     assert len(manager.page_allocator.inuse) <= LIMIT_PAGES, _sglang_report(manager, cache)
-    assert manager.memory_limit_state()["status"] == "applied"
+    assert manager.memory_limit_state()["status"] == "converged"
     assert cache.cached
 
 
 def test_sglang_idle_scheduler_applies_kvctl_limit(sglang_scheduler):
     scheduler = sglang_scheduler()
     manager = scheduler.tree_cache.manager
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
     scheduler.on_idle()
 
@@ -611,7 +618,7 @@ def test_sglang_allocation_reclaims_before_the_first_idle_pass(sglang_scheduler)
     have been idle when an allocation applies a lower limit."""
     scheduler = sglang_scheduler()
     manager = scheduler.tree_cache.manager
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
     assert manager.alloc(1) is not None
 
@@ -623,7 +630,7 @@ def test_sglang_tensor_parallel_keeps_previous_behavior(sglang_scheduler):
     make their radix caches diverge, so nothing changes with TP > 1."""
     scheduler = sglang_scheduler(tp_size=2)
     manager = scheduler.tree_cache.manager
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
     scheduler.on_idle()
 
@@ -638,10 +645,10 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
     cache = scheduler.tree_cache
     manager = cache.manager
     cache.token_to_kv_pool_allocator.free_group = []
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
 
     scheduler.on_idle()
 
     excess_pages = 9 - LIMIT_PAGES
     assert len(cache.cached) == 32 - excess_pages * BLOCKS_PER_PAGE
-    assert manager.memory_limit_state()["status"] == "deferred"
+    assert manager.memory_limit_state()["status"] == "pending"

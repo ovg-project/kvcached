@@ -13,7 +13,13 @@ from typing import List, Optional, TypedDict
 
 from kvcached import control_segment
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, get_ipc_path, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import (
+    _format_size,
+    get_ipc_path,
+    get_kv_cache_limit,
+    get_segment_control,
+    update_kv_cache_limit,
+)
 
 try:
     import readline  # type: ignore
@@ -211,21 +217,32 @@ class _IpcStats(TypedDict):
     ipc: str
     limit_bytes: int
     used_bytes: int
+    gpus: list
 
 
 def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_inactive: bool = False):
     names = ipcs or _detect_kvcache_ipc_names(include_inactive=include_inactive)
     res: List[_IpcStats] = []
+    seen = set()
     for name in names:
-        if not include_inactive and control_segment.active(get_ipc_path(name)) is False:
+        active = control_segment.active(get_ipc_path(name))
+        if not include_inactive and active is False:
             continue
         info = get_kv_cache_limit(name)
         if info is None:
             continue
+        state = (get_segment_control(name)
+                 if active is not False else {"gpus": []})
+        owner = state["instance"] if state["gpus"] else name
+        if owner in seen:
+            continue
+        seen.add(owner)
         res.append({
-            'ipc': name,
-            'limit_bytes': info.total_size,
-            'used_bytes': info.used_size,
+            'ipc': owner,
+            'limit_bytes': sum(gpu['effective_limit_bytes'] for gpu in state['gpus']),
+            'used_bytes': (sum(gpu['charged_bytes'] for gpu in state['gpus'])
+                           if state['gpus'] else info.used_size),
+            'gpus': state['gpus'],
         })
 
     if json_out:
@@ -235,7 +252,7 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_i
             print("No active KVCached segments found.")
             return
         print(
-            _clr(f"{'IPC':24} {'Limit':>12} {'Used':>12} {'%':>6}",
+            _clr(f"{'IPC':24} {'Effective Σ':>12} {'Used':>12} {'%':>6}",
                  'cyan',
                  bold=True))
         for entry in res:
@@ -255,40 +272,18 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_i
 
 
 def cmd_limit(ipc: str, size_str: str):
-    """Set an absolute limit for an existing IPC segment.
-
-    We first validate that the supplied ``ipc`` name corresponds to a running
-    segment; otherwise we refuse the operation to avoid accidentally creating
-    a new (wrong-case) shared-memory file.
-    """
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        avail = _detect_kvcache_ipc_names()
-        if avail:
-            print("Active IPC names:", ", ".join(avail), file=sys.stderr)
-        return
-
-    size_bytes = _parse_size(size_str)
-    update_kv_cache_limit(ipc, size_bytes)
+    """Set a physical-byte max independently on each live instance GPU."""
+    return update_kv_cache_limit(ipc, _parse_size(size_str))
 
 
 def cmd_limit_percent(ipc: str, percent: float):
-    """Set limit as percentage of total GPU RAM for an existing IPC."""
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        return
-
+    """Set a byte max derived from device zero, preserving CLI syntax."""
     from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        print("CUDA unavailable; cannot compute size from percentage",
-              file=sys.stderr)
-        sys.exit(1)
-    size_bytes = int(total_mem * percent / 100.0)
-    update_kv_cache_limit(ipc, size_bytes)
+        raise RuntimeError("CUDA unavailable; cannot compute size from percentage")
+    return update_kv_cache_limit(ipc, int(total_mem * percent / 100.0))
 
 
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):

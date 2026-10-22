@@ -351,9 +351,6 @@ class KVCacheManager:
         self.target_num_pages: Optional[int] = None
         self._resize_rejected: bool = False
         self._rejected_resize_target: Optional[int] = None
-        self._memory_limit_bytes: Optional[int] = None
-        self._memory_limit_effective_bytes: Optional[int] = None
-        self._memory_limit_revision = -1
         # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
         # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated after every
         # physical-pool mutation the manager drives (alloc, free, resize,
@@ -1039,6 +1036,9 @@ class KVCacheManager:
                     self._resize_rejected = True
                     self.in_shrink = False
                     self.target_num_pages = None
+                    control = getattr(self, "_runtime_control", None)
+                    if control is not None:
+                        control.fail()
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can
@@ -1054,6 +1054,9 @@ class KVCacheManager:
                         # cached value so available_size() re-reads the driver.
                         self._avail_physical_pages_cache = None
                         self.target_num_pages = None
+                        control = getattr(self, "_runtime_control", None)
+                        if control is not None:
+                            control.acknowledge()
                     else:
                         logger.warning(
                             "shrink to %d pages refused by allocator "
@@ -1135,37 +1138,9 @@ class KVCacheManager:
             self.free(blocks)
 
     def _apply_resize_target(self) -> None:
-        new_mem_size = self.page_allocator.get_resize_target()
-        # -1 means nothing published; 0 is a valid limit.
-        if new_mem_size < 0:
-            return
-        if new_mem_size != self._kvctl_target:
-            # A changed value is a new kvctl publication; it wins over an
-            # earlier set_memory_limit() or resize().
-            self._kvctl_target = new_mem_size
-            self._kvctl_target_is_latest = True
-        elif not self._kvctl_target_is_latest:
-            # resize() published a later target. Applying the quota again
-            # would cancel it; in_shrink, free() and the reclaimers complete
-            # that resize instead.
-            return
-        if new_mem_size == getattr(self, "_rejected_resize_target", None):
-            return
-        try:
-            self.resize(new_mem_size)
-        except QuarantinedResizeError:
-            self._rejected_resize_target = new_mem_size
-            self._resize_rejected = True
-            logger.warning("Automatic resize rejected: pool has quarantined pages")
-        else:
-            # resize() snapshots the watcher for API takeover. Keep the value
-            # actually applied here so a concurrent watcher change is not lost.
-            self._kvctl_target = new_mem_size
-            # resize() marked its target as the latest; here that is the
-            # quota. The next pass applies a deferred shrink again, which is
-            # what completes it when _resize() freed the reserved blocks
-            # before entering the shrink.
-            self._kvctl_target_is_latest = True
+        control = getattr(self, "_runtime_control", None)
+        if control is not None:
+            control.apply()
 
     @_after_post_init
     @synchronized
@@ -1354,102 +1329,35 @@ class KVCacheManager:
         # for the same grow-direction mutation, so trim() does too.
         self._avail_physical_pages_cache = None
 
-    def set_memory_limit(
-        self,
-        limit_bytes: int,
-        *,
-        revision: int,
-    ) -> Dict[str, Any]:
-        """Validate a limit, wait for setup, then apply its revision atomically."""
-        limit_bytes = int(limit_bytes)
-        revision = int(revision)
-        if limit_bytes < 0:
-            raise ValueError("limit_bytes must be non-negative")
-        if revision < 0:
-            raise ValueError("revision must be non-negative")
+    def set_memory_limit(self, limit_bytes: int, *, revision=None, generations=None):
+        """Publish an instance-per-GPU limit through the common native authority."""
+        from kvcached.control import set_instance_memory_limit
 
-        # Validate before waiting, but keep the revision comparison and commit
-        # together under the lock after initialization has finished.
-        self._wait_post_init()
-        return self._set_memory_limit(limit_bytes, revision=revision)
+        if not isinstance(limit_bytes, int) or not 0 <= limit_bytes <= (1 << 64) - 1:
+            raise ValueError("limit_bytes must be a uint64 byte count")
+        if getattr(self, "_runtime_control", None) is None:
+            raise RuntimeError("runtime control is unavailable before engine initialization")
+        return set_instance_memory_limit(limit_bytes, revision=revision,
+                                         generations=generations,
+                                         instance_name=self._control_instance_name())
 
-    @synchronized
-    def _set_memory_limit(self, limit_bytes: int, *, revision: int) -> Dict[str, Any]:
-        current_revision = self._memory_limit_revision
-        current_limit = self._memory_limit_bytes
-        if revision < current_revision:
-            return self._memory_limit_state(status="stale")
-        if revision == current_revision and current_limit == limit_bytes:
-            return self._memory_limit_state()
-        if revision == current_revision:
-            return self._memory_limit_state(status="conflict")
-
-        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
-        max_pages = self.mem_size // self.page_size
-        target_pages = min(limit_bytes // page_bundle_bytes, max_pages)
-        effective_limit_bytes = target_pages * page_bundle_bytes
-
-        self.resize(target_pages * self.page_size)
-        self._memory_limit_bytes = limit_bytes
-        self._memory_limit_effective_bytes = effective_limit_bytes
-        self._memory_limit_revision = revision
-        return self._memory_limit_state()
+    def _control_instance_name(self) -> str:
+        runtime = getattr(self, "_runtime_control", None)
+        if runtime is None:
+            raise RuntimeError("runtime control is unavailable before engine initialization")
+        names = {source["instance"] for source in runtime.sources}
+        if len(names) != 1:
+            raise RuntimeError("runtime control sources disagree on instance identity")
+        return names.pop()
 
     def _memory_limit_page_bundle_bytes(self) -> int:
         return self.page_size * self.num_layers * self.num_kv_buffers
 
-    def _memory_limit_state(
-        self,
-        *,
-        status: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        page_state = self.page_allocator.get_page_state()
-        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
-        mapped_pages = (int(page_state["inuse_pages"])
-                        + int(page_state["reserved_pages"]))
-        mapped_bytes = mapped_pages * page_bundle_bytes
-        limit_bytes = self._memory_limit_bytes
-        effective_limit_bytes = self._memory_limit_effective_bytes
-        if self._kvctl_target_is_latest and self._kvctl_target is not None:
-            # Report the controlling quota, including a retained zero whose
-            # physical target was floored for the null page. An API takeover
-            # clears this flag without changing the watcher's remembered value.
-            limit_bytes = self._kvctl_target * self.num_layers * self.num_kv_buffers
-            effective_limit_bytes = (
-                min(self._kvctl_target, self.mem_size) // self.page_size
-                * page_bundle_bytes)
-        overage_bytes = (0 if effective_limit_bytes is None else
-                         max(0, mapped_bytes - effective_limit_bytes))
-        if status is None:
-            status = ("rejected" if getattr(self, "_resize_rejected", False) else
-                      "deferred" if self.in_shrink or overage_bytes else "applied")
-        return {
-            "status": status,
-            "pool_name": str(self.pool_name or ""),
-            "group_id": self.group_id,
-            "limit_bytes": limit_bytes,
-            "effective_limit_bytes": effective_limit_bytes,
-            "current_capacity_bytes": (
-                int(page_state["total_pages"]) * page_bundle_bytes
-            ),
-            "revision": self._memory_limit_revision,
-            "mapped_bytes": mapped_bytes,
-            "remaining_bytes": (
-                None if effective_limit_bytes is None else
-                max(0, effective_limit_bytes - mapped_bytes)
-            ),
-            "overage_bytes": overage_bytes,
-            "reason": {
-                "deferred": "inuse_capacity_above_limit",
-                "rejected": "quarantined_pages_prevent_resize",
-                "conflict": "revision_reused_with_different_limit",
-            }.get(status, ""),
-        }
-
-    @synchronized
     def memory_limit_state(self) -> Dict[str, Any]:
-        """Return the current revisioned resize limit and apply state."""
-        return self._memory_limit_state()
+        """Read instance-wide control state from the native ledger."""
+        from kvcached.control import get_instance_memory_limit
+
+        return get_instance_memory_limit(self._control_instance_name())
 
     @synchronized
     def available_size(self) -> int:
@@ -1709,6 +1617,13 @@ class KVCacheManager:
         # Clear reserved blocks
         self.free_reserved()
 
+        # A runtime zero cap forbids new physical grants. Keep the mandatory
+        # null page charged across clear(), rather than temporarily overriding
+        # the instance cap to rebuild it.
+        retained_null_page = None
+        if getattr(self, "_runtime_control", None) is not None and self.null_block == [0]:
+            retained_null_page = self.avail_pages.get(0, self.full_pages.get(0))
+
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = [
             page_id
@@ -1719,6 +1634,8 @@ class KVCacheManager:
             pages_to_free.append(page.page_id)
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
+        if retained_null_page is not None:
+            pages_to_free = [page_id for page_id in pages_to_free if page_id != 0]
         if pages_to_free:
             pages_to_free = list(dict.fromkeys(pages_to_free))
             self.page_allocator.free_pages(pages_to_free)
@@ -1752,10 +1669,23 @@ class KVCacheManager:
         self._avail_physical_pages_cache = None
         self.num_avail_blocks = 0
 
-        # Possibly reserve the first block as null block for padding tokens
-        self._reserve_null_block()
-        # Rebuild the mandatory null block before reapplying a pending quota.
-        # The watcher is stopped here, so a zero target must not strand clear().
+        # Possibly reserve the first block as null block for padding tokens.
+        if retained_null_page is None:
+            self._reserve_null_block()
+        else:
+            retained_null_page.init(self.block_mem_size)
+            reserved_null = retained_null_page.alloc(1)
+            assert reserved_null == [0]
+            self.null_block = [0]
+            self._logical_allocated_blocks = 1
+            self.num_avail_blocks = retained_null_page.num_free_blocks()
+            target = self.avail_pages if self.num_avail_blocks else self.full_pages
+            target[0] = retained_null_page
+        # Reapply the accepted revision after clear reset the execution state.
+        runtime = getattr(self, "_runtime_control", None)
+        if runtime is not None:
+            runtime.executing = ()
+            runtime.acknowledged = ()
         if not self._shutdown_requested.is_set():
             self._apply_resize_target()
 

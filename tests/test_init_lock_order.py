@@ -269,7 +269,7 @@ def _child(operation: str, mode: str, connection: Connection) -> None:
                 result["readiness_error"] = type(error).__name__
         else:
             if operation == "limits":
-                result["revision"] = manager.memory_limit_state()["revision"]
+                result["control_ready"] = getattr(manager, "_runtime_control", None) is not None
             for outcome in outcomes:
                 if operation in ("alloc", "alloc_packed", "sglang_factory", "many_allocs"):
                     manager.free(outcome["value"])
@@ -304,7 +304,7 @@ def _observe(operation: str, mode: str = "waiting") -> dict[str, Any]:
 
 @pytest.mark.parametrize("operation", [
     "alloc", "alloc_packed", "free", "reserve", "resize", "trim", "clear",
-    "apply_resize_target", "reclaim_for_shrink", "limits",
+    "apply_resize_target", "reclaim_for_shrink",
 ])
 def test_operation_waits_without_holding_init_lock(operation: str) -> None:
     result = _observe(operation)
@@ -345,10 +345,11 @@ def test_multiple_waiters_preserve_private_slots_and_counters() -> None:
     assert result["counters"]["freed_blocks_total"] == 4
 
 
-def test_concurrent_limits_keep_newest_revision() -> None:
+def test_preinitialization_limits_are_explicitly_unavailable() -> None:
     result = _observe("limits")
     assert not result["blocked"], result
-    assert result["revision"] == 3
+    assert not result["control_ready"]
+    assert all(outcome["error_type"] == "RuntimeError" for outcome in result["outcomes"])
 
 
 def test_invalid_limit_is_rejected_before_readiness() -> None:

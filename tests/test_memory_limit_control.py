@@ -139,415 +139,420 @@ def _allocate(manager):
     assert manager.alloc(0) == []
 
 
-def test_idle_limit_applies_immediately_through_resize():
-    manager = _manager(inuse_pages=1, reserved_pages=2)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
+class NativeControlFake:
+    """Constructed frontend/engine tests; native concurrency is tested in C++."""
 
-    state = manager.set_memory_limit(page_bundle * 3 + 123, revision=7)
+    def __init__(self, manager):
+        bundle = manager._memory_limit_page_bundle_bytes()
+        self.states = {
+            gpu: dict(status="unpublished", convergence="unpublished", generation=42,
+                      revision=0, published=False, pool_slot=0, pool_owner=123,
+                      pool_target_bytes=16 * bundle, pool_capacity_bytes=16 * bundle,
+                      page_bundle_bytes=bundle, can_shrink=True, ready=True,
+                      expected_participants=2, registered_participants=1)
+            for gpu in ("gpu-a", "gpu-b")
+        }
+        self.acks = []
+        self.fail_gpu = None
 
-    assert manager.page_allocator.resize_calls == [3]
-    assert manager.page_allocator.total_pages == 3
-    assert manager.mem_size == manager.page_size * 16
-    assert state["status"] == "applied"
-    assert state["limit_bytes"] == page_bundle * 3 + 123
-    assert state["effective_limit_bytes"] == page_bundle * 3
-    assert state["current_capacity_bytes"] == page_bundle * 3
-    assert state["revision"] == 7
+    def query_instance_control(self, path, instance, slot=None):
+        return dict(self.states[path])
+
+    observe_instance_control = query_instance_control
+
+    def publish_instance_control(self, path, instance, limit, generation, revision):
+        if path == self.fail_gpu:
+            raise RuntimeError("injected publication failure")
+        state = self.states[path]
+        if generation != state["generation"]:
+            return dict(state, status="instance_changed")
+        if revision is not None and state["published"]:
+            if revision < state["revision"]:
+                return dict(state, status="stale")
+            if revision == state["revision"]:
+                return dict(state, status="idempotent" if limit == state["limit_bytes"] else "conflict")
+        revision = state["revision"] + 1 if revision is None else revision
+        bundle = state["page_bundle_bytes"]
+        state.update(status="pending", convergence="pending", revision=revision,
+                     published=True, limit_bytes=limit,
+                     pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
+        return dict(state, status="accepted")
+
+    def fail_instance_control(self, path, instance, slot, owner, generation, revision):
+        state = self.states[path]
+        if (slot, owner, generation, revision) != tuple(
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+            return False
+        state.update(status="failed", convergence="failed", failed=1,
+                     failure_reason="quarantined_pages_prevent_resize")
+        return True
+
+    def local_instance_control(self, group_id):
+        return dict(self.states["gpu-a"])
+
+    def acknowledge_instance_control(self, group_id, revision):
+        self.acks.append(revision)
+        return revision == self.states["gpu-a"]["revision"]
 
 
-@pytest.mark.parametrize("limit_bytes", [0, 123])
-@pytest.mark.parametrize("reserve_null", [False, True])
-@pytest.mark.parametrize("deferred", [False, True])
-def test_subpage_limit_keeps_only_null_page_with_exact_geometry(
-    limit_bytes, reserve_null, deferred,
-):
-    manager = _manager(inuse_pages=3 if deferred else int(reserve_null),
-                       reserved_pages=2)
-    manager.null_block = [0] if reserve_null else None
-    manager.block_mem_size = manager.page_size // 3
+@pytest.fixture
+def controls(monkeypatch):
+    import kvcached
+    from kvcached import control
+    from kvcached.runtime_control import RuntimeControl
+
+    manager = _manager()
+    native = NativeControlFake(manager)
+    monkeypatch.setattr(kvcached, "_C", native, raising=False)
+    monkeypatch.setattr(control.glob, "glob", lambda pattern: list(native.states))
+    runtime = object.__new__(RuntimeControl)
+    runtime.manager = manager
+    runtime.worker_ipc = False
+    runtime.sources = (dict(native.states["gpu-a"], gpu="gpu-a", instance="model"),)
+    runtime.current = ()
+    runtime.executing = ()
+    runtime.last_poll = 0.0
+    manager._runtime_control = runtime
+    return manager, native, control
+
+
+def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):
+    from kvcached.cli.utils import update_kv_cache_limit
+
+    manager, native, control = controls
+    size = manager._memory_limit_page_bundle_bytes() * 4
+    first = update_kv_cache_limit("model", size)
+    second = control.set_instance_memory_limit(size, instance_name="model")
+    third = update_kv_cache_limit("model", size)
+    assert [r["revision"] for r in first["gpus"]] == [1, 1]
+    assert [r["revision"] for r in second["gpus"]] == [2, 2]
+    assert [r["revision"] for r in third["gpus"]] == [3, 3]
+    assert all(r["limit_bytes"] == size for r in third["gpus"])
+    assert '"converged": false' in capsys.readouterr().out
+
+
+def test_explicit_retry_conflict_stale_and_restart(controls):
+    _, native, control = controls
+    generations = {gpu: 42 for gpu in native.states}
+    assert control.set_instance_memory_limit(123, revision=7, generations=generations)["accepted"]
+    same = control.set_instance_memory_limit(123, revision=7, generations=generations)
+    assert {r["status"] for r in same["gpus"]} == {"idempotent"}
+    assert {r["status"] for r in control.set_instance_memory_limit(
+        124, revision=7, generations=generations)["gpus"]} == {"conflict"}
+    assert {r["status"] for r in control.set_instance_memory_limit(
+        123, revision=6, generations=generations)["gpus"]} == {"stale"}
+    native.states["gpu-b"]["generation"] = 43
+    retry = control.set_instance_memory_limit(123, revision=7, generations=generations)
+    assert retry["status"] == "partial"
+    assert retry["gpus"][1]["status"] == "instance_changed"
+
+
+def test_partial_gpu_failure_can_be_repaired_by_caller(controls):
+    _, native, control = controls
+    native.fail_gpu = "gpu-b"
+    result = control.set_instance_memory_limit(123)
+    assert result["status"] == "partial"
+    assert result["gpus"][0]["revision"] == 1
+    assert result["gpus"][1]["status"] == "error"
+    native.fail_gpu = None
+    repair = control.set_instance_memory_limit(123, gpu_ids=["gpu-b"])
+    assert repair["accepted"]
+    assert native.states["gpu-a"]["revision"] == native.states["gpu-b"]["revision"] == 1
+
+
+def test_missing_rank_does_not_report_complete_or_publish(controls):
+    _, native, control = controls
+    native.states["gpu-b"]["registered_participants"] = 0
+    result = control.set_instance_memory_limit(123)
+    assert result["status"] == "unavailable" and not result["accepted"]
+    assert not result["converged"]
+    assert native.states["gpu-a"]["revision"] == 0
+
+
+def test_raw_legacy_watcher_is_never_consumed(controls):
+    manager, _, _ = controls
+    _kvctl_limit(manager, 1)
+    _allocate(manager)
+    assert manager.page_allocator.resize_calls == []
+
+
+def test_revision_replaces_old_shrink_and_old_ack_is_rejected(controls):
+    manager, native, control = controls
     bundle = manager._memory_limit_page_bundle_bytes()
-    allocator = manager.page_allocator
-    # Sparse live pages require page accounting, even with few live blocks.
-    manager.avail_pages = dict.fromkeys(range(allocator.inuse_pages))
-    state = manager.set_memory_limit(limit_bytes, revision=1)
-    assert state["limit_bytes"] == limit_bytes
-    assert state["effective_limit_bytes"] == 0
-    if deferred:
-        assert manager.in_shrink
-        assert manager.target_num_pages == int(reserve_null)
-        assert manager.shrink_excess_pages() == 3 - int(reserve_null)
-        allocator.inuse_pages = int(reserve_null)
-        manager.avail_pages = dict.fromkeys(range(allocator.inuse_pages))
-        manager._maybe_finish_shrink()
-    state = manager.memory_limit_state()
+    manager.page_allocator.inuse_pages = 6
+    control.set_instance_memory_limit(bundle * 4)
+    manager.apply_resize_target()
+    assert manager.in_shrink
+    old = manager._runtime_control.executing
+    control.set_instance_memory_limit(bundle * 12)
+    manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
     assert not manager.in_shrink
-    assert allocator.total_pages == int(reserve_null)
-    assert allocator.reserved_pages == 0
-    assert state["mapped_bytes"] == state["overage_bytes"] == int(reserve_null) * bundle
-    assert state["status"] == ("deferred" if reserve_null else "applied")
-    assert manager.set_memory_limit(2 * bundle, revision=2)["status"] == "applied"
-    assert allocator.total_pages == 2
+    assert manager.page_allocator.total_pages == 12
+    manager._runtime_control.executing = old
+    manager._runtime_control.acknowledge()
+    assert native.acks[-1] == 1
+    assert not native.acknowledge_instance_control(0, 1)
+    assert native.states["gpu-a"]["revision"] == 2
 
 
-def test_quarantined_resize_rejection_does_not_accept_revision(monkeypatch):
+def test_deferred_shrink_finishes_without_republishing(controls):
+    manager, native, control = controls
+    manager.page_allocator.inuse_pages = 6
+    control.set_instance_memory_limit(manager._memory_limit_page_bundle_bytes() * 4)
+    manager.apply_resize_target()
+    assert manager.in_shrink and native.acks == []
+    manager.page_allocator.inuse_pages = 2
+    manager._maybe_finish_shrink()
+    assert not manager.in_shrink and native.acks == [1]
+    assert native.states["gpu-a"]["revision"] == 1
+
+
+def test_unsupported_pool_does_not_execute_shrink(controls):
+    manager, native, control = controls
+    native.states["gpu-a"]["can_shrink"] = False
+    control.set_instance_memory_limit(0)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls == [] and native.acks == []
+
+
+def test_shared_logical_pool_uses_minimum_rank_page_target(controls):
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    runtime.sources += (dict(native.states["gpu-b"], gpu="gpu-b", instance="model"),)
+    # Rank B has twice as many bytes per page bundle (e.g. asymmetric PP).
+    native.states["gpu-b"]["page_bundle_bytes"] *= 2
+    control.set_instance_memory_limit(manager._memory_limit_page_bundle_bytes() * 8)
+    runtime.acknowledge = lambda: None
+    manager.apply_resize_target()
+    assert manager.page_allocator.total_pages == 4
+
+
+def test_explicit_revision_requires_instance_generation(controls):
+    _, _, control = controls
+    with pytest.raises(ValueError, match="generations"):
+        control.set_instance_memory_limit(123, revision=1)
+
+
+def test_completed_revision_acknowledged_once(controls):
+    manager, native, control = controls
+    control.set_instance_memory_limit(manager._memory_limit_page_bundle_bytes() * 8)
+    for _ in range(10):
+        manager.apply_resize_target()
+    assert native.acks == [1]
+
+
+@pytest.mark.parametrize("generation", [-1, 1 << 64, "42"])
+def test_invalid_generation_validated_before_any_gpu_write(controls, generation):
+    _, native, control = controls
+    with pytest.raises(ValueError, match="generation"):
+        control.set_instance_memory_limit(123, generations={"gpu-a": 42, "gpu-b": generation})
+    assert all(state["revision"] == 0 for state in native.states.values())
+
+
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_runtime_uses_manager_startup_pages(controls, monkeypatch, buffers):
+    from kvcached.runtime_control import RuntimeControl
+    manager, native, _ = controls
+    manager.num_kv_buffers = buffers
+    calls = []
+    def configure(group, shrink, participants, pages, reserve_null):
+        calls.append((group, shrink, participants, pages, reserve_null))
+        return dict(native.states["gpu-a"], gpu="gpu-a", instance="model")
+    monkeypatch.setattr(native, "local_instance_control", configure)
+    RuntimeControl(manager, worker_ipc=False, can_shrink=True, expected_participants=2)
+    assert calls == [(0, True, 2, 16, False)]
+
+
+@pytest.mark.parametrize("segment,exact,expected", [
+    ("model_g1", False, "model"),
+    ("/dev/shm/model_g12", False, "model"),
+    ("model_g1", True, "model_g1"),
+    ("model_g0", False, "model_g0"),
+    ("model_group", False, "model_group"),
+])
+def test_group_segment_control_resolution(monkeypatch, segment, exact, expected):
+    from kvcached import control
+    from kvcached.cli.utils import get_segment_control, update_kv_cache_limit
+
+    def query(name):
+        return {"instance": name, "gpus": [{}] if name == "model" or exact else []}
+
+    monkeypatch.setattr(control, "get_instance_memory_limit", query)
+    monkeypatch.setattr(control, "_get_instance_memory_limit", lambda name, **kwargs: query(name))
+    monkeypatch.setattr(control, "set_instance_memory_limit",
+                        lambda size, *, instance_name: {"instance": instance_name})
+    assert get_segment_control(segment)["instance"] == expected
+    assert update_kv_cache_limit(segment, 100)["instance"] == expected
+
+
+def test_manager_controls_use_registered_instance(controls, monkeypatch):
+    manager, native, control = controls
+    monkeypatch.setattr(control, "get_instance_memory_limit", lambda name: name)
+    monkeypatch.setattr(control, "set_instance_memory_limit",
+                        lambda size, **kwargs: kwargs["instance_name"])
+    assert manager.memory_limit_state() == "model"
+    assert manager.set_memory_limit(100) == "model"
+
+
+def test_listing_groups_uses_one_physical_instance_row(monkeypatch, capsys):
+    import json
+
+    from kvcached.cli import kvctl
+    from kvcached.cli.utils import MemInfoStruct
+
+    monkeypatch.setattr(kvctl.control_segment, "active", lambda path: True)
+    monkeypatch.setattr(kvctl, "get_kv_cache_limit", lambda name: MemInfoStruct(999, 10, 5))
+    monkeypatch.setattr(kvctl, "get_segment_control", lambda name: {
+        "instance": "model", "gpus": [{"effective_limit_bytes": 200, "charged_bytes": 120}]})
+    kvctl.cmd_list(["model", "model_g1"], json_out=True)
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert rows[0]["ipc"] == "model"
+    assert rows[0]["used_bytes"] == 120
+    assert rows[0]["limit_bytes"] == 200
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_quarantine_failure_is_queryable_without_retry(controls, monkeypatch, deferred):
     from kvcached.errors import QuarantinedResizeError
 
-    manager = _manager()
-
-    def resize(_size):
-        raise QuarantinedResizeError("quarantined pages")
-
-    monkeypatch.setattr(manager.page_allocator, "resize", resize)
-    with pytest.raises(QuarantinedResizeError):
-        manager.set_memory_limit(manager.page_size, revision=1)
-    assert manager._memory_limit_revision == -1
-    assert not manager.in_shrink
-
-
-def test_rejected_deferred_limit_is_visible_until_next_resize():
-    manager = _manager()
-    manager._resize_rejected = True
-    state = manager.memory_limit_state()
-    assert state["status"] == "rejected"
-    assert state["reason"] == "quarantined_pages_prevent_resize"
-    assert manager.resize(manager.page_size * 8)
-    assert manager.memory_limit_state()["status"] == "applied"
-
-
-def test_active_limit_defers_without_revoking_and_converges_on_release():
-    manager = _manager(inuse_pages=4)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-
-    deferred = manager.set_memory_limit(page_bundle * 2, revision=1)
-
-    assert deferred["status"] == "deferred"
-    assert deferred["mapped_bytes"] == page_bundle * 4
-    assert deferred["overage_bytes"] == page_bundle * 2
-    assert deferred["reason"] == "inuse_capacity_above_limit"
-    assert manager.in_shrink
-    assert manager.page_allocator.total_pages == 16
-
-    manager.page_allocator.inuse_pages = 2
-    assert manager.resize(manager.page_size * 2)
-    applied = manager.set_memory_limit(page_bundle * 2, revision=1)
-
-    assert applied["status"] == "applied"
-    assert applied["current_capacity_bytes"] == page_bundle * 2
-    assert not manager.in_shrink
-
-
-def test_retained_kvctl_target_does_not_cancel_a_later_api_shrink():
-    manager = _manager(inuse_pages=9)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-    _kvctl_limit(manager, 12)
-    _allocate(manager)
-    assert manager.page_allocator.resize_calls == [12]
-
-    deferred = manager.set_memory_limit(page_bundle * 4, revision=1)
-    assert deferred["status"] == "deferred"
-
-    # The watcher still reports 12. Allocations must not apply it again.
-    _allocate(manager)
-    _allocate(manager)
-
-    assert manager.page_allocator.resize_calls == [12, 4]
-    assert manager.in_shrink
-    assert manager.memory_limit_state()["status"] == "deferred"
-
-    # Requests finish; the free() path completes the pending shrink.
-    manager.page_allocator.inuse_pages = 4
-    manager._maybe_finish_shrink()
-    _allocate(manager)
-
-    state = manager.memory_limit_state()
-    assert manager.page_allocator.resize_calls == [12, 4, 4]
-    assert manager.page_allocator.total_pages == 4
-    assert state["status"] == "applied"
-    assert state["overage_bytes"] == 0
-
-
-def test_retained_kvctl_target_does_not_undo_a_later_api_grow():
-    manager = _manager(inuse_pages=9)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-    _kvctl_limit(manager, 4)
-    _allocate(manager)
-    assert manager.in_shrink
-
-    grown = manager.set_memory_limit(page_bundle * 16, revision=1)
-    assert grown["status"] == "applied"
-    assert not manager.in_shrink
-
-    _allocate(manager)
-
-    assert manager.page_allocator.resize_calls == [4, 16]
-    assert not manager.in_shrink
-    assert manager.memory_limit_state()["status"] == "applied"
-
-
-def test_changed_kvctl_target_after_an_api_limit_still_applies():
-    manager = _manager(inuse_pages=9)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-    _kvctl_limit(manager, 12)
-    _allocate(manager)
-    assert manager.set_memory_limit(page_bundle * 4, revision=1)["status"] == "deferred"
-
-    _kvctl_limit(manager, 16)
-    _allocate(manager)
-
-    assert manager.page_allocator.resize_calls == [12, 4, 16]
-    assert manager.page_allocator.total_pages == 16
-    assert not manager.in_shrink
-
-
-def test_null_overage_follows_kvctl_and_api_takeover():
-    manager = _manager(inuse_pages=1)
-    manager.null_block = [0]
+    manager, native, control = controls
     bundle = manager._memory_limit_page_bundle_bytes()
-    _kvctl_limit(manager, 0)
-    manager.apply_resize_target()
-    state = manager.memory_limit_state()
-    assert not manager.in_shrink
-    assert state["status"] == "deferred"
-    assert state["limit_bytes"] == state["effective_limit_bytes"] == 0
-    assert state["overage_bytes"] == bundle
-
-    assert manager.set_memory_limit(2 * bundle, revision=1)["status"] == "applied"
-    manager.apply_resize_target()
-    assert manager.memory_limit_state()["effective_limit_bytes"] == 2 * bundle
-    assert manager.page_allocator.resize_target == 0
-
-    # A new quota supersedes the API; neither its bytes nor its overage may
-    # continue to describe the older API target.
-    manager.page_allocator.resize_target = manager.page_size // 2
-    manager.apply_resize_target()
-    state = manager.memory_limit_state()
-    assert state["status"] == "deferred"
-    assert state["limit_bytes"] == bundle // 2
-    assert state["effective_limit_bytes"] == 0
-    assert state["overage_bytes"] == bundle
-    _kvctl_limit(manager, 3)
-    manager.apply_resize_target()
-    assert manager.memory_limit_state()["status"] == "applied"
-    assert manager.memory_limit_state()["effective_limit_bytes"] == 3 * bundle
-
-
-def test_deferred_kvctl_target_is_applied_again_until_it_completes():
-    manager = _manager(inuse_pages=9)
-    _kvctl_limit(manager, 4)
-    _allocate(manager)
-    assert manager.in_shrink
-
-    # The watcher keeps reporting 4 and every pass applies it again. That is
-    # what completes a shrink whose last in-use pages were freed by resize()
-    # itself (reserved blocks), where free() ran before in_shrink was set.
-    _allocate(manager)
-    assert manager.page_allocator.resize_calls == [4, 4]
-    assert manager.in_shrink
-
-    manager.page_allocator.inuse_pages = 3
-    _allocate(manager)
-
-    assert manager.page_allocator.resize_calls == [4, 4, 4]
-    assert manager.page_allocator.total_pages == 4
-    assert not manager.in_shrink
-
-
-def test_idle_pass_does_not_apply_the_kvctl_target_over_a_later_api_limit():
-    manager = _manager(inuse_pages=9)
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-    _kvctl_limit(manager, 12)
-    manager.apply_resize_target()
-    assert manager.page_allocator.resize_calls == [12]
-
-    assert manager.set_memory_limit(page_bundle * 4, revision=1)["status"] == "deferred"
-    # The engine idle hooks call this as soon as the revision changes.
-    manager.apply_resize_target()
-
-    assert manager.page_allocator.resize_calls == [12, 4]
-    assert manager.in_shrink
-    assert manager.memory_limit_state()["status"] == "deferred"
-
-
-def test_limit_can_regrow_within_the_original_reservation():
-    manager = _manager()
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-
-    manager.set_memory_limit(page_bundle * 3, revision=1)
-    state = manager.set_memory_limit(page_bundle * 6, revision=2)
-
-    assert manager.page_allocator.resize_calls == [3, 6]
-    assert manager.page_allocator.total_pages == 6
-    assert manager.mem_size == manager.page_size * 16
-    assert state["status"] == "applied"
-    assert state["effective_limit_bytes"] == page_bundle * 6
-
-
-def test_limit_is_clamped_to_the_original_reservation():
-    manager = _manager()
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-
-    state = manager.set_memory_limit(page_bundle * 32, revision=1)
-
-    assert manager.page_allocator.resize_calls == [16]
-    assert state["effective_limit_bytes"] == page_bundle * 16
-
-
-def test_kvctl_quota_is_clamped_to_the_original_reservation():
-    manager = _manager()
-    assert manager.resize(manager.page_size * 3)
-    # kvctl publishes the raw quota, which may exceed the startup size.
-    manager.page_allocator.get_resize_target = lambda: manager.page_size * 32
-    manager.apply_resize_target()
-
-    assert manager.page_allocator.resize_calls == [3, 16]
-    assert manager.page_allocator.total_pages == 16
-
-
-@pytest.mark.parametrize("earlier_quota", [None, 8])
-@pytest.mark.parametrize("pending_quota", [0, 12])
-def test_api_takes_over_watcher_value_not_yet_consumed(earlier_quota, pending_quota):
-    """Construct the native-watch/engine-poll window, not a serving repro."""
-    manager = _manager()
-    if earlier_quota is not None:
-        _kvctl_limit(manager, earlier_quota)
+    control.set_instance_memory_limit(4 * bundle)
+    if deferred:
+        manager.page_allocator.inuse_pages = 6
         manager.apply_resize_target()
-    _kvctl_limit(manager, pending_quota)
-    bundle = manager._memory_limit_page_bundle_bytes()
-    manager.set_memory_limit(4 * bundle, revision=1)
-    manager.apply_resize_target()
-    assert manager.page_allocator.total_pages == 4
-    assert manager.memory_limit_state()["effective_limit_bytes"] == 4 * bundle
-    _kvctl_limit(manager, 6)
-    manager.apply_resize_target()
-    assert manager.page_allocator.total_pages == 6
-
-
-@pytest.mark.parametrize("from_kvctl", [False, True])
-def test_watcher_change_during_resize_is_not_acknowledged(monkeypatch, from_kvctl):
-    manager = _manager()
-    _kvctl_limit(manager, 8)
-    original = manager.page_allocator.resize
-
-    def resize(size):
-        _kvctl_limit(manager, 12)
-        return original(size)
-
-    monkeypatch.setattr(manager.page_allocator, "resize", resize)
-    if from_kvctl:
-        manager.apply_resize_target()
-    else:
-        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
-    manager.apply_resize_target()
-    assert manager.page_allocator.resize_calls == ([8, 12] if from_kvctl else [4, 12])
-
-
-def test_failed_api_does_not_acknowledge_pending_quota(monkeypatch):
-    manager = _manager()
-    _kvctl_limit(manager, 12)
-    original = manager.page_allocator.resize
+        assert manager.in_shrink
+        manager.page_allocator.inuse_pages = 2
+    attempts = []
 
     def fail(size):
-        raise ValueError("injected resize failure")
+        attempts.append(size)
+        raise QuarantinedResizeError("injected quarantine")
 
     monkeypatch.setattr(manager.page_allocator, "resize", fail)
-    with pytest.raises(ValueError, match="injected"):
-        manager.set_memory_limit(4 * manager._memory_limit_page_bundle_bytes(), revision=1)
-    monkeypatch.setattr(manager.page_allocator, "resize", original)
+    monkeypatch.setattr(manager, "_record_operation_error", lambda *args: None)
+    if deferred:
+        manager._maybe_finish_shrink()
+    else:
+        manager.apply_resize_target()
+    for _ in range(3):
+        manager.apply_resize_target()
+    state = control.get_instance_memory_limit()
+    assert state["status"] == "failed" and not state["converged"]
+    assert state["gpus"][0]["failure_reason"] == "quarantined_pages_prevent_resize"
+    assert state["gpus"][0]["limit_bytes"] == 4 * bundle
+    assert len(attempts) == 1 and not manager.in_shrink and native.acks == []
+
+
+def test_deferred_failure_does_not_poison_new_publication(controls, monkeypatch):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager, native, control = controls
+    bundle = manager._memory_limit_page_bundle_bytes()
+    manager.page_allocator.inuse_pages = 6
+    control.set_instance_memory_limit(4 * bundle)
     manager.apply_resize_target()
-    assert manager.page_allocator.resize_calls == [12]
-    assert manager._memory_limit_revision == -1
+    old = manager._runtime_control.executing
+    control.set_instance_memory_limit(12 * bundle)
+    manager.page_allocator.inuse_pages = 2
+
+    def fail(size):
+        raise QuarantinedResizeError("injected quarantine")
+
+    resize = manager.page_allocator.resize
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    monkeypatch.setattr(manager, "_record_operation_error", lambda *args: None)
+    manager._maybe_finish_shrink()
+    assert native.states["gpu-a"]["convergence"] == "pending"
+    assert native.states["gpu-a"]["revision"] == 2
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
+    assert native.acks == [2] and not manager._resize_rejected
+    manager._runtime_control.executing = old
+    manager._runtime_control.fail()
+    assert native.states["gpu-a"]["convergence"] == "pending"
 
 
-def test_zero_limit_drains_an_idle_pool():
-    manager = _manager()
-
-    state = manager.set_memory_limit(0, revision=1)
-
-    assert manager.page_allocator.resize_calls == [0]
-    assert manager.page_allocator.total_pages == 0
-    assert state["status"] == "applied"
-    assert state["effective_limit_bytes"] == 0
-
-
-def test_stale_update_is_ignored_and_revision_reuse_must_match():
-    manager = _manager()
-    page_bundle = manager._memory_limit_page_bundle_bytes()
-    first = manager.set_memory_limit(page_bundle * 4, revision=9)
-    repeated = manager.set_memory_limit(page_bundle * 4, revision=9)
-    conflict = manager.set_memory_limit(page_bundle * 3, revision=9)
-    stale = manager.set_memory_limit(page_bundle * 2, revision=8)
-
-    assert repeated == first
-    assert conflict["status"] == "conflict"
-    assert conflict["reason"] == "revision_reused_with_different_limit"
-    assert stale["status"] == "stale"
-    assert stale["revision"] == 9
-    assert manager.page_allocator.resize_calls == [4]
+def test_worker_control_failure_reports_each_bound_participant(controls):
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    runtime.worker_ipc = True
+    runtime.sources += (dict(native.states["gpu-b"], gpu="gpu-b", instance="model"),)
+    control.set_instance_memory_limit(0)
+    runtime.executing = runtime.poll(force=True)
+    # A replacement participant must not receive an old worker's failure.
+    native.states["gpu-b"]["pool_owner"] += 1
+    runtime.fail()
+    assert native.states["gpu-a"]["convergence"] == "failed"
+    assert native.states["gpu-b"]["convergence"] == "pending"
 
 
-def test_instance_limit_is_split_by_pool_capacity():
-    from kvcached import control
-    from kvcached.pool_registry import (
-        clear_registered_kv_cache_pools,
-        register_kv_cache_pool,
-    )
-
-    clear_registered_kv_cache_pools()
-
-    class Pool:
-        def __init__(self, group_id, name, capacity):
-            self.group_id = group_id
-            self.pool_name = name
-            self.mem_size = capacity
-            self.num_layers = 1
-            self.num_kv_buffers = 1
-            self.received = None
-
-        def set_memory_limit(self, limit_bytes, *, revision):
-            self.received = (limit_bytes, revision)
-            return {
-                "status": "applied",
-                "mapped_bytes": 0,
-                "effective_limit_bytes": limit_bytes,
-            }
-
-    pools = [Pool(0, "large", 3), Pool(1, "small", 1)]
-    register_kv_cache_pool(pools[0], integration="vllm")
-    register_kv_cache_pool(pools[1], integration="vllm")
-    try:
-        result = control.set_instance_memory_limit(101, revision=4)
-
-        assert pools[0].received == (3, 4)
-        assert pools[1].received == (1, 4)
-        assert result["status"] == "applied"
-        assert result["effective_limit_bytes"] == 4
-    finally:
-        clear_registered_kv_cache_pools()
+@pytest.mark.parametrize("left,right,expected", [
+    ("unsupported", "pending", "unsupported"),
+    ("converged", "unsupported", "unsupported"),
+    ("unsupported", "unsupported", "unsupported"),
+    ("failed", "unsupported", "failed"),
+    ("unsupported", "failed", "failed"),
+    ("unavailable", "unsupported", "unavailable"),
+    ("converged", "pending", "pending"),
+    ("converged", "converged", "converged"),
+])
+def test_instance_terminal_state_priority(controls, left, right, expected):
+    _, native, control = controls
+    for state, status in zip(native.states.values(), (left, right)):
+        state.update(status=status, convergence=status)
+    result = control.get_instance_memory_limit("model")
+    assert result["status"] == expected
+    assert result["converged"] == (expected == "converged")
+    native.states["gpu-b"]["registered_participants"] = 0
+    assert control.get_instance_memory_limit("model")["status"] == "unavailable"
 
 
-def test_instance_limit_reports_unavailable_without_live_pools():
-    from kvcached import control
-    from kvcached.pool_registry import clear_registered_kv_cache_pools
+def test_monitoring_and_publication_use_distinct_native_queries(controls, monkeypatch):
+    manager, native, control = controls
+    calls = []
+    original = native.query_instance_control
+    def locked(*args):
+        calls.append("locked")
+        return original(*args)
 
-    clear_registered_kv_cache_pools()
-    result = control.set_instance_memory_limit(1024, revision=1)
+    def observe(*args):
+        calls.append("observe")
+        return original(*args)
 
-    assert result["status"] == "unavailable"
-    assert result["reason"] == "no_registered_kv_cache_pool"
-    assert result["pools"] == []
+    monkeypatch.setattr(native, "query_instance_control", locked)
+    monkeypatch.setattr(native, "observe_instance_control", observe)
+    manager.memory_limit_state()
+    assert calls == ["observe", "observe"]
+    calls.clear()
+    control.set_instance_memory_limit(0)
+    assert calls == ["locked", "locked"]
+    calls.clear()
+    manager._runtime_control.poll(force=True)
+    assert calls == ["locked"]
 
 
-def test_instance_limit_preserves_a_rejected_pool(monkeypatch):
-    from kvcached import control
-
-    pools = [_manager(), _manager()]
-    share = pools[0]._memory_limit_page_bundle_bytes() * 8
-    for pool in pools:
-        pool.set_memory_limit(share, revision=1)
-    pools[0]._resize_rejected = True
-    monkeypatch.setattr(control, "get_registered_kv_cache_pools",
-                        lambda: [(pool, {}) for pool in pools])
-    state = control.set_instance_memory_limit(share * 2, revision=1)
-    assert state["status"] == "rejected"
-    assert state["reason"] == "quarantined_pages_prevent_resize"
-    assert [pool["status"] for pool in state["pools"]] == ["rejected", "applied"]
+@pytest.mark.parametrize("reserve_null", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("limit_bytes", [0, 123])
+def test_exact_page_floor_with_nondivisible_blocks(controls, reserve_null, deferred, limit_bytes):
+    manager, native, control = controls
+    manager.null_block = [0] if reserve_null else None
+    manager.block_mem_size = 3 * manager.page_size // 8
+    manager.page_allocator.inuse_pages = 3 if deferred else int(reserve_null)
+    control.set_instance_memory_limit(limit_bytes)
+    for state in native.states.values():
+        state["pool_target_bytes"] = manager._memory_limit_page_bundle_bytes() * int(reserve_null)
+        state.update(published=True, revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls[-1] == int(reserve_null)
+    if deferred:
+        assert manager.target_num_pages == int(reserve_null)
+        manager.page_allocator.inuse_pages = int(reserve_null)
+        manager._maybe_finish_shrink()
+    assert not manager.in_shrink
+    assert manager.page_allocator.total_pages == int(reserve_null)
+    assert manager.target_num_pages is None
