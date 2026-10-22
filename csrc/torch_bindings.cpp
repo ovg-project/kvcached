@@ -417,6 +417,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &kvcached::map_to_kv_tensors_with_result,
         "map_to_kv_tensors_with_result", py::arg("offsets"),
         py::arg("group_id") = 0);
+  m.def(
+      "observe_physical_budget",
+      [](const std::string &physical_device) {
+        kvcached::BudgetObservation state;
+        {
+          py::gil_scoped_release release;
+          state = kvcached::observe_physical_budget(physical_device);
+        }
+        py::dict result;
+        result["budget_bytes"] = state.budget_bytes;
+        result["last_sample_ns"] = state.last_sample_ns;
+        result["incomplete"] = state.incomplete;
+        py::list pools;
+        for (const auto &pool : state.pools) {
+          py::dict entry;
+          entry["generation"] = pool.generation;
+          entry["instance"] = pool.instance;
+          entry["group"] = pool.group;
+          entry["charged_bytes"] = pool.charged_bytes;
+          entry["limit_bytes"] = pool.limit_bytes;
+          entry["revision"] = pool.revision;
+          entry["has_revision"] = pool.has_revision;
+          pools.append(entry);
+        }
+        result["pools"] = pools;
+        return result;
+      },
+      py::arg("physical_device"),
+      "Read atomic budget observations without sampling or the ledger lock. "
+      "Fields are not a consistent snapshot or admission authority. "
+      "Missing/initializing/incompatible ledgers raise RuntimeError. "
+      "The argument is the allocator's PCI bus ID, not a file path.");
   m.def("physical_budget_state", &kvcached::physical_budget_state,
         py::arg("group_id") = 0);
   m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,

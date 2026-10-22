@@ -18,15 +18,21 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473033ULL;
+constexpr uint64_t kMagic = 0x4b56425544473034ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
 constexpr off_t kPoolLeaseStart = 3;
 static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
               "shared budget needs lock-free aligned 64-bit publication");
-void publish(uint64_t &target, uint64_t value) {
-  __atomic_store_n(&target, value, __ATOMIC_RELEASE);
+template <typename T, typename V> void publish(T &target, V value) {
+  __atomic_store_n(&target, static_cast<T>(value), __ATOMIC_SEQ_CST);
+}
+// Sequential ordering is used only for publication/observation. In particular,
+// identity checks bracket atomic payload reads across slot reuse, without
+// promising consistency between updates within the same identity.
+template <typename T> T observe(const T &source) {
+  return __atomic_load_n(&source, __ATOMIC_SEQ_CST);
 }
 uint64_t add(uint64_t a, uint64_t b) {
   if (b > UINT64_MAX - a)
@@ -90,6 +96,7 @@ struct GpuBudget::Shared {
   uint64_t magic;
   uint64_t budget;
   uint64_t last_sample_ns;
+  uint64_t next_generation; // writer-only, under the ledger lock
   struct Instance {
     char name[kName];
     uint64_t limit;
@@ -98,12 +105,101 @@ struct GpuBudget::Shared {
     uint64_t valid;
   } instances[kInstances];
   struct Pool {
+    uint64_t generation;
     uint64_t owner;
     uint64_t instance;
     int64_t group;
     alignas(8) uint64_t charged;
   } pools[kPools];
 };
+
+BudgetObservation observe_gpu_budget(const std::string &path) {
+  using Shared = GpuBudget::Shared;
+  struct Mapping {
+    int fd = -1;
+    const Shared *data = nullptr;
+    ~Mapping() {
+      if (data)
+        munmap(const_cast<Shared *>(data), sizeof(Shared));
+      if (fd >= 0)
+        close(fd);
+    }
+  } mapping;
+  mapping.fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (mapping.fd < 0)
+    throw system_error("open KV budget observation");
+  // These nonblocking lifetime leases never acquire the accounting flock.
+  // Pin an already live epoch before mapping: initialization/reset/truncation
+  // cannot race the read, and a reader cannot resurrect an abandoned epoch.
+  if (lease(mapping.fd, F_RDLCK, false, 2) < 0)
+    throw system_error("KV budget observation initializing");
+  struct flock usage{};
+  usage.l_type = F_WRLCK;
+  usage.l_whence = SEEK_SET;
+  usage.l_len = 1;
+  if (fcntl(mapping.fd, F_OFD_GETLK, &usage) < 0)
+    throw system_error("inspect KV budget observation epoch");
+  if (usage.l_type != F_RDLCK)
+    throw std::runtime_error("KV budget observation has no live epoch");
+  if (lease(mapping.fd, F_RDLCK, false) < 0)
+    throw system_error("retain KV budget observation epoch");
+  struct stat held{}, current{};
+  auto validate = [&] {
+    if (fstat(mapping.fd, &held) < 0 || lstat(path.c_str(), &current) < 0 ||
+        !S_ISREG(held.st_mode) || !S_ISREG(current.st_mode) ||
+        held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
+        held.st_size != static_cast<off_t>(sizeof(Shared)))
+      throw std::runtime_error(
+          "unavailable or incompatible KV budget observation");
+  };
+  validate();
+  void *address =
+      mmap(nullptr, sizeof(Shared), PROT_READ, MAP_SHARED, mapping.fd, 0);
+  if (address == MAP_FAILED)
+    throw system_error("map KV budget observation");
+  mapping.data = static_cast<const Shared *>(address);
+  const auto &shared = *mapping.data;
+  if (observe(shared.magic) != kMagic)
+    throw std::runtime_error("incompatible KV budget observation protocol");
+  BudgetObservation result;
+  result.budget_bytes = observe(shared.budget);
+  result.last_sample_ns = observe(shared.last_sample_ns);
+  for (const auto &pool : shared.pools) {
+    const auto generation = observe(pool.generation);
+    if (!generation) {
+      // Interrupted retirement may leave charged resources in an invalid slot.
+      if (observe(pool.owner) || observe(pool.charged))
+        result.incomplete = true;
+      continue;
+    }
+    const auto index = observe(pool.instance);
+    if (index >= kInstances)
+      throw std::runtime_error("invalid KV budget observation instance");
+    const auto &instance = shared.instances[index];
+    const auto identity = observe(instance.valid);
+    BudgetPoolObservation entry;
+    entry.generation = generation;
+    for (const auto &byte : instance.name) {
+      const auto value = observe(byte);
+      if (!value)
+        break;
+      entry.instance += value;
+    }
+    entry.group = observe(pool.group);
+    entry.charged_bytes = observe(pool.charged);
+    entry.limit_bytes = observe(instance.limit);
+    entry.revision = observe(instance.revision);
+    entry.has_revision = observe(instance.has_revision) != 0;
+    if (!identity || identity != observe(instance.valid) ||
+        generation != observe(pool.generation)) {
+      result.incomplete = true;
+      continue;
+    }
+    result.pools.push_back(std::move(entry));
+  }
+  validate();
+  return result;
+}
 
 struct GpuBudget::Locked {
   GpuBudget &budget;
@@ -223,8 +319,10 @@ GpuBudget::~GpuBudget() {
       for (auto slot : slots_) {
         auto &pool = shared_->pools[slot];
         // Unknown resources remain charged while any other participant lives.
-        if (pool.owner == owner_ && pool.charged == 0)
+        if (pool.owner == owner_ && pool.charged == 0) {
+          publish(pool.generation, 0);
           publish(pool.owner, 0);
+        }
         if (pool.owner == 0 &&
             lease(fd_, F_UNLCK, false, kPoolLeaseStart + slot) < 0)
           throw system_error("release KV budget pool owner");
@@ -281,6 +379,7 @@ void GpuBudget::retire_dead_pools() {
       throw system_error("inspect KV budget pool owner");
     if (owner_lock.l_type != F_UNLCK)
       continue;
+    publish(pool.generation, 0);
     const auto charged = pool.charged;
     const auto budget = shared_->budget;
     publish(shared_->budget, budget > charged ? budget - charged : 0);
@@ -315,10 +414,14 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
     for (size_t i = 0; i < kInstances; ++i) {
       auto &entry = shared_->instances[i];
       if (!entry.valid) {
-        std::memset(&entry, 0, sizeof(entry));
-        std::memcpy(entry.name, instance.c_str(), instance.size() + 1);
-        entry.limit = UINT64_MAX;
-        publish(entry.valid, 1);
+        const auto generation = add(shared_->next_generation, 1);
+        shared_->next_generation = generation;
+        for (size_t n = 0; n < kName; ++n)
+          publish(entry.name[n], n < instance.size() ? instance[n] : '\0');
+        publish(entry.limit, UINT64_MAX);
+        publish(entry.revision, 0);
+        publish(entry.has_revision, 0);
+        publish(entry.valid, generation);
         instance_index = i;
         break;
       }
@@ -339,9 +442,12 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
         slots_.pop_back();
         throw system_error("retain KV budget pool owner");
       }
-      entry.instance = instance_index;
-      entry.group = group;
+      const auto generation = add(shared_->next_generation, 1);
+      shared_->next_generation = generation;
+      publish(entry.instance, instance_index);
+      publish(entry.group, group);
       publish(entry.owner, owner_);
+      publish(entry.generation, generation);
       return i;
     }
   }
@@ -447,8 +553,8 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
   if (entry.has_revision && revision == entry.revision)
     return entry.limit == bytes ? "applied" : "conflict";
   publish(entry.limit, bytes);
-  entry.revision = revision;
-  entry.has_revision = 1;
+  publish(entry.revision, revision);
+  publish(entry.has_revision, 1);
   return "applied";
 }
 
@@ -476,7 +582,7 @@ bool GpuBudget::recalibrate(const Sampler &sampler) {
   // and changes since the driver sample can temporarily overstate capacity.
   // Negative headroom remains signed until combined with current charges.
   publish(shared_->budget, sampled_capacity(charged, free_budget));
-  shared_->last_sample_ns = monotonic_ns();
+  publish(shared_->last_sample_ns, monotonic_ns());
   return true;
 }
 

@@ -178,6 +178,11 @@ size_t checked_transaction_bytes(size_t bytes_per_offset, size_t offset_count) {
 
 } // namespace
 
+BudgetObservation observe_physical_budget(const std::string &physical_device) {
+  return observe_gpu_budget(physical_gpu_lock_path(physical_device) +
+                            ".budget-v2");
+}
+
 // Global configurable page size
 size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 

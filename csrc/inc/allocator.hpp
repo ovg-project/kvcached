@@ -23,6 +23,10 @@
 
 namespace kvcached {
 
+// Physical PCI identity, with the same namespace as allocator accounting.
+// No allocator registration, CUDA sampling or device initialization.
+BudgetObservation observe_physical_budget(const std::string &physical_device);
+
 struct PhysicalGrowthOperationStats {
   uint64_t ticket_wait_us = 0;
   uint64_t admission_us = 0;

@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <fcntl.h>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -64,6 +67,95 @@ struct ExitBudgetCleanup {
 };
 static ExitBudgetCleanup exit_cleanup;
 
+static void check_observation(const std::string &path) {
+  unlink(path.c_str());
+  rejected([&] { observe_gpu_budget(path); });
+  assert(access(path.c_str(), F_OK) != 0); // reader never creates a ledger
+  unsigned samples = 0;
+  auto budget = GpuBudget::connect(path, [&] {
+    ++samples;
+    return 8 * page;
+  });
+  auto slot = budget->register_pool("observed", 7);
+  auto grant = budget->grant(slot, page);
+  budget->set_instance_limit(slot, 4 * page, 9);
+  const auto before = budget->snapshot(slot);
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  assert(fd >= 0 && flock(fd, LOCK_EX) == 0);
+  // A separate process holds the ledger lock across open, mapping and reads.
+  // If observation accidentally takes it, the bounded child dies, not hangs CI.
+  auto child = fork();
+  assert(child >= 0);
+  if (!child) {
+    alarm(5);
+    const auto state = observe_gpu_budget(path);
+    assert(!state.incomplete && state.pools.size() == 1);
+    assert(state.budget_bytes == 8 * page);
+    assert(state.last_sample_ns != 0);
+    const auto &pool = state.pools.front();
+    assert(pool.instance == "observed" && pool.group == 7);
+    assert(pool.charged_bytes == page && pool.limit_bytes == 4 * page);
+    assert(pool.has_revision && pool.revision == 9);
+    _exit(0);
+  }
+  child_ok(child);
+  assert(flock(fd, LOCK_UN) == 0);
+  close(fd);
+  const auto first = observe_gpu_budget(path).pools.front().generation;
+  const auto after = budget->snapshot(slot);
+  assert(after.sync_acquisitions == before.sync_acquisitions + 1);
+  assert(samples == 1);
+  grant.reset();
+  auto keeper = GpuBudget::connect(path, [] { return 0; });
+  budget.reset();
+  assert(observe_gpu_budget(path).pools.empty());
+  auto replacement = GpuBudget::connect(path, [] { return 0; });
+  auto replacement_slot = replacement->register_pool("replacement", -3);
+  assert(replacement_slot == slot);
+  auto reused = observe_gpu_budget(path).pools.front();
+  assert(reused.generation != first && reused.instance == "replacement");
+  assert(reused.group == -3 && !reused.has_revision);
+  assert(reused.charged_bytes == 0 && reused.limit_bytes == UINT64_MAX);
+  replacement.reset();
+  // Exercise slot reuse concurrent with atomic payload reads. These are
+  // constructed race regressions, not a serving reproduction.
+  std::atomic<bool> finished{false};
+  std::thread writer([&] {
+    for (unsigned i = 0; i < 500; ++i) {
+      auto owner = GpuBudget::connect(path, [] { return 0; });
+      const bool alternate = i % 2;
+      auto index = owner->register_pool(alternate ? "aaaaaaaa" : "bbbbbbbb",
+                                        alternate ? 1 : 2);
+      auto held = owner->grant(index, page);
+      owner->set_instance_limit(index, 2 * page, i);
+    }
+    finished = true;
+  });
+  do {
+    try {
+      for (const auto &pool : observe_gpu_budget(path).pools) {
+        assert((pool.instance == "aaaaaaaa" && pool.group == 1) ||
+               (pool.instance == "bbbbbbbb" && pool.group == 2));
+        assert(pool.charged_bytes <= page);
+      }
+    } catch (const std::runtime_error &error) {
+      // connect() temporarily owns the initialization lease. Only this
+      // documented nonblocking-open failure is allowed by the race test.
+      assert(std::string(error.what())
+                 .find("KV budget observation initializing:") == 0);
+    }
+  } while (!finished);
+  writer.join();
+  keeper.reset();
+  rejected([&] { observe_gpu_budget(path); }); // no epoch resurrection
+  auto fresh = GpuBudget::connect(path, [] { return 3 * page; });
+  assert(observe_gpu_budget(path).budget_bytes == 3 * page);
+  fresh.reset();
+  unlink(path.c_str());
+  std::cout
+      << "PASS observation: no flock/sample, reuse, concurrent lifecycle\n";
+}
+
 static void check_interrupted_initialization(const std::string &path) {
   for (bool crash : {false, true}) {
     {
@@ -90,6 +182,7 @@ static void check_interrupted_initialization(const std::string &path) {
       _exit(0);
     }
     await_pipe(sampling[0]);
+    rejected([&] { observe_gpu_budget(path); });
     pid_t waiters[2];
     for (int i = 0; i < 2; ++i) {
       waiters[i] = fork();
@@ -607,6 +700,7 @@ int main() {
   }
   std::cout
       << "PASS calibration: headroom deficit survives release and retry\n";
+  check_observation(path);
   check_interrupted_initialization(path);
   check_capacity_recovery(path);
   check_owner_retirement(path);
