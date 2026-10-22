@@ -35,3 +35,9 @@ trap 'rm -rf "${test_build_dir}"' EXIT
   "${script_dir}/test_control_segment.cpp" \
   -o "${test_build_dir}/test_control_segment"
 "${test_build_dir}/test_control_segment"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
+  -I"${repo_root}/csrc/inc" \
+  "${script_dir}/test_unified_memory.cpp" \
+  -o "${test_build_dir}/test_unified_memory"
+"${test_build_dir}/test_unified_memory"

@@ -541,7 +541,8 @@ PageState PageAllocator::get_page_state_unlocked() const {
 
 int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  CHECK_GPU(device_mem_info(gpu_vmm::current_device(), &avail_phy_mem_size,
+                            &total_phy_mem_size));
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));

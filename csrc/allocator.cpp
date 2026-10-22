@@ -140,7 +140,7 @@ void validate_physical_capacity(int dev_idx, size_t required_bytes,
   size_t total_bytes = 0;
   {
     const ScopedDeviceGuard device_guard(dev_idx);
-    const auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+    const auto status = device_mem_info(dev_idx, &free_bytes, &total_bytes);
     if (!gpu_vmm::is_success(status)) {
       throw std::runtime_error(std::string("GPU memory query failed: ") +
                                gpu_vmm::error_string(status));

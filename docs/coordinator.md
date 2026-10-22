@@ -55,7 +55,10 @@ capacity = charged + free − margin
 ```
 
 with `free` from `cudaMemGetInfo` and the margin 5% of the GPU
-(`KVCACHED_GPU_UTILIZATION`). A sample overstates the capacity, until the
+(`KVCACHED_GPU_UTILIZATION`). On a unified-memory GPU such as GB10, `free`
+is `MemAvailable` from `/proc/meminfo` instead, because the driver's count
+leaves out page cache that the kernel reclaims for device allocations.
+A sample overstates the capacity, until the
 next one, when it counts a batch both in `charged` and in `free`:
 
 - a batch that is charged but whose pages are not created yet;
