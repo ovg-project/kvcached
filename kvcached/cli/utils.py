@@ -27,16 +27,21 @@ def get_ipc_name(ipc_path: str) -> str:
     return os.path.basename(ipc_path)
 
 
-def get_segment_control(ipc_name: str):
+def get_segment_control(ipc_name: str, *, observe: bool = True):
     """Resolve an advertised SGLang group segment to its instance ledger."""
-    from kvcached.control import get_instance_memory_limit
+    from kvcached.control import _get_instance_memory_limit, get_instance_memory_limit
+
+    def query(name: str):
+        if observe:
+            return get_instance_memory_limit(name)
+        return _get_instance_memory_limit(name, observe=False)
 
     name = get_ipc_name(ipc_name)
-    state = get_instance_memory_limit(name)
+    state = query(name)
     # Prefer an exact instance, including user names that end in _g<digits>.
     base, separator, group = name.rpartition("_g")
     if not state["gpus"] and separator and base and group.isdecimal() and int(group) > 0:
-        owner = get_instance_memory_limit(base)
+        owner = query(base)
         if owner["gpus"]:
             return owner
     return state
@@ -150,7 +155,7 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
 
     from kvcached.control import set_instance_memory_limit
 
-    result = set_instance_memory_limit(kv_cache_limit, instance_name=get_segment_control(ipc_name)["instance"])
+    result = set_instance_memory_limit(kv_cache_limit, instance_name=get_segment_control(ipc_name, observe=False)["instance"])
     print(json.dumps(result, sort_keys=True))
     return result
 

@@ -17,6 +17,7 @@ if not torch.cuda.is_available():
 from kvcached import vmm_ops  # noqa: E402
 from kvcached.cli.utils import update_kv_cache_limit  # noqa: E402
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
+from kvcached.runtime_control import RuntimeControl  # noqa: E402
 
 PAGE_SIZE = 2 * 1024 * 1024
 NUM_PAGES = 4
@@ -68,14 +69,17 @@ def _exercise_zero_quota(
     )
 
     def publish(per_layer_bytes):
-        assert update_kv_cache_limit(manager.ipc_name, per_layer_bytes) is not None
-        deadline = time.monotonic() + 5
-        while manager.page_allocator.get_resize_target() != per_layer_bytes:
-            assert time.monotonic() < deadline, "resize watcher did not publish quota"
-            time.sleep(0.01)
+        result = update_kv_cache_limit(manager.ipc_name, per_layer_bytes)
+        assert result["status"] == "accepted"
+        runtime.poll(force=True)
+        manager.apply_resize_target()
+        return result
 
     try:
         manager.wait_ready(timeout=10)
+        runtime = RuntimeControl(
+            manager, worker_ipc=False, can_shrink=True, expected_participants=1)
+        setattr(manager, "_runtime_control", runtime)
         if not enable_prealloc:
             time.sleep(0.2)
             assert manager.page_allocator.get_num_reserved_pages() == 0
@@ -104,29 +108,38 @@ def _exercise_zero_quota(
             if keep_live_block:
                 manager.free(blocks)
             if reserve_null_block:
-                # The null block remains mapped; zero is a pending limit,
-                # not permission to revoke an address still in use.
-                assert manager.in_shrink
+                assert not manager.in_shrink
+                assert manager.page_allocator.get_num_total_pages() == 1
+                state = manager.memory_limit_state()
+                assert state["status"] == "pending"
+                assert state["gpus"][0]["limit_bytes"] == 0
+                assert state["gpus"][0]["charged_bytes"] == PAGE_SIZE
             else:
                 assert manager.page_allocator.get_num_total_pages() == 0
 
             if api_takeover:
-                state = manager.set_memory_limit(2 * PAGE_SIZE, revision=cycle)
-                assert state["status"] == "applied"
+                state = manager.set_memory_limit(2 * PAGE_SIZE)
+                assert state["status"] == "accepted"
+                runtime.poll(force=True)
+                manager.apply_resize_target()
 
-            # clear() must finish while the watcher still retains zero, including
-            # rebuilding the null block while the quota watcher is stopped.
+            # Repeated clear must preserve the existing null receipt under a
+            # zero cap; it cannot acquire a new background grant.
             manager.clear()
             assert manager.null_block == ([0] if reserve_null_block else None)
-            assert manager.in_shrink == (reserve_null_block and not api_takeover)
+            assert not manager.in_shrink
             if api_takeover:
-                assert manager.page_allocator.get_resize_target() == 0
                 assert manager.page_allocator.get_num_total_pages() == 2
                 assert manager.alloc(0) == []
                 assert manager.page_allocator.get_num_total_pages() == 2
             else:
                 mapped_free = manager.num_avail_blocks
                 assert manager.alloc(mapped_free + 1) is None
+                time.sleep(0.2)
+                assert manager.page_allocator.get_num_reserved_pages() == 0
+                assert manager.page_allocator.get_num_total_pages() == int(reserve_null_block)
+                state = manager.memory_limit_state()
+                assert state["status"] == ("pending" if reserve_null_block else "converged")
 
             publish(NUM_PAGES * PAGE_SIZE)
             recovered = manager.alloc(1)

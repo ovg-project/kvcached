@@ -427,7 +427,8 @@ std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
 }
 
 InstanceControl FTensorAllocator::configure_instance_control(
-    bool can_shrink, uint64_t expected_participants, uint64_t startup_pages) {
+    bool can_shrink, uint64_t expected_participants, uint64_t startup_pages,
+    bool reserve_null) {
   std::lock_guard<std::mutex> lock(mtx_);
   if (num_layers_ <= 0 || physical_bytes_per_offset_ == 0)
     throw std::runtime_error(
@@ -443,9 +444,12 @@ InstanceControl FTensorAllocator::configure_instance_control(
     budget_->configure_control_pool(
         budget_slot_,
         checked_transaction_bytes(startup_pages, physical_bytes_per_offset_),
-        physical_bytes_per_offset_, can_shrink, expected_participants);
+        physical_bytes_per_offset_, can_shrink, expected_participants,
+        reserve_null);
     budget_->ready_control_pool(budget_slot_);
   } else if (state.can_shrink != can_shrink ||
+             state.minimum_bytes !=
+                 (reserve_null ? physical_bytes_per_offset_ : 0) ||
              state.pool_capacity_bytes !=
                  checked_transaction_bytes(startup_pages,
                                            physical_bytes_per_offset_) ||

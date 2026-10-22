@@ -348,7 +348,7 @@ class KVCacheManager:
         self.null_block: Optional[list[int]] = None
 
         self.in_shrink: bool = False
-        self.target_num_blocks: Optional[int] = None
+        self.target_num_pages: Optional[int] = None
         self._resize_rejected: bool = False
         self._rejected_resize_target: Optional[int] = None
         # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
@@ -1024,17 +1024,18 @@ class KVCacheManager:
             # physically mapped for an in-flight worker batch.
             return
         if self.in_shrink:
-            assert self.target_num_blocks is not None
-            if self._get_num_alloced_blocks() <= self.target_num_blocks:
+            assert self.target_num_pages is not None
+            target_blocks = self.target_num_pages * self.page_size // self.block_mem_size
+            if self._get_num_alloced_blocks() <= target_blocks:
                 try:
                     resized = self.page_allocator.resize(
-                        self.target_num_blocks * self.block_mem_size)
+                        self.target_num_pages * self.page_size)
                 except QuarantinedResizeError:
                     # Reject the pending limit without blocking healthy pages.
                     self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
                     self.in_shrink = False
-                    self.target_num_blocks = None
+                    self.target_num_pages = None
                     control = getattr(self, "_runtime_control", None)
                     if control is not None:
                         control.fail()
@@ -1052,15 +1053,15 @@ class KVCacheManager:
                         # footprint and this toggle bypasses resize(), so drop the
                         # cached value so available_size() re-reads the driver.
                         self._avail_physical_pages_cache = None
-                        self.target_num_blocks = None
+                        self.target_num_pages = None
                         control = getattr(self, "_runtime_control", None)
                         if control is not None:
                             control.acknowledge()
                     else:
                         logger.warning(
-                            "shrink to %d blocks refused by allocator "
+                            "shrink to %d pages refused by allocator "
                             "(in-use pages above target); keeping shrink pending",
-                            self.target_num_blocks)
+                            self.target_num_pages)
 
     @synchronized
     def capture_physical_release_marker(self) -> int:
@@ -1201,13 +1202,19 @@ class KVCacheManager:
 
         Retired pages are already empty and only wait for physical release.
         """
-        if not self.in_shrink or self.target_num_blocks is None:
+        if not self.in_shrink or self.target_num_pages is None:
             return 0
-        target_pages = (self.target_num_blocks * self.block_mem_size
-                        // self.page_size)
         retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
         occupied = len(self.full_pages) + len(self.avail_pages) - retiring
-        return max(0, occupied - target_pages)
+        return max(0, occupied - self.target_num_pages)
+
+    @property
+    def target_num_blocks(self) -> Optional[int]:
+        """Block equivalent for diagnostics; shrink execution uses whole pages."""
+        target_pages = getattr(self, "target_num_pages", None)
+        if target_pages is None:
+            return None
+        return target_pages * self.page_size // self.block_mem_size
 
     def _retiring_page_ids(self) -> frozenset:
         return frozenset(
@@ -1256,12 +1263,17 @@ class KVCacheManager:
         # A kvctl quota can exceed the startup size, but the KV tensors only
         # reserve mem_size, so the pool cannot grow past it.
         new_mem_size = min(new_mem_size, self.mem_size)
+        # The permanent null block pins one page. Keep the control limit
+        # unchanged, but give the allocator a reachable physical target so
+        # it reclaims every other page before background preallocation resumes.
+        target_pages = max(int(getattr(self, "null_block", None) is not None),
+                           new_mem_size // self.page_size)
         try:
-            resized = self.page_allocator.resize(new_mem_size)
+            resized = self.page_allocator.resize(target_pages * self.page_size)
         except QuarantinedResizeError:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
                 self._resize_rejected = True
             raise
         except Exception as e:
@@ -1274,7 +1286,7 @@ class KVCacheManager:
         if resized:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
             return True  # Successfully resized.
         # Failed to resize due to too many in-use blocks. Free any
         # outstanding reserved blocks before entering the lazy shrink wait.
@@ -1284,7 +1296,7 @@ class KVCacheManager:
         assert (len(self.reserved_blocks) == 0
                 ), "Reserved blocks must be freed before resizing."
         self.in_shrink = True
-        self.target_num_blocks = new_mem_size // self.block_mem_size
+        self.target_num_pages = target_pages
         return False
 
     @_after_post_init
@@ -1650,7 +1662,7 @@ class KVCacheManager:
         # (which yields block 0 — the null block SGLang requires).
         self.page_allocator.reset_free_page_order()
 
-        self.target_num_blocks = None
+        self.target_num_pages = None
         self.in_shrink = False
         # clear() freed every page and trimmed; drop the cached value so
         # the next available_size() re-reads the post-clear physical state.

@@ -408,7 +408,8 @@ def _start_worker_listener_thread(
                     from kvcached import _C  # type: ignore[attr-defined]
                     state = _C.local_instance_control(group_id, msg.get("configure"),
                                                       msg.get("expected_participants", 0),
-                                                      msg.get("startup_pages", 0))
+                                                      msg.get("startup_pages", 0),
+                                                      msg.get("reserve_null", False))
                     send_msg(conn, {"status": "success", "control": state})
                 elif msg["cmd"] == "ack_instance_control":
                     from kvcached import _C  # type: ignore[attr-defined]
@@ -760,7 +761,7 @@ def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0, group_id: int =
 
 
 async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
-                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0):
+                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
     targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
                for rank in range(tp_size)]
     messages = []
@@ -768,7 +769,7 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
         if acknowledgements is None:
             messages.append({"cmd": "instance_control", "group_id": group_id,
                              "configure": configure, "expected_participants": expected_participants,
-                             "startup_pages": startup_pages})
+                             "startup_pages": startup_pages, "reserve_null": reserve_null})
         else:
             messages.append({"cmd": "ack_instance_control", "group_id": group_id,
                              "generation": acknowledgements[(stage, rank)][0],
@@ -791,6 +792,6 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
 
 
 def control_workers(tp_size: int, pp_rank: int, group_id: int,
-                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0):
+                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
     return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
-                                       configure, acknowledgements, expected_participants, startup_pages))
+                                       configure, acknowledgements, expected_participants, startup_pages, reserve_null))

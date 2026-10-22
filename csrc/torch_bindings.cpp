@@ -391,6 +391,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["pool_target_bytes"] = state.pool_target_bytes;
   result["pool_capacity_bytes"] = state.pool_capacity_bytes;
   result["page_bundle_bytes"] = state.page_bundle_bytes;
+  result["minimum_bytes"] = state.minimum_bytes;
   result["can_shrink"] = state.can_shrink;
   result["ready"] = state.ready;
   result["registered_participants"] = state.registered_participants;
@@ -403,14 +404,15 @@ py::dict control_dict(const InstanceControl &state) {
 
 py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
                                 uint64_t expected_participants,
-                                uint64_t startup_pages) {
+                                uint64_t startup_pages, bool reserve_null) {
   InstanceControl state;
   std::string path, name;
   {
     py::gil_scoped_release release;
     auto allocator = FTensorAllocator::global_allocator(group_id);
     state = configure ? allocator->configure_instance_control(
-                            *configure, expected_participants, startup_pages)
+                            *configure, expected_participants, startup_pages,
+                            reserve_null)
                       : allocator->instance_control_state();
     path = allocator->instance_control_path();
     name = FTensorAllocator::instance_control_name();
@@ -428,6 +430,16 @@ py::dict query_instance_control(const std::string &path,
   {
     py::gil_scoped_release release;
     state = GpuBudget::open_control(path)->query_control(name, slot);
+  }
+  return control_dict(state);
+}
+
+py::dict observe_instance_control(const std::string &path,
+                                  const std::string &name) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path, true)->observe_control(name);
   }
   return control_dict(state);
 }
@@ -497,9 +509,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("local_instance_control", &kvcached::local_instance_control,
         py::arg("group_id") = 0, py::arg("configure") = py::none(),
-        py::arg("expected_participants") = 0, py::arg("startup_pages") = 0);
+        py::arg("expected_participants") = 0, py::arg("startup_pages") = 0,
+        py::arg("reserve_null") = false);
   m.def("query_instance_control", &kvcached::query_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
+  m.def("observe_instance_control", &kvcached::observe_instance_control,
+        py::arg("path"), py::arg("instance"));
   m.def("publish_instance_control", &kvcached::publish_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("bytes"),
         py::arg("generation"), py::arg("revision") = py::none());

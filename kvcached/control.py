@@ -12,16 +12,22 @@ from typing import Any
 
 
 def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any]:
+    """Return a bounded observational snapshot, never an admission decision."""
+    return _get_instance_memory_limit(instance_name, observe=True)
+
+
+def _get_instance_memory_limit(instance_name: str | None, *, observe: bool) -> dict[str, Any]:
     from kvcached import _C  # type: ignore[attr-defined]
     from kvcached.utils import DEFAULT_IPC_NAME
 
     name = DEFAULT_IPC_NAME if instance_name is None else instance_name
     directory = os.getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", "/dev/shm")
+    query = _C.observe_instance_control if observe else _C.query_instance_control
     states = []
     errors = []
     for path in sorted(glob.glob(os.path.join(directory, "kvcached-physical-growth-*.lock.budget-v2"))):
         try:
-            state = dict(_C.query_instance_control(path, name))
+            state = dict(query(path, name))
         except (OSError, RuntimeError) as error:
             errors.append({"gpu": path, "error": str(error)})
             continue
@@ -31,9 +37,11 @@ def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any
     complete = (len(expected) == 1 and next(iter(expected)) > 0
                 and sum(state["registered_participants"] for state in states) == next(iter(expected)))
     converged = complete and all(state["convergence"] == "converged" for state in states)
+    unsupported = any(state["convergence"] == "unsupported" for state in states)
+    unavailable = any(state["convergence"] == "unavailable" for state in states)
     failed = any(state["convergence"] == "failed" for state in states)
-    return {"instance": name, "status": "unavailable" if not complete else
-            "failed" if failed else "converged" if converged else "pending", "complete_membership": complete,
+    return {"instance": name, "status": "unavailable" if not complete or unavailable else
+            "failed" if failed else "unsupported" if unsupported else "converged" if converged else "pending", "complete_membership": complete,
             "converged": converged, "gpus": states, "discovery_errors": errors}
 
 
@@ -55,7 +63,7 @@ def set_instance_memory_limit(
         raise ValueError("explicit revision requires per-GPU generations from get_instance_memory_limit()")
     from kvcached import _C  # type: ignore[attr-defined]
 
-    snapshot = get_instance_memory_limit(instance_name)
+    snapshot = _get_instance_memory_limit(instance_name, observe=False)
     if not snapshot["complete_membership"]:
         return dict(snapshot, accepted=False)
     selected = set(gpu_ids) if gpu_ids is not None else {state["gpu"] for state in snapshot["gpus"]}

@@ -94,9 +94,11 @@ def test_real_zero_clear_preserves_pending_revision(pools):
     configure(managers)
     result = manager.set_memory_limit(0)
     apply(manager)
-    assert manager.in_shrink
+    assert not manager.in_shrink
+    assert manager.page_allocator.get_num_total_pages() == 1
     manager.clear()
-    assert manager.null_block == [0] and manager.in_shrink
+    assert manager.null_block == [0] and not manager.in_shrink
+    assert manager.page_allocator.get_num_total_pages() == 1
     state = control.get_instance_memory_limit()
     assert not state["converged"]
     assert state["gpus"][0]["revision"] == result["gpus"][0]["revision"]
@@ -113,6 +115,7 @@ def test_real_unsupported_shrink_blocks_growth(pools):
     configure(managers, supported=False)
     result = manager.set_memory_limit(0)
     assert result["gpus"][0]["convergence"] == "unsupported"
+    assert control.get_instance_memory_limit()["status"] == "unsupported"
     apply(manager)
     assert not manager.in_shrink
     assert manager.alloc(1) is None
@@ -136,3 +139,27 @@ def test_real_cli_api_share_publication_and_observation(pools, capsys):
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["gpus"][0]["revision"] == second["gpus"][0]["revision"]
     assert rows[0]["limit_bytes"] == 8 * PAGE
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+def test_real_mixed_null_pools_keep_physical_floor_and_exact_cap(pools, limit):
+    create, managers = pools
+    create(1, 0, null=True)
+    create(2, 1, null=True)
+    create(1, 2, null=False)
+    configure(managers)
+    accepted = control.set_instance_memory_limit(limit)
+    assert accepted["accepted"]
+    for manager in managers:
+        apply(manager)
+    state = control.get_instance_memory_limit()
+    assert state["status"] == "pending"
+    assert state["gpus"][0]["limit_bytes"] == limit
+    assert state["gpus"][0]["charged_bytes"] == 6 * PAGE
+    assert state["gpus"][0]["effective_limit_bytes"] == 6 * PAGE
+    assert [m.page_allocator.get_num_total_pages() for m in managers] == [1, 1, 0]
+    assert managers[2].alloc(1) is None
+    control.set_instance_memory_limit(12 * PAGE)
+    for manager in managers:
+        apply(manager)
+    assert control.get_instance_memory_limit()["converged"]

@@ -30,6 +30,7 @@ struct InstanceControl {
   uint64_t pool_target_bytes = 0;
   uint64_t pool_capacity_bytes = 0;
   uint64_t page_bundle_bytes = 0;
+  uint64_t minimum_bytes = 0;
   bool can_shrink = false;
   bool ready = false;
   uint64_t participants = 0;
@@ -118,7 +119,8 @@ public:
   static std::shared_ptr<GpuBudget> connect(const std::string &path,
                                             const Sampler &sampler);
   // Attach to an existing live ledger without creating or sampling an epoch.
-  static std::shared_ptr<GpuBudget> open_control(const std::string &path);
+  static std::shared_ptr<GpuBudget> open_control(const std::string &path,
+                                                 bool observe = false);
   ~GpuBudget();
   size_t register_pool(const std::string &instance, int64_t pool);
   std::unique_ptr<BudgetGrant> grant(size_t slot, uint64_t bytes,
@@ -131,10 +133,12 @@ public:
                                  uint64_t revision);
   void configure_control_pool(size_t slot, uint64_t capacity,
                               uint64_t page_bundle, bool can_shrink,
-                              uint64_t expected_participants = 0);
+                              uint64_t expected_participants = 0,
+                              bool reserve_null = false);
   void ready_control_pool(size_t slot);
   InstanceControl query_control(const std::string &instance,
                                 size_t slot = SIZE_MAX);
+  InstanceControl observe_control(const std::string &instance);
   InstanceControl publish_control(const std::string &instance, uint64_t bytes,
                                   uint64_t generation,
                                   std::optional<uint64_t> revision = {});
@@ -163,9 +167,9 @@ private:
     std::unordered_map<size_t, uint64_t> refunds;
   };
   explicit GpuBudget(const std::string &path, const Sampler &sampler);
-  explicit GpuBudget(const std::string &path);
-  InstanceControl control_state_locked(size_t instance,
-                                       size_t slot = SIZE_MAX) const;
+  explicit GpuBudget(const std::string &path, bool observe);
+  InstanceControl control_state_locked(size_t instance, size_t slot = SIZE_MAX,
+                                       const Shared *snapshot = nullptr) const;
   InstanceControl publish_control_locked(size_t instance, uint64_t bytes,
                                          std::optional<uint64_t> revision);
   void check_owner() const;

@@ -166,7 +166,7 @@ def _make_manager(defer_physical_release: bool) -> KVCacheManager:
     manager.full_pages = {}
     manager.reserved_blocks = []
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._resize_rejected = False
     manager._rejected_resize_target = None
     manager._avail_physical_pages_cache = None
@@ -397,7 +397,7 @@ def test_shrink_does_not_reallocate_retiring_pages(pool):
 
 def test_zero_kvctl_limit_is_applied(pool):
     """0 is a limit, not the "nothing published" value (-1). The null
-    block's page keeps it deferred; every other page is evicted."""
+    block's page remains over quota; every other page is evicted."""
     _fill_prefix_cache(pool)
     manager = pool.kv_cache_manager
     manager.set_memory_limit(0)
@@ -406,8 +406,10 @@ def test_zero_kvctl_limit_is_applied(pool):
     manager.reclaim_for_shrink()
     _end_step(pool)
 
-    assert manager.page_allocator.resize_calls == [0]
+    assert manager.page_allocator.resize_calls == [1, 1]
     assert _mapped_pages(pool) == 1
+    assert manager.page_allocator.total_pages == 1
+    assert not manager.in_shrink
     # Blocks sharing the null block's page cannot free it and stay cached.
     assert {bid // BLOCKS_PER_PAGE for bid in pool._evictable_blocks} == {0}
     assert manager.memory_limit_state()["status"] == "pending"

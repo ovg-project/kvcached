@@ -27,14 +27,15 @@ def attach_control(manager, monkeypatch):
             state["status"] = state["convergence"] = (
                 "failed" if failed[0] == state["revision"] else
                 "converged" if acked[0] == state["revision"] and
-                state["charged_bytes"] <= state["pool_target_bytes"] else "pending")
+                state["charged_bytes"] <= min(state["pool_target_bytes"], state["requested_bytes"]) else "pending")
         return dict(state)
 
     def publish(path, name, limit, generation, revision):
         assert generation == 42
         state.update(revision=state["revision"] + 1 if revision is None else revision,
                      published=True, requested_bytes=limit,
-                     pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
+                     pool_target_bytes=max(bundle if getattr(manager, "null_block", None) is not None else 0,
+                                           min(limit // bundle * bundle, state["pool_capacity_bytes"])))
         state["effective_limit_bytes"] = state["pool_target_bytes"]
         return dict(query(), status="accepted")
 
@@ -53,7 +54,7 @@ def attach_control(manager, monkeypatch):
         return True
 
     monkeypatch.setattr(kvcached, "_C", SimpleNamespace(
-        local_instance_control=query, query_instance_control=query,
+        local_instance_control=query, query_instance_control=query, observe_instance_control=query,
         publish_instance_control=publish, acknowledge_instance_control=ack,
         fail_instance_control=fail), raising=False)
     monkeypatch.setattr(control.glob, "glob", lambda _: ["test-gpu"])

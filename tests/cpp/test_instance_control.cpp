@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <fcntl.h>
 #include <set>
 #include <stdexcept>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -260,6 +264,93 @@ int main() {
                                  first.generation, first.revision));
     assert(budget->acknowledge_control(slot, next.revision));
     assert(writer->query_control("failure").status == "converged");
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto a = budget->register_pool("floors", 0);
+    auto b = budget->register_pool("floors", 1);
+    auto c = budget->register_pool("floors", 2);
+    budget->configure_control_pool(a, 120, 12, true, 3, true);
+    budget->configure_control_pool(b, 240, 24, true, 3, true);
+    budget->configure_control_pool(c, 120, 12, true, 3, false);
+    for (auto slot : {a, b, c})
+      budget->ready_control_pool(slot);
+    auto grant_a = budget->grant(a, 24);
+    auto receipt_a = grant_a->take(24);
+    grant_a->finish();
+    auto grant_b = budget->grant(b, 24);
+    auto receipt_b = grant_b->take(24);
+    grant_b->finish();
+    const auto generation = budget->query_control("floors").generation;
+    for (auto limit : {0ULL, 1ULL, 36ULL}) {
+      auto state = budget->publish_control("floors", limit, generation);
+      assert(state.requested_bytes == limit);
+      assert(budget->control_state(a).pool_target_bytes == 12);
+      assert(budget->control_state(b).pool_target_bytes == 24);
+      assert(budget->control_state(c).pool_target_bytes == 0);
+      for (auto slot : {a, b, c})
+        assert(budget->acknowledge_control(slot, state.revision));
+      assert(budget->query_control("floors").status == "pending");
+      bool blocked = false;
+      try {
+        budget->grant(c, 12);
+      } catch (const std::runtime_error &) {
+        blocked = true;
+      }
+      assert(blocked);
+    }
+    // Removing excess charge allows convergence at the physical floor.
+    receipt_a->release();
+    assert(budget->query_control("floors").status == "converged");
+    auto zero = budget->publish_control("floors", 0, generation);
+    for (auto slot : {a, b, c})
+      budget->acknowledge_control(slot, zero.revision);
+    assert(budget->query_control("floors").status == "pending");
+    receipt_b->release();
+    assert(budget->query_control("floors").status == "converged");
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("observe", 0);
+    budget->configure_control_pool(slot, 120, 12, true, 1);
+    budget->ready_control_pool(slot);
+    auto published = budget->publish_control(
+        "observe", 60, budget->query_control("observe").generation);
+    int held = open(path.c_str(), O_RDWR);
+    assert(held >= 0 && flock(held, LOCK_EX) == 0);
+    // Attachment, query, and destruction must all finish while flock is held.
+    alarm(10);
+    {
+      auto reader = GpuBudget::open_control(path, true);
+      auto state = reader->observe_control("observe");
+      assert(state.generation == published.generation &&
+             state.revision == published.revision);
+      assert(state.status == "pending");
+    }
+    std::atomic<bool> started{false}, finished{false};
+    std::thread writer([&] {
+      started = true;
+      assert(budget->acknowledge_control(slot, published.revision));
+      finished = true;
+    });
+    while (!started)
+      std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(!finished);
+    flock(held, LOCK_UN);
+    close(held);
+    writer.join();
+    assert(finished);
+    auto observer = GpuBudget::open_control(path, true);
+    assert(observer->observe_control("observe").status == "converged");
+    budget.reset();
+    auto replacement = GpuBudget::connect(path, [] { return 1000; });
+    slot = replacement->register_pool("observe", 0);
+    replacement->configure_control_pool(slot, 120, 12, true, 1);
+    replacement->ready_control_pool(slot);
+    auto state = observer->observe_control("observe");
+    assert(state.generation != published.generation && !state.published);
+    alarm(0);
   }
   unlink(path.c_str());
   rmdir(directory);

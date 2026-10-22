@@ -119,7 +119,7 @@ def _manager(*, inuse_pages: int = 0, reserved_pages: int = 0):
     manager.num_avail_blocks = 0
     manager.reserved_blocks = []
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager.block_mem_size = manager.page_size
     manager.avail_pages = {}
     manager.full_pages = {}
@@ -157,6 +157,8 @@ class NativeControlFake:
 
     def query_instance_control(self, path, instance, slot=None):
         return dict(self.states[path])
+
+    observe_instance_control = query_instance_control
 
     def publish_instance_control(self, path, instance, limit, generation, revision):
         if path == self.fail_gpu:
@@ -354,12 +356,12 @@ def test_runtime_uses_manager_startup_pages(controls, monkeypatch, buffers):
     manager, native, _ = controls
     manager.num_kv_buffers = buffers
     calls = []
-    def configure(group, shrink, participants, pages):
-        calls.append((group, shrink, participants, pages))
+    def configure(group, shrink, participants, pages, reserve_null):
+        calls.append((group, shrink, participants, pages, reserve_null))
         return dict(native.states["gpu-a"], gpu="gpu-a", instance="model")
     monkeypatch.setattr(native, "local_instance_control", configure)
     RuntimeControl(manager, worker_ipc=False, can_shrink=True, expected_participants=2)
-    assert calls == [(0, True, 2, 16)]
+    assert calls == [(0, True, 2, 16, False)]
 
 
 @pytest.mark.parametrize("segment,exact,expected", [
@@ -377,6 +379,7 @@ def test_group_segment_control_resolution(monkeypatch, segment, exact, expected)
         return {"instance": name, "gpus": [{}] if name == "model" or exact else []}
 
     monkeypatch.setattr(control, "get_instance_memory_limit", query)
+    monkeypatch.setattr(control, "_get_instance_memory_limit", lambda name, **kwargs: query(name))
     monkeypatch.setattr(control, "set_instance_memory_limit",
                         lambda size, *, instance_name: {"instance": instance_name})
     assert get_segment_control(segment)["instance"] == expected
@@ -485,3 +488,71 @@ def test_worker_control_failure_reports_each_bound_participant(controls):
     runtime.fail()
     assert native.states["gpu-a"]["convergence"] == "failed"
     assert native.states["gpu-b"]["convergence"] == "pending"
+
+
+@pytest.mark.parametrize("left,right,expected", [
+    ("unsupported", "pending", "unsupported"),
+    ("converged", "unsupported", "unsupported"),
+    ("unsupported", "unsupported", "unsupported"),
+    ("failed", "unsupported", "failed"),
+    ("unsupported", "failed", "failed"),
+    ("unavailable", "unsupported", "unavailable"),
+    ("converged", "pending", "pending"),
+    ("converged", "converged", "converged"),
+])
+def test_instance_terminal_state_priority(controls, left, right, expected):
+    _, native, control = controls
+    for state, status in zip(native.states.values(), (left, right)):
+        state.update(status=status, convergence=status)
+    result = control.get_instance_memory_limit("model")
+    assert result["status"] == expected
+    assert result["converged"] == (expected == "converged")
+    native.states["gpu-b"]["registered_participants"] = 0
+    assert control.get_instance_memory_limit("model")["status"] == "unavailable"
+
+
+def test_monitoring_and_publication_use_distinct_native_queries(controls, monkeypatch):
+    manager, native, control = controls
+    calls = []
+    original = native.query_instance_control
+    def locked(*args):
+        calls.append("locked")
+        return original(*args)
+
+    def observe(*args):
+        calls.append("observe")
+        return original(*args)
+
+    monkeypatch.setattr(native, "query_instance_control", locked)
+    monkeypatch.setattr(native, "observe_instance_control", observe)
+    manager.memory_limit_state()
+    assert calls == ["observe", "observe"]
+    calls.clear()
+    control.set_instance_memory_limit(0)
+    assert calls == ["locked", "locked"]
+    calls.clear()
+    manager._runtime_control.poll(force=True)
+    assert calls == ["locked"]
+
+
+@pytest.mark.parametrize("reserve_null", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("limit_bytes", [0, 123])
+def test_exact_page_floor_with_nondivisible_blocks(controls, reserve_null, deferred, limit_bytes):
+    manager, native, control = controls
+    manager.null_block = [0] if reserve_null else None
+    manager.block_mem_size = 3 * manager.page_size // 8
+    manager.page_allocator.inuse_pages = 3 if deferred else int(reserve_null)
+    control.set_instance_memory_limit(limit_bytes)
+    for state in native.states.values():
+        state["pool_target_bytes"] = manager._memory_limit_page_bundle_bytes() * int(reserve_null)
+        state.update(published=True, revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls[-1] == int(reserve_null)
+    if deferred:
+        assert manager.target_num_pages == int(reserve_null)
+        manager.page_allocator.inuse_pages = int(reserve_null)
+        manager._maybe_finish_shrink()
+    assert not manager.in_shrink
+    assert manager.page_allocator.total_pages == int(reserve_null)
+    assert manager.target_num_pages is None

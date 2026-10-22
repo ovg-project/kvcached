@@ -18,16 +18,13 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473035ULL;
+constexpr uint64_t kMagic = 0x4b56425544473036ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
 constexpr off_t kPoolLeaseStart = 3;
 static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr),
               "shared budget needs lock-free aligned 64-bit publication");
-void publish(uint64_t &target, uint64_t value) {
-  __atomic_store_n(&target, value, __ATOMIC_RELEASE);
-}
 uint64_t add(uint64_t a, uint64_t b) {
   if (b > UINT64_MAX - a)
     throw std::overflow_error("KV budget byte overflow");
@@ -86,41 +83,71 @@ uint64_t monotonic_ns() {
 }
 } // namespace
 
+// Every observational load is atomic, including strings and reused slots.
+// Writer serialization still provides authoritative admission/control ordering.
+template <typename T> struct Observed {
+  T value{};
+  Observed() = default;
+  Observed(const Observed &other) : value(static_cast<T>(other)) {}
+  operator T() const { return __atomic_load_n(&value, __ATOMIC_SEQ_CST); }
+  Observed &operator=(T next) {
+    __atomic_store_n(&value, next, __ATOMIC_SEQ_CST);
+    return *this;
+  }
+  Observed &operator=(const Observed &other) {
+    return *this = static_cast<T>(other);
+  }
+};
+void publish(Observed<uint64_t> &target, uint64_t value) { target = value; }
+
 struct GpuBudget::Shared {
-  uint64_t magic;
-  uint64_t budget;
-  uint64_t last_sample_ns;
-  uint64_t next_generation;
+  Observed<uint64_t> magic;
+  Observed<uint64_t> sequence;
+  Observed<uint64_t> budget;
+  Observed<uint64_t> last_sample_ns;
+  Observed<uint64_t> next_generation;
   struct Instance {
-    char name[kName];
-    uint64_t limit;
-    uint64_t revision;
-    uint64_t has_revision;
-    uint64_t valid;
-    uint64_t participants;
-    uint64_t generation;
-    uint64_t expected_participants;
+    Observed<char> name[kName];
+    std::string name_string() const {
+      std::string result;
+      for (const auto &c : name) {
+        const char value = c;
+        if (!value)
+          break;
+        result += value;
+      }
+      return result;
+    }
+    Observed<uint64_t> limit;
+    Observed<uint64_t> revision;
+    Observed<uint64_t> has_revision;
+    Observed<uint64_t> valid;
+    Observed<uint64_t> participants;
+    Observed<uint64_t> generation;
+    Observed<uint64_t> expected_participants;
   } instances[kInstances];
   struct Pool {
-    uint64_t owner;
-    uint64_t instance;
-    int64_t group;
-    alignas(8) uint64_t charged;
-    uint64_t capacity;
-    uint64_t page_bundle;
-    uint64_t ready;
-    uint64_t can_shrink;
-    uint64_t target;
-    uint64_t acknowledged_revision;
-    uint64_t acknowledged;
-    uint64_t failed_revision;
-    uint64_t failed;
+    Observed<uint64_t> owner;
+    Observed<uint64_t> instance;
+    Observed<int64_t> group;
+    alignas(8) Observed<uint64_t> charged;
+    Observed<uint64_t> capacity;
+    Observed<uint64_t> page_bundle;
+    Observed<uint64_t> minimum;
+    Observed<uint64_t> ready;
+    Observed<uint64_t> can_shrink;
+    Observed<uint64_t> target;
+    Observed<uint64_t> acknowledged_revision;
+    Observed<uint64_t> acknowledged;
+    Observed<uint64_t> failed_revision;
+    Observed<uint64_t> failed;
   } pools[kPools];
 };
 
 struct GpuBudget::Locked {
   GpuBudget &budget;
   std::unique_lock<std::mutex> local;
+  bool publishing = false;
   explicit Locked(GpuBudget &value) : budget(value), local(value.mutex_) {
     value.check_owner();
     const auto started = monotonic_ns();
@@ -148,8 +175,18 @@ struct GpuBudget::Locked {
       flock(value.fd_, LOCK_UN);
       throw std::runtime_error("KV budget segment was replaced");
     }
+    if (value.shared_ && value.shared_->magic == kMagic) {
+      // A subsequent writer also recovers an odd sequence left by a dead
+      // writer.
+      value.shared_->sequence = (value.shared_->sequence + 1) | 1;
+      publishing = true;
+    }
   }
-  ~Locked() { flock(budget.fd_, LOCK_UN); }
+  ~Locked() {
+    if (publishing)
+      budget.shared_->sequence = budget.shared_->sequence + 1;
+    flock(budget.fd_, LOCK_UN);
+  }
 };
 
 std::shared_ptr<GpuBudget> GpuBudget::connect(const std::string &path,
@@ -157,17 +194,19 @@ std::shared_ptr<GpuBudget> GpuBudget::connect(const std::string &path,
   return std::shared_ptr<GpuBudget>(new GpuBudget(path, sampler));
 }
 
-std::shared_ptr<GpuBudget> GpuBudget::open_control(const std::string &path) {
-  return std::shared_ptr<GpuBudget>(new GpuBudget(path));
+std::shared_ptr<GpuBudget> GpuBudget::open_control(const std::string &path,
+                                                   bool observe) {
+  return std::shared_ptr<GpuBudget>(new GpuBudget(path, observe));
 }
 
-GpuBudget::GpuBudget(const std::string &path) : path_(path), pid_(getpid()) {
+GpuBudget::GpuBudget(const std::string &path, bool observe)
+    : path_(path), pid_(getpid()) {
   fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
   if (fd_ < 0)
     throw system_error("open live KV control");
   try {
     // Serialize with epoch initialization, then require an existing user.
-    if (lease(fd_, F_WRLCK, true, 2) < 0)
+    if (lease(fd_, F_WRLCK, !observe, 2) < 0)
       throw system_error("lock KV control attachment");
     if (lease(fd_, F_WRLCK, false) == 0)
       throw std::runtime_error("KV control instance is not running");
@@ -176,7 +215,11 @@ GpuBudget::GpuBudget(const std::string &path) : path_(path), pid_(getpid()) {
     if (lease(fd_, F_RDLCK, true) < 0)
       throw system_error("retain live KV control");
     {
-      Locked lock(*this);
+      // The initialization lease stabilizes the layout. Observation must not
+      // queue behind the accounting flock, even during attachment/teardown.
+      std::unique_ptr<Locked> lock;
+      if (!observe)
+        lock = std::make_unique<Locked>(*this);
       struct stat info{};
       if (fstat(fd_, &info) < 0 ||
           info.st_size != static_cast<off_t>(sizeof(Shared)))
@@ -250,7 +293,7 @@ GpuBudget::GpuBudget(const std::string &path, const Sampler &sampler)
     if (first) {
       const auto initial_budget = sampled_capacity(0, sampler());
       Locked lock(*this);
-      std::memset(shared_, 0, sizeof(Shared));
+      *shared_ = Shared{};
       shared_->budget = initial_budget;
       shared_->last_sample_ns = monotonic_ns();
       shared_->next_generation = shared_->last_sample_ns;
@@ -273,7 +316,7 @@ GpuBudget::GpuBudget(const std::string &path, const Sampler &sampler)
 }
 
 GpuBudget::~GpuBudget() {
-  if (getpid() == pid_ && shared_) {
+  if (getpid() == pid_ && shared_ && !slots_.empty()) {
     try {
       Locked lock(*this);
       for (auto slot : slots_) {
@@ -362,7 +405,8 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
   reclaim_instances_locked();
   size_t instance_index = kInstances;
   for (size_t i = 0; i < kInstances; ++i) {
-    if (shared_->instances[i].valid && instance == shared_->instances[i].name) {
+    if (shared_->instances[i].valid &&
+        instance == shared_->instances[i].name_string()) {
       instance_index = i;
       break;
     }
@@ -371,8 +415,9 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
     for (size_t i = 0; i < kInstances; ++i) {
       auto &entry = shared_->instances[i];
       if (!entry.valid) {
-        std::memset(&entry, 0, sizeof(entry));
-        std::memcpy(entry.name, instance.c_str(), instance.size() + 1);
+        entry = Shared::Instance{};
+        for (size_t n = 0; n < instance.size(); ++n)
+          entry.name[n] = instance[n];
         entry.limit = UINT64_MAX;
         entry.generation = add(shared_->next_generation, 1);
         shared_->next_generation = entry.generation;
@@ -400,7 +445,7 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
         slots_.pop_back();
         throw system_error("retain KV budget pool owner");
       }
-      std::memset(&entry, 0, sizeof(entry));
+      entry = Shared::Pool{};
       entry.instance = instance_index;
       entry.group = group;
       publish(entry.owner, owner_);
@@ -528,8 +573,10 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
 
 void GpuBudget::configure_control_pool(size_t slot, uint64_t capacity,
                                        uint64_t page_bundle, bool can_shrink,
-                                       uint64_t expected_participants) {
-  if (!page_bundle || capacity % page_bundle)
+                                       uint64_t expected_participants,
+                                       bool reserve_null) {
+  if (!page_bundle || capacity % page_bundle ||
+      (reserve_null && capacity < page_bundle))
     throw std::invalid_argument(
         "KV control capacity must contain whole page bundles");
   Locked lock(*this);
@@ -544,6 +591,7 @@ void GpuBudget::configure_control_pool(size_t slot, uint64_t capacity,
   instance.expected_participants = expected_participants;
   pool.capacity = capacity;
   pool.page_bundle = page_bundle;
+  pool.minimum = reserve_null ? page_bundle : 0;
   pool.can_shrink = can_shrink;
 }
 
@@ -556,9 +604,10 @@ void GpuBudget::ready_control_pool(size_t slot) {
   pool.ready = 1;
 }
 
-InstanceControl GpuBudget::control_state_locked(size_t instance,
-                                                size_t slot) const {
-  const auto &entry = shared_->instances[instance];
+InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
+                                                const Shared *snapshot) const {
+  const auto *data = snapshot ? snapshot : shared_;
+  const auto &entry = data->instances[instance];
   InstanceControl state;
   state.published = entry.has_revision;
   state.generation = entry.generation;
@@ -567,10 +616,10 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
   state.participants = entry.participants;
   state.expected_participants = entry.expected_participants;
   state.status = entry.has_revision ? "pending" : "unpublished";
-  bool unsupported = false;
+  bool unsupported = false, cannot_shrink = false;
   uint64_t live = 0;
   for (size_t i = 0; i < kPools; ++i) {
-    const auto &pool = shared_->pools[i];
+    const auto &pool = data->pools[i];
     if (!pool.owner || pool.instance != instance)
       continue;
     state.charged_bytes = add(state.charged_bytes, pool.charged);
@@ -596,6 +645,7 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
       state.pool_target_bytes = pool.target;
       state.pool_capacity_bytes = pool.capacity;
       state.page_bundle_bytes = pool.page_bundle;
+      state.minimum_bytes = pool.minimum;
       state.can_shrink = pool.can_shrink;
       state.ready = pool.ready;
     }
@@ -603,6 +653,7 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
       ++state.failed;
       state.failure_reason = "quarantined_pages_prevent_resize";
     }
+    cannot_shrink |= !pool.can_shrink;
     unsupported |= !pool.can_shrink && pool.target < pool.capacity;
     if (pool.acknowledged && pool.acknowledged_revision == entry.revision &&
         pool.charged <= pool.target)
@@ -613,9 +664,11 @@ InstanceControl GpuBudget::control_state_locked(size_t instance,
       state.status = "unavailable";
     else if (state.failed)
       state.status = "failed";
-    else if (unsupported)
+    else if (unsupported ||
+             (cannot_shrink && state.effective_bytes > entry.limit))
       state.status = "unsupported";
-    else if (state.completed == entry.participants)
+    else if (state.completed == entry.participants &&
+             state.charged_bytes <= entry.limit)
       state.status = "converged";
   }
   state.registered_participants = live;
@@ -658,14 +711,16 @@ GpuBudget::publish_control_locked(size_t instance, uint64_t bytes,
     return rejected("unavailable");
   // Proportional startup-capacity shares, independently rounded DOWN to each
   // pool's physical page bundle. The remainder stays unassigned. No pool can
-  // independently consume the whole instance cap and rounding cannot raise it.
+  // independently consume the whole instance cap. Null-page floors constrain
+  // physical targets only; the exact instance cap still gates native grants.
   const auto bounded = std::min(bytes, capacity);
   for (auto &pool : shared_->pools) {
     if (!pool.owner || pool.instance != instance)
       continue;
     const auto share = static_cast<uint64_t>(
         static_cast<unsigned __int128>(bounded) * pool.capacity / capacity);
-    pool.target = share / pool.page_bundle * pool.page_bundle;
+    pool.target = std::max(uint64_t(pool.minimum),
+                           share / pool.page_bundle * pool.page_bundle);
     pool.acknowledged = 0;
     pool.failed = 0;
   }
@@ -685,7 +740,8 @@ InstanceControl GpuBudget::publish_control(const std::string &instance,
   retire_dead_pools();
   Locked lock(*this);
   for (size_t i = 0; i < kInstances; ++i) {
-    if (shared_->instances[i].valid && instance == shared_->instances[i].name) {
+    if (shared_->instances[i].valid &&
+        instance == shared_->instances[i].name_string()) {
       if (shared_->instances[i].generation != generation) {
         auto state = control_state_locked(i);
         state.status = "instance_changed";
@@ -703,12 +759,41 @@ InstanceControl GpuBudget::query_control(const std::string &instance,
                                          size_t slot) {
   Locked lock(*this);
   for (size_t i = 0; i < kInstances; ++i) {
-    if (shared_->instances[i].valid && instance == shared_->instances[i].name)
+    if (shared_->instances[i].valid &&
+        instance == shared_->instances[i].name_string())
       return control_state_locked(i, slot);
   }
   InstanceControl state;
   state.status = "unavailable";
   return state;
+}
+
+InstanceControl GpuBudget::observe_control(const std::string &instance) {
+  check_owner();
+  InstanceControl unavailable;
+  unavailable.status = unavailable.convergence = "unavailable";
+  const uint64_t before = shared_->sequence;
+  if (before & 1)
+    return unavailable;
+  // Bounded, atomic copy: never wait for a writer. The sequence rejects slot
+  // reuse or interleaved revisions; all copied words remain race-free.
+  auto snapshot = std::make_unique<Shared>(*shared_);
+  InstanceControl result = unavailable;
+  for (size_t i = 0; i < kInstances; ++i) {
+    if (snapshot->instances[i].valid &&
+        instance == snapshot->instances[i].name_string()) {
+      result = control_state_locked(i, SIZE_MAX, snapshot.get());
+      break;
+    }
+  }
+  struct stat held{}, current{};
+  if (fstat(fd_, &held) < 0 || lstat(path_.c_str(), &current) < 0 ||
+      held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
+      !S_ISREG(current.st_mode))
+    return unavailable;
+  if (shared_->sequence != before)
+    return unavailable;
+  return result;
 }
 
 InstanceControl GpuBudget::control_state(size_t slot) {
@@ -739,7 +824,7 @@ bool GpuBudget::fail_control(const std::string &instance, size_t slot,
   if (pool.owner != owner)
     return false;
   const auto &entry = shared_->instances[pool.instance];
-  if (!entry.valid || instance != entry.name ||
+  if (!entry.valid || instance != entry.name_string() ||
       entry.generation != generation || !entry.has_revision ||
       entry.revision != revision)
     return false;

@@ -84,7 +84,8 @@ public:
   bool recalibrate_physical_budget();
   InstanceControl configure_instance_control(bool can_shrink,
                                              uint64_t expected_participants,
-                                             uint64_t startup_pages);
+                                             uint64_t startup_pages,
+                                             bool reserve_null = false);
   InstanceControl instance_control_state();
   bool acknowledge_instance_control(uint64_t revision);
   std::string instance_control_path();

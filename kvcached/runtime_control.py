@@ -20,10 +20,12 @@ class RuntimeControl:
             sources = control_workers(manager.world_size, manager.pp_rank,
                                       manager.group_id, configure=can_shrink,
                                       expected_participants=expected_participants,
-                                      startup_pages=manager.mem_size // manager.page_size)
+                                      startup_pages=manager.mem_size // manager.page_size,
+                                      reserve_null=getattr(manager, "null_block", None) is not None)
         else:
             sources = [_C.local_instance_control(manager.group_id, can_shrink, expected_participants,
-                                                  manager.mem_size // manager.page_size)]
+                                                  manager.mem_size // manager.page_size,
+                                                  getattr(manager, "null_block", None) is not None)]
         if not sources or any(not source["ready"] for source in sources):
             raise RuntimeError("KV runtime control requires every worker pool ready")
         self.sources = tuple(sources)
