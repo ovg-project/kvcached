@@ -159,9 +159,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
 
 PageAllocator::~PageAllocator() {
   try {
-    if (enable_page_prealloc_ && prealloc_thread_) {
-      stop_prealloc_thread_internal();
-    }
+    stop_prealloc_thread_internal();
   } catch (...) {
     // Silently ignore exceptions during cleanup
   }
@@ -648,16 +646,10 @@ void PageAllocator::set_use_worker_ipc(bool use_worker_ipc) {
 }
 
 void PageAllocator::start_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    start_prealloc_thread_internal();
-  }
+  start_prealloc_thread_internal();
 }
 
-void PageAllocator::stop_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    stop_prealloc_thread_internal();
-  }
-}
+void PageAllocator::stop_prealloc_thread() { stop_prealloc_thread_internal(); }
 
 void PageAllocator::prealloc_worker() {
   auto start_time = std::chrono::steady_clock::now();
@@ -877,7 +869,7 @@ void PageAllocator::trigger_preallocation() {
 
 void PageAllocator::start_prealloc_thread_internal() {
   std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
-  if (!prealloc_thread_) {
+  if (enable_page_prealloc_ && !prealloc_thread_) {
     prealloc_running_ = true;
     prealloc_thread_ =
         std::make_unique<std::thread>(&PageAllocator::prealloc_worker, this);
@@ -886,7 +878,7 @@ void PageAllocator::start_prealloc_thread_internal() {
     trigger_preallocation();
   }
 
-  // Start resize watcher thread alongside prealloc thread
+  // Quota updates must remain active even when page preallocation is disabled.
   if (!resize_watcher_thread_) {
     resize_watcher_running_ = true;
     resize_watcher_thread_ =
