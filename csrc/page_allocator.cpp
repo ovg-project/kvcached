@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "allocator.hpp"
+#include "exact_blocks.hpp"
 #include "gpu_utils.hpp"
 #include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
@@ -68,6 +69,10 @@ std::vector<int64_t> InternalPage::alloc(int64_t num_blocks) {
   }
   free_list.erase(free_list.begin(), free_list.begin() + num_blocks);
   return block_ids;
+}
+
+bool InternalPage::alloc_exact(const std::vector<int64_t> &block_ids) {
+  return claim_exact_blocks(free_list, block_ids);
 }
 
 void InternalPage::free(int64_t block_id) { free_list.push_back(block_id); }
@@ -166,20 +171,38 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  return alloc_page_impl(-1);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::try_alloc_page_at(page_id_t page_id) {
+  if (page_id < 0) {
+    throw std::invalid_argument("Exact page ID must be nonnegative");
+  }
+  return alloc_page_impl(page_id);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::alloc_page_impl(page_id_t requested_id) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
+  bool trimmed_for_exact = false;
 
   while (page_id == -1) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
       throw StateConsistencyError(transaction_error_);
     }
     // Fast path: allocate from reserved pages
-    if (!reserved_page_list_.empty()) {
-      page_id = reserved_page_list_.front();
-      reserved_page_list_.pop_front();
+    auto reserved = requested_id < 0
+                        ? reserved_page_list_.begin()
+                        : std::find(reserved_page_list_.begin(),
+                                    reserved_page_list_.end(), requested_id);
+    if (reserved != reserved_page_list_.end()) {
+      page_id = *reserved;
+      reserved_page_list_.erase(reserved);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
       // Trigger preallocation to refill reserved pool if getting low
@@ -201,13 +224,49 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     }
 
     // Slow path: allocate from free pages
-    if (!free_page_list_.empty()) {
-      page_id = free_page_list_.front();
-      free_page_list_.pop_front();
+    auto free = requested_id < 0
+                    ? free_page_list_.begin()
+                    : std::find(free_page_list_.begin(), free_page_list_.end(),
+                                requested_id);
+    auto reclaimed = reclaimed_page_list_.end();
+    if (requested_id >= 0 && free == free_page_list_.end()) {
+      reclaimed = std::find(reclaimed_page_list_.begin(),
+                            reclaimed_page_list_.end(), requested_id);
+    }
+    if (requested_id >= 0 && (free != free_page_list_.end() ||
+                              reclaimed != reclaimed_page_list_.end())) {
+      // A shrink limits the number of pages, not their virtual placement.
+      // Preallocated backing at another ID may need to be unmapped first.
+      if (free_page_list_.empty() || get_avail_physical_pages() <= 0) {
+        if (!trimmed_for_exact && !reserved_page_list_.empty()) {
+          trimmed_for_exact = true;
+          lock.unlock();
+          trim();
+          lock.lock();
+          continue;
+        }
+        return nullptr;
+      }
+      if (reclaimed != reclaimed_page_list_.end()) {
+        // Exchange one unused slot without growing the active page budget.
+        // The displaced ID remains available to a later resize or exact claim.
+        free = free_page_list_.begin();
+        std::swap(*free, *reclaimed);
+      }
+    }
+    if (free != free_page_list_.end()) {
+      page_id = *free;
+      free_page_list_.erase(free);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
       break;
     }
 
+    if (requested_id >= 0) {
+      // Another allocation, preallocation, or release may own this ID.
+      // Never substitute another page or wait while an integration holds a
+      // sibling pool's allocation. The caller can roll back and retry.
+      return nullptr;
+    }
     if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
       throw std::runtime_error("No free pages left");
     }

@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import uuid
+
 import pytest
 
 
@@ -518,3 +521,38 @@ def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
     finally:
         del allocator
         native.shutdown_kvcached()
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_exact_placement_reuses_capacity_after_shrink(preallocate):
+    vmm_ops = _compiled_vmm_ops()
+    page_size = 2 * 1024 * 1024
+    vmm_ops.init_kvcached("cuda:0", page_size, False)
+    vmm_ops.create_kv_tensors(8 * page_size, 2, "cuda:0", 1, 1, 0, False)
+    allocator = vmm_ops.PageAllocator(
+        num_layers=1, mem_size_per_layer=8 * page_size, page_size=page_size,
+        world_size=1, pp_rank=0, async_sched=False, contiguous_layout=False,
+        enable_page_prealloc=preallocate, num_kv_buffers=1, group_id=0,
+        ipc_name=f"exact-shrink-{os.getpid()}-{uuid.uuid4().hex}",
+    )
+    try:
+        assert allocator.try_alloc_page_at(7).page_id == 7
+        assert allocator.resize(2 * page_size)
+        # The shrink retained live ID 7 and free ID 0, reclaiming IDs 1..6.
+        assert allocator.try_alloc_page_at(3).page_id == 3
+        assert allocator.get_num_total_pages() == 2
+        assert allocator.get_num_free_pages() == 0
+        assert allocator.try_alloc_page_at(1) is None
+        allocator.free_page(3)
+        # With preallocation enabled, free_page keeps ID 3 physically mapped.
+        # Exact ID 1 must be able to use that budget after trimming it.
+        assert allocator.try_alloc_page_at(1).page_id == 1
+        assert allocator.get_num_total_pages() == 2
+        assert allocator.get_num_free_pages() == 0
+        assert allocator.resize(8 * page_size)
+        rest = [allocator.alloc_page().page_id for _ in range(6)]
+        assert set(rest) == {0, 2, 3, 4, 5, 6}
+        allocator.free_pages(rest + [1, 7])
+    finally:
+        allocator.stop_prealloc_thread()
+        allocator.trim()
+        allocator.release_shared_segment()
+        vmm_ops.shutdown_kvcached()
