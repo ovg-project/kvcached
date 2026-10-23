@@ -1362,3 +1362,16 @@ def test_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
                        "__kvcached_alloc_for_extend_patched__")
     assert not hasattr(pipeline.sched_module.Scheduler._get_new_batch_prefill_raw,
                        "__kvcached_prefill_capacity_miss_patched__")
+
+
+@pytest.mark.parametrize("consumer, synced", [(0, True), (-1, False)])
+def test_an_unwound_batch_waits_for_its_hicache_loads(monkeypatch, consumer, synced):
+    """HiCache submits a batch's loads before its allocation can miss."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    scheduler = types.SimpleNamespace(tree_cache=None, req_to_token_pool=None,
+                                      chunked_req=None, waiting_queue=[])
+    batch = types.SimpleNamespace(reqs=[], hicache_consumer_index=consumer)
+
+    patches._unwind_prefill_admission(scheduler, batch, None, None)
+    assert calls == (["sync"] if synced else [])
