@@ -317,3 +317,15 @@ def test_host_pools_that_would_assume_dense_rows_are_rejected(monkeypatch, kerne
                       {"backup_from_device_all_layer": lambda self, *args: None})
     with pytest.raises(KVCachedConfigError, match="OwnBackup"):
         own_backup(InterleavedKVPool())
+
+
+def test_host_memory_is_split_by_logical_pool_size():
+    elastic = types.SimpleNamespace(
+        get_kv_size_bytes=lambda: (500, 500), kvcached_allocator=object(),
+        k_buffer=[torch.zeros(1000, 1)], size=96, page_size=4)
+    native = types.SimpleNamespace(get_kv_size_bytes=lambda: (300, 300),
+                                   k_buffer=[torch.zeros(100, 1)], size=96, page_size=4)
+    mamba = types.SimpleNamespace(get_kv_size_bytes=lambda: 100)
+    assert hicache.device_pool_bytes(elastic) == 100
+    assert hicache.device_pool_bytes(native) == 600
+    assert hicache.device_pool_bytes(mamba) == 100
