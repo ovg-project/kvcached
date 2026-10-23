@@ -1252,15 +1252,12 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                # OffloadingConnector allocates cross-layer KV tensors outside
-                # kvcached's VMM path (issue #267). Reject before any startup.
-                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
-                    raise KVCachedConfigError(
-                        "kvcached does not support vLLM CPU KV offloading "
-                        "(OffloadingConnector, --kv-offloading-size); "
-                        "remove --kv-offloading-size or disable kvcached"
-                    )
+                # Before 0.29 OffloadingConnector allocates cross-layer KV
+                # tensors outside kvcached's VMM path (issue #267); from 0.29
+                # its copies need the pins installed below. Reject the rest.
+                from kvcached.integration.vllm.offload_pins import check_offloading_config
+
+                check_offloading_config(vllm_config, detected_version)
                 # Reject a partial integration before either allocator or the
                 # native executor starts. vLLM can select V1 automatically.
                 if detected_version and VersionRange(">=0.29.0").contains(detected_version):
@@ -1338,6 +1335,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                         manager.defer_physical_release = primary.defer_physical_release
                         if hasattr(primary, "physical_release_barrier"):
                             manager.physical_release_barrier = primary.physical_release_barrier
+                from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+
+                install_offload_copy_pins(self, primary)
                 self._kvcached_start_limit_watch()
             return result
 
