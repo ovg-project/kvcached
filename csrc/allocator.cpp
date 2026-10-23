@@ -284,6 +284,10 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
   }
 
   torch::stable::Device device(dev_str);
+  if (device.is_cuda() && device.index() < 0) {
+    device = torch::stable::Device("cuda:" +
+                                   std::to_string(gpu_vmm::current_device()));
+  }
   g_device_ = device;
   g_contiguous_layout_ = contiguous_layout;
   const char *explicit_name = std::getenv("KVCACHED_IPC_NAME");
@@ -293,6 +297,17 @@ void FTensorAllocator::init(const std::string &dev_str, size_t page_size,
                          : "kvcached_native_" + std::to_string(getpid());
   g_allocators_[0] =
       std::make_unique<FTensorAllocator>(device, contiguous_layout);
+}
+
+int FTensorAllocator::device_index() {
+  std::lock_guard<std::mutex> lock(g_allocator_mutex_);
+  return g_allocators_.empty() || !g_device_.is_cuda() ? -1 : g_device_.index();
+}
+
+FTensorAllocator *FTensorAllocator::find_allocator(int64_t group_id) {
+  std::lock_guard<std::mutex> lock(g_allocator_mutex_);
+  auto it = g_allocators_.find(group_id);
+  return it == g_allocators_.end() ? nullptr : it->second.get();
 }
 
 FTensorAllocator *FTensorAllocator::global_allocator(int64_t group_id) {
