@@ -371,6 +371,13 @@ std::vector<torch::stable::Tensor> FTensorAllocator::create_kv_tensors(
   }
 }
 
+void FTensorAllocator::synchronize_device() {
+  if (dev_.is_cuda()) {
+    const ScopedDeviceGuard device_guard(resolve_device_index(dev_));
+    CHECK_GPU(gpu_vmm::device_synchronize());
+  }
+}
+
 int64_t FTensorAllocator::sample_budget_capacity_() {
   PhysicalGrowthOperationStats stats;
   validate_physical_capacity(resolve_device_index(dev_), 0, &stats);

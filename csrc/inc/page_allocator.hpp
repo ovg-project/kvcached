@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "constants.hpp"
@@ -144,7 +145,11 @@ private:
   void resize_watcher();
 
   // Internal methods
-  void map_pages(const std::vector<page_id_t> &page_ids);
+  void map_pages(const std::vector<page_id_t> &page_ids,
+                 bool from_reserved = false);
+  void prepare_pages(const std::vector<page_id_t> &page_ids);
+  bool uses_local_prepare() const;
+  std::string prepared_id(page_id_t page_id) const;
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
   PageState get_page_state_unlocked() const;
@@ -195,6 +200,10 @@ private:
   // Serializes this pool's IPC transactions, not allocation across instances.
   // Never acquire while holding lock_; Python callbacks may acquire the GIL.
   std::mutex transaction_lock_;
+  // Protected by transaction_lock_. Reserved pages without an entry are
+  // already mapped (returned by free_page), and need no VA edit on reuse.
+  std::unordered_set<page_id_t> prepared_pages_;
+  const uint64_t prepare_owner_;
   std::condition_variable cond_;
   std::atomic<bool> prealloc_running_;
   std::atomic<bool> prealloc_needed_;

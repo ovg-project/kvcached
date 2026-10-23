@@ -52,6 +52,7 @@ public:
                     int64_t num_kv_buffers = 2, bool unified_pool = false,
                     size_t page_size = 0);
   bool kv_tensors_created();
+  void synchronize_device();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   std::pair<bool, std::vector<offset_t>>
   map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);

@@ -518,3 +518,62 @@ def test_page_availability_observes_instance_budget(monkeypatch, tmp_path):
     finally:
         del allocator
         native.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("async_sched", [False, True])
+def test_page_preallocation_budget_trim_and_mapped_reuse(monkeypatch, tmp_path, async_sched):
+    """Constructed lifecycle regression, not a serving-race reproduction."""
+    import time
+    import uuid
+
+    import torch
+
+    native = _compiled_vmm_ops()
+    page = 2 * 1024 * 1024
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    native.init_kvcached("cuda:0", page, True)
+    allocator = None
+    try:
+        tensors = native.create_kv_tensors(4 * page, 1, "cuda:0", 1, 1, 0)
+        allocator = native.PageAllocator(
+            1, 4 * page, page, 1, 0, async_sched, True, True, 1, 0,
+            "PREP_" + uuid.uuid4().hex[:8])
+        allocator.start_prealloc_thread()
+        deadline = time.monotonic() + 10
+        while allocator.get_num_reserved_pages() == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        allocator.stop_prealloc_thread()
+        reserved = allocator.get_num_reserved_pages()
+        assert native.physical_budget_state()["charged_bytes"] == reserved * page
+        allocator.trim()
+        assert native.physical_budget_state()["charged_bytes"] == 0
+        assert allocator.get_num_free_pages() == 4
+
+        allocator.start_prealloc_thread()
+        deadline = time.monotonic() + 10
+        while allocator.get_num_reserved_pages() == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        allocator.stop_prealloc_thread()
+        allocated = [allocator.alloc_page() for _ in range(4)]
+        assert native.physical_budget_state()["charged_bytes"] == 4 * page
+        ids = [entry.page_id for entry in allocated]
+        for pid in ids:
+            tensors[0][pid * page:pid * page + 128].fill_(pid + 17)
+        torch.cuda.synchronize()
+        allocator.free_pages(ids)
+        reused = [allocator.alloc_page().page_id for _ in range(4)]
+        assert set(reused) == set(ids)
+        assert native.physical_budget_state()["charged_bytes"] == 4 * page
+        for pid in reused:
+            assert (tensors[0][pid * page:pid * page + 128] == pid + 17).all().item()
+        torch.cuda.synchronize()
+        allocator.free_pages(reused)
+        allocator.trim()
+        assert native.physical_budget_state()["charged_bytes"] == 0
+        assert allocator.get_num_free_pages() == 4
+    finally:
+        if allocator is not None:
+            allocator.stop_prealloc_thread()
+        native.shutdown_kvcached()
