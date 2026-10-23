@@ -37,6 +37,7 @@ from kvcached.integration.version_utils import (
 )
 from kvcached.kv_geometry import backing_blocks_for_capacity
 from kvcached.utils import (
+    MAX_CACHED_SWA_TOKENS,
     MAX_CACHED_TOKENS,
     PAGE_SIZE,
     KVCachePoolExhausted,
@@ -3438,8 +3439,11 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     target_class = "RadixCache"
     patch_name = "radix_cache_limit"
 
+    def _limit_enabled(self) -> bool:
+        return MAX_CACHED_TOKENS >= 0
+
     def apply(self, radix_cache_mod: types.ModuleType) -> bool:
-        if MAX_CACHED_TOKENS < 0:
+        if not self._limit_enabled():
             logger.debug(
                 "KVCACHED_MAX_CACHED_TOKENS < 0 (unlimited) — "
                 "RadixCacheLimitPatch skipped"
@@ -3518,8 +3522,16 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
 class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
     """Enforce KVCACHED_MAX_CACHED_TOKENS on a prefix cache that is not a
     RadixCache subclass, so RadixCacheLimitPatch alone leaves it unbounded.
-    The cap counts full-attention tokens, like RadixCache.evictable_size_.
+    FULL counts full-attention tokens, like RadixCache.evictable_size_.
+    Caches with native SWA accounting may opt into an independent SWA limit.
     """
+
+    supports_swa_limit = False
+
+    def _limit_enabled(self) -> bool:
+        return super()._limit_enabled() or (
+            self.supports_swa_limit and MAX_CACHED_SWA_TOKENS >= 0
+        )
 
     @version_range(SGLANG_ALL_RANGE)
     def patch_radix_cache_limit(self, radix_cache_mod: types.ModuleType) -> bool:
@@ -3538,19 +3550,47 @@ class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         max_cached = MAX_CACHED_TOKENS
+        max_swa = MAX_CACHED_SWA_TOKENS if self.supports_swa_limit else -1
+        if max_swa >= 0:
+            if not callable(getattr(cache_cls, "swa_evictable_size", None)):
+                raise ValueError(
+                    "KVCACHED_MAX_CACHED_SWA_TOKENS requires native SWA cache "
+                    "accounting; set it to -1 to retain FULL-only cache limits"
+                )
+            try:
+                EvictParams(num_tokens=0, swa_num_tokens=0)
+            except TypeError as exc:
+                raise ValueError(
+                    "KVCACHED_MAX_CACHED_SWA_TOKENS requires native SWA eviction "
+                    "parameters; set it to -1 to retain FULL-only cache limits"
+                ) from exc
 
-        def _wrapped(self_rc, *args: Any, **kwargs: Any):
+        def _wrapped(self_rc: Any, *args: Any, **kwargs: Any) -> None:
             original_cache_finished(self_rc, *args, **kwargs)
-            excess = self_rc.full_evictable_size() - max_cached
-            if excess > 0:
-                self_rc.evict(EvictParams(num_tokens=excess))
+            excess = (
+                max(0, self_rc.full_evictable_size() - max_cached)
+                if max_cached >= 0 else 0
+            )
+            swa_excess = (
+                max(0, self_rc.swa_evictable_size() - max_swa)
+                if max_swa >= 0 else 0
+            )
+            if excess > 0 or swa_excess > 0:
+                if max_swa >= 0:
+                    # One native call accounts for SWA freed by FULL eviction,
+                    # while preserving the engine's locks and transfer lifetime.
+                    self_rc.evict(
+                        EvictParams(num_tokens=excess, swa_num_tokens=swa_excess)
+                    )
+                else:
+                    self_rc.evict(EvictParams(num_tokens=excess))
 
         self._mark_as_patched(_wrapped)
         cache_cls.cache_finished_req = _wrapped
 
         logger.info(
-            f"[kvcached] {self.target_class} evictable size capped at "
-            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+            "[kvcached] %s evictable token limits: FULL=%d, SWA=%d "
+            "(negative means unlimited)", self.target_class, max_cached, max_swa
         )
         return True
 
@@ -3562,6 +3602,7 @@ class UnifiedRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
     target_module = "sglang.srt.mem_cache.unified_radix_cache"
     target_class = "UnifiedRadixCache"
     patch_name = "unified_radix_cache_limit"
+    supports_swa_limit = True
 
 
 class SWARadixCacheLimitPatch(_FullTokenCacheLimitPatch):
@@ -3570,6 +3611,7 @@ class SWARadixCacheLimitPatch(_FullTokenCacheLimitPatch):
     target_module = "sglang.srt.mem_cache.swa_radix_cache"
     target_class = "SWARadixCache"
     patch_name = "swa_radix_cache_limit"
+    supports_swa_limit = True
 
 
 class MambaRadixCacheLimitPatch(_FullTokenCacheLimitPatch):
