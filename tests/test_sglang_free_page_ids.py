@@ -38,6 +38,12 @@ class FakeTensor:
     def cpu(self):
         return self
 
+    def detach(self):
+        return self
+
+    def to(self, *, device, non_blocking):
+        return self
+
     def numpy(self):
         return self
 
@@ -331,7 +337,13 @@ def test_paged_clear_resets_group_state(alloc_mod):
     assert manager.free_calls == [[5]]
 
 
-def test_modern_group_defers_a_copy_of_the_tensor(monkeypatch):
+@pytest.mark.parametrize("method, original, mutated, expected", [
+    ("free_page_ids", 2, 9, 2),
+    ("free", 8, 36, 2),
+])
+def test_modern_group_defers_a_copy_of_the_tensor(
+    monkeypatch, method, original, mutated, expected,
+):
     _install_fake_torch(monkeypatch)
     _install_fake_sglang_utils(monkeypatch)
 
@@ -348,10 +360,10 @@ def test_modern_group_defers_a_copy_of_the_tensor(monkeypatch):
     )
     manager = allocator.kvcached_allocator
 
-    deferred = FakeTensor([2])
+    deferred = FakeTensor([original])
     allocator.free_group_begin()
-    allocator.free_page_ids(deferred)
-    deferred.data[0] = 9  # caller mutates its tensor after the deferred free
+    getattr(allocator, method)(deferred)
+    deferred.data[0] = mutated  # caller mutates its tensor after the deferred free
     allocator.free_group_end()
 
-    assert manager.free_calls == [[2]]
+    assert manager.free_calls == [[expected]]
