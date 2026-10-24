@@ -573,9 +573,10 @@ def test_pool_snapshot_reports_logical_capacity_beside_the_backing_extent():
 
 
 def test_pool_snapshot_logical_capacity_equals_the_backing_extent_without_a_limit():
-    """vLLM and the SGLang MHA pools size num_blocks to the capacity they
-    asked for, so the manager keeps logical_num_blocks unset and the two
-    fields agree. A manager-like without the attribute reads the same."""
+    """Pools without a separate logical limit report the backing extent.
+
+    A manager-like without the attribute reads the same.
+    """
 
     class UnlimitedManager(FakeManager):
         logical_num_blocks = None

@@ -1165,9 +1165,56 @@ class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
         if not self.initialize_version_info():
             return False
         success = self.alias_swa_sub_allocators(swa_alloc_mod)
+        if success:
+            success &= self.patch_swa_mapping_extent(swa_alloc_mod)
         if success and self.patch_swa_composite_misses in self.applicable_methods:
             success &= self.patch_swa_composite_misses(swa_alloc_mod)
         return success
+
+    @version_range(">=0.5.13")
+    def patch_swa_mapping_extent(self, swa_alloc_mod: types.ModuleType) -> bool:
+        """Cover elastic block IDs without changing scheduler capacity."""
+        marker = "__kvcached_swa_mapping_extent_patched__"
+        if self._is_already_patched(swa_alloc_mod, marker):
+            return True
+
+        try:
+            swa_cls = getattr(swa_alloc_mod, "SWATokenToKVPoolAllocator")
+            original_init = swa_cls.__init__
+
+            @functools.wraps(original_init)
+            def init_with_backing_extent(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                manager = getattr(
+                    self.full_attn_allocator, "kvcached_allocator", None)
+                if manager is None:
+                    return
+
+                # Logical admission limits the number of live blocks, not
+                # their IDs: whole-page padding and page-boundary gaps can
+                # produce token IDs beyond size + page_size.
+                mapping = self.full_to_swa_index_mapping
+                has_sentinel = mapping[-1].item() == -1
+                old_tokens = mapping.numel() - int(has_sentinel)
+                backing_tokens = manager.num_blocks * self.page_size
+                if backing_tokens <= old_tokens:
+                    return
+
+                extended = mapping.new_zeros(backing_tokens + int(has_sentinel))
+                extended[:old_tokens] = mapping[:old_tokens]
+                if has_sentinel:
+                    extended[-1] = -1
+                self.full_to_swa_index_mapping = extended
+                # Native init registered the original tensor. Both readers
+                # must use this replacement before serving or graph capture.
+                self._kvcache.register_mapping(extended)
+
+            swa_cls.__init__ = init_with_backing_extent
+            self._mark_as_patched(swa_alloc_mod, marker)
+            return True
+        except Exception as exc:
+            self.logger.warning("Failed to extend SGLang SWA mapping: %s", exc)
+            return False
 
     @version_range(">=0.5.13")
     def patch_swa_composite_misses(self, swa_alloc_mod: types.ModuleType) -> bool:
@@ -1324,6 +1371,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # storage dtype. The parent may call our _create_buffers()
                     # before returning, so install the logical fallback first.
                     self.store_dtype = dtype
+                    self._kvcached_logical_size = size
 
                     super().__init__(
                         size=size,
@@ -1363,11 +1411,23 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             f"(group_id={self._group_id})")
                         return
 
+                    # Back whole physical pages, including space for the null
+                    # block, without exposing the padding as token capacity.
+                    logical_num_blocks = math.ceil(size / page_size) + 1
+                    block_mem_size = page_size * self.cell_size
+                    physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
+                    num_blocks = backing_blocks_for_capacity(
+                        logical_num_blocks, block_mem_size, physical_page_size)
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
+                        num_blocks, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
                         pool_name="mha",
+                        logical_num_blocks=logical_num_blocks,
                     )
+                    # Native KV writers use size + page_size as an index
+                    # bound. Admission still uses the allocator's requested
+                    # size and logical_num_blocks, independently of this span.
+                    self.size = num_blocks * page_size - page_size
 
                     k_size, v_size = self.get_kv_size_bytes()
                     k_size_phy, v_size_phy = self.get_kv_size_bytes_phy()
@@ -1566,7 +1626,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
 
                     This limit is enforced by `--mem-fraction-static` option.
                     """
-                    total_tokens = self.size + self.page_size
+                    total_tokens = self._kvcached_logical_size + self.page_size
                     elems_per_token = self.head_num * self.head_dim
                     bytes_per_elem = self.store_dtype.itemsize
 
