@@ -375,6 +375,102 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
   return allocator->group_indices_by_page(indices, block_mem_size);
 }
 
+py::dict control_dict(const InstanceControl &state) {
+  py::dict result;
+  result["status"] = state.status;
+  result["convergence"] = state.convergence;
+  result["failed"] = state.failed;
+  result["failure_reason"] = state.failure_reason;
+  result["generation"] = state.generation;
+  result["revision"] = state.revision;
+  result["limit_bytes"] = state.requested_bytes;
+  result["effective_limit_bytes"] = state.effective_bytes;
+  result["charged_bytes"] = state.charged_bytes;
+  result["pool_slot"] = state.pool_slot;
+  result["pool_owner"] = state.pool_owner;
+  result["pool_target_bytes"] = state.pool_target_bytes;
+  result["pool_capacity_bytes"] = state.pool_capacity_bytes;
+  result["page_bundle_bytes"] = state.page_bundle_bytes;
+  result["minimum_bytes"] = state.minimum_bytes;
+  result["can_shrink"] = state.can_shrink;
+  result["ready"] = state.ready;
+  result["registered_participants"] = state.registered_participants;
+  result["expected_participants"] = state.expected_participants;
+  result["participants"] = state.participants;
+  result["completed"] = state.completed;
+  result["published"] = state.published;
+  return result;
+}
+
+py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
+                                uint64_t expected_participants,
+                                uint64_t startup_pages, bool reserve_null) {
+  InstanceControl state;
+  std::string path, name;
+  {
+    py::gil_scoped_release release;
+    auto allocator = FTensorAllocator::global_allocator(group_id);
+    state = configure ? allocator->configure_instance_control(
+                            *configure, expected_participants, startup_pages,
+                            reserve_null)
+                      : allocator->instance_control_state();
+    path = allocator->instance_control_path();
+    name = FTensorAllocator::instance_control_name();
+  }
+  auto result = control_dict(state);
+  result["gpu"] = path;
+  result["instance"] = name;
+  result["group_id"] = group_id;
+  return result;
+}
+
+py::dict query_instance_control(const std::string &path,
+                                const std::string &name, size_t slot) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path)->query_control(name, slot);
+  }
+  return control_dict(state);
+}
+
+py::dict observe_instance_control(const std::string &path,
+                                  const std::string &name) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path, true)->observe_control(name);
+  }
+  return control_dict(state);
+}
+
+py::dict publish_instance_control(const std::string &path,
+                                  const std::string &name, uint64_t bytes,
+                                  uint64_t generation,
+                                  std::optional<uint64_t> revision) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path)->publish_control(
+        name, bytes, generation, revision);
+  }
+  return control_dict(state);
+}
+
+bool fail_instance_control(const std::string &path, const std::string &name,
+                           size_t slot, uint64_t owner, uint64_t generation,
+                           uint64_t revision) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->fail_control(name, slot, owner,
+                                                     generation, revision);
+}
+
+bool acknowledge_instance_control(int64_t group_id, uint64_t revision) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)
+      ->acknowledge_instance_control(revision);
+}
+
 } // namespace kvcached
 
 // Register the KV tensor ops in the "kvcached" dispatcher namespace.
@@ -411,6 +507,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::register_exception<kvcached::QuarantinedResizeError>(
       m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
 
+  m.def("local_instance_control", &kvcached::local_instance_control,
+        py::arg("group_id") = 0, py::arg("configure") = py::none(),
+        py::arg("expected_participants") = 0, py::arg("startup_pages") = 0,
+        py::arg("reserve_null") = false);
+  m.def("query_instance_control", &kvcached::query_instance_control,
+        py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
+  m.def("observe_instance_control", &kvcached::observe_instance_control,
+        py::arg("path"), py::arg("instance"));
+  m.def("publish_instance_control", &kvcached::publish_instance_control,
+        py::arg("path"), py::arg("instance"), py::arg("bytes"),
+        py::arg("generation"), py::arg("revision") = py::none());
+  m.def("fail_instance_control", &kvcached::fail_instance_control,
+        py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
+        py::arg("generation"), py::arg("revision"));
+  m.def("acknowledge_instance_control", &kvcached::acknowledge_instance_control,
+        py::arg("group_id"), py::arg("revision"));
   // Torch-free transactional ops (the six core ops are on the stable
   // dispatcher; see STABLE_TORCH_LIBRARY above).
   m.def("map_to_kv_tensors_with_result",

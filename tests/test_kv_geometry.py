@@ -189,7 +189,7 @@ def test_alloc_fails_loud_instead_of_parking_an_empty_page(monkeypatch):
     manager.full_pages = {}
     manager.reserved_blocks = []
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()

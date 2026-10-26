@@ -3585,6 +3585,8 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
+    for manager in getattr(scheduler, "_kvcached_control_managers", ()):
+        manager.apply_resize_target()
     now = time.monotonic()
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager
@@ -3642,6 +3644,15 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                 original_init(sched_self, *args, **kwargs)
                 if enable_kvcached():
                     _register_shrink_reclaimers(sched_self)
+                    from kvcached.runtime_control import initialize_runtime_controls
+
+                    token_managers = _token_kv_managers(
+                        getattr(sched_self, "token_to_kv_pool_allocator", None))
+                    ranks = _sglang_parallel_size(sched_self)
+                    sched_self._kvcached_control_managers = initialize_runtime_controls(
+                        "sglang", ranks=ranks,
+                        can_shrink=lambda manager: ranks == 1 and any(
+                            manager is token for token in token_managers))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init
