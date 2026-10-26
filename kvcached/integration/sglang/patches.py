@@ -2963,7 +2963,10 @@ class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
     never reads allocator state, so every rank issues the same collectives
     in the same order, the counts first, then the miss flags of the
     attempts the round makes. A pipeline opens no round, as the miss
-    patches keep SGLang's own behaviour there.
+    patches keep SGLang's own behaviour there. The round registers from
+    0.5.13, where the elastic SWA and Mamba slot allocators it reads first
+    exist, while the miss patches register from 0.5.20: below that the
+    ranks admit the same batch and a physical miss is fatal, as native.
     """
 
     library = "sglang"
@@ -2980,7 +2983,7 @@ class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
             return True
         return self.patch_budget_rounds(sched_mod)
 
-    @version_range(">=0.5.20")
+    @version_range(">=0.5.13")
     def patch_budget_rounds(self, sched_mod: types.ModuleType) -> bool:
         Scheduler = self._get_target_class(sched_mod)
         if Scheduler is None:

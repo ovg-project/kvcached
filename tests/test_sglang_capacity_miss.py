@@ -1727,7 +1727,9 @@ def test_pipeline_keeps_a_prefill_miss_fatal(
         pipeline.round()
 
 
-def test_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
+def test_miss_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
+    """The two miss patches read 0.5.20 shapes and register from 0.5.20; the
+    budget round registers from 0.5.13, so at 0.5.19 only the round is in."""
     pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=2,
                         version="0.5.19")
     assert pipeline.applied == (True, True)
@@ -1736,5 +1738,41 @@ def test_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
     assert not hasattr(pipeline.sched_module.Scheduler._get_new_batch_prefill_raw,
                        "__kvcached_prefill_capacity_miss_patched__")
     assert pipeline.budget_applied is True
-    assert not hasattr(pipeline.sched_module.Scheduler.get_next_batch_to_run,
-                       "__kvcached_budget_round_patched__")
+    assert hasattr(pipeline.sched_module.Scheduler.get_next_batch_to_run,
+                   "__kvcached_budget_round_patched__")
+
+
+@pytest.mark.parametrize("version, wrapped", [("0.5.12", False), ("0.5.13", True)])
+def test_budget_round_registers_from_the_allocator_split(
+        monkeypatch, cpu_tensors, version, wrapped):
+    """The round registers from SGLang 0.5.13, where the elastic SWA and
+    Mamba slot allocators it reads first exist, ahead of the miss patches.
+    At 0.5.13 the ranks of a queue group admit the same batch from one MIN
+    reduce and no MAX reduce follows; at 0.5.12 nothing is wrapped and each
+    rank admits from its own count."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=tokens,
+                      version=version, admit_by_budget=True)
+             for tokens in (16, 6)]
+    for rank in ranks:
+        assert rank.applied == (True, True)
+        assert rank.budget_applied is True
+        assert hasattr(rank.sched_module.Scheduler.get_next_batch_to_run,
+                       "__kvcached_budget_round_patched__") is wrapped
+        assert not hasattr(rank.batch_module.alloc_for_extend,
+                           "__kvcached_alloc_for_extend_patched__")
+        rank.enqueue(FakeReq("a"), FakeReq("b"))
+
+    _run_ranks([rank.iteration for rank in ranks])
+
+    admitted = [rank.scheduler.admitted for rank in ranks]
+    budgets = [rank.scheduler.budgets_seen for rank in ranks]
+    if wrapped:
+        assert admitted == [[["a"]], [["a"]]]
+        assert budgets == [[6], [6]]
+        assert gloo.rounds == [[[6], [16]]]
+    else:
+        assert admitted == [[["a", "b"]], [["a"]]]
+        assert budgets == [[16], [6]]
+        assert gloo.rounds == []
