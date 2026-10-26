@@ -55,28 +55,28 @@ def check_offloading_config(vllm_config: Any, version: str | None) -> None:
     if OFFLOADING_CONNECTOR not in names:
         return
     parallel_config = vllm_config.parallel_config
-    tp_size = int(parallel_config.tensor_parallel_size)
+    from kvcached.integration.vllm.offload_config import positive_int
+
+    tp_size = positive_int(parallel_config.tensor_parallel_size, "TP")
+    pp_size = positive_int(parallel_config.pipeline_parallel_size, "PP")
+    backend = getattr(parallel_config, "distributed_executor_backend", None)
     if (
         names[0] != OFFLOADING_CONNECTOR
         or not (version and VersionRange(SUPPORTED_RANGE).contains(version))
         or not getattr(vllm_config, "use_v2_model_runner", False)
-        or tp_size not in (1, 2, 4)
-        # PP stages can have different KV bytes per block. The native CPU
-        # offloader's shared row layout assumes equal-sized worker slots.
-        or int(parallel_config.pipeline_parallel_size) != 1
         or any(int(getattr(parallel_config, name, 1)) != 1 for name in (
             "data_parallel_size", "prefill_context_parallel_size",
-            "decode_context_parallel_size", "nnodes"))
+            "decode_context_parallel_size", "nnodes", "nnodes_within_dp"))
         # mp owns all local workers and aggregates their copy completions.
         # In particular, external_launcher cannot fence all IPC unmap peers.
-        or (tp_size > 1 and getattr(
-            parallel_config, "distributed_executor_backend", None) != "mp")
+        or backend not in ("mp", "uni")
+        or (tp_size * pp_size > 1 and backend != "mp")
     ):
         raise KVCachedConfigError(
             "kvcached supports vLLM CPU KV offloading (OffloadingConnector, "
             "--kv-offloading-size) only as the sole connector on vLLM 0.29-0.30 "
-            "with Model Runner V2, TP=1/2/4, PP=1, DP=1 and no context "
-            "parallelism, on one node (mp executor for TP>1); "
+            "with Model Runner V2, positive TP/PP, DP=1 and no context "
+            "parallelism, on one node (mp executor for TP*PP>1); "
             "remove --kv-offloading-size or disable kvcached"
         )
 
