@@ -223,7 +223,9 @@ def test_short_data_flock_does_not_release_usage(segment):
     try:
         for _ in range(10):
             owner.update_memory_usage(64, 32)
-            utils.update_kv_cache_limit(segment.name, 8192)
+            with utils.RwLockedShm(segment.name, utils.MemInfoStruct.SHM_SIZE,
+                                   utils.RwLockedShm.WLOCK) as mm:
+                utils.MemInfoStruct(8192, 64, 32).write_to_buffer(mm)
             assert protocol.active(str(segment)) is True
         assert owner.check_and_get_resize_target(1024, 2) == 2048
     finally:

@@ -7,12 +7,38 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace kvcached {
+
+struct InstanceControl {
+  std::string status;
+  std::string convergence;
+  std::string failure_reason;
+  uint64_t failed = 0;
+  uint64_t generation = 0;
+  uint64_t revision = 0;
+  uint64_t requested_bytes = 0;
+  uint64_t effective_bytes = 0;
+  uint64_t charged_bytes = 0;
+  uint64_t pool_slot = 0;
+  uint64_t pool_owner = 0;
+  uint64_t pool_target_bytes = 0;
+  uint64_t pool_capacity_bytes = 0;
+  uint64_t page_bundle_bytes = 0;
+  uint64_t minimum_bytes = 0;
+  bool can_shrink = false;
+  bool ready = false;
+  uint64_t participants = 0;
+  uint64_t registered_participants = 0;
+  uint64_t expected_participants = 0;
+  uint64_t completed = 0;
+  bool published = false;
+};
 
 struct BudgetSnapshot {
   uint64_t budget_bytes = 0;
@@ -92,6 +118,9 @@ public:
   using Sampler = std::function<int64_t()>;
   static std::shared_ptr<GpuBudget> connect(const std::string &path,
                                             const Sampler &sampler);
+  // Attach to an existing live ledger without creating or sampling an epoch.
+  static std::shared_ptr<GpuBudget> open_control(const std::string &path,
+                                                 bool observe = false);
   ~GpuBudget();
   size_t register_pool(const std::string &instance, int64_t pool);
   std::unique_ptr<BudgetGrant> grant(size_t slot, uint64_t bytes,
@@ -102,6 +131,21 @@ public:
   // above the target, in which case new grants are denied until release.
   std::string set_instance_limit(size_t slot, uint64_t bytes,
                                  uint64_t revision);
+  void configure_control_pool(size_t slot, uint64_t capacity,
+                              uint64_t page_bundle, bool can_shrink,
+                              uint64_t expected_participants = 0,
+                              bool reserve_null = false);
+  void ready_control_pool(size_t slot);
+  InstanceControl query_control(const std::string &instance,
+                                size_t slot = SIZE_MAX);
+  InstanceControl observe_control(const std::string &instance);
+  InstanceControl publish_control(const std::string &instance, uint64_t bytes,
+                                  uint64_t generation,
+                                  std::optional<uint64_t> revision = {});
+  InstanceControl control_state(size_t slot);
+  bool acknowledge_control(size_t slot, uint64_t revision);
+  bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
+                    uint64_t generation, uint64_t revision);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -123,6 +167,11 @@ private:
     std::unordered_map<size_t, uint64_t> refunds;
   };
   explicit GpuBudget(const std::string &path, const Sampler &sampler);
+  explicit GpuBudget(const std::string &path, bool observe);
+  InstanceControl control_state_locked(size_t instance, size_t slot = SIZE_MAX,
+                                       const Shared *snapshot = nullptr) const;
+  InstanceControl publish_control_locked(size_t instance, uint64_t bytes,
+                                         std::optional<uint64_t> revision);
   void check_owner() const;
   void reclaim_instances_locked();
   void retire_dead_pools();
