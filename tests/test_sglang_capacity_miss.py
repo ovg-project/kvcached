@@ -1742,6 +1742,35 @@ def test_miss_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
                    "__kvcached_budget_round_patched__")
 
 
+@pytest.mark.parametrize("version, budget, miss", [
+    ("0.5.12", False, False),
+    ("0.5.13", True, False),
+    ("0.5.19", True, False),
+    ("0.5.20", True, True),
+])
+def test_autopatch_selects_budget_and_miss_patches(monkeypatch, version, budget, miss):
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "false")
+    from kvcached.integration.sglang import autopatch
+
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "true")
+    manager = autopatch.PatchManager("sglang")
+    monkeypatch.setattr(manager.version_manager, "detect_version", lambda _: version)
+    applied = []
+
+    def record_patch(self, patch):
+        applied.append(type(patch).__name__)
+        return True
+
+    # Keep the real registration and apply_all_patches version filtering;
+    # only replace the engine imports and individual patch implementations.
+    monkeypatch.setattr(autopatch.PatchManager, "_apply_single_patch", record_patch)
+    autopatch._patch_sglang(types.ModuleType("sglang"))
+
+    assert ("SchedulerSharedBudgetPatch" in applied) is budget
+    for name in ("ScheduleBatchCapacityMissPatch", "SchedulerCapacityMissPatch"):
+        assert (name in applied) is miss
+
+
 @pytest.mark.parametrize("version, wrapped", [("0.5.12", False), ("0.5.13", True)])
 def test_budget_round_registers_from_the_allocator_split(
         monkeypatch, cpu_tensors, version, wrapped):

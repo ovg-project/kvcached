@@ -80,7 +80,7 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         )
     # The shared budget reads the pools the miss wrappers roll back, and its
     # reduce precedes theirs in a round, so it registers right after them.
-    assert patch_versions["SchedulerSharedBudgetPatch"] == ">=0.5.20"
+    assert patch_versions["SchedulerSharedBudgetPatch"] == ">=0.5.13"
     assert patch_names.index("SchedulerSharedBudgetPatch") == (
         patch_names.index("SchedulerCapacityMissPatch") + 1
     )

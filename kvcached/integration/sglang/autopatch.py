@@ -76,7 +76,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # Under TP every rank's pool reports its own GPU's headroom;
             # this makes the ranks of a waiting queue admit and evict from
             # one agreed budget per scheduling round.
-            (SchedulerSharedBudgetPatch(), ">=0.5.20"),
+            (SchedulerSharedBudgetPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
