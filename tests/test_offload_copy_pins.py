@@ -398,30 +398,43 @@ def test_full_attention_and_mamba_align_groups_are_covered_by_the_fence():
 # --- the startup gate --------------------------------------------------------
 
 
-def _config(connector="OffloadingConnector", tp=1, pp=1, v2=True, nested=None):
+def _config(connector="OffloadingConnector", tp=1, pp=1, v2=True, nested=None,
+            **parallel_options):
     extra = {"connectors": [{"kv_connector": name} for name in nested]} if nested else {}
+    parallel = dict(tensor_parallel_size=tp, pipeline_parallel_size=pp,
+                    distributed_executor_backend="mp" if tp > 1 else "uni")
+    parallel.update(parallel_options)
     return types.SimpleNamespace(
         use_v2_model_runner=v2,
-        parallel_config=types.SimpleNamespace(
-            tensor_parallel_size=tp, pipeline_parallel_size=pp),
+        parallel_config=types.SimpleNamespace(**parallel),
         kv_transfer_config=types.SimpleNamespace(
             kv_connector=connector, kv_connector_extra_config=extra),
     )
 
 
 @pytest.mark.parametrize("version", ["0.29.0", "0.30.0"])
-def test_offloading_is_allowed_where_copies_are_pinned(version):
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_offloading_is_allowed_where_copies_are_pinned(version, tp):
     from kvcached.integration.vllm.offload_pins import check_offloading_config
 
-    check_offloading_config(_config(), version)
+    check_offloading_config(_config(tp=tp), version)
 
 
 @pytest.mark.parametrize("version,config", [
     ("0.28.0", _config()),
     ("0.31.0", _config()),
     ("0.30.0", _config(v2=False)),
-    ("0.30.0", _config(tp=2)),
+    ("0.30.0", _config(tp=8)),
     ("0.30.0", _config(pp=2)),
+    ("0.30.0", _config(tp=2, pp=2)),
+    ("0.30.0", _config(tp=2, data_parallel_size=2)),
+    ("0.30.0", _config(tp=2, prefill_context_parallel_size=2)),
+    ("0.30.0", _config(tp=2, decode_context_parallel_size=2)),
+    ("0.30.0", _config(tp=2, nnodes=2)),
+    ("0.30.0", _config(tp=2, distributed_executor_backend="external_launcher")),
+    ("0.30.0", _config(tp=2, distributed_executor_backend="ray")),
+    ("0.30.0", _config(tp=2, distributed_executor_backend="uni")),
+    ("0.30.0", _config(tp=2, distributed_executor_backend=None)),
     ("0.30.0", _config("MultiConnector", nested=["NixlConnector", "OffloadingConnector"])),
 ])
 def test_offloading_is_rejected_elsewhere(version, config):
@@ -437,3 +450,132 @@ def test_other_connectors_are_untouched():
 
     check_offloading_config(_config("NixlConnector", tp=4), "0.20.0")
     check_offloading_config(types.SimpleNamespace(kv_transfer_config=None), "0.30.0")
+
+
+@pytest.mark.parametrize("num_workers", [2, 4])
+@pytest.mark.parametrize("queued", [False, True])
+def test_hybrid_copies_wait_for_the_slowest_rank_after_free(num_workers, queued):
+    """Scheduler-side lifecycle harness; no CUDA execution or real TP ranks."""
+    from kvcached.integration.vllm.offload_pins import windowed_groups
+
+    manager = _manager({1: [10], 2: [20], 3: [30]})
+    if queued:
+        manager.physical_release_barrier = mock.Mock()
+    groups = [_group(0), _group(1, window=1, cow=True)]
+    pins = _pins(manager, num_workers, windowed_groups(groups))
+    # Finished attention, the exact align boundary, and a cancelled load.
+    manager.free([10, 20, 30])
+    _build(pins, FakeMeta(
+        store_jobs={9: FakeJob(FakeGPUSpec([10]), object()),
+                    10: FakeJob(FakeGPUSpec([20]), object())},
+        load_jobs={11: FakeJob(object(), FakeGPUSpec([30]))}))
+    pins.completed({9: num_workers - 1, 10: 1, 11: num_workers - 1})
+    _build(pins)
+    _release(manager)
+    assert manager.page_allocator.freed_pages == []
+
+    pins.completed({9: 1, 10: num_workers - 1})
+    _build(pins)
+    _release(manager)
+    assert set(manager.page_allocator.freed_pages) == {1, 2}
+    assert manager._copy_pins == {3: 1}
+    assert manager.has_pending_copy_release()
+
+    pins.completed({11: 1})
+    _build(pins)
+    _release(manager)
+    assert set(manager.page_allocator.freed_pages) == {1, 2, 3}
+    assert not manager.has_pending_copy_release()
+    assert pins.reports == {}
+
+
+@pytest.fixture
+def offload_engine(monkeypatch):
+    """Exercise wrapper installation against the native metadata contract."""
+    @dataclass
+    class WorkerMeta:
+        completed_jobs: dict = field(default_factory=dict)
+
+    modules: dict[str, dict[str, object]] = {
+        "vllm.distributed.kv_transfer.kv_connector.utils": {
+            "yield_req_data": lambda output: iter(output.reqs)},
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.common": {
+            "OffloadingConnectorMetadata": FakeMeta,
+            "OffloadingWorkerMetadata": WorkerMeta},
+        "vllm.v1.kv_offload.base": {"GPULoadStoreSpec": FakeGPUSpec},
+    }
+    for path, attributes in modules.items():
+        module = types.ModuleType(path)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, path, module)
+
+    class OffloadingConnector:
+        def __init__(self, workers):
+            self.connector_scheduler = types.SimpleNamespace(config=types.SimpleNamespace(
+                num_workers=workers, kv_group_configs=[_group(0), _group(1, 1, True)]))
+            self.build_connector_meta = mock.Mock(return_value=_store(9, [10]))
+            self.update_connector_output = mock.Mock()
+            self.has_pending_push_work = mock.Mock(return_value=False)
+
+    def make(tp, workers, executor_workers, queued=False):
+        return types.SimpleNamespace(
+            vllm_config=_config(tp=tp),
+            scheduler=types.SimpleNamespace(connector=OffloadingConnector(workers)),
+            model_executor=types.SimpleNamespace(world_size=executor_workers),
+            batch_queue=[] if queued else None,
+        )
+    return make
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+def test_installed_wrapper_drains_only_after_all_workers(offload_engine, workers):
+    from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+
+    engine = offload_engine(workers, workers, workers)
+    manager = _manager({1: [10]})
+    assert install_offload_copy_pins(engine, manager)
+    connector = engine.scheduler.connector
+    manager.free([10])
+    connector.build_connector_meta(FakeSchedulerOutput())
+    for _ in range(workers - 1):
+        connector.update_connector_output(types.SimpleNamespace(
+            kv_connector_worker_meta=types.SimpleNamespace(completed_jobs={9: 1})))
+    _release(manager)
+    assert manager.page_allocator.freed_pages == []
+    assert connector.has_pending_push_work()
+
+    connector.update_connector_output(types.SimpleNamespace(
+        kv_connector_worker_meta=types.SimpleNamespace(completed_jobs={9: 1})))
+    _release(manager)
+    assert manager.page_allocator.freed_pages == [1]
+    assert not connector.has_pending_push_work()
+
+
+@pytest.mark.parametrize("tp,workers,executor_workers", [
+    (2, 1, 2), (2, 4, 2), (4, 4, 1), (4, 4, None), (1, 0, 1),
+])
+def test_worker_mismatch_fails_before_enabling_copies(
+        offload_engine, tp, workers, executor_workers):
+    from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+    from kvcached.utils import KVCachedConfigError
+
+    engine = offload_engine(tp, workers, executor_workers)
+    manager = _manager({1: [10]})
+    manager.enable_copy_fence = mock.Mock()
+    original_build = engine.scheduler.connector.build_connector_meta
+    with pytest.raises(KVCachedConfigError, match="worker count mismatch"):
+        install_offload_copy_pins(engine, manager)
+    manager.enable_copy_fence.assert_not_called()
+    assert engine.scheduler.connector.build_connector_meta is original_build
+
+
+def test_queued_offloading_requires_the_release_barrier(offload_engine):
+    from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+    from kvcached.utils import KVCachedConfigError
+
+    engine = offload_engine(2, 2, 2, queued=True)
+    manager = _manager({1: [10]})
+    with pytest.raises(KVCachedConfigError, match="physical release barrier"):
+        install_offload_copy_pins(engine, manager)
+    manager.physical_release_barrier = mock.Mock()
+    assert install_offload_copy_pins(engine, manager)
