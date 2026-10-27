@@ -119,6 +119,45 @@ def test_mla_backup_copies_every_layer_of_an_interleaved_pool(kernels):
     assert torch.equal(buffer[host_indices], base[device_indices])
 
 
+@pytest.mark.parametrize("kind", ["mha", "mla"])
+@pytest.mark.parametrize("index_device", ["cpu", "cuda:1"])
+def test_backup_indices_follow_the_kv_device(monkeypatch, kernels, kind, index_device):
+    """Model direct/layer_first CPU indices and kernel GPU indices without CUDA."""
+    class Indices:
+        def __init__(self, values, device, dtype="int64"):
+            self.values, self.device, self.dtype = values, device, dtype
+
+        def numel(self):
+            return len(self.values)
+
+        def to(self, *, device, dtype=None, non_blocking=False):
+            return Indices(self.values, device, dtype or self.dtype)
+
+    # The controller sorts host indices and applies the same permutation to
+    # device indices for direct copies. Keep that pairing after moving them.
+    host_indices = Indices([0, 3, 7], "cpu")
+    device_indices = Indices([5, 11, 2], index_device)
+    buffer = types.SimpleNamespace(device="cuda:1")
+    device = types.SimpleNamespace(k_buffer=[buffer], v_buffer=[buffer], kv_buffer=[buffer])
+    host = types.SimpleNamespace(layer_num=1, element_dim=8, kv_cache_dim=4,
+                                 k_data_refs=[object()], v_data_refs=[object()],
+                                 data_refs=[object()])
+    calls = []
+
+    def transfer(**kwargs):
+        src, dst = kwargs["indices_src"], kwargs["indices_dst"]
+        assert src.device == dst.device == buffer.device
+        assert src.dtype == dst.dtype == "int64"
+        assert list(zip(dst.values, src.values)) == [(0, 5), (3, 11), (7, 2)]
+        calls.append(True)
+
+    module = sys.modules["sglang.kernels.ops.kvcache.hicache"]
+    monkeypatch.setattr(module, "transfer_hicache_one_layer", transfer)
+    monkeypatch.setattr(module, "transfer_hicache_one_layer_mla", transfer)
+    getattr(hicache, "backup_" + kind)(host, device, host_indices, device_indices)
+    assert calls == [True]
+
+
 CONV_SHAPES, TEMPORAL_SHAPE, SLOTS = [(8, 8), (32,)], (8, 8), 6
 
 
@@ -319,13 +358,57 @@ def test_host_pools_that_would_assume_dense_rows_are_rejected(monkeypatch, kerne
         own_backup(InterleavedKVPool())
 
 
-def test_host_memory_is_split_by_logical_pool_size():
+@pytest.mark.parametrize("buffer_name", ["k_buffer", "kv_buffer"])
+@pytest.mark.parametrize("capacity, expected", [(100, 100), (1000, 1000), (2000, 1000)])
+def test_host_memory_is_split_by_logical_pool_size(buffer_name, capacity, expected):
+    reported = (500, 500) if buffer_name == "k_buffer" else 1000
     elastic = types.SimpleNamespace(
-        get_kv_size_bytes=lambda: (500, 500), kvcached_allocator=object(),
-        k_buffer=[torch.zeros(1000, 1)], size=96, page_size=4)
+        get_kv_size_bytes=lambda: reported, kvcached_allocator=object(),
+        size=capacity - 4, page_size=4,
+        **{buffer_name: [torch.zeros(1000, 1)]})
     native = types.SimpleNamespace(get_kv_size_bytes=lambda: (300, 300),
                                    k_buffer=[torch.zeros(100, 1)], size=96, page_size=4)
     mamba = types.SimpleNamespace(get_kv_size_bytes=lambda: 100)
-    assert hicache.device_pool_bytes(elastic) == 100
+    assert hicache.device_pool_bytes(elastic) == expected
+    assert elastic.get_kv_size_bytes() == reported
     assert hicache.device_pool_bytes(native) == 600
     assert hicache.device_pool_bytes(mamba) == 100
+
+
+def test_zero_layer_pool_needs_no_capacity_scaling():
+    pool = types.SimpleNamespace(get_kv_size_bytes=lambda: (0, 0),
+                                 kvcached_allocator=None, k_buffer=[], v_buffer=[])
+    assert hicache.device_pool_bytes(pool) == 0
+
+
+@pytest.mark.parametrize("version", ["0.5.18", "0.5.19", "0.5.20"])
+def test_host_size_split_patch_preserves_budget_and_native_fallback(monkeypatch, version):
+    calls = []
+    module: Any = types.ModuleType(hicache.HiCacheSizeSplitPatch.target_module)
+
+    def original(size, pools):
+        calls.append((size, pools))
+        return (3.0, 9.0)
+
+    module._split_hicache_size = original
+    patch = hicache.HiCacheSizeSplitPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version", lambda library: version)
+    monkeypatch.setattr(hicache, "enable_kvcached", lambda: True)
+    assert patch.apply(module)
+    wrapped = module._split_hicache_size
+    assert patch.apply(module)
+    assert module._split_hicache_size is wrapped
+
+    elastic = types.SimpleNamespace(
+        get_kv_size_bytes=lambda: (500, 500), kvcached_allocator=object(),
+        k_buffer=[torch.zeros(1000, 1)], size=96, page_size=4)
+    mamba = types.SimpleNamespace(get_kv_size_bytes=lambda: 100)
+    pools = (elastic, mamba)
+    split = module._split_hicache_size(12, pools)
+    assert split == (6.0, 6.0)
+    assert sum(split) == 12
+    assert calls == []
+
+    monkeypatch.setattr(hicache, "enable_kvcached", lambda: False)
+    assert module._split_hicache_size(12, pools) == (3.0, 9.0)
+    assert calls == [(12, pools)]
