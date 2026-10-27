@@ -11,6 +11,7 @@ import sys
 import threading
 import types
 from dataclasses import dataclass, field
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -297,6 +298,82 @@ def test_a_resumed_request_drops_the_blocks_it_held_before_preemption():
     _build(pins, reqs=[("r", ([], [30]), True)])
     assert manager.page_allocator.freed_pages == [1]
     assert manager._copy_pins == {3: 1}
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_matching_drops_obsolete_window_holds_before_resumed_admission(monkeypatch, pending):
+    """Constructed lower-limit/reset-running-requests regression, not serving."""
+    from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+
+    @dataclass
+    class WorkerMeta:
+        completed_jobs: dict = field(default_factory=dict)
+
+    modules: dict[str, dict[str, Any]] = {
+        "vllm.distributed.kv_transfer.kv_connector.utils": {
+            "yield_req_data": lambda output: iter(output.reqs)},
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.common": {
+            "OffloadingConnectorMetadata": FakeMeta, "OffloadingWorkerMetadata": WorkerMeta},
+        "vllm.v1.kv_offload.base": {"GPULoadStoreSpec": FakeGPUSpec},
+    }
+    for name, attrs in modules.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    manager = _manager({1: [10], 2: [20]})
+    old_blocks = [10, 20]
+
+    def match(request, num_computed_tokens, **kwargs):
+        # vLLM 0.29/0.30 discard these before checking pending transfer jobs.
+        old_blocks.clear()
+        return (None if pending else 0), False
+
+    connector = type("OffloadingConnector", (), {})()
+    connector.connector_scheduler = types.SimpleNamespace(config=types.SimpleNamespace(
+        kv_group_configs=[_group(0, window=8)], num_workers=2))
+    connector.build_connector_meta = lambda output: FakeMeta()
+    connector.update_connector_output = lambda output: None
+    connector.has_pending_push_work = lambda: False
+    connector.get_num_new_matched_tokens = match
+    engine = types.SimpleNamespace(scheduler=types.SimpleNamespace(connector=connector))
+    assert install_offload_copy_pins(engine, manager)
+    pins = engine._kvcached_offload_copy_pins
+    _build(pins, reqs=[("r", ([10, 20],), False)])
+    if pending:
+        _build(pins, _store(9, [10]))
+
+    # Lowering the limit and reset_running_requests=True retire the old pages.
+    manager.in_shrink, manager.target_num_pages = True, 1
+    manager.num_avail_blocks = 18
+    manager.page_size = BLOCKS_PER_PAGE
+    manager.page_allocator.get_num_free_pages = lambda: 2
+    manager.free([10, 20])
+    _build(pins)
+    assert manager.available_size() == 0
+    assert manager.page_allocator.freed_pages == []
+
+    result = connector.get_num_new_matched_tokens(
+        types.SimpleNamespace(request_id="r"), 0, max_num_new_tokens=20)
+    assert result == ((None if pending else 0), False)
+    assert old_blocks == []
+    assert pins.held == {}
+    assert manager._copy_pins == ({1: 1} if pending else {})
+    _build(pins)
+    assert set(manager.page_allocator.freed_pages) == ({2} if pending else {1, 2})
+    if pending:
+        pins.completed({9: 1})
+        _build(pins)
+        assert manager.page_allocator.freed_pages == [2]
+        pins.completed({9: 1})
+        _build(pins)
+    assert set(manager.page_allocator.freed_pages) == {1, 2}
+    assert not manager.in_shrink
+    manager.page_allocator.get_avail_physical_pages = lambda: 1
+    manager.page_allocator.get_num_reserved_pages = lambda: 0
+    monkeypatch.setattr("kvcached.kv_cache_manager.InternalPage", types.SimpleNamespace(
+        get_num_blocks=lambda page_size, block_size: page_size // block_size))
+    assert manager.available_size() >= BLOCKS_PER_PAGE
 
 
 def test_full_attention_blocks_are_not_held():

@@ -196,6 +196,15 @@ def install_offload_copy_pins(engine_core: Any, manager: Any) -> bool:
     build_connector_meta = connector.build_connector_meta
     update_connector_output = connector.update_connector_output
     has_pending_push_work = connector.has_pending_push_work
+    get_num_new_matched_tokens = connector.get_num_new_matched_tokens
+
+    def match_with_pins(request: Any, *args: Any, **kwargs: Any) -> Any:
+        result = get_num_new_matched_tokens(request, *args, **kwargs)
+        # Native matching discards the old block lists before admission, even
+        # when in-flight transfers make it return None. Only their window
+        # holds are obsolete; transfer-job pins still await worker reports.
+        pins._drop(request.request_id)
+        return result
 
     def build_with_pins(scheduler_output: Any) -> Any:
         meta = build_connector_meta(scheduler_output)
@@ -215,6 +224,7 @@ def install_offload_copy_pins(engine_core: Any, manager: Any) -> bool:
     connector.build_connector_meta = build_with_pins
     connector.update_connector_output = update_with_pins
     connector.has_pending_push_work = has_pending_work_with_pins
+    connector.get_num_new_matched_tokens = match_with_pins
     engine_core._kvcached_offload_copy_pins = pins
     logger.info("Pinning kvcached pages for OffloadingConnector copies (%d workers, "
                 "windowed groups %s)", num_workers, list(windowed))
