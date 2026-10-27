@@ -476,6 +476,36 @@ def test_engine_core_rejects_kv_offloading_before_initialization(
         original_init.assert_called_once()
 
 
+@pytest.mark.parametrize("version", ["0.29.0", "0.30.0"])
+def test_engine_core_starts_with_kv_offloading_on_model_runner_v2(
+    monkeypatch, vllm_modules, version
+):
+    # From 0.29 OffloadingConnector allocates through kvcached, and its copies
+    # are pinned once the engine is up (offload_pins.py).
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = version
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    EngineCore(types.SimpleNamespace(
+        use_v2_model_runner=True,
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1,
+        ),
+        kv_transfer_config=types.SimpleNamespace(kv_connector="OffloadingConnector"),
+    ))
+    initialize.assert_called_once()
+    original_init.assert_called_once()
+
+
 @pytest.mark.parametrize("coordinator_flag,pool_flag,expected", [
     (True, False, True),   # <= 0.29: the coordinator owns the flag
     (False, True, False),
