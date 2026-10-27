@@ -282,6 +282,51 @@ def copy_mamba(host: Any, host_indices: Any, device_indices: Any, layer: Optiona
                 cache_src=plan.host, indices_src=host_rows, element_dim=plan.elements)
 
 
+def device_pool_bytes(pool: Any) -> float:
+    """A device pool's size for splitting --hicache-size between pools."""
+    size = pool.get_kv_size_bytes()
+    total = sum(size) if isinstance(size, tuple) else size
+    buffers = getattr(pool, "k_buffer", None) or getattr(pool, "kv_buffer", None)
+    if getattr(pool, "kvcached_allocator", None) is None or not buffers:
+        return total
+    # Elastic buffers span kvcached's whole virtual reservation, about a GPU
+    # per pool, which would starve the other pools (e.g. Mamba states) of
+    # host memory. Count the pool's logical capacity instead.
+    return total * min(1.0, (pool.size + pool.page_size) / buffers[0].shape[0])
+
+
+class HiCacheSizeSplitPatch(VersionAwarePatch, BasePatch):
+    """Split --hicache-size by the pools' logical sizes, not their reservations."""
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
+    patch_name = "hicache_size_split"
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_split(target_module)
+
+    @version_range(HICACHE_RANGE)
+    def patch_split(self, target_module: types.ModuleType) -> bool:
+        original = getattr(target_module, "_split_hicache_size", None)
+        if original is None:
+            return False
+        if self._is_already_patched(original):
+            return True
+
+        @functools.wraps(original)
+        def _split_hicache_size(hicache_size: int, kv_pools: Tuple[Any, ...]) -> Tuple[float, ...]:
+            if not enable_kvcached():
+                return original(hicache_size, kv_pools)
+            sizes = [device_pool_bytes(pool) for pool in kv_pools]
+            return tuple(hicache_size * size / sum(sizes) for size in sizes)
+
+        self._mark_as_patched(_split_hicache_size)
+        setattr(target_module, "_split_hicache_size", _split_hicache_size)
+        return True
+
+
 class _HostKVBackupPatch(VersionAwarePatch, BasePatch):
     """Back up interleaved elastic KV one layer at a time."""
 

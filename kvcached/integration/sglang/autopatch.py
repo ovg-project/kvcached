@@ -16,6 +16,7 @@ from kvcached.integration.sglang.hicache import (
     HiCacheKVHostPoolPatch,
     HiCacheMambaHostPoolPatch,
     HiCacheMLAHostPoolPatch,
+    HiCacheSizeSplitPatch,
 )
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
@@ -89,6 +90,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (HiCacheKVHostPoolPatch(), HICACHE_RANGE),
             (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),
             (HiCacheMambaHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheSizeSplitPatch(), HICACHE_RANGE),
         ]
     )
 
