@@ -119,6 +119,45 @@ def test_mla_backup_copies_every_layer_of_an_interleaved_pool(kernels):
     assert torch.equal(buffer[host_indices], base[device_indices])
 
 
+@pytest.mark.parametrize("kind", ["mha", "mla"])
+@pytest.mark.parametrize("index_device", ["cpu", "cuda:1"])
+def test_backup_indices_follow_the_kv_device(monkeypatch, kernels, kind, index_device):
+    """Model direct/layer_first CPU indices and kernel GPU indices without CUDA."""
+    class Indices:
+        def __init__(self, values, device, dtype="int64"):
+            self.values, self.device, self.dtype = values, device, dtype
+
+        def numel(self):
+            return len(self.values)
+
+        def to(self, *, device, dtype=None, non_blocking=False):
+            return Indices(self.values, device, dtype or self.dtype)
+
+    # The controller sorts host indices and applies the same permutation to
+    # device indices for direct copies. Keep that pairing after moving them.
+    host_indices = Indices([0, 3, 7], "cpu")
+    device_indices = Indices([5, 11, 2], index_device)
+    buffer = types.SimpleNamespace(device="cuda:1")
+    device = types.SimpleNamespace(k_buffer=[buffer], v_buffer=[buffer], kv_buffer=[buffer])
+    host = types.SimpleNamespace(layer_num=1, element_dim=8, kv_cache_dim=4,
+                                 k_data_refs=[object()], v_data_refs=[object()],
+                                 data_refs=[object()])
+    calls = []
+
+    def transfer(**kwargs):
+        src, dst = kwargs["indices_src"], kwargs["indices_dst"]
+        assert src.device == dst.device == buffer.device
+        assert src.dtype == dst.dtype == "int64"
+        assert list(zip(dst.values, src.values)) == [(0, 5), (3, 11), (7, 2)]
+        calls.append(True)
+
+    module = sys.modules["sglang.kernels.ops.kvcache.hicache"]
+    monkeypatch.setattr(module, "transfer_hicache_one_layer", transfer)
+    monkeypatch.setattr(module, "transfer_hicache_one_layer_mla", transfer)
+    getattr(hicache, "backup_" + kind)(host, device, host_indices, device_indices)
+    assert calls == [True]
+
+
 CONV_SHAPES, TEMPORAL_SHAPE, SLOTS = [(8, 8), (32,)], (8, 8), 6
 
 

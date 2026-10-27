@@ -95,6 +95,10 @@ def backup_mha(host: Any, device_pool: Any, host_indices: Any, device_indices: A
 
     if device_indices.numel() == 0:
         return
+    # The direct backend supplies CPU indices with layer_first host storage.
+    # Our strided copies use JIT, whose indices must follow the device KV.
+    device_indices = device_indices.to(device=device_pool.k_buffer[0].device,
+                                       non_blocking=True)
     dst_indices = _indices_like(host_indices, device_indices)
     for layer in range(host.layer_num):
         transfer_hicache_one_layer(
@@ -113,6 +117,8 @@ def backup_mla(host: Any, device_pool: Any, host_indices: Any, device_indices: A
 
     if device_indices.numel() == 0:
         return
+    device_indices = device_indices.to(device=device_pool.kv_buffer[0].device,
+                                       non_blocking=True)
     dst_indices = _indices_like(host_indices, device_indices)
     for layer in range(host.layer_num):
         transfer_hicache_one_layer_mla(
