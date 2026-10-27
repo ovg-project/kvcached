@@ -32,6 +32,7 @@ from kvcached.integration.sglang.patches import (
     SchedulerCapacityMissPatch,
     SchedulerIdleLimitPatch,
     SchedulerMemoryLeakPatch,
+    SchedulerSharedBudgetPatch,
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
     SWARadixCacheLimitPatch,
@@ -79,6 +80,10 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # (#547); they read the 0.5.20 batch and request shapes.
             (ScheduleBatchCapacityMissPatch(), ">=0.5.20"),
             (SchedulerCapacityMissPatch(), ">=0.5.20"),
+            # Under TP every rank's pool reports its own GPU's headroom;
+            # this makes the ranks of a waiting queue admit and evict from
+            # one agreed budget per scheduling round.
+            (SchedulerSharedBudgetPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
