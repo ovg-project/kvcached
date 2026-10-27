@@ -207,6 +207,15 @@ class KVCacheManager:
         self.physical_release_barrier: Optional[Callable[[], None]] = None
         self._physical_release_epoch = 0
         self._retired_pages: List[tuple[int, List[int]]] = []
+        # Engine KV copies (CPU offload stores and loads) pin the pages they
+        # read or write until the copy has completed on the GPU. With an
+        # offload fence, a retired page also waits for the next copy-job build
+        # after its retirement, the latest point at which a copy of its old
+        # contents can still be created (see enable_copy_fence()).
+        self._copy_pins: Dict[int, int] = {}
+        self._copy_job_pages: Dict[Any, List[int]] = {}
+        self._copy_fence: Optional[int] = None
+        self._retire_fence: Dict[int, int] = {}
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE if page_size is None else page_size
@@ -1005,6 +1014,11 @@ class KVCacheManager:
                 retired_pages.append(
                     (self._physical_release_epoch, pages_to_free)
                 )
+                fence = getattr(self, "_copy_fence", None)
+                if fence is not None:
+                    if getattr(self, "_retire_fence", None) is None:
+                        self._retire_fence = {}
+                    self._retire_fence[self._physical_release_epoch] = fence
             else:
                 try:
                     self.page_allocator.free_pages(pages_to_free)
@@ -1080,11 +1094,21 @@ class KVCacheManager:
     def _release_retired_pages_through(self, marker: int) -> None:
         pages_to_free: List[int] = []
         still_retired: List[tuple[int, List[int]]] = []
+        pins = getattr(self, "_copy_pins", None) or {}
+        fence = getattr(self, "_copy_fence", None)
+        retire_fence = getattr(self, "_retire_fence", None) or {}
         for epoch, page_ids in getattr(self, "_retired_pages", []):
-            if epoch <= marker:
-                pages_to_free.extend(page_ids)
-            else:
+            if epoch > marker or (
+                    fence is not None and retire_fence.get(epoch, -1) >= fence):
+                # Not yet past the batch that may use it, or no copy-job build
+                # has run since it was retired.
                 still_retired.append((epoch, page_ids))
+                continue
+            held = [page_id for page_id in page_ids if pins.get(page_id)]
+            pages_to_free.extend(page_id for page_id in page_ids
+                                 if not pins.get(page_id))
+            if held:
+                still_retired.append((epoch, held))
 
         if pages_to_free:
             barrier = getattr(self, "physical_release_barrier", None)
@@ -1106,7 +1130,75 @@ class KVCacheManager:
             # the cached count only once physical release has succeeded.
             self._avail_physical_pages_cache = None
         self._retired_pages = still_retired
+        if retire_fence:
+            live = {epoch for epoch, _ in still_retired}
+            self._retire_fence = {epoch: value for epoch, value in retire_fence.items()
+                                  if epoch in live}
         self._maybe_finish_shrink()
+
+    @synchronized
+    def enable_copy_fence(self) -> None:
+        """Hold retired pages for engine KV copies (vLLM CPU offloading).
+
+        A copy job that reads a freed block is created at the latest in the
+        first copy-job build after the free, the same bound the engine relies
+        on before it reuses the block. From then on the job's pins keep the
+        page mapped, so a retired page may be released once a build has
+        followed its retirement and no pin is left.
+        """
+        self.defer_physical_release = True
+        for name in ("_copy_pins", "_copy_job_pages", "_retire_fence"):
+            if getattr(self, name, None) is None:
+                setattr(self, name, {})
+        if getattr(self, "_copy_fence", None) is None:
+            self._copy_fence = 0
+
+    @synchronized
+    def pin_copy_job(self, job: Any, block_ids: Iterable[int]) -> None:
+        """Keep the pages under a copy job mapped until unpin_copy_job(job)."""
+        if job in self._copy_job_pages:
+            return
+        indices = [int(block_id) for block_id in block_ids]
+        pages = list(self.page_allocator.group_indices_by_page(
+            indices, self.block_mem_size)) if indices else []
+        for page_id in pages:
+            if page_id not in self.avail_pages and page_id not in self.full_pages:
+                # The page was handed back already, so the copy would read or
+                # write memory that no longer holds this KV.
+                raise StateConsistencyError(
+                    f"KV copy job {job} uses page {page_id}, which kvcached "
+                    "has already released")
+        for page_id in pages:
+            self._copy_pins[page_id] = self._copy_pins.get(page_id, 0) + 1
+        self._copy_job_pages[job] = pages
+
+    @synchronized
+    def unpin_copy_job(self, job: Any) -> bool:
+        """Release a copy job's pins once the copy has completed on the GPU."""
+        pages = self._copy_job_pages.pop(job, None)
+        if pages is None:
+            return False
+        for page_id in pages:
+            count = self._copy_pins.get(page_id, 0) - 1
+            if count > 0:
+                self._copy_pins[page_id] = count
+            else:
+                self._copy_pins.pop(page_id, None)
+        return True
+
+    @synchronized
+    def advance_copy_fence(self) -> None:
+        """Record that a copy-job build has completed (enable_copy_fence())."""
+        fence = getattr(self, "_copy_fence", None)
+        if fence is not None:
+            self._copy_fence = fence + 1
+
+    @synchronized
+    def has_pending_copy_release(self) -> bool:
+        """Whether copy pins or the fence still hold pages back."""
+        return bool(getattr(self, "_copy_job_pages", None)) or (
+            getattr(self, "_copy_fence", None) is not None
+            and bool(getattr(self, "_retired_pages", None)))
 
     @_after_post_init
     @synchronized
@@ -1607,6 +1699,10 @@ class KVCacheManager:
             raise
 
     def _clear_locked(self) -> None:
+        if getattr(self, "_copy_job_pages", None):
+            # clear() releases every page, including those a pending KV copy
+            # still uses; only SGLang calls it, and SGLang never pins pages.
+            raise StateConsistencyError("clear() while KV copy jobs are pending")
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
@@ -1647,6 +1743,7 @@ class KVCacheManager:
                 len(pages_to_free),
             )
         self._retired_pages = []
+        self._retire_fence = {}
         self.avail_pages.clear()
         self.full_pages.clear()
         self._logical_allocated_blocks = 0

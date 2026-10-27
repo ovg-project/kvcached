@@ -1805,3 +1805,36 @@ def test_budget_round_registers_from_the_allocator_split(
         assert admitted == [[["a", "b"]], [["a"]]]
         assert budgets == [[16], [6]]
         assert gloo.rounds == []
+
+
+@pytest.mark.parametrize("consumer", [-1, 0, 2])
+def test_an_unwound_batch_waits_for_its_hicache_loads(monkeypatch, consumer):
+    """Wait for this batch's loads before releasing its admission state."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize",
+                        lambda: pytest.fail("must not synchronize the whole device"))
+    events = [
+        types.SimpleNamespace(finish_event=types.SimpleNamespace(
+            synchronize=lambda index=index: calls.append(("wait", index))))
+        for index in range(3)
+    ]
+    tree_cache = types.SimpleNamespace(
+        cache_controller=types.SimpleNamespace(
+            layer_done_counter=types.SimpleNamespace(events=events)),
+        dec_lock_ref=lambda node: calls.append(("unlock", node)))
+    mamba_allocator = types.SimpleNamespace(
+        free=lambda slots: calls.append(("free", slots.tolist())))
+    req = types.SimpleNamespace(
+        last_node="node",
+        kv=types.SimpleNamespace(holds_mamba=True, mamba_pool_idx=torch.tensor(7)))
+    scheduler = types.SimpleNamespace(tree_cache=tree_cache,
+                                      req_to_token_pool=types.SimpleNamespace(
+                                          mamba_allocator=mamba_allocator),
+                                      chunked_req=None, waiting_queue=[])
+    batch = types.SimpleNamespace(reqs=[req], hicache_consumer_index=consumer)
+
+    assert patches._unwind_prefill_admission(scheduler, batch, None, None) == [req]
+    wait = [("wait", consumer)] if consumer >= 0 else []
+    assert calls == wait + [("unlock", "node"), ("free", [7])]
+    assert req.kv.mamba_pool_idx is None
+    assert scheduler.waiting_queue == [req]

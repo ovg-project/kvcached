@@ -541,6 +541,14 @@ def _unwind_prefill_admission(scheduler: Any, batch: Any, chunked_before: Any,
     the next round re-admits it the way the hybrid SWA early return does.
     Returns the requests placed back at the head of the waiting queue.
     """
+    consumer = getattr(batch, "hicache_consumer_index", -1)
+    if consumer >= 0:
+        # HiCache submitted this batch's host-to-device loads before its
+        # allocation missed, and no forward will wait for them. Let them land
+        # before their Mamba slots are freed and later batches read the
+        # loaded nodes.
+        counter = scheduler.tree_cache.cache_controller.layer_done_counter
+        counter.events[consumer].finish_event.synchronize()
     tree_cache = scheduler.tree_cache
     mamba_allocator = getattr(scheduler.req_to_token_pool, "mamba_allocator", None)
     chunked_after = scheduler.chunked_req

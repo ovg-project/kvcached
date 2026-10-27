@@ -11,6 +11,13 @@ from kvcached.integration.patch_base import (
     is_integration_version_supported,
     log_patch_results,
 )
+from kvcached.integration.sglang.hicache import (
+    HICACHE_RANGE,
+    HiCacheKVHostPoolPatch,
+    HiCacheMambaHostPoolPatch,
+    HiCacheMLAHostPoolPatch,
+    HiCacheSizeSplitPatch,
+)
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     ElasticAllocatorPatch,
@@ -84,6 +91,11 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
             (SWARadixCacheLimitPatch(), ">=0.5.13"),
             (MambaRadixCacheLimitPatch(), ">=0.5.13"),
+            # HiCache host copies that assume dense device layers.
+            (HiCacheKVHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheMambaHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheSizeSplitPatch(), HICACHE_RANGE),
         ]
     )
 
