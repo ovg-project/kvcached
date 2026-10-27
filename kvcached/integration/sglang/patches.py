@@ -36,8 +36,11 @@ from kvcached.integration.version_utils import (
     version_range,
 )
 from kvcached.kv_geometry import backing_blocks_for_capacity
+from kvcached.prefix_cache_retention import (
+    _get_prefix_cache_retention_limit,
+    _register_prefix_cache_retention_enforcer,
+)
 from kvcached.utils import (
-    MAX_CACHED_TOKENS,
     PAGE_SIZE,
     KVCachePoolExhausted,
     get_kvcached_logger,
@@ -3683,6 +3686,39 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _install_prefix_cache_retention_hooks(
+    patch: BasePatch,
+    cache_cls: Any,
+    original_cache_finished: Callable[..., Any],
+    enforce: Callable[[Any, int], None],
+) -> None:
+    """Install the common runtime retention hooks on one cache adapter."""
+    cache_cls._enforce_prefix_cache_retention = enforce
+
+    @functools.wraps(original_cache_finished)
+    def wrapped_cache_finished(cache: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original_cache_finished(cache, *args, **kwargs)
+        cache._enforce_prefix_cache_retention(
+            _get_prefix_cache_retention_limit())
+        return result
+
+    patch._mark_as_patched(wrapped_cache_finished)
+    cache_cls.cache_finished_req = wrapped_cache_finished
+
+    original_init = cache_cls.__init__
+    marker = "__kvcached_retention_registration__"
+    if patch._is_already_patched(original_init, marker):
+        return
+
+    @functools.wraps(original_init)
+    def wrapped_init(cache: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(cache, *args, **kwargs)
+        _register_prefix_cache_retention_enforcer(cache)
+
+    patch._mark_as_patched(wrapped_init, marker)
+    cache_cls.__init__ = wrapped_init
+
+
 class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     """Enforce KVCACHED_MAX_CACHED_TOKENS limit on SGLang's RadixCache.
 
@@ -3692,7 +3728,7 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     capacity and leaves headroom for running requests.
 
     KVCACHED_MAX_CACHED_TOKENS semantics:
-      < 0  → unlimited; this patch is a no-op.
+      < 0  → unlimited; the installed runtime hook is a no-op.
       == 0 → disabled; every cached entry is evicted immediately on insert.
       > 0  → cap evictable size at this many tokens.
     """
@@ -3703,13 +3739,6 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
     patch_name = "radix_cache_limit"
 
     def apply(self, radix_cache_mod: types.ModuleType) -> bool:
-        if MAX_CACHED_TOKENS < 0:
-            logger.debug(
-                "KVCACHED_MAX_CACHED_TOKENS < 0 (unlimited) — "
-                "RadixCacheLimitPatch skipped"
-            )
-            return True  # Not an error; just not needed.
-
         if not self.initialize_version_info():
             return False
 
@@ -3730,31 +3759,32 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             self.logger.debug("RadixCache.cache_finished_req already patched")
             return True
 
-        max_cached = MAX_CACHED_TOKENS
         evict_params_cls = getattr(radix_cache_mod, "EvictParams", None)
         # SGLang < 0.5.9 computes leaves on demand and does not expose the
         # persistent evictable_leaves set required by the page-aware planner.
 
-        def _wrapped(self_rc: Any, *args: Any, **kwargs: Any) -> None:
-            original_cache_finished(self_rc, *args, **kwargs)
-            excess = self_rc.evictable_size_ - max_cached
-            if excess > 0:
-                if type(self_rc) is RadixCache and evict_params_cls is not None:
-                    _evict_radix_cache_page_aware(
-                        radix_cache=self_rc,
+        def _enforce(self_rc: Any, limit_tokens: int) -> None:
+            if limit_tokens < 0:
+                return
+            excess = self_rc.evictable_size_ - limit_tokens
+            if excess <= 0:
+                return
+            if type(self_rc) is RadixCache and evict_params_cls is not None:
+                _evict_radix_cache_page_aware(
+                    radix_cache=self_rc,
+                    num_tokens=excess,
+                    evict_params_cls=evict_params_cls,
+                )
+            else:
+                self_rc.evict(
+                    _make_sglang_evict_arg(
                         num_tokens=excess,
                         evict_params_cls=evict_params_cls,
                     )
-                else:
-                    self_rc.evict(
-                        _make_sglang_evict_arg(
-                            num_tokens=excess,
-                            evict_params_cls=evict_params_cls,
-                        )
-                    )
+                )
 
-        self._mark_as_patched(_wrapped)
-        RadixCache.cache_finished_req = _wrapped  # type: ignore
+        _install_prefix_cache_retention_hooks(
+            self, RadixCache, original_cache_finished, _enforce)
 
         if evict_params_cls is not None:
             original_reset = RadixCache.reset
@@ -3773,8 +3803,8 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             RadixCache.reset = _wrapped_reset  # type: ignore
 
         logger.info(
-            f"[kvcached] RadixCache evictable size capped at "
-            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+            "[kvcached] RadixCache retention limit initialized at %d tokens",
+            _get_prefix_cache_retention_limit(),
         )
         return True
 
@@ -3801,20 +3831,20 @@ class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
 
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        max_cached = MAX_CACHED_TOKENS
-
-        def _wrapped(self_rc, *args: Any, **kwargs: Any):
-            original_cache_finished(self_rc, *args, **kwargs)
-            excess = self_rc.full_evictable_size() - max_cached
+        def _enforce(self_rc: Any, limit_tokens: int) -> None:
+            if limit_tokens < 0:
+                return
+            excess = self_rc.full_evictable_size() - limit_tokens
             if excess > 0:
                 self_rc.evict(EvictParams(num_tokens=excess))
 
-        self._mark_as_patched(_wrapped)
-        cache_cls.cache_finished_req = _wrapped
+        _install_prefix_cache_retention_hooks(
+            self, cache_cls, original_cache_finished, _enforce)
 
         logger.info(
-            f"[kvcached] {self.target_class} evictable size capped at "
-            f"{max_cached} tokens (KVCACHED_MAX_CACHED_TOKENS)"
+            "[kvcached] %s retention limit initialized at %d tokens",
+            self.target_class,
+            _get_prefix_cache_retention_limit(),
         )
         return True
 

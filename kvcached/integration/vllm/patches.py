@@ -500,6 +500,27 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     return isinstance(kv_cache_spec, MLAAttentionSpec)
 
 
+def _max_cached_blocks_for_tokens(
+    max_cached_tokens: int, block_size: int, num_kv_cache_groups: int = 1
+) -> int:
+    """Convert one logical token retention limit to vLLM block units."""
+    if max_cached_tokens < 0:
+        return -1
+    if max_cached_tokens == 0:
+        return 0
+    max_cached_blocks = max_cached_tokens // block_size
+    if max_cached_blocks == 0:
+        logger.warning(
+            "prefix cache retention limit %d is smaller than the KV block size "
+            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
+            "stays enabled. Set the limit to 0 to disable caching explicitly.",
+            max_cached_tokens,
+            block_size,
+        )
+        max_cached_blocks = 1
+    return max_cached_blocks * max(1, num_kv_cache_groups)
+
+
 def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
@@ -516,23 +537,10 @@ def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int
     enabled for the smallest non-zero budget, matching the user's intent; a
     warning is logged so the effective granularity is not silent.
     """
-    from kvcached.utils import MAX_CACHED_TOKENS
-    if MAX_CACHED_TOKENS < 0:
-        return -1
-    if MAX_CACHED_TOKENS == 0:
-        return 0
-    max_cached_blocks = MAX_CACHED_TOKENS // block_size
-    if max_cached_blocks == 0:
-        logger.warning(
-            "KVCACHED_MAX_CACHED_TOKENS=%d is smaller than the KV block size "
-            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
-            "stays enabled. Set KVCACHED_MAX_CACHED_TOKENS=0 to disable "
-            "caching explicitly.",
-            MAX_CACHED_TOKENS,
-            block_size,
-        )
-        max_cached_blocks = 1
-    return max_cached_blocks * max(1, num_kv_cache_groups)
+    from kvcached.prefix_cache_retention import _get_prefix_cache_retention_limit
+
+    return _max_cached_blocks_for_tokens(
+        _get_prefix_cache_retention_limit(), block_size, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -711,12 +719,15 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 num_kv_buffers: int = 2,
                 max_cached_blocks: int = 1000,
                 hash_block_size: Optional[int] = None,
+                num_kv_cache_groups: int = 1,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
                 self.enable_caching = enable_caching
                 # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
+                self._retention_block_size = block_size
+                self._retention_kv_cache_groups = max(1, num_kv_cache_groups)
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
 
@@ -786,6 +797,21 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager, "_register_shrink_reclaimer", None)
                 if self._page_eviction is not None and register_reclaimer is not None:
                     register_reclaimer(self._reclaim_for_shrink)
+                from kvcached.prefix_cache_retention import (
+                    _register_prefix_cache_retention_enforcer,
+                )
+                _register_prefix_cache_retention_enforcer(self)
+
+            def _enforce_prefix_cache_retention(self, limit_tokens: int) -> None:
+                self.max_cached_blocks = _max_cached_blocks_for_tokens(
+                    limit_tokens,
+                    self._retention_block_size,
+                    self._retention_kv_cache_groups,
+                )
+                if (self.enable_prefix_cache and self.max_cached_blocks >= 0
+                        and len(self._evictable_blocks) > self.max_cached_blocks):
+                    self._evict_blocks_from_pool(
+                        len(self._evictable_blocks) - self.max_cached_blocks)
 
             def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
                 block = self._evictable_blocks.pop(block_id, None)
@@ -2018,6 +2044,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 max_cached_blocks=_get_max_cached_blocks(
                     block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
                 hash_block_size=hash_block_size,
+                num_kv_cache_groups=len(
+                    getattr(kv_cache_config, "kv_cache_groups", ()) or ()),
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool

@@ -21,10 +21,11 @@ from kvcached.integration.vllm.patches import _get_max_cached_blocks
 
 @pytest.fixture
 def set_max_cached_tokens(monkeypatch):
-    """Set the module-level MAX_CACHED_TOKENS the function reads at call time."""
+    """Set the process-local retention policy read by the conversion helper."""
 
     def _set(value: int) -> None:
-        monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", value)
+        monkeypatch.setattr(
+            "kvcached.prefix_cache_retention._policy.limit_tokens", value)
 
     return _set
 

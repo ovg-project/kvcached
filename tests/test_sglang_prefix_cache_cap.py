@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 import kvcached.integration.sglang.patches as sgl_patches
+import kvcached.prefix_cache_retention as retention
 
 
 @dataclasses.dataclass
@@ -65,7 +66,8 @@ def _modules(monkeypatch, full_evictable, target):
 
 
 def _apply(monkeypatch, mod, cap, target):
-    monkeypatch.setattr(sgl_patches, "MAX_CACHED_TOKENS", cap)
+    monkeypatch.setattr(
+        retention, "_policy", retention._PrefixCacheRetentionPolicy(cap))
     patch = getattr(sgl_patches, target[0])()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _name: "0.5.20")
     assert patch.apply(mod)
@@ -93,11 +95,19 @@ def test_cache_within_the_cap_is_left_alone(monkeypatch, target, evictable):
     assert cache.evicted == []
 
 
-def test_unlimited_cap_leaves_the_class_unpatched(monkeypatch, target):
+def test_unlimited_cap_installs_runtime_hook_but_does_not_evict(
+        monkeypatch, target):
     mod, cache_cls = _modules(monkeypatch, 20000, target)
     original = cache_cls.cache_finished_req
     _apply(monkeypatch, mod, -1, target)
-    assert cache_cls.cache_finished_req is original
+    assert cache_cls.cache_finished_req is not original
+
+    cache = cache_cls()
+    cache.cache_finished_req("req")
+    assert cache.evicted == []
+
+    retention._set_prefix_cache_retention_limit(16000)
+    assert cache.evicted == [EvictParams(num_tokens=4000)]
 
 
 def test_patch_is_idempotent(monkeypatch, target):
