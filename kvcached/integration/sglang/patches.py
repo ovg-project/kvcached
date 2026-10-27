@@ -46,6 +46,7 @@ from kvcached.utils import (
 
 BYTES_PER_GB = 1024**3
 _CAPACITY_QUERY_FAILED = -(1 << 63)
+PAGED_FREE_CPU_UNIQUE_MAX_INDICES = 4096
 
 # Version ranges for SGLang support
 # All supported versions. Autopatch leaves any other SGLang unpatched, so
@@ -1061,11 +1062,13 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         return
 
                     if _sglang_free_immediately(self):
+                        free_index = free_index.detach()
+                        if free_index.numel() <= PAGED_FREE_CPU_UNIQUE_MAX_INDICES:
+                            free_index = free_index.to(
+                                device="cpu", non_blocking=False
+                            )
                         page_ids = torch.unique(free_index // self.page_size)
-                        try:
-                            indices: list[int] = page_ids.cpu().numpy().tolist()
-                        except Exception:
-                            indices = list(page_ids)
+                        indices: list[int] = page_ids.tolist()
                         return self.kvcached_allocator.free(indices)
                     else:
                         self.free_group.append(
@@ -1728,7 +1731,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             kvcache_shape=(
                                 size + page_size,
                                 1,
-                                self.kv_cache_dim,
+                                cast(int, self.kv_cache_dim),
                             ),
                             dtype=self.store_dtype,
                             device=device,
