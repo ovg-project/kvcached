@@ -3695,13 +3695,17 @@ def _install_prefix_cache_retention_hooks(
     """Install the common runtime retention hooks on one cache adapter."""
     cache_cls._enforce_prefix_cache_retention = enforce
 
-    @functools.wraps(original_cache_finished)
-    def wrapped_cache_finished(cache: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original_cache_finished(cache, *args, **kwargs)
-        cache._enforce_prefix_cache_retention(
-            _get_prefix_cache_retention_limit())
-        return result
+    def wrap_with_retention_check(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def wrapped(cache: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(cache, *args, **kwargs)
+            cache._enforce_prefix_cache_retention(
+                _get_prefix_cache_retention_limit())
+            return result
 
+        return wrapped
+
+    wrapped_cache_finished = wrap_with_retention_check(original_cache_finished)
     patch._mark_as_patched(wrapped_cache_finished)
     cache_cls.cache_finished_req = wrapped_cache_finished
 
@@ -3713,6 +3717,20 @@ def _install_prefix_cache_retention_hooks(
     @functools.wraps(original_init)
     def wrapped_init(cache: Any, *args: Any, **kwargs: Any) -> None:
         original_init(cache, *args, **kwargs)
+        # HiRadixCache inherits this constructor hook but defines its own
+        # completion checks. Install on the concrete class to cover it as well
+        # as UnifiedRadixCache, without wrapping intermediate lock releases.
+        # loading_check is also called outside the scheduler's event poll.
+        # Avoid writing_check: native write-back eviction calls it internally.
+        concrete_cls = type(cache)
+        completion_marker = "__kvcached_hicache_retention__"
+        for name in ("check_hicache_events", "loading_check"):
+            original = getattr(concrete_cls, name, None)
+            if original is None or patch._is_already_patched(original, completion_marker):
+                continue
+            wrapped = wrap_with_retention_check(original)
+            patch._mark_as_patched(wrapped, completion_marker)
+            setattr(concrete_cls, name, wrapped)
         _register_prefix_cache_retention_enforcer(cache)
 
     patch._mark_as_patched(wrapped_init, marker)
