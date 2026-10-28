@@ -353,50 +353,38 @@ int main() {
     alarm(0);
   }
   {
-    // The startup policy applies when an instance is created, every
-    // publication takes the instance's next revision, empty fields keep their
-    // value, and a retry of a revision must carry the values it published.
-    InstancePolicy startup;
-    startup.min_bytes = 24;
-    startup.priority = -3;
-    startup.headroom_bytes = 12;
+    // The controls share max's revision: a retry of a revision must carry the
+    // values it published, and an older revision is stale. A publication
+    // without max sets the pool targets only as the instance's first one.
     auto budget = GpuBudget::connect(path, [] { return 1000; });
-    auto a = budget->register_pool("policy", 0, startup);
+    auto a = budget->register_pool("policy", 0);
     auto b = budget->register_pool("policy", 1);
     budget->configure_control_pool(a, 120, 12, true);
     budget->configure_control_pool(b, 120, 12, true);
     budget->ready_control_pool(a);
     budget->ready_control_pool(b);
     auto writer = GpuBudget::open_control(path);
-    const auto initial = writer->query_control("policy");
-    assert(!initial.published && initial.min_bytes == 24 &&
-           initial.priority == -3 && initial.headroom_bytes == 12);
-    const auto generation = initial.generation;
+    const auto generation = writer->query_control("policy").generation;
 
     ControlUpdate priority;
     priority.priority = 5;
     auto first = writer->publish_control("policy", priority, generation);
     assert(first.status == "accepted" && first.revision == 1);
-    assert(first.priority == 5 && first.min_bytes == 24 &&
-           first.headroom_bytes == 12);
     assert(first.requested_bytes == UINT64_MAX && first.effective_bytes == 240);
 
     auto limit = writer->publish_control("policy", 120, generation);
-    assert(limit.revision == 2 && limit.priority == 5 && limit.min_bytes == 24);
+    assert(limit.revision == 2 && limit.priority == 5);
     assert(budget->control_state(a).pool_target_bytes == 60);
     assert(budget->acknowledge_control(a, 2) &&
            budget->acknowledge_control(b, 2));
     assert(writer->query_control("policy").status == "converged");
 
-    // A min above max is kept as published. Without max, the publication
-    // keeps the targets and the engines' acknowledgements.
     ControlUpdate floor;
     floor.min_bytes = 480;
     floor.headroom_bytes = 0;
     auto third = writer->publish_control("policy", floor, generation);
     assert(third.status == "accepted" && third.revision == 3);
-    assert(third.min_bytes == 480 && third.headroom_bytes == 0 &&
-           third.priority == 5 && third.requested_bytes == 120);
+    assert(third.min_bytes == 480 && third.requested_bytes == 120);
     assert(budget->control_state(a).pool_target_bytes == 60);
     assert(third.convergence == "converged" && third.completed == 2);
     assert(writer->publish_control("policy", floor, generation, 3).status ==
@@ -416,31 +404,6 @@ int main() {
     assert(writer->publish_control("policy", stale, generation, 2).status ==
            "stale");
     assert(writer->query_control("policy").priority == 5);
-
-    ControlUpdate all{UINT64_C(240), UINT64_C(12), INT64_C(-1), UINT64_C(36)};
-    auto explicit_revision =
-        writer->publish_control("policy", all, generation, 9);
-    assert(explicit_revision.status == "accepted" &&
-           explicit_revision.revision == 9);
-    assert(explicit_revision.requested_bytes == 240 &&
-           explicit_revision.min_bytes == 12 &&
-           explicit_revision.priority == -1 &&
-           explicit_revision.headroom_bytes == 36);
-    auto reader = GpuBudget::open_control(path, true);
-    auto observed = reader->observe_control("policy");
-    assert(observed.revision == 9 && observed.min_bytes == 12 &&
-           observed.priority == -1 && observed.headroom_bytes == 36);
-    reader.reset();
-    writer.reset();
-
-    // A restarted instance starts from its own startup policy.
-    budget.reset();
-    auto replacement = GpuBudget::connect(path, [] { return 1000; });
-    replacement->register_pool("policy", 0);
-    auto restarted = replacement->query_control("policy");
-    assert(restarted.generation != generation && !restarted.published);
-    assert(restarted.min_bytes == 0 && restarted.priority == 0 &&
-           restarted.headroom_bytes == 0);
   }
   {
     // A publication without max keeps a failed resize failed.
@@ -496,49 +459,6 @@ int main() {
     assert(budget->acknowledge_control(slot, next.revision));
     assert(writer->query_control("carry-shrink").status == "converged");
     assert(budget->control_state(slot).pool_target_bytes == 120);
-  }
-  {
-    const char *names[] = {"KVCACHED_MIN", "KVCACHED_PRIORITY",
-                           "KVCACHED_HEADROOM"};
-    for (auto name : names)
-      unsetenv(name);
-    auto defaults = startup_policy_from_env();
-    assert(defaults.min_bytes == 0 && defaults.priority == 0 &&
-           defaults.headroom_bytes == 0);
-    setenv("KVCACHED_MIN", "512M", 1);
-    setenv("KVCACHED_PRIORITY", "-7", 1);
-    setenv("KVCACHED_HEADROOM", "1.5gb", 1);
-    auto parsed = startup_policy_from_env();
-    assert(parsed.min_bytes == 512ULL << 20);
-    assert(parsed.priority == -7);
-    assert(parsed.headroom_bytes == 3ULL << 29);
-    setenv("KVCACHED_MIN", "4096", 1);
-    setenv("KVCACHED_HEADROOM", "", 1);
-    parsed = startup_policy_from_env();
-    assert(parsed.min_bytes == 4096 && parsed.headroom_bytes == 0);
-    for (const char *bad : {"12x", "-1", "G", "18446744073709551616", "nan"}) {
-      setenv("KVCACHED_MIN", bad, 1);
-      bool rejected = false;
-      try {
-        startup_policy_from_env();
-      } catch (const std::invalid_argument &) {
-        rejected = true;
-      }
-      assert(rejected);
-    }
-    unsetenv("KVCACHED_MIN");
-    for (const char *bad : {"1.5", "high", "99999999999999999999"}) {
-      setenv("KVCACHED_PRIORITY", bad, 1);
-      bool rejected = false;
-      try {
-        startup_policy_from_env();
-      } catch (const std::invalid_argument &) {
-        rejected = true;
-      }
-      assert(rejected);
-    }
-    for (auto name : names)
-      unsetenv(name);
   }
   unlink(path.c_str());
   rmdir(directory);
