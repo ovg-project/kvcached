@@ -27,6 +27,26 @@ def get_ipc_name(ipc_path: str) -> str:
     return os.path.basename(ipc_path)
 
 
+def get_segment_control(ipc_name: str, *, observe: bool = True):
+    """Resolve an advertised SGLang group segment to its instance ledger."""
+    from kvcached.control import _get_instance_memory_limit, get_instance_memory_limit
+
+    def query(name: str):
+        if observe:
+            return get_instance_memory_limit(name)
+        return _get_instance_memory_limit(name, observe=False)
+
+    name = get_ipc_name(ipc_name)
+    state = query(name)
+    # Prefer an exact instance, including user names that end in _g<digits>.
+    base, separator, group = name.rpartition("_g")
+    if not state["gpus"] and separator and base and group.isdecimal() and int(group) > 0:
+        owner = query(base)
+        if owner["gpus"]:
+            return owner
+    return state
+
+
 @dataclass
 class MemInfoStruct:
     total_size: int
@@ -129,30 +149,15 @@ def get_kv_cache_limit(ipc_name: str) -> Optional[MemInfoStruct]:
         return None
 
 
-def update_kv_cache_limit(ipc_name: str,
-                          kv_cache_limit: int) -> Optional[MemInfoStruct]:
-    """
-    Update the kv cache limit for the current process.
-    """
-    try:
-        with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK, retain_usage=True, create=False) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            delta = kv_cache_limit - mem_info.total_size
-            if delta < 0:
-                if mem_info.used_size > kv_cache_limit:
-                    print(
-                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
-                    )
-            mem_info.total_size = kv_cache_limit
-            mem_info.write_to_buffer(mm)
-            human_limit = _format_size(kv_cache_limit)
-            print(
-                f"Updated kv cache limit for {ipc_name} to {human_limit} ({kv_cache_limit} bytes)"
-            )
-            return mem_info
-    except FileNotFoundError:
-        return None
+def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
+    """Publish through the same native path as the Python control frontend."""
+    import json
+
+    from kvcached.control import set_instance_memory_limit
+
+    result = set_instance_memory_limit(kv_cache_limit, instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
 
 
 # ---------------------------------------------------------------------------

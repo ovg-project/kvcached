@@ -140,7 +140,7 @@ void validate_physical_capacity(int dev_idx, size_t required_bytes,
   size_t total_bytes = 0;
   {
     const ScopedDeviceGuard device_guard(dev_idx);
-    const auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+    const auto status = device_mem_info(dev_idx, &free_bytes, &total_bytes);
     if (!gpu_vmm::is_success(status)) {
       throw std::runtime_error(std::string("GPU memory query failed: ") +
                                gpu_vmm::error_string(status));
@@ -424,6 +424,57 @@ std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
   if (!budget_)
     throw std::runtime_error("physical budget requires a GPU allocator");
   return budget_->set_instance_limit(budget_slot_, bytes, revision);
+}
+
+InstanceControl FTensorAllocator::configure_instance_control(
+    bool can_shrink, uint64_t expected_participants, uint64_t startup_pages,
+    bool reserve_null) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (num_layers_ <= 0 || physical_bytes_per_offset_ == 0)
+    throw std::runtime_error(
+        "KV tensors must be initialized before runtime control");
+  ensure_budget_locked_();
+  if (!budget_)
+    throw std::runtime_error("instance control requires a GPU allocator");
+  if (num_kv_buffers_ <= 0 ||
+      startup_pages > kv_tensor_size_per_layer_ / num_kv_buffers_ / page_size_)
+    throw std::runtime_error("startup pages exceed native KV tensor capacity");
+  const auto state = budget_->control_state(budget_slot_);
+  if (!state.ready) {
+    budget_->configure_control_pool(
+        budget_slot_,
+        checked_transaction_bytes(startup_pages, physical_bytes_per_offset_),
+        physical_bytes_per_offset_, can_shrink, expected_participants,
+        reserve_null);
+    budget_->ready_control_pool(budget_slot_);
+  } else if (state.can_shrink != can_shrink ||
+             state.minimum_bytes !=
+                 (reserve_null ? physical_bytes_per_offset_ : 0) ||
+             state.pool_capacity_bytes !=
+                 checked_transaction_bytes(startup_pages,
+                                           physical_bytes_per_offset_) ||
+             state.expected_participants != expected_participants) {
+    throw std::runtime_error("KV control capabilities are already frozen");
+  }
+  return budget_->control_state(budget_slot_);
+}
+
+InstanceControl FTensorAllocator::instance_control_state() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!budget_)
+    throw std::runtime_error("KV instance control is not initialized");
+  return budget_->control_state(budget_slot_);
+}
+
+bool FTensorAllocator::acknowledge_instance_control(uint64_t revision) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (!budget_)
+    return false;
+  return budget_->acknowledge_control(budget_slot_, revision);
+}
+
+std::string FTensorAllocator::instance_control_path() {
+  return physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v2";
 }
 
 bool FTensorAllocator::recalibrate_physical_budget() {

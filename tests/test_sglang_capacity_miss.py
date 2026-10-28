@@ -12,13 +12,14 @@ SGLang's own retry path, retraction to the waiting queue, and pin that it
 stays as narrow as the vLLM one (#453, #511): only a kvcached capacity miss is
 translated, and only what the failed batch was handed out is released. Under
 TP every rank drives its own pool, so the ranks that share a waiting queue
-must reach one verdict before any of them runs the batch; the two-rank tests
-run each rank in its own thread over a rendezvous that stands in for the
-gloo all-reduce.
+must read one budget before they admit (the budget round) and reach one
+verdict before any of them runs the batch; the two-rank tests run each rank
+in its own thread over a rendezvous that stands in for the gloo all-reduce.
 """
 from __future__ import annotations
 
 import contextlib
+import functools
 import inspect
 import sys
 import threading
@@ -35,8 +36,10 @@ from kvcached.integration.sglang.patches import (
     ElasticSWAAllocatorPatch,
     ScheduleBatchCapacityMissPatch,
     SchedulerCapacityMissPatch,
+    SchedulerSharedBudgetPatch,
     SGLangPrefillCapacityMiss,
     _sglang_batch_allocation_zone,
+    _sglang_budget_round,
 )
 from kvcached.utils import KVCachePoolExhausted
 
@@ -130,10 +133,16 @@ class FakeBaseTokenToKVPoolAllocator:
         self._kvcache = kvcache
         self.free_group = None
         self.evicted: List[Any] = []
+        self.evict_shortfalls: List[int] = []
+
+    def available_size(self) -> int:
+        raise NotImplementedError  # the elastic subclasses define it
 
     def evict_to_free_tokens(self, tree_cache, num_tokens):
-        # The 0.5.19+ base helper the decode gate calls before deciding.
+        # The 0.5.19+ base helper the decode gate calls before deciding;
+        # evict_from_tree_cache evicts the shortfall against available_size().
         self.evicted.append((tree_cache, num_tokens))
+        self.evict_shortfalls.append(max(0, num_tokens - self.available_size()))
 
     def check_decode_capacity(self, *, num_tokens, tree_cache, requests=None,
                               spec_algorithm=None):
@@ -548,6 +557,7 @@ class FakeTreeCache:
     def __init__(self, token_allocator: Any) -> None:
         self.token_to_kv_pool_allocator = token_allocator
         self.lock_calls: List[Any] = []
+        self.evict_calls: List[Any] = []
         self.printed = 0
 
     def inc_lock_ref(self, node: Any) -> FakeReceipt:
@@ -558,7 +568,7 @@ class FakeTreeCache:
         self.lock_calls.append(("dec", node, params))
 
     def evict_for_alloc(self, params: Any) -> None:
-        pass
+        self.evict_calls.append(params)
 
     def pretty_print(self) -> None:
         self.printed += 1
@@ -635,10 +645,21 @@ class FakeBatch:
         return self._module.alloc_for_extend(self)
 
 
+MAMBA_SLOTS_PER_REQ = 3  # MAMBA_STATE_PER_REQ_PREFIX_CACHE: the slot and the ping-pong pair
+
+
 def _make_schedule_batch_module() -> Any:
     module: Any = types.ModuleType("sglang.srt.managers.schedule_batch")
 
     def alloc_req_slots(pool, reqs, tree_cache):
+        mamba_allocator = getattr(pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            # allocation.py:301-322 evicts the Mamba shortfall by the
+            # planner's count before the rows are bound.
+            available = mamba_allocator.schedulable_available_size()
+            needed = len(reqs) * MAMBA_SLOTS_PER_REQ
+            if available < needed:
+                tree_cache.evict_for_alloc(("mamba", needed - available))
         req_pool_indices = pool.alloc(reqs)
         if req_pool_indices is None:
             raise RuntimeError(ROW_OOM)
@@ -684,19 +705,51 @@ class FakeScheduleBag:
 
 
 class FakeScheduler:
-    """Scheduler._get_new_batch_prefill_raw from admission to prepare."""
+    """Scheduler._get_new_batch_prefill_raw from admission to prepare, and
+    the entry points around it that a budget round wraps."""
 
     CHUNK = 8
+    TOKENS_PER_REQ = 4
 
-    def __init__(self, module, pool, tree_cache, bag) -> None:
+    def __init__(self, module, pool, tree_cache, bag,
+                 admit_by_budget: bool = False) -> None:
         self.waiting_queue: List[FakeReq] = []
         self.chunked_req: Optional[FakeReq] = None
         self.req_to_token_pool = pool
         self.tree_cache = tree_cache
+        self.token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
         self._module = module
         self._bag = bag
         self.caps_seen: List[Optional[int]] = []
         self.extend_num_tokens = 4
+        # With admit_by_budget the adder's token budget decides admission,
+        # as PrefillAdder.rem_total_tokens does; without it every queued
+        # request is admitted, the stale-snapshot case of the miss tests.
+        self.admit_by_budget = admit_by_budget
+        self.budgets_seen: List[int] = []
+        self.admitted: List[List[str]] = []
+        self.decode_verdicts: List[bool] = []
+
+    def get_next_batch_to_run(self, running_batch, last_batch):
+        # scheduler.py:3655-3681: the prefill pass first, the decode update
+        # only when it yields no batch.
+        batch, running_batch = self.get_new_batch_prefill(running_batch)
+        if batch is None and running_batch.reqs:
+            running_batch = self.update_running_batch(running_batch)
+        return batch, running_batch
+
+    def get_new_batch_prefill(self, running_batch):
+        return self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=None, running_batch=running_batch)
+
+    def update_running_batch(self, batch):
+        # scheduler.py:4101-4185: the decode gate, then retraction when it
+        # says no.
+        fits = batch.check_decode_mem()
+        self.decode_verdicts.append(fits)
+        if not fits:
+            batch.retract_decode()
+        return batch
 
     def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass, running_batch):
         if (running_batch.batch_is_full
@@ -704,6 +757,10 @@ class FakeScheduler:
             return None, running_batch
         cap = self._bag.prefill_max_requests  # read when the adder is built
         self.caps_seen.append(cap)
+        # PrefillAdder.rem_total_tokens: the allocator's count plus the
+        # evictable tree, which these fakes keep empty.
+        rem_total_tokens = self.token_to_kv_pool_allocator.available_size()
+        self.budgets_seen.append(rem_total_tokens)
         can_run_list: List[FakeReq] = []
         new_chunked_req = None
         if self.chunked_req is not None:
@@ -715,6 +772,12 @@ class FakeScheduler:
         for req in self.waiting_queue:
             if cap is not None and len(can_run_list) >= cap:
                 break
+            if self.admit_by_budget:
+                # add_one_req: NO_TOKEN once the request's tokens reach the
+                # remaining budget.
+                if self.TOKENS_PER_REQ >= rem_total_tokens:
+                    break
+                rem_total_tokens -= self.TOKENS_PER_REQ
             req.set_extend_range(0, self.CHUNK)
             req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
             can_run_list.append(req)
@@ -731,10 +794,36 @@ class FakeScheduler:
             self.chunked_req = new_chunked_req
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
+        self.admitted.append([req.rid for req in can_run_list])
+        extend_num_tokens = (self.TOKENS_PER_REQ * len(can_run_list)
+                             if self.admit_by_budget else self.extend_num_tokens)
         batch = FakeBatch(can_run_list, self.req_to_token_pool, self.tree_cache,
-                          self._module, self.extend_num_tokens)
+                          self._module, extend_num_tokens)
         batch.prepare_for_extend()
         return batch, running_batch
+
+
+class FakeRunningBatch:
+    """The running batch as update_running_batch drives it: check_decode_mem
+    asks the allocator's gate (schedule_batch.py:3149-3166) and a shortfall
+    retracts."""
+
+    def __init__(self, allocator: Any, tree_cache: Any, reqs: List[FakeReq],
+                 num_tokens: int) -> None:
+        self.token_to_kv_pool_allocator = allocator
+        self.tree_cache = tree_cache
+        self.reqs = reqs
+        self.num_tokens = num_tokens
+        self.batch_is_full = False
+        self.retracted = 0
+
+    def check_decode_mem(self) -> bool:
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            num_tokens=self.num_tokens, tree_cache=self.tree_cache,
+            requests=self.reqs)
+
+    def retract_decode(self) -> None:
+        self.retracted += 1
 
 
 _ACTIVE_BAG = threading.local()
@@ -765,26 +854,32 @@ class FakeGloo:
 
     def __init__(self, world_size: int) -> None:
         self.world_size = world_size
-        self.rounds: List[List[int]] = []
-        self._deposits: List[int] = []
-        self._result = 0
+        self.rounds: List[Any] = []
+        self._deposits: List[Tuple[Any, List[int]]] = []
+        self._result: List[int] = []
         self._lock = threading.Lock()
         self._barrier = threading.Barrier(world_size, action=self._reduce,
                                           timeout=10)
 
     def _reduce(self) -> None:
-        self._result = max(self._deposits)
-        # Arrival order is thread scheduling; record the flags in rank order
-        # by value so the assertions do not depend on who deposited first.
-        self.rounds.append(sorted(self._deposits))
+        ops = [op for op, _ in self._deposits]
+        assert all(op == ops[0] for op in ops), "the ranks issued different collectives"
+        values = [value for _, value in self._deposits]
+        pick = max if ops[0] == torch.distributed.ReduceOp.MAX else min
+        self._result = [pick(column) for column in zip(*values)]
+        # Arrival order is thread scheduling; record the deposits sorted so
+        # the assertions do not depend on who deposited first: a MAX of miss
+        # flags as ints, a MIN of counts as lists.
+        flags = ops[0] == torch.distributed.ReduceOp.MAX
+        self.rounds.append(sorted(value[0] if flags else value for value in values))
         self._deposits = []
 
     def all_reduce(self, tensor, op) -> None:
-        assert op == torch.distributed.ReduceOp.MAX
+        assert op in (torch.distributed.ReduceOp.MAX, torch.distributed.ReduceOp.MIN)
         with self._lock:
-            self._deposits.append(int(tensor.item()))
+            self._deposits.append((op, [int(v) for v in tensor.reshape(-1).tolist()]))
         self._barrier.wait()
-        tensor.fill_(self._result)
+        tensor.copy_(torch.tensor(self._result, dtype=tensor.dtype).reshape(tensor.shape))
 
 
 def _install_queue_groups(monkeypatch, gloo: Optional[FakeGloo],
@@ -844,7 +939,8 @@ class Pipeline:
                  tokens: int, prefill_max_requests: Optional[int] = None,
                  version: str = "0.5.20", patched: bool = True,
                  mamba_slot_allocator_cls=None,
-                 token_allocator: Optional[Tuple[Any, FakeManager]] = None) -> None:
+                 token_allocator: Optional[Tuple[Any, FakeManager]] = None,
+                 admit_by_budget: bool = False) -> None:
         if token_allocator is None:
             token_allocator = _token_allocator(tokens)
         self.token_allocator: Any = token_allocator[0]
@@ -867,25 +963,39 @@ class Pipeline:
         sched_module.Scheduler = scheduler_cls
         self.sched_module = sched_module
         self.applied = (False, False)
+        self.budget_applied = False
         if patched:
             batch_patch = ScheduleBatchCapacityMissPatch()
             sched_patch = SchedulerCapacityMissPatch()
-            for patch in (batch_patch, sched_patch):
+            budget_patch = SchedulerSharedBudgetPatch()
+            for patch in (batch_patch, sched_patch, budget_patch):
                 monkeypatch.setattr(patch.version_manager, "detect_version",
                                     lambda library: version)
             self.applied = (batch_patch.apply(self.batch_module),
                             sched_patch.apply(sched_module))
+            self.budget_applied = budget_patch.apply(sched_module)
         self.scheduler = scheduler_cls(
-            self.batch_module, self.pool, self.tree_cache, self.bag)
+            self.batch_module, self.pool, self.tree_cache, self.bag,
+            admit_by_budget=admit_by_budget)
         self.running_batch = types.SimpleNamespace(batch_is_full=False, reqs=[])
 
     def enqueue(self, *reqs: FakeReq) -> None:
         self.scheduler.waiting_queue.extend(reqs)
 
     def round(self):
+        """The prefill pass alone, as the miss tests drive it."""
         _ACTIVE_BAG.bag = self.bag
         return self.scheduler._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=None, running_batch=self.running_batch)
+
+    def iteration(self, running_batch: Any = None):
+        """One scheduler iteration through get_next_batch_to_run, the entry
+        the budget round wraps."""
+        _ACTIVE_BAG.bag = self.bag
+        if running_batch is None:
+            running_batch = self.running_batch
+        return self.scheduler.get_next_batch_to_run(
+            running_batch=running_batch, last_batch=None)
 
     def state(self, reqs: List[FakeReq], result=None):
         """What one rank ends a round with, for comparing ranks."""
@@ -1222,6 +1332,269 @@ def test_tp_peer_miss_unwinds_mamba_slots_too(
     assert ranks[0].token_manager.free_calls == [[1, 2, 3, 4]]
 
 
+# --------------------------------------------------------------------------
+# the budget round: one agreed count per pool per scheduling round
+# --------------------------------------------------------------------------
+
+
+def _budget_rank(tokens: int) -> Tuple[Any, FakeManager, Any]:
+    """A token allocator and the scheduler shape _sglang_budget_round walks."""
+    allocator, manager = _token_allocator(tokens)
+    scheduler = types.SimpleNamespace(token_to_kv_pool_allocator=allocator,
+                                      req_to_token_pool=None)
+    return allocator, manager, scheduler
+
+
+def test_budget_round_serves_the_group_minimum_plus_its_own_moves(
+        monkeypatch, cpu_tensors):
+    """One MIN reduce per outermost round; inside it every count read is the
+    agreed minimum plus what the round itself allocated and freed, and a
+    nested round adds no collective. Outside the round the live count is
+    back."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [_budget_rank(16), _budget_rank(6)]
+
+    def round_on(allocator, manager, scheduler):
+        seen = []
+        with _sglang_budget_round(scheduler):
+            seen.append(allocator.available_size())
+            allocator.alloc(2)
+            seen.append(allocator.available_size())
+            allocator.free(torch.tensor([1]))
+            seen.append(allocator.available_size())
+            with _sglang_budget_round(scheduler):
+                seen.append(allocator.available_size())
+        seen.append(allocator.available_size())
+        return seen
+
+    seen = _run_ranks([functools.partial(round_on, *rank) for rank in ranks])
+
+    assert seen[0][:4] == seen[1][:4] == [6, 4, 5, 5]
+    assert [rank_seen[4] for rank_seen in seen] == [15, 5]
+    assert gloo.rounds == [[[6], [16]]]
+
+
+def test_budget_round_keeps_the_paged_allocator_unit(monkeypatch, cpu_tensors):
+    """The reduce carries manager blocks; the paged allocator still reports
+    tokens."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = []
+    for pages in (3, 2):
+        allocator, _ = _paged_allocator(
+            monkeypatch, manager_size=pages, page_size=4, num_new_pages=1)
+        ranks.append((allocator, types.SimpleNamespace(
+            token_to_kv_pool_allocator=allocator, req_to_token_pool=None)))
+
+    def round_on(allocator, scheduler):
+        with _sglang_budget_round(scheduler):
+            before = allocator.available_size()
+            allocator.alloc(4)
+            return before, allocator.available_size()
+
+    assert _run_ranks([functools.partial(round_on, *rank)
+                       for rank in ranks]) == [(8, 4), (8, 4)]
+    assert gloo.rounds == [[[2], [3]]]
+
+
+def test_budget_round_ignores_the_mamba_group_preallocation(
+        monkeypatch, cpu_tensors, mamba_slot_allocator_cls):
+    """alloc_group_begin pre-allocates through the pool and succeeds on one
+    rank only, so the tally follows the slots requests receive instead, and
+    the counts stay equal through the group."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = []
+    for slots in (8, 2):
+        pool = FakeMambaPool(slots)
+        allocator = mamba_slot_allocator_cls(slots, "cpu", pool)
+        scheduler = types.SimpleNamespace(
+            token_to_kv_pool_allocator=None,
+            req_to_token_pool=types.SimpleNamespace(mamba_allocator=allocator))
+        ranks.append((allocator, pool, scheduler))
+
+    def round_on(allocator, pool, scheduler):
+        with _sglang_budget_round(scheduler):
+            seen = [allocator.schedulable_available_size()]
+            allocator.alloc_group_begin(3)  # 3 slots on one rank, None on the other
+            seen.append(allocator.available_size())
+            slot = allocator.alloc(1)  # from the group or the pool, one slot either way
+            seen.append(allocator.available_size())
+            allocator.alloc_group_end()
+            seen.append(allocator.available_size())
+            allocator.free(slot)
+            seen.append(allocator.available_size())
+        return seen, pool.available_size()
+
+    results = _run_ranks([functools.partial(round_on, *rank) for rank in ranks])
+
+    assert results[0][0] == results[1][0] == [2, 2, 1, 1, 2]
+    assert [live for _, live in results] == [8, 2]
+    assert gloo.rounds == [[[2], [8]]]
+
+
+def test_budget_is_local_at_tp_size_one(monkeypatch, cpu_tensors):
+    """A group of one opens no round: admission reads the local count and
+    no collective runs."""
+    _install_queue_groups(monkeypatch, None, world_size=1)
+    pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=6,
+                        admit_by_budget=True)
+    assert pipeline.budget_applied is True
+    pipeline.enqueue(FakeReq("a"), FakeReq("b"))
+
+    batch, _ = pipeline.iteration()
+
+    assert [req.rid for req in batch.reqs] == ["a"]
+    assert pipeline.scheduler.budgets_seen == [6]
+    assert pipeline.token_allocator.available_size() == 2
+
+
+def test_pipeline_keeps_the_budget_local(monkeypatch, cpu_tensors):
+    """A pipeline opens no round, as the miss patches keep SGLang's own
+    behaviour there: with a queue group present every rank still reads its
+    own count and no collective runs."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    parallel_state = sys.modules["sglang.srt.distributed.parallel_state"]
+    parallel_state.get_pipeline_model_parallel_world_size = (  # type: ignore[attr-defined]
+        lambda: 2)
+    ranks = [_budget_rank(16), _budget_rank(6)]
+
+    def round_on(allocator, manager, scheduler):
+        with _sglang_budget_round(scheduler):
+            return allocator.available_size()
+
+    assert _run_ranks([functools.partial(round_on, *rank)
+                       for rank in ranks]) == [16, 6]
+    assert gloo.rounds == []
+
+
+def test_tp_admission_reads_one_budget(monkeypatch, cpu_tensors):
+    """The weekly case of #577: rank 1's GPU is short and rank 0's is not.
+    With each rank admitting against its own count, rank 0 builds [a, b]
+    while rank 1 builds [a], both allocate, and the forward hangs on the
+    mismatch. Under the round rank 1's count is the budget of both: the
+    ranks build the same batch, and when rank 1's pool later cannot back
+    an agreed batch they miss together, requeue identically and run the
+    same batch once the pressure lifts."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=16,
+                      admit_by_budget=True),
+             Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=6,
+                      admit_by_budget=True)]
+    reqs = [[FakeReq("a"), FakeReq("b")] for _ in ranks]
+    for rank, rank_reqs in zip(ranks, reqs):
+        rank.enqueue(*rank_reqs)
+
+    def states_after(results):
+        return [rank.state(rank_reqs, result)
+                for rank, rank_reqs, result in zip(ranks, reqs, results)]
+
+    # Rank 0 could fit both requests; the group's smallest count admits one.
+    states = states_after(_run_ranks([rank.iteration for rank in ranks]))
+    assert states[0] == states[1]
+    assert states[0]["batch"] == ["a"]
+    assert states[0]["queued"] == ["b"]
+    assert [rank.scheduler.budgets_seen for rank in ranks] == [[6], [6]]
+    assert [rank.scheduler.admitted for rank in ranks] == [[["a"]], [["a"]]]
+    # One MIN reduce of the counts, then the MAX reduce of the miss flags.
+    assert gloo.rounds == [[[6], [16]], [0, 0]]
+
+    # The batch finishes and its tokens come back. Then the other process
+    # on rank 1's GPU takes the memory: rank 1's count still admits b, but
+    # its pool backs nothing while the pressure is on.
+    for rank in ranks:
+        rank.token_manager.clear()
+    pressure = {"on": True}
+    pool_alloc = ranks[1].token_manager.alloc
+    monkeypatch.setattr(ranks[1].token_manager, "alloc",
+                        lambda count: None if pressure["on"] else pool_alloc(count))
+    before = [rank.free_state() for rank in ranks]
+
+    states = states_after(_run_ranks([rank.iteration for rank in ranks]))
+    assert states[0] == states[1]
+    assert states[0]["has_batch"] is False
+    assert states[0]["queued"] == ["b"]
+    assert states[0]["cap"] == 1
+    assert [rank.scheduler.admitted for rank in ranks] == [[["a"], ["b"]], [["a"], ["b"]]]
+    assert gloo.rounds[2:] == [[[6], [16]], [0, 1]]
+    assert [rank.free_state() for rank in ranks] == before
+    assert ranks[0].token_manager.free_calls == [[1, 2, 3, 4]]
+
+    # The pressure lifts: the same capped batch runs on both.
+    pressure["on"] = False
+    states = states_after(_run_ranks([rank.iteration for rank in ranks]))
+    assert states[0] == states[1]
+    assert states[0]["batch"] == ["b"]
+    assert states[0]["queued"] == []
+    assert states[0]["cap"] is None
+    assert gloo.rounds[4:] == [[[6], [16]], [0, 0]]
+
+
+def test_tp_admission_agrees_on_the_mamba_count(
+        monkeypatch, cpu_tensors, mamba_slot_allocator_cls):
+    """alloc_req_slots evicts the Mamba shortfall by the planner's count
+    (allocation.py:301-322), so the ranks must read one count there as
+    well, or their radix trees drift apart. Rank 1's Mamba pool is short:
+    both ranks evict the same shortfall, and the miss that follows unwinds
+    both."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=8, tokens=16,
+                      admit_by_budget=True,
+                      mamba_slot_allocator_cls=mamba_slot_allocator_cls),
+             Pipeline(monkeypatch, rows=4, mamba_slots=2, tokens=16,
+                      admit_by_budget=True,
+                      mamba_slot_allocator_cls=mamba_slot_allocator_cls)]
+    reqs = [[FakeReq("a"), FakeReq("b")] for _ in ranks]
+    for rank, rank_reqs in zip(ranks, reqs):
+        rank.enqueue(*rank_reqs)
+    before = [rank.free_state() for rank in ranks]
+
+    results = _run_ranks([rank.iteration for rank in ranks])
+
+    states = [rank.state(rank_reqs, result)
+              for rank, rank_reqs, result in zip(ranks, reqs, results)]
+    assert states[0] == states[1]
+    assert states[0]["has_batch"] is False
+    assert states[0]["queued"] == ["a", "b"]
+    assert states[0]["cap"] == 1
+    assert [rank.scheduler.admitted for rank in ranks] == [[["a", "b"]], [["a", "b"]]]
+    # Two requests need six slots against the agreed count of two, on both.
+    assert [rank.tree_cache.evict_calls for rank in ranks] == [
+        [("mamba", 4)], [("mamba", 4)]]
+    assert gloo.rounds == [[[16, 2], [16, 8]], [0, 1]]
+    assert [rank.free_state() for rank in ranks] == before
+    for rank_reqs in reqs:
+        assert all(not req.kv.holds_mamba for req in rank_reqs)
+
+
+def test_decode_gate_evicts_the_same_amount_on_every_rank(monkeypatch, cpu_tensors):
+    """The gate evicts the shortfall against available_size() before it
+    reserves (allocator/base.py:72-93 through evict_from_tree_cache). With
+    per-rank counts rank 0 evicts nothing while rank 1 evicts two tokens,
+    and the trees drift; under the round both evict the agreed shortfall and
+    retract together."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=16),
+             Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=2)]
+    batches = [FakeRunningBatch(rank.token_allocator, rank.tree_cache,
+                                [FakeReq("r")], num_tokens=4) for rank in ranks]
+
+    _run_ranks([functools.partial(rank.iteration, batch)
+                for rank, batch in zip(ranks, batches)])
+
+    assert [rank.scheduler.decode_verdicts for rank in ranks] == [[False], [False]]
+    assert [batch.retracted for batch in batches] == [1, 1]
+    assert [rank.token_allocator.evict_shortfalls for rank in ranks] == [[2], [2]]
+    assert gloo.rounds == [[[2], [16]], [0, 1]]
+    # The rank that could reserve keeps its pages for the next gate.
+    assert ranks[0].token_manager.reserved == [1, 2, 3, 4]
+
+
 class FakeSWAComposite:
     """SWATokenToKVPoolAllocator.alloc at v0.5.20 (swa.py:219-232): the
     pre-check reads both children's counts, then the full child allocates,
@@ -1354,7 +1727,9 @@ def test_pipeline_keeps_a_prefill_miss_fatal(
         pipeline.round()
 
 
-def test_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
+def test_miss_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
+    """The two miss patches read 0.5.20 shapes and register from 0.5.20; the
+    budget round registers from 0.5.13, so at 0.5.19 only the round is in."""
     pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=2,
                         version="0.5.19")
     assert pipeline.applied == (True, True)
@@ -1362,3 +1737,104 @@ def test_patches_leave_older_sglang_alone(monkeypatch, cpu_tensors):
                        "__kvcached_alloc_for_extend_patched__")
     assert not hasattr(pipeline.sched_module.Scheduler._get_new_batch_prefill_raw,
                        "__kvcached_prefill_capacity_miss_patched__")
+    assert pipeline.budget_applied is True
+    assert hasattr(pipeline.sched_module.Scheduler.get_next_batch_to_run,
+                   "__kvcached_budget_round_patched__")
+
+
+@pytest.mark.parametrize("version, budget, miss", [
+    ("0.5.12", False, False),
+    ("0.5.13", True, False),
+    ("0.5.19", True, False),
+    ("0.5.20", True, True),
+])
+def test_autopatch_selects_budget_and_miss_patches(monkeypatch, version, budget, miss):
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "false")
+    from kvcached.integration.sglang import autopatch
+
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "true")
+    manager = autopatch.PatchManager("sglang")
+    monkeypatch.setattr(manager.version_manager, "detect_version", lambda _: version)
+    applied = []
+
+    def record_patch(self, patch):
+        applied.append(type(patch).__name__)
+        return True
+
+    # Keep the real registration and apply_all_patches version filtering;
+    # only replace the engine imports and individual patch implementations.
+    monkeypatch.setattr(autopatch.PatchManager, "_apply_single_patch", record_patch)
+    autopatch._patch_sglang(types.ModuleType("sglang"))
+
+    assert ("SchedulerSharedBudgetPatch" in applied) is budget
+    for name in ("ScheduleBatchCapacityMissPatch", "SchedulerCapacityMissPatch"):
+        assert (name in applied) is miss
+
+
+@pytest.mark.parametrize("version, wrapped", [("0.5.12", False), ("0.5.13", True)])
+def test_budget_round_registers_from_the_allocator_split(
+        monkeypatch, cpu_tensors, version, wrapped):
+    """The round registers from SGLang 0.5.13, where the elastic SWA and
+    Mamba slot allocators it reads first exist, ahead of the miss patches.
+    At 0.5.13 the ranks of a queue group admit the same batch from one MIN
+    reduce and no MAX reduce follows; at 0.5.12 nothing is wrapped and each
+    rank admits from its own count."""
+    gloo = FakeGloo(2)
+    _install_queue_groups(monkeypatch, gloo, world_size=2)
+    ranks = [Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=tokens,
+                      version=version, admit_by_budget=True)
+             for tokens in (16, 6)]
+    for rank in ranks:
+        assert rank.applied == (True, True)
+        assert rank.budget_applied is True
+        assert hasattr(rank.sched_module.Scheduler.get_next_batch_to_run,
+                       "__kvcached_budget_round_patched__") is wrapped
+        assert not hasattr(rank.batch_module.alloc_for_extend,
+                           "__kvcached_alloc_for_extend_patched__")
+        rank.enqueue(FakeReq("a"), FakeReq("b"))
+
+    _run_ranks([rank.iteration for rank in ranks])
+
+    admitted = [rank.scheduler.admitted for rank in ranks]
+    budgets = [rank.scheduler.budgets_seen for rank in ranks]
+    if wrapped:
+        assert admitted == [[["a"]], [["a"]]]
+        assert budgets == [[6], [6]]
+        assert gloo.rounds == [[[6], [16]]]
+    else:
+        assert admitted == [[["a", "b"]], [["a"]]]
+        assert budgets == [[16], [6]]
+        assert gloo.rounds == []
+
+
+@pytest.mark.parametrize("consumer", [-1, 0, 2])
+def test_an_unwound_batch_waits_for_its_hicache_loads(monkeypatch, consumer):
+    """Wait for this batch's loads before releasing its admission state."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize",
+                        lambda: pytest.fail("must not synchronize the whole device"))
+    events = [
+        types.SimpleNamespace(finish_event=types.SimpleNamespace(
+            synchronize=lambda index=index: calls.append(("wait", index))))
+        for index in range(3)
+    ]
+    tree_cache = types.SimpleNamespace(
+        cache_controller=types.SimpleNamespace(
+            layer_done_counter=types.SimpleNamespace(events=events)),
+        dec_lock_ref=lambda node: calls.append(("unlock", node)))
+    mamba_allocator = types.SimpleNamespace(
+        free=lambda slots: calls.append(("free", slots.tolist())))
+    req = types.SimpleNamespace(
+        last_node="node",
+        kv=types.SimpleNamespace(holds_mamba=True, mamba_pool_idx=torch.tensor(7)))
+    scheduler = types.SimpleNamespace(tree_cache=tree_cache,
+                                      req_to_token_pool=types.SimpleNamespace(
+                                          mamba_allocator=mamba_allocator),
+                                      chunked_req=None, waiting_queue=[])
+    batch = types.SimpleNamespace(reqs=[req], hicache_consumer_index=consumer)
+
+    assert patches._unwind_prefill_admission(scheduler, batch, None, None) == [req]
+    wait = [("wait", consumer)] if consumer >= 0 else []
+    assert calls == wait + [("unlock", "node"), ("free", [7])]
+    assert req.kv.mamba_pool_idx is None
+    assert scheduler.waiting_queue == [req]

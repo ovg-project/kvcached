@@ -15,6 +15,12 @@ trap 'rm -rf "${test_build_dir}"' EXIT
   -I"${repo_root}/csrc/inc" \
   "${repo_root}/csrc/gpu_budget.cpp" "${script_dir}/test_gpu_budget.cpp" \
   -o "${test_build_dir}/test_gpu_budget"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pthread \
+  -I"${repo_root}/csrc/inc" \
+  "${repo_root}/csrc/gpu_budget.cpp" "${script_dir}/test_instance_control.cpp" \
+  -o "${test_build_dir}/test_instance_control"
+"${test_build_dir}/test_instance_control"
 "${test_build_dir}/test_gpu_budget"
 
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
@@ -29,3 +35,9 @@ trap 'rm -rf "${test_build_dir}"' EXIT
   "${script_dir}/test_control_segment.cpp" \
   -o "${test_build_dir}/test_control_segment"
 "${test_build_dir}/test_control_segment"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
+  -I"${repo_root}/csrc/inc" \
+  "${script_dir}/test_unified_memory.cpp" \
+  -o "${test_build_dir}/test_unified_memory"
+"${test_build_dir}/test_unified_memory"

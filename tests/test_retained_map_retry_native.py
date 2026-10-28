@@ -98,7 +98,7 @@ def _case(source, consumer):
     manager.reserved_blocks = []
     manager.null_block = None
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._lock = threading.RLock()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()

@@ -158,12 +158,24 @@ def _sglang_batch_allocation_zone():
 
 
 def _sglang_journal_blocks(manager: Any, block_ids: Any) -> None:
-    """Record token blocks a manager handed out inside the batch window."""
+    """Record token blocks a manager handed out.
+
+    The open budget round's tally takes them whenever a round is open, and
+    the batch window's journal takes them while the window is active.
+    """
+    block_ids = list(block_ids)
+    _sglang_budget_move(manager, -len(block_ids))
     if not getattr(_SGLANG_BATCH_ALLOCATION, "active", False):
         return
     journal = getattr(_SGLANG_BATCH_ALLOCATION, "journal", None)
     if journal is not None:
-        journal.append((manager, list(block_ids)))
+        journal.append((manager, block_ids))
+
+
+def _sglang_free_blocks(manager: Any, block_ids: List[int]) -> None:
+    """Return blocks to the manager and credit them to the open budget round."""
+    manager.free(block_ids)
+    _sglang_budget_move(manager, len(block_ids))
 
 
 def _sglang_return_journaled_blocks(journal: List[Tuple[Any, List[int]]]) -> None:
@@ -176,7 +188,7 @@ def _sglang_return_journaled_blocks(journal: List[Tuple[Any, List[int]]]) -> Non
     while journal:
         manager, block_ids = journal.pop()
         if block_ids:
-            manager.free(block_ids)
+            _sglang_free_blocks(manager, block_ids)
 
 
 def _sglang_queue_cpu_groups() -> List[Any]:
@@ -249,6 +261,160 @@ def _sglang_pipeline_stages() -> int:
         return int(parallel_state.get_pipeline_model_parallel_world_size())
     except (ImportError, AttributeError, AssertionError):
         return 1
+
+
+_SGLANG_BUDGET = threading.local()
+
+
+class _SGLangBudgetRound:
+    """The counts the ranks sharing a waiting queue agreed on for one round.
+
+    ``agreed`` holds, per manager, the group minimum of the manager's
+    ``available_size()`` at the start of the round, and ``delta`` follows the
+    blocks the round itself hands out and takes back through the elastic
+    allocators. Their sum is what every count read returns while the round
+    is open. The sum stays identical on every rank because the ranks run the
+    same batch, whereas a live count would move with the other process on
+    that rank's GPU (``KVCacheManager.available_size`` re-reads the physical
+    free pages after every allocation).
+    """
+
+    def __init__(self, managers: Sequence[Any], agreed: Sequence[int]) -> None:
+        self.managers = list(managers)  # keeps the ids valid for the round
+        self.agreed = {id(m): int(count) for m, count in zip(managers, agreed)}
+        self.delta = {key: 0 for key in self.agreed}
+
+    def available(self, manager: Any) -> Optional[int]:
+        key = id(manager)
+        if key not in self.agreed:
+            return None
+        return max(0, self.agreed[key] + self.delta[key])
+
+    def move(self, manager: Any, blocks: int) -> None:
+        key = id(manager)
+        if key in self.delta:
+            self.delta[key] += blocks
+
+
+def _sglang_open_budget_round() -> Optional[_SGLangBudgetRound]:
+    return getattr(_SGLANG_BUDGET, "round", None)
+
+
+def _sglang_budget_available(manager: Any) -> int:
+    """The manager's free count as admission should read it.
+
+    Inside a budget round that covers the manager this is the agreed count
+    plus the round's own moves; outside one it is the manager's live count.
+    """
+    budget_round = _sglang_open_budget_round()
+    if budget_round is not None:
+        agreed = budget_round.available(manager)
+        if agreed is not None:
+            return agreed
+    return int(manager.available_size())
+
+
+def _sglang_budget_move(manager: Any, blocks: int) -> None:
+    """Debit (negative) or credit blocks of ``manager`` in the open round."""
+    budget_round = _sglang_open_budget_round()
+    if budget_round is not None and manager is not None:
+        budget_round.move(manager, blocks)
+
+
+def _sglang_budget_managers(scheduler: Any) -> List[Any]:
+    """The kvcached managers whose counts admission reads, in a fixed order.
+
+    The token allocator's manager, or the managers of the SWA composite's
+    full and SWA children, then the Mamba pool's. The walk is the same on
+    every rank, so the counts line up position by position in the reduce.
+    """
+    token_allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    if token_allocator is None:
+        tree_cache = getattr(scheduler, "tree_cache", None)
+        token_allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    req_pool = getattr(scheduler, "req_to_token_pool", None)
+    mamba_allocator = getattr(req_pool, "mamba_allocator", None)
+    owners = (
+        token_allocator,
+        getattr(token_allocator, "full_attn_allocator", None),
+        getattr(token_allocator, "swa_attn_allocator", None),
+        getattr(mamba_allocator, "mamba_pool", None),
+    )
+    managers: List[Any] = []
+    for owner in owners:
+        manager = getattr(owner, "kvcached_allocator", None)
+        if manager is not None and all(manager is not seen for seen in managers):
+            managers.append(manager)
+    return managers
+
+
+def _sglang_group_min_counts(counts: Sequence[int], groups: Sequence[Any]) -> List[int]:
+    """One MIN all-reduce of the counts over each queue group, in order."""
+    import torch
+
+    values = torch.tensor(list(counts), dtype=torch.int64)
+    for cpu_group in groups:
+        torch.distributed.all_reduce(
+            values, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return [int(value) for value in values.tolist()]
+
+
+def _sglang_log_budget_round(scheduler: Any, managers: Sequence[Any],
+                             local: Sequence[int], agreed: Sequence[int]) -> None:
+    if list(local) == list(agreed):
+        return
+    now = time.monotonic()
+    last = getattr(scheduler, "_kvcached_budget_log_at", None)
+    if last is not None and now - last < 10.0:
+        return
+    scheduler._kvcached_budget_log_at = now
+    pools = ", ".join(
+        f"{getattr(manager, 'pool_name', None) or 'pool'} local={here} agreed={shared}"
+        for manager, here, shared in zip(managers, local, agreed))
+    logger.info(
+        "kvcached admission budget follows the shortest rank of the queue "
+        "group: %s", pools)
+
+
+@contextlib.contextmanager
+def _sglang_budget_round(scheduler: Any):
+    """One scheduling round in which the queue group reads one budget.
+
+    Under TP every rank's kvcached pool reports its own GPU's physical
+    headroom, while SGLang's scheduler expects every rank of a waiting queue
+    to take the same decisions from these counts: the ``PrefillAdder``
+    budget, the Mamba shortfall ``alloc_req_slots`` evicts, the token
+    shortfall ``evict_from_tree_cache`` evicts before every allocation and
+    inside the decode gate. Different counts build different batches, or
+    evict different amounts and let the radix trees drift apart, and the
+    forward desyncs either way. At the start of the round every rank reads
+    its managers' counts and one MIN all-reduce over the queue groups (the
+    same groups as ``_sglang_group_capacity_miss``) makes the smallest the
+    budget of all; the elastic allocators serve it, plus the round's own
+    moves, until the round closes. The reduce runs whatever the local
+    counts, once per outermost round, so every rank issues it the same
+    number of times, and it precedes the MAX reduces of the attempts the
+    round makes. Without a queue group no round opens and every read stays
+    local. A pipeline opens no round either: the miss patches keep SGLang's
+    own behaviour there until a stage-wide verdict exists, and the budget
+    follows them.
+    """
+    if _sglang_open_budget_round() is not None:
+        yield
+        return
+    groups = _sglang_queue_cpu_groups() if _sglang_pipeline_stages() == 1 else []
+    managers = _sglang_budget_managers(scheduler) if groups else []
+    if not managers:
+        yield
+        return
+    local = [int(manager.available_size()) for manager in managers]
+    agreed = _sglang_group_min_counts(local, groups)
+    _sglang_log_budget_round(scheduler, managers, local, agreed)
+    _SGLANG_BUDGET.round = _SGLangBudgetRound(managers, agreed)
+    try:
+        yield
+    finally:
+        _SGLANG_BUDGET.round = None
 
 
 def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
@@ -375,6 +541,14 @@ def _unwind_prefill_admission(scheduler: Any, batch: Any, chunked_before: Any,
     the next round re-admits it the way the hybrid SWA early return does.
     Returns the requests placed back at the head of the waiting queue.
     """
+    consumer = getattr(batch, "hicache_consumer_index", -1)
+    if consumer >= 0:
+        # HiCache submitted this batch's host-to-device loads before its
+        # allocation missed, and no forward will wait for them. Let them land
+        # before their Mamba slots are freed and later batches read the
+        # loaded nodes.
+        counter = scheduler.tree_cache.cache_controller.layer_done_counter
+        counter.events[consumer].finish_event.synchronize()
     tree_cache = scheduler.tree_cache
     mamba_allocator = getattr(scheduler.req_to_token_pool, "mamba_allocator", None)
     chunked_after = scheduler.chunked_req
@@ -765,7 +939,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # can slightly exceed the pool's declared size.
                     # SGLang's SWATokenToKVPoolAllocator asserts
                     # available <= size.
-                    return min(self.kvcached_allocator.available_size(),
+                    return min(_sglang_budget_available(self.kvcached_allocator),
                                self.size)
 
                 def alloc(self, need_size: int):
@@ -793,7 +967,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices: list[int] = free_index.cpu().numpy().tolist()
                         except Exception:
                             indices = list(free_index)
-                        return self.kvcached_allocator.free(indices)
+                        return _sglang_free_blocks(self.kvcached_allocator, indices)
                     else:
                         self.free_group.append(
                             _sglang_free_group_copy(self, free_index)
@@ -926,7 +1100,8 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # page so a small logical pool can reserve its null block.
                     # Do not expose that backing-only capacity to SGLang.
                     return min(
-                        self.kvcached_allocator.available_size() * self.page_size,
+                        _sglang_budget_available(self.kvcached_allocator)
+                        * self.page_size,
                         self.size,
                     )
 
@@ -1066,7 +1241,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             indices: list[int] = page_ids.cpu().numpy().tolist()
                         except Exception:
                             indices = list(page_ids)
-                        return self.kvcached_allocator.free(indices)
+                        return _sglang_free_blocks(self.kvcached_allocator, indices)
                     else:
                         self.free_group.append(
                             _sglang_free_group_copy(self, free_index)
@@ -1086,7 +1261,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                             ids: list[int] = page_ids.cpu().numpy().tolist()
                         except Exception:
                             ids = list(page_ids)
-                        return self.kvcached_allocator.free(ids)
+                        return _sglang_free_blocks(self.kvcached_allocator, ids)
                     else:
                         self.free_page_ids_group.append(
                             _sglang_free_group_copy(self, page_ids)
@@ -2168,7 +2343,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                     )
 
                 def available_size(self) -> int:
-                    return self.kvcached_allocator.available_size()
+                    return _sglang_budget_available(self.kvcached_allocator)
 
                 def alloc(
                     self, need_size: int,
@@ -2421,6 +2596,10 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 self.mamba_pool = mamba_pool
                 self._alloc_iter = None
                 self._free_ids = set(range(1, size + 1))
+                # The budget round's tally follows the slots handed to
+                # requests, not the pool's group pre-allocation, whose
+                # success differs between ranks.
+                self._budget_manager = getattr(mamba_pool, "kvcached_allocator", None)
 
             @property
             def free_slots(self):
@@ -2431,6 +2610,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 )
 
             def available_size(self) -> int:
+                if self._budget_manager is not None:
+                    return _sglang_budget_available(self._budget_manager)
                 return self.mamba_pool.available_size()
 
             def schedulable_available_size(self) -> int:
@@ -2448,8 +2629,12 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 if self._alloc_iter is not None and need_size == 1:
                     slot = next(self._alloc_iter, None)
                     if slot is not None:
+                        _sglang_budget_move(self._budget_manager, -1)
                         return slot
-                return self._do_alloc(need_size)
+                slots = self._do_alloc(need_size)
+                if slots is not None:
+                    _sglang_budget_move(self._budget_manager, -need_size)
+                return slots
 
             def free(self, free_index) -> None:
                 if free_index.numel() == 0:
@@ -2457,6 +2642,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 block_ids = free_index.tolist()
                 self.mamba_pool.free(free_index)
                 self._free_ids.update(block_ids)
+                _sglang_budget_move(self._budget_manager, len(block_ids))
 
             def alloc_group_begin(self, num_reqs: int) -> None:
                 self._alloc_iter = None
@@ -2469,7 +2655,11 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 if self._alloc_iter is not None:
                     remaining = list(self._alloc_iter)
                     if remaining:
-                        self.free(torch.cat(remaining))
+                        # Back to the pool only: the pre-allocation never
+                        # entered the budget tally.
+                        unused = torch.cat(remaining)
+                        self.mamba_pool.free(unused)
+                        self._free_ids.update(unused.tolist())
                 self._alloc_iter = None
 
             def clear(self) -> None:
@@ -2760,6 +2950,80 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         self._mark_as_patched(_patched_get_new_batch_prefill_raw, marker)
         Scheduler._get_new_batch_prefill_raw = _patched_get_new_batch_prefill_raw
         return True
+
+
+class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
+    """Make the ranks sharing a waiting queue admit against one budget.
+
+    Each SGLang TP rank drives a kvcached pool of its own, whose free count
+    is that GPU's physical headroom, while the scheduler expects every rank
+    of a queue group to build the same batch and evict the same amount from
+    the same counts. ``ScheduleBatchCapacityMissPatch`` agrees on a miss
+    after the allocation; this patch agrees on the counts before it. Each
+    scheduling round, ``get_next_batch_to_run`` in the normal and overlap
+    loops, runs inside ``_sglang_budget_round``: one MIN all-reduce of the
+    managers' counts over the queue groups at the start, and the agreed
+    counts, plus the round's own moves, served by every elastic allocator
+    until the round ends. ``get_new_batch_prefill`` and
+    ``update_running_batch`` open a round of their own only when the loop
+    calls them directly (PD prefill and decode, multiplexing) and none is
+    open; inside a round they add no collective. The decision to reduce
+    never reads allocator state, so every rank issues the same collectives
+    in the same order, the counts first, then the miss flags of the
+    attempts the round makes. A pipeline opens no round, as the miss
+    patches keep SGLang's own behaviour there. The round registers from
+    0.5.13, where the elastic SWA and Mamba slot allocators it reads first
+    exist, while the miss patches register from 0.5.20: below that the
+    ranks admit the same batch and a physical miss is fatal, as native.
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_shared_budget"
+    round_methods = ("get_next_batch_to_run", "get_new_batch_prefill",
+                     "update_running_batch")
+
+    def apply(self, sched_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if self.patch_budget_rounds not in self.applicable_methods:
+            return True
+        return self.patch_budget_rounds(sched_mod)
+
+    @version_range(">=0.5.13")
+    def patch_budget_rounds(self, sched_mod: types.ModuleType) -> bool:
+        Scheduler = self._get_target_class(sched_mod)
+        if Scheduler is None:
+            return False
+        marker = "__kvcached_budget_round_patched__"
+        wrapped = 0
+        for name in self.round_methods:
+            original = getattr(Scheduler, name, None)
+            if original is None:
+                self.logger.warning(
+                    "Scheduler.%s was not found; admission there reads this "
+                    "rank's own budget", name)
+                continue
+            if self._is_already_patched(original, marker):
+                wrapped += 1
+                continue
+            patched = self._wrap_in_budget_round(original)
+            self._mark_as_patched(patched, marker)
+            setattr(Scheduler, name, patched)
+            wrapped += 1
+        return wrapped > 0
+
+    @staticmethod
+    def _wrap_in_budget_round(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def _patched(self, *args: Any, **kwargs: Any) -> Any:
+            if not enable_kvcached():
+                return original(self, *args, **kwargs)
+            with _sglang_budget_round(self):
+                return original(self, *args, **kwargs)
+
+        return _patched
 
 
 class SchedulerMemoryLeakPatch(VersionAwarePatch, BasePatch):
@@ -3332,6 +3596,8 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
+    for manager in getattr(scheduler, "_kvcached_control_managers", ()):
+        manager.apply_resize_target()
     now = time.monotonic()
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager
@@ -3389,6 +3655,15 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                 original_init(sched_self, *args, **kwargs)
                 if enable_kvcached():
                     _register_shrink_reclaimers(sched_self)
+                    from kvcached.runtime_control import initialize_runtime_controls
+
+                    token_managers = _token_kv_managers(
+                        getattr(sched_self, "token_to_kv_pool_allocator", None))
+                    ranks = _sglang_parallel_size(sched_self)
+                    sched_self._kvcached_control_managers = initialize_runtime_controls(
+                        "sglang", ranks=ranks,
+                        can_shrink=lambda manager: ranks == 1 and any(
+                            manager is token for token in token_managers))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

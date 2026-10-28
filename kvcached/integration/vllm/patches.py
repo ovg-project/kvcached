@@ -1252,15 +1252,12 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                # OffloadingConnector allocates cross-layer KV tensors outside
-                # kvcached's VMM path (issue #267). Reject before any startup.
-                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
-                    raise KVCachedConfigError(
-                        "kvcached does not support vLLM CPU KV offloading "
-                        "(OffloadingConnector, --kv-offloading-size); "
-                        "remove --kv-offloading-size or disable kvcached"
-                    )
+                # Before 0.29 OffloadingConnector allocates cross-layer KV
+                # tensors outside kvcached's VMM path (issue #267); from 0.29
+                # its copies need the pins installed below. Reject the rest.
+                from kvcached.integration.vllm.offload_pins import check_offloading_config
+
+                check_offloading_config(vllm_config, detected_version)
                 # Reject a partial integration before either allocator or the
                 # native executor starts. vLLM can select V1 automatically.
                 if detected_version and VersionRange(">=0.29.0").contains(detected_version):
@@ -1328,7 +1325,19 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 )
             result = original_init(self, vllm_config, *args, **kwargs)
             if enable_kvcached():
+                from kvcached.runtime_control import initialize_runtime_controls
+
+                self._kvcached_control_managers = initialize_runtime_controls("vllm")
                 self._kvcached_install_ordered_unmap()
+                primary = _get_vllm_kv_cache_manager(self)
+                for manager in self._kvcached_control_managers:
+                    if primary is not None and manager is not primary:
+                        manager.defer_physical_release = primary.defer_physical_release
+                        if hasattr(primary, "physical_release_barrier"):
+                            manager.physical_release_barrier = primary.physical_release_barrier
+                from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+
+                install_offload_copy_pins(self, primary)
                 self._kvcached_start_limit_watch()
             return result
 
@@ -1389,9 +1398,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             callbacks run on the engine thread, the only thread that may
             change the block pool.
             """
-            manager = _get_vllm_kv_cache_manager(self)
+            managers = getattr(self, "_kvcached_control_managers", ())
             callbacks = getattr(self, "_idle_state_callbacks", None)
-            if manager is None or not isinstance(callbacks, list):
+            if not managers or not isinstance(callbacks, list):
                 return
             try:
                 from vllm.v1.engine import EngineCoreRequestType
@@ -1400,29 +1409,39 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 return
 
             def apply_limit(engine_core: Any) -> None:
-                manager.apply_resize_target()
-                manager.reclaim_for_shrink()
-                _release_retired_pages_if_idle(engine_core, manager)
+                for manager in managers:
+                    manager.apply_resize_target()
+                    manager.reclaim_for_shrink()
+                    _release_retired_pages_if_idle(engine_core, manager)
                 _publish_kv_cache_events_if_idle(engine_core)
 
             stop = threading.Event()
 
-            def limits() -> tuple[int, int]:
-                return (manager.page_allocator.get_resize_target(),
-                        getattr(manager, "_memory_limit_revision", -1))
-
             def watch() -> None:
-                # -1 means no kvctl target and no set_memory_limit() revision.
-                # Starting there also applies a limit set during startup.
-                seen = (-1, -1)
+                # Read ledger metadata here; physical work stays on the engine.
+                from kvcached import _C  # type: ignore[attr-defined]
+
                 while not stop.wait(0.2):
-                    current = limits()
-                    input_queue = getattr(self, "input_queue", None)
-                    if current == seen or input_queue is None:
+                    pending = False
+                    try:
+                        for manager in managers:
+                            runtime = manager._runtime_control
+                            states = [_C.query_instance_control(source["gpu"], source["instance"],
+                                                               source["pool_slot"])
+                                      for source in runtime.sources]
+                            pending |= any(state["published"] and
+                                           state["convergence"] == "pending" for state in states)
+                    except (RuntimeError, OSError):
+                        # Engine-side polling surfaces participant failures.
+                        pending = True
+                    if not pending:
                         continue
-                    seen = current
-                    callbacks.append(apply_limit)
-                    input_queue.put_nowait((wakeup, None))
+                    input_queue = getattr(self, "input_queue", None)
+                    if input_queue is None:
+                        continue
+                    if apply_limit not in callbacks:
+                        callbacks.append(apply_limit)
+                        input_queue.put_nowait((wakeup, None))
 
             thread = threading.Thread(target=watch, name="kvcached-limit-watch", daemon=True)
             self._kvcached_limit_watch = (stop, thread)

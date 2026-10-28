@@ -159,9 +159,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
 
 PageAllocator::~PageAllocator() {
   try {
-    if (enable_page_prealloc_ && prealloc_thread_) {
-      stop_prealloc_thread_internal();
-    }
+    stop_prealloc_thread_internal();
   } catch (...) {
     // Silently ignore exceptions during cleanup
   }
@@ -581,7 +579,8 @@ PageState PageAllocator::get_page_state_unlocked() const {
 
 int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  CHECK_GPU(device_mem_info(gpu_vmm::current_device(), &avail_phy_mem_size,
+                            &total_phy_mem_size));
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
@@ -609,13 +608,8 @@ page_id_t PageAllocator::get_page_id(int64_t block_id,
   return block_id * block_mem_size / page_size_;
 }
 
-int64_t
-PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
-  if (!mem_info_tracker_) {
-    return -1;
-  }
-  return mem_info_tracker_->check_and_get_resize_target(
-      current_mem_size, num_layers_, num_kv_buffers_);
+int64_t PageAllocator::check_and_get_resize_target(int64_t) const {
+  return -1; // Raw total_size writers are no longer a control authority.
 }
 
 std::unordered_map<page_id_t, std::vector<int64_t>>
@@ -686,16 +680,10 @@ void PageAllocator::set_use_worker_ipc(bool use_worker_ipc) {
 }
 
 void PageAllocator::start_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    start_prealloc_thread_internal();
-  }
+  start_prealloc_thread_internal();
 }
 
-void PageAllocator::stop_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    stop_prealloc_thread_internal();
-  }
-}
+void PageAllocator::stop_prealloc_thread() { stop_prealloc_thread_internal(); }
 
 void PageAllocator::prealloc_worker() {
   auto start_time = std::chrono::steady_clock::now();
@@ -990,7 +978,7 @@ void PageAllocator::trigger_preallocation() {
 
 void PageAllocator::start_prealloc_thread_internal() {
   std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
-  if (!prealloc_thread_) {
+  if (enable_page_prealloc_ && !prealloc_thread_) {
     prealloc_running_ = true;
     prealloc_thread_ =
         std::make_unique<std::thread>(&PageAllocator::prealloc_worker, this);
@@ -999,12 +987,7 @@ void PageAllocator::start_prealloc_thread_internal() {
     trigger_preallocation();
   }
 
-  // Start resize watcher thread alongside prealloc thread
-  if (!resize_watcher_thread_) {
-    resize_watcher_running_ = true;
-    resize_watcher_thread_ =
-        std::make_unique<std::thread>(&PageAllocator::resize_watcher, this);
-  }
+  // Runtime controls are consumed by the engine independently of preallocation.
 }
 
 namespace {
@@ -1054,27 +1037,7 @@ bool PageAllocator::should_use_worker_ipc() const {
   return use_worker_ipc_.load(std::memory_order_acquire);
 }
 
-void PageAllocator::resize_watcher() {
-  LOGGER(INFO, "Resize watcher thread started (poll interval: 100ms)");
-  while (resize_watcher_running_) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!resize_watcher_running_) {
-      break;
-    }
-    if (mem_info_tracker_) {
-      int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          last_observed_mem_size_, num_layers_, num_kv_buffers_);
-      if (target >= 0) {
-        // Observe quota changes, including a return to the startup value.
-        // Retain the latest request between polls so allocations can apply
-        // it later, including when an in-use page initially prevents shrink.
-        last_observed_mem_size_ = target;
-        resize_target_.store(target, std::memory_order_relaxed);
-      }
-    }
-  }
-  LOGGER(INFO, "Resize watcher thread stopped");
-}
+void PageAllocator::resize_watcher() {}
 
 int64_t PageAllocator::get_resize_target() const {
   return resize_target_.load(std::memory_order_relaxed);

@@ -1054,6 +1054,20 @@ def _start_worker_listener_thread(
                             "transaction_state": transaction_state,
                         },
                     )
+                elif msg["cmd"] == "instance_control":
+                    from kvcached import _C  # type: ignore[attr-defined]
+                    state = _C.local_instance_control(group_id, msg.get("configure"),
+                                                      msg.get("expected_participants", 0),
+                                                      msg.get("startup_pages", 0),
+                                                      msg.get("reserve_null", False))
+                    send_msg(conn, {"status": "success", "control": state})
+                elif msg["cmd"] == "ack_instance_control":
+                    from kvcached import _C  # type: ignore[attr-defined]
+                    state = _C.local_instance_control(group_id)
+                    accepted = (not msg["published"] or
+                                (state["generation"] == msg["generation"] and
+                                 _C.acknowledge_instance_control(group_id, msg["revision"])))
+                    send_msg(conn, {"status": "success", "accepted": accepted})
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
@@ -1805,3 +1819,40 @@ def query_worker_cuda_mem_get_info(rank: int,
     if response.get("status") != "success":
         raise RuntimeError(f"worker cuda_mem_get_info failed: {response}")
     return int(response["free_bytes"]), int(response["total_bytes"])
+
+
+async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
+                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
+    targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
+               for rank in range(tp_size)]
+    messages = []
+    for stage, rank in targets:
+        if acknowledgements is None:
+            messages.append({"cmd": "instance_control", "group_id": group_id,
+                             "configure": configure, "expected_participants": expected_participants,
+                             "startup_pages": startup_pages, "reserve_null": reserve_null})
+        else:
+            messages.append({"cmd": "ack_instance_control", "group_id": group_id,
+                             "generation": acknowledgements[(stage, rank)][0],
+                             "revision": acknowledgements[(stage, rank)][1],
+                             "published": acknowledgements[(stage, rank)][2]})
+
+    responses = await asyncio.gather(*[
+        _send_and_receive_message(rank, message, stage)
+        for (stage, rank), message in zip(targets, messages)
+    ], return_exceptions=True)
+    results = []
+    for (stage, rank), response in zip(targets, responses):
+        if isinstance(response, Exception) or not isinstance(response, dict) or response.get("status") != "success":
+            raise RuntimeError(f"KV control worker pp{stage}/rank{rank} unavailable: {response}")
+        if acknowledgements is None:
+            results.append(dict(response["control"], pp_rank=stage, rank=rank))
+        elif not response.get("accepted"):
+            return False
+    return results if acknowledgements is None else True
+
+
+def control_workers(tp_size: int, pp_rank: int, group_id: int,
+                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
+    return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
+                                       configure, acknowledgements, expected_participants, startup_pages, reserve_null))

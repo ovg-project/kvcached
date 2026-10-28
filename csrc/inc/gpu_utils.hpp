@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 #include "gpu_vmm.hpp"
+#include "unified_memory.hpp"
 
 typedef enum {
   FATAL = 0,
@@ -115,3 +117,24 @@ static inline pid_t gettid(void) { return (pid_t)syscall(SYS_gettid); }
 #define CHECK_GPU(x) kvcached::gpu_vmm::check((x), #x, __FILE__, __LINE__)
 #define CHECK_RT(x) CHECK_GPU(x)
 #define CHECK_DRV(x) CHECK_GPU(x)
+
+namespace kvcached {
+
+// gpu_vmm::mem_get_info, except that on an integrated GPU free is MemAvailable
+// (unified_memory.hpp).
+inline auto device_mem_info(int dev_idx, size_t *free_bytes,
+                            size_t *total_bytes) {
+  const auto status = gpu_vmm::mem_get_info(free_bytes, total_bytes);
+  int integrated = 0;
+  if (gpu_vmm::is_success(status) &&
+      gpu_vmm::is_success(
+          gpu_vmm::device_is_integrated(&integrated, dev_idx)) &&
+      integrated != 0) {
+    if (const auto available = read_mem_available()) {
+      *free_bytes = std::min(*available, *total_bytes);
+    }
+  }
+  return status;
+}
+
+} // namespace kvcached
