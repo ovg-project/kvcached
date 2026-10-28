@@ -154,6 +154,7 @@ class NativeControlFake:
         }
         self.acks = []
         self.fail_gpu = None
+        self.published_controls = []
 
     def query_instance_control(self, path, instance, slot=None):
         return dict(self.states[path])
@@ -176,6 +177,15 @@ class NativeControlFake:
         state.update(status="pending", convergence="pending", revision=revision,
                      published=True, limit_bytes=limit,
                      pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
+        return dict(state, status="accepted")
+
+    def publish_instance_controls(self, path, instance, generation, revision, **controls):
+        self.published_controls.append((path, controls))
+        state = self.states[path]
+        if generation != state["generation"]:
+            return dict(state, status="instance_changed")
+        state.update(controls, published=True,
+                     revision=state["revision"] + 1 if revision is None else revision)
         return dict(state, status="accepted")
 
     def fail_instance_control(self, path, instance, slot, owner, generation, revision):
@@ -229,6 +239,46 @@ def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):
     assert [r["revision"] for r in third["gpus"]] == [3, 3]
     assert all(r["limit_bytes"] == size for r in third["gpus"])
     assert '"converged": false' in capsys.readouterr().out
+
+
+def test_policy_controls_take_the_next_revision_of_max(controls):
+    manager, native, control = controls
+    size = manager._memory_limit_page_bundle_bytes() * 4
+    assert control.set_instance_memory_limit(size, instance_name="model")["accepted"]
+    result = control.set_instance_controls(min_bytes=0, priority=3, instance_name="model")
+    assert result["accepted"] and result["priority"] == 3 and result["min_bytes"] == 0
+    assert "limit_bytes" not in result and "headroom_bytes" not in result
+    assert [r["revision"] for r in result["gpus"]] == [2, 2]
+    # Unset controls are not sent, so the native side keeps their values.
+    assert native.published_controls == [
+        ("gpu-a", {"min_bytes": 0, "priority": 3}),
+        ("gpu-b", {"min_bytes": 0, "priority": 3})]
+
+
+@pytest.mark.parametrize("controls_kwargs", [
+    {}, {"min_bytes": -1}, {"headroom_bytes": 1 << 64}, {"limit_bytes": 1.5},
+    {"priority": 1 << 63}, {"priority": -(1 << 63) - 1}, {"priority": "1"},
+    {"priority": 1, "revision": 4},
+])
+def test_policy_controls_are_validated_before_any_gpu_write(controls, controls_kwargs):
+    _, native, control = controls
+    with pytest.raises(ValueError):
+        control.set_instance_controls(instance_name="model", **controls_kwargs)
+    assert native.published_controls == []
+
+
+def test_kvctl_policy_commands(controls, monkeypatch, capsys):
+    from kvcached.cli import kvctl
+
+    _, native, _ = controls
+    kvctl.cmd_min("model", "512M")
+    kvctl.cmd_headroom("model", "1g")
+    monkeypatch.setattr(sys, "argv", ["kvctl", "priority", "model", "-2"])
+    kvctl.main()
+    sent = [controls for gpu, controls in native.published_controls if gpu == "gpu-a"]
+    assert sent == [{"min_bytes": 512 << 20}, {"headroom_bytes": 1 << 30}, {"priority": -2}]
+    assert native.states["gpu-a"]["revision"] == 3
+    assert '"priority": -2' in capsys.readouterr().out
 
 
 def test_explicit_retry_conflict_stale_and_restart(controls):

@@ -160,6 +160,21 @@ def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     return result
 
 
+def update_kv_cache_controls(ipc_name: str, *, min_bytes: Optional[int] = None,
+                             priority: Optional[int] = None,
+                             headroom_bytes: Optional[int] = None):
+    """Publish min, priority or headroom like update_kv_cache_limit()."""
+    import json
+
+    from kvcached.control import set_instance_controls
+
+    result = set_instance_controls(
+        min_bytes=min_bytes, priority=priority, headroom_bytes=headroom_bytes,
+        instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # IPC cleanup helpers
 # ---------------------------------------------------------------------------

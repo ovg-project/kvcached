@@ -18,6 +18,7 @@ from kvcached.cli.utils import (
     get_ipc_path,
     get_kv_cache_limit,
     get_segment_control,
+    update_kv_cache_controls,
     update_kv_cache_limit,
 )
 
@@ -67,9 +68,13 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
-    'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'min', 'priority', 'headroom', 'watch',
+    'kvtop', 'delete', 'help', 'exit', 'quit'
 ]
+
+# Commands whose first argument is an IPC name.
+IPC_COMMANDS = ('limit', 'limit-percent', 'min', 'priority', 'headroom',
+                'list', 'watch', 'delete')
 
 # Nicely formatted help text for the interactive shell.
 HELP_TEXT = """\
@@ -77,6 +82,9 @@ Available commands:
   list [--all] [ipc ...]       List active IPC segments; --all includes unused
   limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
+  min <ipc> <size>             Set the reclaim floor (e.g. 512M, 2G)
+  priority <ipc> <int>         Set the priority (larger is more important)
+  headroom <ipc> <size>        Set the headroom kept from lower priorities
   watch [-n sec] [ipc ...]     Continuously display usage table
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
@@ -124,7 +132,7 @@ def _setup_readline():
 
             cmd = tokens[0]
 
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd in IPC_COMMANDS:
                 ipc_names = _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                 # Case-insensitive matching so "VLLM" also matches "vllm".
                 options = [
@@ -134,7 +142,7 @@ def _setup_readline():
                 options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd in IPC_COMMANDS:
                 options = [
                     n for n in _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                     if n.lower().startswith(text.lower())
@@ -286,6 +294,21 @@ def cmd_limit_percent(ipc: str, percent: float):
     return update_kv_cache_limit(ipc, int(total_mem * percent / 100.0))
 
 
+def cmd_min(ipc: str, size_str: str):
+    """Set the reclaim floor in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, min_bytes=_parse_size(size_str))
+
+
+def cmd_priority(ipc: str, priority: int):
+    """Set the priority on each live instance GPU."""
+    return update_kv_cache_controls(ipc, priority=priority)
+
+
+def cmd_headroom(ipc: str, size_str: str):
+    """Set the headroom in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, headroom_bytes=_parse_size(size_str))
+
+
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
     try:
         while True:
@@ -362,6 +385,12 @@ def interactive_shell():
                 cmd_limit(tokens[1], tokens[2])
             elif cmd == 'limit-percent' and len(tokens) == 3:
                 cmd_limit_percent(tokens[1], float(tokens[2]))
+            elif cmd == 'min' and len(tokens) == 3:
+                cmd_min(tokens[1], tokens[2])
+            elif cmd == 'priority' and len(tokens) == 3:
+                cmd_priority(tokens[1], int(tokens[2]))
+            elif cmd == 'headroom' and len(tokens) == 3:
+                cmd_headroom(tokens[1], tokens[2])
             elif cmd == 'watch':
                 # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
                 interval: float = 1.0
@@ -442,6 +471,17 @@ def main():
     p_lp.add_argument('ipc')
     p_lp.add_argument('percent', type=float)
 
+    # min, priority, headroom
+    p_min = sub.add_parser('min', help='Set the reclaim floor')
+    p_min.add_argument('ipc')
+    p_min.add_argument('size', help="Size, e.g. 512M, 2G")
+    p_prio = sub.add_parser('priority', help='Set the priority (larger is more important)')
+    p_prio.add_argument('ipc')
+    p_prio.add_argument('priority', type=int)
+    p_head = sub.add_parser('headroom', help='Set the headroom kept from lower priorities')
+    p_head.add_argument('ipc')
+    p_head.add_argument('size', help="Size, e.g. 512M, 2G")
+
     # watch
     p_watch = sub.add_parser('watch', help='Continuously list')
     p_watch.add_argument('-n', '--interval', type=float, default=1.0)
@@ -472,6 +512,12 @@ def main():
         cmd_limit(args.ipc, args.size)
     elif args.command == 'limit-percent':
         cmd_limit_percent(args.ipc, args.percent)
+    elif args.command == 'min':
+        cmd_min(args.ipc, args.size)
+    elif args.command == 'priority':
+        cmd_priority(args.ipc, args.priority)
+    elif args.command == 'headroom':
+        cmd_headroom(args.ipc, args.size)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
