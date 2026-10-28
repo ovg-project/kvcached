@@ -35,11 +35,13 @@ kcm.broadcast_kv_tensors_created = (
 inject = False
 hits = 0
 
-def map_pages(world_size, offsets, pp_rank=0, group_id=0):
+def map_pages(world_size, offsets, pp_rank=0, group_id=0, offset_stride=None):
+    assert offset_stride == native.kv_mapping_page_size(group_id)
     assert native.map_to_kv_tensors(offsets, group_id)
 
-def unmap_pages(world_size, offsets, pp_rank=0, group_id=0):
+def unmap_pages(world_size, offsets, pp_rank=0, group_id=0, offset_stride=None):
     global hits
+    assert offset_stride == native.kv_mapping_page_size(group_id)
     if inject:
         hits += 1
         raise RuntimeError("injected native unmap failure")

@@ -312,6 +312,11 @@ class KVCacheManager:
                 #   the ledger dropped. That is an unknown cross-rank outcome
                 #   and degrades the pool per the #375 rule.
                 lifecycle_ref = weakref.ref(self._lifecycle)
+                # Native callbacks use scheduler geometry; uneven PP stages
+                # translate the same logical page IDs to their local stride.
+                offset_stride = self.page_size
+                if CONTIGUOUS_LAYOUT:
+                    offset_stride *= self.num_layers * self.num_kv_buffers
 
                 # Wrap Python functions to match C++ callback signature
                 def map_callback(
@@ -321,7 +326,8 @@ class KVCacheManager:
                     group_id: int = self.group_id,
                 ) -> None:
                     """Wrapper for Python broadcast function"""
-                    broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    broadcast_map_to_kv_tensors(
+                        world_size, offsets, pp_rank, group_id, offset_stride=offset_stride)
 
                 def unmap_callback(
                     world_size: int,
@@ -331,7 +337,8 @@ class KVCacheManager:
                 ) -> None:
                     """Wrapper for Python broadcast function"""
                     try:
-                        broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+                        broadcast_unmap_from_kv_tensors(
+                            world_size, offsets, pp_rank, group_id, offset_stride=offset_stride)
                     except Exception as exc:
                         lifecycle = lifecycle_ref()
                         if lifecycle is not None:
