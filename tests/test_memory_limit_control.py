@@ -556,3 +556,51 @@ def test_exact_page_floor_with_nondivisible_blocks(controls, reserve_null, defer
     assert not manager.in_shrink
     assert manager.page_allocator.total_pages == int(reserve_null)
     assert manager.target_num_pages is None
+
+
+@pytest.mark.parametrize("entry", ["initial", "apply_pending", "finish_pending"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_retained_mapping_keeps_control_pending_until_retry(
+        controls, monkeypatch, entry, replacement):
+    """Constructed retained-map failure across the runtime-control boundary."""
+    from kvcached.errors import RetainedResizeError
+
+    manager, native, control = controls
+    bundle = manager._memory_limit_page_bundle_bytes()
+    control.set_instance_memory_limit(4 * bundle)
+    if entry != "initial":
+        manager.page_allocator.inuse_pages = 6
+        manager.apply_resize_target()
+        assert manager.in_shrink and native.acks == []
+        manager.page_allocator.inuse_pages = 2
+    resize = manager.page_allocator.resize
+    attempts = []
+
+    def retained(size):
+        attempts.append(size)
+        raise RetainedResizeError("retained batch pending adoption")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", retained)
+    if entry == "finish_pending":
+        manager._maybe_finish_shrink()
+    else:
+        manager.apply_resize_target()
+    assert not manager.in_shrink and manager.target_num_pages is None
+    assert native.acks == []
+    assert native.states["gpu-a"]["convergence"] == "pending"
+    assert manager._runtime_control.executing == ()
+    # A repeated poll must retry the same revision without failing it.
+    manager.apply_resize_target()
+    assert len(attempts) == 2 and native.acks == []
+    assert native.states["gpu-a"]["convergence"] == "pending"
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    if replacement:
+        control.set_instance_memory_limit(8 * bundle)
+        manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
+    assert native.acks == [2 if replacement else 1]
+    assert manager.page_allocator.total_pages == (8 if replacement else 4)
+    assert not manager._resize_rejected
+    manager.apply_resize_target()
+    assert len(native.acks) == 1

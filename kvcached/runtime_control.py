@@ -72,10 +72,16 @@ class RuntimeControl:
         previous = tuple((state["generation"], state["revision"], state["published"])
                          for state in self.executing)
         if signature != previous or manager.in_shrink:
-            from kvcached.errors import QuarantinedResizeError
+            from kvcached.errors import QuarantinedResizeError, RetainedResizeError
 
             try:
                 manager.resize(pages * manager.page_size)
+            except RetainedResizeError:
+                # The same revision must retry after the retained batch is
+                # adopted, including a revision already executing a shrink.
+                manager._resize_rejected = True
+                self.executing = ()
+                return
             except QuarantinedResizeError:
                 manager._resize_rejected = True
                 self.executing = states

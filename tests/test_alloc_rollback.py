@@ -817,6 +817,40 @@ def test_fatal_mapping_counts_error_and_closes_readiness(monkeypatch, typed):
 
 
 
+@pytest.mark.parametrize("background", [False, True])
+def test_growth_latch_closes_readiness_and_preserves_error_accounting(monkeypatch, background):
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.lifecycle import LifecyclePhase
+
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+    unresolved: Dict[str, Dict[str, str]] = {}
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS", unresolved)
+
+    def fail():
+        unresolved["lost-ack"] = {"message": "unresolved worker result"}
+        raise RuntimeError("legacy callback lost its exception type")
+
+    if background:
+        unresolved["lost-ack"] = {"message": "unresolved worker result"}
+    else:
+        monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+
+    def action():
+        return manager.available_size() if background else manager.alloc(1)
+
+    with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+        action()
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+        manager.wait_ready()
+    data = manager.operation_snapshot_dict()
+    assert data["capacity_exhausted_total"] == 0
+    assert data["manager_page_allocation_failures_total"] == int(not background)
+    assert data["allocation_errors_total"] == int(not background)
+    assert manager.page_allocator.freed_pages == []
+
+
 def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatch):
     manager = make_manager(fail_after=1)
     manager.num_blocks = manager.logical_num_blocks = BLOCKS_PER_PAGE
@@ -978,6 +1012,32 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
         manager.resize(2000)
 
 
+@pytest.mark.parametrize("pending_shrink", [False, True])
+def test_retained_resize_target_is_retried_after_recovery(monkeypatch, pending_shrink):
+    from kvcached.errors import RetainedResizeError
+
+    manager = make_manager(fail_after=2)
+    manager.in_shrink = pending_shrink
+    manager.target_num_pages = 1 if pending_shrink else None
+    pending = [True]
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        if pending[0]:
+            raise RetainedResizeError("retained map pending")
+        return True
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    publish_limit(manager, monkeypatch, 1000)
+    assert manager.alloc(1) is not None
+    assert not manager.in_shrink
+    pending[0] = False
+    assert manager.alloc(1) is not None
+    assert calls == [1000, 1000]
+    assert not manager._resize_rejected
+
+
 def test_miss_with_no_partial_state_is_clean():
     manager = make_manager(fail_after=1)
     assert manager.alloc(BLOCKS_PER_PAGE) == [0, 1, 2, 3]
@@ -1040,6 +1100,22 @@ def test_failed_allocation_rollback_does_not_count_caller_free_progress(monkeypa
     assert data["manager_page_releases_total"] == 0
 
 
+def test_failed_legacy_growth_retires_empty_pages_until_safe_epoch():
+    manager = make_manager(fail_after=1)
+    manager.defer_physical_release = True
+    manager._retired_pages = []
+    manager._physical_release_epoch = 8
+    assert manager.alloc(6) is None
+    assert list(manager.avail_pages) == [0]
+    assert manager.avail_pages[0].empty()
+    assert manager.page_allocator.freed_pages == []
+    assert manager._retired_pages == [(9, [0])]
+    manager.release_retired_pages_through(8)
+    assert manager.page_allocator.freed_pages == []
+    manager.release_retired_pages_through(9)
+    assert manager.page_allocator.freed_pages == [0]
+
+
 def test_reserved_blocks_restored_on_miss():
     manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
     assert manager.alloc(4) is None
@@ -1080,7 +1156,8 @@ def test_mixed_reserved_and_page_blocks_restored():
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.
     assert manager.alloc(8) is None
     assert manager.reserved_blocks == [10, 11]
-    # Page 0 went fully free again, so it was returned to the page allocator.
+    # A failed legacy single-page allocation must not pin an idle partial
+    # request while another instance is waiting for the same capacity.
     assert manager.page_allocator.freed_pages == [0]
     assert manager.num_avail_blocks == 0
     assert manager.avail_pages == {}
@@ -1488,3 +1565,46 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
     assert data["free_failures_total"] == 1
     assert data["last_error_code"] == "free_failed"
     assert data["last_error_timestamp_ns"] is not None
+
+
+def test_unknown_outcome_is_not_an_allocation_miss(monkeypatch):
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0)
+
+    def fail():
+        raise MapTransactionOutcomeUnknownError("unconfirmed map")
+
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="unconfirmed map"):
+        manager.alloc(1)
+
+
+@pytest.mark.parametrize("legacy_native_wrapper", [False, True])
+def test_latched_failure_surfaces_before_capacity_or_miss(monkeypatch, legacy_native_wrapper):
+    # Model a background callback failure, and an older extension that wraps
+    # the Python exception in std::runtime_error on the foreground path.
+    from kvcached.tp_ipc_util import MapTransactionOutcomeUnknownError
+
+    manager = make_manager(fail_after=0, reserved_blocks=[10])
+    failed = not legacy_native_wrapper
+
+    def check():
+        if failed:
+            raise MapTransactionOutcomeUnknownError("restart the engine")
+
+    def fail():
+        nonlocal failed
+        failed = True
+        raise RuntimeError("wrapped callback failure")
+
+    monkeypatch.setitem(
+        KVCacheManager.available_size.__wrapped__.__globals__,
+        "raise_if_physical_growth_unresolved", check,
+    )
+    monkeypatch.setattr(manager.page_allocator, "alloc_page", fail)
+    if not legacy_native_wrapper:
+        with pytest.raises(MapTransactionOutcomeUnknownError):
+            manager.available_size()
+    with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
+        manager.alloc(2)
