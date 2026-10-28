@@ -742,7 +742,7 @@ def test_offload_topology_must_be_positive_integral(axis, value):
         check_offloading_config(cfg, "0.30.0")
 
 
-def _capacity_engine(cap, monkeypatch, tp=1, pp=2, failure=None):
+def _capacity_engine(cap, monkeypatch, tp=1, pp=2, failure=None, native=False):
     """Workers already exist with independent config copies when planning runs."""
     from copy import deepcopy
 
@@ -769,7 +769,7 @@ def _capacity_engine(cap, monkeypatch, tp=1, pp=2, failure=None):
         def initialize_from_config(self, received):
             events.append("initialize")
             assert received is configs
-            for worker in workers:
+            for worker in workers if not native else ():
                 extra = worker.vllm_config.kv_transfer_config.kv_connector_extra_config
                 assert extra["spec_name"] == cap.adapter.SPEC_NAME
                 assert extra[cap.adapter.PLAN_KEY] == cfg.kv_transfer_config.kv_connector_extra_config[cap.adapter.PLAN_KEY]
@@ -789,7 +789,7 @@ def _capacity_engine(cap, monkeypatch, tp=1, pp=2, failure=None):
     return cfg, engine, workers, events
 
 
-@pytest.mark.parametrize("tp,pp", [(3, 1), (1, 3), (3, 2)])
+@pytest.mark.parametrize("tp,pp", [(1, 3), (3, 2)])
 def test_capacity_reaches_existing_workers_before_native_initialization(
         offload_capacity, monkeypatch, tp, pp):
     cap = offload_capacity
@@ -799,6 +799,19 @@ def test_capacity_reaches_existing_workers_before_native_initialization(
     assert "initialize_from_config" not in vars(engine.model_executor)
     plan = cfg.kv_transfer_config.kv_connector_extra_config[cap.adapter.PLAN_KEY]
     assert len(plan["payloads"]) == len(workers) == tp * pp
+
+
+@pytest.mark.parametrize("tp", [1, 3])
+def test_without_pp_native_spec_and_shared_region_are_kept(offload_capacity, monkeypatch, tp):
+    cap = offload_capacity
+    cfg, engine, workers, events = _capacity_engine(cap, monkeypatch, tp, pp=1, native=True)
+    previous_extra = cfg.kv_transfer_config.kv_connector_extra_config
+    assert engine._initialize_kv_caches(cfg) == "initialized"
+    assert events == ["initialize"]
+    assert cfg.kv_transfer_config.kv_connector_extra_config is previous_extra
+    for worker in workers:
+        extra = worker.vllm_config.kv_transfer_config.kv_connector_extra_config
+        assert cap.adapter.PLAN_KEY not in extra and "spec_name" not in extra
 
 
 @pytest.mark.parametrize("failure", ["rpc", "missing_rank", "initialize"])

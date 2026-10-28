@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Configure rank-private native CPU offload before worker KV initialization."""
+"""Configure rank-private native CPU offload for pipeline stages before worker
+KV initialization."""
 
 from __future__ import annotations
 
@@ -155,7 +156,11 @@ def patch_offload_initialization(engine_cls: Any) -> None:
     def prepare(engine: Any, config: Any, *args: Any, **kwargs: Any) -> Any:
         transfer = getattr(config, "kv_transfer_config", None)
         if (not enable_kvcached() or transfer is None
-                or getattr(transfer, "kv_connector", None) != "OffloadingConnector"):
+                or getattr(transfer, "kv_connector", None) != "OffloadingConnector"
+                # Without PP every rank holds the same layers, so the native
+                # spec's sizing and shared CPU region apply unchanged,
+                # including one MLA copy for all TP ranks.
+                or config.parallel_config.pipeline_parallel_size == 1):
             return original(engine, config, *args, **kwargs)
         executor = engine.model_executor
         initialize = executor.initialize_from_config
