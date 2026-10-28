@@ -82,9 +82,9 @@ def set_instance_controls(
     the retry rules of set_instance_memory_limit(): a retry of a revision must
     carry the values it published.
     """
-    fields = {"limit_bytes": limit_bytes, "min_bytes": min_bytes,
-              "priority": priority, "headroom_bytes": headroom_bytes}
-    fields = {name: value for name, value in fields.items() if value is not None}
+    given = {"limit_bytes": limit_bytes, "min_bytes": min_bytes,
+             "priority": priority, "headroom_bytes": headroom_bytes}
+    fields = {name: value for name, value in given.items() if value is not None}
     if not fields:
         raise ValueError("set_instance_controls needs at least one control")
     for name, value in fields.items():
