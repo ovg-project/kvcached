@@ -21,7 +21,12 @@ def get_prefix_cache_retention_limit() -> int:
 
 
 def set_prefix_cache_retention_limit(limit_tokens: int) -> None:
-    """Update prefix retention from the engine or scheduler thread."""
+    """Update this process's prefix retention from the engine or scheduler thread.
+
+    The update is process-local and is not synchronized with other processes.
+    The new limit is stored before eviction is attempted. If eviction raises
+    an exception, it propagates to the caller and the new limit remains in effect.
+    """
     from kvcached.prefix_cache_retention import (
         _set_prefix_cache_retention_limit,
     )
