@@ -157,19 +157,20 @@ class MultiLLMFrontend:
                                                   'Connection':
                                                   'keep-alive'
                                               })
-                await response.prepare(request)
-
+                stream_complete = False
                 try:
+                    await response.prepare(request)
                     async for chunk in result.content.iter_chunked(1024):
                         await response.write(chunk)
 
                     # Explicitly close the stream to make sure the
                     # connection/FIFO is released promptly.
                     await response.write_eof()
+                    stream_complete = True
 
                     return response
                 finally:
-                    await result.release()
+                    self.router.finish_stream(result, success=stream_complete)
             else:
                 # This is a regular JSON response
                 return web.Response(text=json.dumps(result),
@@ -221,18 +222,19 @@ class MultiLLMFrontend:
                                                   'Connection':
                                                   'keep-alive'
                                               })
-                await response.prepare(request)
-
+                stream_complete = False
                 try:
+                    await response.prepare(request)
                     async for chunk in result.content.iter_chunked(1024):
                         await response.write(chunk)
 
                     # Ensure the downstream connection is properly closed.
                     await response.write_eof()
+                    stream_complete = True
 
                     return response
                 finally:
-                    await result.release()
+                    self.router.finish_stream(result, success=stream_complete)
             else:
                 # This is a regular JSON response
                 return web.Response(text=json.dumps(result),
