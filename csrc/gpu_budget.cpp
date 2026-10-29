@@ -536,24 +536,50 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   return result;
 }
 
+// Liveness only, as control queries check it: a crashed instance's pools
+// keep their entries, and nothing here refunds or retires them. Cleanup is
+// the orchestrator's.
+bool GpuBudget::pool_alive(size_t slot, const Shared *data) const {
+  const auto &pool = data->pools[slot];
+  if (!pool.owner)
+    return false;
+  if (pool.owner == owner_)
+    return true;
+  struct flock owner_lock{};
+  owner_lock.l_type = F_WRLCK;
+  owner_lock.l_whence = SEEK_SET;
+  owner_lock.l_start = kPoolLeaseStart + slot;
+  owner_lock.l_len = 1;
+  if (fcntl(fd_, F_OFD_GETLK, &owner_lock) < 0)
+    throw system_error("inspect KV budget pool owner");
+  return owner_lock.l_type != F_UNLCK;
+}
+
 // headroom + shortfall of #585, where the shortfall is the demand that the
-// headroom does not cover. Instances whose pools all left are not counted;
-// demand goes away with them.
+// headroom does not cover. An instance none of whose pools is alive is not
+// read; only instances that would count are checked.
 uint64_t GpuBudget::watermark_locked(size_t instance,
                                      const Shared *data) const {
-  bool live[kInstances]{};
-  for (const auto &pool : data->pools)
-    if (pool.owner && pool.instance < kInstances)
-      live[pool.instance] = true;
   const int64_t priority = data->instances[instance].priority;
-  uint64_t total = 0;
+  bool counted[kInstances]{};
   for (size_t i = 0; i < kInstances; ++i) {
     const auto &entry = data->instances[i];
-    if (i == instance || !live[i] || !entry.valid || entry.priority <= priority)
-      continue;
-    total =
-        saturating_add(total, std::max<uint64_t>(entry.headroom, entry.demand));
+    counted[i] = i != instance && entry.valid && entry.priority > priority &&
+                 std::max<uint64_t>(entry.headroom, entry.demand) > 0;
   }
+  bool live[kInstances]{};
+  for (size_t slot = 0; slot < kPools; ++slot) {
+    const uint64_t owner = data->pools[slot].instance;
+    if (owner < kInstances && counted[owner] && !live[owner] &&
+        pool_alive(slot, data))
+      live[owner] = true;
+  }
+  uint64_t total = 0;
+  for (size_t i = 0; i < kInstances; ++i)
+    if (live[i])
+      total =
+          saturating_add(total, std::max<uint64_t>(data->instances[i].headroom,
+                                                   data->instances[i].demand));
   return total;
 }
 

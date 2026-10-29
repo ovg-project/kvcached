@@ -574,6 +574,31 @@ int main() {
     assert(budget->snapshot(low).watermark_bytes == 4 && fits(low, 4));
     budget->set_demand(high, 0);
     assert(budget->query_control("low").watermark_bytes == 4);
+    // A crashed instance's controls stop counting at once, and its entry is
+    // left for the orchestrator to clean up.
+    int ready[2], release[2];
+    assert(pipe(ready) == 0 && pipe(release) == 0);
+    const pid_t child = fork();
+    if (child == 0) {
+      auto other = GpuBudget::connect(ledger, [] { return 100; });
+      other->register_pool("crashed", 0, InstancePolicy{0, 5, 3});
+      char byte = 1;
+      if (write(ready[1], &byte, 1) != 1 || read(release[0], &byte, 1) != 1)
+        _exit(1);
+      _exit(0); // no destructor: the pool entry stays behind
+    }
+    char byte = 0;
+    assert(read(ready[0], &byte, 1) == 1);
+    assert(budget->snapshot(low).watermark_bytes == 7);
+    assert(write(release[1], &byte, 1) == 1);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->snapshot(high).watermark_bytes == 0);
+    assert(budget->query_control("crashed").priority == 5);
+    for (int fd : {ready[0], ready[1], release[0], release[1]})
+      close(fd);
     held.clear();
     budget.reset();
     unlink(ledger.c_str());
