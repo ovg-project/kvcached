@@ -1033,14 +1033,16 @@ class KVCacheManager:
         return freed_blocks, had_inconsistency
 
     def _maybe_finish_shrink(self) -> None:
-        if getattr(self, "_retired_pages", None):
-            # PageAllocator.resize() cannot shrink past pages that are still
-            # physically mapped for an in-flight worker batch.
-            return
         if self.in_shrink:
             assert self.target_num_pages is not None
             target_blocks = self.target_num_pages * self.page_size // self.block_mem_size
-            if self._get_num_alloced_blocks() <= target_blocks:
+            get_state = getattr(self.page_allocator, "get_transaction_state", None)
+            healthy = get_state is None or get_state()["state"] == "HEALTHY"
+            # A late preallocation failure must reach resize()'s native verdict
+            # even while live blocks or a physical-release barrier prevent
+            # completion. Healthy pending polls do not resize or drop the cache.
+            if not healthy or (not getattr(self, "_retired_pages", None)
+                               and self._get_num_alloced_blocks() <= target_blocks):
                 try:
                     resized = self.page_allocator.resize(
                         self.target_num_pages * self.page_size)

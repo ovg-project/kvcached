@@ -67,11 +67,11 @@ class RuntimeControl:
                and state["pool_target_bytes"] < state["pool_capacity_bytes"]
                for state in states):
             return  # Native cap already blocks growth; no unsafe engine shrink.
-        signature = tuple((state["generation"], state["revision"], state["published"])
+        signature = tuple((state["generation"], state["limit_revision"], state["published"])
                           for state in states)
-        previous = tuple((state["generation"], state["revision"], state["published"])
+        previous = tuple((state["generation"], state["limit_revision"], state["published"])
                          for state in self.executing)
-        if signature != previous or manager.in_shrink:
+        if signature != previous:
             from kvcached.errors import QuarantinedResizeError
 
             try:
@@ -82,24 +82,31 @@ class RuntimeControl:
                 self.fail()
                 return
             self.executing = states
+        elif manager.in_shrink:
+            # Continue the existing request without recording a new resize.
+            manager._maybe_finish_shrink()
+            if manager.in_shrink:
+                # Reservations made since the initial resize must not pin the
+                # request indefinitely. free() also tries to finish the shrink.
+                manager.free_reserved()
         if not manager.in_shrink and not getattr(manager, "_resize_rejected", False):
             self.acknowledge()
 
     def fail(self) -> None:
-        """Report the executing revision, even if a newer one was published."""
+        """Report the executing max, even if newer controls were published."""
         from kvcached import _C  # type: ignore[attr-defined]
 
         for source, state in zip(self.sources, self.executing):
             if state["published"]:
                 _C.fail_instance_control(
                     source["gpu"], source["instance"], source["pool_slot"],
-                    source["pool_owner"], state["generation"], state["revision"])
+                    source["pool_owner"], state["generation"], state["limit_revision"])
 
     def acknowledge(self) -> None:
         from kvcached import _C  # type: ignore[attr-defined]
         from kvcached.tp_ipc_util import control_workers
 
-        signature = tuple((s["generation"], s["revision"], s["published"])
+        signature = tuple((s["generation"], s["limit_revision"], s["published"])
                           for s in self.executing)
         if not signature or signature == getattr(self, "acknowledged", ()):
             return
@@ -107,7 +114,7 @@ class RuntimeControl:
         if self.worker_ipc:
             acknowledgements = {
                 (source["pp_rank"], source["rank"]):
-                (state["generation"], state["revision"], state["published"])
+                (state["generation"], state["limit_revision"], state["published"])
                 for source, state in zip(self.sources, self.executing)
             }
             accepted = control_workers(self.manager.world_size, self.manager.pp_rank,
@@ -117,7 +124,7 @@ class RuntimeControl:
             if state["published"]:
                 current = _C.local_instance_control(self.manager.group_id)
                 if current["generation"] == state["generation"]:
-                    accepted = _C.acknowledge_instance_control(self.manager.group_id, state["revision"])
+                    accepted = _C.acknowledge_instance_control(self.manager.group_id, state["limit_revision"])
             else:
                 accepted = True
         if accepted:
