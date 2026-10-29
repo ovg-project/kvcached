@@ -146,7 +146,7 @@ class NativeControlFake:
         bundle = manager._memory_limit_page_bundle_bytes()
         self.states = {
             gpu: dict(status="unpublished", convergence="unpublished", generation=42,
-                      revision=0, published=False, pool_slot=0, pool_owner=123,
+                      revision=0, limit_revision=0, published=False, pool_slot=0, pool_owner=123,
                       pool_target_bytes=16 * bundle, pool_capacity_bytes=16 * bundle,
                       page_bundle_bytes=bundle, can_shrink=True, ready=True,
                       expected_participants=2, registered_participants=1)
@@ -160,6 +160,17 @@ class NativeControlFake:
 
     observe_instance_control = query_instance_control
 
+    def publish_instance_controls(self, path, instance, generation, revision, **fields):
+        if "limit_bytes" in fields:
+            result = self.publish_instance_control(
+                path, instance, fields.pop("limit_bytes"), generation, revision)
+            assert result["status"] == "accepted"
+        else:
+            state = self.states[path]
+            state["revision"] = state["revision"] + 1 if revision is None else revision
+        self.states[path].update(fields)
+        return dict(self.states[path], status="accepted")
+
     def publish_instance_control(self, path, instance, limit, generation, revision):
         if path == self.fail_gpu:
             raise RuntimeError("injected publication failure")
@@ -170,10 +181,11 @@ class NativeControlFake:
             if revision < state["revision"]:
                 return dict(state, status="stale")
             if revision == state["revision"]:
-                return dict(state, status="idempotent" if limit == state["limit_bytes"] else "conflict")
+                same_max = revision == state["limit_revision"] and limit == state["limit_bytes"]
+                return dict(state, status="idempotent" if same_max else "conflict")
         revision = state["revision"] + 1 if revision is None else revision
         bundle = state["page_bundle_bytes"]
-        state.update(status="pending", convergence="pending", revision=revision,
+        state.update(status="pending", convergence="pending", revision=revision, limit_revision=revision,
                      published=True, limit_bytes=limit,
                      pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
         return dict(state, status="accepted")
@@ -181,7 +193,7 @@ class NativeControlFake:
     def fail_instance_control(self, path, instance, slot, owner, generation, revision):
         state = self.states[path]
         if (slot, owner, generation, revision) != tuple(
-                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "limit_revision")):
             return False
         state.update(status="failed", convergence="failed", failed=1,
                      failure_reason="quarantined_pages_prevent_resize")
@@ -192,7 +204,7 @@ class NativeControlFake:
 
     def acknowledge_instance_control(self, group_id, revision):
         self.acks.append(revision)
-        return revision == self.states["gpu-a"]["revision"]
+        return revision == self.states["gpu-a"]["limit_revision"]
 
 
 @pytest.fixture
@@ -556,3 +568,163 @@ def test_exact_page_floor_with_nondivisible_blocks(controls, reserve_null, defer
     assert not manager.in_shrink
     assert manager.page_allocator.total_pages == int(reserve_null)
     assert manager.target_num_pages is None
+
+
+@pytest.mark.parametrize("phase", ["unpublished", "converged", "pending", "failed"])
+@pytest.mark.parametrize("policy", [{"min_bytes": 123}, {"priority": 7}, {"headroom_bytes": 456}])
+def test_policy_does_not_execute_resize(controls, monkeypatch, phase, policy):
+    """Run the real RuntimeControl and manager, with constructed native boundaries."""
+    from kvcached.errors import QuarantinedResizeError
+
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    manager._operation_counters = {}
+    bundle = manager._memory_limit_page_bundle_bytes()
+    if phase == "pending":
+        manager.page_allocator.inuse_pages = 6
+    if phase == "failed":
+        def fail(size):
+            raise QuarantinedResizeError("injected quarantine")
+        monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    if phase != "unpublished":
+        control.set_instance_memory_limit(4 * bundle)
+        manager.apply_resize_target()
+    counters = dict(manager._operation_counters)
+    calls = list(manager.page_allocator.resize_calls)
+    acks = list(native.acks)
+    manager._avail_physical_pages_cache = 321
+    for _ in range(3):
+        control.set_instance_controls(**policy)
+        runtime.poll(force=True)
+        manager.apply_resize_target()
+    assert manager._operation_counters == counters
+    assert manager.page_allocator.resize_calls == calls
+    assert native.acks == acks
+    assert manager._avail_physical_pages_cache == 321
+    assert manager.in_shrink == (phase == "pending")
+    if phase == "failed":
+        assert control.get_instance_memory_limit()["status"] == "failed"
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("fail_resize", [False, True])
+def test_policy_between_execution_and_report(controls, monkeypatch, deferred, fail_resize):
+    from kvcached.errors import QuarantinedResizeError
+
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    manager._operation_counters = {}
+    bundle = manager._memory_limit_page_bundle_bytes()
+    limit = 4 * bundle
+    control.set_instance_memory_limit(limit)
+    if deferred:
+        manager.page_allocator.inuse_pages = 6
+        manager.apply_resize_target()
+        assert manager.in_shrink
+        manager.page_allocator.inuse_pages = 2
+    resize = manager.page_allocator.resize
+
+    def interleaved(size):
+        control.set_instance_controls(priority=9)
+        if fail_resize:
+            raise QuarantinedResizeError("injected quarantine")
+        return resize(size)
+
+    monkeypatch.setattr(manager.page_allocator, "resize", interleaved)
+    manager.apply_resize_target()
+    assert not manager.in_shrink
+    assert native.states["gpu-a"]["revision"] == 2
+    assert native.states["gpu-a"]["limit_revision"] == 1
+    if fail_resize:
+        assert control.get_instance_memory_limit()["status"] == "failed"
+    else:
+        assert native.acks == [1]
+    count = dict(manager._operation_counters)
+    for _ in range(3):
+        runtime.poll(force=True)
+        manager.apply_resize_target()
+    assert manager._operation_counters == count
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    # An explicit same-value max publication must retry even after policies.
+    control.set_instance_controls(limit_bytes=limit, headroom_bytes=17)
+    runtime.poll(force=True)
+    manager.apply_resize_target()
+    assert native.acks[-1] == 3
+    assert manager._operation_counters["resize_requests_total"] == 2
+    assert not manager._resize_rejected
+
+
+def test_worker_ack_uses_max_revision_after_policy(controls, monkeypatch):
+    from kvcached import tp_ipc_util
+
+    manager, native, control = controls
+    runtime = manager._runtime_control
+    runtime.worker_ipc = True
+    manager.world_size, manager.pp_rank = 2, 0
+    runtime.sources = tuple(dict(native.states[gpu], gpu=gpu, instance="model", pp_rank=0, rank=rank)
+                            for rank, gpu in enumerate(native.states))
+    control.set_instance_memory_limit(0, revision=0, generations={gpu: 42 for gpu in native.states})
+    resize = manager.resize
+
+    def interleaved(size):
+        control.set_instance_controls(priority=1)
+        return resize(size)
+
+    monkeypatch.setattr(manager, "resize", interleaved)
+    reports = []
+
+    def workers(*args, acknowledgements):
+        reports.append(acknowledgements)
+        return True
+
+    monkeypatch.setattr(tp_ipc_util, "control_workers", workers)
+    manager.apply_resize_target()
+    runtime.poll(force=True)
+    manager.apply_resize_target()
+    assert reports == [{(0, 0): (42, 0, True), (0, 1): (42, 0, True)}]
+    assert manager.page_allocator.resize_calls == [0]
+
+
+@pytest.mark.parametrize("retired", [False, True])
+@pytest.mark.parametrize("fatal", [False, True])
+def test_pending_checks_late_allocator_failure(controls, monkeypatch, retired, fatal):
+    from kvcached.errors import QuarantinedResizeError, StateConsistencyError
+    from kvcached.lifecycle import LifecycleState
+
+    manager, native, control = controls
+    manager._lifecycle = LifecycleState("late-failure-test")
+    manager._lifecycle.mark_ready()
+    manager._operation_counters = {}
+    manager._operation_error_lock = threading.Lock()
+    manager.page_allocator.inuse_pages = 6
+    control.set_instance_memory_limit(4 * manager._memory_limit_page_bundle_bytes())
+    manager.apply_resize_target()
+    assert manager.in_shrink
+    if retired:
+        manager._retired_pages = [(1, [0])]
+    monkeypatch.setattr(manager.page_allocator, "get_transaction_state",
+                        lambda: {"state": "FAILED" if fatal else "DEGRADED"}, raising=False)
+
+    def fail(size):
+        # The failure report must still identify the executing max after this
+        # publication, and must not acknowledge the newer generic revision.
+        control.set_instance_controls(priority=7)
+        error = StateConsistencyError if fatal else QuarantinedResizeError
+        raise error("injected late allocator failure")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", fail)
+    if fatal:
+        with pytest.raises(StateConsistencyError):
+            manager.apply_resize_target()
+        assert manager._lifecycle.phase == "failed"
+    else:
+        manager.apply_resize_target()
+        assert not manager.in_shrink
+        assert control.get_instance_memory_limit()["status"] == "failed"
+        assert native.states["gpu-a"]["revision"] == 2
+        assert native.states["gpu-a"]["limit_revision"] == 1
+        assert not native.acks
+        manager._runtime_control.poll(force=True)
+        manager.apply_resize_target()
+        assert manager._operation_counters["resize_errors_total"] == 1
+    assert manager._operation_counters["resize_requests_total"] == 1

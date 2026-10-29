@@ -389,7 +389,8 @@ void FTensorAllocator::ensure_budget_locked_() {
   auto budget = GpuBudget::connect(
       physical_gpu_lock_path(resolve_device_index(dev_)) + ".budget-v2",
       [this] { return sample_budget_capacity_(); });
-  const auto slot = budget->register_pool(g_instance_name_, group_id_);
+  const auto slot = budget->register_pool(g_instance_name_, group_id_,
+                                          startup_policy_from_env());
   budget_slot_ = slot;
   budget_ = std::move(budget);
 }

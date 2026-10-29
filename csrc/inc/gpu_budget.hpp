@@ -22,6 +22,8 @@ struct InstanceControl {
   uint64_t failed = 0;
   uint64_t generation = 0;
   uint64_t revision = 0;
+  // Revision of the last max publication, stable across policy-only writes.
+  uint64_t limit_revision = 0;
   uint64_t requested_bytes = 0;
   uint64_t effective_bytes = 0;
   uint64_t charged_bytes = 0;
@@ -37,7 +39,33 @@ struct InstanceControl {
   uint64_t registered_participants = 0;
   uint64_t expected_participants = 0;
   uint64_t completed = 0;
-  bool published = false;
+  bool published = false; // A max has been published (revision zero is valid).
+  // The instance's policy controls besides max. min_bytes is the reclaim
+  // floor, unrelated to minimum_bytes, the pool's null-page floor.
+  uint64_t min_bytes = 0;
+  int64_t priority = 0;
+  uint64_t headroom_bytes = 0;
+};
+
+// The policy an instance starts with, before any control is published.
+struct InstancePolicy {
+  uint64_t min_bytes = 0;
+  int64_t priority = 0;
+  uint64_t headroom_bytes = 0;
+};
+
+// KVCACHED_MIN and KVCACHED_HEADROOM are byte counts with kvctl's suffixes
+// (512M, 2G); KVCACHED_PRIORITY is an integer, larger is more important.
+// Unset values are 0. Throws on a malformed value.
+InstancePolicy startup_policy_from_env();
+
+// One control publication. Fields left empty keep their current value, and
+// every publication takes the instance's next revision.
+struct ControlUpdate {
+  std::optional<uint64_t> limit_bytes;
+  std::optional<uint64_t> min_bytes;
+  std::optional<int64_t> priority;
+  std::optional<uint64_t> headroom_bytes;
 };
 
 struct BudgetSnapshot {
@@ -122,7 +150,10 @@ public:
   static std::shared_ptr<GpuBudget> open_control(const std::string &path,
                                                  bool observe = false);
   ~GpuBudget();
-  size_t register_pool(const std::string &instance, int64_t pool);
+  // The startup policy applies only when this registration creates the
+  // instance; the instance's other pools find it set.
+  size_t register_pool(const std::string &instance, int64_t pool,
+                       const InstancePolicy &startup = {});
   std::unique_ptr<BudgetGrant> grant(size_t slot, uint64_t bytes,
                                      BudgetSnapshot *state = nullptr,
                                      const Sampler &sampler = {});
@@ -142,7 +173,12 @@ public:
   InstanceControl publish_control(const std::string &instance, uint64_t bytes,
                                   uint64_t generation,
                                   std::optional<uint64_t> revision = {});
+  InstanceControl publish_control(const std::string &instance,
+                                  const ControlUpdate &update,
+                                  uint64_t generation,
+                                  std::optional<uint64_t> revision = {});
   InstanceControl control_state(size_t slot);
+  // Execution reports use limit_revision, not the all-controls revision.
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
                     uint64_t generation, uint64_t revision);
@@ -170,7 +206,8 @@ private:
   explicit GpuBudget(const std::string &path, bool observe);
   InstanceControl control_state_locked(size_t instance, size_t slot = SIZE_MAX,
                                        const Shared *snapshot = nullptr) const;
-  InstanceControl publish_control_locked(size_t instance, uint64_t bytes,
+  InstanceControl publish_control_locked(size_t instance,
+                                         const ControlUpdate &update,
                                          std::optional<uint64_t> revision);
   void check_owner() const;
   void reclaim_instances_locked();

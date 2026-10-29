@@ -11,7 +11,7 @@ def attach_control(manager, monkeypatch):
 
     bundle = manager._memory_limit_page_bundle_bytes()
     state = dict(status="unpublished", convergence="unpublished", generation=42,
-                 revision=0, published=False, ready=True, pool_owner=1, pool_slot=0,
+                 revision=0, limit_revision=0, published=False, ready=True, pool_owner=1, pool_slot=0,
                  gpu="test-gpu", instance="test", can_shrink=True,
                  pool_capacity_bytes=manager.mem_size // manager.page_size * bundle,
                  pool_target_bytes=manager.mem_size // manager.page_size * bundle,
@@ -25,8 +25,8 @@ def attach_control(manager, monkeypatch):
         state["charged_bytes"] = (pages["inuse_pages"] + pages["reserved_pages"]) * bundle
         if state["published"]:
             state["status"] = state["convergence"] = (
-                "failed" if failed[0] == state["revision"] else
-                "converged" if acked[0] == state["revision"] and
+                "failed" if failed[0] == state["limit_revision"] else
+                "converged" if acked[0] == state["limit_revision"] and
                 state["charged_bytes"] <= min(state["pool_target_bytes"], state["requested_bytes"]) else "pending")
         return dict(state)
 
@@ -36,18 +36,19 @@ def attach_control(manager, monkeypatch):
                      published=True, requested_bytes=limit,
                      pool_target_bytes=max(bundle if getattr(manager, "null_block", None) is not None else 0,
                                            min(limit // bundle * bundle, state["pool_capacity_bytes"])))
+        state["limit_revision"] = state["revision"]
         state["effective_limit_bytes"] = state["pool_target_bytes"]
         return dict(query(), status="accepted")
 
     def ack(group, revision):
-        if revision != state["revision"]:
+        if revision != state["limit_revision"]:
             return False
         acked[0] = revision
         return True
 
     def fail(path, name, slot, owner, generation, revision):
         if (slot, owner, generation, revision) != tuple(
-                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "limit_revision")):
             return False
         failed[0] = revision
         state["failure_reason"] = "quarantined_pages_prevent_resize"
