@@ -130,10 +130,12 @@ run_vllm() {
     local port="$2"
     local tp="$3"
     local venv="$4"
+    local ipc_name="$5"
 
     if [[ -n "$venv" ]]; then source "$venv/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
+    export KVCACHED_IPC_NAME="$ipc_name"
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
     vllm serve "$model" \
@@ -151,10 +153,12 @@ run_sgl() {
     local port="$2"
     local tp="$3"
     local venv="$4"
+    local ipc_name="$5"
 
     if [[ -n "$venv" ]]; then source "$venv/bin/activate"; fi
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
+    export KVCACHED_IPC_NAME="$ipc_name"
     $PYTHON -m sglang.launch_server --model "$model" \
       --disable-radix-cache \
       --trust-remote-code \
@@ -167,16 +171,16 @@ run_sgl() {
 
 # Start A
 if [[ "$ENGINE_A" == "vllm" ]]; then
-    run_vllm "$MODEL_A" "$PORT_A" "$TP_A" "$venv_vllm_path"
+    run_vllm "$MODEL_A" "$PORT_A" "$TP_A" "$venv_vllm_path" "kvcached_instance_a"
 else
-    run_sgl "$MODEL_A" "$PORT_A" "$TP_A" "$venv_sgl_path"
+    run_sgl "$MODEL_A" "$PORT_A" "$TP_A" "$venv_sgl_path" "kvcached_instance_a"
 fi
 
 # Start B
 if [[ "$ENGINE_B" == "vllm" ]]; then
-    run_vllm "$MODEL_B" "$PORT_B" "$TP_B" "$venv_vllm_path"
+    run_vllm "$MODEL_B" "$PORT_B" "$TP_B" "$venv_vllm_path" "kvcached_instance_b"
 else
-    run_sgl "$MODEL_B" "$PORT_B" "$TP_B" "$venv_sgl_path"
+    run_sgl "$MODEL_B" "$PORT_B" "$TP_B" "$venv_sgl_path" "kvcached_instance_b"
 fi
 
 wait -n || true
