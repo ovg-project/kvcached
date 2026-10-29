@@ -372,7 +372,8 @@ def test_engine_core_rejects_partial_integration_before_initialization(
 
 def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modules):
     interfaces, patches = vllm_modules
-    monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", 160)
+    monkeypatch.setattr(
+        "kvcached.prefix_cache_retention._policy.limit_tokens", 160)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
     monkeypatch.setattr(

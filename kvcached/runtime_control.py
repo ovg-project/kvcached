@@ -150,4 +150,8 @@ def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int
         manager._runtime_control = RuntimeControl(
             manager, worker_ipc=worker_ipc, can_shrink=supported,
             expected_participants=len(managers) * ranks)
+    if managers:
+        from kvcached.prefix_cache_retention import _policy
+
+        _policy.instance_name = managers[0]._control_instance_name()
     return managers

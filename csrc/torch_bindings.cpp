@@ -383,6 +383,8 @@ py::dict control_dict(const InstanceControl &state) {
   result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
+  result["retention_tokens"] = state.retention_tokens;
+  result["retention_revision"] = state.retention_revision;
   result["limit_revision"] = state.limit_revision;
   result["limit_bytes"] = state.requested_bytes;
   result["effective_limit_bytes"] = state.effective_bytes;
@@ -478,6 +480,19 @@ py::dict publish_instance_controls(const std::string &path,
   return control_dict(state);
 }
 
+py::dict publish_prefix_cache_retention(const std::string &path,
+                                        const std::string &name, int64_t tokens,
+                                        uint64_t generation,
+                                        uint64_t revision) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path)->publish_retention(
+        name, tokens, generation, revision);
+  }
+  return control_dict(state);
+}
+
 bool fail_instance_control(const std::string &path, const std::string &name,
                            size_t slot, uint64_t owner, uint64_t generation,
                            uint64_t revision) {
@@ -544,6 +559,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("revision") = py::none(), py::arg("limit_bytes") = py::none(),
         py::arg("min_bytes") = py::none(), py::arg("priority") = py::none(),
         py::arg("headroom_bytes") = py::none());
+  m.def("publish_prefix_cache_retention",
+        &kvcached::publish_prefix_cache_retention, py::arg("path"),
+        py::arg("instance"), py::arg("tokens"), py::arg("generation"),
+        py::arg("revision"));
   m.def("fail_instance_control", &kvcached::fail_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
         py::arg("generation"), py::arg("revision"));

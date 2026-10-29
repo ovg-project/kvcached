@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Post-initialization physical KV controls, in bytes per instance per GPU."""
+"""Post-initialization controls for physical KV and prefix retention."""
 
 from __future__ import annotations
 
@@ -9,6 +9,64 @@ import glob
 import os
 from collections.abc import Callable, Mapping
 from typing import Any
+
+
+def get_prefix_cache_retention_limit() -> int:
+    """Return this engine process's idle prefix retention limit in tokens."""
+    from kvcached.prefix_cache_retention import _policy
+
+    return _policy.limit_tokens
+
+
+def set_prefix_cache_retention_limit(
+    limit_tokens: int, *, instance_name: str | None = None,
+) -> dict[str, Any]:
+    """Publish an instance's prefix retention limit from any process.
+
+    Like set_instance_memory_limit(), this requires initialized runtime-control
+    participants and access to their existing native ledger directory. Limits
+    are -1 (unlimited) or a non-negative int64 token count. GPUs publish
+    independently; inspect status and gpus for partial failures and republish
+    the desired limit to repair them. Engines consume only matching assignments
+    across all GPUs. SGLang TP ranks apply the update together on the scheduler
+    thread. Acceptance does not mean eviction or physical GPU memory release
+    has completed.
+
+    SGLang runtime updates support only pp_size=1. With pipeline parallelism,
+    publication may still return accepted, but schedulers do not apply the
+    update; the existing retention limit remains in effect.
+    """
+    from kvcached import _C  # type: ignore[attr-defined]
+    from kvcached.prefix_cache_retention import _policy
+
+    if (not isinstance(limit_tokens, int) or isinstance(limit_tokens, bool)
+            or not -1 <= limit_tokens <= (1 << 63) - 1):
+        raise ValueError("limit_tokens must be -1 or a non-negative int64 integer")
+    name = _policy.instance_name if instance_name is None else instance_name
+    snapshot = _get_instance_memory_limit(name, observe=False)
+    if not snapshot["complete_membership"]:
+        return dict(snapshot, accepted=False)
+    # Use one revision across GPUs. A partial or interleaved publication must
+    # not be consumed until every GPU reports the same revision and value.
+    revision = max(state["retention_revision"] for state in snapshot["gpus"]) + 1
+    if revision > (1 << 64) - 1:
+        raise OverflowError("prefix retention revision exhausted")
+    results = []
+    for state in snapshot["gpus"]:
+        try:
+            result = dict(_C.publish_prefix_cache_retention(
+                state["gpu"], snapshot["instance"], limit_tokens,
+                state["generation"], revision))
+        except (OSError, RuntimeError) as error:
+            result = {"status": "error", "error": str(error)}
+        results.append(dict(result, gpu=state["gpu"]))
+    accepted = [state["status"] in ("accepted", "idempotent") for state in results]
+    return {
+        "instance": snapshot["instance"], "limit_tokens": limit_tokens,
+        "revision": revision, "gpus": results,
+        "status": "accepted" if all(accepted) else "partial" if any(accepted) else "rejected",
+        "accepted": all(accepted), "converged": False,
+    }
 
 
 def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any]:
