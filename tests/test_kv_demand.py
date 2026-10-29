@@ -32,6 +32,21 @@ class _PageAllocator:
     def get_num_reserved_pages(self) -> int:
         return self.reserved_pages
 
+    def get_avail_physical_pages(self) -> int:
+        return 50
+
+
+class _WorkerControl:
+    """Runtime control over two workers whose pages are 16 and 24 bytes."""
+
+    worker_ipc = True
+    sources = ({"gpu": "gpu0", "instance": "model", "generation": 7},
+               {"gpu": "gpu1", "instance": "model", "generation": 8})
+
+    def poll(self) -> tuple:
+        return ({"page_bundle_bytes": 16, "available_bytes": 16 * 9},
+                {"page_bundle_bytes": 24, "available_bytes": 24 * 5 + 3})
+
 
 @pytest.fixture
 def manager_module(monkeypatch):
@@ -69,6 +84,8 @@ def _manager(module: Any, *, world_size: int = 1, worker_ipc: bool = False) -> A
     manager.world_size = world_size
     manager.group_id = 0
     manager._uses_worker_ipc = worker_ipc
+    manager._avail_physical_pages_cache = None
+    manager._avail_physical_pages_ts = 0.0
     manager._lock = NoOpLock()
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
@@ -79,28 +96,53 @@ def test_demand_counts_only_new_pages(manager_module):
     module, _ = manager_module
     manager = _manager(module)
     # 1 free block, 1 reserved block and a pre-mapped page of 4 need no grant.
-    assert manager.physical_demand_bytes(6) == 0
-    assert manager.physical_demand_bytes(7) == 16
-    assert manager.physical_demand_bytes(15) == 3 * 16
-    assert manager.physical_demand_bytes(0) == 0
+    assert manager.demand_pages(6) == 0
+    assert manager.demand_pages(7) == 1
+    assert manager.demand_pages(15) == 3
+    assert manager.demand_pages(0) == 0
 
 
 def test_demand_is_written_only_when_the_level_changes(manager_module):
     module, demand = manager_module
     manager = _manager(module)
-    manager.post_demand(32)
-    manager.post_demand(32)
+    manager.post_demand(2)
+    manager.post_demand(2)
     manager.post_demand(0)
+    # A page bundle is 4 bytes x 2 layers x K and V.
     assert demand.call_args_list == [mock.call(32, 0), mock.call(0, 0)]
 
 
+@pytest.fixture
+def native(monkeypatch):
+    import kvcached
+
+    fake = mock.MagicMock()
+    monkeypatch.setattr(kvcached, "_C", fake, raising=False)
+    return fake
+
+
 @pytest.mark.parametrize("world_size,worker_ipc", [(2, False), (1, True)])
-def test_a_scheduler_without_a_local_ledger_posts_nothing(
-        manager_module, world_size, worker_ipc):
+def test_worker_ledgers_get_the_demand_in_their_page_size(
+        manager_module, native, world_size, worker_ipc):
     module, demand = manager_module
     manager = _manager(module, world_size=world_size, worker_ipc=worker_ipc)
-    manager.post_demand(32)
+    manager.post_demand(2)  # workers not registered yet: nothing, not cached
+    assert not native.publish_instance_demand.called
+    manager._runtime_control = _WorkerControl()
+    manager.post_demand(2)
+    assert native.publish_instance_demand.call_args_list == [
+        mock.call("gpu0", "model", 7, 32), mock.call("gpu1", "model", 8, 48)]
     assert not demand.called
+
+
+def test_worker_ledgers_bound_the_forecast(manager_module):
+    module, _ = manager_module
+    manager = _manager(module, world_size=2)
+    assert manager._get_cached_avail_physical_pages() == 50
+    manager._runtime_control = _WorkerControl()
+    manager._avail_physical_pages_cache = None
+    # The second GPU can still grant 5 of its pages.
+    assert manager._get_cached_avail_physical_pages() == 5
 
 
 @pytest.fixture
@@ -194,16 +236,16 @@ def test_a_failed_post_does_not_fail_the_step(vllm_patches, monkeypatch):
 
 
 class _DemandManager:
-    """A kvcached manager stand-in: each missing block is 10 bytes of pages."""
+    """A kvcached manager stand-in: every missing block is one page."""
 
     def __init__(self) -> None:
         self.posted: list[int] = []
 
-    def physical_demand_bytes(self, need_blocks: int) -> int:
-        return max(0, need_blocks) * 10
+    def demand_pages(self, need_blocks: int) -> int:
+        return max(0, need_blocks)
 
-    def post_demand(self, demand_bytes: int) -> None:
-        self.posted.append(demand_bytes)
+    def post_demand(self, pages: int) -> None:
+        self.posted.append(pages)
 
 
 def _sglang_scheduler(evictable_tokens: int = 0):
@@ -224,10 +266,10 @@ def test_sglang_round_posts_its_first_unfit_request():
         with patches._sglang_demand_round(scheduler):  # nested: posts nothing
             patches._sglang_note_unfit(5)
         patches._sglang_note_unfit(9)
-    assert manager.posted == [30]
+    assert manager.posted == [3]
     with patches._sglang_demand_round(scheduler):
         pass
-    assert manager.posted == [30, 0]
+    assert manager.posted == [3, 0]
 
 
 def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
@@ -260,7 +302,7 @@ def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
     scheduler, manager = _sglang_scheduler()
     with patches._sglang_demand_round(scheduler):
         assert PrefillAdder().add_one_req(req, False, None) is AddReqResult.NO_TOKEN
-    assert manager.posted == [60]
+    assert manager.posted == [6]
 
 
 def test_sglang_decode_gate_miss_is_recorded():
@@ -272,4 +314,4 @@ def test_sglang_decode_gate_miss_is_recorded():
     with patches._sglang_demand_round(scheduler):
         assert not patches._sglang_reserve_decode_capacity(
             allocator, scheduler.tree_cache, num_tokens=6, need_blocks=3)
-    assert manager.posted == [30]
+    assert manager.posted == [3]

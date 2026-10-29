@@ -583,6 +583,20 @@ uint64_t GpuBudget::watermark_locked(size_t instance,
   return total;
 }
 
+bool GpuBudget::post_demand(const std::string &instance, uint64_t generation,
+                            uint64_t bytes) {
+  Locked lock(*this);
+  for (auto &entry : shared_->instances) {
+    if (entry.valid && entry.generation == generation &&
+        instance == entry.name_string()) {
+      if (entry.demand != bytes)
+        publish(entry.demand, bytes);
+      return true;
+    }
+  }
+  return false;
+}
+
 void GpuBudget::set_demand(size_t slot, uint64_t bytes) {
   Locked lock(*this);
   (void)snapshot_locked(slot);
@@ -744,6 +758,12 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.shortfall_bytes =
       entry.demand > entry.headroom ? entry.demand - entry.headroom : 0;
   state.watermark_bytes = watermark_locked(instance, data);
+  uint64_t total = 0;
+  for (const auto &pool : data->pools)
+    total = add(total, pool.charged);
+  const uint64_t budget = data->budget;
+  const auto usable =
+      budget > state.watermark_bytes ? budget - state.watermark_bytes : 0;
   state.status = state.published ? "pending" : "unpublished";
   bool unsupported = false, cannot_shrink = false;
   uint64_t live = 0;
@@ -800,6 +820,10 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
              state.charged_bytes <= entry.limit)
       state.status = "converged";
   }
+  state.available_bytes = std::min<uint64_t>(
+      usable > total ? usable - total : 0,
+      entry.limit > state.charged_bytes ? entry.limit - state.charged_bytes
+                                        : 0);
   state.registered_participants = live;
   state.convergence = state.status;
   return state;

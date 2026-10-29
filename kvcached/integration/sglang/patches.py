@@ -472,7 +472,7 @@ def _sglang_post_demand(scheduler: Any, need_blocks: int) -> None:
                 tree_cache, "evictable_size", None)
             page_size = max(1, int(getattr(scheduler, "page_size", 1) or 1))
             evictable_blocks = int(evictable()) // page_size if evictable else 0
-            demand = manager.physical_demand_bytes(need_blocks - evictable_blocks)
+            demand = manager.demand_pages(need_blocks - evictable_blocks)
         manager.post_demand(demand)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)

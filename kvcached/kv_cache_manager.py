@@ -1225,8 +1225,8 @@ class KVCacheManager:
 
     @synchronized
     @synchronized
-    def physical_demand_bytes(self, need_blocks: int) -> int:
-        """Bytes of new pages that ``need_blocks`` more blocks would map.
+    def demand_pages(self, need_blocks: int) -> int:
+        """Pages that ``need_blocks`` more blocks would have to map.
 
         Free blocks in mapped pages, reserved blocks and pre-mapped pages need
         no grant, so only the rest counts toward the demand an engine posts
@@ -1240,26 +1240,39 @@ class KVCacheManager:
         held = (self.num_avail_blocks + len(self.reserved_blocks)
                 + self.page_allocator.get_num_reserved_pages() * blocks_per_page)
         missing = need_blocks - held
-        if missing <= 0:
-            return 0
-        pages = -(-missing // blocks_per_page)
-        return pages * self._memory_limit_page_bundle_bytes()
+        return -(-missing // blocks_per_page) if missing > 0 else 0
 
-    def post_demand(self, demand_bytes: int) -> None:
-        """Post the instance's unmet demand on this GPU; 0 clears it.
+    def _worker_control(self) -> Any:
+        """The runtime control whose sources are worker ledgers, if any."""
+        control = getattr(self, "_runtime_control", None)
+        return control if control is not None and control.worker_ipc else None
 
-        Writes only when the level changes. A scheduler whose pages are mapped
-        by worker processes has no ledger of its own; it posts nothing.
+    def post_demand(self, pages: int) -> None:
+        """Post the instance's unmet demand on each of its GPUs; 0 clears it.
+
+        Writes only when the level changes. When workers map the pages (TP or
+        PP > 1), the level goes to each worker's ledger in that ledger's page
+        size, which differs between pipeline stages.
         """
+        pages = max(0, int(pages))
+        if pages == getattr(self, "_posted_demand_pages", 0):
+            return
         if self.world_size > 1 or getattr(self, "_uses_worker_ipc", False):
-            return
-        demand_bytes = max(0, int(demand_bytes))
-        if demand_bytes == getattr(self, "_posted_demand", 0):
-            return
-        from kvcached.vmm_ops import set_kv_demand
+            control = self._worker_control()
+            if control is None:
+                return  # workers are not registered yet
+            from kvcached import _C  # type: ignore[attr-defined]
 
-        set_kv_demand(demand_bytes, self.group_id)
-        self._posted_demand = demand_bytes
+            for source, state in zip(control.sources, control.poll()):
+                _C.publish_instance_demand(source["gpu"], source["instance"],
+                                           source["generation"],
+                                           pages * state["page_bundle_bytes"])
+        else:
+            from kvcached.vmm_ops import set_kv_demand
+
+            set_kv_demand(pages * self._memory_limit_page_bundle_bytes(),
+                          self.group_id)
+        self._posted_demand_pages = pages
 
     def free_reserved(self):
         if self.reserved_blocks:
@@ -1570,6 +1583,13 @@ class KVCacheManager:
                 < _AVAIL_PHYSICAL_PAGES_TTL_S):
             return cached
         result: int = self.page_allocator.get_avail_physical_pages()
+        control = self._worker_control()
+        if control is not None:
+            # The ledgers are the workers'. Each GPU's state carries what this
+            # instance can still be granted there, net of its watermark.
+            result = min([result] + [
+                state["available_bytes"] // state["page_bundle_bytes"]
+                for state in control.poll() if state["page_bundle_bytes"]])
         self._avail_physical_pages_cache = result
         self._avail_physical_pages_ts = now
         return result

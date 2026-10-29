@@ -49,6 +49,9 @@ struct InstanceControl {
   // and the free bytes higher priorities keep from it on this GPU.
   uint64_t shortfall_bytes = 0;
   uint64_t watermark_bytes = 0;
+  // What the instance can still be granted on this GPU: free memory above
+  // its watermark, within its max.
+  uint64_t available_bytes = 0;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -193,6 +196,10 @@ public:
   // does not fit needs. A level that each scheduling step overwrites; 0 clears
   // it, and it goes away with the instance.
   void set_demand(size_t slot, uint64_t bytes);
+  // The same level, posted by a process that drives the instance's workers
+  // (vLLM's scheduler under TP > 1). False if the instance is gone.
+  bool post_demand(const std::string &instance, uint64_t generation,
+                   uint64_t bytes);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();

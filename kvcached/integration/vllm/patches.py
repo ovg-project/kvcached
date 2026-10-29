@@ -1191,7 +1191,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if self.enable_prefix_cache:
                     need_blocks -= len(self._evictable_blocks)
                 manager = self.kv_cache_manager
-                manager.post_demand(manager.physical_demand_bytes(need_blocks))
+                manager.post_demand(manager.demand_pages(need_blocks))
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)

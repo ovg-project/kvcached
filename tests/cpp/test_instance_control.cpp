@@ -562,8 +562,21 @@ int main() {
     // A demand of 10 counts 6 beyond the headroom, so the watermark is 10 and
     // low cannot take any of the 8 free bytes. High and its equal-priority
     // peer still can.
+    // What each instance can still be granted, as a scheduler that drives
+    // workers reads it.
+    assert(budget->query_control("low").available_bytes == 4);
+    assert(budget->query_control("high").available_bytes == 8);
     budget->set_demand(high, 10);
     assert(budget->query_control("high").shortfall_bytes == 6);
+    assert(budget->query_control("low").available_bytes == 0);
+    // Such a scheduler posts the demand by instance name and generation.
+    auto writer = GpuBudget::open_control(ledger);
+    const auto generation = budget->query_control("high").generation;
+    assert(writer->post_demand("high", generation, 12));
+    assert(budget->snapshot(low).watermark_bytes == 12);
+    assert(!writer->post_demand("high", generation + 1, 0));
+    assert(writer->post_demand("high", generation, 10));
+    writer.reset();
     assert(budget->snapshot(low).watermark_bytes == 10);
     assert(!fits(low, 1));
     assert(budget->snapshot(high).watermark_bytes == 0 && fits(high, 8));
