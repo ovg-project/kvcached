@@ -417,6 +417,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["shortfall_bytes"] = state.shortfall_bytes;
   result["watermark_bytes"] = state.watermark_bytes;
   result["reclaim_bytes"] = state.reclaim_bytes;
+  result["available_bytes"] = state.available_bytes;
   return result;
 }
 
@@ -460,6 +461,12 @@ py::dict observe_instance_control(const std::string &path,
     state = GpuBudget::open_control(path, true)->observe_control(name);
   }
   return control_dict(state);
+}
+
+bool publish_instance_demand(const std::string &path, const std::string &name,
+                             uint64_t generation, uint64_t bytes) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_demand(name, generation, bytes);
 }
 
 py::dict publish_instance_control(const std::string &path,
@@ -550,6 +557,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
   m.def("observe_instance_control", &kvcached::observe_instance_control,
         py::arg("path"), py::arg("instance"));
+  m.def("publish_instance_demand", &kvcached::publish_instance_demand,
+        py::arg("path"), py::arg("instance"), py::arg("generation"),
+        py::arg("bytes"));
   m.def("publish_instance_control", &kvcached::publish_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("bytes"),
         py::arg("generation"), py::arg("revision") = py::none());

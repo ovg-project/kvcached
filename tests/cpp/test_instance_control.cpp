@@ -562,8 +562,21 @@ int main() {
     // A demand of 10 counts 6 beyond the headroom, so the watermark is 10 and
     // low cannot take any of the 8 free bytes. High and its equal-priority
     // peer still can.
+    // What each instance can still be granted, as a scheduler that drives
+    // workers reads it.
+    assert(budget->query_control("low").available_bytes == 4);
+    assert(budget->query_control("high").available_bytes == 8);
     budget->set_demand(high, 10);
     assert(budget->query_control("high").shortfall_bytes == 6);
+    assert(budget->query_control("low").available_bytes == 0);
+    // Such a scheduler posts the demand by instance name and generation.
+    auto writer = GpuBudget::open_control(ledger);
+    const auto generation = budget->query_control("high").generation;
+    assert(writer->post_demand("high", generation, 12));
+    assert(budget->snapshot(low).watermark_bytes == 12);
+    assert(!writer->post_demand("high", generation + 1, 0));
+    assert(writer->post_demand("high", generation, 10));
+    writer.reset();
     assert(budget->snapshot(low).watermark_bytes == 10);
     assert(!fits(low, 1));
     assert(budget->snapshot(high).watermark_bytes == 0 && fits(high, 8));
@@ -572,8 +585,41 @@ int main() {
     budget->set_demand(high, 2);
     assert(budget->query_control("high").shortfall_bytes == 0);
     assert(budget->snapshot(low).watermark_bytes == 4 && fits(low, 4));
+    // Demand that high's own max cannot take keeps nothing from low: with a
+    // max of 14 and 12 held, only 2 of 10 count, which the headroom covers.
+    budget->set_demand(high, 10);
+    assert(budget->set_instance_limit(high, 14, 1) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->set_instance_limit(high, UINT64_MAX, 2) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 10);
     budget->set_demand(high, 0);
     assert(budget->query_control("low").watermark_bytes == 4);
+    // A crashed instance's controls stop counting at once, and its entry is
+    // left for the orchestrator to clean up.
+    int ready[2], release[2];
+    assert(pipe(ready) == 0 && pipe(release) == 0);
+    const pid_t child = fork();
+    if (child == 0) {
+      auto other = GpuBudget::connect(ledger, [] { return 100; });
+      other->register_pool("crashed", 0, InstancePolicy{0, 5, 3});
+      char byte = 1;
+      if (write(ready[1], &byte, 1) != 1 || read(release[0], &byte, 1) != 1)
+        _exit(1);
+      _exit(0); // no destructor: the pool entry stays behind
+    }
+    char byte = 0;
+    assert(read(ready[0], &byte, 1) == 1);
+    assert(budget->snapshot(low).watermark_bytes == 7);
+    assert(write(release[1], &byte, 1) == 1);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->snapshot(high).watermark_bytes == 0);
+    assert(budget->query_control("crashed").priority == 5);
+    for (int fd : {ready[0], ready[1], release[0], release[1]})
+      close(fd);
     held.clear();
     budget.reset();
     unlink(ledger.c_str());
@@ -608,6 +654,13 @@ int main() {
     assert(reclaim(bottom) == 10 && reclaim(spare) == 2 && reclaim(floor) == 0);
     assert(reclaim(fixed) == 0 && reclaim(top) == 0);
     assert(budget->query_control("spare").reclaim_bytes == 2);
+    // A requester held back by its own max asks for nothing: capped may not
+    // grow at all, so its demand of 30 changes no one's share.
+    auto capped = budget->register_pool("capped", 0, InstancePolicy{0, 3, 0});
+    assert(budget->set_instance_limit(capped, 0, 1) == "applied");
+    budget->set_demand(capped, 30);
+    assert(reclaim(bottom) == 10 && reclaim(spare) == 2 && reclaim(top) == 0);
+    budget->set_demand(capped, 0);
     // Floor holds 30, under its min of 35, so it gives nothing, and the
     // instance that cannot shrink is never a victim.
     budget->set_demand(top, 60);

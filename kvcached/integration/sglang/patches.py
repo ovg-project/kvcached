@@ -417,6 +417,84 @@ def _sglang_budget_round(scheduler: Any):
         _SGLANG_BUDGET.round = None
 
 
+_SGLANG_DEMAND = threading.local()
+
+
+@contextlib.contextmanager
+def _sglang_demand_round(scheduler: Any):
+    """Post the round's first request that does not fit as the KV demand.
+
+    #585's watermarks keep free memory from lower priorities while a
+    higher-priority instance waits for it. The level is overwritten every
+    scheduling round: the blocks the round's first unfit request needs, or 0
+    when every request fit. Rounds nest (``get_new_batch_prefill`` and
+    ``update_running_batch`` inside ``get_next_batch_to_run``); only the
+    outermost one posts.
+    """
+    if getattr(_SGLANG_DEMAND, "open", False):
+        yield
+        return
+    _SGLANG_DEMAND.open = True
+    _SGLANG_DEMAND.need = None
+    try:
+        yield
+    finally:
+        need = _SGLANG_DEMAND.need
+        _SGLANG_DEMAND.open = False
+        _SGLANG_DEMAND.need = None
+        _sglang_post_demand(scheduler, need or 0)
+
+
+def _sglang_note_unfit(need_blocks: int) -> None:
+    """Record the blocks of the round's first request that does not fit."""
+    if getattr(_SGLANG_DEMAND, "open", False) and _SGLANG_DEMAND.need is None:
+        _SGLANG_DEMAND.need = max(0, int(need_blocks))
+
+
+def _sglang_post_demand(scheduler: Any, need_blocks: int) -> None:
+    """Post the demand through the token pool's manager, on this rank's GPU.
+
+    Evictable radix-cache blocks free slots in mapped pages, so they need no
+    grant. Only the token pool (the full-attention pool of an SWA composite)
+    is counted, and a pipeline posts nothing.
+    """
+    if _sglang_pipeline_stages() > 1:
+        return
+    managers = _sglang_budget_managers(scheduler)
+    manager = managers[0] if managers else None
+    if getattr(manager, "post_demand", None) is None:
+        return
+    try:
+        demand = 0
+        if need_blocks > 0:
+            tree_cache = getattr(scheduler, "tree_cache", None)
+            evictable = getattr(tree_cache, "full_evictable_size", None) or getattr(
+                tree_cache, "evictable_size", None)
+            page_size = max(1, int(getattr(scheduler, "page_size", 1) or 1))
+            evictable_blocks = int(evictable()) // page_size if evictable else 0
+            demand = manager.demand_pages(need_blocks - evictable_blocks)
+        manager.post_demand(demand)
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not post KV demand: %s", error)
+
+
+def _sglang_request_need_tokens(req: Any) -> int:
+    """Tokens a waiting request asks the prefill budget for (input + output)."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    if fill is None:
+        fill = getattr(req, "fill_ids", None) or getattr(req, "origin_input_ids", ()) or ()
+    prefix = getattr(req, "prefix_indices", None)
+    params = getattr(req, "sampling_params", None)
+    max_new = max(0, int(getattr(params, "max_new_tokens", 0) or 0)
+                  - len(getattr(req, "output_ids", ()) or ()))
+    try:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+    except Exception:
+        CLIP_MAX_NEW_TOKENS = 4096
+    return max(0, len(fill) - (len(prefix) if prefix is not None else 0)) + min(
+        max_new, int(CLIP_MAX_NEW_TOKENS))
+
+
 def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
                           pool: Any) -> None:
     """Report that the kvcached pool behind ``owner`` cannot back a request.
@@ -468,6 +546,8 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
         evict(tree_cache, num_tokens)
     local_miss = need_blocks > 0 and not bool(
         allocator.kvcached_allocator.try_to_reserve(need_blocks, packed=packed))
+    if local_miss:
+        _sglang_note_unfit(need_blocks)
     return not _sglang_group_capacity_miss(local_miss)
 
 
@@ -2952,6 +3032,55 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
+    """Record a waiting request that the prefill budget cannot admit.
+
+    ``PrefillAdder.add_one_req`` answers ``NO_TOKEN`` when the request's
+    input and output tokens exceed the remaining budget, and the scheduler
+    stops admitting for the round. The first such request is the instance's
+    demand for the round (``_sglang_demand_round``).
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.schedule_policy"
+    target_class = "PrefillAdder"
+    patch_name = "prefill_adder_demand"
+
+    def apply(self, policy_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if self.patch_add_one_req not in self.applicable_methods:
+            return True
+        return self.patch_add_one_req(policy_mod)
+
+    @version_range(">=0.5.13")
+    def patch_add_one_req(self, policy_mod: types.ModuleType) -> bool:
+        PrefillAdder = self._get_target_class(policy_mod)
+        if PrefillAdder is None:
+            return False
+        original = getattr(PrefillAdder, "add_one_req", None)
+        if original is None:
+            self.logger.warning(
+                "PrefillAdder.add_one_req was not found; a waiting request "
+                "posts no KV demand")
+            return False
+        marker = "__kvcached_prefill_demand_patched__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        @functools.wraps(original)
+        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(self, req, *args, **kwargs)
+            if enable_kvcached() and getattr(result, "name", None) == "NO_TOKEN":
+                page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+                _sglang_note_unfit(-(-_sglang_request_need_tokens(req) // page_size))
+            return result
+
+        self._mark_as_patched(_patched_add_one_req, marker)
+        PrefillAdder.add_one_req = _patched_add_one_req
+        return True
+
+
 class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
     """Make the ranks sharing a waiting queue admit against one budget.
 
@@ -3020,7 +3149,7 @@ class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
         def _patched(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():
                 return original(self, *args, **kwargs)
-            with _sglang_budget_round(self):
+            with _sglang_demand_round(self), _sglang_budget_round(self):
                 return original(self, *args, **kwargs)
 
         return _patched

@@ -51,6 +51,9 @@ struct InstanceControl {
   uint64_t watermark_bytes = 0;
   // Bytes this instance should release now for higher priorities' demand.
   uint64_t reclaim_bytes = 0;
+  // What the instance can still be granted on this GPU: free memory above
+  // its watermark, within its max.
+  uint64_t available_bytes = 0;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -193,13 +196,18 @@ public:
                     uint64_t generation, uint64_t revision);
   // The instance's unmet demand on this GPU: the bytes its first request that
   // does not fit needs. A level that each scheduling step overwrites; 0 clears
-  // it, and it goes away with the instance.
+  // it, and it goes away with the instance. Only the part its max still
+  // allows counts.
   void set_demand(size_t slot, uint64_t bytes);
   // Bytes the slot's instance should release now so that higher priorities'
   // demand fits. Every instance derives the same plan from the ledger, so all
   // pick the same victims. Nothing is stored: once the demand fits, the plan
   // asks for nothing.
   uint64_t reclaim_bytes(size_t slot);
+  // The same level, posted by a process that drives the instance's workers
+  // (vLLM's scheduler under TP > 1). False if the instance is gone.
+  bool post_demand(const std::string &instance, uint64_t generation,
+                   uint64_t bytes);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -231,6 +239,9 @@ private:
   void reclaim_instances_locked();
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
+  bool pool_alive(size_t slot, const Shared *data) const;
+  static uint64_t allowed_demand(size_t instance, uint64_t charged,
+                                 const Shared *data);
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
   uint64_t reclaim_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
