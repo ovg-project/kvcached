@@ -21,7 +21,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473038ULL;
+constexpr uint64_t kMagic = 0x4b56425544473039ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -32,6 +32,9 @@ uint64_t add(uint64_t a, uint64_t b) {
   if (b > UINT64_MAX - a)
     throw std::overflow_error("KV budget byte overflow");
   return a + b;
+}
+uint64_t saturating_add(uint64_t a, uint64_t b) {
+  return b > UINT64_MAX - a ? UINT64_MAX : a + b;
 }
 uint64_t sampled_capacity(uint64_t charged, int64_t free_after_margin) {
   if (free_after_margin >= 0)
@@ -176,6 +179,7 @@ struct GpuBudget::Shared {
     Observed<uint64_t> min;
     Observed<int64_t> priority;
     Observed<uint64_t> headroom;
+    Observed<uint64_t> demand;
   } instances[kInstances];
   struct Pool {
     Observed<uint64_t> owner;
@@ -517,6 +521,7 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   const auto instance = shared_->pools[slot].instance;
   result.budget_bytes = shared_->budget;
   result.instance_limit_bytes = shared_->instances[instance].limit;
+  result.watermark_bytes = watermark_locked(instance, shared_);
   result.sync_acquisitions = sync_acquisitions_;
   result.sync_contentions = sync_contentions_;
   result.sync_acquire_ns = sync_acquire_ns_;
@@ -529,6 +534,35 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
           add(result.instance_charged_bytes, entry.charged);
   }
   return result;
+}
+
+// headroom + shortfall of #585, where the shortfall is the demand that the
+// headroom does not cover. Instances whose pools all left are not counted;
+// demand goes away with them.
+uint64_t GpuBudget::watermark_locked(size_t instance,
+                                     const Shared *data) const {
+  bool live[kInstances]{};
+  for (const auto &pool : data->pools)
+    if (pool.owner && pool.instance < kInstances)
+      live[pool.instance] = true;
+  const int64_t priority = data->instances[instance].priority;
+  uint64_t total = 0;
+  for (size_t i = 0; i < kInstances; ++i) {
+    const auto &entry = data->instances[i];
+    if (i == instance || !live[i] || !entry.valid || entry.priority <= priority)
+      continue;
+    total = saturating_add(
+        total, std::max<uint64_t>(entry.headroom, entry.demand));
+  }
+  return total;
+}
+
+void GpuBudget::set_demand(size_t slot, uint64_t bytes) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  auto &entry = shared_->instances[shared_->pools[slot].instance];
+  if (entry.demand != bytes)
+    publish(entry.demand, bytes);
 }
 
 BudgetSnapshot GpuBudget::snapshot(size_t slot, const Sampler &sampler) {
@@ -571,8 +605,12 @@ std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
         const auto state = snapshot_locked(slot);
         if (observed)
           *observed = state;
-        if (state.charged_bytes > state.budget_bytes ||
-            bytes > state.budget_bytes - state.charged_bytes ||
+        // Free memory under the watermark is kept for higher priorities.
+        const auto usable = state.budget_bytes > state.watermark_bytes
+                                ? state.budget_bytes - state.watermark_bytes
+                                : 0;
+        if (state.charged_bytes > usable ||
+            bytes > usable - state.charged_bytes ||
             state.instance_charged_bytes > state.instance_limit_bytes ||
             bytes > state.instance_limit_bytes - state.instance_charged_bytes)
           throw std::runtime_error(
@@ -580,7 +618,8 @@ std::unique_ptr<BudgetGrant> GpuBudget::grant(size_t slot, uint64_t bytes,
               " (requested=" +
               std::to_string(bytes) +
               ", budget=" + std::to_string(state.budget_bytes) +
-              ", charged=" + std::to_string(state.charged_bytes) + ")");
+              ", charged=" + std::to_string(state.charged_bytes) +
+              ", watermark=" + std::to_string(state.watermark_bytes) + ")");
         publish(shared_->pools[slot].charged,
                 add(shared_->pools[slot].charged, bytes));
 #ifdef KVCACHED_BUDGET_TESTING
@@ -676,6 +715,9 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.min_bytes = entry.min;
   state.priority = entry.priority;
   state.headroom_bytes = entry.headroom;
+  state.shortfall_bytes =
+      entry.demand > entry.headroom ? entry.demand - entry.headroom : 0;
+  state.watermark_bytes = watermark_locked(instance, data);
   state.status = state.published ? "pending" : "unpublished";
   bool unsupported = false, cannot_shrink = false;
   uint64_t live = 0;

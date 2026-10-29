@@ -408,14 +408,24 @@ uint64_t FTensorAllocator::available_physical_bytes() {
     return UINT64_MAX;
   const auto state = budget_->snapshot(
       budget_slot_, [this] { return sample_budget_capacity_(); });
-  const auto gpu_free = state.budget_bytes > state.charged_bytes
-                            ? state.budget_bytes - state.charged_bytes
-                            : 0;
+  // The same bound as grants: free memory above the watermark.
+  const auto usable = state.budget_bytes > state.watermark_bytes
+                          ? state.budget_bytes - state.watermark_bytes
+                          : 0;
+  const auto gpu_free =
+      usable > state.charged_bytes ? usable - state.charged_bytes : 0;
   const auto instance_free =
       state.instance_limit_bytes > state.instance_charged_bytes
           ? state.instance_limit_bytes - state.instance_charged_bytes
           : 0;
   return std::min(gpu_free, instance_free);
+}
+
+void FTensorAllocator::set_kv_demand(uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  if (budget_)
+    budget_->set_demand(budget_slot_, bytes);
 }
 
 std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
@@ -632,10 +642,11 @@ void FTensorAllocator::reserve_targets_(
           return;
         stats->required_bytes = required_bytes;
         stats->capacity_checks = 1;
+        const auto usable = state.budget_bytes > state.watermark_bytes
+                                ? state.budget_bytes - state.watermark_bytes
+                                : 0;
         const auto gpu_available =
-            state.budget_bytes > state.charged_bytes
-                ? state.budget_bytes - state.charged_bytes
-                : 0;
+            usable > state.charged_bytes ? usable - state.charged_bytes : 0;
         const auto instance_available =
             state.instance_limit_bytes > state.instance_charged_bytes
                 ? state.instance_limit_bytes - state.instance_charged_bytes

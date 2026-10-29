@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace kvcached;
 
@@ -530,6 +531,52 @@ int main() {
     budget->publish_control("zero-revision", policy, state.generation);
     assert(budget->acknowledge_control(slot, 0));
     assert(budget->control_state(slot).convergence == "converged");
+  }
+  {
+    // Watermarks (#585 section 3) on a 100-byte GPU: low holds 80 and high
+    // (priority 1, headroom 4) holds 12, so 8 are free.
+    const auto ledger = std::string(directory) + "/watermarks";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 4});
+    auto peer = budget->register_pool("peer", 0, InstancePolicy{0, 1, 0});
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    auto hold = [&](size_t slot, uint64_t bytes) {
+      auto grant = budget->grant(slot, bytes);
+      held.push_back(grant->take(bytes));
+      grant->finish();
+    };
+    hold(low, 80);
+    hold(high, 12);
+    auto fits = [&](size_t slot, uint64_t bytes) {
+      try {
+        budget->grant(slot, bytes)->finish();
+        return true;
+      } catch (const std::runtime_error &) {
+        return false;
+      }
+    };
+    // Without demand, high's headroom alone is kept from low.
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(fits(low, 4) && !fits(low, 5));
+    // A demand of 10 counts 6 beyond the headroom, so the watermark is 10 and
+    // low cannot take any of the 8 free bytes. High and its equal-priority
+    // peer still can.
+    budget->set_demand(high, 10);
+    assert(budget->query_control("high").shortfall_bytes == 6);
+    assert(budget->snapshot(low).watermark_bytes == 10);
+    assert(!fits(low, 1));
+    assert(budget->snapshot(high).watermark_bytes == 0 && fits(high, 8));
+    assert(budget->snapshot(peer).watermark_bytes == 0 && fits(peer, 8));
+    // Each attempt overwrites the level, and 0 clears it.
+    budget->set_demand(high, 2);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->snapshot(low).watermark_bytes == 4 && fits(low, 4));
+    budget->set_demand(high, 0);
+    assert(budget->query_control("low").watermark_bytes == 4);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
   }
   unlink(path.c_str());
   rmdir(directory);
