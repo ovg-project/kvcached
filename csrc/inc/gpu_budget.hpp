@@ -194,7 +194,8 @@ public:
                     uint64_t generation, uint64_t revision);
   // The instance's unmet demand on this GPU: the bytes its first request that
   // does not fit needs. A level that each scheduling step overwrites; 0 clears
-  // it, and it goes away with the instance.
+  // it, and it goes away with the instance. Only the part its max still
+  // allows counts.
   void set_demand(size_t slot, uint64_t bytes);
   // The same level, posted by a process that drives the instance's workers
   // (vLLM's scheduler under TP > 1). False if the instance is gone.
@@ -232,6 +233,8 @@ private:
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   bool pool_alive(size_t slot, const Shared *data) const;
+  static uint64_t allowed_demand(size_t instance, uint64_t charged,
+                                 const Shared *data);
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);

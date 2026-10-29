@@ -585,6 +585,14 @@ int main() {
     budget->set_demand(high, 2);
     assert(budget->query_control("high").shortfall_bytes == 0);
     assert(budget->snapshot(low).watermark_bytes == 4 && fits(low, 4));
+    // Demand that high's own max cannot take keeps nothing from low: with a
+    // max of 14 and 12 held, only 2 of 10 count, which the headroom covers.
+    budget->set_demand(high, 10);
+    assert(budget->set_instance_limit(high, 14, 1) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->set_instance_limit(high, UINT64_MAX, 2) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 10);
     budget->set_demand(high, 0);
     assert(budget->query_control("low").watermark_bytes == 4);
     // A crashed instance's controls stop counting at once, and its entry is

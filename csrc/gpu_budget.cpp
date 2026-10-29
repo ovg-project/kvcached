@@ -555,6 +555,16 @@ bool GpuBudget::pool_alive(size_t slot, const Shared *data) const {
   return owner_lock.l_type != F_UNLCK;
 }
 
+// The part of an instance's demand that its own max still allows on this GPU.
+// What it could not take anyway keeps nothing from other instances.
+uint64_t GpuBudget::allowed_demand(size_t instance, uint64_t charged,
+                                   const Shared *data) {
+  const auto &entry = data->instances[instance];
+  const uint64_t limit = entry.limit;
+  return std::min<uint64_t>(entry.demand,
+                            limit > charged ? limit - charged : 0);
+}
+
 // headroom + shortfall of #585, where the shortfall is the demand that the
 // headroom does not cover. An instance none of whose pools is alive is not
 // read; only instances that would count are checked.
@@ -568,18 +578,22 @@ uint64_t GpuBudget::watermark_locked(size_t instance,
                  std::max<uint64_t>(entry.headroom, entry.demand) > 0;
   }
   bool live[kInstances]{};
+  uint64_t charged[kInstances]{};
   for (size_t slot = 0; slot < kPools; ++slot) {
-    const uint64_t owner = data->pools[slot].instance;
-    if (owner < kInstances && counted[owner] && !live[owner] &&
-        pool_alive(slot, data))
+    const auto &pool = data->pools[slot];
+    const uint64_t owner = pool.instance;
+    if (owner >= kInstances || !counted[owner] || !pool.owner)
+      continue;
+    charged[owner] = add(charged[owner], pool.charged);
+    if (!live[owner] && pool_alive(slot, data))
       live[owner] = true;
   }
   uint64_t total = 0;
   for (size_t i = 0; i < kInstances; ++i)
     if (live[i])
-      total =
-          saturating_add(total, std::max<uint64_t>(data->instances[i].headroom,
-                                                   data->instances[i].demand));
+      total = saturating_add(
+          total, std::max<uint64_t>(data->instances[i].headroom,
+                                    allowed_demand(i, charged[i], data)));
   return total;
 }
 
@@ -755,8 +769,6 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.min_bytes = entry.min;
   state.priority = entry.priority;
   state.headroom_bytes = entry.headroom;
-  state.shortfall_bytes =
-      entry.demand > entry.headroom ? entry.demand - entry.headroom : 0;
   state.watermark_bytes = watermark_locked(instance, data);
   uint64_t total = 0;
   for (const auto &pool : data->pools)
@@ -820,6 +832,8 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
              state.charged_bytes <= entry.limit)
       state.status = "converged";
   }
+  const auto demand = allowed_demand(instance, state.charged_bytes, data);
+  state.shortfall_bytes = demand > entry.headroom ? demand - entry.headroom : 0;
   state.available_bytes = std::min<uint64_t>(
       usable > total ? usable - total : 0,
       entry.limit > state.charged_bytes ? entry.limit - state.charged_bytes
