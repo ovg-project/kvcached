@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Post-initialization physical KV controls, in bytes per instance per GPU."""
+"""Post-initialization controls for physical KV and prefix retention."""
 
 from __future__ import annotations
 
@@ -9,6 +9,24 @@ import glob
 import os
 from collections.abc import Callable, Mapping
 from typing import Any
+
+
+def get_prefix_cache_retention_limit() -> int:
+    """Return this engine process's idle prefix retention limit in tokens."""
+    from kvcached.prefix_cache_retention import (
+        _get_prefix_cache_retention_limit,
+    )
+
+    return _get_prefix_cache_retention_limit()
+
+
+def set_prefix_cache_retention_limit(limit_tokens: int) -> None:
+    """Update prefix retention from the engine or scheduler thread."""
+    from kvcached.prefix_cache_retention import (
+        _set_prefix_cache_retention_limit,
+    )
+
+    _set_prefix_cache_retention_limit(limit_tokens)
 
 
 def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any]:
