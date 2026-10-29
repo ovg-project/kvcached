@@ -21,7 +21,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473037ULL;
+constexpr uint64_t kMagic = 0x4b56425544473038ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -167,6 +167,8 @@ struct GpuBudget::Shared {
     Observed<uint64_t> limit;
     Observed<uint64_t> revision;
     Observed<uint64_t> has_revision;
+    Observed<uint64_t> limit_revision;
+    Observed<uint64_t> has_limit_revision;
     Observed<uint64_t> valid;
     Observed<uint64_t> participants;
     Observed<uint64_t> generation;
@@ -621,6 +623,8 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
   publish(entry.limit, bytes);
   entry.revision = revision;
   entry.has_revision = 1;
+  entry.limit_revision = revision;
+  entry.has_limit_revision = 1;
   return "applied";
 }
 
@@ -662,16 +666,17 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   const auto *data = snapshot ? snapshot : shared_;
   const auto &entry = data->instances[instance];
   InstanceControl state;
-  state.published = entry.has_revision;
+  state.published = entry.has_limit_revision;
   state.generation = entry.generation;
   state.revision = entry.revision;
+  state.limit_revision = entry.limit_revision;
   state.requested_bytes = entry.limit;
   state.participants = entry.participants;
   state.expected_participants = entry.expected_participants;
   state.min_bytes = entry.min;
   state.priority = entry.priority;
   state.headroom_bytes = entry.headroom;
-  state.status = entry.has_revision ? "pending" : "unpublished";
+  state.status = state.published ? "pending" : "unpublished";
   bool unsupported = false, cannot_shrink = false;
   uint64_t live = 0;
   for (size_t i = 0; i < kPools; ++i) {
@@ -679,9 +684,8 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
     if (!pool.owner || pool.instance != instance)
       continue;
     state.charged_bytes = add(state.charged_bytes, pool.charged);
-    state.effective_bytes =
-        add(state.effective_bytes,
-            entry.has_revision ? pool.target : pool.capacity);
+    state.effective_bytes = add(state.effective_bytes,
+                                state.published ? pool.target : pool.capacity);
     // Check liveness only: a control query never refunds or repairs a worker.
     struct flock owner_lock{};
     owner_lock.l_type = F_WRLCK;
@@ -705,17 +709,18 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
       state.can_shrink = pool.can_shrink;
       state.ready = pool.ready;
     }
-    if (pool.failed && pool.failed_revision == entry.revision) {
+    if (pool.failed && pool.failed_revision == entry.limit_revision) {
       ++state.failed;
       state.failure_reason = "quarantined_pages_prevent_resize";
     }
     cannot_shrink |= !pool.can_shrink;
     unsupported |= !pool.can_shrink && pool.target < pool.capacity;
-    if (pool.acknowledged && pool.acknowledged_revision == entry.revision &&
+    if (pool.acknowledged &&
+        pool.acknowledged_revision == entry.limit_revision &&
         pool.charged <= pool.target)
       ++state.completed;
   }
-  if (entry.has_revision) {
+  if (state.published) {
     if (live != entry.participants)
       state.status = "unavailable";
     else if (state.failed)
@@ -747,7 +752,9 @@ GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
       return rejected("stale");
     if (*revision == entry.revision) {
       // A retry of this revision must carry the values it published.
-      if (entry.limit != bytes ||
+      if ((update.limit_bytes &&
+           (!entry.has_limit_revision || entry.limit_revision != *revision)) ||
+          entry.limit != bytes ||
           (update.min_bytes && *update.min_bytes != entry.min) ||
           (update.priority && *update.priority != entry.priority) ||
           (update.headroom_bytes && *update.headroom_bytes != entry.headroom))
@@ -770,11 +777,9 @@ GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
   if (!participants || !capacity ||
       (entry.participants && participants != entry.participants))
     return rejected("unavailable");
-  // Only max gives the engines something to execute. A publication without
-  // it, after the first, keeps the pool targets and moves their
-  // acknowledgements and failures to its revision below.
-  const bool retarget = update.limit_bytes || !entry.has_revision;
-  const uint64_t previous = entry.revision;
+  // Only max gives the engines something to execute. Policy writes preserve
+  // the executing revision, including reports arriving after this write.
+  const bool retarget = update.limit_bytes || !entry.participants;
   // Proportional startup-capacity shares, independently rounded DOWN to each
   // pool's physical page bundle. The remainder stays unassigned. No pool can
   // independently consume the whole instance cap. Null-page floors constrain
@@ -801,13 +806,9 @@ GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
       revision.value_or(entry.has_revision ? entry.revision + 1 : 1);
   entry.has_revision = 1;
   entry.participants = participants;
-  for (auto &pool : shared_->pools) {
-    if (retarget || !pool.owner || pool.instance != instance)
-      continue;
-    if (pool.acknowledged && pool.acknowledged_revision == previous)
-      pool.acknowledged_revision = entry.revision;
-    if (pool.failed && pool.failed_revision == previous)
-      pool.failed_revision = entry.revision;
+  if (update.limit_bytes) {
+    entry.limit_revision = entry.revision;
+    entry.has_limit_revision = 1;
   }
   auto state = control_state_locked(instance);
   state.status = "accepted";
@@ -895,7 +896,7 @@ bool GpuBudget::acknowledge_control(size_t slot, uint64_t revision) {
   (void)snapshot_locked(slot);
   auto &pool = shared_->pools[slot];
   const auto &entry = shared_->instances[pool.instance];
-  if (!entry.has_revision || revision != entry.revision)
+  if (!entry.has_limit_revision || revision != entry.limit_revision)
     return false;
   pool.acknowledged_revision = revision;
   pool.acknowledged = 1;
@@ -913,8 +914,8 @@ bool GpuBudget::fail_control(const std::string &instance, size_t slot,
     return false;
   const auto &entry = shared_->instances[pool.instance];
   if (!entry.valid || instance != entry.name_string() ||
-      entry.generation != generation || !entry.has_revision ||
-      entry.revision != revision)
+      entry.generation != generation || !entry.has_limit_revision ||
+      entry.limit_revision != revision)
     return false;
   pool.failed_revision = revision;
   pool.failed = 1;

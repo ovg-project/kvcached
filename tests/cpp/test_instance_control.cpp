@@ -370,7 +370,12 @@ int main() {
     priority.priority = 5;
     auto first = writer->publish_control("policy", priority, generation);
     assert(first.status == "accepted" && first.revision == 1);
+    assert(!first.published && first.convergence == "unpublished");
     assert(first.requested_bytes == UINT64_MAX && first.effective_bytes == 240);
+    // A policy revision cannot stand in for a max that was never published.
+    auto unpublished = writer->publish_control("policy", UINT64_MAX, generation,
+                                               first.revision);
+    assert(unpublished.status == "conflict" && !unpublished.published);
 
     auto limit = writer->publish_control("policy", 120, generation);
     assert(limit.revision == 2 && limit.priority == 5);
@@ -384,6 +389,7 @@ int main() {
     floor.headroom_bytes = 0;
     auto third = writer->publish_control("policy", floor, generation);
     assert(third.status == "accepted" && third.revision == 3);
+    assert(third.limit_revision == limit.revision);
     assert(third.min_bytes == 480 && third.requested_bytes == 120);
     assert(budget->control_state(a).pool_target_bytes == 60);
     assert(third.convergence == "converged" && third.completed == 2);
@@ -431,7 +437,7 @@ int main() {
   }
   {
     // A deferred shrink stays pending until its release, and an engine that
-    // acknowledges after a publication without max acknowledges that one.
+    // acknowledges after a policy publication still reports the original max.
     auto budget = GpuBudget::connect(path, [] { return 1000; });
     auto slot = budget->register_pool("carry-shrink", 0);
     budget->configure_control_pool(slot, 120, 12, true);
@@ -455,10 +461,75 @@ int main() {
     priority.priority = 2;
     auto next = writer->publish_control("carry-shrink", priority, generation);
     assert(next.revision == grow.revision + 1 && next.convergence == "pending");
-    assert(!budget->acknowledge_control(slot, grow.revision));
-    assert(budget->acknowledge_control(slot, next.revision));
+    assert(!budget->acknowledge_control(slot, next.revision));
+    assert(budget->acknowledge_control(slot, grow.revision));
     assert(writer->query_control("carry-shrink").status == "converged");
     assert(budget->control_state(slot).pool_target_bytes == 120);
+  }
+  {
+    // Reports race with policy writes in either order. Only a newer max may
+    // invalidate them, even when that max has the same numeric target.
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("report-race", 0);
+    budget->configure_control_pool(slot, 120, 12, true);
+    budget->ready_control_pool(slot);
+    auto writer = GpuBudget::open_control(path);
+    const auto source = budget->control_state(slot);
+    ControlUpdate policy;
+    policy.priority = 4;
+    for (bool fail : {false, true}) {
+      for (bool policy_first : {false, true}) {
+        auto request =
+            writer->publish_control("report-race", 60, source.generation);
+        auto report = [&] {
+          return fail ? writer->fail_control(
+                            "report-race", slot, source.pool_owner,
+                            source.generation, request.limit_revision)
+                      : budget->acknowledge_control(slot,
+                                                    request.limit_revision);
+        };
+        if (policy_first)
+          writer->publish_control("report-race", policy, source.generation);
+        assert(report());
+        if (!policy_first)
+          writer->publish_control("report-race", policy, source.generation);
+        auto state = writer->observe_control("report-race");
+        assert(state.limit_revision == request.revision);
+        assert(state.revision == request.revision + 1);
+        assert(state.convergence == (fail ? "failed" : "converged"));
+        // Losing an explicit-revision race to a policy writer must not report
+        // that this same-value max retry was already executed.
+        auto conflict = writer->publish_control(
+            "report-race", 60, source.generation, state.revision);
+        assert(conflict.status == "conflict");
+        assert(conflict.limit_revision == request.limit_revision);
+        assert(conflict.convergence == state.convergence);
+        auto retry =
+            writer->publish_control("report-race", 60, source.generation);
+        assert(retry.limit_revision == retry.revision &&
+               retry.convergence == "pending");
+        assert(!report());
+        writer->publish_control("report-race", policy, source.generation);
+        assert(!report());
+        assert(writer->query_control("report-race").convergence == "pending");
+      }
+    }
+  }
+  {
+    // Zero is a valid max revision, not an unpublished sentinel.
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("zero-revision", 0);
+    budget->configure_control_pool(slot, 120, 12, true);
+    budget->ready_control_pool(slot);
+    auto state = budget->control_state(slot);
+    auto first =
+        budget->publish_control("zero-revision", 60, state.generation, 0);
+    assert(first.published && first.limit_revision == 0);
+    ControlUpdate policy;
+    policy.min_bytes = 24;
+    budget->publish_control("zero-revision", policy, state.generation);
+    assert(budget->acknowledge_control(slot, 0));
+    assert(budget->control_state(slot).convergence == "converged");
   }
   unlink(path.c_str());
   rmdir(directory);

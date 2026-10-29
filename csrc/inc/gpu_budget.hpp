@@ -22,6 +22,8 @@ struct InstanceControl {
   uint64_t failed = 0;
   uint64_t generation = 0;
   uint64_t revision = 0;
+  // Revision of the last max publication, stable across policy-only writes.
+  uint64_t limit_revision = 0;
   uint64_t requested_bytes = 0;
   uint64_t effective_bytes = 0;
   uint64_t charged_bytes = 0;
@@ -37,7 +39,7 @@ struct InstanceControl {
   uint64_t registered_participants = 0;
   uint64_t expected_participants = 0;
   uint64_t completed = 0;
-  bool published = false;
+  bool published = false; // A max has been published (revision zero is valid).
   // The instance's policy controls besides max. min_bytes is the reclaim
   // floor, unrelated to minimum_bytes, the pool's null-page floor.
   uint64_t min_bytes = 0;
@@ -176,6 +178,7 @@ public:
                                   uint64_t generation,
                                   std::optional<uint64_t> revision = {});
   InstanceControl control_state(size_t slot);
+  // Execution reports use limit_revision, not the all-controls revision.
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
                     uint64_t generation, uint64_t revision);

@@ -383,6 +383,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
+  result["limit_revision"] = state.limit_revision;
   result["limit_bytes"] = state.requested_bytes;
   result["effective_limit_bytes"] = state.effective_bytes;
   result["charged_bytes"] = state.charged_bytes;

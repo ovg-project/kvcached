@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real single-GPU controls; these do not validate TP/PP engine execution."""
 import gc
+import threading
+import time
+from typing import Any
 
 import pytest
 
@@ -22,10 +25,12 @@ def pools(monkeypatch, tmp_path, request):
     monkeypatch.setattr("kvcached.kv_cache_manager.CONTIGUOUS_LAYOUT", request.param)
     vmm.init_kvcached("cuda:0", PAGE, request.param)
     managers, tensors = [], []
-    def create(buffers=2, group=0, null=False):
+    def create(buffers=2, group=0, null=False, blocks_per_page=1, prealloc=False):
+        monkeypatch.setattr("kvcached.kv_cache_manager.PAGE_PREALLOC_ENABLED", prealloc)
         tensors.extend(vmm.create_kv_tensors(8 * PAGE * buffers, 1, "cuda:0", 2,
                                             buffers, group_id=group, page_size=PAGE))
-        manager = KVCacheManager(num_blocks=8, block_size=1, cell_size=PAGE,
+        manager = KVCacheManager(num_blocks=8 * blocks_per_page, block_size=1,
+                                 cell_size=PAGE // blocks_per_page,
                                  num_layers=2, num_kv_buffers=buffers, group_id=group,
                                  page_size=PAGE, reserve_null_block=null)
         manager.wait_ready(timeout=10)
@@ -163,3 +168,182 @@ def test_real_mixed_null_pools_keep_physical_floor_and_exact_cap(pools, limit):
     for manager in managers:
         apply(manager)
     assert control.get_instance_memory_limit()["converged"]
+
+
+@pytest.mark.parametrize("phase", ["unpublished", "converged", "pending"])
+def test_real_policy_preserves_resize_execution(pools, phase):
+    create, managers = pools
+    manager = create()
+    configure(managers)
+    blocks = manager.alloc(4) if phase == "pending" else []
+    if phase != "unpublished":
+        manager.set_memory_limit(8 * PAGE)
+        apply(manager)
+    before = control.get_instance_memory_limit()["gpus"][0]
+    counters = dict(manager._operation_counters)
+    manager._avail_physical_pages_cache = 321
+    policies: tuple[dict[str, Any], ...] = (
+        {"priority": 9}, {"min_bytes": PAGE}, {"headroom_bytes": PAGE})
+    for policy in policies:
+        assert control.set_instance_controls(**policy)["accepted"]
+        apply(manager)
+        after = control.get_instance_memory_limit()["gpus"][0]
+        assert after["limit_revision"] == before["limit_revision"]
+        assert after["convergence"] == before["convergence"]
+        assert after["published"] == before["published"]
+        assert manager._operation_counters == counters
+        assert manager._avail_physical_pages_cache == 321
+    if blocks:
+        manager.free(blocks)
+        apply(manager)
+        assert control.get_instance_memory_limit()["converged"]
+    # Even an unchanged target is a fresh request when max is explicit.
+    manager.set_memory_limit(8 * PAGE)
+    apply(manager)
+    assert control.get_instance_memory_limit()["converged"]
+    assert manager._operation_counters["resize_requests_total"] == counters.get("resize_requests_total", 0) + 1
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("fail_resize", [False, True])
+def test_real_policy_interleaves_with_execution_report(pools, monkeypatch, deferred, fail_resize):
+    """Real ledger/allocator, with a constructed publication race and failure."""
+    from kvcached.errors import QuarantinedResizeError
+
+    create, managers = pools
+    manager = create()
+    configure(managers)
+    blocks = manager.alloc(4) if deferred else []
+    manager.set_memory_limit(8 * PAGE)
+    if deferred:
+        apply(manager)
+        assert manager.in_shrink
+    allocator_type = type(manager.page_allocator)
+    resize = allocator_type.resize
+
+    def interleaved(allocator, size):
+        control.set_instance_controls(priority=9)
+        if fail_resize:
+            raise QuarantinedResizeError("injected quarantine")
+        return resize(allocator, size)
+
+    monkeypatch.setattr(allocator_type, "resize", interleaved)
+    if deferred:
+        manager.free(blocks)
+    else:
+        apply(manager)
+    expected = "failed" if fail_resize else "converged"
+    assert control.get_instance_memory_limit()["status"] == expected
+    assert not manager.in_shrink
+    counters = dict(manager._operation_counters)
+    policies: tuple[dict[str, Any], ...] = (
+        {"priority": 7}, {"min_bytes": PAGE}, {"headroom_bytes": PAGE})
+    for policy in policies:
+        control.set_instance_controls(**policy)
+        apply(manager)
+        assert control.get_instance_memory_limit()["status"] == expected
+        assert manager._operation_counters == counters
+    monkeypatch.setattr(allocator_type, "resize", resize)
+    manager.set_memory_limit(8 * PAGE)
+    apply(manager)
+    assert control.get_instance_memory_limit()["converged"]
+    assert manager._operation_counters["resize_requests_total"] == 2
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_real_pending_observes_late_prealloc_failure(pools, monkeypatch, fatal):
+    """Native background thread and ledger, with a constructed IPC failure."""
+    from kvcached.errors import MapQuarantinedError, StateConsistencyError
+
+    create, managers = pools
+    allocator_type = vmm.PageAllocator
+    start = allocator_type.start_prealloc_thread
+    monkeypatch.setattr(allocator_type, "start_prealloc_thread", lambda self: None)
+    manager = create(prealloc=True)
+    configure(managers)
+    blocks = manager.alloc(2)
+    assert blocks is not None
+    entered, release = threading.Event(), threading.Event()
+
+    def fail(_world_size, _offsets):
+        entered.set()
+        assert release.wait(10)
+        error = StateConsistencyError if fatal else MapQuarantinedError
+        raise error("injected late preallocation failure")
+
+    allocator = manager.page_allocator
+    allocator.set_use_worker_ipc(True)
+    allocator.set_broadcast_map_callback(fail)
+    try:
+        start(allocator)
+        assert entered.wait(10)
+        manager.set_memory_limit(4 * PAGE)
+        apply(manager)
+        assert manager.in_shrink
+        assert manager._get_num_alloced_blocks() == 2
+    finally:
+        release.set()
+    deadline = time.monotonic() + 10
+    while allocator.get_transaction_state()["state"] == "HEALTHY" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    allocator.stop_prealloc_thread()
+    assert allocator.get_transaction_state()["state"] == ("FAILED" if fatal else "DEGRADED")
+    control.set_instance_controls(priority=7)
+    if fatal:
+        with pytest.raises(StateConsistencyError):
+            apply(manager)
+        assert manager._lifecycle.phase == "failed"
+    else:
+        apply(manager)
+        assert not manager.in_shrink
+        assert control.get_instance_memory_limit()["status"] == "failed"
+        assert manager._operation_counters["resize_errors_total"] == 1
+        for _ in range(2):
+            control.set_instance_controls(headroom_bytes=PAGE)
+            apply(manager)
+        assert manager._operation_counters["resize_errors_total"] == 1
+        manager.free(blocks)
+    assert manager._operation_counters["resize_requests_total"] == 1
+
+
+def test_real_pending_releases_late_reserved_blocks(pools):
+    create, managers = pools
+    manager = create(blocks_per_page=2)
+    configure(managers)
+    blocks = manager.alloc(1)
+    assert blocks is not None
+    manager.set_memory_limit(0)
+    apply(manager)
+    assert manager.in_shrink
+    assert manager.try_to_reserve(1)
+    manager.free(blocks)
+    assert manager.in_shrink and manager.reserved_blocks
+    control.set_instance_controls(priority=7)
+    apply(manager)
+    assert not manager.in_shrink and not manager.reserved_blocks
+    assert control.get_instance_memory_limit()["converged"]
+    assert manager._operation_counters["resize_requests_total"] == 1
+
+
+def test_real_policy_revision_cannot_acknowledge_a_max_retry(pools):
+    create, managers = pools
+    manager = create()
+    configure(managers)
+    manager.set_memory_limit(8 * PAGE)
+    apply(manager)
+    state = control.set_instance_controls(priority=7)["gpus"][0]
+    generations = {state["gpu"]: state["generation"]}
+    rejected = control.set_instance_memory_limit(
+        8 * PAGE, revision=state["revision"], generations=generations)
+    assert not rejected["accepted"]
+    assert rejected["gpus"][0]["status"] == "conflict"
+    apply(manager)
+    assert manager._operation_counters["resize_requests_total"] == 1
+    fresh = manager.set_memory_limit(8 * PAGE)
+    apply(manager)
+    assert fresh["accepted"] and control.get_instance_memory_limit()["converged"]
+    repeated = control.set_instance_memory_limit(
+        8 * PAGE, revision=fresh["gpus"][0]["revision"], generations=generations)
+    assert repeated["accepted"] and repeated["gpus"][0]["status"] == "idempotent"
+    apply(manager)
+    assert manager._operation_counters["resize_requests_total"] == 2
