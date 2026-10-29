@@ -552,8 +552,8 @@ uint64_t GpuBudget::watermark_locked(size_t instance,
     const auto &entry = data->instances[i];
     if (i == instance || !live[i] || !entry.valid || entry.priority <= priority)
       continue;
-    total = saturating_add(
-        total, std::max<uint64_t>(entry.headroom, entry.demand));
+    total =
+        saturating_add(total, std::max<uint64_t>(entry.headroom, entry.demand));
   }
   return total;
 }
