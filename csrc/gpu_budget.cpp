@@ -590,9 +590,12 @@ uint64_t GpuBudget::reclaim_locked(size_t instance, const Shared *data) const {
     if (entry.demand)
       requesters.push_back(i);
   }
-  auto priority = [&](size_t i) -> int64_t { return data->instances[i].priority; };
-  std::stable_sort(requesters.begin(), requesters.end(),
-                   [&](size_t a, size_t b) { return priority(a) > priority(b); });
+  auto priority = [&](size_t i) -> int64_t {
+    return data->instances[i].priority;
+  };
+  std::stable_sort(
+      requesters.begin(), requesters.end(),
+      [&](size_t a, size_t b) { return priority(a) > priority(b); });
   uint64_t assigned[kInstances]{};
   for (const auto requester : requesters) {
     const auto watermark = watermark_locked(requester, data);
