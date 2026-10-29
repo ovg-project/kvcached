@@ -191,3 +191,85 @@ def test_a_failed_post_does_not_fail_the_step(vllm_patches, monkeypatch):
                         pool=_BlockPool(fail=True))
     scheduler.needs = [9]
     assert scheduler.schedule() == [None]
+
+
+class _DemandManager:
+    """A kvcached manager stand-in: each missing block is 10 bytes of pages."""
+
+    def __init__(self) -> None:
+        self.posted: list[int] = []
+
+    def physical_demand_bytes(self, need_blocks: int) -> int:
+        return max(0, need_blocks) * 10
+
+    def post_demand(self, demand_bytes: int) -> None:
+        self.posted.append(demand_bytes)
+
+
+def _sglang_scheduler(evictable_tokens: int = 0):
+    manager = _DemandManager()
+    scheduler = types.SimpleNamespace(
+        token_to_kv_pool_allocator=types.SimpleNamespace(kvcached_allocator=manager),
+        tree_cache=types.SimpleNamespace(evictable_size=lambda: evictable_tokens),
+        page_size=2)
+    return scheduler, manager
+
+
+def test_sglang_round_posts_its_first_unfit_request():
+    from kvcached.integration.sglang import patches
+
+    # 4 evictable tokens are 2 blocks that need no new page.
+    scheduler, manager = _sglang_scheduler(evictable_tokens=4)
+    with patches._sglang_demand_round(scheduler):
+        with patches._sglang_demand_round(scheduler):  # nested: posts nothing
+            patches._sglang_note_unfit(5)
+        patches._sglang_note_unfit(9)
+    assert manager.posted == [30]
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert manager.posted == [30, 0]
+
+
+def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
+    import enum
+
+    from kvcached.integration.sglang import patches
+
+    class AddReqResult(enum.Enum):
+        CONTINUE = 1
+        NO_TOKEN = 2
+
+    class PrefillAdder:
+        page_size = 2
+
+        def add_one_req(self, req: Any, has_chunked_req: bool,
+                        truncation_align_size: Any) -> Any:
+            return AddReqResult.NO_TOKEN
+
+    module = types.ModuleType("sglang.srt.managers.schedule_policy")
+    module.PrefillAdder = PrefillAdder  # type: ignore[attr-defined]
+    patch = patches.PrefillAdderDemandPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    assert patch.patch_add_one_req(module) is True
+
+    # 8 input tokens beyond the cached prefix plus 4 output tokens: 6 blocks.
+    req = types.SimpleNamespace(
+        full_untruncated_fill_ids=list(range(10)), prefix_indices=[0, 1],
+        sampling_params=types.SimpleNamespace(max_new_tokens=4), output_ids=[])
+    scheduler, manager = _sglang_scheduler()
+    with patches._sglang_demand_round(scheduler):
+        assert PrefillAdder().add_one_req(req, False, None) is AddReqResult.NO_TOKEN
+    assert manager.posted == [60]
+
+
+def test_sglang_decode_gate_miss_is_recorded():
+    from kvcached.integration.sglang import patches
+
+    allocator = types.SimpleNamespace(kvcached_allocator=types.SimpleNamespace(
+        try_to_reserve=lambda need, packed=False: False))
+    scheduler, manager = _sglang_scheduler()
+    with patches._sglang_demand_round(scheduler):
+        assert not patches._sglang_reserve_decode_capacity(
+            allocator, scheduler.tree_cache, num_tokens=6, need_blocks=3)
+    assert manager.posted == [30]
