@@ -106,7 +106,7 @@ def test_unlimited_cap_installs_runtime_hook_but_does_not_evict(
     cache.cache_finished_req("req")
     assert cache.evicted == []
 
-    retention._set_prefix_cache_retention_limit(16000)
+    retention._policy.set_limit(16000)
     assert cache.evicted == [EvictParams(num_tokens=4000)]
 
 

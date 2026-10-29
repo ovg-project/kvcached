@@ -18,7 +18,7 @@
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473036ULL;
+constexpr uint64_t kMagic = 0x4b56425544473037ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -121,6 +121,8 @@ struct GpuBudget::Shared {
     Observed<uint64_t> limit;
     Observed<uint64_t> revision;
     Observed<uint64_t> has_revision;
+    Observed<int64_t> retention_tokens;
+    Observed<uint64_t> retention_revision;
     Observed<uint64_t> valid;
     Observed<uint64_t> participants;
     Observed<uint64_t> generation;
@@ -419,6 +421,7 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group) {
         for (size_t n = 0; n < instance.size(); ++n)
           entry.name[n] = instance[n];
         entry.limit = UINT64_MAX;
+        entry.retention_tokens = -1;
         entry.generation = add(shared_->next_generation, 1);
         shared_->next_generation = entry.generation;
         publish(entry.valid, 1);
@@ -612,6 +615,8 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.published = entry.has_revision;
   state.generation = entry.generation;
   state.revision = entry.revision;
+  state.retention_tokens = entry.retention_tokens;
+  state.retention_revision = entry.retention_revision;
   state.requested_bytes = entry.limit;
   state.participants = entry.participants;
   state.expected_participants = entry.expected_participants;
@@ -749,6 +754,52 @@ InstanceControl GpuBudget::publish_control(const std::string &instance,
       }
       return publish_control_locked(i, bytes, revision);
     }
+  }
+  InstanceControl state;
+  state.status = "unavailable";
+  return state;
+}
+
+InstanceControl GpuBudget::publish_retention(const std::string &instance,
+                                             int64_t tokens,
+                                             uint64_t generation,
+                                             uint64_t revision) {
+  if (tokens < -1)
+    throw std::invalid_argument("retention tokens must be -1 or non-negative");
+  if (!revision)
+    throw std::invalid_argument("retention revision must be positive");
+  retire_dead_pools();
+  Locked lock(*this);
+  for (size_t i = 0; i < kInstances; ++i) {
+    auto &entry = shared_->instances[i];
+    if (!entry.valid || instance != entry.name_string())
+      continue;
+    auto state = control_state_locked(i);
+    if (entry.generation != generation) {
+      state.status = "instance_changed";
+      return state;
+    }
+    if (!state.registered_participants) {
+      state.status = "unavailable";
+      return state;
+    }
+    for (const auto &pool : shared_->pools) {
+      if (pool.owner && pool.instance == i && !pool.ready) {
+        state.status = "not_ready";
+        return state;
+      }
+    }
+    if (entry.retention_revision && revision <= entry.retention_revision) {
+      state.status = revision < entry.retention_revision ? "stale"
+                     : entry.retention_tokens == tokens  ? "idempotent"
+                                                         : "conflict";
+      return state;
+    }
+    entry.retention_tokens = tokens;
+    entry.retention_revision = revision;
+    state = control_state_locked(i);
+    state.status = "accepted";
+    return state;
   }
   InstanceControl state;
   state.status = "unavailable";

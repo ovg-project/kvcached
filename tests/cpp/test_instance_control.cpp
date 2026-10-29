@@ -21,6 +21,74 @@ int main() {
   const auto path = std::string(directory) + "/ledger";
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("retention", 0);
+    const auto generation = budget->query_control("retention").generation;
+    assert(budget->publish_retention("retention", 0, generation, 1).status ==
+           "not_ready");
+    // Retention is logical cache policy, independent of physical shrink
+    // support.
+    budget->configure_control_pool(slot, 120, 12, false, 1);
+    budget->ready_control_pool(slot);
+    auto memory = budget->publish_control("retention", 240, generation);
+    assert(budget->acknowledge_control(slot, memory.revision));
+    const auto child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      auto writer = GpuBudget::open_control(path);
+      const auto state =
+          writer->publish_retention("retention", 0, generation, 1);
+      assert(state.status == "accepted" && state.retention_tokens == 0 &&
+             state.retention_revision == 1);
+      _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    auto state = budget->control_state(slot);
+    assert(state.retention_tokens == 0 && state.retention_revision == 1);
+    assert(state.revision == memory.revision && state.requested_bytes == 240 &&
+           state.pool_target_bytes == 120 && state.status == "converged");
+    auto observer = GpuBudget::open_control(path, true);
+    assert(observer->observe_control("retention").retention_tokens == 0);
+    assert(budget->publish_retention("retention", 0, generation, 1).status ==
+           "idempotent");
+    assert(budget->publish_retention("retention", -1, generation, 1).status ==
+           "conflict");
+    assert(budget->publish_retention("retention", -1, generation, 2).status ==
+           "accepted");
+    assert(budget->publish_retention("retention", -1, generation, 1).status ==
+           "stale");
+    auto next_memory = budget->publish_control("retention", 300, generation);
+    assert(next_memory.retention_tokens == -1 &&
+           next_memory.retention_revision == 2);
+    bool invalid = false;
+    try {
+      budget->publish_retention("retention", -2, generation, 3);
+    } catch (const std::invalid_argument &) {
+      invalid = true;
+    }
+    assert(invalid);
+    invalid = false;
+    try {
+      budget->publish_retention("retention", 0, generation, 0);
+    } catch (const std::invalid_argument &) {
+      invalid = true;
+    }
+    assert(invalid);
+    budget.reset();
+    auto replacement = GpuBudget::connect(path, [] { return 1000; });
+    slot = replacement->register_pool("retention", 0);
+    replacement->configure_control_pool(slot, 120, 12, false, 1);
+    replacement->ready_control_pool(slot);
+    state = observer->observe_control("retention");
+    assert(state.generation != generation && state.retention_revision == 0);
+    assert(
+        replacement->publish_retention("retention", 0, generation, 3).status ==
+        "instance_changed");
+    assert(replacement->query_control("retention").retention_revision == 0);
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
     auto a = budget->register_pool("model", 0);
     auto b = budget->register_pool("model", 1);
     assert(budget

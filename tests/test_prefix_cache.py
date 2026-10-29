@@ -812,7 +812,7 @@ class TestRuntimeRetentionLimit:
         _finish_request(pool, blocks)
         assert len(pool._evictable_blocks) == 4
 
-        retention._set_prefix_cache_retention_limit(32)
+        retention._policy.set_limit(32)
 
         assert pool.max_cached_blocks == 2
         assert len(pool._evictable_blocks) == 2
@@ -827,7 +827,7 @@ class TestRuntimeRetentionLimit:
         initial_free = manager.available_size()
         blocks = _simulate_request(pool, ["h0", "h1"])
 
-        retention._set_prefix_cache_retention_limit(0)
+        retention._policy.set_limit(0)
         assert manager.available_size() == initial_free - 2
 
         _finish_request(pool, blocks)
