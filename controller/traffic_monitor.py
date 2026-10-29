@@ -22,6 +22,7 @@ class RequestStats:
     response_time: Optional[float] = None
     success: bool = True
     error_message: Optional[str] = None
+    finished: bool = False
 
 
 @dataclass
@@ -31,6 +32,9 @@ class ModelActivityStats:
     successful_requests: int = 0
     failed_requests: int = 0
     last_activity_time: float = 0.0
+    last_completion_time: float = 0.0
+    active_requests: int = 0
+    backend_state_unknown: bool = False
     avg_response_time: float = 0.0
     request_timestamps: deque = field(
         default_factory=lambda: deque(maxlen=1000))
@@ -71,11 +75,12 @@ class ModelActivityStats:
         """Get the idle time in seconds since last activity"""
         if self.last_activity_time == 0:
             return float('inf')  # Never had any activity
-        return time.time() - self.last_activity_time
+        return time.time() - max(self.last_activity_time, self.last_completion_time)
 
     def is_idle(self, idle_threshold_seconds: int = 300) -> bool:
         """Check if the model has been idle longer than the threshold (default 5 minutes)"""
-        return self.get_idle_time() > idle_threshold_seconds
+        return (self.active_requests == 0 and not self.backend_state_unknown
+                and self.get_idle_time() > idle_threshold_seconds)
 
 
 class TrafficMonitor:
@@ -117,6 +122,9 @@ class TrafficMonitor:
                                      endpoint_path=endpoint_path)
 
         with self._lock:
+            stats = self.model_stats[model_name]
+            stats.active_requests += 1
+            stats.last_activity_time = max(stats.last_activity_time, request_stats.timestamp)
             self._request_history.append(request_stats)
             # Keep only recent history (last 10000 requests)
             if len(self._request_history) > 10000:
@@ -128,18 +136,27 @@ class TrafficMonitor:
                            request_stats: RequestStats,
                            success: bool = True,
                            response_time: Optional[float] = None,
-                           error_message: Optional[str] = None):
+                           error_message: Optional[str] = None,
+                           backend_drained: bool = True):
         """Record the end of a request"""
         if response_time is None:
             response_time = time.time() - request_stats.timestamp
 
-        request_stats.response_time = response_time
-        request_stats.success = success
-        request_stats.error_message = error_message
-
         with self._lock:
-            self.model_stats[request_stats.model_name].add_request(
-                request_stats)
+            if request_stats.finished:
+                return
+            request_stats.finished = True
+            request_stats.response_time = response_time
+            request_stats.success = success
+            request_stats.error_message = error_message
+            stats = self.model_stats[request_stats.model_name]
+            stats.active_requests -= 1
+            stats.last_completion_time = max(stats.last_completion_time, time.time())
+            # A transport error is not proof that the engine stopped generating.
+            # Keep this separate from active counts; only an engine lifecycle
+            # reset can establish that an unobserved request has gone away.
+            stats.backend_state_unknown |= not backend_drained
+            stats.add_request(request_stats)
 
         logger.debug(f"Request completed for {request_stats.model_name}: "
                      f"success={success}, response_time={response_time:.3f}s")
@@ -196,6 +213,8 @@ class TrafficMonitor:
                     'request_rate': stats.get_request_rate(window_seconds),
                     'avg_response_time': stats.avg_response_time,
                     'last_activity_time': stats.last_activity_time,
+                    'active_requests': stats.active_requests,
+                    'backend_state_unknown': stats.backend_state_unknown,
                     'idle_time_seconds': stats.get_idle_time(),
                     'is_idle': stats.is_idle(self.idle_threshold_seconds)
                 }
