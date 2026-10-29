@@ -272,6 +272,8 @@ class KVCacheManager:
         except ImportError:
             use_worker_ipc = False
         self.page_allocator.set_use_worker_ipc(use_worker_ipc)
+        # The ledger lives in the workers then; see post_demand().
+        self._uses_worker_ipc = use_worker_ipc
 
         if self.world_size > 1 or use_worker_ipc:
             try:
@@ -1222,6 +1224,43 @@ class KVCacheManager:
         return True
 
     @synchronized
+    @synchronized
+    def physical_demand_bytes(self, need_blocks: int) -> int:
+        """Bytes of new pages that ``need_blocks`` more blocks would map.
+
+        Free blocks in mapped pages, reserved blocks and pre-mapped pages need
+        no grant, so only the rest counts toward the demand an engine posts
+        for its first request that does not fit (#585's shortfall before the
+        headroom is subtracted).
+        """
+        blocks_per_page = InternalPage.get_num_blocks(self.page_size,
+                                                      self.block_mem_size)
+        if need_blocks <= 0 or blocks_per_page <= 0:
+            return 0
+        held = (self.num_avail_blocks + len(self.reserved_blocks)
+                + self.page_allocator.get_num_reserved_pages() * blocks_per_page)
+        missing = need_blocks - held
+        if missing <= 0:
+            return 0
+        pages = -(-missing // blocks_per_page)
+        return pages * self._memory_limit_page_bundle_bytes()
+
+    def post_demand(self, demand_bytes: int) -> None:
+        """Post the instance's unmet demand on this GPU; 0 clears it.
+
+        Writes only when the level changes. A scheduler whose pages are mapped
+        by worker processes has no ledger of its own; it posts nothing.
+        """
+        if self.world_size > 1 or getattr(self, "_uses_worker_ipc", False):
+            return
+        demand_bytes = max(0, int(demand_bytes))
+        if demand_bytes == getattr(self, "_posted_demand", 0):
+            return
+        from kvcached.vmm_ops import set_kv_demand
+
+        set_kv_demand(demand_bytes, self.group_id)
+        self._posted_demand = demand_bytes
+
     def free_reserved(self):
         if self.reserved_blocks:
             # Detach first: once off the ledger the blocks are ordinary
