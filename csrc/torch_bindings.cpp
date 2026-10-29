@@ -189,6 +189,11 @@ void set_kv_demand(uint64_t bytes, int64_t group_id = 0) {
   FTensorAllocator::global_allocator(group_id)->set_kv_demand(bytes);
 }
 
+uint64_t kv_reclaim_bytes(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  return FTensorAllocator::global_allocator(group_id)->kv_reclaim_bytes();
+}
+
 std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision,
                                       int64_t group_id = 0) {
   py::gil_scoped_release release;
@@ -411,6 +416,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["headroom_bytes"] = state.headroom_bytes;
   result["shortfall_bytes"] = state.shortfall_bytes;
   result["watermark_bytes"] = state.watermark_bytes;
+  result["reclaim_bytes"] = state.reclaim_bytes;
   return result;
 }
 
@@ -570,6 +576,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("recalibrate_physical_budget", &kvcached::recalibrate_physical_budget,
         py::arg("group_id") = 0);
   m.def("set_kv_demand", &kvcached::set_kv_demand, py::arg("bytes"),
+        py::arg("group_id") = 0);
+  m.def("kv_reclaim_bytes", &kvcached::kv_reclaim_bytes,
         py::arg("group_id") = 0);
   m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
         "prepare_map_to_kv_tensors", py::arg("transaction_id"),

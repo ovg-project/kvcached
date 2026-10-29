@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace kvcached {
 namespace {
@@ -557,6 +558,75 @@ uint64_t GpuBudget::watermark_locked(size_t instance,
   return total;
 }
 
+// #585 section 4. From the highest priority down, the demand an instance
+// cannot fit is taken from lower priorities: the lowest priority first, then
+// the largest excess over min(min, max). An instance with a pool that cannot
+// shrink is never a victim. Requesters' deficits are measured against the
+// same free memory, so together they can ask for too little, never too much;
+// their next demands post the rest.
+uint64_t GpuBudget::reclaim_locked(size_t instance, const Shared *data) const {
+  uint64_t charged[kInstances]{};
+  bool live[kInstances]{};
+  bool shrinkable[kInstances];
+  std::fill(std::begin(shrinkable), std::end(shrinkable), true);
+  uint64_t total = 0;
+  for (const auto &pool : data->pools) {
+    total = add(total, pool.charged);
+    if (!pool.owner || pool.instance >= kInstances)
+      continue;
+    live[pool.instance] = true;
+    charged[pool.instance] = add(charged[pool.instance], pool.charged);
+    shrinkable[pool.instance] = shrinkable[pool.instance] && pool.can_shrink;
+  }
+  uint64_t excess[kInstances]{};
+  std::vector<size_t> requesters;
+  for (size_t i = 0; i < kInstances; ++i) {
+    const auto &entry = data->instances[i];
+    if (!live[i] || !entry.valid)
+      continue;
+    const uint64_t floor = std::min<uint64_t>(entry.min, entry.limit);
+    if (shrinkable[i] && charged[i] > floor)
+      excess[i] = charged[i] - floor;
+    if (entry.demand)
+      requesters.push_back(i);
+  }
+  auto priority = [&](size_t i) -> int64_t { return data->instances[i].priority; };
+  std::stable_sort(requesters.begin(), requesters.end(),
+                   [&](size_t a, size_t b) { return priority(a) > priority(b); });
+  uint64_t assigned[kInstances]{};
+  for (const auto requester : requesters) {
+    const auto watermark = watermark_locked(requester, data);
+    const uint64_t budget = data->budget;
+    const auto usable = budget > watermark ? budget - watermark : 0;
+    const auto available = usable > total ? usable - total : 0;
+    const uint64_t demand = data->instances[requester].demand;
+    uint64_t deficit = demand > available ? demand - available : 0;
+    std::vector<size_t> victims;
+    for (size_t i = 0; i < kInstances; ++i)
+      if (excess[i] && priority(i) < priority(requester))
+        victims.push_back(i);
+    std::stable_sort(victims.begin(), victims.end(), [&](size_t a, size_t b) {
+      return priority(a) != priority(b) ? priority(a) < priority(b)
+                                        : excess[a] > excess[b];
+    });
+    for (const auto victim : victims) {
+      if (!deficit)
+        break;
+      const auto take = std::min(excess[victim], deficit);
+      excess[victim] -= take;
+      assigned[victim] += take;
+      deficit -= take;
+    }
+  }
+  return assigned[instance];
+}
+
+uint64_t GpuBudget::reclaim_bytes(size_t slot) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  return reclaim_locked(shared_->pools[slot].instance, shared_);
+}
+
 void GpuBudget::set_demand(size_t slot, uint64_t bytes) {
   Locked lock(*this);
   (void)snapshot_locked(slot);
@@ -718,6 +788,7 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.shortfall_bytes =
       entry.demand > entry.headroom ? entry.demand - entry.headroom : 0;
   state.watermark_bytes = watermark_locked(instance, data);
+  state.reclaim_bytes = reclaim_locked(instance, data);
   state.status = state.published ? "pending" : "unpublished";
   bool unsupported = false, cannot_shrink = false;
   uint64_t live = 0;

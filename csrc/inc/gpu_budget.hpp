@@ -49,6 +49,8 @@ struct InstanceControl {
   // and the free bytes higher priorities keep from it on this GPU.
   uint64_t shortfall_bytes = 0;
   uint64_t watermark_bytes = 0;
+  // Bytes this instance should release now for higher priorities' demand.
+  uint64_t reclaim_bytes = 0;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -193,6 +195,11 @@ public:
   // does not fit needs. A level that each scheduling step overwrites; 0 clears
   // it, and it goes away with the instance.
   void set_demand(size_t slot, uint64_t bytes);
+  // Bytes the slot's instance should release now so that higher priorities'
+  // demand fits. Every instance derives the same plan from the ledger, so all
+  // pick the same victims. Nothing is stored: once the demand fits, the plan
+  // asks for nothing.
+  uint64_t reclaim_bytes(size_t slot);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -225,6 +232,7 @@ private:
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
+  uint64_t reclaim_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);
   void accounting_test_hook(int stage);

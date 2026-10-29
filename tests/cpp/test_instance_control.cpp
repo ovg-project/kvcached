@@ -578,6 +578,48 @@ int main() {
     budget.reset();
     unlink(ledger.c_str());
   }
+  {
+    // On-demand reclaim (#585 section 4) on a 100-byte GPU with 8 free.
+    const auto ledger = std::string(directory) + "/reclaim";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto bottom = budget->register_pool("bottom", 0, InstancePolicy{0, -1, 0});
+    auto floor = budget->register_pool("floor", 0, InstancePolicy{35, 0, 0});
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 0, 0});
+    auto fixed = budget->register_pool("fixed", 0, InstancePolicy{0, 0, 0});
+    auto top = budget->register_pool("top", 0, InstancePolicy{0, 2, 0});
+    for (auto slot : {bottom, floor, spare, top})
+      budget->configure_control_pool(slot, 100, 1, true);
+    budget->configure_control_pool(fixed, 100, 1, false);
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    auto hold = [&](size_t slot, uint64_t bytes) {
+      auto grant = budget->grant(slot, bytes);
+      held.push_back(grant->take(bytes));
+      grant->finish();
+    };
+    hold(bottom, 10);
+    hold(floor, 30);
+    hold(spare, 20);
+    hold(fixed, 20);
+    hold(top, 12);
+    auto reclaim = [&](size_t slot) { return budget->reclaim_bytes(slot); };
+    // Top needs 20 and can use 8. The lowest priority gives all 10 it holds,
+    // then the largest excess at the next priority gives the other 2.
+    budget->set_demand(top, 20);
+    assert(reclaim(bottom) == 10 && reclaim(spare) == 2 && reclaim(floor) == 0);
+    assert(reclaim(fixed) == 0 && reclaim(top) == 0);
+    assert(budget->query_control("spare").reclaim_bytes == 2);
+    // Floor holds 30, under its min of 35, so it gives nothing, and the
+    // instance that cannot shrink is never a victim.
+    budget->set_demand(top, 60);
+    assert(reclaim(bottom) == 10 && reclaim(spare) == 20);
+    assert(reclaim(floor) == 0 && reclaim(fixed) == 0);
+    // Nothing is stored: once the demand fits, nobody is asked to release.
+    budget->set_demand(top, 8);
+    assert(reclaim(bottom) == 0 && reclaim(spare) == 0);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
   unlink(path.c_str());
   rmdir(directory);
 }

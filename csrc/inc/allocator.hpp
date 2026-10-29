@@ -82,6 +82,8 @@ public:
   uint64_t available_physical_bytes();
   // Post the instance's unmet demand on this GPU (#585 shortfall).
   void set_kv_demand(uint64_t bytes);
+  // Bytes to release now for higher priorities' demand (#585 reclaim).
+  uint64_t kv_reclaim_bytes();
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
   bool recalibrate_physical_budget();
   InstanceControl configure_instance_control(bool can_shrink,

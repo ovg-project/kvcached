@@ -428,6 +428,12 @@ void FTensorAllocator::set_kv_demand(uint64_t bytes) {
     budget_->set_demand(budget_slot_, bytes);
 }
 
+uint64_t FTensorAllocator::kv_reclaim_bytes() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  ensure_budget_locked_();
+  return budget_ ? budget_->reclaim_bytes(budget_slot_) : 0;
+}
+
 std::string FTensorAllocator::set_instance_budget_limit(uint64_t bytes,
                                                         uint64_t revision) {
   std::lock_guard<std::mutex> lock(mtx_);
