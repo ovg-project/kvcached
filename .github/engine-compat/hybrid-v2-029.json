@@ -1,0 +1,12 @@
+{
+  "task": "Validate 0.29 MRV2 hybrid state and partial-prefix reuse without modifying candidate code. Require native/elastic token equality, actual worker copies, two CoW admission-miss injections and recovery, and complete shutdown in both scheduling modes. Tiny FP16 text-only fixture; not full-model, multimodal, TP/PP, MPS or performance acceptance.",
+  "allow": ["kvcached/integration/vllm/patches.py"],
+  "cpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "gpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.29"],
+  "repair": false,
+  "runner": "v2",
+  "layouts": ["non-contiguous"],
+  "probe": "hybrid"
+}

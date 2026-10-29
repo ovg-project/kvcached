@@ -1,0 +1,12 @@
+{
+  "task": "Validate tiny Gemma4 cross-layer KV sharing without modifying candidate code. Require actual owner/borrower tensor aliasing, heterogeneous full/sliding attention and repeated complete native/elastic outputs in both matched layouts. A native failure blocks qualification, not proof of a KVCached regression. No full-model, async, multimodal, TP/PP, MPS or performance acceptance.",
+  "allow": ["kvcached/integration/vllm/model_runner_v2.py"],
+  "cpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "gpu_tests": ["tests/test_vllm_model_runner_v2.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.29"],
+  "repair": false,
+  "runner": "v2",
+  "layouts": ["non-contiguous", "contiguous"],
+  "probe": "sharing"
+}
