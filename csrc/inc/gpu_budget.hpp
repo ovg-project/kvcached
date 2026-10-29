@@ -22,6 +22,8 @@ struct InstanceControl {
   uint64_t failed = 0;
   uint64_t generation = 0;
   uint64_t revision = 0;
+  int64_t retention_tokens = -1;
+  uint64_t retention_revision = 0;
   uint64_t requested_bytes = 0;
   uint64_t effective_bytes = 0;
   uint64_t charged_bytes = 0;
@@ -142,6 +144,9 @@ public:
   InstanceControl publish_control(const std::string &instance, uint64_t bytes,
                                   uint64_t generation,
                                   std::optional<uint64_t> revision = {});
+  // Revision zero denotes an unpublished retention policy.
+  InstanceControl publish_retention(const std::string &instance, int64_t tokens,
+                                    uint64_t generation, uint64_t revision);
   InstanceControl control_state(size_t slot);
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,

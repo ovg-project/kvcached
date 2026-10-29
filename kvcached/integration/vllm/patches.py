@@ -14,6 +14,7 @@ import threading
 import time
 import types
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import wraps
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
@@ -24,6 +25,10 @@ from kvcached.integration.version_utils import (
     VersionManager,
     VersionRange,
     version_range,
+)
+from kvcached.prefix_cache_retention import (
+    _apply_prefix_cache_retention_update,
+    _read_prefix_cache_retention_update,
 )
 from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
 
@@ -537,10 +542,10 @@ def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int
     enabled for the smallest non-zero budget, matching the user's intent; a
     warning is logged so the effective granularity is not silent.
     """
-    from kvcached.prefix_cache_retention import _get_prefix_cache_retention_limit
+    from kvcached.control import get_prefix_cache_retention_limit
 
     return _max_cached_blocks_for_tokens(
-        _get_prefix_cache_retention_limit(), block_size, num_kv_cache_groups)
+        get_prefix_cache_retention_limit(), block_size, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -797,10 +802,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager, "_register_shrink_reclaimer", None)
                 if self._page_eviction is not None and register_reclaimer is not None:
                     register_reclaimer(self._reclaim_for_shrink)
-                from kvcached.prefix_cache_retention import (
-                    _register_prefix_cache_retention_enforcer,
-                )
-                _register_prefix_cache_retention_enforcer(self)
+                from kvcached.prefix_cache_retention import _policy
+
+                _policy.register(self)
 
             def _enforce_prefix_cache_retention(self, limit_tokens: int) -> None:
                 self.max_cached_blocks = _max_cached_blocks_for_tokens(
@@ -1435,6 +1439,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 return
 
             def apply_limit(engine_core: Any) -> None:
+                _apply_prefix_cache_retention_update(_read_prefix_cache_retention_update(throttle=True))
                 for manager in managers:
                     manager.apply_resize_target()
                     manager.reclaim_for_shrink()
@@ -1450,6 +1455,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 while not stop.wait(0.2):
                     pending = False
                     try:
+                        pending = _read_prefix_cache_retention_update() is not None
                         for manager in managers:
                             runtime = manager._runtime_control
                             states = [_C.query_instance_control(source["gpu"], source["instance"],
@@ -1477,6 +1483,25 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
         EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
         EngineCore._kvcached_start_limit_watch = _kvcached_start_limit_watch
+
+        def wrap_step(original: Callable[..., Any]) -> Callable[..., Any]:
+            @wraps(original)
+            def wrapped(engine_self: Any, *args: Any, **kwargs: Any) -> Any:
+                if enable_kvcached():
+                    _apply_prefix_cache_retention_update(_read_prefix_cache_retention_update(throttle=True))
+                return original(engine_self, *args, **kwargs)
+
+            return wrapped
+
+        for name in ("step", "step_with_batch_queue"):
+            original_step = getattr(EngineCore, name, None)
+            marker = "__kvcached_prefix_retention_step__"
+            if original_step is None or self._is_already_patched(original_step, marker):
+                continue
+
+            wrapped_step = wrap_step(original_step)
+            self._mark_as_patched(wrapped_step, marker)
+            setattr(EngineCore, name, wrapped_step)
         return True
 
     @version_range(VLLM_ALL_RANGE)

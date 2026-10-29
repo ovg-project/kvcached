@@ -30,16 +30,13 @@ from typing import (
     cast,
 )
 
+from kvcached.control import get_prefix_cache_retention_limit
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import (
     VersionAwarePatch,
     version_range,
 )
 from kvcached.kv_geometry import backing_blocks_for_capacity
-from kvcached.prefix_cache_retention import (
-    _get_prefix_cache_retention_limit,
-    _register_prefix_cache_retention_enforcer,
-)
 from kvcached.utils import (
     PAGE_SIZE,
     KVCachePoolExhausted,
@@ -3616,6 +3613,40 @@ def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
             manager.reclaim_for_shrink()
 
 
+def _apply_sglang_prefix_retention() -> None:
+    """Consume one assignment at the same request boundary on every TP rank."""
+    from kvcached.prefix_cache_retention import (
+        _apply_prefix_cache_retention_update,
+        _read_prefix_cache_retention_update,
+    )
+
+    if _sglang_pipeline_stages() != 1:
+        return  # Pipeline stages do not share this scheduling boundary.
+    groups = _sglang_queue_cpu_groups()
+    update = None
+    error = None
+    if groups:
+        import torch
+
+        leader = torch.distributed.get_rank(groups[0]) == 0
+    else:
+        leader = True
+    if leader:
+        try:
+            update = _read_prefix_cache_retention_update(throttle=True)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            error = str(exc)
+    if groups:
+        payload: List[Any] = [update, error]
+        for group in groups:
+            torch.distributed.broadcast_object_list(
+                payload, src=torch.distributed.get_process_group_ranks(group)[0], group=group)
+        update, error = payload
+    if error is not None:
+        raise RuntimeError(f"Cannot read prefix retention control: {error}")
+    _apply_prefix_cache_retention_update(update)
+
+
 class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
     """Apply lowered kvcached limits while the SGLang scheduler is idle.
 
@@ -3641,6 +3672,24 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
         Scheduler = self._get_target_class(sched_mod)
         if Scheduler is None:
             return False
+        # Older releases receive directly on Scheduler; newer ones expose
+        # ingest_requests around RequestReceiver. Both run even when idle.
+        receive_name = next((name for name in ("ingest_requests", "recv_requests")
+                             if callable(getattr(Scheduler, name, None))), None)
+        if receive_name is not None:
+            receive = getattr(Scheduler, receive_name)
+            marker = "__kvcached_scheduler_retention_receive__"
+            if not self._is_already_patched(receive, marker):
+
+                @functools.wraps(receive)
+                def _wrapped_receive(sched_self: Any, *args: Any, **kwargs: Any) -> Any:
+                    result = receive(sched_self, *args, **kwargs)
+                    if enable_kvcached():
+                        _apply_sglang_prefix_retention()
+                    return result
+
+                self._mark_as_patched(_wrapped_receive, marker)
+                setattr(Scheduler, receive_name, _wrapped_receive)
         # SGLang 0.5.20 calls on_idle; earlier releases (e.g. 0.5.10) call
         # self_check_during_idle.
         name = next((name for name in ("on_idle", "self_check_during_idle")
@@ -3700,7 +3749,7 @@ def _install_prefix_cache_retention_hooks(
         def wrapped(cache: Any, *args: Any, **kwargs: Any) -> Any:
             result = original(cache, *args, **kwargs)
             cache._enforce_prefix_cache_retention(
-                _get_prefix_cache_retention_limit())
+                get_prefix_cache_retention_limit())
             return result
 
         return wrapped
@@ -3731,7 +3780,9 @@ def _install_prefix_cache_retention_hooks(
             wrapped = wrap_with_retention_check(original)
             patch._mark_as_patched(wrapped, completion_marker)
             setattr(concrete_cls, name, wrapped)
-        _register_prefix_cache_retention_enforcer(cache)
+        from kvcached.prefix_cache_retention import _policy
+
+        _policy.register(cache)
 
     patch._mark_as_patched(wrapped_init, marker)
     cache_cls.__init__ = wrapped_init
@@ -3822,7 +3873,7 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
 
         logger.info(
             "[kvcached] RadixCache retention limit initialized at %d tokens",
-            _get_prefix_cache_retention_limit(),
+            get_prefix_cache_retention_limit(),
         )
         return True
 
@@ -3862,7 +3913,7 @@ class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
         logger.info(
             "[kvcached] %s retention limit initialized at %d tokens",
             self.target_class,
-            _get_prefix_cache_retention_limit(),
+            get_prefix_cache_retention_limit(),
         )
         return True
 

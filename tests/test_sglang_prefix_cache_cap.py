@@ -106,7 +106,7 @@ def test_unlimited_cap_installs_runtime_hook_but_does_not_evict(
     cache.cache_finished_req("req")
     assert cache.evicted == []
 
-    retention._set_prefix_cache_retention_limit(16000)
+    retention._policy.set_limit(16000)
     assert cache.evicted == [EvictParams(num_tokens=4000)]
 
 
@@ -207,10 +207,30 @@ def _pending_copy(cache, kind, *, active=False):
 
 
 @pytest.mark.parametrize("kind", ["write", "load"])
-def test_hicache_enforces_new_limit_after_copy_completion(hicache, kind):
+def test_hicache_enforces_new_limit_after_copy_completion(hicache, kind, monkeypatch):
+    import kvcached
+    from kvcached import control
+
+    state = dict(gpu="gpu-0", generation=42, retention_tokens=-1, retention_revision=0)
+
+    def publish(gpu, instance, limit, generation, revision):
+        assert (gpu, instance, generation) == ("gpu-0", "model", 42)
+        state.update(retention_tokens=limit, retention_revision=revision)
+        return dict(state, status="accepted")
+
+    monkeypatch.setattr(kvcached, "_C", types.SimpleNamespace(
+        publish_prefix_cache_retention=publish), raising=False)
+    monkeypatch.setattr(control, "_get_instance_memory_limit", lambda name, observe: {
+        "instance": name, "complete_membership": True, "gpus": [dict(state)]})
+    retention._policy.instance_name = "model"
     node = _pending_copy(hicache, kind)
     hicache.cache_finished_req("finished-request")
-    retention._set_prefix_cache_retention_limit(0)
+
+    assert control.set_prefix_cache_retention_limit(0, instance_name="model")["accepted"]
+    assert control.get_prefix_cache_retention_limit() == -1  # Publishing only updates the ledger.
+    retention._apply_prefix_cache_retention_update(
+        retention._read_prefix_cache_retention_update())
+    assert control.get_prefix_cache_retention_limit() == 0
     assert hicache.evicted == []  # The copy still protects its device slots.
 
     assert hicache.check_hicache_events() == "events-result"
@@ -228,7 +248,7 @@ def test_hicache_enforces_new_limit_after_copy_completion(hicache, kind):
 @pytest.mark.parametrize("kind", ["write", "load"])
 def test_hicache_copy_completion_preserves_active_request(hicache, kind):
     node = _pending_copy(hicache, kind, active=True)
-    retention._set_prefix_cache_retention_limit(0)
+    retention._policy.set_limit(0)
     hicache.ready_count = 1
     hicache.check_hicache_events()
     assert node.locks == 1
@@ -251,7 +271,7 @@ def test_hicache_write_back_eviction_does_not_reenter(hicache):
     hicache.writing_check(finish_count=1)
     hicache.write_back = True
 
-    retention._set_prefix_cache_retention_limit(0)
+    retention._policy.set_limit(0)
 
     assert hicache.evicted == [EvictParams(num_tokens=8)]
     assert not node.device
@@ -268,7 +288,7 @@ def test_hicache_completion_hook_is_installed_once_per_class(hicache):
 
 def test_hicache_direct_loading_check_enforces_after_unpin(hicache):
     node = _pending_copy(hicache, "load")
-    retention._set_prefix_cache_retention_limit(0)
+    retention._policy.set_limit(0)
 
     assert hicache.loading_check(finish_count=1) == "load-result"
 
@@ -279,7 +299,7 @@ def test_hicache_direct_loading_check_enforces_after_unpin(hicache):
 def test_hicache_positive_cap_keeps_remaining_device_cache(hicache):
     first = _pending_copy(hicache, "write")
     second = _pending_copy(hicache, "write")
-    retention._set_prefix_cache_retention_limit(8)
+    retention._policy.set_limit(8)
 
     hicache.ready_count = 1
     hicache.check_hicache_events()
