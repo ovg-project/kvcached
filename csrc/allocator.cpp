@@ -490,6 +490,13 @@ bool FTensorAllocator::kv_tensors_created() {
   return num_layers_ > 0;
 }
 
+size_t FTensorAllocator::kv_mapping_page_size() {
+  std::lock_guard<std::mutex> lock(mtx_);
+  if (num_layers_ <= 0 || physical_bytes_per_offset_ == 0)
+    throw std::runtime_error("KV tensors must be initialized before mapping");
+  return contiguous_layout_ ? physical_bytes_per_offset_ : page_size_;
+}
+
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
   return map_to_kv_tensors_with_result(offsets).first;
 }

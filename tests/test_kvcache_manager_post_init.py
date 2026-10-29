@@ -69,8 +69,11 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     assert manager.lifecycle_phase is kv_cache_manager.LifecyclePhase.FAILED
 
 
-def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
+@pytest.mark.parametrize("contiguous", [False, True])
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch, contiguous, buffers):
     kv_cache_manager = _import_kv_cache_manager(monkeypatch)
+    monkeypatch.setattr(kv_cache_manager, "CONTIGUOUS_LAYOUT", contiguous)
     calls = []
 
     class FakePageAllocator:
@@ -106,15 +109,15 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
     monkeypatch.setattr(
         tp_ipc_util,
         "broadcast_map_to_kv_tensors",
-        lambda world_size, offsets, pp_rank=0, group_id=0: calls.append(
-            ("map", world_size, offsets, pp_rank, group_id)
+        lambda world_size, offsets, pp_rank=0, group_id=0, offset_stride=None: calls.append(
+            ("map", world_size, offsets, pp_rank, group_id, offset_stride)
         ),
     )
     monkeypatch.setattr(
         tp_ipc_util,
         "broadcast_unmap_from_kv_tensors",
-        lambda world_size, offsets, pp_rank=0, group_id=0: calls.append(
-            ("unmap", world_size, offsets, pp_rank, group_id)
+        lambda world_size, offsets, pp_rank=0, group_id=0, offset_stride=None: calls.append(
+            ("unmap", world_size, offsets, pp_rank, group_id, offset_stride)
         ),
     )
 
@@ -122,17 +125,20 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
         num_blocks=4,
         block_size=1,
         cell_size=1,
-        num_layers=1,
+        num_layers=8,
         world_size=4,
         pp_rank=2,
         async_sched=True,
         group_id=1007,
+        num_kv_buffers=buffers,
+        page_size=4 * 1024**2,
     )
 
     manager.page_allocator.map_callback(4, [1, 2, 3])
     manager.page_allocator.unmap_callback(4, [4, 5])
 
+    stride = 4 * 1024**2 * (8 * buffers if contiguous else 1)
     assert calls == [
-        ("map", 4, [1, 2, 3], 2, 1007),
-        ("unmap", 4, [4, 5], 2, 1007),
+        ("map", 4, [1, 2, 3], 2, 1007, stride),
+        ("unmap", 4, [4, 5], 2, 1007, stride),
     ]
