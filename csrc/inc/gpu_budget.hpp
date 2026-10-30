@@ -194,10 +194,10 @@ public:
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
                     uint64_t generation, uint64_t revision);
-  // The instance's unmet demand on this GPU: the bytes its first request that
-  // does not fit needs. A level that each scheduling step overwrites; 0 clears
-  // it, and it goes away with the instance. Only the part its max still
-  // allows counts.
+  // The instance's demand on this GPU: the new memory its last scheduling
+  // step needed beyond the pool's free blocks, as a forecast of the next
+  // step. A level that each step overwrites; 0 clears it, and it goes away
+  // with the instance. Only the part its max still allows counts.
   void set_demand(size_t slot, uint64_t bytes);
   // Bytes the slot's instance should release now so that higher priorities'
   // demand fits. Every instance derives the same plan from the ledger, so all

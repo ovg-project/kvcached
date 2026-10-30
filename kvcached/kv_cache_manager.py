@@ -704,6 +704,7 @@ class KVCacheManager:
         counters = getattr(self, "_operation_counters", None) if not _skip_wait else None
         if counters is not None:
             counters["allocation_requests_total"] = counters.get("allocation_requests_total", 0) + 1
+        reserved_before = len(self.reserved_blocks)
         try:
             indices = self._alloc_impl(need_size, _skip_wait=_skip_wait, pack_pages=pack_pages)
         except Exception:
@@ -722,6 +723,10 @@ class KVCacheManager:
             else:
                 counters["allocation_successes_total"] = counters.get("allocation_successes_total", 0) + 1
                 counters["allocated_blocks_total"] = counters.get("allocated_blocks_total", 0) + len(indices)
+        if indices is not None and not _skip_wait:
+            # Blocks set aside by try_to_reserve() were counted when reserved.
+            taken = len(indices) - (reserved_before - len(self.reserved_blocks))
+            self._step_alloc_blocks = getattr(self, "_step_alloc_blocks", 0) + taken
         return indices
 
     def _alloc_impl(self,
@@ -1224,14 +1229,26 @@ class KVCacheManager:
         return True
 
     @synchronized
+    def take_step_alloc_blocks(self) -> int:
+        """Blocks allocated since the last call, and restart the count.
+
+        Engines call it at each scheduling step's boundary. Blocks handed out
+        from ``try_to_reserve()``'s reservation count once, when reserved.
+        """
+        taken = getattr(self, "_step_alloc_blocks", 0)
+        self._step_alloc_blocks = 0
+        return taken
+
     @synchronized
     def demand_pages(self, need_blocks: int) -> int:
         """Pages that ``need_blocks`` more blocks would have to map.
 
         Free blocks in mapped pages, reserved blocks and pre-mapped pages need
-        no grant, so only the rest counts toward the demand an engine posts
-        for its first request that does not fit (#585's shortfall before the
-        headroom is subtracted).
+        no grant, so only the rest counts. Engines pass a step's need (what it
+        allocated plus what did not fit), so the demand is that need as a
+        forecast of the next step, beyond what the pool still holds free.
+        Evictable prefix cache is not subtracted: lower priorities' empty
+        pages and cache go before the instance's own cache (#608).
         """
         blocks_per_page = InternalPage.get_num_blocks(self.page_size,
                                                       self.block_mem_size)

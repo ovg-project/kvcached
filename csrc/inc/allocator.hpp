@@ -80,7 +80,7 @@ public:
   void destroy();
   BudgetSnapshot physical_budget_state();
   uint64_t available_physical_bytes();
-  // Post the instance's unmet demand on this GPU (#585 shortfall).
+  // Post the instance's demand on this GPU (see GpuBudget::set_demand).
   void set_kv_demand(uint64_t bytes);
   // Bytes to release now for higher priorities' demand (#585 reclaim).
   uint64_t kv_reclaim_bytes();
