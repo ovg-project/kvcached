@@ -3755,7 +3755,7 @@ class _PrefixCacheShrinkReclaimer:
         return cache, evictable if callable(evictable) else None, tokens_per_page
 
     def count_pages(self) -> int:
-        """Pages the evictable prefix cache would fill if packed (#609).
+        """Pages the evictable prefix cache would fill if packed (#585).
 
         Evictable tokens can share pages with running requests, so this can
         overstate what eviction frees; the next plan corrects it.
@@ -3844,7 +3844,7 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
 
 
 def _sglang_reclaim_for_priority(scheduler: Any) -> int:
-    """Release what higher priorities ask of this rank's token pool (#609).
+    """Release what higher priorities ask of this rank's token pool (#585).
 
     Returns the pages still asked of running requests. Under TP or PP the
     pool cannot shrink, so the ledger never picks it as a victim.
