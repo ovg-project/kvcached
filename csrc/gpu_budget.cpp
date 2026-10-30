@@ -18,10 +18,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace kvcached {
 namespace {
-constexpr uint64_t kMagic = 0x4b56425544473039ULL;
+constexpr uint64_t kMagic = 0x4b56425544473130ULL;
 constexpr size_t kInstances = 128;
 constexpr size_t kPools = 1024;
 constexpr size_t kName = 192;
@@ -180,6 +181,9 @@ struct GpuBudget::Shared {
     Observed<int64_t> priority;
     Observed<uint64_t> headroom;
     Observed<uint64_t> demand;
+    Observed<uint64_t> empty;
+    Observed<uint64_t> cache;
+    Observed<uint64_t> releasing;
   } instances[kInstances];
   struct Pool {
     Observed<uint64_t> owner;
@@ -597,6 +601,146 @@ uint64_t GpuBudget::watermark_locked(size_t instance,
   return total;
 }
 
+uint64_t ReclaimPlan::total() const {
+  return saturating_add(saturating_add(empty_bytes, cache_bytes),
+                        running_bytes);
+}
+
+// #585 section 4. From the highest priority down, each requester's need,
+// max(headroom, demand) as in its watermark, that free memory (plus what is
+// already being released) cannot cover is taken tier by tier: lower priorities'
+// empty pages, then their prefix cache, then the requester's own cache, then
+// lower priorities' running requests. Within a tier the lowest priority goes
+// first, then the largest excess over min(min, max). An instance with a pool
+// that cannot shrink is never a victim, and none is taken below its floor.
+ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
+                                      const Shared *data) const {
+  uint64_t charged[kInstances]{};
+  bool live[kInstances]{};
+  bool shrinkable[kInstances];
+  std::fill(std::begin(shrinkable), std::end(shrinkable), true);
+  uint64_t total = 0;
+  for (size_t slot = 0; slot < kPools; ++slot) {
+    const auto &pool = data->pools[slot];
+    total = add(total, pool.charged);
+    if (!pool.owner || pool.instance >= kInstances)
+      continue;
+    // A crashed instance neither asks nor gives (see watermark_locked).
+    if (!live[pool.instance] && pool_alive(slot, data))
+      live[pool.instance] = true;
+    charged[pool.instance] = add(charged[pool.instance], pool.charged);
+    shrinkable[pool.instance] = shrinkable[pool.instance] && pool.can_shrink;
+  }
+  enum Tier { kEmpty, kCache, kRunning, kTiers };
+  uint64_t left[kTiers][kInstances]{};
+  uint64_t excess[kInstances]{};
+  uint64_t releasing = 0;
+  std::vector<size_t> requesters;
+  auto need = [&](size_t i) {
+    return std::max<uint64_t>(data->instances[i].headroom,
+                              allowed_demand(i, charged[i], data));
+  };
+  for (size_t i = 0; i < kInstances; ++i) {
+    const auto &entry = data->instances[i];
+    if (!live[i] || !entry.valid)
+      continue;
+    // Released pages stay charged until refunded; they are already given.
+    const uint64_t held =
+        charged[i] - std::min<uint64_t>(entry.releasing, charged[i]);
+    releasing = add(releasing, charged[i] - held);
+    left[kEmpty][i] = std::min<uint64_t>(entry.empty, held);
+    left[kCache][i] = std::min<uint64_t>(entry.cache, held - left[kEmpty][i]);
+    left[kRunning][i] = held - left[kEmpty][i] - left[kCache][i];
+    const uint64_t floor = std::min<uint64_t>(entry.min, entry.limit);
+    if (shrinkable[i] && held > floor)
+      excess[i] = held - floor;
+    if (need(i))
+      requesters.push_back(i);
+  }
+  auto priority = [&](size_t i) -> int64_t {
+    return data->instances[i].priority;
+  };
+  std::stable_sort(
+      requesters.begin(), requesters.end(),
+      [&](size_t a, size_t b) { return priority(a) > priority(b); });
+  ReclaimPlan assigned[kInstances];
+  auto give = [&](size_t victim, Tier tier, uint64_t bytes) {
+    auto &plan = assigned[victim];
+    (tier == kEmpty   ? plan.empty_bytes
+     : tier == kCache ? plan.cache_bytes
+                      : plan.running_bytes) += bytes;
+  };
+  for (const auto requester : requesters) {
+    const auto watermark = watermark_locked(requester, data);
+    const uint64_t budget = data->budget;
+    const auto usable = budget > watermark ? budget - watermark : 0;
+    const auto available = add(usable > total ? usable - total : 0, releasing);
+    const auto wanted = need(requester);
+    uint64_t deficit = wanted > available ? wanted - available : 0;
+    for (int step = 0; step < 4 && deficit; ++step) {
+      if (step == 2) {
+        // The requester's own cache: it evicts that itself when short.
+        const auto take = std::min(deficit, left[kCache][requester]);
+        left[kCache][requester] -= take;
+        deficit -= take;
+        continue;
+      }
+      const Tier tier = step == 0 ? kEmpty : step == 1 ? kCache : kRunning;
+      std::vector<size_t> victims;
+      for (size_t i = 0; i < kInstances; ++i)
+        if (excess[i] && left[tier][i] && priority(i) < priority(requester))
+          victims.push_back(i);
+      std::stable_sort(victims.begin(), victims.end(), [&](size_t a, size_t b) {
+        return priority(a) != priority(b) ? priority(a) < priority(b)
+                                          : excess[a] > excess[b];
+      });
+      for (const auto victim : victims) {
+        if (!deficit)
+          break;
+        const auto take =
+            std::min({excess[victim], left[tier][victim], deficit});
+        excess[victim] -= take;
+        left[tier][victim] -= take;
+        give(victim, tier, take);
+        deficit -= take;
+      }
+    }
+  }
+  return assigned[instance];
+}
+
+ReclaimPlan GpuBudget::reclaim_plan(size_t slot) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  return reclaim_locked(shared_->pools[slot].instance, shared_);
+}
+
+bool GpuBudget::post_reclaimable(const std::string &instance,
+                                 uint64_t generation, uint64_t empty,
+                                 uint64_t cache, uint64_t releasing) {
+  Locked lock(*this);
+  for (auto &entry : shared_->instances) {
+    if (entry.valid && entry.generation == generation &&
+        instance == entry.name_string()) {
+      publish(entry.empty, empty);
+      publish(entry.cache, cache);
+      publish(entry.releasing, releasing);
+      return true;
+    }
+  }
+  return false;
+}
+
+void GpuBudget::set_reclaimable(size_t slot, uint64_t empty, uint64_t cache,
+                                uint64_t releasing) {
+  Locked lock(*this);
+  (void)snapshot_locked(slot);
+  auto &entry = shared_->instances[shared_->pools[slot].instance];
+  publish(entry.empty, empty);
+  publish(entry.cache, cache);
+  publish(entry.releasing, releasing);
+}
+
 bool GpuBudget::post_demand(const std::string &instance, uint64_t generation,
                             uint64_t bytes) {
   Locked lock(*this);
@@ -770,6 +914,14 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.priority = entry.priority;
   state.headroom_bytes = entry.headroom;
   state.watermark_bytes = watermark_locked(instance, data);
+  const auto plan = reclaim_locked(instance, data);
+  state.reclaim_bytes = plan.total();
+  state.reclaim_empty_bytes = plan.empty_bytes;
+  state.reclaim_cache_bytes = plan.cache_bytes;
+  state.reclaim_running_bytes = plan.running_bytes;
+  state.empty_bytes = entry.empty;
+  state.cache_bytes = entry.cache;
+  state.releasing_bytes = entry.releasing;
   uint64_t total = 0;
   for (const auto &pool : data->pools)
     total = add(total, pool.charged);
