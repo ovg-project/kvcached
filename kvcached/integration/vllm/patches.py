@@ -3394,6 +3394,54 @@ def _record_blocks_to_allocate(coordinator: Any) -> None:
     coordinator._kvcached_records_need = True
 
 
+def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
+    """Preempt running requests until ``pages`` whole pages are released.
+
+    The last tier of #585's reclaim: a higher priority's demand is still
+    short after this instance's empty pages and prefix cache. Requests are
+    preempted in the scheduler's own order (the last admitted, or the lowest
+    priority under the priority policy) and go back to the waiting queue, as
+    vLLM's own preemption does. Only pages left empty are released, so a
+    request whose blocks share pages with others may free nothing at once.
+    Returns how many requests were preempted.
+    """
+    preempt = getattr(scheduler, "_preempt_request", None)
+    running = getattr(scheduler, "running", None)
+    if pages <= 0 or preempt is None or not running:
+        return 0
+    can_free = getattr(scheduler, "_request_blocks_can_be_freed", None)
+    by_priority = getattr(getattr(scheduler, "policy", None), "name", "") == "PRIORITY"
+    try:
+        takes_drop = "drop_stale_output" in inspect.signature(preempt).parameters
+    except (TypeError, ValueError):
+        takes_drop = False
+    prev_scheduled = getattr(scheduler, "prev_step_scheduled_req_ids", None)
+    reserved = kv.page_allocator.get_num_reserved_pages()
+    start = kv.occupied_pages()
+    timestamp = time.monotonic()
+    preempted = 0
+    while running and start - kv.occupied_pages() < pages:
+        victim = (max(running, key=lambda r: (r.priority, r.arrival_time))
+                  if by_priority else running[-1])
+        if can_free is not None and not can_free(victim):
+            break  # an in-flight step still writes its blocks
+        running.remove(victim)
+        if takes_drop:
+            preempt(victim, timestamp,
+                    drop_stale_output=getattr(scheduler, "requires_kv_delivery", False))
+        else:
+            preempt(victim, timestamp)
+        if prev_scheduled is not None:
+            # It may resume in this same step; resend its tokens if it does.
+            prev_scheduled.discard(victim.request_id)
+        preempted += 1
+        # Freed blocks of a cached prefix stay in the prefix cache.
+        kv.evict_cache_pages(pages - (start - kv.occupied_pages()))
+    kv.release_empty_pages(
+        max(0, kv.page_allocator.get_num_reserved_pages() - reserved))
+    return preempted
+
+
 class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
     """Post each step's need for new memory as the instance's demand.
 
@@ -3402,6 +3450,10 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
     the step allocated plus those of its first request that did not fit,
     beyond what the pool still holds free, so lower priorities leave one more
     step of it free. It is 0 when the pool's own free blocks cover a step.
+
+    Before scheduling, the step also releases what higher priorities' demand
+    asks of this instance: empty pages and prefix cache, then running
+    requests, which it preempts (#609).
     """
 
     library = "vllm"
@@ -3445,7 +3497,10 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
                 try:
                     # Release what higher priorities ask of this instance
                     # before scheduling; the rest is running requests'.
-                    self._kvcached_reclaim_running_pages = reclaim()
+                    running = reclaim()
+                    self._kvcached_reclaim_running_pages = running
+                    if running > 0:
+                        _kvcached_preempt_for_priority(self, kv, running)
                 except Exception as error:  # never fail a scheduling step
                     logger.warning("Could not release KV memory for a higher "
                                    "priority: %s", error)

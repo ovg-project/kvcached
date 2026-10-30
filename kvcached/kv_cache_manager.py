@@ -1385,6 +1385,25 @@ class KVCacheManager:
         return plan
 
     @synchronized
+    def occupied_pages(self) -> int:
+        """Mapped pages that still hold blocks or wait to be reused.
+
+        Pages retired for a deferred physical release count as released.
+        """
+        retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", None) or ())
+        return len(self.full_pages) + len(self.avail_pages) - retiring
+
+    @synchronized
+    def evict_cache_pages(self, pages: int) -> int:
+        """Evict up to ``pages`` whole pages of prefix cache; returns how many."""
+        left = pages
+        for _, evict in self._live_cache_owners():
+            if left <= 0:
+                break
+            left -= max(0, int(evict(left)))
+        return pages - max(0, left)
+
+    @synchronized
     def release_empty_pages(self, max_pages: int) -> int:
         """Unmap up to ``max_pages`` pre-mapped pages; returns how many."""
         if max_pages <= 0:
@@ -1411,11 +1430,8 @@ class KVCacheManager:
         if not plan["empty"] and not plan["cache"]:
             return plan["running"]
         reserved = self.page_allocator.get_num_reserved_pages()
-        left = plan["cache"]
-        for _, evict in self._live_cache_owners():
-            if left <= 0:
-                break
-            left -= max(0, int(evict(left)))
+        if plan["cache"]:
+            self.evict_cache_pages(plan["cache"])
         landed = max(0, self.page_allocator.get_num_reserved_pages() - reserved)
         self.release_empty_pages(plan["empty"] + landed)
         self._increment_operation_counter("priority_reclaims_total")
