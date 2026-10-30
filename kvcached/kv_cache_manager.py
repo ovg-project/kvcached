@@ -751,10 +751,10 @@ class KVCacheManager:
             logger.warning(f"available_size()={self.available_size()} < "
                            f"need_size={need_size}")
             return None
-        # A pending shrink waits for retired pages to be released; reusing
-        # them would undo the pages its reclaimers just emptied.
-        retiring = (self._retiring_page_ids()
-                    if getattr(self, "in_shrink", False) else frozenset())
+        # A pending shrink, or a release for a higher priority, waits for
+        # retired pages to be released; reusing them would undo the pages
+        # its reclaimers just emptied.
+        retiring = self._unreusable_page_ids()
 
         ret_index = []
         page: Optional[InternalPage] = None
@@ -1408,6 +1408,9 @@ class KVCacheManager:
         """
         self._wait_post_init()
         plan = self.reclaim_plan_pages()
+        # Under a deferred physical release, pages emptied for the plan wait
+        # for the release barrier; this step must not reuse them.
+        self._releasing_for_priority = any(plan.values())
         if not plan["empty"] and not plan["cache"]:
             return plan["running"]
         reserved = self.page_allocator.get_num_reserved_pages()
@@ -1509,6 +1512,11 @@ class KVCacheManager:
         if target_pages is None:
             return None
         return target_pages * self.page_size // self.block_mem_size
+
+    def _unreusable_page_ids(self) -> frozenset:
+        if getattr(self, "in_shrink", False) or getattr(self, "_releasing_for_priority", False):
+            return self._retiring_page_ids()
+        return frozenset()
 
     def _retiring_page_ids(self) -> frozenset:
         return frozenset(
@@ -1656,8 +1664,9 @@ class KVCacheManager:
     @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
-        if self.in_shrink:
-            # alloc() does not reuse pages retired for a pending shrink.
+        if self.in_shrink or getattr(self, "_releasing_for_priority", False):
+            # alloc() does not reuse pages retired for a pending shrink or a
+            # higher priority.
             for page_id in self._retiring_page_ids():
                 page = self.avail_pages.get(page_id)
                 if page is not None:
