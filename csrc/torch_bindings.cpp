@@ -180,7 +180,13 @@ py::dict physical_budget_state(int64_t group_id = 0) {
   result["sync_acquire_ns"] = state.sync_acquire_ns;
   result["sync_wait_ns"] = state.sync_wait_ns;
   result["sync_dead_owner_recoveries"] = state.sync_dead_owner_recoveries;
+  result["watermark_bytes"] = state.watermark_bytes;
   return result;
+}
+
+void set_kv_demand(uint64_t bytes, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  FTensorAllocator::global_allocator(group_id)->set_kv_demand(bytes);
 }
 
 std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision,
@@ -403,6 +409,9 @@ py::dict control_dict(const InstanceControl &state) {
   result["min_bytes"] = state.min_bytes;
   result["priority"] = state.priority;
   result["headroom_bytes"] = state.headroom_bytes;
+  result["shortfall_bytes"] = state.shortfall_bytes;
+  result["watermark_bytes"] = state.watermark_bytes;
+  result["available_bytes"] = state.available_bytes;
   return result;
 }
 
@@ -446,6 +455,12 @@ py::dict observe_instance_control(const std::string &path,
     state = GpuBudget::open_control(path, true)->observe_control(name);
   }
   return control_dict(state);
+}
+
+bool publish_instance_demand(const std::string &path, const std::string &name,
+                             uint64_t generation, uint64_t bytes) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_demand(name, generation, bytes);
 }
 
 py::dict publish_instance_control(const std::string &path,
@@ -536,6 +551,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
   m.def("observe_instance_control", &kvcached::observe_instance_control,
         py::arg("path"), py::arg("instance"));
+  m.def("publish_instance_demand", &kvcached::publish_instance_demand,
+        py::arg("path"), py::arg("instance"), py::arg("generation"),
+        py::arg("bytes"));
   m.def("publish_instance_control", &kvcached::publish_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("bytes"),
         py::arg("generation"), py::arg("revision") = py::none());
@@ -560,6 +578,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
         py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);
   m.def("recalibrate_physical_budget", &kvcached::recalibrate_physical_budget,
+        py::arg("group_id") = 0);
+  m.def("set_kv_demand", &kvcached::set_kv_demand, py::arg("bytes"),
         py::arg("group_id") = 0);
   m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
         "prepare_map_to_kv_tensors", py::arg("transaction_id"),

@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import math
 import os
@@ -1183,6 +1184,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def get_num_free_blocks(self) -> int:
                 return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
+
+            def begin_demand_step(self) -> None:
+                self.kv_cache_manager.take_step_alloc_blocks()
+
+            def post_demand_blocks(self, unfit_blocks: int) -> None:
+                # The step's need: what it allocated, including blocks freed
+                # by evicting this pool's own prefix cache, plus what did not
+                # fit. It forecasts the next step (#585).
+                manager = self.kv_cache_manager
+                need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+                manager.post_demand(manager.demand_pages(need))
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
@@ -3323,6 +3335,89 @@ class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _record_blocks_to_allocate(coordinator: Any) -> None:
+    """Keep the last block count the coordinator computed for a request.
+
+    ``allocate_slots()`` compares that count with the free blocks and
+    returns None when it does not fit, so after a None it is the need of the
+    request that did not fit.
+    """
+    if getattr(coordinator, "_kvcached_records_need", False):
+        return
+    original = getattr(coordinator, "get_num_blocks_to_allocate", None)
+    if original is None:
+        return
+
+    @functools.wraps(original)
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        need = original(*args, **kwargs)
+        coordinator._kvcached_last_need = need
+        return need
+
+    coordinator.get_num_blocks_to_allocate = recording
+    coordinator._kvcached_records_need = True
+
+
+class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
+    """Post each step's need for new memory as the instance's demand.
+
+    #585's watermarks keep free memory from lower priorities for a
+    higher-priority instance. The level is overwritten every step: the blocks
+    the step allocated plus those of its first request that did not fit,
+    beyond what the pool still holds free, so lower priorities leave one more
+    step of it free. It is 0 when the pool's own free blocks cover a step.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.sched.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_demand"
+
+    def apply(self, scheduler_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_schedule(scheduler_mod)
+
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_schedule(self, scheduler_mod: types.ModuleType) -> bool:
+        Scheduler = self._get_target_class(scheduler_mod)
+        if Scheduler is None:
+            return False
+        original_schedule = getattr(Scheduler, "schedule", None)
+        if original_schedule is None:
+            self.logger.warning(
+                "Scheduler.schedule was not found; kvcached posts no demand")
+            return False
+        if self._is_already_patched(original_schedule, "scheduler_demand"):
+            return True
+
+        logger = self.logger
+
+        @functools.wraps(original_schedule)
+        def _patched_schedule(self, *args: Any, **kwargs: Any) -> Any:
+            manager = getattr(self, "kv_cache_manager", None)
+            if not enable_kvcached() or manager is None:
+                return original_schedule(self, *args, **kwargs)
+            manager._kvcached_step_need = None
+            pool = getattr(manager, "block_pool", None)
+            begin = getattr(pool, "begin_demand_step", None)
+            if begin is not None:
+                begin()
+            try:
+                return original_schedule(self, *args, **kwargs)
+            finally:
+                post = getattr(pool, "post_demand_blocks", None)
+                if post is not None:
+                    try:
+                        post(int(manager._kvcached_step_need or 0))
+                    except Exception as error:  # never fail a scheduling step
+                        logger.warning("Could not post KV demand: %s", error)
+
+        self._mark_as_patched(_patched_schedule, "scheduler_demand")
+        Scheduler.schedule = _patched_schedule  # type: ignore[method-assign]
+        return True
+
+
 class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
     """Report an exhausted physical KV pool the way vLLM's scheduler expects.
 
@@ -3382,6 +3477,8 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                 return original_allocate_slots(self, *args, **kwargs)
             attempt = None
             coordinator = getattr(self, "coordinator", None)
+            if coordinator is not None:
+                _record_blocks_to_allocate(coordinator)
             if repair_native_retry and coordinator is not None:
                 from kvcached.integration.vllm.allocation_attempt import AllocationAttempt
 
@@ -3392,7 +3489,7 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                 request = args[0] if args else kwargs["request"]
                 attempt.begin(request.request_id)
             try:
-                return original_allocate_slots(self, *args, **kwargs)
+                result = original_allocate_slots(self, *args, **kwargs)
             except KVCachePoolExhausted as exhausted:
                 if attempt is not None:
                     attempt.rollback()
@@ -3402,10 +3499,16 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                     "Shared physical KV pool is exhausted; reporting a "
                     "scheduling miss so the engine can preempt and retry: %s",
                     exhausted)
-                return None
+                result = None
             finally:
                 if attempt is not None:
                     attempt.end()
+            if result is None and getattr(self, "_kvcached_step_need", None) is None:
+                # The first request of the step that does not fit; the
+                # scheduler patch posts it as the instance's demand.
+                self._kvcached_step_need = getattr(
+                    coordinator, "_kvcached_last_need", None)
+            return result
 
         self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
         KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]

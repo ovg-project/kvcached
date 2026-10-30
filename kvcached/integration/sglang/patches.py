@@ -417,6 +417,122 @@ def _sglang_budget_round(scheduler: Any):
         _SGLANG_BUDGET.round = None
 
 
+_SGLANG_DEMAND = threading.local()
+
+
+@contextlib.contextmanager
+def _sglang_demand_round(scheduler: Any):
+    """Post the round's need for new memory as the KV demand.
+
+    #585's watermarks keep free memory from lower priorities for a
+    higher-priority instance. The level is overwritten every scheduling
+    round: the blocks the round allocated plus those of its first request
+    that did not fit, beyond what the pool still holds free, as a forecast of
+    the next round. Rounds nest (``get_new_batch_prefill`` and
+    ``update_running_batch`` inside ``get_next_batch_to_run``); only the
+    outermost one posts.
+
+    After a prefill misses for memory, SGLang skips prefill until one of its
+    own requests finishes. Under kvcached another instance can free the
+    memory instead, so once the pool can back the missed request again the
+    round lets SGLang retry; until then a round that does not try one
+    carries the last miss over while requests wait.
+    """
+    if getattr(_SGLANG_DEMAND, "open", False):
+        yield
+        return
+    _SGLANG_DEMAND.open = True
+    _SGLANG_DEMAND.need = None
+    _SGLANG_DEMAND.prefill_tried = False
+    _SGLANG_DEMAND.prefill_miss = None
+    try:
+        manager = _sglang_demand_manager(scheduler)
+        if manager is not None:
+            manager.take_step_alloc_blocks()
+            _sglang_retry_prefill_if_backed(scheduler, manager)
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not start a KV demand round: %s", error)
+    try:
+        yield
+    finally:
+        need = _SGLANG_DEMAND.need
+        miss = _SGLANG_DEMAND.prefill_miss
+        _SGLANG_DEMAND.open = False
+        _SGLANG_DEMAND.need = None
+        if miss is not None:
+            scheduler._kvcached_prefill_miss = miss
+        elif _SGLANG_DEMAND.prefill_tried or not getattr(scheduler, "waiting_queue", None):
+            scheduler._kvcached_prefill_miss = None
+        elif need is None:
+            need = getattr(scheduler, "_kvcached_prefill_miss", None)
+        _sglang_post_demand(scheduler, need or 0)
+
+
+def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
+    """Clear SGLang's full-batch flag once the pool can back its last miss.
+
+    Only without TP: each rank reads its own GPU's memory, and ranks that
+    disagree on whether to try a prefill would schedule different batches.
+    """
+    if _sglang_parallel_size(scheduler) != 1:
+        return
+    miss = getattr(scheduler, "_kvcached_prefill_miss", None)
+    batch = getattr(scheduler, "running_batch", None)
+    if (miss and batch is not None and getattr(batch, "batch_is_full", False)
+            and getattr(scheduler, "waiting_queue", None)
+            and manager.available_size() >= miss):
+        batch.batch_is_full = False
+
+
+def _sglang_note_unfit(need_blocks: int) -> None:
+    """Record the blocks of the round's first request that does not fit."""
+    if getattr(_SGLANG_DEMAND, "open", False) and _SGLANG_DEMAND.need is None:
+        _SGLANG_DEMAND.need = max(0, int(need_blocks))
+
+
+def _sglang_demand_manager(scheduler: Any) -> Any:
+    """The token pool's manager, which posts demand on this rank's GPU.
+
+    Only the token pool (the full-attention pool of an SWA composite) is
+    counted, and a pipeline posts nothing.
+    """
+    if _sglang_pipeline_stages() > 1:
+        return None
+    managers = _sglang_budget_managers(scheduler)
+    manager = managers[0] if managers else None
+    return manager if getattr(manager, "post_demand", None) is not None else None
+
+
+def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
+    """Post the round's need: what it allocated, including blocks freed by
+    evicting the radix cache, plus what did not fit."""
+    manager = _sglang_demand_manager(scheduler)
+    if manager is None:
+        return
+    try:
+        need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+        manager.post_demand(manager.demand_pages(need))
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not post KV demand: %s", error)
+
+
+def _sglang_request_need_tokens(req: Any) -> int:
+    """Tokens a waiting request asks the prefill budget for (input + output)."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    if fill is None:
+        fill = getattr(req, "fill_ids", None) or getattr(req, "origin_input_ids", ()) or ()
+    prefix = getattr(req, "prefix_indices", None)
+    params = getattr(req, "sampling_params", None)
+    max_new = max(0, int(getattr(params, "max_new_tokens", 0) or 0)
+                  - len(getattr(req, "output_ids", ()) or ()))
+    try:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+    except Exception:
+        CLIP_MAX_NEW_TOKENS = 4096
+    return max(0, len(fill) - (len(prefix) if prefix is not None else 0)) + min(
+        max_new, int(CLIP_MAX_NEW_TOKENS))
+
+
 def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
                           pool: Any) -> None:
     """Report that the kvcached pool behind ``owner`` cannot back a request.
@@ -468,6 +584,8 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
         evict(tree_cache, num_tokens)
     local_miss = need_blocks > 0 and not bool(
         allocator.kvcached_allocator.try_to_reserve(need_blocks, packed=packed))
+    if local_miss:
+        _sglang_note_unfit(need_blocks)
     return not _sglang_group_capacity_miss(local_miss)
 
 
@@ -2952,6 +3070,64 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
+    """Record a waiting request that the prefill budget cannot admit.
+
+    ``PrefillAdder.add_one_req`` answers ``NO_TOKEN`` when the request's
+    input and output tokens exceed the remaining budget, and the scheduler
+    stops admitting for the round. The first such request is the instance's
+    demand for the round (``_sglang_demand_round``).
+    """
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.schedule_policy"
+    target_class = "PrefillAdder"
+    patch_name = "prefill_adder_demand"
+
+    def apply(self, policy_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        if self.patch_add_one_req not in self.applicable_methods:
+            return True
+        return self.patch_add_one_req(policy_mod)
+
+    @version_range(">=0.5.13")
+    def patch_add_one_req(self, policy_mod: types.ModuleType) -> bool:
+        PrefillAdder = self._get_target_class(policy_mod)
+        if PrefillAdder is None:
+            return False
+        original = getattr(PrefillAdder, "add_one_req", None)
+        if original is None:
+            self.logger.warning(
+                "PrefillAdder.add_one_req was not found; a waiting request "
+                "posts no KV demand")
+            return False
+        marker = "__kvcached_prefill_demand_patched__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        @functools.wraps(original)
+        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(self, req, *args, **kwargs)
+            if enable_kvcached():
+                _SGLANG_DEMAND.prefill_tried = True
+                if getattr(result, "name", None) == "NO_TOKEN":
+                    page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+                    # The adder first sets tokens aside for running requests'
+                    # remaining output; free blocks kept for them are not
+                    # free for this request.
+                    offset = max(0, int(getattr(self, "rem_total_token_offset", 0) or 0))
+                    blocks = -(-(_sglang_request_need_tokens(req) + offset) // page_size)
+                    _sglang_note_unfit(blocks)
+                    if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
+                        _SGLANG_DEMAND.prefill_miss = blocks
+            return result
+
+        self._mark_as_patched(_patched_add_one_req, marker)
+        PrefillAdder.add_one_req = _patched_add_one_req
+        return True
+
+
 class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
     """Make the ranks sharing a waiting queue admit against one budget.
 
@@ -3020,7 +3196,7 @@ class SchedulerSharedBudgetPatch(VersionAwarePatch, BasePatch):
         def _patched(self, *args: Any, **kwargs: Any) -> Any:
             if not enable_kvcached():
                 return original(self, *args, **kwargs)
-            with _sglang_budget_round(self):
+            with _sglang_demand_round(self), _sglang_budget_round(self):
                 return original(self, *args, **kwargs)
 
         return _patched

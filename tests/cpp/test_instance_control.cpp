@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace kvcached;
 
@@ -530,6 +531,98 @@ int main() {
     budget->publish_control("zero-revision", policy, state.generation);
     assert(budget->acknowledge_control(slot, 0));
     assert(budget->control_state(slot).convergence == "converged");
+  }
+  {
+    // Watermarks (#585 section 3) on a 100-byte GPU: low holds 80 and high
+    // (priority 1, headroom 4) holds 12, so 8 are free.
+    const auto ledger = std::string(directory) + "/watermarks";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 4});
+    auto peer = budget->register_pool("peer", 0, InstancePolicy{0, 1, 0});
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    auto hold = [&](size_t slot, uint64_t bytes) {
+      auto grant = budget->grant(slot, bytes);
+      held.push_back(grant->take(bytes));
+      grant->finish();
+    };
+    hold(low, 80);
+    hold(high, 12);
+    auto fits = [&](size_t slot, uint64_t bytes) {
+      try {
+        budget->grant(slot, bytes)->finish();
+        return true;
+      } catch (const std::runtime_error &) {
+        return false;
+      }
+    };
+    // Without demand, high's headroom alone is kept from low.
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(fits(low, 4) && !fits(low, 5));
+    // A demand of 10 counts 6 beyond the headroom, so the watermark is 10 and
+    // low cannot take any of the 8 free bytes. High and its equal-priority
+    // peer still can.
+    // What each instance can still be granted, as a scheduler that drives
+    // workers reads it.
+    assert(budget->query_control("low").available_bytes == 4);
+    assert(budget->query_control("high").available_bytes == 8);
+    budget->set_demand(high, 10);
+    assert(budget->query_control("high").shortfall_bytes == 6);
+    assert(budget->query_control("low").available_bytes == 0);
+    // Such a scheduler posts the demand by instance name and generation.
+    auto writer = GpuBudget::open_control(ledger);
+    const auto generation = budget->query_control("high").generation;
+    assert(writer->post_demand("high", generation, 12));
+    assert(budget->snapshot(low).watermark_bytes == 12);
+    assert(!writer->post_demand("high", generation + 1, 0));
+    assert(writer->post_demand("high", generation, 10));
+    writer.reset();
+    assert(budget->snapshot(low).watermark_bytes == 10);
+    assert(!fits(low, 1));
+    assert(budget->snapshot(high).watermark_bytes == 0 && fits(high, 8));
+    assert(budget->snapshot(peer).watermark_bytes == 0 && fits(peer, 8));
+    // Each attempt overwrites the level, and 0 clears it.
+    budget->set_demand(high, 2);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->snapshot(low).watermark_bytes == 4 && fits(low, 4));
+    // Demand that high's own max cannot take keeps nothing from low: with a
+    // max of 14 and 12 held, only 2 of 10 count, which the headroom covers.
+    budget->set_demand(high, 10);
+    assert(budget->set_instance_limit(high, 14, 1) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->set_instance_limit(high, UINT64_MAX, 2) == "applied");
+    assert(budget->snapshot(low).watermark_bytes == 10);
+    budget->set_demand(high, 0);
+    assert(budget->query_control("low").watermark_bytes == 4);
+    // A crashed instance's controls stop counting at once, and its entry is
+    // left for the orchestrator to clean up.
+    int ready[2], release[2];
+    assert(pipe(ready) == 0 && pipe(release) == 0);
+    const pid_t child = fork();
+    if (child == 0) {
+      auto other = GpuBudget::connect(ledger, [] { return 100; });
+      other->register_pool("crashed", 0, InstancePolicy{0, 5, 3});
+      char byte = 1;
+      if (write(ready[1], &byte, 1) != 1 || read(release[0], &byte, 1) != 1)
+        _exit(1);
+      _exit(0); // no destructor: the pool entry stays behind
+    }
+    char byte = 0;
+    assert(read(ready[0], &byte, 1) == 1);
+    assert(budget->snapshot(low).watermark_bytes == 7);
+    assert(write(release[1], &byte, 1) == 1);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->snapshot(high).watermark_bytes == 0);
+    assert(budget->query_control("crashed").priority == 5);
+    for (int fd : {ready[0], ready[1], release[0], release[1]})
+      close(fd);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
   }
   unlink(path.c_str());
   rmdir(directory);

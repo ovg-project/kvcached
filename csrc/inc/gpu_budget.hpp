@@ -45,6 +45,13 @@ struct InstanceControl {
   uint64_t min_bytes = 0;
   int64_t priority = 0;
   uint64_t headroom_bytes = 0;
+  // The part of the instance's posted demand its headroom does not cover,
+  // and the free bytes higher priorities keep from it on this GPU.
+  uint64_t shortfall_bytes = 0;
+  uint64_t watermark_bytes = 0;
+  // What the instance can still be granted on this GPU: free memory above
+  // its watermark, within its max.
+  uint64_t available_bytes = 0;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -73,6 +80,9 @@ struct BudgetSnapshot {
   uint64_t charged_bytes = 0;
   uint64_t instance_charged_bytes = 0;
   uint64_t instance_limit_bytes = UINT64_MAX;
+  // Free bytes that higher-priority instances keep from this one: the sum of
+  // max(headroom, demand) over them. Grants and forecasts stop above it.
+  uint64_t watermark_bytes = 0;
   uint64_t sync_acquisitions = 0;
   uint64_t sync_contentions = 0;
   uint64_t sync_acquire_ns = 0;
@@ -182,6 +192,15 @@ public:
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
                     uint64_t generation, uint64_t revision);
+  // The instance's demand on this GPU: the new memory its last scheduling
+  // step needed beyond the pool's free blocks, as a forecast of the next
+  // step. A level that each step overwrites; 0 clears it, and it goes away
+  // with the instance. Only the part its max still allows counts.
+  void set_demand(size_t slot, uint64_t bytes);
+  // The same level, posted by a process that drives the instance's workers
+  // (vLLM's scheduler under TP > 1). False if the instance is gone.
+  bool post_demand(const std::string &instance, uint64_t generation,
+                   uint64_t bytes);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -213,6 +232,10 @@ private:
   void reclaim_instances_locked();
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
+  bool pool_alive(size_t slot, const Shared *data) const;
+  static uint64_t allowed_demand(size_t instance, uint64_t charged,
+                                 const Shared *data);
+  uint64_t watermark_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);
   void accounting_test_hook(int stage);

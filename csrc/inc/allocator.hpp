@@ -80,6 +80,8 @@ public:
   void destroy();
   BudgetSnapshot physical_budget_state();
   uint64_t available_physical_bytes();
+  // Post the instance's demand on this GPU (see GpuBudget::set_demand).
+  void set_kv_demand(uint64_t bytes);
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
   bool recalibrate_physical_budget();
   InstanceControl configure_instance_control(bool can_shrink,
