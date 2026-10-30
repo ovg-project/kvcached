@@ -452,7 +452,7 @@ def _sglang_demand_round(scheduler: Any):
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
-    scheduler._kvcached_reclaim_running_pages = _sglang_reclaim_for_priority(scheduler)
+    _sglang_begin_preemption(scheduler, _sglang_reclaim_for_priority(scheduler))
     try:
         yield
     finally:
@@ -466,6 +466,7 @@ def _sglang_demand_round(scheduler: Any):
             scheduler._kvcached_prefill_miss = None
         elif need is None:
             need = getattr(scheduler, "_kvcached_prefill_miss", None)
+        _sglang_end_preemption()
         _sglang_post_demand(scheduler, need or 0)
 
 
@@ -483,6 +484,46 @@ def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
             and getattr(scheduler, "waiting_queue", None)
             and manager.available_size() >= miss):
         batch.batch_is_full = False
+
+
+def _sglang_begin_preemption(scheduler: Any, pages: int) -> None:
+    """Let this round's decode retract requests until ``pages`` are free.
+
+    The last tier of #585's reclaim: a higher priority's demand is still
+    short after this pool's empty pages and prefix cache. The decode capacity
+    gate then reports a miss while too few pages have emptied, so SGLang's
+    own retract path picks and requeues the requests. Skipped while frees are
+    grouped: retracted requests would free nothing until the group ends, and
+    the gate would retract every request but one.
+    """
+    _SGLANG_DEMAND.preempt = None
+    manager = _sglang_demand_manager(scheduler)
+    if pages <= 0 or getattr(manager, "occupied_pages", None) is None:
+        return
+    if _frees_are_deferred(getattr(scheduler, "token_to_kv_pool_allocator", None)):
+        return
+    _SGLANG_DEMAND.preempt = (manager, manager.occupied_pages() - pages,
+                              manager.page_allocator.get_num_reserved_pages())
+
+
+def _sglang_end_preemption() -> None:
+    preempt = getattr(_SGLANG_DEMAND, "preempt", None)
+    _SGLANG_DEMAND.preempt = None
+    if preempt is None:
+        return
+    manager, _, reserved = preempt
+    try:
+        # Pages the retracted requests emptied may sit on the reserve.
+        manager.release_empty_pages(
+            max(0, manager.page_allocator.get_num_reserved_pages() - reserved))
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not release KV memory for a higher priority: %s", error)
+
+
+def _sglang_preemption_pending(manager: Any) -> bool:
+    preempt = getattr(_SGLANG_DEMAND, "preempt", None)
+    return (preempt is not None and preempt[0] is manager
+            and manager.occupied_pages() > preempt[1])
 
 
 def _sglang_note_unfit(need_blocks: int) -> None:
@@ -583,6 +624,9 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     rank that reserved keeps its blocks, and the retract loop's next gate
     re-reserves the same set.
     """
+    if _sglang_preemption_pending(allocator.kvcached_allocator):
+        # A higher priority waits for pages only running requests hold.
+        return not _sglang_group_capacity_miss(True)
     evict = getattr(allocator, "evict_to_free_tokens", None)
     if evict is not None:
         evict(tree_cache, num_tokens)
