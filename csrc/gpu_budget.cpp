@@ -606,13 +606,13 @@ uint64_t ReclaimPlan::total() const {
                         running_bytes);
 }
 
-// #585 section 4. From the highest priority down, each requester's demand
-// that free memory (plus what is already being released) cannot cover is
-// taken tier by tier: lower priorities' empty pages, then their prefix cache,
-// then the requester's own cache, then lower priorities' running requests.
-// Within a tier the lowest priority goes first, then the largest excess over
-// min(min, max). An instance with a pool that cannot shrink is never a
-// victim, and none is taken below its floor.
+// #585 section 4. From the highest priority down, each requester's need,
+// max(headroom, demand) as in its watermark, that free memory (plus what is
+// already being released) cannot cover is taken tier by tier: lower priorities'
+// empty pages, then their prefix cache, then the requester's own cache, then
+// lower priorities' running requests. Within a tier the lowest priority goes
+// first, then the largest excess over min(min, max). An instance with a pool
+// that cannot shrink is never a victim, and none is taken below its floor.
 ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
                                       const Shared *data) const {
   uint64_t charged[kInstances]{};
@@ -636,6 +636,10 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
   uint64_t excess[kInstances]{};
   uint64_t releasing = 0;
   std::vector<size_t> requesters;
+  auto need = [&](size_t i) {
+    return std::max<uint64_t>(data->instances[i].headroom,
+                              allowed_demand(i, charged[i], data));
+  };
   for (size_t i = 0; i < kInstances; ++i) {
     const auto &entry = data->instances[i];
     if (!live[i] || !entry.valid)
@@ -650,7 +654,7 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
     const uint64_t floor = std::min<uint64_t>(entry.min, entry.limit);
     if (shrinkable[i] && held > floor)
       excess[i] = held - floor;
-    if (allowed_demand(i, charged[i], data))
+    if (need(i))
       requesters.push_back(i);
   }
   auto priority = [&](size_t i) -> int64_t {
@@ -671,8 +675,8 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
     const uint64_t budget = data->budget;
     const auto usable = budget > watermark ? budget - watermark : 0;
     const auto available = add(usable > total ? usable - total : 0, releasing);
-    const auto demand = allowed_demand(requester, charged[requester], data);
-    uint64_t deficit = demand > available ? demand - available : 0;
+    const auto wanted = need(requester);
+    uint64_t deficit = wanted > available ? wanted - available : 0;
     for (int step = 0; step < 4 && deficit; ++step) {
       if (step == 2) {
         // The requester's own cache: it evicts that itself when short.

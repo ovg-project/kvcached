@@ -55,8 +55,9 @@ struct InstanceControl {
   uint64_t empty_bytes = 0;
   uint64_t cache_bytes = 0;
   uint64_t releasing_bytes = 0;
-  // Bytes this instance should release now for higher priorities' demand,
-  // and how much of it from each tier (see GpuBudget::reclaim_plan).
+  // Bytes this instance should release now for higher priorities' headroom
+  // and demand, and how much of it from each tier (see
+  // GpuBudget::reclaim_plan).
   uint64_t reclaim_bytes = 0;
   uint64_t reclaim_empty_bytes = 0;
   uint64_t reclaim_cache_bytes = 0;
@@ -230,9 +231,9 @@ public:
   bool post_reclaimable(const std::string &instance, uint64_t generation,
                         uint64_t empty, uint64_t cache, uint64_t releasing);
   // What the slot's instance should release now so that higher priorities'
-  // demand fits. Every instance derives the same plan from the ledger, so all
-  // pick the same victims. Nothing is stored: once the demand fits, the plan
-  // asks for nothing.
+  // max(headroom, demand) fits. Every instance derives the same plan from the
+  // ledger, so all pick the same victims. Nothing is stored: once that fits,
+  // the plan asks for nothing.
   ReclaimPlan reclaim_plan(size_t slot);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();

@@ -83,7 +83,8 @@ public:
   // Post the instance's demand on this GPU (see GpuBudget::set_demand).
   void set_kv_demand(uint64_t bytes);
   // Post what the instance can release on this GPU, by tier, and read what
-  // it should release now for higher priorities' demand (#585 reclaim).
+  // it should release now for higher priorities' headroom and demand (#585
+  // reclaim).
   void set_kv_reclaimable(uint64_t empty, uint64_t cache, uint64_t releasing);
   ReclaimPlan kv_reclaim();
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
