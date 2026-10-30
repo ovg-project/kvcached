@@ -244,3 +244,28 @@ def test_sglang_does_not_retract_while_frees_are_grouped(monkeypatch):
         assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
     finally:
         patches._sglang_end_preemption()
+
+
+def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
+    # 4 blocks a page. Page 0 holds a's and b's blocks, page 1 only c's,
+    # page 2 c's and d's; page 3 also holds a cached block nobody runs.
+    blocks = {"a": [1, 12], "b": [2, 3], "c": [4, 5, 9], "d": [10]}
+    occupancy = {0: 3, 1: 2, 2: 2, 3: 2}
+
+    class KV(_KV):
+        block_mem_size = 1
+        page_size = 4
+
+        def get_page_occupancy(self, pages: list[int]) -> dict[int, int]:
+            return {page: occupancy[page] for page in pages}
+
+    kv = KV(occupied=10)
+    running = [_Request(rid, 1) for rid in "abcd"]
+    scheduler = _Scheduler(kv, running)
+    setattr(scheduler, "kv_cache_manager", types.SimpleNamespace(
+        get_block_ids=lambda request_id: (blocks[request_id],)))
+    victims = vllm_patches._kvcached_page_victims(scheduler, kv, running, 2)
+    # Page 1 has one owner (c), then page 2 two (c, d); page 3 cannot empty.
+    assert [r.request_id for r in victims] == ["c", "d"]
+    vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 2)
+    assert [rid for rid, _ in scheduler.preempted] == ["c", "d"]

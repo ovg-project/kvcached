@@ -3396,15 +3396,60 @@ def _record_blocks_to_allocate(coordinator: Any) -> None:
     coordinator._kvcached_records_need = True
 
 
+def _kvcached_page_victims(scheduler: Any, kv: Any, running: list, pages: int) -> list:
+    """Running requests whose preemption empties ``pages`` pages cheaply.
+
+    A request's blocks are spread over pages that other requests share, so
+    preempting in admission order can take many requests to empty one page.
+    Pick the pages that running requests alone hold, with the fewest owners
+    first, and return their owners in that order. Empty when the scheduler
+    does not expose its requests' blocks.
+    """
+    get_block_ids = getattr(getattr(scheduler, "kv_cache_manager", None),
+                            "get_block_ids", None)
+    occupancy_of = getattr(kv, "get_page_occupancy", None)
+    if get_block_ids is None or occupancy_of is None or pages <= 0:
+        return []
+    owners: dict[int, list] = {}
+    blocks: dict[int, set[int]] = {}
+    for request in running:
+        try:
+            groups = get_block_ids(request.request_id)
+        except Exception:
+            return []
+        for group in groups:
+            for block_id in group:
+                if block_id <= 0:
+                    continue  # the null block
+                page = block_id * kv.block_mem_size // kv.page_size
+                blocks.setdefault(page, set()).add(block_id)
+                page_owners = owners.setdefault(page, [])
+                if not page_owners or page_owners[-1] is not request:
+                    page_owners.append(request)
+    occupancy = occupancy_of(list(blocks))
+    # A page empties only if running requests hold every block on it.
+    candidates = sorted(
+        (page for page in blocks if len(blocks[page]) >= occupancy.get(page, 0)),
+        key=lambda page: (len(owners[page]), len(blocks[page])))
+    victims: list = []
+    chosen: set[int] = set()
+    for page in candidates[:pages]:
+        for request in owners[page]:
+            if id(request) not in chosen:
+                chosen.add(id(request))
+                victims.append(request)
+    return victims
+
+
 def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
     """Preempt running requests until ``pages`` whole pages are released.
 
     The last tier of #585's reclaim: a higher priority's demand is still
-    short after this instance's empty pages and prefix cache. Requests are
-    preempted in the scheduler's own order (the last admitted, or the lowest
-    priority under the priority policy) and go back to the waiting queue, as
-    vLLM's own preemption does. Only pages left empty are released, so a
-    request whose blocks share pages with others may free nothing at once.
+    short after this instance's empty pages and prefix cache. Requests go
+    back to the waiting queue, as vLLM's own preemption does. Only pages
+    left empty are released, so the owners of the cheapest pages to empty go
+    first (see _kvcached_page_victims), then the scheduler's own order: the
+    last admitted, or the lowest priority under the priority policy.
     Returns how many requests were preempted.
     """
     preempt = getattr(scheduler, "_preempt_request", None)
@@ -3422,9 +3467,15 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
     start = kv.occupied_pages()
     timestamp = time.monotonic()
     preempted = 0
+    targeted = _kvcached_page_victims(scheduler, kv, running, pages)
     while running and start - kv.occupied_pages() < pages:
-        victim = (max(running, key=lambda r: (r.priority, r.arrival_time))
-                  if by_priority else running[-1])
+        if targeted:
+            victim = targeted.pop(0)
+            if victim not in running:
+                continue
+        else:
+            victim = (max(running, key=lambda r: (r.priority, r.arrival_time))
+                      if by_priority else running[-1])
         if can_free is not None and not can_free(victim):
             break  # an in-flight step still writes its blocks
         running.remove(victim)
