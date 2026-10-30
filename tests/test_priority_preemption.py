@@ -99,7 +99,7 @@ def test_vllm_preempts_the_last_admitted_until_enough_pages_empty(vllm_patches):
     kv = _KV(occupied=10)
     running = [_Request("a", 3), _Request("b", 1), _Request("c", 2)]
     scheduler = _Scheduler(kv, running)
-    assert vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 3) == 2
+    assert len(vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 3)) == 2
     assert scheduler.preempted == [("c", False), ("b", False)]
     assert [r.request_id for r in scheduler.running] == ["a"]
     # Preempted requests may resume this step, so their tokens are resent.
@@ -123,14 +123,14 @@ def test_vllm_stops_at_a_request_an_in_flight_step_still_writes(vllm_patches):
     kv = _KV(occupied=10)
     running = [_Request("a", 2), _Request("busy", 2, freeable=False)]
     scheduler = _Scheduler(kv, running)
-    assert vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 3) == 0
+    assert vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 3) == []
     assert len(scheduler.running) == 2
 
 
 def test_vllm_preempts_nothing_without_an_ask(vllm_patches):
     kv = _KV(occupied=10)
     scheduler = _Scheduler(kv, [_Request("a", 2)])
-    assert vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 0) == 0
+    assert vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 0) == []
     assert scheduler.preempted == []
 
 
@@ -269,3 +269,52 @@ def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
     assert [r.request_id for r in victims] == ["c", "d"]
     vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 2)
     assert [rid for rid, _ in scheduler.preempted] == ["c", "d"]
+
+
+
+def test_vllm_step_does_not_resume_its_victims(vllm_patches, monkeypatch):
+    # vLLM schedules no waiting request in a step that preempted one; a KV
+    # connector asserts a preempted request has no load in flight.
+    monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: True)
+    victim = _Request("victim", 1)
+
+    class Waiting(list):
+        def remove_requests(self, requests: Any) -> None:
+            for request in requests:
+                self.remove(request)
+
+        def prepend_request(self, request: Any) -> None:
+            self.insert(0, request)
+
+    def preempt(scheduler: Any, kv: Any, pages: int) -> list:
+        scheduler.waiting.prepend_request(victim)
+        return [victim]
+
+    monkeypatch.setattr(vllm_patches, "_kvcached_preempt_for_priority", preempt)
+
+    class KV:
+        def reclaim_for_priority(self) -> int:
+            return 1
+
+    seen: list[list[str]] = []
+
+    class Scheduler:
+        def __init__(self) -> None:
+            pool = types.SimpleNamespace(kv_cache_manager=KV())
+            self.kv_cache_manager = types.SimpleNamespace(block_pool=pool)
+            self.waiting = Waiting([_Request("queued", 1)])
+
+        def schedule(self) -> str:
+            seen.append([r.request_id for r in self.waiting])
+            return "output"
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler  # type: ignore[attr-defined]
+    patch = vllm_patches.SchedulerDemandPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    patch.detected_version = None
+    assert patch.patch_schedule(module) is True
+    scheduler = Scheduler()
+    assert scheduler.schedule() == "output"
+    assert seen == [["queued"]]
+    assert [r.request_id for r in scheduler.waiting] == ["victim", "queued"]

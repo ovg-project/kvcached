@@ -3453,7 +3453,7 @@ def _kvcached_page_victims(scheduler: Any, kv: Any, running: list, pages: int) -
     return victims
 
 
-def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
+def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
     """Preempt running requests until ``pages`` whole pages are released.
 
     The last tier of #585's reclaim: a higher priority's demand is still
@@ -3462,12 +3462,12 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
     left empty are released, so the owners of the cheapest pages to empty go
     first (see _kvcached_page_victims), then the scheduler's own order: the
     last admitted, or the lowest priority under the priority policy.
-    Returns how many requests were preempted.
+    Returns the preempted requests.
     """
     preempt = getattr(scheduler, "_preempt_request", None)
     running = getattr(scheduler, "running", None)
     if pages <= 0 or preempt is None or not running:
-        return 0
+        return []
     can_free = getattr(scheduler, "_request_blocks_can_be_freed", None)
     by_priority = getattr(getattr(scheduler, "policy", None), "name", "") == "PRIORITY"
     try:
@@ -3478,16 +3478,20 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
     reserved = kv.page_allocator.get_num_reserved_pages()
     start = kv.occupied_pages()
     timestamp = time.monotonic()
-    preempted = 0
+    preempted: list = []
     targeted = _kvcached_page_victims(scheduler, kv, running, pages)
-    while running and start - kv.occupied_pages() < pages:
+    candidates = list(running) if by_priority else list(reversed(running))
+    if by_priority:
+        candidates.sort(key=lambda r: (r.priority, r.arrival_time), reverse=True)
+    while start - kv.occupied_pages() < pages:
         if targeted:
             victim = targeted.pop(0)
-            if victim not in running:
-                continue
+        elif candidates:
+            victim = candidates.pop(0)
         else:
-            victim = (max(running, key=lambda r: (r.priority, r.arrival_time))
-                      if by_priority else running[-1])
+            break
+        if victim not in running:
+            continue
         if can_free is not None and not can_free(victim):
             break  # an in-flight step still writes its blocks
         running.remove(victim)
@@ -3499,7 +3503,7 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> int:
         if prev_scheduled is not None:
             # It may resume in this same step; resend its tokens if it does.
             prev_scheduled.discard(victim.request_id)
-        preempted += 1
+        preempted.append(victim)
         # Freed blocks of a cached prefix stay in the prefix cache.
         kv.evict_cache_pages(pages - (start - kv.occupied_pages()))
     kv.release_empty_pages(
@@ -3558,6 +3562,7 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
                 begin()
             kv: Any = getattr(pool, "kv_cache_manager", None)
             reclaim = getattr(kv, "reclaim_for_priority", None)
+            held: list = []
             if reclaim is not None:
                 try:
                     # Release what higher priorities ask of this instance
@@ -3565,13 +3570,24 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
                     running = reclaim()
                     self._kvcached_reclaim_running_pages = running
                     if running > 0:
-                        _kvcached_preempt_for_priority(self, kv, running)
+                        held = _kvcached_preempt_for_priority(self, kv, running)
                 except Exception as error:  # never fail a scheduling step
                     logger.warning("Could not release KV memory for a higher "
                                    "priority: %s", error)
+            # vLLM schedules no waiting request in a step that preempted one,
+            # so a preempted request never resumes in the same step (a KV
+            # connector relies on it). Keep this step's victims out of the
+            # waiting queue until it is scheduled.
+            waiting = getattr(self, "waiting", None)
+            if held and getattr(waiting, "remove_requests", None) is not None:
+                waiting.remove_requests(held)
+            else:
+                held = []
             try:
                 return original_schedule(self, *args, **kwargs)
             finally:
+                for request in reversed(held):
+                    waiting.prepend_request(request)
                 post = getattr(pool, "post_demand_blocks", None)
                 if post is not None:
                     try:
