@@ -3408,19 +3408,19 @@ def _record_blocks_to_allocate(coordinator: Any) -> None:
     coordinator._kvcached_records_need = True
 
 
-def _kvcached_page_victims(scheduler: Any, kv: Any, running: list, pages: int) -> list:
-    """Running requests whose preemption empties ``pages`` pages cheaply.
+def _kvcached_target_pages(scheduler: Any, kv: Any, running: list) -> list:
+    """Pages that preempting running requests can empty, cheapest first.
 
     A request's blocks are spread over pages that other requests share, so
     preempting in admission order can take many requests to empty one page.
-    Pick the pages that running requests alone hold, with the fewest owners
-    first, and return their owners in that order. Empty when the scheduler
-    does not expose its requests' blocks.
+    Returns ``(page, owners)`` for the pages that running requests alone
+    hold, fewest owners first; empty when the scheduler does not expose its
+    requests' blocks.
     """
     get_block_ids = getattr(getattr(scheduler, "kv_cache_manager", None),
                             "get_block_ids", None)
     occupancy_of = getattr(kv, "get_page_occupancy", None)
-    if get_block_ids is None or occupancy_of is None or pages <= 0:
+    if get_block_ids is None or occupancy_of is None:
         return []
     owners: dict[int, list] = {}
     blocks: dict[int, set[int]] = {}
@@ -3443,14 +3443,7 @@ def _kvcached_page_victims(scheduler: Any, kv: Any, running: list, pages: int) -
     candidates = sorted(
         (page for page in blocks if len(blocks[page]) >= occupancy.get(page, 0)),
         key=lambda page: (len(owners[page]), len(blocks[page])))
-    victims: list = []
-    chosen: set[int] = set()
-    for page in candidates[:pages]:
-        for request in owners[page]:
-            if id(request) not in chosen:
-                chosen.add(id(request))
-                victims.append(request)
-    return victims
+    return [(page, owners[page]) for page in candidates]
 
 
 def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
@@ -3460,9 +3453,13 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
     short after this instance's empty pages and prefix cache. Requests go
     back to the waiting queue, as vLLM's own preemption does. Only pages
     left empty are released, so the owners of the cheapest pages to empty go
-    first (see _kvcached_page_victims), then the scheduler's own order: the
+    first (see _kvcached_target_pages), then the scheduler's own order: the
     last admitted, or the lowest priority under the priority policy.
-    Returns the preempted requests.
+
+    With an asynchronous KV connector, vLLM frees a preempted request's
+    blocks only after the step in flight; those pages count as released
+    here and as releasing in the ledger until then. Returns the preempted
+    requests.
     """
     preempt = getattr(scheduler, "_preempt_request", None)
     running = getattr(scheduler, "running", None)
@@ -3474,38 +3471,45 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
         takes_drop = "drop_stale_output" in inspect.signature(preempt).parameters
     except (TypeError, ValueError):
         takes_drop = False
-    prev_scheduled = getattr(scheduler, "prev_step_scheduled_req_ids", None)
     reserved = kv.page_allocator.get_num_reserved_pages()
     start = kv.occupied_pages()
     timestamp = time.monotonic()
     preempted: list = []
-    targeted = _kvcached_page_victims(scheduler, kv, running, pages)
-    candidates = list(running) if by_priority else list(reversed(running))
-    if by_priority:
-        candidates.sort(key=lambda r: (r.priority, r.arrival_time), reverse=True)
-    while start - kv.occupied_pages() < pages:
-        if targeted:
-            victim = targeted.pop(0)
-        elif candidates:
-            victim = candidates.pop(0)
-        else:
-            break
-        if victim not in running:
-            continue
-        if can_free is not None and not can_free(victim):
-            break  # an in-flight step still writes its blocks
+    emptied = 0  # target pages whose owners are all preempted
+
+    def released() -> int:
+        return max(start - kv.occupied_pages(), emptied)
+
+    def preempt_one(victim: Any) -> None:
         running.remove(victim)
         if takes_drop:
             preempt(victim, timestamp,
                     drop_stale_output=getattr(scheduler, "requires_kv_delivery", False))
         else:
             preempt(victim, timestamp)
-        if prev_scheduled is not None:
-            # It may resume in this same step; resend its tokens if it does.
-            prev_scheduled.discard(victim.request_id)
         preempted.append(victim)
         # Freed blocks of a cached prefix stay in the prefix cache.
-        kv.evict_cache_pages(pages - (start - kv.occupied_pages()))
+        kv.evict_cache_pages(pages - released())
+
+    for _, owners in _kvcached_target_pages(scheduler, kv, running):
+        if released() >= pages:
+            break
+        for victim in owners:
+            if victim in running:
+                preempt_one(victim)
+        emptied += 1
+    candidates = list(running) if by_priority else list(reversed(running))
+    if by_priority:
+        candidates.sort(key=lambda r: (r.priority, r.arrival_time), reverse=True)
+    for victim in candidates:
+        if released() >= pages:
+            break
+        if can_free is not None and not can_free(victim):
+            break  # its blocks free after the step in flight: not countable here
+        preempt_one(victim)
+    note = getattr(kv, "note_pending_release", None)
+    if note is not None:
+        note(max(0, emptied - (start - kv.occupied_pages())))
     kv.release_empty_pages(
         max(0, kv.page_allocator.get_num_reserved_pages() - reserved))
     return preempted
@@ -3565,6 +3569,9 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
             held: list = []
             if reclaim is not None:
                 try:
+                    note = getattr(kv, "note_pending_release", None)
+                    if note is not None and not getattr(self, "deferred_frees", None):
+                        note(0)
                     # Release what higher priorities ask of this instance
                     # before scheduling; the rest is running requests'.
                     running = reclaim()

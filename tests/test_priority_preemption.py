@@ -49,6 +49,9 @@ class _KV:
         self.page_allocator.reserved -= pages
         return pages
 
+    def note_pending_release(self, pages: int) -> None:
+        self.pending = pages
+
 
 class _Request:
     def __init__(self, request_id: str, pages: int, priority: int = 0,
@@ -75,8 +78,9 @@ class _Scheduler:
     def _preempt_request(self, request: _Request, timestamp: float,
                          drop_stale_output: bool = False) -> None:
         self.preempted.append((request.request_id, drop_stale_output))
-        self.kv.occupied -= request.pages
-        self.kv.page_allocator.reserved += request.pages
+        if request.freeable:  # otherwise vLLM frees after the step in flight
+            self.kv.occupied -= request.pages
+            self.kv.page_allocator.reserved += request.pages
 
 
 @pytest.fixture
@@ -102,8 +106,6 @@ def test_vllm_preempts_the_last_admitted_until_enough_pages_empty(vllm_patches):
     assert len(vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 3)) == 2
     assert scheduler.preempted == [("c", False), ("b", False)]
     assert [r.request_id for r in scheduler.running] == ["a"]
-    # Preempted requests may resume this step, so their tokens are resent.
-    assert scheduler.prev_step_scheduled_req_ids == {"a"}
     # Blocks the preemption left in the prefix cache are evicted as well,
     # and pages that landed on the reserve are unmapped.
     assert kv.cache_asks == [1, 0]
@@ -246,11 +248,8 @@ def test_sglang_does_not_retract_while_frees_are_grouped(monkeypatch):
         patches._sglang_end_preemption()
 
 
-def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
-    # 4 blocks a page. Page 0 holds a's and b's blocks, page 1 only c's,
-    # page 2 c's and d's; page 3 also holds a cached block nobody runs.
-    blocks = {"a": [1, 12], "b": [2, 3], "c": [4, 5, 9], "d": [10]}
-    occupancy = {0: 3, 1: 2, 2: 2, 3: 2}
+def _paged(blocks: dict, occupancy: dict, freeable: bool = True) -> tuple:
+    """Four blocks a page; `blocks` maps a request to its block ids."""
 
     class KV(_KV):
         block_mem_size = 1
@@ -260,16 +259,36 @@ def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
             return {page: occupancy[page] for page in pages}
 
     kv = KV(occupied=10)
-    running = [_Request(rid, 1) for rid in "abcd"]
+    running = [_Request(rid, 1, freeable=freeable) for rid in blocks]
     scheduler = _Scheduler(kv, running)
     setattr(scheduler, "kv_cache_manager", types.SimpleNamespace(
         get_block_ids=lambda request_id: (blocks[request_id],)))
-    victims = vllm_patches._kvcached_page_victims(scheduler, kv, running, 2)
-    # Page 1 has one owner (c), then page 2 two (c, d); page 3 cannot empty.
-    assert [r.request_id for r in victims] == ["c", "d"]
+    return kv, running, scheduler
+
+
+def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
+    # Page 0 holds a's and b's blocks, page 1 only c's, page 2 c's and d's;
+    # page 3 also holds a cached block nobody runs, so it cannot empty.
+    kv, running, scheduler = _paged(
+        {"a": [1, 12], "b": [2, 3], "c": [4, 5, 9], "d": [10]},
+        {0: 3, 1: 2, 2: 2, 3: 2})
+    targets = vllm_patches._kvcached_target_pages(scheduler, kv, running)
+    assert [(page, [r.request_id for r in owners]) for page, owners in targets] == [
+        (1, ["c"]), (2, ["c", "d"]), (0, ["a", "b"])]
     vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 2)
     assert [rid for rid, _ in scheduler.preempted] == ["c", "d"]
 
+
+def test_vllm_counts_pages_freed_after_the_step_in_flight(vllm_patches):
+    # With an asynchronous KV connector vLLM frees preempted requests' blocks
+    # after the step in flight: their pages count as released, and the
+    # ledger hears of them as releasing until then.
+    kv, running, scheduler = _paged(
+        {"a": [1, 12], "b": [2, 3], "c": [4, 5, 9], "d": [10]},
+        {0: 3, 1: 2, 2: 2, 3: 2}, freeable=False)
+    vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 2)
+    assert [rid for rid, _ in scheduler.preempted] == ["c", "d"]
+    assert kv.occupied == 10 and getattr(kv, "pending") == 2
 
 
 def test_vllm_step_does_not_resume_its_victims(vllm_patches, monkeypatch):

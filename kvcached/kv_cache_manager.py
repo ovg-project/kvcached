@@ -1347,12 +1347,17 @@ class KVCacheManager:
             set_kv_reclaimable(*(level * bundle for level in levels), self.group_id)
         self._posted_reclaimable = levels
 
+    def note_pending_release(self, pages: int) -> None:
+        """Count pages an engine freed after the step in flight as releasing."""
+        self._pending_release_pages = max(0, int(pages))
+
     @synchronized
     def post_reclaimable_levels(self) -> None:
-        """Post this pool's pre-mapped pages, reclaimable cache and retired
-        pages (released, not yet unmapped). Engine thread only."""
+        """Post this pool's pre-mapped pages, reclaimable cache and pages
+        released but not yet unmapped. Engine thread only."""
         empty = self.page_allocator.get_num_reserved_pages()
         releasing = sum(len(ids) for _, ids in getattr(self, "_retired_pages", None) or ())
+        releasing += getattr(self, "_pending_release_pages", 0)
         cache = sum(count() for count, _ in self._live_cache_owners())
         self.post_reclaimable(empty, cache, releasing)
 

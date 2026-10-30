@@ -344,3 +344,11 @@ def test_pages_retired_for_a_priority_are_not_reused_meanwhile(manager_module):
     plan.update(running_bytes=0)
     manager.reclaim_for_priority()
     assert manager._unreusable_page_ids() == frozenset()
+
+
+def test_pages_freed_after_the_step_in_flight_post_as_releasing(manager_module):
+    module, reclaimable, _ = manager_module
+    manager = _manager(module)
+    manager.note_pending_release(2)
+    manager.post_reclaimable_levels()
+    reclaimable.assert_called_once_with(0, 0, 32, 0)
