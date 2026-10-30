@@ -340,6 +340,12 @@ def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
     with patches._sglang_demand_round(scheduler):
         assert PrefillAdder().add_one_req(req, False, None) is AddReqResult.NO_TOKEN
     assert manager.posted == [6]
+    # Tokens the adder set aside for running requests' output count too.
+    adder = PrefillAdder()
+    adder.rem_total_token_offset = 4  # type: ignore[attr-defined]
+    with patches._sglang_demand_round(scheduler):
+        adder.add_one_req(req, False, None)
+    assert manager.posted == [6, 8]
 
 
 def test_sglang_decode_gate_miss_is_recorded():

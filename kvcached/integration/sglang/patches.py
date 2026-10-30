@@ -3113,7 +3113,11 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
                 _SGLANG_DEMAND.prefill_tried = True
                 if getattr(result, "name", None) == "NO_TOKEN":
                     page_size = max(1, int(getattr(self, "page_size", 1) or 1))
-                    blocks = -(-_sglang_request_need_tokens(req) // page_size)
+                    # The adder first sets tokens aside for running requests'
+                    # remaining output; free blocks kept for them are not
+                    # free for this request.
+                    offset = max(0, int(getattr(self, "rem_total_token_offset", 0) or 0))
+                    blocks = -(-(_sglang_request_need_tokens(req) + offset) // page_size)
                     _sglang_note_unfit(blocks)
                     if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
                         _SGLANG_DEMAND.prefill_miss = blocks
