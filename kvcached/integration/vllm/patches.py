@@ -3585,7 +3585,7 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
             # so a preempted request never resumes in the same step (a KV
             # connector relies on it). Keep this step's victims out of the
             # waiting queue until it is scheduled.
-            waiting = getattr(self, "waiting", None)
+            waiting: Any = getattr(self, "waiting", None)
             if held and getattr(waiting, "remove_requests", None) is not None:
                 waiting.remove_requests(held)
             else:
