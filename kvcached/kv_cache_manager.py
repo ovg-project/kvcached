@@ -1251,7 +1251,7 @@ class KVCacheManager:
         allocated plus what did not fit), so the demand is that need as a
         forecast of the next step, beyond what the pool still holds free.
         Evictable prefix cache is not subtracted: lower priorities' empty
-        pages and cache go before the instance's own cache (#608).
+        pages and cache go before the instance's own cache (#585).
         """
         blocks_per_page = InternalPage.get_num_blocks(self.page_size,
                                                       self.block_mem_size)
@@ -1268,7 +1268,7 @@ class KVCacheManager:
         return control if control is not None and control.worker_ipc else None
 
     def post_demand(self, pages: int) -> None:
-        """Post the instance's unmet demand on each of its GPUs; 0 clears it.
+        """Post the instance's demand on each of its GPUs; 0 clears it.
 
         Writes only when the level changes. When workers map the pages (TP or
         PP > 1), the level goes to each worker's ledger in that ledger's page
