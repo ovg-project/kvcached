@@ -1460,6 +1460,14 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                                 "Could not release KV memory for a higher "
                                 "priority: %s", error)
                     _release_retired_pages_if_idle(engine_core, manager)
+                    if reclaim is not None:
+                        # Retired pages are unmapped now; an idle engine posts
+                        # no more steps, so stop counting them as releasing.
+                        try:
+                            manager.post_reclaimable_levels()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not post KV reclaimable levels: %s", error)
                 _publish_kv_cache_events_if_idle(engine_core)
 
             stop = threading.Event()
@@ -1468,8 +1476,11 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 # Read ledger metadata here; physical work stays on the engine.
                 from kvcached import _C  # type: ignore[attr-defined]
 
-                while not stop.wait(0.2):
-                    pending = False
+                reclaiming = False
+                # An idle engine releases one step of a higher priority's
+                # demand per wakeup, so poll faster while one asks.
+                while not stop.wait(0.05 if reclaiming else 0.2):
+                    pending = reclaiming = False
                     try:
                         for manager in managers:
                             runtime = manager._runtime_control
@@ -1479,8 +1490,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                             pending |= any(state["published"] and
                                            state["convergence"] == "pending" for state in states)
                             # A higher priority asks this instance for memory.
-                            pending |= any(state.get("reclaim_bytes", 0)
-                                           for state in states)
+                            reclaiming |= any(state.get("reclaim_bytes", 0)
+                                              for state in states)
+                        pending |= reclaiming
                     except (RuntimeError, OSError):
                         # Engine-side polling surfaces participant failures.
                         pending = True
