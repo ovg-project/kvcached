@@ -480,7 +480,7 @@ def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
         return
     miss = getattr(scheduler, "_kvcached_prefill_miss", None)
     batch = getattr(scheduler, "running_batch", None)
-    if (miss and getattr(batch, "batch_is_full", False)
+    if (miss and batch is not None and getattr(batch, "batch_is_full", False)
             and getattr(scheduler, "waiting_queue", None)
             and manager.available_size() >= miss):
         batch.batch_is_full = False
