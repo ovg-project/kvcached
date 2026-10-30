@@ -1213,7 +1213,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def post_demand_blocks(self, unfit_blocks: int) -> None:
                 # The step's need: what it allocated, including blocks freed
                 # by evicting this pool's own prefix cache, plus what did not
-                # fit. It forecasts the next step (#608).
+                # fit. It forecasts the next step (#585).
                 manager = self.kv_cache_manager
                 need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
                 manager.post_demand(manager.demand_pages(need))
