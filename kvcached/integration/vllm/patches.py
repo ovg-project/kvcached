@@ -3518,7 +3518,7 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
 
     Before scheduling, the step also releases what higher priorities' demand
     asks of this instance: empty pages and prefix cache, then running
-    requests, which it preempts (#609).
+    requests, which it preempts (#585).
     """
 
     library = "vllm"
