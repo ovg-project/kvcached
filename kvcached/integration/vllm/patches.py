@@ -1449,8 +1449,11 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     reclaim = getattr(manager, "reclaim_for_priority", None)
                     if reclaim is not None:
                         # An idle engine holds no running requests; its empty
-                        # pages and cache go to a higher priority (#609).
+                        # pages and cache go to a higher priority (#609). The
+                        # last step posted its levels before its last requests
+                        # finished, so post them again first.
                         try:
+                            manager.post_reclaimable_levels()
                             reclaim()
                         except Exception as error:
                             patch_logger.warning(
@@ -1475,9 +1478,8 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                                       for source in runtime.sources]
                             pending |= any(state["published"] and
                                            state["convergence"] == "pending" for state in states)
-                            # A higher priority asks for empty pages or cache.
-                            pending |= any(state.get("reclaim_empty_bytes", 0)
-                                           or state.get("reclaim_cache_bytes", 0)
+                            # A higher priority asks this instance for memory.
+                            pending |= any(state.get("reclaim_bytes", 0)
                                            for state in states)
                     except (RuntimeError, OSError):
                         # Engine-side polling surfaces participant failures.

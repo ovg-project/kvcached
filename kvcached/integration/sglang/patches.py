@@ -3788,6 +3788,14 @@ def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
         # cache go to a higher priority that asks for them.
         scheduler._kvcached_idle_reclaim_at = now
         _register_shrink_reclaimers(scheduler)
+        # The last round posted its levels before its last requests finished.
+        manager = _sglang_demand_manager(scheduler)
+        post_levels = getattr(manager, "post_reclaimable_levels", None)
+        if post_levels is not None:
+            try:
+                post_levels()
+            except Exception as error:
+                logger.warning("Could not post KV reclaimable levels: %s", error)
         _sglang_reclaim_for_priority(scheduler)
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager
