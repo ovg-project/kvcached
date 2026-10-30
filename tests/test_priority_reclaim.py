@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Releasing memory for a higher priority's demand, tier by tier (#609).
+"""Releasing memory for a higher priority's demand, tier by tier (#585).
 
 Every instance reads the same plan from its GPU's ledger and releases its own
 part: pre-mapped pages that hold no data first, then whole pages of prefix

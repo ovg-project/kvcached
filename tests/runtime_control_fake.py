@@ -60,7 +60,7 @@ def attach_control(manager, monkeypatch):
         fail_instance_control=fail), raising=False)
     monkeypatch.setattr(control.glob, "glob", lambda _: ["test-gpu"])
     # The fake ledger holds no other instance, so no priority asks this one
-    # to release anything (#609).
+    # to release anything (#585).
     import sys
 
     ops = sys.modules.get("kvcached.vmm_ops")
