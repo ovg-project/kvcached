@@ -328,3 +328,19 @@ def test_a_failed_release_does_not_fail_the_step(vllm_patches, monkeypatch):
     patch.detected_version = None
     assert patch.patch_schedule(module) is True
     assert Scheduler().schedule() == "output"
+
+
+def test_pages_retired_for_a_priority_are_not_reused_meanwhile(manager_module):
+    module, _, plan = manager_module
+    manager = _manager(module)
+    manager.in_shrink = False
+    manager._retired_pages = [(3, [5, 6])]
+    plan.update(running_bytes=16)
+    # Without a plan, a retired page may be reused (its unmap is cancelled).
+    assert manager._unreusable_page_ids() == frozenset()
+    manager.reclaim_for_priority()
+    # Pages emptied for the plan wait for the release barrier instead.
+    assert manager._unreusable_page_ids() == frozenset({5, 6})
+    plan.update(running_bytes=0)
+    manager.reclaim_for_priority()
+    assert manager._unreusable_page_ids() == frozenset()
