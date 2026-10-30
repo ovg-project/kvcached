@@ -124,7 +124,7 @@ class KVCacheManager:
     _avail_physical_pages_ts: float = 0.0
     _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
     _shrink_reclaimers: tuple[weakref.WeakMethod, ...] = ()
-    # Prefix caches that higher priorities can reclaim (#609): pairs of bound
+    # Prefix caches that higher priorities can reclaim (#585): pairs of bound
     # methods counting and evicting the whole pages they could free.
     _cache_owners: tuple[tuple[weakref.WeakMethod, weakref.WeakMethod], ...] = ()
     _reclaiming_for_shrink = False
@@ -1299,7 +1299,7 @@ class KVCacheManager:
     @synchronized
     def _register_cache_owner(self, count_pages: Callable[[], int],
                               evict_pages: Callable[[int], int]) -> None:
-        """Register a prefix cache that higher priorities can reclaim (#609).
+        """Register a prefix cache that higher priorities can reclaim (#585).
 
         ``count_pages()`` returns how many whole pages the cache could free
         and ``evict_pages(n)`` frees up to ``n`` of them, returning how many.
@@ -1321,7 +1321,7 @@ class KVCacheManager:
 
     def post_reclaimable(self, empty_pages: int, cache_pages: int,
                          releasing_pages: int) -> None:
-        """Post what this instance can release on each GPU, by tier (#609).
+        """Post what this instance can release on each GPU, by tier (#585).
 
         Writes only when a level changes, in each ledger's page size as
         post_demand() does.
@@ -1369,7 +1369,7 @@ class KVCacheManager:
         else:
             try:
                 from kvcached.vmm_ops import kv_reclaim
-            except ImportError:  # an extension built without #609
+            except ImportError:  # an extension built without it
                 return plan
             raw = kv_reclaim(self.group_id)
             states = ({"page_bundle_bytes": self._memory_limit_page_bundle_bytes(),
@@ -1399,7 +1399,7 @@ class KVCacheManager:
 
     @synchronized
     def reclaim_for_priority(self) -> int:
-        """Release what higher priorities' demand asks of this pool (#609).
+        """Release what higher priorities' demand asks of this pool (#585).
 
         Empty pre-mapped pages go first, then whole pages of prefix cache;
         pages that eviction puts back on the reserve are unmapped too. Engine

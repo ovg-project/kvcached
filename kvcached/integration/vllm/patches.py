@@ -1039,7 +1039,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def _evict_cache_pages(self, pages: int) -> int:
                 """Evict up to `pages` whole pages of prefix cache, cheapest
-                first, for a higher priority's demand (#609)."""
+                first, for a higher priority's demand (#585)."""
                 if pages <= 0 or self._page_eviction is None or not self._evictable_blocks:
                     return 0
                 victims = self._page_eviction.victims(
@@ -1449,7 +1449,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                     reclaim = getattr(manager, "reclaim_for_priority", None)
                     if reclaim is not None:
                         # An idle engine holds no running requests; its empty
-                        # pages and cache go to a higher priority (#609). The
+                        # pages and cache go to a higher priority (#585). The
                         # last step posted its levels before its last requests
                         # finished, so post them again first.
                         try:
