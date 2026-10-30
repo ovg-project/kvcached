@@ -756,6 +756,69 @@ int main() {
     budget.reset();
     unlink(ledger.c_str());
   }
+  {
+    // Headroom asks for memory like a demand, on a 100-byte GPU with 20 free.
+    // low (priority 0) holds 60: 5 empty, 10 cache, 45 running. high (1) is
+    // idle, with demand 0, and holds 20, 4 of it its own cache.
+    const auto ledger = std::string(directory) + "/headroom";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0, InstancePolicy{0, 0, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 0});
+    for (auto slot : {low, high}) {
+      budget->configure_control_pool(slot, 100, 1, true);
+      budget->ready_control_pool(slot);
+    }
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    auto hold = [&](size_t slot, uint64_t bytes) {
+      auto grant = budget->grant(slot, bytes);
+      held.push_back(grant->take(bytes));
+      grant->finish();
+    };
+    hold(low, 60);
+    hold(high, 20);
+    budget->set_reclaimable(low, 5, 10, 0);
+    budget->set_reclaimable(high, 0, 4, 0);
+    auto plan = [&](size_t slot) {
+      const auto value = budget->reclaim_plan(slot);
+      return std::vector<uint64_t>{value.empty_bytes, value.cache_bytes,
+                                   value.running_bytes};
+    };
+    using Tiers = std::vector<uint64_t>;
+    auto writer = GpuBudget::open_control(ledger);
+    const auto generation = writer->query_control("high").generation;
+    auto set_headroom = [&](uint64_t bytes) {
+      ControlUpdate update;
+      update.headroom_bytes = bytes;
+      assert(writer->publish_control("high", update, generation).status ==
+             "accepted");
+    };
+    // Free memory covers a headroom of 20, so nobody is asked.
+    set_headroom(20);
+    assert(plan(low) == (Tiers{0, 0, 0}));
+    // 5 short: low's empty pages cover it.
+    set_headroom(25);
+    assert(plan(low) == (Tiers{5, 0, 0}) && plan(high) == (Tiers{0, 0, 0}));
+    // 20 short: low's empty pages and cache go first, then high's own cache
+    // (4) spares low's running requests that much, so 1 is preempted.
+    set_headroom(40);
+    assert(plan(low) == (Tiers{5, 10, 1}) && plan(high) == (Tiers{0, 0, 0}));
+    assert(writer->query_control("low").reclaim_bytes == 16);
+    // The need is max(headroom, demand), as in the watermark, not the sum.
+    set_headroom(25);
+    budget->set_demand(high, 30);
+    assert(plan(low) == (Tiers{5, 5, 0}));
+    budget->set_demand(high, 0);
+    // Equal priorities ask nothing of each other.
+    ControlUpdate equal;
+    equal.priority = 0;
+    assert(writer->publish_control("high", equal, generation).status ==
+           "accepted");
+    assert(plan(low) == (Tiers{0, 0, 0}));
+    writer.reset();
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
   unlink(path.c_str());
   rmdir(directory);
 }

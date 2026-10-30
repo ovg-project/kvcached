@@ -1362,7 +1362,7 @@ class KVCacheManager:
         self.post_reclaimable(empty, cache, releasing)
 
     def reclaim_plan_pages(self) -> Dict[str, int]:
-        """Pages to release now for higher priorities' demand, by tier.
+        """Pages to release now for higher priorities' headroom and demand, by tier.
 
         Under TP each GPU's ledger plans in its own page size; the largest
         ask wins, since every page spans all of them.
@@ -1423,7 +1423,7 @@ class KVCacheManager:
 
     @synchronized
     def reclaim_for_priority(self) -> int:
-        """Release what higher priorities' demand asks of this pool (#585).
+        """Release what higher priorities' headroom and demand ask of this pool (#585).
 
         Empty pre-mapped pages go first, then whole pages of prefix cache;
         pages that eviction puts back on the reserve are unmapped too. Engine
