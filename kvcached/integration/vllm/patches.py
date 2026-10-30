@@ -787,6 +787,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager, "_register_shrink_reclaimer", None)
                 if self._page_eviction is not None and register_reclaimer is not None:
                     register_reclaimer(self._reclaim_for_shrink)
+                register_owner = getattr(
+                    self.kv_cache_manager, "_register_cache_owner", None)
+                if self._page_eviction is not None and register_owner is not None:
+                    register_owner(self._reclaimable_cache_pages,
+                                   self._evict_cache_pages)
 
             def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
                 block = self._evictable_blocks.pop(block_id, None)
@@ -1025,6 +1030,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if excess > 0:
                     self._evict_block_ids(self._page_eviction.victims(
                         len(self._evictable_blocks), max_pages=excess))
+
+            def _reclaimable_cache_pages(self) -> int:
+                """Pages holding nothing but evictable prefix blocks."""
+                if self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                return self._page_eviction.whole_pages()
+
+            def _evict_cache_pages(self, pages: int) -> int:
+                """Evict up to `pages` whole pages of prefix cache, cheapest
+                first, for a higher priority's demand (#609)."""
+                if pages <= 0 or self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                victims = self._page_eviction.victims(
+                    len(self._evictable_blocks), max_pages=pages)
+                evicted = len({self._page_eviction.page_id(bid) for bid in victims})
+                self._evict_block_ids(victims)
+                return evicted
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -1424,6 +1446,16 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 for manager in managers:
                     manager.apply_resize_target()
                     manager.reclaim_for_shrink()
+                    reclaim = getattr(manager, "reclaim_for_priority", None)
+                    if reclaim is not None:
+                        # An idle engine holds no running requests; its empty
+                        # pages and cache go to a higher priority (#609).
+                        try:
+                            reclaim()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not release KV memory for a higher "
+                                "priority: %s", error)
                     _release_retired_pages_if_idle(engine_core, manager)
                 _publish_kv_cache_events_if_idle(engine_core)
 
@@ -1443,6 +1475,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                                       for source in runtime.sources]
                             pending |= any(state["published"] and
                                            state["convergence"] == "pending" for state in states)
+                            # A higher priority asks for empty pages or cache.
+                            pending |= any(state.get("reclaim_empty_bytes", 0)
+                                           or state.get("reclaim_cache_bytes", 0)
+                                           for state in states)
                     except (RuntimeError, OSError):
                         # Engine-side polling surfaces participant failures.
                         pending = True
@@ -3403,6 +3439,16 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
             begin = getattr(pool, "begin_demand_step", None)
             if begin is not None:
                 begin()
+            kv: Any = getattr(pool, "kv_cache_manager", None)
+            reclaim = getattr(kv, "reclaim_for_priority", None)
+            if reclaim is not None:
+                try:
+                    # Release what higher priorities ask of this instance
+                    # before scheduling; the rest is running requests'.
+                    self._kvcached_reclaim_running_pages = reclaim()
+                except Exception as error:  # never fail a scheduling step
+                    logger.warning("Could not release KV memory for a higher "
+                                   "priority: %s", error)
             try:
                 return original_schedule(self, *args, **kwargs)
             finally:
@@ -3410,6 +3456,9 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
                 if post is not None:
                     try:
                         post(int(manager._kvcached_step_need or 0))
+                        post_levels = getattr(kv, "post_reclaimable_levels", None)
+                        if post_levels is not None:
+                            post_levels()
                     except Exception as error:  # never fail a scheduling step
                         logger.warning("Could not post KV demand: %s", error)
 

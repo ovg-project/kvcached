@@ -647,7 +647,10 @@ int main() {
     hold(spare, 20);
     hold(fixed, 20);
     hold(top, 12);
-    auto reclaim = [&](size_t slot) { return budget->reclaim_bytes(slot); };
+    auto reclaim = [&](size_t slot) {
+      return budget->reclaim_plan(slot).total();
+    };
+    // Nobody posted empty pages or cache, so everything is running requests.
     // Top needs 20 and can use 8. The lowest priority gives all 10 it holds,
     // then the largest excess at the next priority gives the other 2.
     budget->set_demand(top, 20);
@@ -669,6 +672,86 @@ int main() {
     // Nothing is stored: once the demand fits, nobody is asked to release.
     budget->set_demand(top, 8);
     assert(reclaim(bottom) == 0 && reclaim(spare) == 0);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    // Tiered reclaim on a 100-byte GPU with 10 free. low (priority 0) holds
+    // 40: 5 empty, 10 cache, 25 running. mid (1) holds 30: 3 empty, 20
+    // cache, 7 running. high (2) holds 20, 6 of it its own cache.
+    const auto ledger = std::string(directory) + "/tiers";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0, InstancePolicy{0, 0, 0});
+    auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    for (auto slot : {low, mid, high}) {
+      budget->configure_control_pool(slot, 100, 1, true);
+      budget->ready_control_pool(slot);
+    }
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    auto hold = [&](size_t slot, uint64_t bytes) {
+      auto grant = budget->grant(slot, bytes);
+      held.push_back(grant->take(bytes));
+      grant->finish();
+    };
+    hold(low, 40);
+    hold(mid, 30);
+    hold(high, 20);
+    budget->set_reclaimable(low, 5, 10, 0);
+    budget->set_reclaimable(mid, 3, 20, 0);
+    budget->set_reclaimable(high, 0, 6, 0);
+    auto plan = [&](size_t slot) {
+      const auto value = budget->reclaim_plan(slot);
+      return std::vector<uint64_t>{value.empty_bytes, value.cache_bytes,
+                                   value.running_bytes};
+    };
+    using Tiers = std::vector<uint64_t>;
+    // 5 short: the lowest priority's empty pages cover it.
+    budget->set_demand(high, 15);
+    assert(plan(low) == (Tiers{5, 0, 0}) && plan(mid) == (Tiers{0, 0, 0}));
+    // 20 short: every empty page goes before any cache, lowest priority
+    // first within each tier.
+    budget->set_demand(high, 30);
+    assert(plan(low) == (Tiers{5, 10, 0}) && plan(mid) == (Tiers{3, 2, 0}));
+    assert(plan(high) == (Tiers{0, 0, 0}));
+    // 50 short: after all lower empty pages and cache (38), high's own cache
+    // (6) goes before any running request is preempted (6 more).
+    budget->set_demand(high, 60);
+    assert(plan(low) == (Tiers{5, 10, 6}) && plan(mid) == (Tiers{3, 20, 0}));
+    const auto state = budget->query_control("low");
+    assert(state.reclaim_bytes == 21 && state.reclaim_running_bytes == 6);
+    assert(state.empty_bytes == 5 && state.cache_bytes == 10);
+    // A floor caps everything an instance gives: with a min of 25, mid gives
+    // 5 of its 30 and low makes up the rest by preemption.
+    auto writer = GpuBudget::open_control(ledger);
+    const auto mid_generation = writer->query_control("mid").generation;
+    ControlUpdate floor;
+    floor.min_bytes = 25;
+    assert(writer->publish_control("mid", floor, mid_generation).status ==
+           "accepted");
+    assert(plan(mid) == (Tiers{3, 2, 0}) && plan(low) == (Tiers{5, 10, 24}));
+    floor.min_bytes = 0;
+    assert(writer->publish_control("mid", floor, mid_generation).status ==
+           "accepted");
+    // Pages low already released count as freed: with 4 of them, 15 needs
+    // only 1 more, from low's empty pages. A scheduler that drives workers
+    // posts these levels by instance name and generation.
+    const auto generation = writer->query_control("low").generation;
+    assert(writer->post_reclaimable("low", generation, 5, 10, 4));
+    assert(!writer->post_reclaimable("low", generation + 1, 0, 0, 0));
+    writer.reset();
+    budget->set_demand(high, 15);
+    assert(plan(low) == (Tiers{1, 0, 0}));
+    budget->set_reclaimable(low, 5, 10, 0);
+    // Two requesters: high is served first, from low's empty pages; mid's
+    // demand of 10 then fits nowhere but low's cache.
+    budget->set_demand(mid, 10);
+    assert(plan(low) == (Tiers{5, 10, 0}) && plan(mid) == (Tiers{0, 0, 0}));
+    // Nothing is stored: once the demands fit, nobody releases anything.
+    budget->set_demand(high, 0);
+    budget->set_demand(mid, 0);
+    assert(plan(low) == (Tiers{0, 0, 0}) && plan(mid) == (Tiers{0, 0, 0}));
     held.clear();
     budget.reset();
     unlink(ledger.c_str());

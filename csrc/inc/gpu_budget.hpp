@@ -49,11 +49,30 @@ struct InstanceControl {
   // and the free bytes higher priorities keep from it on this GPU.
   uint64_t shortfall_bytes = 0;
   uint64_t watermark_bytes = 0;
-  // Bytes this instance should release now for higher priorities' demand.
+  // What the instance last posted it could release on this GPU: pre-mapped
+  // pages that hold no data, prefix cache that whole pages can drop, and
+  // pages already released but not yet refunded.
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t releasing_bytes = 0;
+  // Bytes this instance should release now for higher priorities' demand,
+  // and how much of it from each tier (see GpuBudget::reclaim_plan).
   uint64_t reclaim_bytes = 0;
+  uint64_t reclaim_empty_bytes = 0;
+  uint64_t reclaim_cache_bytes = 0;
+  uint64_t reclaim_running_bytes = 0;
   // What the instance can still be granted on this GPU: free memory above
   // its watermark, within its max.
   uint64_t available_bytes = 0;
+};
+
+// What an instance should release now, by tier: pre-mapped pages, prefix
+// cache, then memory of running requests (preemption).
+struct ReclaimPlan {
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t running_bytes = 0;
+  uint64_t total() const;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -199,15 +218,22 @@ public:
   // step. A level that each step overwrites; 0 clears it, and it goes away
   // with the instance. Only the part its max still allows counts.
   void set_demand(size_t slot, uint64_t bytes);
-  // Bytes the slot's instance should release now so that higher priorities'
-  // demand fits. Every instance derives the same plan from the ledger, so all
-  // pick the same victims. Nothing is stored: once the demand fits, the plan
-  // asks for nothing.
-  uint64_t reclaim_bytes(size_t slot);
   // The same level, posted by a process that drives the instance's workers
   // (vLLM's scheduler under TP > 1). False if the instance is gone.
   bool post_demand(const std::string &instance, uint64_t generation,
                    uint64_t bytes);
+  // What the instance can release on this GPU, by tier: empty (pre-mapped,
+  // no data), cache (prefix cache that frees whole pages) and releasing
+  // (released, not yet refunded). Levels, overwritten when they change.
+  void set_reclaimable(size_t slot, uint64_t empty, uint64_t cache,
+                       uint64_t releasing);
+  bool post_reclaimable(const std::string &instance, uint64_t generation,
+                        uint64_t empty, uint64_t cache, uint64_t releasing);
+  // What the slot's instance should release now so that higher priorities'
+  // demand fits. Every instance derives the same plan from the ledger, so all
+  // pick the same victims. Nothing is stored: once the demand fits, the plan
+  // asks for nothing.
+  ReclaimPlan reclaim_plan(size_t slot);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -243,7 +269,7 @@ private:
   static uint64_t allowed_demand(size_t instance, uint64_t charged,
                                  const Shared *data);
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
-  uint64_t reclaim_locked(size_t instance, const Shared *data) const;
+  ReclaimPlan reclaim_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);
   void accounting_test_hook(int stage);

@@ -84,7 +84,9 @@ public:
 
   // Memory management
   bool resize(int64_t new_mem_size);
-  void trim();
+  // Unmap up to max_pages reserved pages (all of them when negative) and
+  // return how many were unmapped.
+  int64_t trim(int64_t max_pages = -1);
 
   // Status queries
   int64_t get_num_free_pages() const;
