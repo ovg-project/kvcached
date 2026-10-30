@@ -352,3 +352,62 @@ def test_sglang_decode_gate_miss_is_recorded():
         assert not patches._sglang_reserve_decode_capacity(
             allocator, scheduler.tree_cache, num_tokens=6, need_blocks=3)
     assert manager.posted == [3]
+
+
+def test_sglang_carries_a_prefill_miss_over_rounds_that_skip_prefill(monkeypatch):
+    import enum
+
+    from kvcached.integration.sglang import patches
+
+    class AddReqResult(enum.Enum):
+        CONTINUE = 1
+        NO_TOKEN = 2
+
+    class PrefillAdder:
+        page_size = 2
+        result = AddReqResult.NO_TOKEN
+
+        def add_one_req(self, req: Any, has_chunked_req: bool,
+                        truncation_align_size: Any) -> Any:
+            return self.result
+
+    module = types.ModuleType("sglang.srt.managers.schedule_policy")
+    module.PrefillAdder = PrefillAdder  # type: ignore[attr-defined]
+    patch = patches.PrefillAdderDemandPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    assert patch.patch_add_one_req(module) is True
+    req = types.SimpleNamespace(
+        full_untruncated_fill_ids=list(range(10)), prefix_indices=[0, 1],
+        sampling_params=types.SimpleNamespace(max_new_tokens=4), output_ids=[])
+    scheduler, manager = _sglang_scheduler()
+    scheduler.waiting_queue = [req]
+    with patches._sglang_demand_round(scheduler):
+        PrefillAdder().add_one_req(req, False, None)
+    # SGLang then skips prefill while its batch is full; the request waits.
+    with patches._sglang_demand_round(scheduler):
+        pass
+    PrefillAdder.result = AddReqResult.CONTINUE
+    with patches._sglang_demand_round(scheduler):
+        PrefillAdder().add_one_req(req, False, None)
+    scheduler.waiting_queue = []
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert manager.posted == [6, 6, 0, 0]
+
+
+def test_sglang_retries_prefill_once_the_pool_backs_its_last_miss():
+    from kvcached.integration.sglang import patches
+
+    scheduler, manager = _sglang_scheduler()
+    manager.available_size = lambda: manager.available  # type: ignore[attr-defined]
+    manager.available = 5  # type: ignore[attr-defined]
+    scheduler.waiting_queue = ["req"]
+    scheduler.running_batch = types.SimpleNamespace(batch_is_full=True)
+    scheduler._kvcached_prefill_miss = 6
+    with patches._sglang_demand_round(scheduler):
+        assert scheduler.running_batch.batch_is_full  # 5 blocks cannot back 6
+    # Another instance released memory: SGLang may try the prefill again.
+    manager.available = 6  # type: ignore[attr-defined]
+    with patches._sglang_demand_round(scheduler):
+        assert not scheduler.running_batch.batch_is_full

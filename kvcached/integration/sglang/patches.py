@@ -431,16 +431,25 @@ def _sglang_demand_round(scheduler: Any):
     the next round. Rounds nest (``get_new_batch_prefill`` and
     ``update_running_batch`` inside ``get_next_batch_to_run``); only the
     outermost one posts.
+
+    After a prefill misses for memory, SGLang skips prefill until one of its
+    own requests finishes. Under kvcached another instance can free the
+    memory instead, so once the pool can back the missed request again the
+    round lets SGLang retry; until then a round that does not try one
+    carries the last miss over while requests wait.
     """
     if getattr(_SGLANG_DEMAND, "open", False):
         yield
         return
     _SGLANG_DEMAND.open = True
     _SGLANG_DEMAND.need = None
+    _SGLANG_DEMAND.prefill_tried = False
+    _SGLANG_DEMAND.prefill_miss = None
     try:
         manager = _sglang_demand_manager(scheduler)
         if manager is not None:
             manager.take_step_alloc_blocks()
+            _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
     scheduler._kvcached_reclaim_running_pages = _sglang_reclaim_for_priority(scheduler)
@@ -448,9 +457,32 @@ def _sglang_demand_round(scheduler: Any):
         yield
     finally:
         need = _SGLANG_DEMAND.need
+        miss = _SGLANG_DEMAND.prefill_miss
         _SGLANG_DEMAND.open = False
         _SGLANG_DEMAND.need = None
+        if miss is not None:
+            scheduler._kvcached_prefill_miss = miss
+        elif _SGLANG_DEMAND.prefill_tried or not getattr(scheduler, "waiting_queue", None):
+            scheduler._kvcached_prefill_miss = None
+        elif need is None:
+            need = getattr(scheduler, "_kvcached_prefill_miss", None)
         _sglang_post_demand(scheduler, need or 0)
+
+
+def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
+    """Clear SGLang's full-batch flag once the pool can back its last miss.
+
+    Only without TP: each rank reads its own GPU's memory, and ranks that
+    disagree on whether to try a prefill would schedule different batches.
+    """
+    if _sglang_parallel_size(scheduler) != 1:
+        return
+    miss = getattr(scheduler, "_kvcached_prefill_miss", None)
+    batch = getattr(scheduler, "running_batch", None)
+    if (miss and getattr(batch, "batch_is_full", False)
+            and getattr(scheduler, "waiting_queue", None)
+            and manager.available_size() >= miss):
+        batch.batch_is_full = False
 
 
 def _sglang_note_unfit(need_blocks: int) -> None:
@@ -3081,9 +3113,14 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
         @functools.wraps(original)
         def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
             result = original(self, req, *args, **kwargs)
-            if enable_kvcached() and getattr(result, "name", None) == "NO_TOKEN":
-                page_size = max(1, int(getattr(self, "page_size", 1) or 1))
-                _sglang_note_unfit(-(-_sglang_request_need_tokens(req) // page_size))
+            if enable_kvcached():
+                _SGLANG_DEMAND.prefill_tried = True
+                if getattr(result, "name", None) == "NO_TOKEN":
+                    page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+                    blocks = -(-_sglang_request_need_tokens(req) // page_size)
+                    _sglang_note_unfit(blocks)
+                    if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
+                        _SGLANG_DEMAND.prefill_miss = blocks
             return result
 
         self._mark_as_patched(_patched_add_one_req, marker)
