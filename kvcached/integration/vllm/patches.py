@@ -1185,13 +1185,16 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_num_free_blocks(self) -> int:
                 return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
 
-            def post_demand_blocks(self, need_blocks: int) -> None:
-                # Evictable prefix blocks free slots in mapped pages, so they
-                # need no grant either (#585 shortfall, see #608).
-                if self.enable_prefix_cache:
-                    need_blocks -= len(self._evictable_blocks)
+            def begin_demand_step(self) -> None:
+                self.kv_cache_manager.take_step_alloc_blocks()
+
+            def post_demand_blocks(self, unfit_blocks: int) -> None:
+                # The step's need: what it allocated, including blocks freed
+                # by evicting this pool's own prefix cache, plus what did not
+                # fit. It forecasts the next step (#608).
                 manager = self.kv_cache_manager
-                manager.post_demand(manager.demand_pages(need_blocks))
+                need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+                manager.post_demand(manager.demand_pages(need))
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
@@ -3356,12 +3359,13 @@ def _record_blocks_to_allocate(coordinator: Any) -> None:
 
 
 class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
-    """Post the first request per step that does not fit as the demand.
+    """Post each step's need for new memory as the instance's demand.
 
-    #585's watermarks keep free memory from lower priorities while a
-    higher-priority instance has a request waiting for it. The level is
-    overwritten every step: the blocks the step's first unfit request needs
-    beyond what the pool already holds, or 0 when every request fit.
+    #585's watermarks keep free memory from lower priorities for a
+    higher-priority instance. The level is overwritten every step: the blocks
+    the step allocated plus those of its first request that did not fit,
+    beyond what the pool still holds free, so lower priorities leave one more
+    step of it free. It is 0 when the pool's own free blocks cover a step.
     """
 
     library = "vllm"
@@ -3395,11 +3399,14 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
             if not enable_kvcached() or manager is None:
                 return original_schedule(self, *args, **kwargs)
             manager._kvcached_step_need = None
+            pool = getattr(manager, "block_pool", None)
+            begin = getattr(pool, "begin_demand_step", None)
+            if begin is not None:
+                begin()
             try:
                 return original_schedule(self, *args, **kwargs)
             finally:
-                post = getattr(getattr(manager, "block_pool", None),
-                               "post_demand_blocks", None)
+                post = getattr(pool, "post_demand_blocks", None)
                 if post is not None:
                     try:
                         post(int(manager._kvcached_step_need or 0))

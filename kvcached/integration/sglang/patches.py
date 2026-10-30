@@ -422,12 +422,13 @@ _SGLANG_DEMAND = threading.local()
 
 @contextlib.contextmanager
 def _sglang_demand_round(scheduler: Any):
-    """Post the round's first request that does not fit as the KV demand.
+    """Post the round's need for new memory as the KV demand.
 
-    #585's watermarks keep free memory from lower priorities while a
-    higher-priority instance waits for it. The level is overwritten every
-    scheduling round: the blocks the round's first unfit request needs, or 0
-    when every request fit. Rounds nest (``get_new_batch_prefill`` and
+    #585's watermarks keep free memory from lower priorities for a
+    higher-priority instance. The level is overwritten every scheduling
+    round: the blocks the round allocated plus those of its first request
+    that did not fit, beyond what the pool still holds free, as a forecast of
+    the next round. Rounds nest (``get_new_batch_prefill`` and
     ``update_running_batch`` inside ``get_next_batch_to_run``); only the
     outermost one posts.
     """
@@ -436,6 +437,12 @@ def _sglang_demand_round(scheduler: Any):
         return
     _SGLANG_DEMAND.open = True
     _SGLANG_DEMAND.need = None
+    try:
+        manager = _sglang_demand_manager(scheduler)
+        if manager is not None:
+            manager.take_step_alloc_blocks()
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not start a KV demand round: %s", error)
     try:
         yield
     finally:
@@ -451,29 +458,28 @@ def _sglang_note_unfit(need_blocks: int) -> None:
         _SGLANG_DEMAND.need = max(0, int(need_blocks))
 
 
-def _sglang_post_demand(scheduler: Any, need_blocks: int) -> None:
-    """Post the demand through the token pool's manager, on this rank's GPU.
+def _sglang_demand_manager(scheduler: Any) -> Any:
+    """The token pool's manager, which posts demand on this rank's GPU.
 
-    Evictable radix-cache blocks free slots in mapped pages, so they need no
-    grant. Only the token pool (the full-attention pool of an SWA composite)
-    is counted, and a pipeline posts nothing.
+    Only the token pool (the full-attention pool of an SWA composite) is
+    counted, and a pipeline posts nothing.
     """
     if _sglang_pipeline_stages() > 1:
-        return
+        return None
     managers = _sglang_budget_managers(scheduler)
     manager = managers[0] if managers else None
-    if getattr(manager, "post_demand", None) is None:
+    return manager if getattr(manager, "post_demand", None) is not None else None
+
+
+def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
+    """Post the round's need: what it allocated, including blocks freed by
+    evicting the radix cache, plus what did not fit."""
+    manager = _sglang_demand_manager(scheduler)
+    if manager is None:
         return
     try:
-        demand = 0
-        if need_blocks > 0:
-            tree_cache = getattr(scheduler, "tree_cache", None)
-            evictable = getattr(tree_cache, "full_evictable_size", None) or getattr(
-                tree_cache, "evictable_size", None)
-            page_size = max(1, int(getattr(scheduler, "page_size", 1) or 1))
-            evictable_blocks = int(evictable()) // page_size if evictable else 0
-            demand = manager.demand_pages(need_blocks - evictable_blocks)
-        manager.post_demand(demand)
+        need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+        manager.post_demand(manager.demand_pages(need))
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)
 

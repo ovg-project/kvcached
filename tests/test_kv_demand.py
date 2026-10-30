@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""The demand an engine posts for its first request that does not fit (#608).
+"""The demand an engine posts for each scheduling step (#608).
 
-#585's watermarks keep free memory from lower priorities while a
-higher-priority instance waits for it. The engine posts that wait as a level:
-the bytes of new pages its first unfit request of a scheduling step needs, or
-0 once every request fits.
+#585's watermarks keep free memory from lower priorities for a
+higher-priority instance. The engine posts a level every step: the new pages
+the step's need would map beyond the pool's free blocks, where the need is
+what the step allocated plus its first request that did not fit.
 """
 from __future__ import annotations
 
@@ -102,6 +102,29 @@ def test_demand_counts_only_new_pages(manager_module):
     assert manager.demand_pages(0) == 0
 
 
+def test_a_step_counts_each_new_block_once(manager_module):
+    module, _ = manager_module
+    manager = _manager(module)
+    manager.reserved_blocks = [7, 8, 9]
+    fresh = iter(range(100, 200))
+
+    def alloc_impl(need, **kwargs):
+        taken = manager.reserved_blocks[:need]
+        manager.reserved_blocks = manager.reserved_blocks[len(taken):]
+        return taken + [next(fresh) for _ in range(need - len(taken))]
+
+    manager._alloc_impl = alloc_impl
+    manager._operation_counters = None
+    # try_to_reserve(): 3 reserved blocks and 2 new ones, set aside again.
+    reserved = module.KVCacheManager._alloc(manager, 5)
+    manager.reserved_blocks.extend(reserved)
+    # The allocation that takes them maps nothing new; one more block does.
+    module.KVCacheManager._alloc(manager, 6)
+    module.KVCacheManager._alloc(manager, 1, _skip_wait=True)  # the null block
+    assert manager.take_step_alloc_blocks() == 3
+    assert manager.take_step_alloc_blocks() == 0
+
+
 def test_demand_is_written_only_when_the_level_changes(manager_module):
     module, demand = manager_module
     manager = _manager(module)
@@ -174,7 +197,11 @@ class _Coordinator:
 class _BlockPool:
     def __init__(self, fail: bool = False) -> None:
         self.posted: list[int] = []
+        self.steps = 0
         self.fail = fail
+
+    def begin_demand_step(self) -> None:
+        self.steps += 1
 
     def post_demand_blocks(self, need_blocks: int) -> None:
         if self.fail:
@@ -225,7 +252,9 @@ def test_the_first_unfit_request_of_a_step_is_posted(vllm_patches, monkeypatch):
     assert scheduler.schedule() == [["blocks"], None, None]
     scheduler.needs = [3]
     scheduler.schedule()
+    # The pool adds what each step allocated to its unfit request's blocks.
     assert pool.posted == [9, 0]
+    assert pool.steps == 2
 
 
 def test_a_failed_post_does_not_fail_the_step(vllm_patches, monkeypatch):
@@ -240,6 +269,11 @@ class _DemandManager:
 
     def __init__(self) -> None:
         self.posted: list[int] = []
+        self.allocated = 0
+
+    def take_step_alloc_blocks(self) -> int:
+        allocated, self.allocated = self.allocated, 0
+        return allocated
 
     def demand_pages(self, need_blocks: int) -> int:
         return max(0, need_blocks)
@@ -257,19 +291,22 @@ def _sglang_scheduler(evictable_tokens: int = 0):
     return scheduler, manager
 
 
-def test_sglang_round_posts_its_first_unfit_request():
+def test_sglang_round_posts_what_it_allocated_and_its_first_unfit_request():
     from kvcached.integration.sglang import patches
 
-    # 4 evictable tokens are 2 blocks that need no new page.
+    # Evictable radix cache is not subtracted: lower priorities' empty pages
+    # and cache go first.
     scheduler, manager = _sglang_scheduler(evictable_tokens=4)
+    manager.allocated = 2  # before the round: not this round's
     with patches._sglang_demand_round(scheduler):
+        manager.allocated += 4
         with patches._sglang_demand_round(scheduler):  # nested: posts nothing
             patches._sglang_note_unfit(5)
         patches._sglang_note_unfit(9)
-    assert manager.posted == [3]
+    assert manager.posted == [9]
     with patches._sglang_demand_round(scheduler):
         pass
-    assert manager.posted == [3, 0]
+    assert manager.posted == [9, 0]
 
 
 def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
