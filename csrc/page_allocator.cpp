@@ -540,9 +540,22 @@ PageState PageAllocator::get_page_state_unlocked() const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
+  const int previous_device = gpu_vmm::current_device();
+  const int pool_device = FTensorAllocator::device_index();
+  const bool change_device = pool_device >= 0 && previous_device != pool_device;
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(pool_device));
+  }
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(device_mem_info(gpu_vmm::current_device(), &avail_phy_mem_size,
-                            &total_phy_mem_size));
+  const auto status =
+      device_mem_info(pool_device >= 0 ? pool_device : previous_device,
+                      &avail_phy_mem_size, &total_phy_mem_size);
+  // Restore the caller's device even when the query reports an error, then
+  // preserve the existing fatal runtime-error contract.
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(previous_device));
+  }
+  CHECK_GPU(status);
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
@@ -552,8 +565,8 @@ int64_t PageAllocator::get_avail_physical_pages() const {
   // Worker-IPC allocators own their ledgers in the workers, not this process.
   // This remains an estimate; the actual map still performs atomic admission.
   if (world_size_ == 1 && !should_use_worker_ipc()) {
-    auto allocator = FTensorAllocator::global_allocator(group_id_);
-    if (allocator->kv_tensors_created())
+    auto allocator = FTensorAllocator::find_allocator(group_id_);
+    if (allocator != nullptr && allocator->kv_tensors_created())
       usable_phy_mem_size =
           std::min(usable_phy_mem_size, allocator->available_physical_bytes());
   }
