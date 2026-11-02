@@ -110,6 +110,11 @@ def case_brief(s: dict[str, Any], setup: dict[str, Any]) -> str:
         a, b = s["a"], s["b"]
         return (f"{ENGINE_NAMES[a['engine']]} {a['hf_id']} + {ENGINE_NAMES[b['engine']]} "
                 f"{b['hf_id']} on GPU {s.get('gpu', '0')}, batch limit {s.get('batch')}")
+    if s.get("kind") == "priority":
+        low, high = s["l"], s["h"]
+        return (f"{ENGINE_NAMES[low['engine']]} {low['hf_id']} (low priority) + "
+                f"{ENGINE_NAMES[high['engine']]} {high['hf_id']} (high priority) on GPU "
+                f"{s.get('gpu', '0')}, batch limit {s.get('batch')}")
     engine = setup.get("engines", {}).get(s["engine"], {})
     parts = [f"{ENGINE_NAMES[s['engine']]} {engine.get('engine') or ''}".strip(),
              f"{s['hf_id']}@{short(revisions.get(s['hf_id']))}", LAYOUTS[s.get("layout")],
@@ -136,7 +141,8 @@ def env_lines(setup: dict[str, Any]) -> list[str]:
     native cases add to that."""
     lines = []
     cases = (setup.get("cases", []) + [s[k] for s in setup.get("elastic", []) for k in "ab"]
-             + setup.get("limit", []))
+             + setup.get("limit", [])
+             + [s[k] for s in setup.get("priority", []) for k in "lh"])
     for name, info in setup.get("engines", {}).items():
         engine_env = dict(info.get("env") or {})  # a dict, or [key, value] pairs
         common = " ".join(f"{k}={v}" for k, v in engine_env.items())
@@ -179,6 +185,17 @@ def elastic_table(setup: dict[str, Any]) -> list[str]:
     return lines
 
 
+def priority_table(setup: dict[str, Any]) -> list[str]:
+    revisions = setup.get("model_revisions", {})
+    lines = ["| case | GPU | server L (low priority) | server H (high priority) |",
+             "|---|---|---|---|"]
+    for s in setup.get("priority", []):
+        servers = [f"{ENGINE_NAMES[x['engine']]}, {revision_link(x['hf_id'], revisions.get(x['hf_id']))}"
+                   f", {LAYOUTS[x.get('layout')]}, {model_flags(x)}" for x in (s["l"], s["h"])]
+        lines.append(f"| {s['name']} | {s.get('gpu', '0')} | {servers[0]} | {servers[1]} |")
+    return lines
+
+
 def limit_table(setup: dict[str, Any]) -> list[str]:
     revisions = setup.get("model_revisions", {})
     lines = ["| case | server |", "|---|---|"]
@@ -207,7 +224,7 @@ def merge_setups(parts: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     merged["engines"] = {k: v for s in setups for k, v in s.get("engines", {}).items()}
     merged["model_revisions"] = {k: v for s in setups
                                  for k, v in s.get("model_revisions", {}).items()}
-    for key in ("cases", "elastic", "limit"):
+    for key in ("cases", "elastic", "limit", "priority"):
         merged[key] = [c for s in setups for c in s.get(key, [])]
     merged["parts"] = [name for name, _ in parts] if len(parts) > 1 else []
     return merged
@@ -246,6 +263,10 @@ def correctness_section(profile: str, setup: dict[str, Any], args: argparse.Name
         lines += ["", "### Elastic tests", "", *elastic_table(setup), "",
                   *[f"- {step}" for step in setup.get("elastic_workload", [])], "",
                   *checks_table(setup.get("elastic_checks", {}))]
+    if setup.get("priority"):
+        lines += ["", "### Priority tests", "", *priority_table(setup), "",
+                  *[f"- {step}" for step in setup.get("priority_workload", [])], "",
+                  *checks_table(setup.get("priority_checks", {}))]
     if setup.get("limit"):
         lines += ["", "### Limit tests", "", *limit_table(setup), "",
                   *[f"- {step}" for step in setup.get("limit_workload", [])], "",
@@ -274,7 +295,8 @@ def header(title: str, verdict: str, args: argparse.Namespace) -> list[str]:
 
 def failed_cases(summary: dict[str, Any], setup: dict[str, Any]) -> list[str]:
     briefs = {s["name"]: case_brief(s, setup)
-              for s in setup.get("cases", []) + setup.get("elastic", []) + setup.get("limit", [])}
+              for s in setup.get("cases", []) + setup.get("elastic", []) + setup.get("limit", [])
+              + setup.get("priority", [])}
     failed = [c for c in summary.get("cases", []) if not c.get("ok")]
     lines = ["| case | setup | failed checks |", "|---|---|---|"]
     for case in failed[:MAX_FAILED_ROWS]:
