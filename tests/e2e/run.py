@@ -246,6 +246,16 @@ class LocalHost(Container):
     def __init__(self, engine: EngineSpec, name: str, gpus: str, out_dir: Path) -> None:
         self.engine = engine
         self.name = name
+        # A local server inherits this process's environment, so with --gpus
+        # all the run's GPUs are the ones an inherited CUDA_VISIBLE_DEVICES
+        # exposes, not the host indices 0, 1, ... Resolving them here keeps
+        # A (all of the run's GPUs), B (one of them), the memory sampler and
+        # the ballast on the same host devices, whatever the run inherited.
+        if gpus == "all":
+            inherited = [x.strip() for x in
+                         os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+            if inherited:
+                gpus = ",".join(inherited)
         self.gpus = gpus
         self.gpu = "0" if gpus == "all" else gpus.split(",")[0]
         self.out_dir = out_dir
