@@ -248,6 +248,58 @@ def test_sglang_does_not_retract_while_frees_are_grouped(monkeypatch):
         patches._sglang_end_preemption()
 
 
+@pytest.mark.parametrize("released_pool", [0, 1])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_sglang_coupled_preemption_stops_on_either_pools_claim(monkeypatch, released_pool, deferred):
+    from test_priority_reclaim import _coupled_managers
+
+    from kvcached.integration.sglang import patches
+
+    members, group = _coupled_managers(monkeypatch, deferred=deferred)
+    ops = sys.modules["kvcached.vmm_ops"]
+    monkeypatch.setattr(ops, "set_kv_reclaimable", lambda *a: None, raising=False)
+    monkeypatch.setattr(ops, "kv_reclaim", lambda *a: dict(
+        limit_bytes=4, empty_bytes=0, cache_bytes=0, running_bytes=4), raising=False)
+    full = members[0]
+    allocator = types.SimpleNamespace(kvcached_allocator=full)
+    scheduler = types.SimpleNamespace(token_to_kv_pool_allocator=allocator)
+    monkeypatch.setattr(patches, "_sglang_demand_manager", lambda _: full)
+    pages = full.reclaim_for_priority()
+    patches._sglang_begin_preemption(scheduler, pages)
+    try:
+        assert patches._sglang_preemption_pending(full)
+        occupied = full.occupied_pages()
+        members[released_pool].free([4, 5, 6, 7])
+        if released_pool == 1:
+            assert full.occupied_pages() == occupied
+        assert not patches._sglang_preemption_pending(full)
+        assert not group.pending()
+    finally:
+        patches._sglang_end_preemption()
+    # A deferred claim remains guarded until its acknowledged batch completes.
+    member = members[released_pool]
+    if deferred:
+        assert member._unreusable_page_ids() == frozenset({1})
+        member.release_retired_pages_through(member.capture_physical_release_marker())
+    assert len(member.page_allocator.inuse) == 1
+
+
+def test_sglang_coupled_grouped_frees_keep_session_without_forced_retraction(monkeypatch):
+    from test_priority_reclaim import _coupled_managers
+
+    from kvcached.integration.sglang import patches
+
+    (full, _), group = _coupled_managers(monkeypatch)
+    group.active, group.limit, group.asks = True, 4, [0, 0, 4]
+    monkeypatch.setattr(patches, "_sglang_demand_manager", lambda _: full)
+    monkeypatch.setattr(patches, "_frees_are_deferred", lambda _: True)
+    scheduler = types.SimpleNamespace(token_to_kv_pool_allocator=None)
+    assert patches._sglang_reclaim_for_priority(scheduler) == 0
+    patches._sglang_begin_preemption(scheduler, 1)
+    assert not patches._sglang_preemption_pending(full)
+    assert group.pending() and group.limit == 4
+
+
 def _paged(blocks: dict, occupancy: dict, freeable: bool = True) -> tuple:
     """Four blocks a page; `blocks` maps a request to its block ids."""
 

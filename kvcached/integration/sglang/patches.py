@@ -513,6 +513,10 @@ def _sglang_end_preemption() -> None:
         return
     manager, _, reserved = preempt
     try:
+        group = getattr(manager, "_priority_reclaim_group", None)
+        if group is not None:
+            group.finish()
+            return
         # Pages the retracted requests emptied may sit on the reserve.
         manager.release_empty_pages(
             max(0, manager.page_allocator.get_num_reserved_pages() - reserved))
@@ -522,6 +526,10 @@ def _sglang_end_preemption() -> None:
 
 def _sglang_preemption_pending(manager: Any) -> bool:
     preempt = getattr(_SGLANG_DEMAND, "preempt", None)
+    if preempt is not None:
+        group = getattr(preempt[0], "_priority_reclaim_group", None)
+        if group is not None:
+            return any(manager is member for member in group.members) and group.pending()
     return (preempt is not None and preempt[0] is manager
             and manager.occupied_pages() > preempt[1])
 
