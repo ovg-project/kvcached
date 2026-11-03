@@ -588,7 +588,7 @@ def test_priority_engine_deferred_allowance_survives_zero_plans(monkeypatch, ord
 def test_vllm_only_priority_deferred_tickets_keep_guard(vllm_patches, monkeypatch):
     monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: True)
     priority, ordinary = [object()], [object()]
-    seen = []
+    seen: list[bool] = []
 
     class Scheduler:
         def __init__(self):
@@ -638,10 +638,10 @@ def test_sglang_legacy_decode_context_preserves_selected_requests(monkeypatch, c
             return patches._sglang_reserve_decode_capacity(sub, tree_cache, num_tokens, num_tokens)
 
     if composite:
-        Allocator.full_attn_allocator = sub
-        Allocator.swa_attn_allocator = None
+        Allocator.full_attn_allocator = sub  # type: ignore[attr-defined]
+        Allocator.swa_attn_allocator = None  # type: ignore[attr-defined]
         module = types.ModuleType("swa")
-        module.SWATokenToKVPoolAllocator = Allocator
+        module.SWATokenToKVPoolAllocator = Allocator  # type: ignore[attr-defined]
         assert patches.ElasticSWAAllocatorPatch().patch_swa_composite_misses(module)
     allocator = Allocator()
 
@@ -652,7 +652,7 @@ def test_sglang_legacy_decode_context_preserves_selected_requests(monkeypatch, c
             return allocator.check_decode_capacity(num_tokens=2, tree_cache=None)
 
     module = types.ModuleType("sglang.srt.managers.schedule_batch")
-    module.ScheduleBatch = Batch
+    module.ScheduleBatch = Batch  # type: ignore[attr-defined]
     assert patches.ScheduleBatchDecodeContextPatch().patch_check_decode_mem(module)
     batch = Batch()
     assert not batch.check_decode_mem()
@@ -677,7 +677,7 @@ def test_sglang_legacy_decode_context_restored_after_error(monkeypatch):
             raise RuntimeError("native gate failed")
 
     module = types.ModuleType("sglang.srt.managers.schedule_batch")
-    module.ScheduleBatch = Batch
+    module.ScheduleBatch = Batch  # type: ignore[attr-defined]
     assert patches.ScheduleBatchDecodeContextPatch().patch_check_decode_mem(module)
     with pytest.raises(RuntimeError, match="native gate failed"):
         Batch().check_decode_mem([1])

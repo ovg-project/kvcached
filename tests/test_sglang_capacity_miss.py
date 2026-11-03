@@ -525,7 +525,7 @@ def test_pipeline_modern_decode_gate_keeps_request_context(monkeypatch, cpu_tens
     _install_pipeline_stages(monkeypatch, 2)
     allocator, manager = (_paged_allocator(monkeypatch, 1, 4, 1) if paged
                           else _token_allocator(1))
-    requests = [] if context in ("requests", "both") else None
+    requests: Optional[list[object]] = [] if context in ("requests", "both") else None
     spec = object() if context in ("spec", "both") else None
     capacity = 4 if paged else 1
     for need in (capacity, capacity + 1):
