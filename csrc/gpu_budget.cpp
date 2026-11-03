@@ -631,6 +631,9 @@ uint64_t ReclaimPlan::total() const {
 ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
                                       const Shared *data) const {
   uint64_t charged[kInstances]{};
+  uint64_t release_unit[kInstances];
+  std::fill(std::begin(release_unit), std::end(release_unit), UINT64_MAX);
+  bool unknown_geometry[kInstances]{};
   bool live[kInstances]{};
   bool shrinkable[kInstances];
   std::fill(std::begin(shrinkable), std::end(shrinkable), true);
@@ -641,8 +644,17 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
     if (!pool.owner || pool.instance >= kInstances)
       continue;
     // A crashed instance neither asks nor gives (see watermark_locked).
-    if (!live[pool.instance] && pool_alive(slot, data))
+    const bool alive = pool_alive(slot, data);
+    if (alive)
       live[pool.instance] = true;
+    if (alive && pool.can_shrink) {
+      if (!pool.page_bundle)
+        unknown_geometry[pool.instance] = true;
+      else if (pool.charged > pool.minimum &&
+               pool.charged - pool.minimum >= pool.page_bundle)
+        release_unit[pool.instance] =
+            std::min<uint64_t>(release_unit[pool.instance], pool.page_bundle);
+    }
     charged[pool.instance] = add(charged[pool.instance], pool.charged);
     shrinkable[pool.instance] = shrinkable[pool.instance] && pool.can_shrink;
   }
@@ -706,7 +718,10 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
       const Tier tier = step == 0 ? kEmpty : step == 1 ? kCache : kRunning;
       std::vector<size_t> victims;
       for (size_t i = 0; i < kInstances; ++i)
-        if (excess[i] && left[tier][i] && priority(i) < priority(requester))
+        // Skip only snapshots where no live pool can release even one page.
+        // Use the original limit: later asks can share an already asked page.
+        if (excess[i] && left[tier][i] && priority(i) < priority(requester) &&
+            (unknown_geometry[i] || release_unit[i] <= assigned[i].limit_bytes))
           victims.push_back(i);
       std::stable_sort(victims.begin(), victims.end(), [&](size_t a, size_t b) {
         return priority(a) != priority(b) ? priority(a) < priority(b)
