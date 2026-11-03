@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -508,6 +509,20 @@ bool publish_instance_reclaimable(const std::string &path,
       name, generation, empty, cache, releasing);
 }
 
+bool publish_pool_reclaimable(
+    const std::string &path, const std::string &name, uint64_t generation,
+    const std::vector<
+        std::tuple<size_t, uint64_t, uint64_t, uint64_t, uint64_t>> &levels) {
+  std::vector<PoolReclaimable> pools;
+  pools.reserve(levels.size());
+  for (const auto &level : levels)
+    pools.push_back({std::get<0>(level), std::get<1>(level), std::get<2>(level),
+                     std::get<3>(level), std::get<4>(level)});
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_pool_reclaimable(name, generation,
+                                                              pools);
+}
+
 py::dict publish_instance_control(const std::string &path,
                                   const std::string &name, uint64_t bytes,
                                   uint64_t generation,
@@ -632,6 +647,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_kv_reclaimable", &kvcached::set_kv_reclaimable, py::arg("empty"),
         py::arg("cache"), py::arg("releasing"), py::arg("group_id") = 0);
   m.def("kv_reclaim", &kvcached::kv_reclaim, py::arg("group_id") = 0);
+  m.def("_publish_pool_reclaimable", &kvcached::publish_pool_reclaimable,
+        py::arg("path"), py::arg("name"), py::arg("generation"),
+        py::arg("levels"));
   m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
         "prepare_map_to_kv_tensors", py::arg("transaction_id"),
         py::arg("offsets"), py::arg("group_id") = 0);

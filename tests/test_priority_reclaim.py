@@ -697,8 +697,21 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
     from kvcached import kv_cache_manager
     from kvcached.priority_reclaim import PriorityReclaimGroup
 
-    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
     members: tuple[Any, ...] = (_make_manager(deferred), _make_manager(deferred))
+    ops = sys.modules.get("kvcached.vmm_ops")
+    if ops is None:
+        ops = types.ModuleType("kvcached.vmm_ops")
+        monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", ops)
+
+    def publish_pools(path, name, generation, pools):
+        # Keep the existing aggregate assertions while recording every pool.
+        post = getattr(ops, "set_kv_reclaimable", None)
+        if post is not None:
+            post(*(sum(pool[i] for pool in pools) for i in (2, 3, 4)), 0)
+        return True
+
+    monkeypatch.setattr(ops, "_publish_pool_reclaimable", publish_pools, raising=False)
+    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
     for i, member in enumerate(members):
         member.group_id = i
         member.world_size = 1
@@ -966,3 +979,48 @@ def test_pages_freed_after_the_step_in_flight_post_as_releasing(manager_module):
     manager.post_reclaimable_levels()
     reclaimable.assert_called_once_with(0, 0, 32, 0)
     assert manager._priority_release_allowance == 0
+
+
+def test_coupled_publishes_pool_tiers_when_aggregate_does_not_change(manager_module, monkeypatch):
+    members, group = _coupled_managers(monkeypatch)
+    ops = sys.modules["kvcached.vmm_ops"]
+    published = mock.Mock(return_value=True)
+    monkeypatch.setattr(ops, "_publish_pool_reclaimable", published)
+    levels = [[1, 0, 0], [0, 0, 0]]
+    for i, member in enumerate(members):
+        monkeypatch.setattr(member, "_reclaimable_levels", lambda i=i: levels[i])
+    group.publish()
+    first = published.call_args.args[-1]
+    levels.reverse()
+    group.publish()
+    second = published.call_args.args[-1]
+    assert published.call_count == 2
+    assert first != second
+    assert sum(pool[2] for pool in first) == sum(pool[2] for pool in second)
+    assert [pool[:2] for pool in second] == [(0, 1), (1, 2)]
+    group.publish()
+    assert published.call_count == 2
+
+
+def test_coupled_rejected_pool_publication_keeps_retryable_snapshot(manager_module, monkeypatch):
+    _, group = _coupled_managers(monkeypatch)
+    published = mock.Mock(return_value=False)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "_publish_pool_reclaimable", published)
+    with pytest.raises(RuntimeError, match="participants changed"):
+        group.publish()
+    assert group.posted is None
+    published.return_value = True
+    group.publish()
+    assert group.posted is not None
+
+
+def test_coupled_reclaim_refreshes_pool_metadata_after_legacy_publication(manager_module, monkeypatch):
+    _, _, plan = manager_module
+    _, group = _coupled_managers(monkeypatch)
+    published = mock.Mock(return_value=True)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "_publish_pool_reclaimable", published)
+    group.publish()
+    before = published.call_count
+    plan.update(limit_bytes=0)
+    group.reclaim()
+    assert published.call_count == before + 1
