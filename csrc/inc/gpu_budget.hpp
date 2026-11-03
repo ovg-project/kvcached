@@ -80,6 +80,15 @@ struct ReclaimPlan {
   uint64_t total() const;
 };
 
+// Internal pool detail accompanying one instance's aggregate reclaim levels.
+struct PoolReclaimable {
+  size_t slot;
+  uint64_t owner;
+  uint64_t empty_bytes;
+  uint64_t cache_bytes;
+  uint64_t releasing_bytes;
+};
+
 // The policy an instance starts with, before any control is published.
 struct InstancePolicy {
   uint64_t min_bytes = 0;
@@ -234,6 +243,10 @@ public:
                        uint64_t releasing);
   bool post_reclaimable(const std::string &instance, uint64_t generation,
                         uint64_t empty, uint64_t cache, uint64_t releasing);
+  // Publish every live pool together. Invalid identities or an incomplete
+  // batch leave both the aggregate and all pool detail unchanged.
+  bool post_pool_reclaimable(const std::string &instance, uint64_t generation,
+                             const std::vector<PoolReclaimable> &pools);
   // What the slot's instance should release now so that higher priorities'
   // max(headroom, demand) fits. Every instance derives the same plan from the
   // ledger, so all pick the same victims. Nothing is stored: once that fits,
@@ -269,6 +282,7 @@ private:
   void check_owner() const;
   void reclaim_instances_locked();
   void retire_dead_pools();
+  void invalidate_pool_reclaimable_locked(size_t instance);
   BudgetSnapshot snapshot_locked(size_t slot) const;
   bool pool_alive(size_t slot, const Shared *data) const;
   uint64_t allowed_demand(size_t instance, uint64_t charged,
