@@ -445,6 +445,8 @@ def _sglang_demand_round(scheduler: Any):
     _SGLANG_DEMAND.need = None
     _SGLANG_DEMAND.prefill_tried = False
     _SGLANG_DEMAND.prefill_miss = None
+    _SGLANG_DEMAND.prefill_input_blocks = 0
+    _SGLANG_DEMAND.need_overlap = 0
     _SGLANG_DEMAND.prefill_retry_budget = None
     _SGLANG_DEMAND.prefill_retry_reservation = None
     _SGLANG_DEMAND.prefill_retry = False
@@ -471,8 +473,10 @@ def _sglang_demand_round(scheduler: Any):
             scheduler._kvcached_prefill_retry_reservation = _SGLANG_DEMAND.prefill_retry_reservation
         elif _SGLANG_DEMAND.prefill_tried or not getattr(scheduler, "waiting_queue", None):
             scheduler._kvcached_prefill_miss = None
+            scheduler._kvcached_prefill_demand = None
         elif need is None:
-            need = getattr(scheduler, "_kvcached_prefill_miss", None)
+            need = getattr(scheduler, "_kvcached_prefill_demand",
+                           getattr(scheduler, "_kvcached_prefill_miss", None))
         _sglang_post_demand(scheduler, need or 0)
 
 
@@ -504,7 +508,10 @@ def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
 def _sglang_prefill_miss_is_backed(scheduler: Any, manager: Any, miss: int) -> bool:
     budget = getattr(scheduler, "_kvcached_prefill_retry_budget", None)
     if budget is None:
-        return manager.available_size() >= miss
+        # Legacy/ignore_eos retries use the same remaining requirement we post:
+        # admitted inputs are now allocated, but output reservations remain.
+        demand = getattr(scheduler, "_kvcached_prefill_demand", None)
+        return manager.available_size() >= (miss if demand is None else demand)
     reservation = getattr(scheduler, "_kvcached_prefill_retry_reservation", None)
     running = getattr(getattr(scheduler, "running_batch", None), "reqs", None)
     if reservation is not None and running is not None:
@@ -573,10 +580,11 @@ def _sglang_prefill_retry_budgets(adder: Any) -> Any:
     return budgets
 
 
-def _sglang_note_unfit(need_blocks: int) -> None:
+def _sglang_note_unfit(need_blocks: int, allocated_overlap: int = 0) -> None:
     """Record the blocks of the round's first request that does not fit."""
     if getattr(_SGLANG_DEMAND, "open", False) and _SGLANG_DEMAND.need is None:
         _SGLANG_DEMAND.need = max(0, int(need_blocks))
+        _SGLANG_DEMAND.need_overlap = max(0, allocated_overlap)
 
 
 def _sglang_demand_manager(scheduler: Any) -> Any:
@@ -599,13 +607,37 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
     if manager is None:
         return
     try:
-        need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+        allocated = manager.take_step_alloc_blocks()
+        # A prefill miss includes inputs already admitted in the same pass.
+        # Count their allocation once, keeping output reservations and slack.
+        overlap = min(allocated, getattr(_SGLANG_DEMAND, "need_overlap", 0))
+        need = allocated + max(0, unfit_blocks) - overlap
+        miss = getattr(_SGLANG_DEMAND, "prefill_miss", None)
+        if miss is not None:
+            scheduler._kvcached_prefill_demand = miss - min(
+                allocated, getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
         manager.post_demand(manager.demand_pages(need))
         post_levels = getattr(manager, "post_reclaimable_levels", None)
         if post_levels is not None:
             post_levels()
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)
+
+
+def _sglang_prefill_input_blocks(adder: Any, page_size: int) -> int:
+    """New input blocks already included in this adder's total-token offset."""
+    blocks = 0
+    for req in getattr(adder, "can_run_list", ()):
+        extend_range = getattr(req, "extend_range", None)
+        if extend_range is not None:
+            start, end = extend_range.start, extend_range.end
+        else:
+            start = len(getattr(req, "prefix_indices", ()))
+            end = start + int(getattr(req, "extend_input_len", 0))
+        # A partial prefix page is already backed. Keep the native page
+        # rounding/overhead budget that does not allocate another block.
+        blocks += max(0, -(-end // page_size) - -(-start // page_size))
+    return blocks
 
 
 def _sglang_request_need_tokens(req: Any) -> int:
@@ -3147,6 +3179,10 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
                 try:
                     result = original(self, *args, **kwargs)
                 except SGLangPrefillCapacityMiss as miss:
+                    # The admitted inputs were rolled back, so they cannot
+                    # replace any of this round's later allocation forecast.
+                    _SGLANG_DEMAND.prefill_input_blocks = 0
+                    _SGLANG_DEMAND.need_overlap = 0
                     batch = miss.batch
                     _unwind_prefill_admission(
                         self, batch, chunked_before, running_batch)
@@ -3227,9 +3263,11 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
                     if can_run_list and can_run_list[-1] is req:
                         _SGLANG_DEMAND.prefill_retry = True
                     else:
-                        _sglang_note_unfit(blocks)
+                        input_blocks = min(blocks, _sglang_prefill_input_blocks(self, page_size))
+                        _sglang_note_unfit(blocks, input_blocks)
                         if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
                             _SGLANG_DEMAND.prefill_miss = blocks
+                            _SGLANG_DEMAND.prefill_input_blocks = input_blocks
                             if ignore_eos:
                                 # Cache-disabled ignore_eos has its own lifetime
                                 # occupancy test and unclipped output lengths.
