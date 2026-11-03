@@ -923,6 +923,108 @@ int main() {
     budget.reset();
     unlink(ledger.c_str());
   }
+  for (int tier = 0; tier < 3; ++tier) {
+    for (uint64_t minimum : {15u, 0u}) {
+      const auto ledger = std::string(directory) + "/subpage-floor";
+      auto budget = GpuBudget::connect(ledger, [] { return 32; });
+      auto low = budget->register_pool("low", 0, InstancePolicy{minimum, 0, 0});
+      auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+      auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+      for (auto slot : {low, mid, high})
+        budget->configure_control_pool(slot, 64, 16, true);
+      auto first = budget->grant(low, 16);
+      auto low_held = first->take(16);
+      first->finish();
+      auto second = budget->grant(mid, 16);
+      auto mid_held = second->take(16);
+      second->finish();
+      for (auto slot : {low, mid})
+        budget->set_reclaimable(slot, tier == 0 ? 16 : 0, tier == 1 ? 16 : 0,
+                                0);
+      budget->set_demand(high, 1);
+      for (int round = 0; round < 3; ++round) {
+        // A byte ask must pass the victim that cannot release a whole page.
+        assert(budget->reclaim_plan(low).total() == (minimum ? 0 : 1));
+        assert(budget->reclaim_plan(mid).total() == (minimum ? 1 : 0));
+        assert(budget->reclaim_plan(low).limit_bytes == (minimum ? 1 : 16));
+      }
+      low_held.reset();
+      mid_held.reset();
+      budget.reset();
+      unlink(ledger.c_str());
+    }
+  }
+  {
+    const auto ledger = std::string(directory) + "/live-release-unit";
+    auto budget = GpuBudget::connect(ledger, [] { return 64; });
+    auto large = budget->register_pool("low", 0, InstancePolicy{15, 0, 0});
+    auto small = budget->register_pool("low", 1);
+    auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(large, 32, 16, true);
+    budget->configure_control_pool(small, 16, 1, true, 0, true);
+    budget->configure_control_pool(mid, 48, 1, true);
+    auto first = budget->grant(large, 16);
+    auto held = first->take(16);
+    first->finish();
+    auto second = budget->grant(mid, 47);
+    auto mid_held = second->take(47);
+    second->finish();
+    budget->set_reclaimable(large, 16, 0, 0);
+    budget->set_reclaimable(mid, 47, 0, 0);
+    budget->set_demand(high, 2);
+    // Empty small pools cannot make a sub-page remainder executable.
+    assert(budget->reclaim_plan(large).total() == 0);
+    assert(budget->reclaim_plan(mid).total() == 1);
+    budget->set_demand(high, 0);
+    auto third = budget->grant(small, 1);
+    auto null_held = third->take(1);
+    third->finish();
+    budget->set_demand(high, 2);
+    // Its only page is the native null reservation, still not releasable.
+    assert(budget->reclaim_plan(large).total() == 0);
+    assert(budget->reclaim_plan(mid).total() == 2);
+    mid_held->release();
+    auto fourth = budget->grant(small, 1);
+    auto small_held = fourth->take(1);
+    fourth->finish();
+    budget->set_demand(high, 64);
+    // A real small page must remain eligible alongside a larger sibling.
+    assert(budget->reclaim_plan(large).total() > 0);
+    held.reset();
+    null_held.reset();
+    small_held.reset();
+    mid_held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = std::string(directory) + "/shared-page-asks";
+    auto budget = GpuBudget::connect(ledger, [] { return 32; });
+    auto low = budget->register_pool("low", 0);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    auto highest = budget->register_pool("highest", 0, InstancePolicy{0, 3, 0});
+    budget->configure_control_pool(low, 16, 16, true);
+    budget->configure_control_pool(spare, 16, 16, true);
+    auto first = budget->grant(low, 16);
+    auto low_held = first->take(16);
+    first->finish();
+    auto second = budget->grant(spare, 16);
+    auto spare_held = second->take(16);
+    second->finish();
+    budget->set_reclaimable(low, 16, 0, 0);
+    budget->set_reclaimable(spare, 16, 0, 0);
+    budget->set_demand(high, 1);
+    budget->set_demand(highest, 1);
+    // Both byte asks fit in the same page; do not also reclaim from spare.
+    assert(budget->reclaim_plan(low).empty_bytes == 2);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    low_held.reset();
+    spare_held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
   unlink(path.c_str());
   rmdir(directory);
 }
