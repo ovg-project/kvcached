@@ -981,3 +981,114 @@ def test_sglang_retry_on_independent_native_budget_progress(monkeypatch, pool):
     with patches._sglang_demand_round(scheduler):
         assert not scheduler.running_batch.batch_is_full
         assert PrefillAdder().add_one_req(req).name == "CONTINUE"
+
+
+@pytest.mark.parametrize("page_size,prefix,end,offset,allocated,need,miss", [
+    (1, 0, 4, 6, 4, 11, 11),  # Jeff's accepted A, then rejected B.
+    (2, 0, 3, 7, 2, 7, 7),    # Round each admitted request's actual pages.
+    (2, 1, 2, 5, 0, 6, 6),    # Reuse the partial prefix page; keep padding.
+    (1, 0, 4, 8.5, 4, 13, 13),  # Keep running output reservation.
+    (1, 0, 4, 6, 0, 11, 11),  # No allocation: no overlap can be deducted.
+])
+def test_sglang_admitted_input_is_counted_once(
+        monkeypatch, page_size, prefix, end, offset, allocated, need, miss):
+    from kvcached.integration.sglang import patches
+
+    accepted = types.SimpleNamespace(extend_range=types.SimpleNamespace(start=prefix, end=end))
+    rejected = types.SimpleNamespace(
+        full_untruncated_fill_ids=[0, 1], prefix_indices=[], output_ids=[],
+        sampling_params=types.SimpleNamespace(max_new_tokens=1))
+
+    class PrefillAdder:
+        def __init__(self):
+            self.page_size = page_size
+            self.rem_total_token_offset = offset
+            self.can_run_list = [accepted]
+
+        def add_one_req(self, req):
+            return types.SimpleNamespace(name="NO_TOKEN")
+
+    module = types.ModuleType("sglang.srt.managers.schedule_policy")
+    module.PrefillAdder = PrefillAdder  # type: ignore[attr-defined]
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    assert patches.PrefillAdderDemandPatch().patch_add_one_req(module)
+    scheduler, manager = _sglang_scheduler()
+    scheduler.waiting_queue = [rejected]
+    with patches._sglang_demand_round(scheduler):
+        PrefillAdder().add_one_req(rejected)
+        manager.allocated = allocated
+    assert manager.posted == [need]
+    assert scheduler._kvcached_prefill_miss == miss  # Keep the original admission estimate.
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert manager.posted == [need, need - allocated]
+    scheduler.waiting_queue = []
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert manager.posted[-1] == 0
+
+
+def test_sglang_ignore_eos_retry_keeps_output_reservations_after_admitted_input(monkeypatch):
+    from kvcached.integration.sglang import patches
+
+    accepted = types.SimpleNamespace(extend_range=types.SimpleNamespace(start=0, end=40))
+    rejected = types.SimpleNamespace(
+        full_untruncated_fill_ids=list(range(40)), prefix_indices=[], output_ids=[],
+        sampling_params=types.SimpleNamespace(max_new_tokens=5, ignore_eos=True))
+
+    class PrefillAdder:
+        page_size = 1
+        tree_cache = types.SimpleNamespace(disable=True)
+        # Existing running output 20, accepted input 40 + output 10 + page 1.
+        rem_total_token_offset = 71
+        can_run_list = [accepted]
+
+        def add_one_req(self, req):
+            return types.SimpleNamespace(name="NO_TOKEN")
+
+    module = types.ModuleType("sglang.srt.managers.schedule_policy")
+    module.PrefillAdder = PrefillAdder  # type: ignore[attr-defined]
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    assert patches.PrefillAdderDemandPatch().patch_add_one_req(module)
+    scheduler, manager = _sglang_scheduler()
+    scheduler.waiting_queue = [rejected]
+    scheduler.running_batch = types.SimpleNamespace(batch_is_full=True)
+    manager.available = 60
+    manager.available_size = lambda: manager.available
+    manager.demand_pages = lambda blocks: max(0, blocks - manager.available)
+    with patches._sglang_demand_round(scheduler):
+        PrefillAdder().add_one_req(rejected)
+        manager.allocated = 40
+    assert scheduler._kvcached_prefill_miss == 116
+    assert scheduler._kvcached_prefill_demand == 76
+    assert scheduler._kvcached_prefill_retry_budget is None
+    with patches._sglang_demand_round(scheduler):
+        assert scheduler.running_batch.batch_is_full
+    assert manager.posted[-1] == 16
+    manager.available = 75
+    with patches._sglang_demand_round(scheduler):
+        assert scheduler.running_batch.batch_is_full
+    manager.available = 76
+    with patches._sglang_demand_round(scheduler):
+        assert not scheduler.running_batch.batch_is_full
+
+
+def test_sglang_prefill_input_pages_include_legacy_and_chunked_ranges():
+    from kvcached.integration.sglang import patches
+
+    adder = types.SimpleNamespace(can_run_list=[
+        types.SimpleNamespace(prefix_indices=[0, 1], extend_input_len=3),
+        types.SimpleNamespace(extend_range=types.SimpleNamespace(start=4, end=6)),
+    ])
+    assert patches._sglang_prefill_input_blocks(adder, 2) == 3
+
+
+def test_sglang_decode_miss_does_not_deduct_later_prefill_inputs():
+    from kvcached.integration.sglang import patches
+
+    scheduler, manager = _sglang_scheduler()
+    with patches._sglang_demand_round(scheduler):
+        patches._sglang_note_unfit(5)
+        patches._sglang_note_unfit(11, allocated_overlap=4)
+        manager.allocated = 4
+    assert manager.posted == [9]
