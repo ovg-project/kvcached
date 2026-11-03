@@ -555,14 +555,29 @@ bool GpuBudget::pool_alive(size_t slot, const Shared *data) const {
   return owner_lock.l_type != F_UNLCK;
 }
 
-// The part of an instance's demand that its own max still allows on this GPU.
+// The part of an instance's demand its max and live pools can still map.
 // What it could not take anyway keeps nothing from other instances.
 uint64_t GpuBudget::allowed_demand(size_t instance, uint64_t charged,
-                                   const Shared *data) {
+                                   const Shared *data) const {
   const auto &entry = data->instances[instance];
+  uint64_t pool_room = 0;
+  for (size_t slot = 0; slot < kPools; ++slot) {
+    const auto &pool = data->pools[slot];
+    if (!pool.owner || pool.instance != instance || !pool_alive(slot, data))
+      continue;
+    // Observe leases without refunding or retiring dead siblings. Unknown
+    // geometry is unbounded; configured zero capacity is an actual bound.
+    const uint64_t capacity = !pool.page_bundle    ? UINT64_MAX
+                              : entry.participants ? pool.target
+                                                   : pool.capacity;
+    // Published targets are page-rounded. A pool still shrinking above its
+    // target cannot grow, but must not consume another pool's usable room.
+    pool_room = saturating_add(
+        pool_room, capacity > pool.charged ? capacity - pool.charged : 0);
+  }
   const uint64_t limit = entry.limit;
-  return std::min<uint64_t>(entry.demand,
-                            limit > charged ? limit - charged : 0);
+  return std::min<uint64_t>(
+      entry.demand, std::min(pool_room, limit > charged ? limit - charged : 0));
 }
 
 // headroom + shortfall of #585, where the shortfall is the demand that the

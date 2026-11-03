@@ -233,8 +233,8 @@ private:
   void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   bool pool_alive(size_t slot, const Shared *data) const;
-  static uint64_t allowed_demand(size_t instance, uint64_t charged,
-                                 const Shared *data);
+  uint64_t allowed_demand(size_t instance, uint64_t charged,
+                          const Shared *data) const;
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);

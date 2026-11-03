@@ -624,6 +624,84 @@ int main() {
     budget.reset();
     unlink(ledger.c_str());
   }
+  {
+    // An unlimited runtime max must not reserve beyond virtual pool capacity.
+    const auto ledger = std::string(directory) + "/demand-capacity";
+    auto budget = GpuBudget::connect(ledger, [] { return 40; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 20, 2, true);
+    auto grant = budget->grant(high, 20);
+    auto held = grant->take(20);
+    grant->finish();
+    budget->set_demand(high, 10);
+    assert(budget->snapshot(low).watermark_bytes == 0);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    budget->grant(low, 15)->finish();
+    // All pools of the instance contribute, not just the posting pool.
+    auto sibling = budget->register_pool("high", 1);
+    budget->configure_control_pool(sibling, 6, 2, true);
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    assert(budget->query_control("high").shortfall_bytes == 6);
+    budget->ready_control_pool(high);
+    budget->ready_control_pool(sibling);
+    assert(budget->set_instance_limit(high, 24, 1) == "accepted");
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->set_instance_limit(high, UINT64_MAX, 2) == "accepted");
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    // A configured zero pool differs from unknown/unconfigured geometry.
+    auto empty = budget->register_pool("empty", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(empty, 0, 2, true, 0, false);
+    budget->set_demand(empty, 100);
+    assert(budget->query_control("empty").shortfall_bytes == 0);
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    held->release();
+    held.reset();
+    assert(budget->snapshot(low).watermark_bytes == 10);
+    budget->set_demand(high, 100);
+    assert(budget->set_instance_limit(high, 24, 3) == "accepted");
+    // Proportional page-rounded targets are 18 + 4, not the raw limit 24.
+    assert(budget->snapshot(low).watermark_bytes == 22);
+    assert(budget->query_control("high").shortfall_bytes == 22);
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  for (uint64_t dead_charge : {0u, 6u}) {
+    const auto ledger = std::string(directory) + "/dead-demand-capacity";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 20, 2, true);
+    auto grant = budget->grant(high, 20);
+    auto held = grant->take(20);
+    grant->finish();
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      auto other = GpuBudget::connect(ledger, [] { return 100; });
+      auto sibling = other->register_pool("high", 1);
+      other->configure_control_pool(sibling, 20, 2, true);
+      auto child_grant = other->grant(sibling, dead_charge);
+      auto child_held = child_grant->take(dead_charge);
+      child_grant->finish();
+      _exit(0); // Preserve the pool entry and charge; release only its lease.
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    budget->set_demand(high, 100);
+    assert(budget->snapshot(low).watermark_bytes == 0);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->query_control("high").charged_bytes == 20 + dead_charge);
+    held->release();
+    // Dead charges remain accounted for, but do not reduce the 20 bytes
+    // that the live pool can map again after its confirmed release.
+    assert(budget->snapshot(low).watermark_bytes == 20);
+    assert(budget->query_control("high").charged_bytes == dead_charge);
+    held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
   unlink(path.c_str());
   rmdir(directory);
 }

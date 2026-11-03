@@ -445,6 +445,9 @@ def _sglang_demand_round(scheduler: Any):
     _SGLANG_DEMAND.need = None
     _SGLANG_DEMAND.prefill_tried = False
     _SGLANG_DEMAND.prefill_miss = None
+    _SGLANG_DEMAND.prefill_retry_budget = None
+    _SGLANG_DEMAND.prefill_retry_reservation = None
+    _SGLANG_DEMAND.prefill_retry = False
     try:
         manager = _sglang_demand_manager(scheduler)
         if manager is not None:
@@ -457,10 +460,14 @@ def _sglang_demand_round(scheduler: Any):
     finally:
         need = _SGLANG_DEMAND.need
         miss = _SGLANG_DEMAND.prefill_miss
+        if _SGLANG_DEMAND.prefill_tried:
+            scheduler._kvcached_prefill_retry = _SGLANG_DEMAND.prefill_retry and miss is None
         _SGLANG_DEMAND.open = False
         _SGLANG_DEMAND.need = None
         if miss is not None:
             scheduler._kvcached_prefill_miss = miss
+            scheduler._kvcached_prefill_retry_budget = _SGLANG_DEMAND.prefill_retry_budget
+            scheduler._kvcached_prefill_retry_reservation = _SGLANG_DEMAND.prefill_retry_reservation
         elif _SGLANG_DEMAND.prefill_tried or not getattr(scheduler, "waiting_queue", None):
             scheduler._kvcached_prefill_miss = None
         elif need is None:
@@ -469,7 +476,7 @@ def _sglang_demand_round(scheduler: Any):
 
 
 def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
-    """Clear SGLang's full-batch flag once the pool can back its last miss.
+    """Retry a known miss when backed, or probe after an admitted NO_TOKEN.
 
     Only without TP: each rank reads its own GPU's memory, and ranks that
     disagree on whether to try a prefill would schedule different batches.
@@ -478,10 +485,91 @@ def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
         return
     miss = getattr(scheduler, "_kvcached_prefill_miss", None)
     batch = getattr(scheduler, "running_batch", None)
+    # NO_TOKEN can follow a successful admission. Give the *next* waiting
+    # request one native attempt; the admitted request's size is not its gate.
+    # If it cannot fit, that attempt records its own miss and waits normally.
+    if (getattr(scheduler, "_kvcached_prefill_retry", False)
+            and batch is not None and getattr(batch, "batch_is_full", False)
+            and getattr(scheduler, "waiting_queue", None)):
+        scheduler._kvcached_prefill_retry = False
+        batch.batch_is_full = False
+        return
     if (miss and batch is not None and getattr(batch, "batch_is_full", False)
             and getattr(scheduler, "waiting_queue", None)
-            and manager.available_size() >= miss):
+            and _sglang_prefill_miss_is_backed(scheduler, manager, miss)):
         batch.batch_is_full = False
+
+
+def _sglang_prefill_miss_is_backed(scheduler: Any, manager: Any, miss: int) -> bool:
+    budget = getattr(scheduler, "_kvcached_prefill_retry_budget", None)
+    if budget is None:
+        return manager.available_size() >= miss
+    reservation = getattr(scheduler, "_kvcached_prefill_retry_reservation", None)
+    running = getattr(getattr(scheduler, "running_batch", None), "reqs", None)
+    if reservation is not None and running is not None:
+        estimate, previous_offset, previous_ratio = reservation
+        tracker = getattr(scheduler, "new_token_ratio_tracker", None)
+        ratio = getattr(tracker, "current", getattr(scheduler, "new_token_ratio", previous_ratio))
+        # Use the native estimator: decode progress and ratio decay both change
+        # reservation without adding physical capacity. Do not freeze the miss
+        # at its old reservation, or prefix-loop suppression can starve it.
+        context = types.SimpleNamespace(new_token_ratio=ratio)
+        current_offset = sum(estimate(context, req) for req in running)
+        if getattr(scheduler, "is_mixed_chunk", False):
+            current_offset += len(running)
+        if current_offset < previous_offset:
+            # A fractional reduction can cross a strict gate without reaching
+            # the old rounded threshold. Let native admission decide once;
+            # another rejection records the new reservation and capacity.
+            return True
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    cache = getattr(scheduler, "tree_cache", None)
+    for available_name, evictable_name, previous in budget:
+        owner = allocator
+        for part in available_name.split("."):
+            owner = getattr(owner, part, None)
+        if callable(owner):
+            current = owner()
+        elif available_name == "available_size":
+            page_size = max(1, int(getattr(scheduler, "page_size", 1) or 1))
+            current = manager.available_size() * page_size
+        else:
+            continue  # Do not substitute another pool's capacity.
+        evictable = getattr(cache, evictable_name, None) if evictable_name else None
+        if callable(evictable):
+            current += evictable()
+        if current > previous:
+            # This is progress, not an admission prediction. Native code checks
+            # all its gates; another miss replaces the baseline.
+            return True
+    return False
+
+
+def _sglang_prefill_retry_budgets(adder: Any) -> Any:
+    """Snapshot native resource budgets before a candidate temporarily pins cache."""
+    remaining = getattr(adder, "rem_total_tokens", None)
+    if remaining is None:
+        return None  # Legacy adapters retain their block-manager retry.
+    if getattr(adder, "is_all_swa", False):
+        counters = ("swa_available_size", "swa_evictable_size")
+    elif getattr(adder, "is_hybrid_swa", False):
+        counters = ("full_available_size", "full_evictable_size")
+    elif getattr(adder, "is_hybrid_ssm_cache", False):
+        counters = ("available_size", "full_evictable_size")
+    else:
+        counters = ("available_size", "evictable_size")
+    budgets: list[tuple[str, Optional[str], float]] = [
+        (*counters, remaining + getattr(adder, "rem_total_token_offset", 0))]
+    if getattr(adder, "is_hybrid_swa", False):
+        # Ring space cannot be recovered by evicting linear SWA cache.
+        swa_cache = None if getattr(adder, "_swa_req_ring", False) else "swa_evictable_size"
+        budgets.append(("swa_available_size", swa_cache,
+                        adder.rem_swa_tokens + adder.rem_swa_token_offset))
+    if getattr(adder, "rem_mamba_slots", None) is not None:
+        mamba_cache = "mamba_evictable_size" if getattr(adder, "is_hybrid_ssm_cache", False) else None
+        budgets.append(("mamba_allocator.schedulable_available_size", mamba_cache,
+                        adder.rem_mamba_slots))
+    return budgets
 
 
 def _sglang_note_unfit(need_blocks: int) -> None:
@@ -3108,19 +3196,47 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
 
         @functools.wraps(original)
         def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            enabled = enable_kvcached()
+            if enabled:
+                page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+                # Capture before admission can load a prefix, bind a Mamba slot,
+                # or debit the running/accepted requests' output reservation.
+                raw_offset = getattr(self, "rem_total_token_offset", 0) or 0
+                offset = max(0, int(raw_offset))
+                tokens = _sglang_request_need_tokens(req) + offset
+                ignore_eos = (getattr(getattr(req, "sampling_params", None), "ignore_eos", False)
+                              and getattr(getattr(self, "tree_cache", None), "disable", True))
+                retry_budgets = None if ignore_eos else _sglang_prefill_retry_budgets(self)
+                if not ignore_eos:
+                    mamba_budget = getattr(self, "_mamba_gap_budget_for_req", None)
+                    mamba_reserve = int(mamba_budget(req)) if callable(mamba_budget) else 0
+                    # Normal admission rejects at >= and reserves a whole page
+                    # of alignment slack. ignore_eos uses different gates; keep
+                    # its existing estimate rather than applying this boundary.
+                    tokens += page_size + max(0, mamba_reserve) + 1
+                blocks = -(-tokens // page_size)
             result = original(self, req, *args, **kwargs)
-            if enable_kvcached():
+            if enabled:
                 _SGLANG_DEMAND.prefill_tried = True
                 if getattr(result, "name", None) == "NO_TOKEN":
-                    page_size = max(1, int(getattr(self, "page_size", 1) or 1))
-                    # The adder first sets tokens aside for running requests'
-                    # remaining output; free blocks kept for them are not
-                    # free for this request.
-                    offset = max(0, int(getattr(self, "rem_total_token_offset", 0) or 0))
-                    blocks = -(-(_sglang_request_need_tokens(req) + offset) // page_size)
-                    _sglang_note_unfit(blocks)
-                    if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
-                        _SGLANG_DEMAND.prefill_miss = blocks
+                    can_run_list = getattr(self, "can_run_list", ())
+                    if can_run_list and can_run_list[-1] is req:
+                        _SGLANG_DEMAND.prefill_retry = True
+                    else:
+                        _sglang_note_unfit(blocks)
+                        if getattr(_SGLANG_DEMAND, "prefill_miss", None) is None:
+                            _SGLANG_DEMAND.prefill_miss = blocks
+                            if ignore_eos:
+                                # Cache-disabled ignore_eos has its own lifetime
+                                # occupancy test and unclipped output lengths.
+                                # Preserve its legacy block retry rather than
+                                # applying normal radix gate/growth thresholds.
+                                return result
+                            _SGLANG_DEMAND.prefill_retry_budget = retry_budgets
+                            estimate = getattr(type(self), "_get_running_request_total_token_offset", None)
+                            if callable(estimate):
+                                _SGLANG_DEMAND.prefill_retry_reservation = (
+                                    estimate, raw_offset, self.new_token_ratio)
             return result
 
         self._mark_as_patched(_patched_add_one_req, marker)
