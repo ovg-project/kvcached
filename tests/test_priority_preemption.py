@@ -52,6 +52,12 @@ class _KV:
     def note_pending_release(self, pages: int) -> None:
         self.pending = pages
 
+    def _refund_priority_reserve(self) -> None:
+        pass  # The manager refunds successful frees from their native receipts.
+
+    def post_reclaimable_levels(self) -> None:
+        pass
+
 
 class _Request:
     def __init__(self, request_id: str, pages: int, priority: int = 0,
@@ -66,6 +72,7 @@ class _Request:
 class _Scheduler:
     def __init__(self, kv: _KV, running: list[_Request], policy: str = "FCFS") -> None:
         self.kv = kv
+        self.deferred_frees: list = []
         self.running = running
         self.policy = types.SimpleNamespace(name=policy)
         self.requires_kv_delivery = False
@@ -80,7 +87,9 @@ class _Scheduler:
         self.preempted.append((request.request_id, drop_stale_output))
         if request.freeable:  # otherwise vLLM frees after the step in flight
             self.kv.occupied -= request.pages
-            self.kv.page_allocator.reserved += request.pages
+            self.kv.page_allocator.trimmed.append(request.pages)
+        else:
+            self.deferred_frees.append((1, [request.request_id]))
 
 
 @pytest.fixture
@@ -109,7 +118,7 @@ def test_vllm_preempts_the_last_admitted_until_enough_pages_empty(vllm_patches):
     # Blocks the preemption left in the prefix cache are evicted as well,
     # and pages that landed on the reserve are unmapped.
     assert kv.cache_asks == [1, 0]
-    assert kv.page_allocator.trimmed == [3]
+    assert kv.page_allocator.trimmed == [2, 1]
 
 
 def test_vllm_priority_policy_preempts_the_lowest_priority(vllm_patches):
@@ -196,6 +205,7 @@ class _GateManager:
         self.occupied = occupied
         self.reserves: list[int] = []
         self.released: list[int] = []
+        self.refund_debt = 0
 
     def occupied_pages(self) -> int:
         return self.occupied
@@ -207,6 +217,14 @@ class _GateManager:
     def release_empty_pages(self, pages: int) -> int:
         self.released.append(pages)
         return pages
+
+    def _refund_priority_reserve(self) -> None:
+        self.released.append(self.refund_debt)
+        self.page_allocator.reserved -= self.refund_debt
+        self.refund_debt = 0
+
+    def post_reclaimable_levels(self) -> None:
+        pass
 
 
 def test_sglang_decode_gate_retracts_until_enough_pages_empty(monkeypatch):
@@ -223,13 +241,15 @@ def test_sglang_decode_gate_retracts_until_enough_pages_empty(monkeypatch):
         manager.occupied = 8
         assert not patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
         manager.occupied = 7
-        manager.page_allocator.reserved = 2
+        manager.page_allocator.reserved = 3  # Includes one concurrent preallocation.
+        manager.refund_debt = 2
         assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
         assert manager.reserves == [4]
     finally:
         patches._sglang_end_preemption()
     # The emptied pages on the reserve are unmapped when the round ends.
     assert manager.released == [2]
+    assert manager.page_allocator.reserved == 1
     # No pending ask: the gate only reserves.
     assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
 
@@ -313,8 +333,14 @@ def _paged(blocks: dict, occupancy: dict, freeable: bool = True) -> tuple:
     kv = KV(occupied=10)
     running = [_Request(rid, 1, freeable=freeable) for rid in blocks]
     scheduler = _Scheduler(kv, running)
+    references: dict[int, int] = {}
+    for ids in blocks.values():
+        for bid in ids:
+            references[bid] = references.get(bid, 0) + 1
     setattr(scheduler, "kv_cache_manager", types.SimpleNamespace(
-        get_block_ids=lambda request_id: (blocks[request_id],)))
+        get_block_ids=lambda request_id: (blocks[request_id],),
+        block_pool=types.SimpleNamespace(blocks={
+            bid: types.SimpleNamespace(ref_cnt=count) for bid, count in references.items()})))
     return kv, running, scheduler
 
 
@@ -389,3 +415,207 @@ def test_vllm_step_does_not_resume_its_victims(vllm_patches, monkeypatch):
     assert scheduler.schedule() == "output"
     assert seen == [["queued"]]
     assert [r.request_id for r in scheduler.waiting] == ["victim", "queued"]
+
+
+def test_vllm_preemption_does_not_trim_concurrent_preallocation(vllm_patches, monkeypatch):
+    kv = _KV(occupied=10)
+    scheduler = _Scheduler(kv, [_Request("victim", 1)])
+    native_preempt = scheduler._preempt_request
+
+    def preempt(request, timestamp, drop_stale_output=False):
+        native_preempt(request, timestamp, drop_stale_output)
+        kv.page_allocator.reserved += 2
+
+    monkeypatch.setattr(scheduler, "_preempt_request", preempt)
+    vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 1)
+    assert kv.page_allocator.reserved == 2
+    assert kv.page_allocator.trimmed == [1]
+
+
+@pytest.mark.parametrize("requests", [[], [types.SimpleNamespace()],
+                                     [types.SimpleNamespace(beam_group=object()), types.SimpleNamespace()]])
+def test_sglang_priority_does_not_force_a_terminal_or_beam_abort(monkeypatch, requests):
+    from kvcached.integration.sglang import patches
+
+    manager = _GateManager(10)
+    allocator = types.SimpleNamespace(kvcached_allocator=manager)
+    monkeypatch.setattr(patches, "_sglang_preemption_pending", lambda _: True)
+    monkeypatch.setattr(patches._SGLANG_DEMAND, "preempt", (manager, 9), raising=False)
+    monkeypatch.setattr(patches, "_sglang_group_capacity_miss", lambda miss: miss)
+    assert patches._sglang_reserve_decode_capacity(allocator, None, 1, 1, requests=requests)
+    assert manager.reserves == [1]
+    monkeypatch.setattr(manager, "try_to_reserve", lambda *a, **kw: False)
+    # Actual OOM still follows the native failure path.
+    assert not patches._sglang_reserve_decode_capacity(allocator, None, 1, 1, requests=requests)
+
+
+def test_vllm_target_pages_exclude_references_outside_running(vllm_patches):
+    kv, _, scheduler = _paged({"a": [4], "b": [8]}, {1: 1, 2: 1})
+    scheduler.kv_cache_manager.block_pool.blocks[4].ref_cnt = 2  # A waiting KV load holds it too.
+    targets = vllm_patches._kvcached_target_pages(scheduler, kv, scheduler.running)
+    assert [(page, [req.request_id for req in owners]) for page, owners in targets] == [(2, ["b"])]
+    vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 1)
+    assert scheduler.preempted == [("b", False)]
+    assert kv.occupied == 9
+
+
+@pytest.mark.parametrize("connector", [False, True])
+def test_vllm_external_preemption_reaches_output_and_connector(vllm_patches, monkeypatch, connector):
+    monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: True)
+    victim = _Request("victim", 1)
+
+    class Waiting(list):
+        def remove_requests(self, requests):
+            for request in requests:
+                self.remove(request)
+
+        def prepend_request(self, request):
+            self.insert(0, request)
+
+    def preempt(scheduler, kv, pages):
+        scheduler.waiting.prepend_request(victim)
+        return [victim]
+
+    monkeypatch.setattr(vllm_patches, "_kvcached_preempt_for_priority", preempt)
+    seen = []
+
+    class Scheduler:
+        def __init__(self):
+            self.kv_cache_manager = types.SimpleNamespace(block_pool=types.SimpleNamespace(
+                kv_cache_manager=types.SimpleNamespace(reclaim_for_priority=lambda: 1)))
+            self.waiting = Waiting()
+
+        def _build_kv_connector_meta(self, connector, output):
+            seen.append(set(output.preempted_req_ids))
+            return None
+
+        def schedule(self):
+            output = types.SimpleNamespace(preempted_req_ids={"native-victim"})
+            if connector:
+                self._build_kv_connector_meta(None, output)
+            return output
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler  # type: ignore[attr-defined]
+    assert vllm_patches.SchedulerDemandPatch().patch_schedule(module)
+    scheduler = Scheduler()
+    output = scheduler.schedule()
+    assert output.preempted_req_ids == {"native-victim", "victim"}
+    assert seen == ([{"native-victim", "victim"}] if connector else [])
+    assert scheduler.waiting == [victim]
+    assert not getattr(scheduler, "_kvcached_priority_preempted_ids")
+
+
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize("unlocked", [False, True])
+def test_sglang_reclaims_unlocked_cache_before_next_victim(monkeypatch, composite, unlocked):
+    from kvcached.integration.sglang import patches
+
+    manager = _GateManager(10)
+    evictions = []
+
+    def evict(pages):
+        evictions.append(pages)
+        if unlocked:
+            manager.occupied -= pages
+        return pages if unlocked else 0
+
+    monkeypatch.setattr(manager, "evict_cache_pages", evict, raising=False)
+    monkeypatch.setattr(patches._SGLANG_DEMAND, "preempt", (manager, 9), raising=False)
+    monkeypatch.setattr(patches, "_sglang_group_capacity_miss", lambda miss: miss)
+    requests = [types.SimpleNamespace(), types.SimpleNamespace()]
+    if composite:
+        calls = []
+
+        class Base:
+            def check_decode_capacity(self, **kwargs):
+                calls.append(kwargs)
+                return True
+
+        class Composite(Base):
+            full_attn_allocator = types.SimpleNamespace(kvcached_allocator=manager)
+            swa_attn_allocator = None
+
+        module = types.ModuleType("swa")
+        module.SWATokenToKVPoolAllocator = Composite  # type: ignore[attr-defined]
+        assert patches.ElasticSWAAllocatorPatch().patch_swa_composite_misses(module)
+        result = Composite().check_decode_capacity(num_tokens=2, tree_cache=None, requests=requests)
+        assert len(calls) == int(unlocked)
+    else:
+        allocator = types.SimpleNamespace(kvcached_allocator=manager)
+        result = patches._sglang_reserve_decode_capacity(allocator, None, 2, 2, requests=requests)
+    assert result is unlocked
+    assert evictions == [1]
+
+
+@pytest.mark.parametrize("ordinary_first", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_priority_engine_deferred_allowance_survives_zero_plans(monkeypatch, ordinary_first, deferred):
+    from test_prefix_cache_shrink import FakePage, _make_manager
+
+    from kvcached import kv_cache_manager
+
+    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
+    manager = _make_manager(deferred)
+    assert manager.alloc(11) == list(range(1, 12))  # Null + three native pages.
+    monkeypatch.setattr(manager, "post_reclaimable_levels", lambda: None)
+    plan = dict(empty=0, cache=0, running=1)
+    monkeypatch.setattr(manager, "reclaim_plan_pages", lambda: plan.copy())
+    assert manager.reclaim_for_priority() == 1
+    manager.note_pending_release(1)
+    assert manager._pending_release_pages == 1
+    plan["running"] = 0
+    for _ in range(2):
+        manager.reconcile_pending_release(True)
+        assert manager.reclaim_for_priority() == 0
+    if ordinary_first:
+        manager.free([8, 9, 10, 11])
+        assert manager._pending_release_pages == 0
+        manager.reconcile_pending_release(True)
+        assert manager.reclaim_for_priority() == 0
+    # A single deferred request can empty two pages after its one-page ask.
+    manager.free([4, 5, 6, 7] if ordinary_first else list(range(4, 12)))
+    if deferred:
+        manager.release_retired_pages_through(manager.capture_physical_release_marker())
+    assert len(manager.page_allocator.inuse) == 2
+    assert manager._pending_release_pages == 0
+    assert len(manager._priority_empty_ids()) == 1
+    manager.reconcile_pending_release(False)
+    manager.reclaim_for_priority()
+    assert not manager._priority_reclaim_active
+
+
+def test_vllm_only_priority_deferred_tickets_keep_guard(vllm_patches, monkeypatch):
+    monkeypatch.setattr(vllm_patches, "enable_kvcached", lambda: True)
+    priority, ordinary = [object()], [object()]
+    seen = []
+
+    class Scheduler:
+        def __init__(self):
+            kv = types.SimpleNamespace(reclaim_for_priority=lambda: 0,
+                                       reconcile_pending_release=seen.append)
+            self.kv_cache_manager = types.SimpleNamespace(block_pool=types.SimpleNamespace(kv_cache_manager=kv))
+            self._kvcached_priority_deferred = [priority]
+            self.deferred_frees = [(1, priority), (2, ordinary)]
+
+        def schedule(self):
+            return None
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler  # type: ignore[attr-defined]
+    assert vllm_patches.SchedulerDemandPatch().patch_schedule(module)
+    scheduler = Scheduler()
+    scheduler.schedule()
+    scheduler.deferred_frees.pop(0)
+    scheduler.schedule()
+    assert seen == [True, False]
+    assert scheduler._kvcached_priority_deferred == []
+
+
+def test_vllm_deferred_guard_survives_later_eviction_error(vllm_patches, monkeypatch):
+    kv, _, scheduler = _paged({"a": [4]}, {1: 1}, freeable=False)
+    monkeypatch.setattr(kv, "evict_cache_pages", mock.Mock(side_effect=RuntimeError("eviction failed")))
+    with pytest.raises(RuntimeError, match="eviction failed"):
+        vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 1)
+    assert getattr(scheduler, "_kvcached_priority_deferred") == [scheduler.deferred_frees[0][1]]
+    assert kv.pending == 0  # Guard established; no unproven page promise published.

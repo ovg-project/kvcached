@@ -559,14 +559,29 @@ bool GpuBudget::pool_alive(size_t slot, const Shared *data) const {
   return owner_lock.l_type != F_UNLCK;
 }
 
-// The part of an instance's demand that its own max still allows on this GPU.
+// The part of an instance's demand its max and live pools can still map.
 // What it could not take anyway keeps nothing from other instances.
 uint64_t GpuBudget::allowed_demand(size_t instance, uint64_t charged,
-                                   const Shared *data) {
+                                   const Shared *data) const {
   const auto &entry = data->instances[instance];
+  uint64_t pool_room = 0;
+  for (size_t slot = 0; slot < kPools; ++slot) {
+    const auto &pool = data->pools[slot];
+    if (!pool.owner || pool.instance != instance || !pool_alive(slot, data))
+      continue;
+    // Observe leases without refunding or retiring dead siblings. Unknown
+    // geometry is unbounded; configured zero capacity is an actual bound.
+    const uint64_t capacity = !pool.page_bundle    ? UINT64_MAX
+                              : entry.participants ? pool.target
+                                                   : pool.capacity;
+    // Published targets are page-rounded. A pool still shrinking above its
+    // target cannot grow, but must not consume another pool's usable room.
+    pool_room = saturating_add(
+        pool_room, capacity > pool.charged ? capacity - pool.charged : 0);
+  }
   const uint64_t limit = entry.limit;
-  return std::min<uint64_t>(entry.demand,
-                            limit > charged ? limit - charged : 0);
+  return std::min<uint64_t>(
+      entry.demand, std::min(pool_room, limit > charged ? limit - charged : 0));
 }
 
 // headroom + shortfall of #585, where the shortfall is the demand that the
@@ -664,6 +679,8 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
       requesters.begin(), requesters.end(),
       [&](size_t a, size_t b) { return priority(a) > priority(b); });
   ReclaimPlan assigned[kInstances];
+  for (size_t i = 0; i < kInstances; ++i)
+    assigned[i].limit_bytes = excess[i];
   auto give = [&](size_t victim, Tier tier, uint64_t bytes) {
     auto &plan = assigned[victim];
     (tier == kEmpty   ? plan.empty_bytes
@@ -674,7 +691,8 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
     const auto watermark = watermark_locked(requester, data);
     const uint64_t budget = data->budget;
     const auto usable = budget > watermark ? budget - watermark : 0;
-    const auto available = add(usable > total ? usable - total : 0, releasing);
+    const auto after_refunds = total - std::min(total, releasing);
+    const auto available = usable > after_refunds ? usable - after_refunds : 0;
     const auto wanted = need(requester);
     uint64_t deficit = wanted > available ? wanted - available : 0;
     for (int step = 0; step < 4 && deficit; ++step) {
@@ -916,6 +934,7 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.watermark_bytes = watermark_locked(instance, data);
   const auto plan = reclaim_locked(instance, data);
   state.reclaim_bytes = plan.total();
+  state.reclaim_limit_bytes = plan.limit_bytes;
   state.reclaim_empty_bytes = plan.empty_bytes;
   state.reclaim_cache_bytes = plan.cache_bytes;
   state.reclaim_running_bytes = plan.running_bytes;

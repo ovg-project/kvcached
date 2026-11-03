@@ -203,6 +203,7 @@ py::dict kv_reclaim(int64_t group_id = 0) {
     plan = FTensorAllocator::global_allocator(group_id)->kv_reclaim();
   }
   py::dict result;
+  result["limit_bytes"] = plan.limit_bytes;
   result["empty_bytes"] = plan.empty_bytes;
   result["cache_bytes"] = plan.cache_bytes;
   result["running_bytes"] = plan.running_bytes;
@@ -291,6 +292,12 @@ void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
 void page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
                                const std::vector<page_id_t> &page_ids) {
   allocator->free_pages(page_ids);
+}
+
+int64_t
+page_allocator_free_pages_with_receipt(std::shared_ptr<PageAllocator> allocator,
+                                       const std::vector<page_id_t> &page_ids) {
+  return allocator->free_pages_with_receipt(page_ids);
 }
 
 bool page_allocator_resize(std::shared_ptr<PageAllocator> allocator,
@@ -436,6 +443,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["cache_bytes"] = state.cache_bytes;
   result["releasing_bytes"] = state.releasing_bytes;
   result["reclaim_bytes"] = state.reclaim_bytes;
+  result["reclaim_limit_bytes"] = state.reclaim_limit_bytes;
   result["reclaim_empty_bytes"] = state.reclaim_empty_bytes;
   result["reclaim_cache_bytes"] = state.reclaim_cache_bytes;
   result["reclaim_running_bytes"] = state.reclaim_running_bytes;
@@ -700,6 +708,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_free_pages_with_receipt",
+           &kvcached::page_allocator_free_pages_with_receipt,
            py::call_guard<py::gil_scoped_release>())
       .def("resize", &kvcached::page_allocator_resize,
            py::call_guard<py::gil_scoped_release>())
