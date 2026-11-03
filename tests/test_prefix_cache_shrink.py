@@ -112,6 +112,10 @@ class ShrinkablePageAllocator:
     def free_pages(self, page_ids: List[int]) -> None:
         self.inuse.difference_update(page_ids)
 
+    def _free_pages_with_receipt(self, page_ids: List[int]) -> int:
+        self.free_pages(page_ids)
+        return 0  # This fixture unmaps every freed page.
+
     def resize(self, new_mem_size: int) -> bool:
         new_pages = new_mem_size // self.page_size
         self.resize_calls.append(new_pages)
@@ -270,6 +274,97 @@ def _fill_prefix_cache(pool) -> None:
         _serve(pool)
     assert len(pool._evictable_blocks) == 32
     assert _mapped_pages(pool) == 9
+
+
+@pytest.mark.parametrize("native_miss", [False, True])
+def test_priority_guarded_pages_do_not_hide_native_capacity(pool, monkeypatch, native_miss):
+    manager = pool.kv_cache_manager
+    manager.world_size = 1
+    manager.enable_copy_fence()
+    assert manager.alloc(7) == list(range(1, 8))
+    manager.pin_copy_job("copy", [4, 5, 6, 7])
+    manager.free([4, 5, 6, 7])
+    raw = dict(limit_bytes=64, empty_bytes=0, cache_bytes=0, running_bytes=4)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "kv_reclaim", lambda *a: dict(raw), raising=False)
+    manager.reclaim_for_priority()
+    raw["running_bytes"] = 0
+    manager.reclaim_for_priority()
+    manager.advance_copy_fence()
+    manager.release_retired_pages_through(manager.capture_physical_release_marker())
+    assert manager._unreusable_page_ids() == frozenset({1})
+    assert set(manager.avail_pages) == {1}
+    assert manager.available_size() >= 4
+
+    if native_miss:
+        def reject():
+            raise RuntimeError("peer consumed native capacity")
+        monkeypatch.setattr(manager.page_allocator, "alloc_page", reject)
+    allocated = manager.alloc(4)
+    assert allocated == (None if native_miss else [8, 9, 10, 11])
+    assert manager._unreusable_page_ids() == frozenset({1})
+    assert 1 in manager.page_allocator.inuse
+    manager.unpin_copy_job("copy")
+    manager.release_retired_pages_through(manager.capture_physical_release_marker())
+    assert 1 not in manager.page_allocator.inuse
+
+
+def test_limit_uses_retained_empty_pages_before_cached_prefixes(pool, monkeypatch):
+    manager = pool.kv_cache_manager
+    manager.world_size = 1
+    raw = dict(limit_bytes=64, empty_bytes=0, cache_bytes=0, running_bytes=4)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "kv_reclaim", lambda *a: dict(raw), raising=False)
+    _start(pool, 0, 3)  # Fill the null block's page with a running request.
+    cached, hashes = _start(pool, 4)
+    plain, _ = _start(pool, 0, 12)
+    manager.reclaim_for_priority()
+    pool.free_blocks(plain)
+    _finish(pool, cached, hashes)
+    raw["running_bytes"] = 0
+    manager.reclaim_for_priority()
+    assert _mapped_pages(pool) == 4
+    assert len(manager._priority_empty_ids()) == 2
+    cached_ids = set(pool._evictable_blocks)
+    assert len(cached_ids) == 4
+
+    manager.set_memory_limit(manager.page_size * 3)
+    manager.apply_resize_target()
+    manager.reclaim_for_shrink()
+    _end_step(pool)
+    assert not manager.in_shrink
+    assert _mapped_pages(pool) == 3
+    assert set(pool._evictable_blocks) == cached_ids
+    assert len(manager._priority_empty_ids()) == 1
+
+
+@pytest.mark.parametrize("cache_ask,running_ask,cached_blocks,running_left", [
+    (1, 0, 8, 0), (2, 0, 4, 0), (1, 1, 4, 0), (1, 2, 4, 1)])
+def test_claimed_retirements_reduce_cache_eviction(pool, monkeypatch, cache_ask, running_ask,
+                                                cached_blocks, running_left):
+    manager = pool.kv_cache_manager
+    manager.world_size = 1
+    _start(pool, 0, 3)
+    cached, hashes = _start(pool, 8)
+    _finish(pool, cached, hashes)
+    plain, _ = _start(pool, 0, 4)
+    manager.enable_copy_fence()
+    manager.pin_copy_job("store", [block.block_id for block in plain])
+    pool.free_blocks(plain)
+    manager.advance_copy_fence()
+    _end_step(pool)
+    assert len(pool._evictable_blocks) == 8
+    assert len(manager._retiring_page_ids()) == 1
+    raw = dict(limit_bytes=64, empty_bytes=0, cache_bytes=cache_ask * 4, running_bytes=running_ask * 4)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "kv_reclaim", lambda *a: dict(raw), raising=False)
+
+    assert manager.reclaim_for_priority() == running_left
+    # The pending refund satisfies the ask before any useful prefix is discarded.
+    assert len(pool._evictable_blocks) == cached_blocks
+    assert not manager._priority_retained_ids
+    manager.unpin_copy_job("store")
+    manager.advance_copy_fence()
+    _end_step(pool)
+    assert not manager._priority_retired_ids
+    assert len(pool._evictable_blocks) == cached_blocks
 
 
 LIMIT_PAGES = 4

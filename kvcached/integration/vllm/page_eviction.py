@@ -61,27 +61,15 @@ class PageEvictionIndex:
         self.candidates.clear()
         self.heap.clear()
 
+    def whole_pages(self) -> int:
+        """How many pages hold nothing but evictable blocks."""
+        self._refresh()
+        return len(self.candidates)
+
     def victims(self, budget: int, max_pages: int | None = None) -> list[int]:
         """Blocks of the cheapest whole pages, at most `budget` blocks and
         `max_pages` pages."""
-        dirty, self.dirty = self.dirty, set()
-        occupancy = self.manager.get_page_occupancy(
-            [page for page in dirty if page in self.pages]) if dirty else {}
-        for page in dirty:
-            self.candidates.pop(page, None)
-            blocks = self.pages.get(page)
-            if blocks and len(blocks) >= occupancy.get(page, 0):
-                self.clock += 1
-                entry = (len(blocks), next(reversed(blocks.values())), page, self.clock)
-                self.candidates[page] = entry
-                heapq.heappush(self.heap, entry)
-
-        # Lazy deletion keeps updates cheap. Bound stale entries even when
-        # touches repeatedly change a page that is never selected for eviction.
-        if len(self.heap) > max(64, 2 * len(self.candidates)):
-            self.heap = list(self.candidates.values())
-            heapq.heapify(self.heap)
-
+        self._refresh()
         victims: list[int] = []
         selected: list[tuple[int, int, int, int]] = []
         while self.heap and (max_pages is None or len(selected) < max_pages):
@@ -103,3 +91,22 @@ class PageEvictionIndex:
         for entry in selected:
             heapq.heappush(self.heap, entry)
         return victims
+
+    def _refresh(self) -> None:
+        dirty, self.dirty = self.dirty, set()
+        occupancy = self.manager.get_page_occupancy(
+            [page for page in dirty if page in self.pages]) if dirty else {}
+        for page in dirty:
+            self.candidates.pop(page, None)
+            blocks = self.pages.get(page)
+            if blocks and len(blocks) >= occupancy.get(page, 0):
+                self.clock += 1
+                entry = (len(blocks), next(reversed(blocks.values())), page, self.clock)
+                self.candidates[page] = entry
+                heapq.heappush(self.heap, entry)
+
+        # Lazy deletion keeps updates cheap. Bound stale entries even when
+        # touches repeatedly change a page that is never selected for eviction.
+        if len(self.heap) > max(64, 2 * len(self.candidates)):
+            self.heap = list(self.candidates.values())
+            heapq.heapify(self.heap)
