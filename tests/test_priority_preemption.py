@@ -357,6 +357,20 @@ def test_vllm_preempts_the_owners_of_the_cheapest_pages_first(vllm_patches):
     assert [rid for rid, _ in scheduler.preempted] == ["c", "d"]
 
 
+def test_vllm_page_selection_preserves_request_priority(vllm_patches):
+    kv, running, scheduler = _paged(
+        {"low": [4], "late": [5], "high": [8]}, {1: 2, 2: 1})
+    scheduler.policy = types.SimpleNamespace(name="PRIORITY")
+    for request in running[:2]:
+        request.priority = 5
+    running[1].arrival_time = 1.0
+    # The high-priority request owns the cheapest page, but native priority
+    # order must still choose the latest of the lowest-priority requests.
+    vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 1)
+    assert [rid for rid, _ in scheduler.preempted] == ["late"]
+    assert [request.request_id for request in scheduler.running] == ["low", "high"]
+
+
 def test_vllm_counts_pages_freed_after_the_step_in_flight(vllm_patches):
     # With an asynchronous KV connector vLLM frees preempted requests' blocks
     # after the step in flight: their pages count as released, and the

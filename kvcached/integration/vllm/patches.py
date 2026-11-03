@@ -3508,7 +3508,9 @@ def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
         # Freed blocks of a cached prefix stay in the prefix cache.
         kv.evict_cache_pages(pages - released())
 
-    for _, owners in _kvcached_target_pages(scheduler, kv, running):
+    # Page efficiency must not override the engine's request-priority policy.
+    targets = [] if by_priority else _kvcached_target_pages(scheduler, kv, running)
+    for _, owners in targets:
         if released() >= pages:
             break
         for victim in owners:
