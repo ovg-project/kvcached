@@ -237,13 +237,13 @@ def test_sglang_decode_gate_retracts_until_enough_pages_empty(monkeypatch):
     patches._sglang_begin_preemption(scheduler, 3)
     try:
         # SGLang's retract loop asks again after each retracted request.
-        assert not patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
+        assert not patches._sglang_reserve_decode_capacity(allocator, None, 8, 4, requests=[object(), object()])
         manager.occupied = 8
-        assert not patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
+        assert not patches._sglang_reserve_decode_capacity(allocator, None, 8, 4, requests=[object(), object()])
         manager.occupied = 7
         manager.page_allocator.reserved = 3  # Includes one concurrent preallocation.
         manager.refund_debt = 2
-        assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
+        assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4, requests=[object(), object()])
         assert manager.reserves == [4]
     finally:
         patches._sglang_end_preemption()
@@ -251,7 +251,7 @@ def test_sglang_decode_gate_retracts_until_enough_pages_empty(monkeypatch):
     assert manager.released == [2]
     assert manager.page_allocator.reserved == 1
     # No pending ask: the gate only reserves.
-    assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4)
+    assert patches._sglang_reserve_decode_capacity(allocator, None, 8, 4, requests=[object(), object()])
 
 
 def test_sglang_does_not_retract_while_frees_are_grouped(monkeypatch):
@@ -432,7 +432,7 @@ def test_vllm_preemption_does_not_trim_concurrent_preallocation(vllm_patches, mo
     assert kv.page_allocator.trimmed == [1]
 
 
-@pytest.mark.parametrize("requests", [[], [types.SimpleNamespace()],
+@pytest.mark.parametrize("requests", [None, [], [types.SimpleNamespace()],
                                      [types.SimpleNamespace(beam_group=object()), types.SimpleNamespace()]])
 def test_sglang_priority_does_not_force_a_terminal_or_beam_abort(monkeypatch, requests):
     from kvcached.integration.sglang import patches
@@ -619,3 +619,66 @@ def test_vllm_deferred_guard_survives_later_eviction_error(vllm_patches, monkeyp
         vllm_patches._kvcached_preempt_for_priority(scheduler, kv, 1)
     assert getattr(scheduler, "_kvcached_priority_deferred") == [scheduler.deferred_frees[0][1]]
     assert kv.pending == 0  # Guard established; no unproven page promise published.
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_sglang_legacy_decode_context_preserves_selected_requests(monkeypatch, composite):
+    from kvcached.integration.sglang import patches
+
+    manager = _GateManager(10)
+    sub = types.SimpleNamespace(kvcached_allocator=manager)
+    monkeypatch.setattr(patches._SGLANG_DEMAND, "preempt", (manager, 9), raising=False)
+    monkeypatch.setattr(patches._SGLANG_DEMAND, "decode_requests", None, raising=False)
+    monkeypatch.setattr(patches, "_sglang_group_capacity_miss", lambda miss: miss)
+
+    class Allocator:
+        def check_decode_capacity(self, *, num_tokens, tree_cache):
+            if composite:
+                return True  # The native SWA base gate has no requests argument.
+            return patches._sglang_reserve_decode_capacity(sub, tree_cache, num_tokens, num_tokens)
+
+    if composite:
+        Allocator.full_attn_allocator = sub
+        Allocator.swa_attn_allocator = None
+        module = types.ModuleType("swa")
+        module.SWATokenToKVPoolAllocator = Allocator
+        assert patches.ElasticSWAAllocatorPatch().patch_swa_composite_misses(module)
+    allocator = Allocator()
+
+    class Batch:
+        reqs = [types.SimpleNamespace(beam_group=None) for _ in range(2)]
+
+        def check_decode_mem(self, selected_indices=None):
+            return allocator.check_decode_capacity(num_tokens=2, tree_cache=None)
+
+    module = types.ModuleType("sglang.srt.managers.schedule_batch")
+    module.ScheduleBatch = Batch
+    assert patches.ScheduleBatchDecodeContextPatch().patch_check_decode_mem(module)
+    batch = Batch()
+    assert not batch.check_decode_mem()
+    assert batch.check_decode_mem([1])  # Native retraction's final survivor stays healthy.
+    batch.reqs[0].beam_group = object()
+    assert batch.check_decode_mem()
+    assert patches._SGLANG_DEMAND.decode_requests is None
+    assert allocator.check_decode_capacity(num_tokens=2, tree_cache=None)
+
+
+def test_sglang_legacy_decode_context_restored_after_error(monkeypatch):
+    from kvcached.integration.sglang import patches
+
+    previous = [object()]
+    monkeypatch.setattr(patches._SGLANG_DEMAND, "decode_requests", previous, raising=False)
+
+    class Batch:
+        reqs = [object(), object()]
+
+        def check_decode_mem(self, selected_indices=None):
+            assert patches._SGLANG_DEMAND.decode_requests == [self.reqs[1]]
+            raise RuntimeError("native gate failed")
+
+    module = types.ModuleType("sglang.srt.managers.schedule_batch")
+    module.ScheduleBatch = Batch
+    assert patches.ScheduleBatchDecodeContextPatch().patch_check_decode_mem(module)
+    with pytest.raises(RuntimeError, match="native gate failed"):
+        Batch().check_decode_mem([1])
+    assert patches._SGLANG_DEMAND.decode_requests is previous

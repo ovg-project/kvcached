@@ -570,8 +570,10 @@ def _sglang_priority_decode_miss(manager: Any, requests: Any) -> bool:
             member._refund_priority_reserve()
     # Native retraction aborts the last request and beam groups on a failed
     # gate. A priority ask must not turn a physically healthy batch into OOM.
-    retractable = (requests is None or (len(requests) > 1
-                   and not any(getattr(req, "beam_group", None) is not None for req in requests)))
+    if requests is None:
+        requests = getattr(_SGLANG_DEMAND, "decode_requests", None)
+    retractable = (requests is not None and len(requests) > 1
+                   and not any(getattr(req, "beam_group", None) is not None for req in requests))
     return retractable and _sglang_preemption_pending(manager)
 
 
@@ -1270,6 +1272,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
                     if _sglang_pipeline_stages() > 1:
+                        if requests is None and spec_algorithm is None:
+                            # SGLang 0.5.19's native gate accepts only these arguments.
+                            return super().check_decode_capacity(
+                                num_tokens=num_tokens, tree_cache=tree_cache)
                         return super().check_decode_capacity(
                             num_tokens=num_tokens, tree_cache=tree_cache,
                             requests=requests, spec_algorithm=spec_algorithm)
@@ -1538,6 +1544,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
                     if _sglang_pipeline_stages() > 1:
+                        if requests is None and spec_algorithm is None:
+                            # SGLang 0.5.19's native gate accepts only these arguments.
+                            return super().check_decode_capacity(
+                                num_tokens=num_tokens, tree_cache=tree_cache)
                         return super().check_decode_capacity(
                             num_tokens=num_tokens, tree_cache=tree_cache,
                             requests=requests, spec_algorithm=spec_algorithm)
@@ -1707,15 +1717,15 @@ class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
         check_decode = getattr(composite, "check_decode_capacity", None)
         if check_decode is not None:
             @functools.wraps(check_decode)
-            def _check_decode(self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None):
+            def _check_decode(self, *args, **kwargs):
+                requests = kwargs.get("requests")
                 # The composite inherits the native gate; it never calls its
                 # elastic sub-allocators' check_decode_capacity methods.
                 for name in ("full_attn_allocator", "swa_attn_allocator"):
                     manager = getattr(getattr(self, name, None), "kvcached_allocator", None)
                     if manager is not None and _sglang_priority_decode_miss(manager, requests):
                         return not _sglang_group_capacity_miss(True)
-                return check_decode(self, num_tokens=num_tokens, tree_cache=tree_cache,
-                                    requests=requests, spec_algorithm=spec_algorithm)
+                return check_decode(self, *args, **kwargs)
 
             composite.check_decode_capacity = _check_decode
         self._mark_as_patched(composite, marker)
@@ -3113,6 +3123,44 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias HybridLinearKVPool to elastic one: {e}")
             return False
+
+
+class ScheduleBatchDecodeContextPatch(VersionAwarePatch, BasePatch):
+    """Supply the selected requests missing from SGLang 0.5.19's decode gate."""
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.schedule_batch"
+    target_class = "ScheduleBatch"
+    patch_name = "schedule_batch_decode_context"
+
+    def apply(self, batch_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_check_decode_mem(batch_mod)
+
+    @version_range(">=0.5.19,<0.5.20")
+    def patch_check_decode_mem(self, batch_mod: types.ModuleType) -> bool:
+        batch = self._get_target_class(batch_mod)
+        original = getattr(batch, "check_decode_mem", None)
+        if original is None:
+            return False
+        marker = "__kvcached_decode_context__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        @functools.wraps(original)
+        def _check_decode_mem(self, selected_indices=None):
+            previous = getattr(_SGLANG_DEMAND, "decode_requests", None)
+            _SGLANG_DEMAND.decode_requests = (self.reqs if selected_indices is None
+                                              else [self.reqs[i] for i in selected_indices])
+            try:
+                return original(self, selected_indices=selected_indices)
+            finally:
+                _SGLANG_DEMAND.decode_requests = previous
+
+        self._mark_as_patched(_check_decode_mem, marker)
+        batch.check_decode_mem = _check_decode_mem
+        return True
 
 
 class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
