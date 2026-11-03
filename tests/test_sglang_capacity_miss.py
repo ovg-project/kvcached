@@ -494,6 +494,48 @@ def test_pipeline_keeps_the_native_decode_gate(monkeypatch, cpu_tensors):
     assert allocator.evicted == [(None, 1), (None, 2)]
 
 
+@pytest.mark.parametrize("paged", [False, True])
+def test_pipeline_legacy_decode_gate_accepts_native_arguments(monkeypatch, cpu_tensors, paged):
+    def legacy_gate(self, *, num_tokens, tree_cache):
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
+
+    monkeypatch.setattr(FakeBaseTokenToKVPoolAllocator, "check_decode_capacity", legacy_gate)
+    _install_pipeline_stages(monkeypatch, 2)
+    allocator, manager = (_paged_allocator(monkeypatch, 1, 4, 1) if paged
+                          else _token_allocator(1))
+    capacity = 4 if paged else 1
+    assert allocator.check_decode_capacity(num_tokens=capacity, tree_cache=None)
+    assert not allocator.check_decode_capacity(num_tokens=capacity + 1, tree_cache=None)
+    assert allocator.evicted == [(None, capacity), (None, capacity + 1)]
+    assert manager.reserve_calls == []
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("context", ["requests", "spec", "both"])
+def test_pipeline_modern_decode_gate_keeps_request_context(monkeypatch, cpu_tensors, paged, context):
+    seen = []
+
+    def modern_gate(self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None):
+        seen.append((requests, spec_algorithm))
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
+
+    monkeypatch.setattr(FakeBaseTokenToKVPoolAllocator, "check_decode_capacity", modern_gate)
+    _install_pipeline_stages(monkeypatch, 2)
+    allocator, manager = (_paged_allocator(monkeypatch, 1, 4, 1) if paged
+                          else _token_allocator(1))
+    requests: Optional[list[object]] = [] if context in ("requests", "both") else None
+    spec = object() if context in ("spec", "both") else None
+    capacity = 4 if paged else 1
+    for need in (capacity, capacity + 1):
+        assert allocator.check_decode_capacity(
+            num_tokens=need, tree_cache=None, requests=requests, spec_algorithm=spec) is (need == capacity)
+    assert len(seen) == 2
+    assert all(reqs is requests and algorithm is spec for reqs, algorithm in seen)
+    assert manager.reserve_calls == []
+
+
 # --------------------------------------------------------------------------
 # the scheduler path, mirrored from SGLang 0.5.20
 # --------------------------------------------------------------------------

@@ -976,7 +976,8 @@ class KVCacheManager:
         group = getattr(self, "_priority_reclaim_group", None)
         priority_active = ((group.active if group is not None else getattr(self, "_priority_reclaim_active", False))
                            and not getattr(self, "in_shrink", False))
-        allowance = getattr(self, "_priority_release_allowance", 0)
+        allowance = (getattr(self, "_priority_release_allowance", 0)
+                     + getattr(self, "_pending_release_pages", 0))
         retained = set(getattr(self, "_priority_retained_ids", ()))
         surplus = []
         freed_blocks = 0
@@ -1435,6 +1436,23 @@ class KVCacheManager:
         self._posted_reclaimable = levels
 
     @synchronized
+    def note_pending_release(self, pages: int) -> None:
+        """Reserve this step's allowance for its engine-deferred block batches."""
+        allowance = getattr(self, "_priority_release_allowance", 0)
+        promised = min(allowance, max(0, int(pages)))
+        self._priority_release_allowance = allowance - promised
+        self._pending_release_pages = getattr(self, "_pending_release_pages", 0) + promised
+        # Even after another free consumes the promise, the deferred request's
+        # surplus must stay protected until its own batch has drained.
+        self._priority_deferred_active = True
+
+    @synchronized
+    def reconcile_pending_release(self, active: bool) -> None:
+        self._priority_deferred_active = active
+        if not active:
+            self._pending_release_pages = 0
+
+    @synchronized
     def post_reclaimable_levels(self) -> None:
         """Post this pool's pre-mapped pages, reclaimable cache and retired
         pages (released, not yet unmapped). Engine thread only."""
@@ -1443,7 +1461,8 @@ class KVCacheManager:
     def _reclaimable_levels(self) -> tuple[int, int, int]:
         empty = self.page_allocator.get_num_reserved_pages() + len(self._priority_empty_ids())
         releasing = (len(getattr(self, "_priority_retired_ids", ()))
-                     + getattr(self, "_priority_reserve_debt", 0))
+                     + getattr(self, "_priority_reserve_debt", 0)
+                     + getattr(self, "_pending_release_pages", 0))
         empty = max(0, empty - getattr(self, "_priority_reserve_debt", 0))
         cache = sum(count() for count, _ in self._live_cache_owners())
         return empty, cache, releasing
@@ -1493,6 +1512,25 @@ class KVCacheManager:
                 and self.avail_pages[page_id].empty()]
 
     @synchronized
+    def occupied_pages(self) -> int:
+        """Mapped pages that still hold blocks or wait to be reused.
+
+        Pages retired for a deferred physical release count as released.
+        """
+        retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", None) or ())
+        return len(self.full_pages) + len(self.avail_pages) - retiring
+
+    @synchronized
+    def evict_cache_pages(self, pages: int) -> int:
+        """Evict up to ``pages`` whole pages of prefix cache; returns how many."""
+        left = pages
+        for _, evict in self._live_cache_owners():
+            if left <= 0:
+                break
+            left -= max(0, int(evict(left)))
+        return pages - max(0, left)
+
+    @synchronized
     def release_empty_pages(self, max_pages: int) -> int:
         """Unmap up to ``max_pages`` pre-mapped pages; returns how many."""
         if max_pages <= 0:
@@ -1530,7 +1568,8 @@ class KVCacheManager:
                 for page_id in page_ids:
                     group.claim(self, page_id)
             return
-        allowance = getattr(self, "_priority_release_allowance", 0)
+        pending = getattr(self, "_pending_release_pages", 0)
+        allowance = getattr(self, "_priority_release_allowance", 0) + pending
         claimed = set(getattr(self, "_priority_retired_ids", ()))
         for page_id in page_ids:
             if allowance <= 0:
@@ -1541,8 +1580,10 @@ class KVCacheManager:
                 if retained is not None:
                     retained.discard(page_id)
                 allowance -= 1
+                pending = max(0, pending - 1)
         self._priority_retired_ids = claimed
-        self._priority_release_allowance = allowance
+        self._pending_release_pages = pending
+        self._priority_release_allowance = allowance - pending
 
     def _refund_priority_reserve(self) -> None:
         debt = getattr(self, "_priority_reserve_debt", 0)
@@ -1578,18 +1619,15 @@ class KVCacheManager:
         plan = self.reclaim_plan_pages()
         # Unfulfilled asks may change each step. Retired pages already promised
         # to peers remain guarded until their actual native trim/refund.
-        self._priority_reclaim_active = any(plan.values())
+        self._priority_reclaim_active = (any(plan.values())
+                                         or getattr(self, "_priority_deferred_active", False))
         self._priority_release_allowance = plan["cache"] + plan["running"]
         self._claim_priority_retired_pages(self._retiring_page_ids())
         if not plan["empty"] and not plan["cache"]:
             self.post_reclaimable_levels()
             return min(plan["running"], self._priority_release_allowance)
         # Existing retirements already consume part of this step's release ask.
-        left = min(plan["cache"], self._priority_release_allowance)
-        for _, evict in self._live_cache_owners():
-            if left <= 0:
-                break
-            left -= max(0, int(evict(left)))
+        self.evict_cache_pages(min(plan["cache"], self._priority_release_allowance))
         self.release_empty_pages(plan["empty"])
         self._increment_operation_counter("priority_reclaims_total")
         self.post_reclaimable_levels()
@@ -2141,6 +2179,8 @@ class KVCacheManager:
         self._priority_retained_ids = set()
         self._priority_reclaim_active = False
         self._priority_release_allowance = 0
+        self._pending_release_pages = 0
+        self._priority_deferred_active = False
         self._priority_reserve_debt = 0
         self._retire_fence = {}
         self.avail_pages.clear()
