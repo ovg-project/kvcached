@@ -59,6 +59,7 @@ struct InstanceControl {
   // and demand, and how much of it from each tier (see
   // GpuBudget::reclaim_plan).
   uint64_t reclaim_bytes = 0;
+  uint64_t reclaim_limit_bytes = 0;
   uint64_t reclaim_empty_bytes = 0;
   uint64_t reclaim_cache_bytes = 0;
   uint64_t reclaim_running_bytes = 0;
@@ -70,6 +71,9 @@ struct InstanceControl {
 // What an instance should release now, by tier: pre-mapped pages, prefix
 // cache, then memory of running requests (preemption).
 struct ReclaimPlan {
+  // Maximum additional release above min(min, max), excluding in-flight
+  // release.
+  uint64_t limit_bytes = 0;
   uint64_t empty_bytes = 0;
   uint64_t cache_bytes = 0;
   uint64_t running_bytes = 0;

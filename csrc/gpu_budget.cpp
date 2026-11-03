@@ -679,6 +679,8 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
       requesters.begin(), requesters.end(),
       [&](size_t a, size_t b) { return priority(a) > priority(b); });
   ReclaimPlan assigned[kInstances];
+  for (size_t i = 0; i < kInstances; ++i)
+    assigned[i].limit_bytes = excess[i];
   auto give = [&](size_t victim, Tier tier, uint64_t bytes) {
     auto &plan = assigned[victim];
     (tier == kEmpty   ? plan.empty_bytes
@@ -689,7 +691,8 @@ ReclaimPlan GpuBudget::reclaim_locked(size_t instance,
     const auto watermark = watermark_locked(requester, data);
     const uint64_t budget = data->budget;
     const auto usable = budget > watermark ? budget - watermark : 0;
-    const auto available = add(usable > total ? usable - total : 0, releasing);
+    const auto after_refunds = total - std::min(total, releasing);
+    const auto available = usable > after_refunds ? usable - after_refunds : 0;
     const auto wanted = need(requester);
     uint64_t deficit = wanted > available ? wanted - available : 0;
     for (int step = 0; step < 4 && deficit; ++step) {
@@ -931,6 +934,7 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.watermark_bytes = watermark_locked(instance, data);
   const auto plan = reclaim_locked(instance, data);
   state.reclaim_bytes = plan.total();
+  state.reclaim_limit_bytes = plan.limit_bytes;
   state.reclaim_empty_bytes = plan.empty_bytes;
   state.reclaim_cache_bytes = plan.cache_bytes;
   state.reclaim_running_bytes = plan.running_bytes;

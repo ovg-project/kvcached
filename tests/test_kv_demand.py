@@ -981,3 +981,35 @@ def test_sglang_retry_on_independent_native_budget_progress(monkeypatch, pool):
     with patches._sglang_demand_round(scheduler):
         assert not scheduler.running_batch.batch_is_full
         assert PrefillAdder().add_one_req(req).name == "CONTINUE"
+
+
+@pytest.mark.parametrize("guard", ["promised", "surplus", "shrink"])
+def test_demand_excludes_pages_waiting_for_physical_release(manager_module, guard):
+    module, _ = manager_module
+    manager = _manager(module)
+    manager.num_avail_blocks = 4
+    manager.reserved_blocks = []
+    manager.page_allocator.reserved_pages = 0
+    manager.avail_pages = {1: types.SimpleNamespace(num_free_blocks=lambda: 4)}
+    manager._retired_pages = [(1, [1])]
+    manager.in_shrink = guard == "shrink"
+    if guard == "promised":
+        manager._priority_retired_ids = {1}
+    elif guard == "surplus":
+        manager._priority_retained_ids = {1}
+    assert manager.demand_pages(4) == 1
+    manager._priority_retired_ids = set()
+    manager._retired_pages = []
+    manager.in_shrink = False
+    assert manager.demand_pages(4) == 0  # Barrier-safe surplus is reusable.
+
+
+def test_demand_excludes_native_reserve_awaiting_priority_refund(manager_module):
+    module, _ = manager_module
+    manager = _manager(module)
+    manager.num_avail_blocks = 0
+    manager.reserved_blocks = []
+    manager._priority_reserve_debt = 1
+    assert manager.demand_pages(4) == 1
+    manager._priority_reserve_debt = 0
+    assert manager.demand_pages(4) == 0

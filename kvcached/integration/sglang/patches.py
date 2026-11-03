@@ -3818,13 +3818,17 @@ class _PrefixCacheShrinkReclaimer:
     def __init__(self, scheduler: Any, manager: Any) -> None:
         self._scheduler = weakref.ref(scheduler)
         self.manager = manager
+        allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+        swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+        full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+        self.swa = manager is swa and swa is not full
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
     def _cache(self) -> Tuple[Any, Any, int]:
         cache = getattr(self._scheduler(), "tree_cache", None)
-        evictable = getattr(cache, "full_evictable_size", None) or getattr(
-            cache, "evictable_size", None)
+        evictable = (getattr(cache, "swa_evictable_size", None) if self.swa else
+                     getattr(cache, "full_evictable_size", None) or getattr(cache, "evictable_size", None))
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
@@ -3837,7 +3841,7 @@ class _PrefixCacheShrinkReclaimer:
         overstate what eviction frees; the next plan corrects it.
         """
         _, evictable, tokens_per_page = self._cache()
-        return int(evictable()) // tokens_per_page if evictable is not None else 0
+        return -(-int(evictable()) // tokens_per_page) if evictable is not None else 0
 
     def evict_pages(self, pages: int) -> int:
         """Evict about ``pages`` pages of prefix cache for a higher priority."""
@@ -3847,8 +3851,17 @@ class _PrefixCacheShrinkReclaimer:
         before = int(evictable())
         if before <= 0:
             return 0
-        _evict_prefix_cache(cache, pages * tokens_per_page)
+        self._evict(cache, pages * tokens_per_page)
         return max(0, before - int(evictable())) // tokens_per_page
+
+    def _evict(self, cache: Any, tokens: int) -> None:
+        if self.swa:
+            params = _sglang_evict_params_cls()
+            if params is None:
+                raise RuntimeError("SWA reclaim requires EvictParams")
+            cache.evict(params(num_tokens=0, swa_num_tokens=tokens))
+        else:
+            _evict_prefix_cache(cache, tokens)
 
     def reclaim(self) -> None:
         cache, evictable, tokens_per_page = self._cache()
@@ -3861,7 +3874,7 @@ class _PrefixCacheShrinkReclaimer:
             before = evictable()
             if before <= 0:
                 return
-            _evict_prefix_cache(cache, excess * tokens_per_page)
+            self._evict(cache, excess * tokens_per_page)
             if evictable() >= before or _frees_are_deferred(allocator):
                 # Nothing evicted, or the frees wait for the free group to
                 # end: the next allocation or idle pass continues.
@@ -3926,6 +3939,9 @@ def _sglang_reclaim_for_priority(scheduler: Any) -> int:
     pool cannot shrink, so the ledger never picks it as a victim.
     """
     manager = _sglang_demand_manager(scheduler)
+    if (getattr(manager, "_priority_reclaim_group", None) is not None
+            and _frees_are_deferred(getattr(scheduler, "token_to_kv_pool_allocator", None))):
+        return 0  # Keep the previous shared allowance until native grouped frees finish.
     reclaim = getattr(manager, "reclaim_for_priority", None)
     if reclaim is None:
         return 0
@@ -4019,6 +4035,13 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
+                    allocator = getattr(sched_self, "token_to_kv_pool_allocator", None)
+                    full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+                    swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+                    if ranks == 1 and full is not None and swa is not None and full is not swa:
+                        from kvcached.priority_reclaim import PriorityReclaimGroup
+
+                        PriorityReclaimGroup((full, swa))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

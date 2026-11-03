@@ -66,7 +66,7 @@ def attach_control(manager, monkeypatch):
     ops = sys.modules.get("kvcached.vmm_ops")
     if ops is not None:
         monkeypatch.setattr(ops, "kv_reclaim", lambda group_id=0: dict(
-            empty_bytes=0, cache_bytes=0, running_bytes=0), raising=False)
+            limit_bytes=0, empty_bytes=0, cache_bytes=0, running_bytes=0), raising=False)
         monkeypatch.setattr(ops, "set_kv_reclaimable", lambda *args: None,
                             raising=False)
     runtime = RuntimeControl(manager, worker_ipc=False, can_shrink=True, expected_participants=1)

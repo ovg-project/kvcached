@@ -731,6 +731,8 @@ int main() {
     assert(writer->publish_control("mid", floor, mid_generation).status ==
            "accepted");
     assert(plan(mid) == (Tiers{3, 2, 0}) && plan(low) == (Tiers{5, 10, 24}));
+    assert(budget->reclaim_plan(mid).limit_bytes == 5);
+    assert(budget->query_control("mid").reclaim_limit_bytes == 5);
     floor.min_bytes = 0;
     assert(writer->publish_control("mid", floor, mid_generation).status ==
            "accepted");
@@ -893,6 +895,30 @@ int main() {
     // that the live pool can map again after its confirmed release.
     assert(budget->snapshot(low).watermark_bytes == 20);
     assert(budget->query_control("high").charged_bytes == dead_charge);
+    held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    // One in-flight refund cannot cover two distinct priority reservations.
+    const auto ledger = std::string(directory) + "/releasing-watermarks";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    budget->configure_control_pool(low, 100, 1, true);
+    auto grant = budget->grant(low, 100);
+    auto held = grant->take(100);
+    grant->finish();
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 100, 1, true);
+    budget->configure_control_pool(mid, 100, 1, true);
+    budget->set_demand(high, 20);
+    budget->set_demand(mid, 20);
+    budget->set_reclaimable(low, 0, 0, 20);
+    assert(budget->snapshot(mid).watermark_bytes == 20);
+    assert(budget->reclaim_plan(low).running_bytes == 20);
+    budget->set_reclaimable(low, 0, 0, 40);
+    assert(budget->reclaim_plan(low).total() == 0);
     held.reset();
     budget.reset();
     unlink(ledger.c_str());
