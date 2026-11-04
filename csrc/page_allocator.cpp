@@ -103,6 +103,8 @@ int64_t InternalPage::get_num_blocks(int64_t page_size,
   return page_size / block_mem_size;
 }
 
+static std::atomic<uint64_t> next_prepare_owner{0};
+
 // PageAllocator implementation
 PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              int64_t page_size, int64_t world_size,
@@ -123,7 +125,8 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
           num_free_pages_.load(std::memory_order_relaxed), MIN_RESERVED_PAGES)),
       max_reserved_pages_(std::min(
           num_free_pages_.load(std::memory_order_relaxed), MAX_RESERVED_PAGES)),
-      prealloc_running_(false), prealloc_needed_(false),
+      prepare_owner_(next_prepare_owner.fetch_add(1)), prealloc_running_(false),
+      prealloc_needed_(false),
       total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers) {
 
   // Initialize free page list
@@ -171,6 +174,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
+  bool from_reserved = false;
 
   while (page_id == -1) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
@@ -189,15 +193,8 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
         cond_.notify_all();
       }
 
-      update_memory_usage_unlocked();
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-          end_time - start_time);
-      LOGGER(DEBUG, "alloc 1 page fast path cost %lu us", duration.count());
-      // std::cout << "alloc 1 page fast path cost " << duration.count() << "
-      // us" << std::endl;
-
-      return std::make_shared<InternalPage>(page_id, page_size_);
+      from_reserved = true;
+      break;
     }
 
     // Slow path: allocate from free pages
@@ -224,7 +221,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
   lock.unlock();
 
   try {
-    map_pages({page_id});
+    map_pages({page_id}, from_reserved);
   } catch (const MapQuarantinedError &e) {
     std::lock_guard<std::mutex> guard(lock_);
     quarantine_pages_unlocked({page_id}, e.what());
@@ -704,7 +701,7 @@ void PageAllocator::prealloc_worker() {
 
     if (!pages_to_reserve.empty()) {
       try {
-        map_pages(pages_to_reserve);
+        prepare_pages(pages_to_reserve);
         lock.lock();
         reserved_page_list_.insert(reserved_page_list_.end(),
                                    pages_to_reserve.begin(),
@@ -745,7 +742,55 @@ void PageAllocator::prealloc_worker() {
   }
 }
 
-void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+bool PageAllocator::uses_local_prepare() const {
+  return contiguous_layout_ && world_size_ == 1 && !should_use_worker_ipc();
+}
+
+std::string PageAllocator::prepared_id(page_id_t page_id) const {
+  return "page-prealloc:" + std::to_string(prepare_owner_) + ":" +
+         std::to_string(page_id);
+}
+
+void PageAllocator::prepare_pages(const std::vector<page_id_t> &page_ids) {
+  if (!uses_local_prepare()) {
+    map_pages(page_ids);
+    return;
+  }
+  std::lock_guard<std::mutex> transaction(transaction_lock_);
+  throw_if_failed();
+  auto allocator = FTensorAllocator::global_allocator(group_id_);
+  try {
+    for (auto pid : page_ids) {
+      // Own each transaction before allocation. One transaction per page lets
+      // alloc_page publish only the page it hands out, without mapping peers
+      // that the preallocator will later replace under an active kernel.
+      prepared_pages_.insert(pid);
+      if (!allocator
+               ->prepare_map_to_kv_tensors(
+                   prepared_id(pid),
+                   {pid * page_size_ * num_layers_ * num_kv_buffers_})
+               .first) {
+        throw std::runtime_error("Failed to prepare physical KV page");
+      }
+    }
+  } catch (...) {
+    try {
+      for (auto pid : page_ids) {
+        if (prepared_pages_.count(pid)) {
+          allocator->abort_prepared_map(prepared_id(pid));
+          prepared_pages_.erase(pid);
+        }
+      }
+    } catch (const std::exception &cleanup) {
+      throw StateConsistencyError(
+          std::string("KV preallocation cleanup failed: ") + cleanup.what());
+    }
+    throw;
+  }
+}
+
+void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids,
+                              bool from_reserved) {
   std::lock_guard<std::mutex> transaction(transaction_lock_);
   throw_if_failed();
   std::vector<offset_t> offsets;
@@ -766,10 +811,55 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
         broadcast_map_callback_) {
       // Multi-process mode: execute map on all TP workers via broadcast
       // callback
-      broadcast_map_callback_(world_size_, offsets);
+      if (!from_reserved) {
+        broadcast_map_callback_(world_size_, offsets);
+      }
     } else {
       // Single-process mode: directly call FTensorAllocator
       auto allocator = FTensorAllocator::global_allocator(group_id_);
+      if (uses_local_prepare()) {
+        for (auto pid : page_ids) {
+          const bool prepared = prepared_pages_.count(pid) != 0;
+          if (from_reserved && !prepared) {
+            continue; // Already mapped by an earlier allocation; preserve data.
+          }
+          // The synchronous scheduler must hand out pages at its GPU-idle
+          // boundary. Async scheduling needs an explicit completion barrier.
+          if (async_sched_) {
+            try {
+              allocator->synchronize_device();
+            } catch (const std::exception &error) {
+              // Completion is uncertain: retain physical ownership and fail
+              // closed rather than recycling the ID with a pending prepare.
+              throw StateConsistencyError(error.what());
+            }
+          }
+          if (prepared) {
+            try {
+              if (!allocator->commit_prepared_map(prepared_id(pid)).first) {
+                throw StateConsistencyError("Missing prepared KV page");
+              }
+              prepared_pages_.erase(pid);
+            } catch (...) {
+              // Commit rolls back its own attachments. Only forget ownership
+              // once cleanup is confirmed, preserving quarantine and receipts.
+              if (allocator->has_prepared_map(prepared_id(pid))) {
+                throw StateConsistencyError(
+                    "KV commit cleanup pending; retaining prepared page");
+              }
+              prepared_pages_.erase(pid);
+              throw;
+            }
+          } else if (!allocator->map_to_kv_tensors(
+                         {pid * page_size_ * num_layers_ * num_kv_buffers_})) {
+            throw std::runtime_error("Failed to map pages to KV tensors");
+          }
+        }
+        return;
+      }
+      if (from_reserved) {
+        return;
+      }
       bool success = allocator->map_to_kv_tensors(offsets);
       if (!success) {
         throw std::runtime_error("Failed to map pages to KV tensors");
@@ -808,11 +898,28 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
       // callback
       broadcast_unmap_callback_(world_size_, offsets);
     } else {
-      // Need to synchronize first in async scheduling mode
-      if (async_sched_) {
-        CHECK_GPU(gpu_vmm::device_synchronize());
-      }
       auto allocator = FTensorAllocator::global_allocator(group_id_);
+      if (uses_local_prepare()) {
+        offsets.clear();
+        for (auto pid : page_ids) {
+          if (prepared_pages_.count(pid)) {
+            if (!allocator->abort_prepared_map(prepared_id(pid))) {
+              throw StateConsistencyError(
+                  "Missing prepared KV page on release");
+            }
+            prepared_pages_.erase(pid);
+          } else {
+            offsets.push_back(pid * page_size_ * num_layers_ * num_kv_buffers_);
+          }
+        }
+      }
+      if (offsets.empty()) {
+        return;
+      }
+      // Prepared-only pages above have never changed the VA mapping.
+      if (async_sched_) {
+        allocator->synchronize_device();
+      }
       bool success = allocator->unmap_from_kv_tensors(offsets);
       if (!success) {
         throw std::runtime_error("Failed to unmap pages from KV tensors");
