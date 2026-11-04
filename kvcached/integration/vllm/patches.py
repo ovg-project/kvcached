@@ -1249,6 +1249,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         original_init = EngineCore.__init__
         detected_version = self.detected_version
+        from kvcached.integration.vllm.offload_config import patch_offload_initialization
+
+        patch_offload_initialization(EngineCore)
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():

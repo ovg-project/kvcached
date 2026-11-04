@@ -55,18 +55,29 @@ def check_offloading_config(vllm_config: Any, version: str | None) -> None:
     if OFFLOADING_CONNECTOR not in names:
         return
     parallel_config = vllm_config.parallel_config
+    from kvcached.integration.vllm.offload_config import positive_int
+
+    tp_size = positive_int(parallel_config.tensor_parallel_size, "TP")
+    pp_size = positive_int(parallel_config.pipeline_parallel_size, "PP")
+    backend = getattr(parallel_config, "distributed_executor_backend", None)
     if (
         names[0] != OFFLOADING_CONNECTOR
         or not (version and VersionRange(SUPPORTED_RANGE).contains(version))
         or not getattr(vllm_config, "use_v2_model_runner", False)
-        or int(parallel_config.tensor_parallel_size) != 1
-        or int(parallel_config.pipeline_parallel_size) != 1
+        or any(int(getattr(parallel_config, name, 1)) != 1 for name in (
+            "data_parallel_size", "prefill_context_parallel_size",
+            "decode_context_parallel_size", "nnodes", "nnodes_within_dp"))
+        # mp owns all local workers and aggregates their copy completions.
+        # In particular, external_launcher cannot fence all IPC unmap peers.
+        or backend not in ("mp", "uni")
+        or (tp_size * pp_size > 1 and backend != "mp")
     ):
         raise KVCachedConfigError(
             "kvcached supports vLLM CPU KV offloading (OffloadingConnector, "
             "--kv-offloading-size) only as the sole connector on vLLM 0.29-0.30 "
-            "with Model Runner V2, TP=1 and PP=1; remove --kv-offloading-size "
-            "or disable kvcached"
+            "with Model Runner V2, positive TP/PP, DP=1 and no context "
+            "parallelism, on one node (mp executor for TP*PP>1); "
+            "remove --kv-offloading-size or disable kvcached"
         )
 
 
@@ -190,6 +201,23 @@ def install_offload_copy_pins(engine_core: Any, manager: Any) -> bool:
     offload_config = connector.connector_scheduler.config
     windowed = windowed_groups(offload_config.kv_group_configs)
     num_workers = int(offload_config.num_workers)
+    parallel_config = engine_core.vllm_config.parallel_config
+    expected_workers = int(parallel_config.tensor_parallel_size) * int(
+        parallel_config.pipeline_parallel_size)
+    executor = engine_core.model_executor
+    executor_workers = getattr(executor, "world_size", None)
+    if (num_workers != expected_workers or
+            (expected_workers > 1 and executor_workers != expected_workers)):
+        # Never release all ranks' pages using a smaller completion quorum.
+        raise KVCachedConfigError(
+            "kvcached OffloadingConnector worker count mismatch: "
+            f"configured={expected_workers}, connector={num_workers}, "
+            f"executor={executor_workers}")
+    if (expected_workers > 1 and getattr(engine_core, "batch_queue", None) is not None
+            and not callable(getattr(manager, "physical_release_barrier", None))):
+        raise KVCachedConfigError(
+            "kvcached multi-rank offloading requires a physical release barrier "
+            "for queued execution")
     pins = OffloadCopyPins(manager, num_workers, GPULoadStoreSpec, windowed, yield_req_data)
     manager.enable_copy_fence()
 

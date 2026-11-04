@@ -94,6 +94,12 @@ map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
   return allocator->map_to_kv_tensors_with_result(offsets);
 }
 
+size_t kv_mapping_page_size(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->kv_mapping_page_size();
+}
+
 std::string current_device_pci_bus_id() {
   py::gil_scoped_release release;
   char pci_bus_id[64] = {};
@@ -556,6 +562,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "map_to_kv_tensors_with_result", py::arg("offsets"),
         py::arg("group_id") = 0);
   m.def("physical_budget_state", &kvcached::physical_budget_state,
+        py::arg("group_id") = 0);
+  m.def("kv_mapping_page_size", &kvcached::kv_mapping_page_size,
         py::arg("group_id") = 0);
   m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
         py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);

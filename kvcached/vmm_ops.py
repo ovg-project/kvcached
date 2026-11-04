@@ -30,6 +30,7 @@ unmap_from_kv_tensors = torch.ops.kvcached.unmap_from_kv_tensors.default
 # Transactional map/unmap ops and the page-management classes stay on the
 # pybind11 module (they take no tensor arguments).
 map_to_kv_tensors_with_result = _C.map_to_kv_tensors_with_result
+kv_mapping_page_size = _C.kv_mapping_page_size
 prepare_map_to_kv_tensors = _C.prepare_map_to_kv_tensors
 commit_prepared_map = _C.commit_prepared_map
 abort_prepared_map = _C.abort_prepared_map
@@ -56,6 +57,7 @@ __all__ = [
     "has_prepared_map",
     "init_kvcached",
     "kv_tensors_created",
+    "kv_mapping_page_size",
     "map_to_kv_tensors",
     "map_to_kv_tensors_with_result",
     "physical_budget_state",
