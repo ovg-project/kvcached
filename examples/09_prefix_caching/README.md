@@ -39,6 +39,34 @@ To control the cached token budget:
 export KVCACHED_MAX_CACHED_TOKENS=16000   # default; -1 = unlimited, 0 = disabled
 ```
 
+For SGLang caches with FULL and sliding-window attention (SWA) components,
+`KVCACHED_MAX_CACHED_TOKENS` limits FULL evictable tokens. An independent SWA
+limit is available for `UnifiedRadixCache` and `SWARadixCache`:
+
+```bash
+export KVCACHED_MAX_CACHED_TOKENS=16000
+export KVCACHED_MAX_CACHED_SWA_TOKENS=4000
+```
+
+The SWA default is `-1` (unlimited), preserving existing behavior. Any negative
+value leaves that component unlimited, `0` requests eviction of all its
+evictable tokens after request completion, and a positive value sets its token
+limit. FULL may be unlimited while SWA is limited. The SWA setting has no effect
+on vLLM, plain `RadixCache`, or `MambaRadixCache`.
+
+These are **logical evictable-token limits**, not GPU-byte quotas or limits on
+active requests. After native request completion releases its references, the
+adapter submits both excess counts in one native eviction request. SGLang owns
+victim selection, protected windows, transfer completion and grouped frees;
+native node/page granularity can evict more than the requested excess, and
+evicting a node can also release its other component. The limits do not promise
+to retain either component's data, immediately release physical pages, or enforce
+a hard bound during every scheduler step. Native HiCache write-back may wait.
+
+This policy is separate from a physical memory-limit shrink: shrink targets a
+backing pool's physical pages, while these settings trim reusable prefixes after
+request completion. Protected state is never made evictable merely to meet a cap.
+
 To disable prefix caching:
 
 ```bash

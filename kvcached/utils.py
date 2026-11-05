@@ -177,6 +177,10 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
 # Used by both SGLang (RadixCacheLimitPatch) and vLLM (ElasticBlockPool),
 # which converts to blocks internally via MAX_CACHED_TOKENS // block_size.
 MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
+# SGLang FULL/SWA caches can trim SWA evictable tokens independently of FULL.
+# Negative values preserve the existing unlimited SWA behavior; zero trims all
+# evictable SWA entries after a request finishes. This is not a byte quota.
+MAX_CACHED_SWA_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_SWA_TOKENS", "-1"))
 
 
 def _default_contiguous_layout() -> bool:
