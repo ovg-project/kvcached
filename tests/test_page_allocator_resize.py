@@ -9,8 +9,15 @@ from typing import Any
 import pytest
 
 torch = pytest.importorskip("torch")
-if not torch.cuda.is_available():
-    pytest.skip("CUDA required", allow_module_level=True)
+
+from kvcached.utils import get_device_module, get_device_type  # noqa: E402
+
+if not get_device_module().is_available():
+    pytest.skip(f"no {get_device_type()} device available",
+                allow_module_level=True)
+
+# The build serves one accelerator family and rejects the others.
+DEVICE = f"{get_device_type()}:0"
 
 from kvcached import _C, control, vmm_ops as vmm  # noqa: E402
 from kvcached.kv_cache_manager import KVCacheManager  # noqa: E402
@@ -23,11 +30,11 @@ def pools(monkeypatch, tmp_path, request):
     monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
     monkeypatch.setattr("kvcached.kv_cache_manager.PAGE_PREALLOC_ENABLED", False)
     monkeypatch.setattr("kvcached.kv_cache_manager.CONTIGUOUS_LAYOUT", request.param)
-    vmm.init_kvcached("cuda:0", PAGE, request.param)
+    vmm.init_kvcached(DEVICE, PAGE, request.param)
     managers, tensors = [], []
     def create(buffers=2, group=0, null=False, blocks_per_page=1, prealloc=False):
         monkeypatch.setattr("kvcached.kv_cache_manager.PAGE_PREALLOC_ENABLED", prealloc)
-        tensors.extend(vmm.create_kv_tensors(8 * PAGE * buffers, 1, "cuda:0", 2,
+        tensors.extend(vmm.create_kv_tensors(8 * PAGE * buffers, 1, DEVICE, 2,
                                             buffers, group_id=group, page_size=PAGE))
         manager = KVCacheManager(num_blocks=8 * blocks_per_page, block_size=1,
                                  cell_size=PAGE // blocks_per_page,

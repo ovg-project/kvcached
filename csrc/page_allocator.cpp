@@ -541,8 +541,23 @@ PageState PageAllocator::get_page_state_unlocked() const {
 
 int64_t PageAllocator::get_avail_physical_pages() const {
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(device_mem_info(gpu_vmm::current_device(), &avail_phy_mem_size,
-                            &total_phy_mem_size));
+  // Not CHECK_GPU: this runs on every allocation decision, and aborting a
+  // serving process from a routine query is worse than declining to grow.
+  // FTensorAllocator::init_gpu_() already proved the query works at startup, so
+  // a failure here means something changed under us -- report zero available
+  // pages and let the caller's own accounting bound usage.
+  const auto res = device_mem_info(gpu_vmm::current_device(),
+                                   &avail_phy_mem_size, &total_phy_mem_size);
+  if (!gpu_vmm::is_success(res)) {
+    static std::once_flag warned;
+    std::call_once(warned, [&] {
+      LOGGER(ERROR,
+             "%s mem_get_info failed (%s); reporting no available physical "
+             "pages. The KV pool will not grow.",
+             gpu_vmm::backend_name(), gpu_vmm::error_string(res));
+    });
+    return 0;
+  }
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
@@ -648,6 +663,23 @@ void PageAllocator::start_prealloc_thread() {
 void PageAllocator::stop_prealloc_thread() { stop_prealloc_thread_internal(); }
 
 void PageAllocator::prealloc_worker() {
+  // The current device is per thread in every backend (cudaSetDevice,
+  // hipSetDevice and c10::xpu::set_device alike), so this thread starts on
+  // device 0 whatever the engine chose. get_avail_physical_pages() asks the
+  // current device, so without this a rank on device 3 would size its pool by
+  // device 0's free memory. The mappings themselves name their device and are
+  // unaffected.
+  const int dev_idx = FTensorAllocator::device_index();
+  if (dev_idx >= 0) {
+    const auto res = gpu_vmm::set_device(dev_idx);
+    if (!gpu_vmm::is_success(res)) {
+      LOGGER(ERROR,
+             "prealloc worker could not select %s device %d (%s); free-memory "
+             "queries on this thread will ask the default device.",
+             gpu_vmm::backend_name(), dev_idx, gpu_vmm::error_string(res));
+    }
+  }
+
   auto start_time = std::chrono::steady_clock::now();
 
   while (prealloc_running_) {

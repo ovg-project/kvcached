@@ -290,7 +290,11 @@ def cmd_limit_percent(ipc: str, percent: float):
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        raise RuntimeError("CUDA unavailable; cannot compute size from percentage")
+        # get_total_gpu_memory() asks torch.cuda or torch.xpu, whichever the
+        # build has, so naming CUDA here would misreport the failure on XPU.
+        raise RuntimeError(
+            "No accelerator visible (cuda/hip/xpu); cannot compute size from "
+            "percentage")
     return update_kv_cache_limit(ipc, int(total_mem * percent / 100.0))
 
 

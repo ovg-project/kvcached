@@ -25,7 +25,7 @@ from kvcached.integration.vllm.interfaces import (
     shutdown_kvcached,
 )
 from kvcached.kv_cache_manager import KVCacheManager
-from kvcached.utils import DEFAULT_IPC_NAME
+from kvcached.utils import DEFAULT_IPC_NAME, get_device_module, get_device_type
 from kvcached.vmm_ops import kv_tensors_created
 
 IPC_NAME = DEFAULT_IPC_NAME
@@ -36,7 +36,7 @@ NUM_LAYERS = 16
 BLOCK_SIZE = 16
 NUM_BLOCKS = 65536
 DTYPE = torch.float16
-DEVICE = f"cuda:{TP_RANK}"
+DEVICE = f"{get_device_type()}:{TP_RANK}"
 KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
 
 
@@ -44,7 +44,7 @@ KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
 def setup_kvcache():
     # initialize kvcached
     os.environ["KVCACHED_CONTIGUOUS_LAYOUT"] = "true"
-    torch.cuda.set_device(TP_RANK)
+    get_device_module().set_device(TP_RANK)
     init_kvcached(tp_rank=TP_RANK, world_size=TP_SIZE, is_worker=True, async_sched=False)
 
     # allocate kv cache tensors in virtual memory

@@ -17,17 +17,33 @@ from unittest import mock
 # Pre-mock heavy dependencies so kvcached can be imported without torch/CUDA.
 # This MUST happen before any kvcached import.
 # ---------------------------------------------------------------------------
-_torch_mock = mock.MagicMock()
-_torch_mock.__version__ = "2.6.0"
-_torch_mock.cuda.mem_get_info.return_value = (8 * 1024**3, 16 * 1024**3)
-sys.modules.setdefault("torch", _torch_mock)
-sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
-sys.modules.setdefault("torch.utils", _torch_mock.utils)
-sys.modules.setdefault("torch.utils.cpp_extension", _torch_mock.utils.cpp_extension)
+# Only when torch is genuinely missing: these entries are process-wide and
+# outlive this module, so a stub installed on a machine that has torch follows
+# into every later-collected file. Importing cpp_extension is what settles it --
+# torch itself does not pull that submodule in, so a setdefault would install the
+# mock even next to a real torch, and test_vmm_failure_policy.py reads CUDA_HOME
+# out of it to compile its driver shim.
+try:
+    import torch.utils.cpp_extension  # noqa: F401
+except Exception:
+    _torch_mock = mock.MagicMock()
+    _torch_mock.__version__ = "2.6.0"
+    _torch_mock.cuda.mem_get_info.return_value = (8 * 1024**3, 16 * 1024**3)
+    sys.modules.setdefault("torch", _torch_mock)
+    sys.modules.setdefault("torch.cuda", _torch_mock.cuda)
+    sys.modules.setdefault("torch.utils", _torch_mock.utils)
+    sys.modules.setdefault("torch.utils.cpp_extension",
+                           _torch_mock.utils.cpp_extension)
 sys.modules.setdefault("posix_ipc", mock.MagicMock())
 
-# Mock the C extension module and heavy submodules
-sys.modules.setdefault("kvcached.vmm_ops", mock.MagicMock())
+# Mock the C extension module and heavy submodules. Only when it cannot be
+# loaded: the mock is process-wide and outlives this module, so on a machine
+# where kvcached is built it would follow into every later-collected test file
+# and break the ones that import vmm_ops for real.
+try:
+    import kvcached.vmm_ops  # noqa: F401
+except Exception:
+    sys.modules["kvcached.vmm_ops"] = mock.MagicMock()
 
 # Pre-mock the interfaces module so mock.patch can resolve its attributes.
 # This avoids importing torch / C extensions transitively via interfaces.py.

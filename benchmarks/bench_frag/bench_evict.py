@@ -24,6 +24,7 @@ from array import array
 import torch
 
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.utils import get_device_module, get_device_type
 from kvcached.vmm_ops import kv_tensors_created
 
 TP_RANK, TP_SIZE = 0, 1
@@ -32,7 +33,7 @@ BLOCK_SIZE = 16
 CELL_SIZE = 1024
 NUM_BLOCKS = 8192
 DTYPE = torch.float16
-DEVICE = f"cuda:{TP_RANK}"
+DEVICE = f"{get_device_type()}:{TP_RANK}"
 VLLM_KV_SHAPE = (2, NUM_BLOCKS, BLOCK_SIZE, 8, 64)
 SGLANG_KV_SHAPE = (NUM_BLOCKS * BLOCK_SIZE, 8, 64)
 
@@ -64,7 +65,7 @@ class _SGLangAllocator:
 
 
 def setup(backend):
-    torch.cuda.set_device(TP_RANK)
+    get_device_module().set_device(TP_RANK)
     if backend == "vllm":
         from kvcached.integration.vllm.interfaces import (
             alloc_kv_cache,

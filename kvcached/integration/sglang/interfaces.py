@@ -26,6 +26,9 @@ from kvcached.tp_ipc_util import (
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     PAGE_SIZE,
+    get_current_device_str,
+    get_device_module,
+    get_device_type,
     get_kvcached_logger,
     get_page_size_for_block,
     normalize_gpu_device,
@@ -65,7 +68,7 @@ def init_kvcached(
         return
 
     if device is None:
-        device = f"cuda:{torch.cuda.current_device()}"
+        device = get_current_device_str()
     device = normalize_gpu_device(device)
 
     _init_kvcached_impl(device, PAGE_SIZE, _contiguous_layout)
@@ -183,8 +186,11 @@ def alloc_kv_cache(
             f"num_layers must be positive, got {num_layers}. A zero-layer "
             "attention pool owns no KV memory; skip alloc_kv_cache() for it.")
 
-    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    device_module = get_device_module(device)
+    assert device_module.is_available(), (
+        f"GPU backend is not available via torch.{get_device_type(device)}."
+    )
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
@@ -192,7 +198,7 @@ def alloc_kv_cache(
     block_mem_size = block_size * math.prod(kvcache_shape[1:]) * dtype.itemsize
     physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
 
-    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    gpu_mem_bytes = device_module.get_device_properties(device).total_memory
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * physical_page_size for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
@@ -312,8 +318,10 @@ def alloc_mamba_states(
         raise RuntimeError(
             "kvcached is not initialized. Please call init_kvcached() first.")
 
-    assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    assert get_device_module(device).is_available(), (
+        f"GPU backend is not available via torch.{get_device_type(device)}."
+    )
 
     conv_shapes = [tuple(s) for s in cache_params.shape.conv]
     temporal_shape = tuple(cache_params.shape.temporal)

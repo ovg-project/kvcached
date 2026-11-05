@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import queue
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import torch
 
 # kvcached bits
 from kvcached.integration.vllm.interfaces import shutdown_kvcached
+from kvcached.utils import get_device_module, get_device_type
 from kvcached.vmm_ops import unmap_from_kv_tensors
 
 PAGE_SIZE = 2 * 1024 * 1024  # 2MB, typical and for benchmarking purposes
@@ -49,8 +51,8 @@ def _worker(
     try:
         # Device placement
         dev_id = rank if device_mode == "per-rank" else 0
-        torch.cuda.set_device(dev_id)
-        device = f"cuda:{dev_id}"
+        get_device_module().set_device(dev_id)
+        device = f"{get_device_type()}:{dev_id}"
 
         # Init kvcached
         from kvcached.integration.vllm.interfaces import init_kvcached
@@ -156,11 +158,32 @@ class RunStats:
     min_t: float
 
 
-def _aggregate_parallel_results(procs: int, iters: int, result_q: mp.Queue) -> RunStats:
+def _get_or_die(q: mp.Queue, workers: List[mp.Process], waiting_for: str):
+    """queue.get() that gives up once a worker has crashed.
+
+    A worker that dies during init never reaches the queue, and the barrier the
+    survivors sit in has no timeout either, so a plain get() turns any worker
+    exception into a hang with no output. Exiting 0 is normal -- a rank is done
+    once it has posted its last result -- so only a non-zero code is a failure.
+    """
+    while True:
+        try:
+            return q.get(timeout=1.0)
+        except queue.Empty:
+            dead = [(p.pid, p.exitcode) for p in workers if p.exitcode not in (None, 0)]
+            if dead:
+                raise RuntimeError(
+                    f"worker exited before {waiting_for}; (pid, exitcode): {dead}. "
+                    "Its traceback is above."
+                )
+
+
+def _aggregate_parallel_results(procs: int, iters: int, result_q: mp.Queue,
+                                workers: List[mp.Process]) -> RunStats:
     # Gather all (rank, iter, dt, dev) tuples
     bucket: dict[int, dict[int, float]] = defaultdict(dict)  # iter -> {rank: dt}
     for _ in range(procs * iters):
-        rank, it, dt, _dev = result_q.get()
+        rank, it, dt, _dev = _get_or_die(result_q, workers, "reporting its map time")
         bucket[it][rank] = dt
 
     per_iter_wall = []
@@ -235,13 +258,13 @@ def _run_parallel_case(
     # Wait until all workers report readiness
     ready = set()
     while len(ready) < procs:
-        ready.add(ready_q.get())
+        ready.add(_get_or_die(ready_q, procs_list, "reporting ready"))
 
     # Start the timed section for each iteration inside workers
     start_evt.set()
 
     # Collect results and compute wall-clock per iteration as max(rank times)
-    stats = _aggregate_parallel_results(procs, iters, result_q)
+    stats = _aggregate_parallel_results(procs, iters, result_q, procs_list)
 
     # Clean up workers
     for p in procs_list:

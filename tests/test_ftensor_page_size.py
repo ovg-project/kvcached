@@ -4,6 +4,12 @@
 import pytest
 from test_vmm_transaction import _compiled_vmm_ops
 
+from kvcached.utils import get_device_module, get_device_type
+
+# The build serves one accelerator family and rejects the others, so the device
+# string has to follow it rather than name CUDA.
+DEVICE = f"{get_device_type()}:0"
+
 
 @pytest.mark.parametrize("contiguous", [False, True])
 @pytest.mark.parametrize("unified", [False, True])
@@ -14,13 +20,13 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
     mib = 1024**2
     buffers = 1 if unified else 2
     layers = 2
-    vmm.init_kvcached("cuda:0", 2 * mib, contiguous)
+    vmm.init_kvcached(DEVICE, 2 * mib, contiguous)
     pools = []
     try:
         for group, page in enumerate((4 * mib, 6 * mib, 10 * mib, 2 * mib)):
             kwargs = {"page_size": page} if group < 3 else {}
             raw = vmm.create_kv_tensors(
-                4 * page, 1, "cuda:0", layers, num_kv_buffers=buffers,
+                4 * page, 1, DEVICE, layers, num_kv_buffers=buffers,
                 group_id=group, unified_pool=unified, **kwargs)
             stride = page * layers * buffers if contiguous else page
             assert vmm.kv_mapping_page_size(group) == stride
@@ -35,11 +41,11 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
                 assert vmm.map_to_kv_tensors([0, stride], group)
                 for index, view in enumerate(views):
                     view.fill_(10 * group + index + cycle + 1)
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             for group, stride, views in pools:
                 for index, view in enumerate(views):
                     assert torch.all(view == 10 * group + index + cycle + 1).item()
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             for group, stride, _ in pools:
                 assert vmm.unmap_from_kv_tensors([0, stride], group)
     finally:
@@ -49,21 +55,21 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
 @pytest.mark.parametrize("page_size", [-2097152, 1, 3145728])
 def test_invalid_tensor_page_size_is_rejected(page_size):
     vmm = _compiled_vmm_ops()
-    vmm.init_kvcached("cuda:0", 2097152, True)
+    vmm.init_kvcached(DEVICE, 2097152, True)
     try:
         with pytest.raises((ValueError, RuntimeError), match="page size"):
-            vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=page_size)
+            vmm.create_kv_tensors(16 * 1024**2, 1, DEVICE, 1, page_size=page_size)
     finally:
         vmm.shutdown_kvcached()
 
 
 def test_tensor_page_size_cannot_change_after_creation():
     vmm = _compiled_vmm_ops()
-    vmm.init_kvcached("cuda:0", 2097152, True)
+    vmm.init_kvcached(DEVICE, 2097152, True)
     try:
-        vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=4 * 1024**2)
+        vmm.create_kv_tensors(16 * 1024**2, 1, DEVICE, 1, page_size=4 * 1024**2)
         with pytest.raises(RuntimeError, match="Cannot change page size"):
-            vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=2 * 1024**2)
+            vmm.create_kv_tensors(16 * 1024**2, 1, DEVICE, 1, page_size=2 * 1024**2)
     finally:
         vmm.shutdown_kvcached()
 

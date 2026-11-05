@@ -78,6 +78,9 @@ public:
                    const std::string &instance_name = "");
   static void shutdown();
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
+  // Index of the accelerator init() was given, or -1 before init(), on CPU, or
+  // when init() was given a bare device string with no index.
+  static int device_index();
   void destroy();
   BudgetSnapshot physical_budget_state();
   uint64_t available_physical_bytes();
