@@ -240,6 +240,35 @@ def test_ctor_accepts_0517_and_0520_kwargs(elastic_mamba_pool_cls):
     assert pool.available_size() == 0
 
 
+def test_small_mamba_pool_backs_null_slot_with_a_whole_page(
+        elastic_mamba_pool_cls, monkeypatch):
+    """Two 3 MiB slots need one 12 MiB backing page, not zero pages."""
+    import kvcached.integration.sglang.patches as patches
+
+    mib = 1024**2
+    kvi = sys.modules["kvcached.integration.sglang.interfaces"]
+    original = kvi.alloc_mamba_states
+
+    def small_states(**kwargs):
+        conv, temporal, layout = original(**kwargs)
+        layout["cell_size"] = 3 * mib
+        return conv, temporal, layout
+
+    monkeypatch.setattr(kvi, "alloc_mamba_states", small_states)
+    monkeypatch.setattr(patches, "PAGE_SIZE", 12 * mib)
+    monkeypatch.setattr(
+        patches, "get_page_size_for_block", lambda block, default: 12 * mib)
+
+    elastic_mamba_pool_cls(**_mamba_pool_kwargs(size=1))
+    manager_args = elastic_mamba_pool_cls._kvcached_test_record[
+        "get_kv_cache_manager"]
+    assert manager_args["num_blocks"] == 4
+    assert manager_args["logical_num_blocks"] == 2
+    assert manager_args["max_block_id"] == 2
+
+
+
+
 def test_ctor_accepts_0516_kwarg_name(elastic_mamba_pool_cls):
     pool = elastic_mamba_pool_cls(
         **_mamba_pool_kwargs(enable_gdn_replayssm_spec=False)

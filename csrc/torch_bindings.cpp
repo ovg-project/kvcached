@@ -685,7 +685,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("page_size"))
       .def_readonly("page_id", &kvcached::InternalPage::page_id)
       .def_readonly("page_size", &kvcached::InternalPage::page_size)
-      .def("init", &kvcached::InternalPage::init)
+      .def("init", &kvcached::InternalPage::init, py::arg("block_mem_size"),
+           py::arg("max_block_id") = -1)
       .def("alloc", &kvcached::InternalPage::alloc)
       .def("free", &kvcached::InternalPage::free)
       .def("free_batch", &kvcached::InternalPage::free_batch)

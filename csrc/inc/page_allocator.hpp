@@ -53,7 +53,8 @@ public:
   std::vector<int64_t> free_list;
 
   InternalPage(page_id_t id, int64_t size);
-  void init(int64_t block_mem_size);
+  // max_block_id is an exclusive ID bound; -1 keeps every backing block.
+  void init(int64_t block_mem_size, int64_t max_block_id = -1);
   std::vector<int64_t> alloc(int64_t num_blocks = 1);
   void free(int64_t block_id);
   void free_batch(const std::vector<int64_t> &block_ids);
