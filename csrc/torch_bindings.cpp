@@ -679,6 +679,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("reset_free_page_order",
            &kvcached::page_allocator_reset_free_page_order)
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
+      .def("get_allocatable_block_capacity",
+           &kvcached::PageAllocator::get_allocatable_block_capacity,
+           py::arg("block_mem_size"), py::arg("new_page_limit"),
+           py::arg("max_block_id") = -1)
       .def("get_num_inuse_pages", &kvcached::page_allocator_get_num_inuse_pages)
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",

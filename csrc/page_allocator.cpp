@@ -476,6 +476,40 @@ int64_t PageAllocator::get_num_free_pages() const {
   return num_free_pages_.load(std::memory_order_relaxed);
 }
 
+int64_t
+PageAllocator::get_allocatable_block_capacity(int64_t block_mem_size,
+                                              int64_t new_page_limit,
+                                              int64_t max_block_id) const {
+  if (block_mem_size <= 0) {
+    throw std::invalid_argument("block_mem_size must be positive");
+  }
+  throw_if_failed();
+  std::lock_guard<std::mutex> lock(lock_);
+  if (transaction_failed_.load(std::memory_order_acquire)) {
+    throw StateConsistencyError(transaction_error_);
+  }
+  int64_t capacity = 0;
+  auto add_page = [&](page_id_t page_id) {
+    const auto range =
+        InternalPage::get_block_range(page_id, page_size_, block_mem_size);
+    const int64_t start =
+        max_block_id < 0 ? range.first : std::min(range.first, max_block_id);
+    const int64_t end =
+        max_block_id < 0 ? range.second : std::min(range.second, max_block_id);
+    capacity += end - start;
+  };
+  for (page_id_t page_id : reserved_page_list_) {
+    add_page(page_id);
+  }
+  const auto count =
+      std::min(free_page_list_.size(),
+               static_cast<size_t>(std::max<int64_t>(0, new_page_limit)));
+  for (size_t i = 0; i < count; ++i) {
+    add_page(free_page_list_[i]);
+  }
+  return capacity;
+}
+
 int64_t PageAllocator::get_num_inuse_pages() const {
   const int64_t total = num_total_pages_.load(std::memory_order_relaxed);
   const int64_t free = num_free_pages_.load(std::memory_order_relaxed);
