@@ -389,6 +389,8 @@ py::dict control_dict(const InstanceControl &state) {
   result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
+  result["retention_tokens"] = state.retention_tokens;
+  result["retention_revision"] = state.retention_revision;
   result["limit_revision"] = state.limit_revision;
   result["limit_bytes"] = state.requested_bytes;
   result["effective_limit_bytes"] = state.effective_bytes;
@@ -473,12 +475,15 @@ py::dict publish_instance_controls(const std::string &path,
                                    std::optional<uint64_t> limit_bytes,
                                    std::optional<uint64_t> min_bytes,
                                    std::optional<int64_t> priority,
-                                   std::optional<uint64_t> headroom_bytes) {
+                                   std::optional<uint64_t> headroom_bytes,
+                                   std::optional<int64_t> retention_tokens) {
   InstanceControl state;
   {
     py::gil_scoped_release release;
     state = GpuBudget::open_control(path)->publish_control(
-        name, ControlUpdate{limit_bytes, min_bytes, priority, headroom_bytes},
+        name,
+        ControlUpdate{limit_bytes, min_bytes, priority, headroom_bytes,
+                      retention_tokens},
         generation, revision);
   }
   return control_dict(state);
@@ -549,7 +554,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("path"), py::arg("instance"), py::arg("generation"),
         py::arg("revision") = py::none(), py::arg("limit_bytes") = py::none(),
         py::arg("min_bytes") = py::none(), py::arg("priority") = py::none(),
-        py::arg("headroom_bytes") = py::none());
+        py::arg("headroom_bytes") = py::none(),
+        py::arg("retention_tokens") = py::none());
   m.def("fail_instance_control", &kvcached::fail_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
         py::arg("generation"), py::arg("revision"));
