@@ -3,8 +3,10 @@
 
 import importlib
 import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -55,3 +57,43 @@ def test_default_name(monkeypatch, pgid, pid_namespace, expected):
 
     monkeypatch.setattr(utils.os, "stat", stat)
     assert utils._obtain_default_ipc_name() == expected
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux example launch scripts")
+@pytest.mark.parametrize("example,roles", [
+    ("01_simple_two_models/start_two_models.sh", ("a", "b")),
+    ("05_multi_agents/start_multi_agent_models.sh", ("research", "writing")),
+])
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_example_launches_have_distinct_ipc_names(tmp_path, example, roles, engine):
+    """Run the real launch scripts, replacing only the serving executables."""
+    stub = tmp_path / "vllm"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "output = Path(os.environ['IPC_CAPTURE']) / str(os.getpid())\n"
+        "output.write_text(os.environ['KVCACHED_IPC_NAME'])\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = dict(os.environ, PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+               PYTHON=str(stub), KVCACHED_IPC_NAME="inherited-name")
+    script = Path(__file__).resolve().parents[1] / "examples" / example
+    names = []
+    for launch in range(2):
+        output = tmp_path / f"launch-{launch}"
+        output.mkdir()
+        env["IPC_CAPTURE"] = str(output)
+        options = []
+        for index, role in enumerate(roles):
+            engine_arg = f"--engine-{role}" if role in ("a", "b") else f"--{role}-engine"
+            port_arg = f"--port-{role}" if role in ("a", "b") else f"--{role}-port"
+            options.extend([engine_arg, engine, port_arg, str(18000 + 2 * launch + index)])
+        subprocess.run(["bash", str(script), *options], env=env,
+                       check=True, capture_output=True, text=True, timeout=20)
+        launched = [path.read_text() for path in output.iterdir()]
+        assert len(launched) == 2
+        names.extend(launched)
+    assert len(set(names)) == 4
+    assert all(name != "inherited-name" and 0 < len(name) <= 64 for name in names)

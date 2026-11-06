@@ -115,6 +115,9 @@ fi
 
 PYTHON=${PYTHON:-python3}
 
+# Share one launch suffix across the roles, including in separate PID namespaces.
+read -r ipc_suffix < /proc/sys/kernel/random/uuid || exit 1
+
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]}"; do
@@ -171,16 +174,16 @@ run_sgl() {
 
 # Start A
 if [[ "$ENGINE_A" == "vllm" ]]; then
-    run_vllm "$MODEL_A" "$PORT_A" "$TP_A" "$venv_vllm_path" "kvcached_instance_a"
+    run_vllm "$MODEL_A" "$PORT_A" "$TP_A" "$venv_vllm_path" "kvcached_instance_a_$ipc_suffix"
 else
-    run_sgl "$MODEL_A" "$PORT_A" "$TP_A" "$venv_sgl_path" "kvcached_instance_a"
+    run_sgl "$MODEL_A" "$PORT_A" "$TP_A" "$venv_sgl_path" "kvcached_instance_a_$ipc_suffix"
 fi
 
 # Start B
 if [[ "$ENGINE_B" == "vllm" ]]; then
-    run_vllm "$MODEL_B" "$PORT_B" "$TP_B" "$venv_vllm_path" "kvcached_instance_b"
+    run_vllm "$MODEL_B" "$PORT_B" "$TP_B" "$venv_vllm_path" "kvcached_instance_b_$ipc_suffix"
 else
-    run_sgl "$MODEL_B" "$PORT_B" "$TP_B" "$venv_sgl_path" "kvcached_instance_b"
+    run_sgl "$MODEL_B" "$PORT_B" "$TP_B" "$venv_sgl_path" "kvcached_instance_b_$ipc_suffix"
 fi
 
 wait -n || true
