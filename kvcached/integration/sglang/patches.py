@@ -3625,27 +3625,27 @@ class _SGLangPrefixRetentionUpdate(NamedTuple):
     error: Optional[str]
 
 
-_SGLANG_RETENTION_RECEIVE = threading.local()
-
-
 def _wrap_sglang_retention_broadcast(
     original: Callable[..., Any], *, attention_groups: bool = False,
 ) -> Callable[..., Any]:
     """Carry retention on the existing request broadcast, including idle polls."""
     @functools.wraps(original)
     def wrapped(data: Any, *args: Any, **kwargs: Any) -> Any:
-        if (not getattr(_SGLANG_RETENTION_RECEIVE, "active", False)
-                or _sglang_pipeline_stages() != 1):
+        if not enable_kvcached() or _sglang_pipeline_stages() != 1:
             return original(data, *args, **kwargs)
-        if attention_groups:
-            leader = all(torch.distributed.get_rank(group) == 0
-                         for group in _sglang_queue_cpu_groups())
-        else:
+        groups = _sglang_queue_cpu_groups()
+        leader = all(torch.distributed.get_rank(group) == 0 for group in groups)
+        final_broadcast = True
+        if not attention_groups:
             src = kwargs.get("src", args[2] if len(args) > 2 else 0)
-            leader = torch.distributed.get_rank() == src
+            leader &= torch.distributed.get_rank() == src
+            group = kwargs.get("dist_group", args[1] if len(args) > 1 else None)
+            # Older receivers broadcast along TP then CP separately. Keep
+            # the assignment in flight until the last queue group receives it.
+            final_broadcast = not groups or group is groups[-1] or all(group is not peer for peer in groups)
         update = None
         error = None
-        if leader:
+        if leader and not (data and isinstance(data[-1], _SGLangPrefixRetentionUpdate)):
             try:
                 update = _read_prefix_cache_retention_update(throttle=True)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -3653,7 +3653,7 @@ def _wrap_sglang_retention_broadcast(
         if update is not None or error is not None:
             data = [*(data or []), _SGLangPrefixRetentionUpdate(update, error)]
         result = original(data, *args, **kwargs)
-        if result and isinstance(result[-1], _SGLangPrefixRetentionUpdate):
+        if final_broadcast and result and isinstance(result[-1], _SGLangPrefixRetentionUpdate):
             assignment = result.pop()
             if assignment.error is not None:
                 raise RuntimeError(f"Cannot read prefix retention control: {assignment.error}")
@@ -3661,13 +3661,6 @@ def _wrap_sglang_retention_broadcast(
         return result
 
     return wrapped
-
-
-def _apply_sglang_prefix_retention() -> None:
-    """A scheduler without queue peers needs no broadcast."""
-    if _sglang_pipeline_stages() == 1 and not _sglang_queue_cpu_groups():
-        _apply_prefix_cache_retention_update(
-            _read_prefix_cache_retention_update(throttle=True))
 
 
 class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
@@ -3695,44 +3688,33 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
         Scheduler = self._get_target_class(sched_mod)
         if Scheduler is None:
             return False
-        broadcast_modules = [sched_mod]
-        receiver = getattr(sched_mod, "SchedulerRequestReceiver", None)
-        if receiver is not None:
-            broadcast_modules.append(importlib.import_module(receiver.__module__))
-        for module in broadcast_modules:
-            for broadcast_name in ("broadcast_pyobj", "attn_cp_tp_broadcast_pyobj"):
-                broadcast = getattr(module, broadcast_name, None)
-                marker = "__kvcached_prefix_retention_broadcast__"
-                if broadcast is None or self._is_already_patched(broadcast, marker):
-                    continue
-                wrapped = _wrap_sglang_retention_broadcast(
-                    broadcast, attention_groups=broadcast_name == "attn_cp_tp_broadcast_pyobj")
-                self._mark_as_patched(wrapped, marker)
-                setattr(module, broadcast_name, wrapped)
-        # Older releases receive directly on Scheduler; newer ones expose
-        # ingest_requests around RequestReceiver. Both run even when idle.
-        receive_name = next((name for name in ("ingest_requests", "recv_requests")
-                             if callable(getattr(Scheduler, name, None))), None)
-        if receive_name is not None:
-            receive = getattr(Scheduler, receive_name)
-            marker = "__kvcached_scheduler_retention_receive__"
-            if not self._is_already_patched(receive, marker):
+        # 0.5.11/12 receive on Scheduler; 0.5.13+ use a separate receiver.
+        receiver = getattr(sched_mod, "SchedulerRequestReceiver", Scheduler)
+        module = sched_mod if receiver is Scheduler else importlib.import_module(receiver.__module__)
+        for broadcast_name in ("broadcast_pyobj", "attn_cp_tp_broadcast_pyobj"):
+            broadcast = getattr(module, broadcast_name, None)
+            marker = "__kvcached_prefix_retention_broadcast__"
+            if broadcast is None or self._is_already_patched(broadcast, marker):
+                continue
+            wrapped = _wrap_sglang_retention_broadcast(
+                broadcast, attention_groups=broadcast_name == "attn_cp_tp_broadcast_pyobj")
+            self._mark_as_patched(wrapped, marker)
+            setattr(module, broadcast_name, wrapped)
+        receive = getattr(receiver, "recv_requests", None)
+        marker = "__kvcached_scheduler_retention_receive__"
+        if receive is not None and not self._is_already_patched(receive, marker):
 
-                @functools.wraps(receive)
-                def _wrapped_receive(sched_self: Any, *args: Any, **kwargs: Any) -> Any:
-                    enabled = enable_kvcached()
-                    previous = getattr(_SGLANG_RETENTION_RECEIVE, "active", False)
-                    _SGLANG_RETENTION_RECEIVE.active = enabled
-                    try:
-                        result = receive(sched_self, *args, **kwargs)
-                    finally:
-                        _SGLANG_RETENTION_RECEIVE.active = previous
-                    if enabled:
-                        _apply_sglang_prefix_retention()
-                    return result
+            @functools.wraps(receive)
+            def _wrapped_receive(sched_self: Any, *args: Any, **kwargs: Any) -> Any:
+                result = receive(sched_self, *args, **kwargs)
+                if (enable_kvcached() and _sglang_pipeline_stages() == 1
+                        and not _sglang_queue_cpu_groups()):
+                    _apply_prefix_cache_retention_update(
+                        _read_prefix_cache_retention_update(throttle=True))
+                return result
 
-                self._mark_as_patched(_wrapped_receive, marker)
-                setattr(Scheduler, receive_name, _wrapped_receive)
+            self._mark_as_patched(_wrapped_receive, marker)
+            receiver.recv_requests = _wrapped_receive
         # SGLang 0.5.20 calls on_idle; earlier releases (e.g. 0.5.10) call
         # self_check_during_idle.
         name = next((name for name in ("on_idle", "self_check_during_idle")

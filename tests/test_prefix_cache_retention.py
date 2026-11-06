@@ -235,7 +235,7 @@ def _tp_retention_worker(rank, directory, states, results, attention_groups):
 
         receive = sgl_patches._wrap_sglang_retention_broadcast(
             broadcast_requests, attention_groups=attention_groups)
-        sgl_patches._SGLANG_RETENTION_RECEIVE.active = True
+        sgl_patches.enable_kvcached = lambda: True
         # Only the leader may read the ledger. Rank 1 must use the broadcast.
         if rank == 1:
             sgl_patches._read_prefix_cache_retention_update = lambda **kwargs: (_ for _ in ()).throw(
@@ -298,9 +298,9 @@ def test_external_caller_and_nonleader_update_all_tp_ranks(
         shared_states.shutdown()
 
 
-@pytest.mark.parametrize("receive_name", ["recv_requests", "ingest_requests"])
+@pytest.mark.parametrize("modern_receiver", [False, True])
 def test_scheduler_consumes_update_after_receiving_requests(
-        monkeypatch, shared_control, receive_name):
+        monkeypatch, shared_control, modern_receiver):
     events = []
 
     class Scheduler:
@@ -314,8 +314,14 @@ def test_scheduler_consumes_update_after_receiving_requests(
         events.append("receive")
         return ["request"]
 
-    setattr(Scheduler, receive_name, receive)
     module = types.ModuleType("sglang.srt.managers.scheduler")
+    receiver: Any = Scheduler
+    if modern_receiver:
+        receiver_module = types.ModuleType("retention_test_receiver")
+        monkeypatch.setitem(sys.modules, receiver_module.__name__, receiver_module)
+        receiver = type("SchedulerRequestReceiver", (), {"__module__": receiver_module.__name__})
+        setattr(module, "SchedulerRequestReceiver", receiver)
+    setattr(receiver, "recv_requests", receive)
     setattr(module, "Scheduler", Scheduler)
     def no_reclaimers(scheduler):
         return []
@@ -333,7 +339,7 @@ def test_scheduler_consumes_update_after_receiving_requests(
     retention._policy.register(cache)
     control.set_prefix_cache_retention_limit(0)
 
-    assert getattr(scheduler, receive_name)() == ["request"]
+    assert receiver().recv_requests() == ["request"]
     assert events == ["receive"]
     assert cache.limits == [0]
     scheduler.on_idle()
@@ -369,10 +375,11 @@ def test_scheduler_reuses_request_broadcast_before_dispatch(
         assert cache.limits == [0]
         return requests
 
+    receiver: Any = Scheduler
     if modern_receiver:
         receiver = type("SchedulerRequestReceiver", (), {"__module__": receiver_module.__name__})
         setattr(module, "SchedulerRequestReceiver", receiver)
-    setattr(Scheduler, "ingest_requests" if modern_receiver else "recv_requests", receive)
+    setattr(receiver, "recv_requests", receive)
     setattr(module, "Scheduler", Scheduler)
     monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(sgl_patches, "_sglang_queue_cpu_groups", lambda: [object()])
@@ -382,21 +389,19 @@ def test_scheduler_reuses_request_broadcast_before_dispatch(
     assert patch.patch_idle_hook(module)
     assert patch.patch_idle_hook(module)
     control.set_prefix_cache_retention_limit(0)
-    scheduler = Scheduler.__new__(Scheduler)
-    receive_name = "ingest_requests" if modern_receiver else "recv_requests"
+    scheduler = receiver.__new__(receiver)
 
-    assert getattr(scheduler, receive_name)() == ["request"]
+    assert scheduler.recv_requests() == ["request"]
     assert len(payloads) == 1
     assert len(payloads[0]) == 2
     retention._policy.last_poll = 0
-    assert getattr(scheduler, receive_name)() == ["request"]
+    assert scheduler.recv_requests() == ["request"]
     assert payloads[1] == ["request"]
-    assert not sgl_patches._SGLANG_RETENTION_RECEIVE.active
 
 
-@pytest.mark.parametrize("active,pp_size", [(False, 1), (True, 2)])
-def test_retention_leaves_other_broadcasts_unchanged(monkeypatch, active, pp_size):
-    monkeypatch.setattr(sgl_patches._SGLANG_RETENTION_RECEIVE, "active", active, raising=False)
+@pytest.mark.parametrize("enabled,pp_size", [(False, 1), (True, 2)])
+def test_retention_leaves_other_broadcasts_unchanged(monkeypatch, enabled, pp_size):
+    monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: enabled)
     monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: pp_size)
 
     def forbidden_read(**kwargs):
@@ -413,6 +418,35 @@ def test_retention_leaves_other_broadcasts_unchanged(monkeypatch, active, pp_siz
     wrapped = sgl_patches._wrap_sglang_retention_broadcast(broadcast)
     assert wrapped(data, 3, src=3) is data
     assert calls == [(data, 3, {"src": 3})]
+
+
+def test_split_tp_cp_broadcast_keeps_one_assignment_in_flight(monkeypatch, shared_control):
+    tp, cp = object(), object()
+    monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: 1)
+    monkeypatch.setattr(sgl_patches, "_sglang_queue_cpu_groups", lambda: [tp, cp])
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *a: 0)
+    cache = Enforcer()
+    retention._policy.register(cache)
+
+    def broadcast(data, rank, dist_group):
+        return data
+
+    wrapped = sgl_patches._wrap_sglang_retention_broadcast(broadcast)
+    control.set_prefix_cache_retention_limit(0)
+    in_flight = wrapped(["request"], 0, tp)
+    assert cache.limits == []
+
+    # A concurrent publication between the two legs must not replace the
+    # in-flight assignment or leave a second marker in the request stream.
+    control.set_prefix_cache_retention_limit(256)
+    retention._policy.last_poll = 0
+    assert wrapped(in_flight, 0, cp) == ["request"]
+    assert cache.limits == [0]
+
+    in_flight = wrapped([], 0, tp)
+    assert wrapped(in_flight, 0, cp) == []
+    assert cache.limits == [0, 256]
 
 
 @pytest.mark.parametrize("step_name", ["step", "step_with_batch_queue"])
