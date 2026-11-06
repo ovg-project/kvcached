@@ -472,7 +472,9 @@ def test_vllm_consumes_update_before_scheduling(monkeypatch, shared_control, ste
     assert getattr(engine, step_name)() == "scheduled"
 
 
-def test_vllm_idle_watch_leaves_eviction_on_engine_thread(monkeypatch, shared_control):
+@pytest.mark.parametrize("has_wakeup", [False, True])
+def test_vllm_idle_watch_leaves_eviction_on_engine_thread(
+        monkeypatch, shared_control, has_wakeup):
     class EngineCore:
         pass
 
@@ -480,8 +482,12 @@ def test_vllm_idle_watch_leaves_eviction_on_engine_thread(monkeypatch, shared_co
     setattr(module, "EngineCore", EngineCore)
     assert vllm_patches.EngineCorePatch().patch_engine_init(module)
     wakeup = object()
+    abort = object()
     engine_module = types.ModuleType("vllm.v1.engine")
-    setattr(engine_module, "EngineCoreRequestType", types.SimpleNamespace(WAKEUP=wakeup))
+    request_types = types.SimpleNamespace(ABORT=abort)
+    if has_wakeup:
+        request_types.WAKEUP = wakeup
+    setattr(engine_module, "EngineCoreRequestType", request_types)
     monkeypatch.setitem(sys.modules, "vllm.v1.engine", engine_module)
     monkeypatch.setattr(vllm_patches, "_release_retired_pages_if_idle", lambda *a: None)
     monkeypatch.setattr(vllm_patches, "_publish_kv_cache_events_if_idle", lambda *a: None)
@@ -501,16 +507,39 @@ def test_vllm_idle_watch_leaves_eviction_on_engine_thread(monkeypatch, shared_co
         apply_resize_target=lambda: None, reclaim_for_shrink=lambda: None),)
     engine._idle_state_callbacks = []
     engine.input_queue = Queue()
-    control.set_prefix_cache_retention_limit(0)
-    engine._kvcached_start_limit_watch()
-    stop, thread = engine._kvcached_limit_watch
+    waiting = threading.Event()
+    applied = threading.Event()
+    received = []
+
+    def idle_loop():
+        while True:
+            while engine._idle_state_callbacks:
+                engine._idle_state_callbacks.pop()(engine)
+                applied.set()
+            waiting.set()
+            request = engine.input_queue.get()
+            if request is None:
+                return
+            received.append(request)
+
+    engine_thread = threading.Thread(target=idle_loop, name="test-engine-core")
+    engine_thread.start()
     try:
-        assert engine.input_queue.get(timeout=5) == (wakeup, None)
-        assert cache.limits == []
-        engine._idle_state_callbacks.pop()(engine)
+        assert waiting.wait(timeout=5)
+        control.set_prefix_cache_retention_limit(0)
+        engine._kvcached_start_limit_watch()
+        assert applied.wait(timeout=5)
+        assert received == [((wakeup, None) if has_wakeup else (abort, []))]
         assert cache.limits == [0]
-        assert threads == [threading.current_thread()]
+        assert threads == [engine_thread]
     finally:
-        stop.set()
-        thread.join(timeout=5)
-        assert not thread.is_alive()
+        limit_watch = getattr(engine, "_kvcached_limit_watch", None)
+        if limit_watch is not None:
+            stop, thread = limit_watch
+            stop.set()
+            thread.join(timeout=5)
+        engine.input_queue.put(None)
+        engine_thread.join(timeout=5)
+        assert not engine_thread.is_alive()
+        if limit_watch is not None:
+            assert not thread.is_alive()

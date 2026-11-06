@@ -1435,9 +1435,14 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 return
             try:
                 from vllm.v1.engine import EngineCoreRequestType
-                wakeup = EngineCoreRequestType.WAKEUP
-            except (ImportError, AttributeError):
+            except ImportError:
                 return
+            # Older engines have no WAKEUP. An empty abort only unblocks the
+            # input queue; it leaves requests untouched and runs idle callbacks.
+            wakeup: tuple[EngineCoreRequestType, list[str] | None] = (
+                (EngineCoreRequestType.WAKEUP, None)
+                if hasattr(EngineCoreRequestType, "WAKEUP")
+                else (EngineCoreRequestType.ABORT, []))
 
             def apply_limit(engine_core: Any) -> None:
                 _apply_prefix_cache_retention_update(_read_prefix_cache_retention_update(throttle=True))
@@ -1474,7 +1479,7 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                         continue
                     if apply_limit not in callbacks:
                         callbacks.append(apply_limit)
-                        input_queue.put_nowait((wakeup, None))
+                        input_queue.put_nowait(wakeup)
 
             thread = threading.Thread(target=watch, name="kvcached-limit-watch", daemon=True)
             self._kvcached_limit_watch = (stop, thread)
