@@ -1,0 +1,12 @@
+{
+  "task": "Validate fixed tiny FP16 pre-V4 DeepSeek MLA against native vLLM 0.29 MRV2. Preserve the 512-element latent and 64-element RoPE cache. A native prefill backend failure cannot waive a layout.",
+  "allow": ["kvcached/integration/vllm/model_runner_v2.py"],
+  "cpu_tests": ["tests/test_engine_compat_family_probe.py"],
+  "gpu_tests": ["tests/test_vllm_model_runner_v2.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.29"],
+  "repair": false,
+  "runner": "v2",
+  "layouts": ["non-contiguous", "contiguous"],
+  "probe": "mla"
+}

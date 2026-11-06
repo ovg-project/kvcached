@@ -1,0 +1,23 @@
+name: Discover upstream engine releases
+
+on:
+  schedule:
+    - cron: '19 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  release:
+    if: (vars.ENGINE_RELEASE_COMPAT_ENABLED == 'true' || vars.VLLM_RELEASE_COMPAT_ENABLED == 'true') && github.run_attempt == 1
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        engine: [vllm, sglang]
+    uses: ./.github/workflows/vllm-release-compat.yml
+    with:
+      engine: ${{ matrix.engine }}
+    secrets: inherit

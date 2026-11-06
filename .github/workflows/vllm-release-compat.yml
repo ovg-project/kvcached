@@ -1,0 +1,430 @@
+name: Engine release compatibility
+
+on:
+  workflow_call:
+    inputs:
+      engine:
+        type: string
+        required: true
+    secrets:
+      ENGINE_COMPAT_CODEX_API_KEY:
+        required: true
+      ENGINE_COMPAT_PUBLISH_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: Upstream engine
+        type: choice
+        default: vllm
+        options: [vllm, sglang]
+      mode:
+        description: Validate existing code, or permit a bounded repair
+        type: choice
+        default: validate
+        options: [validate, repair]
+      profile:
+        description: Automatic release analysis, or an existing regression profile
+        type: choice
+        default: auto
+        options: [auto, vllm, native-layout, allocation, attention-v1-028, attention-v2-028, hybrid-v1-028, hybrid-v2-029, sharing-v2-029, gptoss-v2-029, mla-v2-029]
+      tag:
+        description: Stable upstream release to replay (empty selects the oldest unseen release)
+        type: string
+      retry:
+        description: Explicitly retry this recorded release, with a new bounded attempt budget
+        type: boolean
+        default: false
+
+# Cross-repository releases do not trigger this repository's `release` event.
+# Poll all unseen releases; no upstream webhook or token is required.
+concurrency:
+  group: engine-release-compat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    if: (vars.ENGINE_RELEASE_COMPAT_ENABLED == 'true' || (inputs.engine != 'sglang' && vars.VLLM_RELEASE_COMPAT_ENABLED == 'true')) && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      status: ${{ steps.plan.outputs.status }}
+      tag: ${{ steps.plan.outputs.tag }}
+      engine_sha: ${{ steps.plan.outputs.engine_sha }}
+      old_tag: ${{ steps.plan.outputs.old_tag }}
+      old_engine_sha: ${{ steps.plan.outputs.old_engine_sha }}
+      engine: ${{ steps.profile.outputs.engine }}
+      upstream: ${{ steps.profile.outputs.upstream }}
+      base_repository: ${{ steps.baseline.outputs.base_repository }}
+      base_branch: ${{ steps.baseline.outputs.base_branch }}
+      base_sha: ${{ steps.baseline.outputs.base_sha }}
+      profile: ${{ steps.profile.outputs.profile }}
+      mode: ${{ steps.profile.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate the operator-selected scope
+        id: profile
+        env:
+          PROFILE: ${{ inputs.profile || 'auto' }}
+          MODE: ${{ inputs.mode || 'repair' }}
+          ENGINE: ${{ inputs.engine || 'vllm' }}
+        run: |
+          if [[ "$ENGINE" == vllm ]]; then upstream=vllm-project/vllm;
+          elif [[ "$ENGINE" == sglang ]]; then upstream=sgl-project/sglang;
+          else exit 2; fi
+          if [[ "$PROFILE" != auto ]]; then
+            [[ "$ENGINE" == vllm ]] || exit 2
+            python tools/engine_compat_profile.py "$PROFILE" --mode "$MODE"
+          fi
+          printf 'profile=%s\nmode=%s\nengine=%s\nupstream=%s\n' \
+            "$PROFILE" "$MODE" "$ENGINE" "$upstream" >> "$GITHUB_OUTPUT"
+      - name: Pin the PR target default branch
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_REPO: ${{ vars.ENGINE_COMPAT_PR_REPOSITORY || vars.VLLM_COMPAT_PR_REPOSITORY || github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import quote
+
+          def api(endpoint):
+              return json.loads(subprocess.check_output(
+                  ["gh", "api", "--hostname", "github.com", endpoint], text=True
+              ))
+
+          repository = os.environ["PR_REPO"]
+          pattern = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+"
+          if not re.fullmatch(pattern, repository) or repository.split("/")[1] in {".", ".."}:
+              raise SystemExit("Invalid PR target repository")
+          metadata = api(f"repos/{repository}")
+          repository = metadata["full_name"]
+          branch = metadata["default_branch"]
+          if (
+              not isinstance(repository, str)
+              or repository.casefold() != os.environ["PR_REPO"].casefold()
+              or not isinstance(branch, str)
+              or not branch
+              or any(ord(char) < 33 or ord(char) == 127 for char in branch)
+          ):
+              raise SystemExit("Invalid PR target default branch")
+          ref = api(f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}")
+          commit = ref.get("object", {})
+          sha = commit.get("sha")
+          if (
+              ref.get("ref") != f"refs/heads/{branch}"
+              or commit.get("type") != "commit"
+              or not isinstance(sha, str)
+              or not re.fullmatch(r"[0-9a-f]{40}", sha)
+          ):
+              raise SystemExit("Invalid PR target branch commit")
+          baseline = dict(base_repository=repository, base_branch=branch, base_sha=sha)
+          Path("baseline.json").write_text(json.dumps(baseline) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              for key, value in baseline.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+      - name: Discover and claim one stable release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER: ${{ vars.ENGINE_RELEASE_TRACKER_ISSUE || vars.VLLM_RELEASE_TRACKER_ISSUE }}
+          FIRST_VERSION: ${{ inputs.engine == 'sglang' && (vars.SGLANG_COMPAT_FIRST_VERSION || '0.5.15') || (vars.VLLM_COMPAT_FIRST_VERSION || '0.28.0') }}
+          ENGINE: ${{ steps.profile.outputs.engine }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RETRY: ${{ inputs.retry }}
+          PROFILE: ${{ steps.profile.outputs.profile }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          if [[ "$RETRY" == true ]]; then args+=(--retry); fi
+          python tools/engine_release_discovery.py discover --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --first-version "$FIRST_VERSION" \
+            --engine "$ENGINE" --profile "$PROFILE" --output plan.json "${args[@]}"
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools")
+          from engine_compat_profile import load_profile, validate_release
+          path = Path("plan.json")
+          plan = json.loads(path.read_text(encoding="utf-8"))
+          if plan.get("tag") and os.environ["PROFILE"] != "auto":
+              validate_release(load_profile(os.environ["PROFILE"]), plan["tag"])
+          plan.update(json.loads(Path("baseline.json").read_text(encoding="utf-8")))
+          path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
+          PY
+          python tools/engine_release_discovery.py claim --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --plan plan.json --run-url "$RUN_URL"
+          python -c 'import json,os; p=json.load(open("plan.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.writelines(f"{k}={p[k]}\n" for k in ("status","tag","engine_sha","old_tag","old_engine_sha") if p.get(k) is not None)'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.profile.outputs.engine }}-release-plan
+          path: plan.json
+
+  analyze:
+    needs: discover
+    if: needs.discover.outputs.status == 'running' && needs.discover.outputs.profile == 'auto' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 145
+    outputs:
+      digest: ${{ steps.analysis.outputs.digest }}
+      status: ${{ steps.analysis.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.discover.outputs.base_repository }}
+          ref: ${{ needs.discover.outputs.base_sha }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.symlinks
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: ${{ needs.discover.outputs.upstream }}
+          ref: ${{ needs.discover.outputs.engine_sha }}
+          fetch-depth: 0
+          path: engine
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.symlinks
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: ${{ needs.discover.outputs.upstream }}
+          ref: ${{ needs.discover.outputs.old_engine_sha }}
+          fetch-depth: 0
+          path: old-engine
+          persist-credentials: false
+      - name: Preserve inert source symlinks for subsequent Git checks
+        run: |
+          git -C engine config core.symlinks false
+          git -C old-engine config core.symlinks false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --global @openai/codex
+      - name: Collect existing adapter PRs without delegating GitHub credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_REPO: ${{ needs.discover.outputs.base_repository }}
+        run: |
+          gh api --paginate --slurp "repos/$PR_REPO/pulls?state=open&per_page=100" \
+            --jq '[.[][] | {number, html_url, title, body, head: .head.sha}]' > pending-prs.json
+      - name: Analyze release changes, generate and review acceptance
+        id: analysis
+        env:
+          CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
+          ENGINE: ${{ needs.discover.outputs.engine }}
+          TAG: ${{ needs.discover.outputs.tag }}
+          OLD_TAG: ${{ needs.discover.outputs.old_tag }}
+        run: |
+          python controller/tools/engine_release_analysis.py \
+            --engine "$ENGINE" --tag "$TAG" --old-tag "$OLD_TAG" \
+            --source candidate --engine-source engine --old-engine old-engine \
+            --pending-prs pending-prs.json --output analysis
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ needs.discover.outputs.engine }}-release-analysis
+          path: analysis/
+          retention-days: 30
+
+  first:
+    needs: [discover, analyze]
+    if: always() && needs.discover.outputs.status == 'running' && (needs.discover.outputs.profile != 'auto' || needs.analyze.outputs.status == 'ready') && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-attempt.yml
+    with:
+      tag: ${{ needs.discover.outputs.tag }}
+      engine_sha: ${{ needs.discover.outputs.engine_sha }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+      attempt: first
+      profile: ${{ needs.discover.outputs.profile }}
+      mode: ${{ needs.discover.outputs.mode }}
+      engine: ${{ needs.discover.outputs.engine }}
+      analysis_digest: ${{ needs.analyze.outputs.digest }}
+    secrets:
+      CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
+
+  second:
+    needs: [discover, analyze, first]
+    if: always() && needs.discover.outputs.mode == 'repair' && needs.first.outputs.status == 'failed' && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-attempt.yml
+    with:
+      tag: ${{ needs.discover.outputs.tag }}
+      engine_sha: ${{ needs.discover.outputs.engine_sha }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+      attempt: second
+      profile: ${{ needs.discover.outputs.profile }}
+      mode: ${{ needs.discover.outputs.mode }}
+      prior: ${{ needs.first.outputs.artifact }}
+      engine: ${{ needs.discover.outputs.engine }}
+      analysis_digest: ${{ needs.analyze.outputs.digest }}
+    secrets:
+      CODEX_API_KEY: ${{ secrets.ENGINE_COMPAT_CODEX_API_KEY }}
+
+  select:
+    needs: [discover, first, second]
+    if: always() && needs.discover.outputs.status == 'running' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.select.outputs.artifact }}
+    steps:
+      - id: select
+        env:
+          FIRST_STATUS: ${{ needs.first.outputs.status }}
+          SECOND_STATUS: ${{ needs.second.outputs.status }}
+          ENGINE: ${{ needs.discover.outputs.engine }}
+        run: |
+          if [[ "$FIRST_STATUS" == passed ]]; then
+            printf 'artifact=gpu-%s-first\n' "$ENGINE" >> "$GITHUB_OUTPUT"
+          elif [[ "$SECOND_STATUS" == passed ]]; then
+            printf 'artifact=gpu-%s-second\n' "$ENGINE" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    needs: [discover, analyze, select]
+    if: always() && needs.select.outputs.artifact != '' && github.run_attempt == 1
+    uses: ./.github/workflows/engine-compat-ci.yml
+    with:
+      engine: ${{ needs.discover.outputs.engine }}
+      artifact: ${{ needs.select.outputs.artifact }}
+      profile: ${{ needs.discover.outputs.profile }}
+      tag: ${{ needs.discover.outputs.tag }}
+      base_repository: ${{ needs.discover.outputs.base_repository }}
+      base_branch: ${{ needs.discover.outputs.base_branch }}
+      base_sha: ${{ needs.discover.outputs.base_sha }}
+      analysis_digest: ${{ needs.analyze.outputs.digest }}
+
+  publish:
+    needs: [discover, analyze, select, verify]
+    if: always() && needs.discover.outputs.mode == 'repair' && needs.verify.result == 'success' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: controller
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          repository: ${{ needs.discover.outputs.base_repository }}
+          ref: ${{ needs.discover.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.select.outputs.artifact }}
+          path: handoff
+      - uses: actions/download-artifact@v4
+        if: needs.discover.outputs.profile == 'auto'
+        with:
+          name: ${{ needs.discover.outputs.engine }}-release-analysis
+          path: analysis
+      - name: Publish the independently verified commit
+        env:
+          GH_TOKEN: ${{ secrets.ENGINE_COMPAT_PUBLISH_TOKEN }}
+          PUBLISH_REPO: ${{ vars.ENGINE_COMPAT_PUBLISH_REPOSITORY || vars.VLLM_COMPAT_PUBLISH_REPOSITORY || github.repository }}
+          PR_REPO: ${{ needs.discover.outputs.base_repository }}
+          BASE_BRANCH: ${{ needs.discover.outputs.base_branch }}
+          BASE_SHA: ${{ needs.discover.outputs.base_sha }}
+          RELEASE_TAG: ${{ needs.discover.outputs.tag }}
+          ENGINE_SHA: ${{ needs.discover.outputs.engine_sha }}
+          PROFILE: ${{ needs.discover.outputs.profile }}
+          ENGINE_COMPAT_ANALYSIS_DIR: ${{ github.workspace }}/analysis/bundle
+          ENGINE_COMPAT_ANALYSIS_DIGEST: ${{ needs.analyze.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh auth setup-git
+          python controller/tools/engine_compat_stage.py publish \
+            --source candidate --prior handoff --output publication \
+            --base "$BASE_SHA" --tag "$RELEASE_TAG" --engine-sha "$ENGINE_SHA" \
+            --publish-repository "$PUBLISH_REPO" --pr-repository "$PR_REPO" \
+            --base-branch "$BASE_BRANCH" --run-url "$RUN_URL" \
+            --profile "$PROFILE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publication-${{ needs.discover.outputs.engine }}
+          path: publication/
+
+  finish:
+    needs: [discover, analyze, first, second, verify, publish]
+    if: always() && needs.discover.outputs.status == 'running' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.discover.outputs.engine }}-release-plan
+          path: handoff
+      - uses: actions/download-artifact@v4
+        if: needs.analyze.outputs.status == 'ready'
+        with:
+          name: ${{ needs.discover.outputs.engine }}-release-analysis
+          path: analysis
+      - name: Record terminal disposition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER: ${{ vars.ENGINE_RELEASE_TRACKER_ISSUE || vars.VLLM_RELEASE_TRACKER_ISSUE }}
+          PUBLISHED: ${{ needs.publish.result }}
+          MODE: ${{ needs.discover.outputs.mode }}
+          VERIFIED: ${{ needs.verify.result }}
+          PROFILE: ${{ needs.discover.outputs.profile }}
+          LAST_GPU_STATUS: ${{ needs.second.outputs.status || needs.first.outputs.status }}
+          ANALYZED: ${{ needs.analyze.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          status=blocked
+          if [[ "$LAST_GPU_STATUS" == failed ]]; then status=failed; fi
+          if [[ "$PUBLISHED" == success ]]; then status=passed; fi
+          if [[ "$MODE" == validate && "$LAST_GPU_STATUS" == passed && "$VERIFIED" == success ]]; then status=passed; fi
+          if [[ "$ANALYZED" == ready ]]; then
+            # A focused repair does not close other pending/native gaps in this release.
+            if ! python -c 'import json; p=json.load(open("analysis/bundle/manifest.json"))["plan"]; raise SystemExit(any(c["disposition"] in ("blocked", "pending-pr") for c in p["coverage"].values()))'; then
+              status=blocked
+            fi
+          fi
+          python tools/engine_release_discovery.py finish --repository "$GITHUB_REPOSITORY" \
+            --tracker-issue "$TRACKER" --plan handoff/plan.json --status "$status" \
+            --run-url "$RUN_URL"
+          printf 'Compatibility task %s (%s): **%s**. This is not whole-release acceptance.\n' "$PROFILE" "$MODE" "$status" >> "$GITHUB_STEP_SUMMARY"
+          test "$status" = passed

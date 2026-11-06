@@ -1,0 +1,11 @@
+{
+  "task": "Validate the existing 0.28 V1 attention adapter without modifying it. Compare complete native/patched token outputs in both elastic storage layouts and verify the actual runner. This is a tiny attention-only probe, not Qwen hybrid, multimodal, TP/PP, async lifetime or release acceptance.",
+  "allow": ["kvcached/integration/vllm/patches.py"],
+  "cpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "gpu_tests": ["tests/test_vllm_virtual_kv_capacity.py"],
+  "qualification": "single-gpu",
+  "releases": ["0.28"],
+  "repair": false,
+  "runner": "v1",
+  "layouts": ["non-contiguous", "contiguous"]
+}
