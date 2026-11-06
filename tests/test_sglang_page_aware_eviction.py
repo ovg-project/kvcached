@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import torch
 
-import kvcached.integration.sglang.patches as sglang_patches
+import kvcached.prefix_cache_retention as retention
 from kvcached.integration.sglang.patches import (
     RadixCacheLimitPatch,
     _evict_radix_cache_page_aware,
@@ -1261,7 +1261,8 @@ def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
 def test_radix_patch_uses_page_aware_order_for_cache_cap(monkeypatch):
     radix_module: Any = types.ModuleType("sglang.srt.mem_cache.radix_cache")
     radix_module.EvictParams = FakeEvictParams
-    monkeypatch.setattr(sglang_patches, "MAX_CACHED_TOKENS", 4)
+    monkeypatch.setattr(
+        retention, "_policy", retention._PrefixCacheRetentionPolicy(4))
 
     class FakeRadixCache:
 
@@ -1328,7 +1329,8 @@ def test_radix_patch_uses_page_aware_order_for_cache_cap(monkeypatch):
 
 def test_radix_patch_uses_native_eviction_for_legacy_sglang(monkeypatch):
     radix_module: Any = types.ModuleType("sglang.srt.mem_cache.radix_cache")
-    monkeypatch.setattr(sglang_patches, "MAX_CACHED_TOKENS", 4)
+    monkeypatch.setattr(
+        retention, "_policy", retention._PrefixCacheRetentionPolicy(4))
 
     class FakeLegacyRadixCache:
 
@@ -1354,7 +1356,8 @@ def test_radix_patch_uses_native_eviction_for_legacy_sglang(monkeypatch):
 
 def test_radix_patch_enforces_limit_after_each_finished_request(monkeypatch):
     radix_module: Any = types.ModuleType("sglang.srt.mem_cache.radix_cache")
-    monkeypatch.setattr(sglang_patches, "MAX_CACHED_TOKENS", 4)
+    monkeypatch.setattr(
+        retention, "_policy", retention._PrefixCacheRetentionPolicy(4))
 
     class FakeRadixCache:
 
