@@ -39,6 +39,7 @@ set_instance_budget_limit = _C.set_instance_budget_limit
 set_kv_demand = _C.set_kv_demand
 kv_reclaim = _C.kv_reclaim
 set_kv_reclaimable = _C.set_kv_reclaimable
+_publish_pool_reclaimable = _C._publish_pool_reclaimable
 recalibrate_physical_budget = _C.recalibrate_physical_budget
 current_device_pci_bus_id = _C.current_device_pci_bus_id
 prepare_unmap_from_kv_tensors = _C.prepare_unmap_from_kv_tensors

@@ -12,13 +12,235 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace kvcached;
 
-int main() {
+void test_pool_reclaim(const std::string &directory) {
+  {
+    const auto ledger = directory + "/pool-registration-order";
+    auto budget = GpuBudget::connect(ledger, [] { return 40; });
+    auto full = budget->register_pool("low", 0, InstancePolicy{4, 0, 0});
+    auto swa = budget->register_pool("low", 1);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(full, 16, 16, true);
+    budget->configure_control_pool(swa, 8, 4, true);
+    budget->configure_control_pool(spare, 16, 1, true);
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    for (auto pair :
+         {std::pair{full, 16u}, std::pair{swa, 8u}, std::pair{spare, 16u}}) {
+      auto grant = budget->grant(pair.first, pair.second);
+      held.push_back(grant->take(pair.second));
+      grant->finish();
+    }
+    const auto state = budget->control_state(full);
+    assert(budget->post_pool_reclaimable(
+        "low", state.generation,
+        {{full, state.pool_owner, 16, 0, 0},
+         {swa, budget->control_state(swa).pool_owner, 8, 0, 0}}));
+    budget->set_reclaimable(spare, 16, 0, 0);
+    budget->set_demand(high, 20);
+    // Keep the engine's full/SWA order: 16 + 4 fits. Taking both small
+    // pages first would leave only 12 bytes and strand the large page.
+    assert(budget->reclaim_plan(full).limit_bytes == 20);
+    assert(budget->reclaim_plan(full).empty_bytes == 20);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = directory + "/pool-owner-reuse";
+    auto budget = GpuBudget::connect(ledger, [] { return 32; });
+    auto full = budget->register_pool("low", 0, InstancePolicy{15, 0, 0});
+    auto other = GpuBudget::connect(ledger, [] { return 32; });
+    auto small = other->register_pool("low", 1);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(full, 16, 16, true);
+    other->configure_control_pool(small, 4, 4, true);
+    budget->configure_control_pool(spare, 12, 4, true);
+    auto grant = budget->grant(full, 16);
+    auto held = grant->take(16);
+    grant->finish();
+    auto second = budget->grant(spare, 12);
+    auto spare_held = second->take(12);
+    second->finish();
+    const auto state = budget->control_state(full);
+    const auto old_owner = other->control_state(small).pool_owner;
+    assert(budget->post_pool_reclaimable(
+        "low", state.generation,
+        {{full, state.pool_owner, 16, 0, 0}, {small, old_owner, 0, 0, 0}}));
+    other.reset();
+    other = GpuBudget::connect(ledger, [] { return 32; });
+    const auto replacement = other->register_pool("low", 1);
+    assert(replacement == small);
+    other->configure_control_pool(replacement, 4, 4, true);
+    auto third = other->grant(replacement, 4);
+    auto small_held = third->take(4);
+    third->finish();
+    budget->set_reclaimable(spare, 12, 0, 0);
+    budget->set_demand(high, 1);
+    // Registration retires the old detail. An old owner cannot republish it.
+    assert(budget->reclaim_plan(full).empty_bytes == 1);
+    assert(!budget->post_pool_reclaimable(
+        "low", state.generation,
+        {{full, state.pool_owner, 16, 0, 0}, {small, old_owner, 0, 0, 0}}));
+    assert(budget->reclaim_plan(full).empty_bytes == 1);
+    assert(budget->post_pool_reclaimable(
+        "low", state.generation,
+        {{full, state.pool_owner, 16, 0, 0},
+         {replacement, other->control_state(replacement).pool_owner, 0, 0,
+          0}}));
+    assert(budget->reclaim_plan(full).total() == 0);
+    assert(budget->reclaim_plan(spare).empty_bytes == 1);
+    held.reset();
+    spare_held.reset();
+    small_held.reset();
+    other.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = directory + "/pool-tiers";
+    auto budget = GpuBudget::connect(ledger, [] { return 48; });
+    auto full = budget->register_pool("low", 0, InstancePolicy{28, 0, 0});
+    auto swa = budget->register_pool("low", 1);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(full, 16, 16, true);
+    budget->configure_control_pool(swa, 16, 4, true);
+    budget->configure_control_pool(spare, 16, 4, true);
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    for (auto slot : {full, swa, spare}) {
+      auto grant = budget->grant(slot, 16);
+      held.push_back(grant->take(16));
+      grant->finish();
+    }
+    const auto generation = budget->control_state(full).generation;
+    const auto full_owner = budget->control_state(full).pool_owner;
+    const auto swa_owner = budget->control_state(swa).pool_owner;
+    const std::vector<PoolReclaimable> a{{full, full_owner, 16, 0, 0},
+                                         {swa, swa_owner, 0, 0, 0}};
+    const std::vector<PoolReclaimable> b{{full, full_owner, 0, 0, 0},
+                                         {swa, swa_owner, 16, 0, 0}};
+    budget->set_reclaimable(spare, 16, 0, 0);
+    budget->set_demand(high, 4);
+    assert(budget->post_pool_reclaimable("low", generation, a));
+    for (int round = 0; round < 3; ++round) {
+      // The only empty page is too large. Another instance can release.
+      assert(budget->reclaim_plan(full).total() == 0);
+      assert(budget->reclaim_plan(spare).empty_bytes == 4);
+      assert(budget->reclaim_plan(full).limit_bytes == 4);
+    }
+    assert(budget->post_pool_reclaimable("low", generation, b));
+    // Identical aggregate counters, but this empty tier really can release.
+    assert(budget->query_control("low").empty_bytes == 16);
+    assert(budget->reclaim_plan(full).empty_bytes == 4);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    auto invalid = a;
+    invalid[1].owner ^= 1;
+    assert(!budget->post_pool_reclaimable("low", generation, invalid));
+    assert(!budget->post_pool_reclaimable("low", generation + 1, a));
+    assert(!budget->post_pool_reclaimable("low", generation, {a[0]}));
+    assert(!budget->post_pool_reclaimable("low", generation, {a[0], a[0]}));
+    invalid = a;
+    invalid[0].empty_bytes = UINT64_MAX;
+    invalid[1].empty_bytes = 1;
+    assert(!budget->post_pool_reclaimable("low", generation, invalid));
+    // A late invalid entry must not publish even the valid first entry.
+    assert(budget->query_control("low").empty_bytes == 16);
+    assert(budget->reclaim_plan(full).empty_bytes == 4);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    assert(budget->post_pool_reclaimable("low", generation, a));
+    budget->set_reclaimable(full, 16, 0, 0);
+    // Legacy writers keep aggregate semantics and invalidate old pool detail.
+    assert(budget->reclaim_plan(full).empty_bytes == 4);
+    assert(budget->post_pool_reclaimable("low", generation, a));
+    assert(budget->post_reclaimable("low", generation, 16, 0, 0));
+    assert(budget->reclaim_plan(full).empty_bytes == 4);
+    assert(budget->post_pool_reclaimable("low", generation, a));
+    assert(budget->reclaim_plan(full).total() == 0);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = directory + "/pool-tier-floor";
+    auto budget = GpuBudget::connect(ledger, [] { return 48; });
+    auto low = budget->register_pool("low", 0, InstancePolicy{15, 0, 0});
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(low, 32, 16, true);
+    budget->configure_control_pool(spare, 16, 1, true);
+    auto grant = budget->grant(low, 32);
+    auto held = grant->take(32);
+    grant->finish();
+    auto other = budget->grant(spare, 16);
+    auto spare_held = other->take(16);
+    other->finish();
+    const auto state = budget->control_state(low);
+    assert(budget->post_pool_reclaimable("low", state.generation,
+                                         {{low, state.pool_owner, 16, 16, 0}}));
+    budget->set_reclaimable(spare, 0, 16, 0);
+    budget->set_demand(high, 17);
+    const auto plan = budget->reclaim_plan(low);
+    // Empty and cache are different pages: the same 17-byte floor room
+    // cannot pay for a 16-byte page from each tier.
+    assert(plan.limit_bytes == 17 && plan.empty_bytes == 16 &&
+           plan.cache_bytes == 0);
+    assert(budget->reclaim_plan(spare).cache_bytes == 1);
+    held.reset();
+    spare_held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = directory + "/pool-shared-page";
+    auto budget = GpuBudget::connect(ledger, [] { return 32; });
+    auto large = budget->register_pool("low", 0, InstancePolicy{6, 0, 0});
+    auto small = budget->register_pool("low", 1);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    auto highest = budget->register_pool("highest", 0, InstancePolicy{0, 3, 0});
+    budget->configure_control_pool(large, 10, 10, true);
+    budget->configure_control_pool(small, 6, 6, true);
+    budget->configure_control_pool(spare, 16, 1, true);
+    std::vector<std::unique_ptr<BudgetReceipt>> held;
+    for (auto pair :
+         {std::pair{large, 10u}, std::pair{small, 6u}, std::pair{spare, 16u}}) {
+      auto grant = budget->grant(pair.first, pair.second);
+      held.push_back(grant->take(pair.second));
+      grant->finish();
+    }
+    const auto state = budget->control_state(large);
+    assert(budget->post_pool_reclaimable(
+        "low", state.generation,
+        {{large, state.pool_owner, 10, 0, 0},
+         {small, budget->control_state(small).pool_owner, 0, 0, 0}}));
+    budget->set_reclaimable(spare, 16, 0, 0);
+    budget->set_demand(high, 6);
+    budget->set_demand(highest, 4);
+    // Both asks fit the same actual 10-byte empty page. The sibling's
+    // 6-byte unit must not round that page's capacity down to six.
+    assert(budget->reclaim_plan(large).empty_bytes == 10);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    held.clear();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+}
+
+int main(int argc, char **argv) {
   char directory[] = "/tmp/kvcached-control-XXXXXX";
   assert(mkdtemp(directory));
+  if (argc == 2 && std::string(argv[1]) == "--pool-reclaim") {
+    test_pool_reclaim(directory);
+    rmdir(directory);
+    return 0;
+  }
   const auto path = std::string(directory) + "/ledger";
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
@@ -731,6 +953,8 @@ int main() {
     assert(writer->publish_control("mid", floor, mid_generation).status ==
            "accepted");
     assert(plan(mid) == (Tiers{3, 2, 0}) && plan(low) == (Tiers{5, 10, 24}));
+    assert(budget->reclaim_plan(mid).limit_bytes == 5);
+    assert(budget->query_control("mid").reclaim_limit_bytes == 5);
     floor.min_bytes = 0;
     assert(writer->publish_control("mid", floor, mid_generation).status ==
            "accepted");
@@ -819,6 +1043,211 @@ int main() {
     budget.reset();
     unlink(ledger.c_str());
   }
+  {
+    // An unlimited runtime max must not reserve beyond virtual pool capacity.
+    const auto ledger = std::string(directory) + "/demand-capacity";
+    auto budget = GpuBudget::connect(ledger, [] { return 40; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 20, 2, true);
+    auto grant = budget->grant(high, 20);
+    auto held = grant->take(20);
+    grant->finish();
+    budget->set_demand(high, 10);
+    assert(budget->snapshot(low).watermark_bytes == 0);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    budget->grant(low, 15)->finish();
+    // All pools of the instance contribute, not just the posting pool.
+    auto sibling = budget->register_pool("high", 1);
+    budget->configure_control_pool(sibling, 6, 2, true);
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    assert(budget->query_control("high").shortfall_bytes == 6);
+    budget->ready_control_pool(high);
+    budget->ready_control_pool(sibling);
+    assert(budget->set_instance_limit(high, 24, 1) == "accepted");
+    assert(budget->snapshot(low).watermark_bytes == 4);
+    assert(budget->set_instance_limit(high, UINT64_MAX, 2) == "accepted");
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    // A configured zero pool differs from unknown/unconfigured geometry.
+    auto empty = budget->register_pool("empty", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(empty, 0, 2, true, 0, false);
+    budget->set_demand(empty, 100);
+    assert(budget->query_control("empty").shortfall_bytes == 0);
+    assert(budget->snapshot(low).watermark_bytes == 6);
+    held->release();
+    held.reset();
+    assert(budget->snapshot(low).watermark_bytes == 10);
+    budget->set_demand(high, 100);
+    assert(budget->set_instance_limit(high, 24, 3) == "accepted");
+    // Proportional page-rounded targets are 18 + 4, not the raw limit 24.
+    assert(budget->snapshot(low).watermark_bytes == 22);
+    assert(budget->query_control("high").shortfall_bytes == 22);
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  for (uint64_t dead_charge : {0u, 6u}) {
+    const auto ledger = std::string(directory) + "/dead-demand-capacity";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 20, 2, true);
+    auto grant = budget->grant(high, 20);
+    auto held = grant->take(20);
+    grant->finish();
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      auto other = GpuBudget::connect(ledger, [] { return 100; });
+      auto sibling = other->register_pool("high", 1);
+      other->configure_control_pool(sibling, 20, 2, true);
+      auto child_grant = other->grant(sibling, dead_charge);
+      auto child_held = child_grant->take(dead_charge);
+      child_grant->finish();
+      _exit(0); // Preserve the pool entry and charge; release only its lease.
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    budget->set_demand(high, 100);
+    assert(budget->snapshot(low).watermark_bytes == 0);
+    assert(budget->query_control("high").shortfall_bytes == 0);
+    assert(budget->query_control("high").charged_bytes == 20 + dead_charge);
+    held->release();
+    // Dead charges remain accounted for, but do not reduce the 20 bytes
+    // that the live pool can map again after its confirmed release.
+    assert(budget->snapshot(low).watermark_bytes == 20);
+    assert(budget->query_control("high").charged_bytes == dead_charge);
+    held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    // One in-flight refund cannot cover two distinct priority reservations.
+    const auto ledger = std::string(directory) + "/releasing-watermarks";
+    auto budget = GpuBudget::connect(ledger, [] { return 100; });
+    auto low = budget->register_pool("low", 0);
+    budget->configure_control_pool(low, 100, 1, true);
+    auto grant = budget->grant(low, 100);
+    auto held = grant->take(100);
+    grant->finish();
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+    budget->configure_control_pool(high, 100, 1, true);
+    budget->configure_control_pool(mid, 100, 1, true);
+    budget->set_demand(high, 20);
+    budget->set_demand(mid, 20);
+    budget->set_reclaimable(low, 0, 0, 20);
+    assert(budget->snapshot(mid).watermark_bytes == 20);
+    assert(budget->reclaim_plan(low).running_bytes == 20);
+    budget->set_reclaimable(low, 0, 0, 40);
+    assert(budget->reclaim_plan(low).total() == 0);
+    held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  for (int tier = 0; tier < 3; ++tier) {
+    for (uint64_t minimum : {15u, 0u}) {
+      const auto ledger = std::string(directory) + "/subpage-floor";
+      auto budget = GpuBudget::connect(ledger, [] { return 32; });
+      auto low = budget->register_pool("low", 0, InstancePolicy{minimum, 0, 0});
+      auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+      auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+      for (auto slot : {low, mid, high})
+        budget->configure_control_pool(slot, 64, 16, true);
+      auto first = budget->grant(low, 16);
+      auto low_held = first->take(16);
+      first->finish();
+      auto second = budget->grant(mid, 16);
+      auto mid_held = second->take(16);
+      second->finish();
+      for (auto slot : {low, mid})
+        budget->set_reclaimable(slot, tier == 0 ? 16 : 0, tier == 1 ? 16 : 0,
+                                0);
+      budget->set_demand(high, 1);
+      for (int round = 0; round < 3; ++round) {
+        // A byte ask must pass the victim that cannot release a whole page.
+        assert(budget->reclaim_plan(low).total() == (minimum ? 0 : 1));
+        assert(budget->reclaim_plan(mid).total() == (minimum ? 1 : 0));
+        assert(budget->reclaim_plan(low).limit_bytes == (minimum ? 1 : 16));
+      }
+      low_held.reset();
+      mid_held.reset();
+      budget.reset();
+      unlink(ledger.c_str());
+    }
+  }
+  {
+    const auto ledger = std::string(directory) + "/live-release-unit";
+    auto budget = GpuBudget::connect(ledger, [] { return 64; });
+    auto large = budget->register_pool("low", 0, InstancePolicy{15, 0, 0});
+    auto small = budget->register_pool("low", 1);
+    auto mid = budget->register_pool("mid", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    budget->configure_control_pool(large, 32, 16, true);
+    budget->configure_control_pool(small, 16, 1, true, 0, true);
+    budget->configure_control_pool(mid, 48, 1, true);
+    auto first = budget->grant(large, 16);
+    auto held = first->take(16);
+    first->finish();
+    auto second = budget->grant(mid, 47);
+    auto mid_held = second->take(47);
+    second->finish();
+    budget->set_reclaimable(large, 16, 0, 0);
+    budget->set_reclaimable(mid, 47, 0, 0);
+    budget->set_demand(high, 2);
+    // Empty small pools cannot make a sub-page remainder executable.
+    assert(budget->reclaim_plan(large).total() == 0);
+    assert(budget->reclaim_plan(mid).total() == 1);
+    budget->set_demand(high, 0);
+    auto third = budget->grant(small, 1);
+    auto null_held = third->take(1);
+    third->finish();
+    budget->set_demand(high, 2);
+    // Its only page is the native null reservation, still not releasable.
+    assert(budget->reclaim_plan(large).total() == 0);
+    assert(budget->reclaim_plan(mid).total() == 2);
+    mid_held->release();
+    auto fourth = budget->grant(small, 1);
+    auto small_held = fourth->take(1);
+    fourth->finish();
+    budget->set_demand(high, 64);
+    // A real small page must remain eligible alongside a larger sibling.
+    assert(budget->reclaim_plan(large).total() > 0);
+    held.reset();
+    null_held.reset();
+    small_held.reset();
+    mid_held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  {
+    const auto ledger = std::string(directory) + "/shared-page-asks";
+    auto budget = GpuBudget::connect(ledger, [] { return 32; });
+    auto low = budget->register_pool("low", 0);
+    auto spare = budget->register_pool("spare", 0, InstancePolicy{0, 1, 0});
+    auto high = budget->register_pool("high", 0, InstancePolicy{0, 2, 0});
+    auto highest = budget->register_pool("highest", 0, InstancePolicy{0, 3, 0});
+    budget->configure_control_pool(low, 16, 16, true);
+    budget->configure_control_pool(spare, 16, 16, true);
+    auto first = budget->grant(low, 16);
+    auto low_held = first->take(16);
+    first->finish();
+    auto second = budget->grant(spare, 16);
+    auto spare_held = second->take(16);
+    second->finish();
+    budget->set_reclaimable(low, 16, 0, 0);
+    budget->set_reclaimable(spare, 16, 0, 0);
+    budget->set_demand(high, 1);
+    budget->set_demand(highest, 1);
+    // Both byte asks fit in the same page; do not also reclaim from spare.
+    assert(budget->reclaim_plan(low).empty_bytes == 2);
+    assert(budget->reclaim_plan(spare).total() == 0);
+    low_held.reset();
+    spare_held.reset();
+    budget.reset();
+    unlink(ledger.c_str());
+  }
+  test_pool_reclaim(directory);
   unlink(path.c_str());
   rmdir(directory);
 }
