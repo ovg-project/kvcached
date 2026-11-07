@@ -69,6 +69,13 @@ def _set_page(iface, monkeypatch, explicit_mb):
         iface.PAGE_SIZE = explicit_mb * MIB
 
 
+def test_manager_forwards_mamba_slot_id_bound(iface):
+    iface.get_kv_cache_manager(
+        4, 1, 3 * MIB, 1, num_kv_buffers=1,
+        logical_num_blocks=2, max_block_id=2)
+    assert iface.KVCacheManager.call_args.kwargs["max_block_id"] == 2
+
+
 def _assert_manager_page(iface, block_size, cell_size, buffers, expected_mb, group_id):
     iface.get_kv_cache_manager(3, block_size, cell_size, 2,
                               num_kv_buffers=buffers, group_id=group_id)

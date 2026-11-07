@@ -161,6 +161,30 @@ def test_manager_rejects_zero_capacity_geometry(monkeypatch):
     allocator.assert_not_called()
 
 
+def test_manager_defaults_logical_capacity_to_block_id_bound(monkeypatch):
+    _stub_extension(monkeypatch)
+    import kvcached.kv_cache_manager as kcm
+
+    monkeypatch.setattr(kcm, "PageAllocator", mock.Mock())
+    manager = kcm.KVCacheManager(
+        num_blocks=8, block_size=1, cell_size=3 * MIB, num_layers=1,
+        page_size=12 * MIB, max_block_id=2)
+    assert manager.logical_num_blocks == 2
+
+
+def test_manager_rejects_logical_capacity_beyond_block_id_bound(monkeypatch):
+    _stub_extension(monkeypatch)
+    import kvcached.kv_cache_manager as kcm
+
+    allocator = mock.Mock()
+    monkeypatch.setattr(kcm, "PageAllocator", allocator)
+    with pytest.raises(ValueError, match="logical_num_blocks.*max_block_id"):
+        kcm.KVCacheManager(
+            num_blocks=8, block_size=1, cell_size=3 * MIB, num_layers=1,
+            page_size=12 * MIB, logical_num_blocks=3, max_block_id=2)
+    allocator.assert_not_called()
+
+
 class _EmptyPage:
     page_id = 1
 

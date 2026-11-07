@@ -45,10 +45,12 @@ InternalPage::InternalPage(page_id_t id, int64_t size)
     : page_id(id), page_size(size), start_block(0), end_block(0),
       num_kv_blocks(0) {}
 
-void InternalPage::init(int64_t block_mem_size) {
+void InternalPage::init(int64_t block_mem_size, int64_t max_block_id) {
   auto range = get_block_range(page_id, page_size, block_mem_size);
-  start_block = range.first;
-  end_block = range.second;
+  start_block =
+      max_block_id < 0 ? range.first : std::min(range.first, max_block_id);
+  end_block =
+      max_block_id < 0 ? range.second : std::min(range.second, max_block_id);
   num_kv_blocks = end_block - start_block;
   free_list.clear();
   for (int64_t i = start_block; i < end_block; ++i) {

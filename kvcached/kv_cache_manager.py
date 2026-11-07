@@ -84,7 +84,8 @@ def _after_post_init(method: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
-                   *, internal_page: Any = None) -> int:
+                   *, internal_page: Any = None,
+                   max_block_id: Optional[int] = None) -> int:
     """Return the number of usable blocks on a page.
 
     Blocks straddling a page boundary belong to neither page (see the
@@ -109,10 +110,14 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
     ip = internal_page if internal_page is not None else InternalPage
     start, end = ip.get_block_range(page_id, page_size,
                                     block_mem_size)
+    if max_block_id is not None:
+        start = min(start, max_block_id)
+        end = min(end, max_block_id)
     return end - start
 
 
 class KVCacheManager:
+    max_block_id: Optional[int] = None
     # The initializer may reenter resize while reserving the null block; it
     # cannot wait for the completion event it is responsible for publishing.
     _post_init_thread_id: Optional[int] = None
@@ -149,6 +154,7 @@ class KVCacheManager:
         own_segment: bool = False,
         page_size: Optional[int] = None,
         logical_num_blocks: Optional[int] = None,
+        max_block_id: Optional[int] = None,
     ):
         """
         Args:
@@ -176,18 +182,29 @@ class KVCacheManager:
                 Defaults to KVCACHED_PAGE_SIZE_MB.
             logical_num_blocks: Optional allocation limit when ``num_blocks``
                 includes extra backing for physical-page rounding and packing.
-                The limit includes any reserved null block.
+                The limit includes any reserved null block. When omitted with
+                ``max_block_id``, it defaults to that ID bound.
+            max_block_id: Optional exclusive bound on block IDs returned from
+                backing pages. SGLang Mamba slots use it to hide padding IDs.
         """
+        if max_block_id is not None and not (0 <= max_block_id <= num_blocks):
+            raise ValueError("max_block_id must be between 0 and num_blocks")
+        if logical_num_blocks is None and max_block_id is not None:
+            logical_num_blocks = max_block_id
         if logical_num_blocks is not None and not (
             0 <= logical_num_blocks <= num_blocks
         ):
             raise ValueError(
                 "logical_num_blocks must be between 0 and num_blocks"
             )
+        if (max_block_id is not None and logical_num_blocks is not None
+                and logical_num_blocks > max_block_id):
+            raise ValueError("logical_num_blocks cannot exceed max_block_id")
         if reserve_null_block and logical_num_blocks == 0:
             raise ValueError("logical_num_blocks must include the reserved null block")
         self.num_blocks = num_blocks
         self.logical_num_blocks = logical_num_blocks
+        self.max_block_id = max_block_id
         # Blocks handed out of pages, including the null block and reservations.
         # Keep logical admission independent of resident-page scans and resize.
         self._logical_allocated_blocks = 0
@@ -810,7 +827,10 @@ class KVCacheManager:
                         f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
                     return None
                 self._increment_operation_counter("manager_page_allocations_total")
-                page.init(self.block_mem_size)
+                if self.max_block_id is None:
+                    page.init(self.block_mem_size)
+                else:
+                    page.init(self.block_mem_size, self.max_block_id)
                 # __init__ rejects geometries where a page can hold no whole
                 # block. Parking such a page would keep it mapped forever
                 # (free() never visits a page without blocks), so fail loud.
@@ -1562,9 +1582,10 @@ class KVCacheManager:
             # Blocks straddling a page boundary belong to neither page, so a
             # page's capacity comes from its own block range rather than from
             # page_size // block_mem_size.
-            start, end = InternalPage.get_block_range(page_id, self.page_size,
-                                                      self.block_mem_size)
-            occupancy[page_id] = (end - start) - page.num_free_blocks()
+            capacity = _page_capacity(
+                page_id, self.page_size, self.block_mem_size,
+                max_block_id=getattr(self, "max_block_id", None))
+            occupancy[page_id] = capacity - page.num_free_blocks()
         return occupancy
 
     @synchronized
@@ -1779,7 +1800,10 @@ class KVCacheManager:
         if retained_null_page is None:
             self._reserve_null_block()
         else:
-            retained_null_page.init(self.block_mem_size)
+            if self.max_block_id is None:
+                retained_null_page.init(self.block_mem_size)
+            else:
+                retained_null_page.init(self.block_mem_size, self.max_block_id)
             reserved_null = retained_null_page.alloc(1)
             assert reserved_null == [0]
             self.null_block = [0]
@@ -1810,13 +1834,15 @@ class KVCacheManager:
         # kv_cache_manager.py:335) contributes nothing here, whereas the
         # previous len(self.full_pages) * get_num_blocks(...) inflated it.
         blocks_from_full_pages = sum(
-            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            _page_capacity(page_id, self.page_size, self.block_mem_size,
+                           max_block_id=getattr(self, "max_block_id", None))
             for page_id in self.full_pages)
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = sum(
-            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            _page_capacity(page_id, self.page_size, self.block_mem_size,
+                           max_block_id=getattr(self, "max_block_id", None))
             for page_id in self.avail_pages) - self.num_avail_blocks
         return blocks_from_full_pages + blocks_from_avail_pages

@@ -2320,8 +2320,14 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
                     # block_size=1 → one block == one mamba slot.
                     # num_kv_buffers=1 → single super-cell per slot per layer.
+                    logical_num_blocks = num_slots
+                    block_mem_size = layout["cell_size"]
+                    physical_page_size = get_page_size_for_block(
+                        block_mem_size, PAGE_SIZE)
+                    num_blocks = backing_blocks_for_capacity(
+                        logical_num_blocks, block_mem_size, physical_page_size)
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        num_blocks=num_slots,
+                        num_blocks=num_blocks,
                         block_size=1,
                         cell_size=layout["cell_size"],
                         num_layers=num_mamba_layers,
@@ -2329,6 +2335,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         num_kv_buffers=1,
                         group_id=self._group_id,
                         pool_name="mamba",
+                        logical_num_blocks=logical_num_blocks,
+                        max_block_id=logical_num_blocks,
                     )
 
                     # Placeholder so code that touches self.free_slots in
