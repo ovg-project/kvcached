@@ -73,6 +73,17 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
     return config
 
 
+def _abort_downstream_stream(request: web.Request) -> None:
+    """Terminate a response whose headers are already on the wire.
+
+    The body is truncated on purpose: the upstream stream failed, so finishing
+    the chunked body would make clients treat a partial answer as complete.
+    """
+    transport = request.transport
+    if transport is not None:
+        transport.close()
+
+
 class MultiLLMFrontend:
 
     def __init__(self, port: int, model_config_json: Dict[str, Any],
@@ -119,72 +130,22 @@ class MultiLLMFrontend:
         self.app.router.add_post('/action/wakeup/{model_name}',
                                  self.handle_model_wakeup)
 
-    async def handle_completion(self, request: web.Request) -> web.Response:
+    async def handle_completion(self, request: web.Request) -> web.StreamResponse:
         """Handle completion requests"""
-        try:
-            request_data = await request.json()
-            model_name = request_data.get('model')
+        return await self._proxy_completion_request(request, "/v1/completions",
+                                                    "completion")
 
-            if not model_name:
-                return web.Response(text=json.dumps(
-                    {"error": "model parameter is required"}),
-                                    status=400,
-                                    content_type='application/json')
-
-            # Route the request
-            result = await self.router.route_request(model_name, request_data,
-                                                     "/v1/completions")
-
-            if result is None:
-                return web.Response(text=json.dumps({
-                    "error":
-                    f"Failed to route request for model {model_name}"
-                }),
-                                    status=500,
-                                    content_type='application/json')
-
-            # Check if this is a streaming response
-            if hasattr(result, 'content') and hasattr(result, 'headers'):
-                # This is a streaming response (aiohttp.ClientResponse)
-                response = web.StreamResponse(status=result.status,
-                                              headers={
-                                                  'Content-Type':
-                                                  result.headers.get(
-                                                      'Content-Type',
-                                                      'text/event-stream'),
-                                                  'Cache-Control':
-                                                  'no-cache',
-                                                  'Connection':
-                                                  'keep-alive'
-                                              })
-                await response.prepare(request)
-
-                try:
-                    async for chunk in result.content.iter_chunked(1024):
-                        await response.write(chunk)
-
-                    # Explicitly close the stream to make sure the
-                    # connection/FIFO is released promptly.
-                    await response.write_eof()
-
-                    return response
-                finally:
-                    await result.release()
-            else:
-                # This is a regular JSON response
-                return web.Response(text=json.dumps(result),
-                                    status=200,
-                                    content_type='application/json')
-
-        except Exception as e:
-            logger.error(f"Error handling completion request: {str(e)}")
-            return web.Response(text=json.dumps({"error": str(e)}),
-                                status=500,
-                                content_type='application/json')
-
-    async def handle_chat_completion(self,
-                                     request: web.Request) -> web.Response:
+    async def handle_chat_completion(
+        self, request: web.Request) -> web.StreamResponse:
         """Handle chat completion requests"""
+        return await self._proxy_completion_request(request,
+                                                    "/v1/chat/completions",
+                                                    "chat completion")
+
+    async def _proxy_completion_request(self, request: web.Request,
+                                        upstream_path: str,
+                                        label: str) -> web.StreamResponse:
+        """Forward a completion request to the engine picked by the router."""
         try:
             request_data = await request.json()
             model_name = request_data.get('model')
@@ -197,7 +158,7 @@ class MultiLLMFrontend:
 
             # Route the request
             result = await self.router.route_request(model_name, request_data,
-                                                     "/v1/chat/completions")
+                                                     upstream_path)
 
             if result is None:
                 return web.Response(text=json.dumps({
@@ -210,40 +171,62 @@ class MultiLLMFrontend:
             # Check if this is a streaming response
             if hasattr(result, 'content') and hasattr(result, 'headers'):
                 # This is a streaming response (aiohttp.ClientResponse)
-                response = web.StreamResponse(status=result.status,
-                                              headers={
-                                                  'Content-Type':
-                                                  result.headers.get(
-                                                      'Content-Type',
-                                                      'text/event-stream'),
-                                                  'Cache-Control':
-                                                  'no-cache',
-                                                  'Connection':
-                                                  'keep-alive'
-                                              })
-                await response.prepare(request)
+                return await self._relay_stream_response(request, result, label)
 
-                try:
-                    async for chunk in result.content.iter_chunked(1024):
-                        await response.write(chunk)
-
-                    # Ensure the downstream connection is properly closed.
-                    await response.write_eof()
-
-                    return response
-                finally:
-                    await result.release()
-            else:
-                # This is a regular JSON response
-                return web.Response(text=json.dumps(result),
-                                    status=200,
-                                    content_type='application/json')
+            # This is a regular JSON response
+            return web.Response(text=json.dumps(result),
+                                status=200,
+                                content_type='application/json')
 
         except Exception as e:
-            logger.error(f"Error handling chat completion request: {e}")
+            logger.error(f"Error handling {label} request: {str(e)}")
             return web.Response(text=json.dumps({"error": str(e)}),
                                 status=500,
                                 content_type='application/json')
+
+    async def _relay_stream_response(self, request: web.Request, result: Any,
+                                     label: str) -> web.StreamResponse:
+        """Relay an upstream streaming response to the downstream client.
+
+        The response is committed as soon as ``prepare()`` writes the status
+        line and headers: from that point on a second HTTP response can no
+        longer be sent. Returning a fresh ``web.Response`` from the error path
+        would append a new status line and headers to the unfinished chunked
+        body, which clients cannot parse (#610). A failure after that point
+        therefore aborts the connection so the client observes a truncated
+        stream; a failure before ``prepare()`` still propagates to the caller
+        and becomes a regular JSON error response.
+        """
+        response = web.StreamResponse(status=result.status,
+                                      headers={
+                                          'Content-Type':
+                                          result.headers.get(
+                                              'Content-Type',
+                                              'text/event-stream'),
+                                          'Cache-Control': 'no-cache',
+                                          'Connection': 'keep-alive'
+                                      })
+        try:
+            await response.prepare(request)
+        except Exception:
+            await result.release()
+            raise
+
+        try:
+            async for chunk in result.content.iter_chunked(1024):
+                await response.write(chunk)
+
+            # Explicitly close the stream to release the connection/FIFO
+            # promptly.
+            await response.write_eof()
+        except Exception as e:
+            logger.error(f"Upstream {label} stream failed after the response "
+                         f"was committed: {e}")
+            _abort_downstream_stream(request)
+        finally:
+            await result.release()
+
+        return response
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """Handle health check requests"""
