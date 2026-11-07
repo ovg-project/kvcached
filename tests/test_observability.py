@@ -20,6 +20,7 @@ from kvcached.kv_geometry import backing_blocks_for_capacity  # noqa: E402
 from kvcached.observability import (  # noqa: E402
     KVCachePoolOperationSnapshot,
     KVCachePoolSnapshot,
+    RuntimeReservationSnapshot,
     RuntimeSnapshot,
     build_kv_cache_pool_operation_snapshot,
     build_kv_cache_pool_snapshot,
@@ -1045,11 +1046,17 @@ def test_capabilities_distinguish_available_and_planned_surfaces():
     features = get_capabilities()["features"]
 
     assert features["operation_counters"] is True
-    assert features["runtime_reservation_reporting"] is False
-    # Landed in #414: the one write path on the surface.
+    assert features["runtime_reservation_reporting"] is True
+    # Landed in #414: revisioned allocator control.
     assert features["instance_memory_limit"] is True
     # Landed with #375 item (5): poll-only lifecycle readiness.
     assert features["lifecycle_readiness"] is True
+
+
+def test_capabilities_describe_runtime_reservation_reports():
+    capabilities = get_capabilities()
+    assert capabilities["runtime_reservation_snapshot_fields"] == list(
+        RuntimeReservationSnapshot.__dataclass_fields__)
 
 
 def test_capabilities_expose_backend_and_integration_records():
