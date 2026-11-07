@@ -1140,7 +1140,11 @@ def test_attention_only_miss_returns_rows(monkeypatch, cpu_tensors):
     pipeline.enqueue(*reqs)
     before = pipeline.free_state()
 
+    patches._SGLANG_DEMAND.prefill_input_blocks = 4
+    patches._SGLANG_DEMAND.need_overlap = 4
     assert pipeline.round() == (None, pipeline.running_batch)
+    assert patches._SGLANG_DEMAND.prefill_input_blocks == 0
+    assert patches._SGLANG_DEMAND.need_overlap == 0
 
     assert pipeline.free_state() == before
     assert pipeline.scheduler.waiting_queue == reqs
