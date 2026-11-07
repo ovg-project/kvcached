@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 from sleep_manager import SleepManager
-from traffic_monitor import TrafficMonitor
+from traffic_monitor import RequestStats, TrafficMonitor
 
 from kvcached.utils import get_kvcached_logger
 
@@ -60,6 +60,8 @@ class LLMRouter:
             timeout=aiohttp.ClientTimeout(total=3000),  # sensible default
         )
 
+        self._streams: Dict[aiohttp.ClientResponse, RequestStats] = {}
+        self._drains: Dict[asyncio.Task, Any] = {}
         self.load_config_from_dict(models_config)
 
     def load_config_from_dict(self, config_data: Dict[str, Any]):
@@ -129,110 +131,94 @@ class LLMRouter:
         endpoint_path: str = "/v1/completions"
     ) -> Optional[Union[Dict[str, Any], aiohttp.ClientResponse]]:
         """Route a request to the appropriate endpoint"""
-        # Record request start for traffic monitoring
-        request_stats = self.traffic_monitor.record_request_start(
-            model_name, endpoint_path)
+        request_stats = None
+        response = None
+        handed_off = False
+        backend_drained = True
+        success = False
+        error = None
+        try:
+            # Sleep must not slip between the awake check and registering work.
+            async with self.sleep_manager.request_admission(model_name) as allowed:
+                request_stats = self.traffic_monitor.record_request_start(
+                    model_name, endpoint_path)
+                if not allowed:
+                    error = f"Failed to wake up sleeping model {model_name}"
+                    return None
 
-        endpoint = self.get_endpoint_for_model(model_name)
-        if not endpoint:
-            self.traffic_monitor.record_request_end(
-                request_stats,
-                success=False,
-                error_message=f"Model {model_name} not found")
-            return None
-
-        # Check if model is sleeping and try to wake it up
-        if self.sleep_manager.is_model_sleeping(model_name):
-            logger.info(
-                f"Model {model_name} is sleeping, attempting to wake up for request"
-            )
-            wakeup_success = await self.sleep_manager.handle_model_wakeup_on_request(
-                model_name)
-            if not wakeup_success:
-                self.traffic_monitor.record_request_end(
-                    request_stats,
-                    success=False,
-                    error_message=
-                    f"Failed to wake up sleeping model {model_name}")
+            endpoint = self.get_endpoint_for_model(model_name)
+            if endpoint is None:
+                error = f"Model {model_name} not found"
+                return None
+            if self.session is None or self.session.closed:
+                error = "Session not initialized"
                 return None
 
-        if self.session is None or self.session.closed:
-            self.traffic_monitor.record_request_end(
-                request_stats,
-                success=False,
-                error_message="Session not initialized")
-            raise Exception("Session not initialized")
-
-        try:
             url = f"{endpoint.base_url}{endpoint_path}"
-
-            # Add timeout configuration
-            timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes
-
-            # Check if this is a streaming request
-            is_streaming = request_data.get('stream', False)
-
-            if is_streaming:
-                # For streaming requests, return the response object directly
-                response = await self.session.post(url,
-                                                   json=request_data,
-                                                   timeout=timeout)
-                if response.status == 200:
-                    logger.info(
-                        f"Successfully routed streaming request for model {model_name} to {endpoint.base_url}"
-                    )
-                    self.traffic_monitor.record_request_end(request_stats,
-                                                            success=True)
-                    return response
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Streaming request failed with status {response.status}: {error_text}"
-                    )
-                    self.traffic_monitor.record_request_end(
-                        request_stats,
-                        success=False,
-                        error_message=f"HTTP {response.status}: {error_text}")
-                    await response.release()
-                    return None
-            else:
-                # For non-streaming requests, handle as before
-                async with self.session.post(url,
-                                             json=request_data,
-                                             timeout=timeout) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(
-                            f"Successfully routed request for model {model_name} to {endpoint.base_url}"
-                        )
-                        self.traffic_monitor.record_request_end(request_stats,
-                                                                success=True)
-                        return result
-                    else:
-                        error_text = await response.text()
-                        logger.error(
-                            f"Request failed with status {response.status}: {error_text}"
-                        )
-                        self.traffic_monitor.record_request_end(
-                            request_stats,
-                            success=False,
-                            error_message=
-                            f"HTTP {response.status}: {error_text}")
-                        return None
-
-        except asyncio.TimeoutError:
-            logger.error(
-                f"Request timeout for model {model_name} at {endpoint.base_url}"
-            )
-            self.traffic_monitor.record_request_end(
-                request_stats, success=False, error_message="Request timeout")
+            timeout = aiohttp.ClientTimeout(total=300)
+            backend_drained = False
+            response = await self.session.post(url, json=request_data, timeout=timeout)
+            if response.status != 200:
+                error = f"HTTP {response.status}: {await response.text()}"
+                return None
+            if request_data.get('stream', False):
+                self._streams[response] = request_stats
+                handed_off = True
+                return response
+            result = await response.json()
+            success = True
+            return result
+        except asyncio.CancelledError:
+            error = "Request cancelled before response completion"
+            raise
+        except Exception as exc:
+            # Failure to establish a connection cannot leave engine work behind.
+            if isinstance(exc, aiohttp.ClientConnectorError):
+                backend_drained = True
+            error = str(exc)
+            logger.error("Error routing request for %s: %s", model_name, exc)
             return None
-        except Exception as e:
-            logger.error(f"Error routing request for model {model_name}: {e}")
-            self.traffic_monitor.record_request_end(request_stats,
-                                                    success=False,
-                                                    error_message=str(e))
-            return None
+        finally:
+            if request_stats is not None and not handed_off:
+                if response is not None:
+                    backend_drained = response.content.at_eof()
+                    response.release()
+                self.traffic_monitor.record_request_end(
+                    request_stats, success=success, error_message=error,
+                    backend_drained=backend_drained)
+
+    def finish_stream(self, response: aiohttp.ClientResponse, *, success: bool):
+        """Finish a relay, retaining ownership while an upstream body drains."""
+        request_stats = self._streams.pop(response, None)
+        if request_stats is None:
+            return
+        if response.content.at_eof():
+            response.release()
+            self.traffic_monitor.record_request_end(request_stats, success=success)
+            return
+
+        # A disconnected client need not have cancelled work in the engine.
+        # Discard the remaining body under the existing upstream request timeout.
+        task = asyncio.create_task(self._drain_stream(response))
+        self._drains[task] = (response, request_stats)
+        task.add_done_callback(self._finish_drain)
+
+    async def _drain_stream(self, response: aiohttp.ClientResponse) -> bool:
+        try:
+            async for _ in response.content.iter_chunked(65536):
+                pass
+            return True
+        except Exception as exc:
+            logger.warning("Cannot confirm backend stream completion: %s", exc)
+            return False
+
+    def _finish_drain(self, task: asyncio.Task):
+        response, request_stats = self._drains.pop(task)
+        drained = False if task.cancelled() else task.result()
+        response.release()
+        self.traffic_monitor.record_request_end(
+            request_stats, success=False, error_message="Stream relay interrupted",
+            backend_drained=drained)
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:
         """Check health of all endpoints for a model"""
@@ -266,7 +252,14 @@ class LLMRouter:
         return health_status
 
     async def close(self):
-        """Close the HTTP session"""
+        """Close the HTTP session and finalize every retained stream owner."""
+        for response in list(self._streams):
+            self.finish_stream(response, success=False)
+        drains = list(self._drains)
+        for task in drains:
+            task.cancel()
+        if drains:
+            await asyncio.gather(*drains, return_exceptions=True)
         if self.session and not self.session.closed:
             await self.session.close()
         if not self._connector.closed:

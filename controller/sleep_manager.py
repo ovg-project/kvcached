@@ -4,6 +4,7 @@
 import asyncio
 import math
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
@@ -110,6 +111,19 @@ class SleepManager:
 
     async def _put_model_to_sleep(self, model_name: str,
                                   manual: bool) -> bool:
+        # Recheck under the same lock used to admit new requests. Candidates
+        # may have become busy while waiting for an earlier transition.
+        stats = (self.traffic_monitor.get_model_stats(model_name)
+                 if self.traffic_monitor else None)
+        # Manual vLLM sleep already delegates draining to its abort/wait mode.
+        # SGLang release requires an idle engine even for a manual request.
+        require_drained = not manual or model_name not in self.config.vllm_models_config
+        if stats is not None and require_drained:
+            if stats.active_requests or stats.backend_state_unknown:
+                logger.warning("Cannot sleep %s: backend work is not drained", model_name)
+                return False
+            if not manual and not stats.is_idle(self.config.idle_threshold_seconds):
+                return False
         if model_name in self.sleeping_models:
             logger.info(f"Model {model_name} is already sleeping")
             return False
@@ -293,6 +307,20 @@ class SleepManager:
             except Exception as e:
                 logger.error(f"Error in sleep monitor: {e}")
                 await asyncio.sleep(30)  # Wait before retrying
+
+    @asynccontextmanager
+    async def request_admission(self, model_name: str):
+        """Wake and register a request atomically with respect to sleep.
+
+        The caller records its active request inside this short critical
+        section, then releases the lock before forwarding or reading a body.
+        """
+        async with self._model_locks.setdefault(model_name, asyncio.Lock()):
+            allowed = True
+            if model_name in self.sleeping_models:
+                allowed = (self.config.wakeup_on_request
+                           and await self._wakeup_model(model_name))
+            yield allowed
 
     async def handle_model_wakeup_on_request(self, model_name: str) -> bool:
         """

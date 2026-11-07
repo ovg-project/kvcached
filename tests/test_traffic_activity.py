@@ -66,13 +66,13 @@ def test_completion_order_preserves_recent_activity(
     assert sleep_manager.get_sleep_candidates() == []
     summary = monitor.get_traffic_summary()["model"]
     assert summary["last_activity_time"] == 400.0
-    assert summary["idle_time_seconds"] == 2.0
+    assert summary["idle_time_seconds"] == 0.0
     assert not summary["is_idle"]
 
-    # Retain the existing request-start timestamp and strict idle threshold.
-    now = 700.0
+    # Preserve request-start statistics, but idle time begins after completion.
+    now = 702.0
     assert sleep_manager.get_sleep_candidates() == []
-    now = 701.0
+    now = 703.0
     assert monitor.get_idle_models() == ["model"]
     assert monitor.get_active_models() == []
     assert sleep_manager.get_sleep_candidates() == ["model"]
