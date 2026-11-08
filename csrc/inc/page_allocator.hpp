@@ -81,10 +81,15 @@ public:
   std::shared_ptr<InternalPage> alloc_page();
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
+  // Internal receipt: number of leading input pages placed in the reserve.
+  // Captured under lock_; later preallocation cannot alter this result.
+  int64_t free_pages_with_receipt(const std::vector<page_id_t> &page_ids);
 
   // Memory management
   bool resize(int64_t new_mem_size);
-  void trim();
+  // Unmap up to max_pages reserved pages (all of them when negative) and
+  // return how many were unmapped.
+  int64_t trim(int64_t max_pages = -1);
 
   // Status queries
   int64_t get_num_free_pages() const;
