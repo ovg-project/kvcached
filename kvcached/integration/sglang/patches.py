@@ -464,6 +464,7 @@ def _sglang_demand_round(scheduler: Any):
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
+    scheduler._kvcached_reclaim_running_pages = _sglang_reclaim_for_priority(scheduler)
     try:
         yield
     finally:
@@ -623,6 +624,9 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
             scheduler._kvcached_prefill_demand = miss - min(
                 allocated, getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
         manager.post_demand(manager.demand_pages(need))
+        post_levels = getattr(manager, "post_reclaimable_levels", None)
+        if post_levels is not None:
+            post_levels()
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)
 
@@ -3867,25 +3871,66 @@ class _PrefixCacheShrinkReclaimer:
     def __init__(self, scheduler: Any, manager: Any) -> None:
         self._scheduler = weakref.ref(scheduler)
         self.manager = manager
+        allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+        swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+        full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+        self.swa = manager is swa and swa is not full
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
-    def reclaim(self) -> None:
+    def _cache(self) -> Tuple[Any, Any, int]:
         cache = getattr(self._scheduler(), "tree_cache", None)
-        evictable = getattr(cache, "full_evictable_size", None) or getattr(
-            cache, "evictable_size", None)
-        if not callable(evictable):
-            return
+        evictable = (getattr(cache, "swa_evictable_size", None) if self.swa else
+                     getattr(cache, "full_evictable_size", None) or getattr(cache, "evictable_size", None))
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
+        return cache, evictable if callable(evictable) else None, tokens_per_page
+
+    def count_pages(self) -> int:
+        """Whole pages the evictable prefix cache would fill if packed (#585).
+
+        Evictable tokens can share pages with running requests, so this can
+        overstate what eviction frees; the next plan corrects it. A partial
+        page is not counted: a requester's plan subtracts its own cache from
+        its demand, and a few cached tokens counted as a page would cover a
+        page of demand, so lower priorities would never be asked.
+        """
+        _, evictable, tokens_per_page = self._cache()
+        return int(evictable()) // tokens_per_page if evictable is not None else 0
+
+    def evict_pages(self, pages: int) -> int:
+        """Evict about ``pages`` pages of prefix cache for a higher priority."""
+        cache, evictable, tokens_per_page = self._cache()
+        if pages <= 0 or evictable is None:
+            return 0
+        before = int(evictable())
+        if before <= 0:
+            return 0
+        self._evict(cache, pages * tokens_per_page)
+        return max(0, before - int(evictable())) // tokens_per_page
+
+    def _evict(self, cache: Any, tokens: int) -> None:
+        if self.swa:
+            params = _sglang_evict_params_cls()
+            if params is None:
+                raise RuntimeError("SWA reclaim requires EvictParams")
+            cache.evict(params(num_tokens=0, swa_num_tokens=tokens))
+        else:
+            _evict_prefix_cache(cache, tokens)
+
+    def reclaim(self) -> None:
+        cache, evictable, tokens_per_page = self._cache()
+        if evictable is None:
+            return
+        manager = self.manager
         allocator = getattr(cache, "token_to_kv_pool_allocator", None)
         excess = manager.shrink_excess_pages()
         while excess > 0:
             before = evictable()
             if before <= 0:
                 return
-            _evict_prefix_cache(cache, excess * tokens_per_page)
+            self._evict(cache, excess * tokens_per_page)
             if evictable() >= before or _frees_are_deferred(allocator):
                 # Nothing evicted, or the frees wait for the free group to
                 # end: the next allocation or idle pass continues.
@@ -3935,15 +3980,52 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
                     continue
                 reclaimer = _PrefixCacheShrinkReclaimer(scheduler, manager)
                 register(reclaimer.reclaim)
+                register_owner = getattr(manager, "_register_cache_owner", None)
+                if register_owner is not None:
+                    register_owner(reclaimer.count_pages, reclaimer.evict_pages)
                 reclaimers.append(reclaimer)
         scheduler._kvcached_shrink_reclaimers = reclaimers
     return reclaimers
+
+
+def _sglang_reclaim_for_priority(scheduler: Any) -> int:
+    """Release what higher priorities ask of this rank's token pool (#585).
+
+    Returns the pages still asked of running requests. Under TP or PP the
+    pool cannot shrink, so the ledger never picks it as a victim.
+    """
+    manager = _sglang_demand_manager(scheduler)
+    if (getattr(manager, "_priority_reclaim_group", None) is not None
+            and _frees_are_deferred(getattr(scheduler, "token_to_kv_pool_allocator", None))):
+        return 0  # Keep the previous shared allowance until native grouped frees finish.
+    reclaim = getattr(manager, "reclaim_for_priority", None)
+    if reclaim is None:
+        return 0
+    try:
+        return int(reclaim())
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not release KV memory for a higher priority: %s", error)
+        return 0
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
     for manager in getattr(scheduler, "_kvcached_control_managers", ()):
         manager.apply_resize_target()
     now = time.monotonic()
+    if now - getattr(scheduler, "_kvcached_idle_reclaim_at", 0.0) >= 0.05:
+        # An idle scheduler holds no running requests; its empty pages and
+        # cache go to a higher priority that asks for them.
+        scheduler._kvcached_idle_reclaim_at = now
+        _register_shrink_reclaimers(scheduler)
+        # The last round posted its levels before its last requests finished.
+        manager = _sglang_demand_manager(scheduler)
+        post_levels = getattr(manager, "post_reclaimable_levels", None)
+        if post_levels is not None:
+            try:
+                post_levels()
+            except Exception as error:
+                logger.warning("Could not post KV reclaimable levels: %s", error)
+        _sglang_reclaim_for_priority(scheduler)
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager
         # kvctl publishes a target; set_memory_limit() bumps a revision.
@@ -4079,6 +4161,13 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
+                    allocator = getattr(sched_self, "token_to_kv_pool_allocator", None)
+                    full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+                    swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+                    if ranks == 1 and full is not None and swa is not None and full is not swa:
+                        from kvcached.priority_reclaim import PriorityReclaimGroup
+
+                        PriorityReclaimGroup((full, swa))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

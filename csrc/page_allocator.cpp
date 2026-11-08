@@ -288,10 +288,16 @@ void PageAllocator::free_page(page_id_t page_id) {
 }
 
 void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+  (void)free_pages_with_receipt(page_ids);
+}
+
+int64_t
+PageAllocator::free_pages_with_receipt(const std::vector<page_id_t> &page_ids) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<page_id_t> pages_to_unmap;
+  int64_t retained = 0;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
@@ -307,12 +313,13 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       reserved_page_list_.insert(reserved_page_list_.end(), page_ids.begin(),
                                  reserve_end);
 
+      retained = std::distance(page_ids.begin(), reserve_end);
       pages_to_unmap.assign(reserve_end, page_ids.end());
 
       if (pages_to_unmap.empty()) {
         update_memory_usage_unlocked();
         cond_.notify_all();
-        return;
+        return retained;
       }
     } else {
       pages_to_unmap = page_ids;
@@ -335,6 +342,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       end_time - start_time);
   LOGGER(DEBUG, "free %ld pages cost %lu us", page_ids.size(),
          duration.count());
+  return retained;
 }
 
 bool PageAllocator::resize(int64_t new_mem_size) {
@@ -444,19 +452,23 @@ bool PageAllocator::resize(int64_t new_mem_size) {
   return true;
 }
 
-void PageAllocator::trim() {
+int64_t PageAllocator::trim(int64_t max_pages) {
   throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    pages_to_unmap.assign(reserved_page_list_.begin(),
+    const auto count = max_pages < 0 ? reserved_page_list_.size()
+                                     : std::min(reserved_page_list_.size(),
+                                                static_cast<size_t>(max_pages));
+    pages_to_unmap.assign(reserved_page_list_.end() - count,
                           reserved_page_list_.end());
-    reserved_page_list_.clear();
+    reserved_page_list_.erase(reserved_page_list_.end() - count,
+                              reserved_page_list_.end());
 
     if (pages_to_unmap.empty()) {
       update_memory_usage_unlocked();
-      return;
+      return 0;
     }
   }
 
@@ -469,6 +481,7 @@ void PageAllocator::trim() {
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
   }
+  return static_cast<int64_t>(pages_to_unmap.size());
 }
 
 int64_t PageAllocator::get_num_free_pages() const {
