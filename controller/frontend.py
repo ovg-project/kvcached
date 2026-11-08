@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 import yaml
 from aiohttp import web
-from router import LLMRouter
+from router import LLMRouter, RouteError
 from sleep_manager import SleepConfig, SleepManager
 from traffic_monitor import TrafficMonitor
 from utils import extract_models_mapping, set_ulimit
@@ -71,6 +71,19 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
     )
 
     return config
+
+
+def _json_error(status: int, error_type: str, message: str) -> web.Response:
+    """Build an OpenAI-shaped error response."""
+    return web.Response(text=json.dumps({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status,
+        }
+    }),
+                        status=status,
+                        content_type='application/json')
 
 
 def _abort_downstream_stream(request: web.Request) -> None:
@@ -161,12 +174,9 @@ class MultiLLMFrontend:
                                                      upstream_path)
 
             if result is None:
-                return web.Response(text=json.dumps({
-                    "error":
-                    f"Failed to route request for model {model_name}"
-                }),
-                                    status=500,
-                                    content_type='application/json')
+                return _json_error(
+                    502, "BadGatewayError",
+                    f"The router returned no response for model {model_name}")
 
             # Check if this is a streaming response
             if hasattr(result, 'content') and hasattr(result, 'headers'):
@@ -178,11 +188,18 @@ class MultiLLMFrontend:
                                 status=200,
                                 content_type='application/json')
 
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON body for {label} request: {e}")
+            return _json_error(400, "BadRequestError",
+                               f"Invalid JSON body: {e}")
+        except RouteError as e:
+            logger.error(f"{label} request failed: {e}")
+            return web.Response(text=json.dumps(e.payload()),
+                                status=e.status,
+                                content_type=e.content_type)
         except Exception as e:
             logger.error(f"Error handling {label} request: {str(e)}")
-            return web.Response(text=json.dumps({"error": str(e)}),
-                                status=500,
-                                content_type='application/json')
+            return _json_error(500, "InternalServerError", str(e))
 
     async def _relay_stream_response(self, request: web.Request, result: Any,
                                      label: str) -> web.StreamResponse:
