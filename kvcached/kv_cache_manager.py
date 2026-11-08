@@ -1558,35 +1558,39 @@ class KVCacheManager:
                 page = self.avail_pages.get(page_id)
                 if page is not None:
                     avail_blocks -= page.num_free_blocks()
-        # Also surfaces a fatal background-preallocation failure during shrink.
+        # Every native capacity read can observe a background-preallocation
+        # failure, including one that races after the first read.
         try:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
+            if self.in_shrink:
+                blocks_from_free_pages = 0
+            else:
+                physical_free_pages = self._get_cached_avail_physical_pages()
+                if self.page_size % self.block_mem_size == 0:
+                    free_pages = min(
+                        virtual_free_pages,
+                        physical_free_pages
+                        + self.page_allocator.get_num_reserved_pages())
+                    blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
+                        self.page_size, self.block_mem_size)
+                else:
+                    # The actual capacity depends on page ID. The native
+                    # snapshot follows alloc_page(): backed reserved pages
+                    # first, then affordable pages from its free list.
+                    max_block_id = getattr(self, "max_block_id", None)
+                    if max_block_id is None:
+                        blocks_from_free_pages = (
+                            self.page_allocator.get_allocatable_block_capacity(
+                                self.block_mem_size, physical_free_pages))
+                    else:
+                        blocks_from_free_pages = (
+                            self.page_allocator.get_allocatable_block_capacity(
+                                self.block_mem_size, physical_free_pages,
+                                max_block_id))
         except Exception as e:
-            # This is the capacity check on the alloc path: it raises before
-            # _alloc()'s own alloc_page() classification is reached, so the
-            # verdict must be recorded here or the phase never leaves
-            # DEGRADED (the #478 review's T4 repro).
+            # This check precedes _alloc()'s alloc_page() classification.
             self._record_native_fatal("available_size", e)
             raise
-        if self.in_shrink:
-            blocks_from_free_pages = 0
-        else:
-            physical_free_pages = (
-                self._get_cached_avail_physical_pages()
-                + self.page_allocator.get_num_reserved_pages())
-            free_pages = min(virtual_free_pages, physical_free_pages)
-            # The allocator exposes only a COUNT of free pages, not their ids,
-            # so this term can't use the boundary-aware _page_capacity
-            # (capacity depends on page_id; some ids yield zero usable blocks
-            # when block_mem_size does not divide page_size — see _alloc's
-            # 0-block parking at kv_cache_manager.py:335). get_num_blocks is
-            # the theoretical page_size // block_mem_size, so this is an UPPER
-            # BOUND; the precise accounting in _get_num_alloced_blocks and
-            # get_page_occupancy uses _page_capacity / get_block_range. A
-            # precise fix here needs page-id enumeration from the allocator
-            # (a C++ change, out of scope).
-            blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
-                self.page_size, self.block_mem_size)
         available = avail_blocks + blocks_from_free_pages
         logical_num_blocks = getattr(self, "logical_num_blocks", None)
         if logical_num_blocks is not None:
