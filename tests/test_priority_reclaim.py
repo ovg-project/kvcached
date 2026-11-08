@@ -271,10 +271,15 @@ def test_sglang_cache_owner_counts_and_evicts_pages(monkeypatch):
     scheduler = Scheduler()
     manager = types.SimpleNamespace(page_size=8, block_mem_size=2)
     reclaimer = patches._PrefixCacheShrinkReclaimer(scheduler, manager)
-    # Four blocks of two tokens: include the partially filled third page.
-    assert reclaimer.count_pages() == 3
+    # Eight tokens per page: 20 tokens fill two whole pages; the partial
+    # third page is not counted.
+    assert reclaimer.count_pages() == 2
     assert reclaimer.evict_pages(1) == 1 and evicted == [8]
     assert reclaimer.evict_pages(0) == 0 and evicted == [8]
+    # Fewer tokens than a page count as none, so a requester's few cached
+    # tokens cannot cover a page of its demand.
+    cache.tokens = 5
+    assert reclaimer.count_pages() == 0
 
 
 @pytest.fixture
@@ -872,7 +877,7 @@ def test_coupled_partial_allocation_rollback_keeps_shared_allowance(manager_modu
     assert swa._priority_empty_ids() == [1]
 
 
-def test_sglang_partial_cache_page_is_offered_to_native_eviction(manager_module, monkeypatch):
+def test_sglang_partial_cache_page_is_not_offered_but_evicts_when_asked(manager_module, monkeypatch):
     from test_prefix_cache_shrink import FakePage, _make_manager
 
     from kvcached import kv_cache_manager
@@ -903,9 +908,11 @@ def test_sglang_partial_cache_page_is_offered_to_native_eviction(manager_module,
     scheduler = Scheduler()
     reclaimer = patches._PrefixCacheShrinkReclaimer(scheduler, manager)
     manager._register_cache_owner(reclaimer.count_pages, reclaimer.evict_pages)
-    assert reclaimer.count_pages() == 1
+    # Two cached tokens do not fill a page, so none is offered.
+    assert reclaimer.count_pages() == 0
     manager.post_reclaimable_levels()
-    assert posted.call_args == mock.call(0, 4, 0, 0)
+    posted.assert_not_called()  # all levels are still zero
+    # A plan made while the cache still held a page evicts what is left.
     plan.update(limit_bytes=4, cache_bytes=4)
     manager.reclaim_for_priority()
     assert len(manager.page_allocator.inuse) == 1
