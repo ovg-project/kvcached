@@ -4009,13 +4009,16 @@ class _PrefixCacheShrinkReclaimer:
         return cache, evictable if callable(evictable) else None, tokens_per_page
 
     def count_pages(self) -> int:
-        """Pages the evictable prefix cache would fill if packed (#585).
+        """Whole pages the evictable prefix cache would fill if packed (#585).
 
         Evictable tokens can share pages with running requests, so this can
-        overstate what eviction frees; the next plan corrects it.
+        overstate what eviction frees; the next plan corrects it. A partial
+        page is not counted: a requester's plan subtracts its own cache from
+        its demand, and a few cached tokens counted as a page would cover a
+        page of demand, so lower priorities would never be asked.
         """
         _, evictable, tokens_per_page = self._cache()
-        return -(-int(evictable()) // tokens_per_page) if evictable is not None else 0
+        return int(evictable()) // tokens_per_page if evictable is not None else 0
 
     def evict_pages(self, pages: int) -> int:
         """Evict about ``pages`` pages of prefix cache for a higher priority."""
