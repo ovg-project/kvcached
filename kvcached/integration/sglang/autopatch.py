@@ -27,6 +27,7 @@ from kvcached.integration.sglang.patches import (
     ElasticMLAMemoryPoolPatch,
     ElasticSWAAllocatorPatch,
     MambaRadixCacheLimitPatch,
+    PrefillAdderDemandPatch,
     RadixCacheLimitPatch,
     ScheduleBatchCapacityMissPatch,
     SchedulerCapacityMissPatch,
@@ -84,6 +85,8 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # this makes the ranks of a waiting queue admit and evict from
             # one agreed budget per scheduling round.
             (SchedulerSharedBudgetPatch(), ">=0.5.13"),
+            # Records the waiting request a round cannot admit as KV demand.
+            (PrefillAdderDemandPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
