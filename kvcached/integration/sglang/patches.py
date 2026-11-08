@@ -2181,6 +2181,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         num_kv_buffers=1,
                         pool_name="mla",
                         logical_num_blocks=logical_num_blocks,
+                        max_block_id=logical_num_blocks,
                     )
 
                     kv_size = self.get_kv_size_bytes()
