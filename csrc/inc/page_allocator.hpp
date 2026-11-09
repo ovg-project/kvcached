@@ -53,7 +53,8 @@ public:
   std::vector<int64_t> free_list;
 
   InternalPage(page_id_t id, int64_t size);
-  void init(int64_t block_mem_size);
+  // max_block_id is an exclusive ID bound; -1 keeps every backing block.
+  void init(int64_t block_mem_size, int64_t max_block_id = -1);
   std::vector<int64_t> alloc(int64_t num_blocks = 1);
   void free(int64_t block_id);
   void free_batch(const std::vector<int64_t> &block_ids);
@@ -93,6 +94,12 @@ public:
 
   // Status queries
   int64_t get_num_free_pages() const;
+  // Capacity of reserved pages, then the next new_page_limit free pages in
+  // alloc_page() order, clipped to max_block_id when nonnegative. This is a
+  // snapshot, not a physical-memory grant.
+  int64_t get_allocatable_block_capacity(int64_t block_mem_size,
+                                         int64_t new_page_limit,
+                                         int64_t max_block_id = -1) const;
   // Approximate. Reads num_total_pages_ and num_free_pages_ as two separate
   // relaxed loads, so a concurrent resize() can land between them; expansion
   // bumps num_free_pages_ before num_total_pages_, which can make this return

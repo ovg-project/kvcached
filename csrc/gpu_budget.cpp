@@ -171,6 +171,8 @@ struct GpuBudget::Shared {
     Observed<uint64_t> limit;
     Observed<uint64_t> revision;
     Observed<uint64_t> has_revision;
+    Observed<int64_t> retention_tokens;
+    Observed<uint64_t> retention_revision;
     Observed<uint64_t> limit_revision;
     Observed<uint64_t> has_limit_revision;
     Observed<uint64_t> valid;
@@ -486,6 +488,7 @@ size_t GpuBudget::register_pool(const std::string &instance, int64_t group,
         for (size_t n = 0; n < instance.size(); ++n)
           entry.name[n] = instance[n];
         entry.limit = UINT64_MAX;
+        entry.retention_tokens = -1;
         entry.min = startup.min_bytes;
         entry.priority = startup.priority;
         entry.headroom = startup.headroom_bytes;
@@ -1093,6 +1096,8 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
   state.published = entry.has_limit_revision;
   state.generation = entry.generation;
   state.revision = entry.revision;
+  state.retention_tokens = entry.retention_tokens;
+  state.retention_revision = entry.retention_revision;
   state.limit_revision = entry.limit_revision;
   state.requested_bytes = entry.limit;
   state.participants = entry.participants;
@@ -1186,6 +1191,10 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
 InstanceControl
 GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
                                   std::optional<uint64_t> revision) {
+  if (update.retention_tokens &&
+      (*update.retention_tokens < -1 || revision == 0))
+    throw std::invalid_argument("retention tokens must be -1 or non-negative, "
+                                "with a positive revision");
   auto &entry = shared_->instances[instance];
   auto rejected = [&](const char *status) {
     auto state = control_state_locked(instance);
@@ -1203,7 +1212,10 @@ GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
           entry.limit != bytes ||
           (update.min_bytes && *update.min_bytes != entry.min) ||
           (update.priority && *update.priority != entry.priority) ||
-          (update.headroom_bytes && *update.headroom_bytes != entry.headroom))
+          (update.headroom_bytes && *update.headroom_bytes != entry.headroom) ||
+          (update.retention_tokens &&
+           (entry.retention_revision != *revision ||
+            *update.retention_tokens != entry.retention_tokens)))
         return rejected("conflict");
       if (entry.participants)
         return rejected("idempotent");
@@ -1252,6 +1264,10 @@ GpuBudget::publish_control_locked(size_t instance, const ControlUpdate &update,
       revision.value_or(entry.has_revision ? entry.revision + 1 : 1);
   entry.has_revision = 1;
   entry.participants = participants;
+  if (update.retention_tokens) {
+    entry.retention_tokens = *update.retention_tokens;
+    entry.retention_revision = entry.revision;
+  }
   if (update.limit_bytes) {
     entry.limit_revision = entry.revision;
     entry.has_limit_revision = 1;

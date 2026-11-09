@@ -95,6 +95,12 @@ map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
   return allocator->map_to_kv_tensors_with_result(offsets);
 }
 
+size_t kv_mapping_page_size(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->kv_mapping_page_size();
+}
+
 std::string current_device_pci_bus_id() {
   py::gil_scoped_release release;
   char pci_bus_id[64] = {};
@@ -418,6 +424,8 @@ py::dict control_dict(const InstanceControl &state) {
   result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
+  result["retention_tokens"] = state.retention_tokens;
+  result["retention_revision"] = state.retention_revision;
   result["limit_revision"] = state.limit_revision;
   result["limit_bytes"] = state.requested_bytes;
   result["effective_limit_bytes"] = state.effective_bytes;
@@ -542,12 +550,15 @@ py::dict publish_instance_controls(const std::string &path,
                                    std::optional<uint64_t> limit_bytes,
                                    std::optional<uint64_t> min_bytes,
                                    std::optional<int64_t> priority,
-                                   std::optional<uint64_t> headroom_bytes) {
+                                   std::optional<uint64_t> headroom_bytes,
+                                   std::optional<int64_t> retention_tokens) {
   InstanceControl state;
   {
     py::gil_scoped_release release;
     state = GpuBudget::open_control(path)->publish_control(
-        name, ControlUpdate{limit_bytes, min_bytes, priority, headroom_bytes},
+        name,
+        ControlUpdate{limit_bytes, min_bytes, priority, headroom_bytes,
+                      retention_tokens},
         generation, revision);
   }
   return control_dict(state);
@@ -624,7 +635,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("path"), py::arg("instance"), py::arg("generation"),
         py::arg("revision") = py::none(), py::arg("limit_bytes") = py::none(),
         py::arg("min_bytes") = py::none(), py::arg("priority") = py::none(),
-        py::arg("headroom_bytes") = py::none());
+        py::arg("headroom_bytes") = py::none(),
+        py::arg("retention_tokens") = py::none());
   m.def("fail_instance_control", &kvcached::fail_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
         py::arg("generation"), py::arg("revision"));
@@ -637,6 +649,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "map_to_kv_tensors_with_result", py::arg("offsets"),
         py::arg("group_id") = 0);
   m.def("physical_budget_state", &kvcached::physical_budget_state,
+        py::arg("group_id") = 0);
+  m.def("kv_mapping_page_size", &kvcached::kv_mapping_page_size,
         py::arg("group_id") = 0);
   m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
         py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);
@@ -737,6 +751,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("reset_free_page_order",
            &kvcached::page_allocator_reset_free_page_order)
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
+      .def("get_allocatable_block_capacity",
+           &kvcached::PageAllocator::get_allocatable_block_capacity,
+           py::arg("block_mem_size"), py::arg("new_page_limit"),
+           py::arg("max_block_id") = -1)
       .def("get_num_inuse_pages", &kvcached::page_allocator_get_num_inuse_pages)
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
@@ -763,7 +781,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("page_size"))
       .def_readonly("page_id", &kvcached::InternalPage::page_id)
       .def_readonly("page_size", &kvcached::InternalPage::page_size)
-      .def("init", &kvcached::InternalPage::init)
+      .def("init", &kvcached::InternalPage::init, py::arg("block_mem_size"),
+           py::arg("max_block_id") = -1)
       .def("alloc", &kvcached::InternalPage::alloc)
       .def("free", &kvcached::InternalPage::free)
       .def("free_batch", &kvcached::InternalPage::free_batch)

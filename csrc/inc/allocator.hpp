@@ -52,6 +52,7 @@ public:
                     int64_t num_kv_buffers = 2, bool unified_pool = false,
                     size_t page_size = 0);
   bool kv_tensors_created();
+  size_t kv_mapping_page_size();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   std::pair<bool, std::vector<offset_t>>
   map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
@@ -75,6 +76,12 @@ public:
   static void init(const std::string &dev_str, size_t page_size = 0,
                    bool contiguous_layout = false,
                    const std::string &instance_name = "");
+  // All groups share the explicit device resolved by init(). Reading it must
+  // not lazily create a group allocator on the querying thread. Returns -1
+  // when there is no initialized GPU backend (standalone IPC allocators).
+  static int device_index();
+  // Queries must not create a missing group or change the calling device.
+  static FTensorAllocator *find_allocator(int64_t group_id);
   static void shutdown();
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();

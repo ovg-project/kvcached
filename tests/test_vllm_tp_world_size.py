@@ -372,7 +372,8 @@ def test_engine_core_rejects_partial_integration_before_initialization(
 
 def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modules):
     interfaces, patches = vllm_modules
-    monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", 160)
+    monkeypatch.setattr(
+        "kvcached.prefix_cache_retention._policy.limit_tokens", 160)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
     monkeypatch.setattr(
@@ -477,8 +478,9 @@ def test_engine_core_rejects_kv_offloading_before_initialization(
 
 
 @pytest.mark.parametrize("version", ["0.29.0", "0.30.0"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_engine_core_starts_with_kv_offloading_on_model_runner_v2(
-    monkeypatch, vllm_modules, version
+    monkeypatch, vllm_modules, version, tp_size
 ):
     # From 0.29 OffloadingConnector allocates through kvcached, and its copies
     # are pinned once the engine is up (offload_pins.py).
@@ -498,11 +500,13 @@ def test_engine_core_starts_with_kv_offloading_on_model_runner_v2(
     EngineCore(types.SimpleNamespace(
         use_v2_model_runner=True,
         parallel_config=types.SimpleNamespace(
-            tensor_parallel_size=1, pipeline_parallel_size=1,
+            tensor_parallel_size=tp_size, pipeline_parallel_size=1,
+            distributed_executor_backend="mp" if tp_size > 1 else "uni",
         ),
         kv_transfer_config=types.SimpleNamespace(kv_connector="OffloadingConnector"),
     ))
     initialize.assert_called_once()
+    assert initialize.call_args.kwargs["world_size"] == tp_size
     original_init.assert_called_once()
 
 

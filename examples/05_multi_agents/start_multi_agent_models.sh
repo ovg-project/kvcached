@@ -131,6 +131,9 @@ fi
 
 PYTHON=${PYTHON:-python3}
 
+# Share one launch suffix across the roles, including in separate PID namespaces.
+read -r ipc_suffix < /proc/sys/kernel/random/uuid || exit 1
+
 echo "========================================"
 echo "Multi-Agent System Model Startup"
 echo "========================================"
@@ -166,6 +169,7 @@ run_vllm() {
     local tp="$3"
     local venv="$4"
     local agent_name="$5"
+    local ipc_name="$6"
 
     echo "Starting vLLM server for $agent_name..."
 
@@ -175,6 +179,7 @@ run_vllm() {
 
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
+    export KVCACHED_IPC_NAME="$ipc_name"
     export VLLM_USE_V1=1
     export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
@@ -195,6 +200,7 @@ run_sgl() {
     local tp="$3"
     local venv="$4"
     local agent_name="$5"
+    local ipc_name="$6"
 
     echo "Starting SGLang server for $agent_name..."
 
@@ -204,6 +210,7 @@ run_sgl() {
 
     export ENABLE_KVCACHED=true
     export KVCACHED_AUTOPATCH=1
+    export KVCACHED_IPC_NAME="$ipc_name"
 
     $PYTHON -m sglang.launch_server --model "$model" \
       --disable-radix-cache \
@@ -217,16 +224,16 @@ run_sgl() {
 
 # Start Research Model
 if [[ "$RESEARCH_ENGINE" == "vllm" ]]; then
-    run_vllm "$RESEARCH_MODEL" "$RESEARCH_PORT" "$RESEARCH_TP" "$venv_vllm_path" "Research Agent"
+    run_vllm "$RESEARCH_MODEL" "$RESEARCH_PORT" "$RESEARCH_TP" "$venv_vllm_path" "Research Agent" "kvcached_research_$ipc_suffix"
 else
-    run_sgl "$RESEARCH_MODEL" "$RESEARCH_PORT" "$RESEARCH_TP" "$venv_sgl_path" "Research Agent"
+    run_sgl "$RESEARCH_MODEL" "$RESEARCH_PORT" "$RESEARCH_TP" "$venv_sgl_path" "Research Agent" "kvcached_research_$ipc_suffix"
 fi
 
 # Start Writing Model
 if [[ "$WRITING_ENGINE" == "vllm" ]]; then
-    run_vllm "$WRITING_MODEL" "$WRITING_PORT" "$WRITING_TP" "$venv_vllm_path" "Writing Agent"
+    run_vllm "$WRITING_MODEL" "$WRITING_PORT" "$WRITING_TP" "$venv_vllm_path" "Writing Agent" "kvcached_writing_$ipc_suffix"
 else
-    run_sgl "$WRITING_MODEL" "$WRITING_PORT" "$WRITING_TP" "$venv_sgl_path" "Writing Agent"
+    run_sgl "$WRITING_MODEL" "$WRITING_PORT" "$WRITING_TP" "$venv_sgl_path" "Writing Agent" "kvcached_writing_$ipc_suffix"
 fi
 
 wait -n || true

@@ -244,6 +244,54 @@ int main(int argc, char **argv) {
   const auto path = std::string(directory) + "/ledger";
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("retention", 0);
+    const auto generation = budget->query_control("retention").generation;
+    budget->configure_control_pool(slot, 120, 12, false, 1);
+    budget->ready_control_pool(slot);
+    const auto memory = budget->publish_control("retention", 240, generation);
+    assert(budget->acknowledge_control(slot, memory.revision));
+    ControlUpdate retention;
+    retention.retention_tokens = 0;
+    const auto child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      const auto state = GpuBudget::open_control(path)->publish_control(
+          "retention", retention, generation);
+      assert(state.status == "accepted" && state.retention_tokens == 0 &&
+             state.retention_revision == state.revision);
+      _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    auto state = budget->control_state(slot);
+    assert(state.retention_tokens == 0 &&
+           state.retention_revision == memory.revision + 1 &&
+           state.limit_revision == memory.limit_revision &&
+           state.requested_bytes == 240 && state.pool_target_bytes == 120 &&
+           state.status == "converged");
+    const auto policy = budget->publish_control(
+        "retention", ControlUpdate{std::nullopt, 12, 7, 24}, generation);
+    assert(policy.retention_revision == state.retention_revision);
+    retention.retention_tokens = -1;
+    state = budget->publish_control("retention", retention, generation);
+    assert(state.retention_tokens == -1 &&
+           state.retention_revision == state.revision &&
+           state.limit_revision == memory.limit_revision &&
+           state.requested_bytes == 240 && state.min_bytes == 12 &&
+           state.priority == 7 && state.headroom_bytes == 24 &&
+           state.status == "accepted" && state.convergence == "converged");
+    retention.retention_tokens = -2;
+    bool invalid = false;
+    try {
+      budget->publish_control("retention", retention, generation);
+    } catch (const std::invalid_argument &) {
+      invalid = true;
+    }
+    assert(invalid);
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
     auto a = budget->register_pool("model", 0);
     auto b = budget->register_pool("model", 1);
     assert(budget

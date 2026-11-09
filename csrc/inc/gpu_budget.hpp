@@ -22,6 +22,8 @@ struct InstanceControl {
   uint64_t failed = 0;
   uint64_t generation = 0;
   uint64_t revision = 0;
+  int64_t retention_tokens = -1;
+  uint64_t retention_revision = 0;
   // Revision of the last max publication, stable across policy-only writes.
   uint64_t limit_revision = 0;
   uint64_t requested_bytes = 0;
@@ -108,6 +110,7 @@ struct ControlUpdate {
   std::optional<uint64_t> min_bytes;
   std::optional<int64_t> priority;
   std::optional<uint64_t> headroom_bytes;
+  std::optional<int64_t> retention_tokens = {};
 };
 
 struct BudgetSnapshot {
