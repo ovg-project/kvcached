@@ -703,7 +703,10 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
     from kvcached.priority_reclaim import PriorityReclaimGroup
 
     members: tuple[Any, ...] = (_make_manager(deferred), _make_manager(deferred))
-    ops = sys.modules["kvcached.vmm_ops"]
+    ops = sys.modules.get("kvcached.vmm_ops")
+    if ops is None:
+        ops = types.ModuleType("kvcached.vmm_ops")
+        monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", ops)
 
     def publish_pools(path, name, generation, pools):
         # Keep the existing aggregate assertions while recording every pool.
@@ -973,6 +976,16 @@ def test_cache_reclaim_does_not_trim_preallocation_completion(manager_module):
     assert manager.reclaim_for_priority() == 0
     assert manager.page_allocator.reserved == 2
     assert manager.page_allocator.trimmed == []
+
+
+def test_pages_freed_after_the_step_in_flight_post_as_releasing(manager_module):
+    module, reclaimable, _ = manager_module
+    manager = _manager(module)
+    manager._priority_release_allowance = 2
+    manager.note_pending_release(2)
+    manager.post_reclaimable_levels()
+    reclaimable.assert_called_once_with(0, 0, 32, 0)
+    assert manager._priority_release_allowance == 0
 
 
 def test_coupled_publishes_pool_tiers_when_aggregate_does_not_change(manager_module, monkeypatch):
