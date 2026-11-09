@@ -17,6 +17,8 @@ from kvcached.integration.sglang.hicache import (
     HiCacheMambaHostPoolPatch,
     HiCacheMLAHostPoolPatch,
     HiCacheSizeSplitPatch,
+    HiRadixCacheRetentionPatch,
+    UnifiedHiCacheRetentionPatch,
 )
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
@@ -94,6 +96,9 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
             (SWARadixCacheLimitPatch(), ">=0.5.13"),
             (MambaRadixCacheLimitPatch(), ">=0.5.13"),
+            # Async copies can keep device KV locked past a retention update.
+            (HiRadixCacheRetentionPatch(), HICACHE_RANGE),
+            (UnifiedHiCacheRetentionPatch(), HICACHE_RANGE),
             # HiCache host copies that assume dense device layers.
             (HiCacheKVHostPoolPatch(), HICACHE_RANGE),
             (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),

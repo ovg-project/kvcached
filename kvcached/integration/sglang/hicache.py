@@ -22,8 +22,9 @@ stacked, and the states are copied as rows one layer at a time.
 import functools
 import math
 import types
-from typing import Any, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 
+from kvcached.control import get_prefix_cache_retention_limit
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
 from kvcached.utils import KVCachedConfigError, get_kvcached_logger
@@ -451,3 +452,71 @@ class HiCacheMambaHostPoolPatch(VersionAwarePatch, BasePatch):
         host_cls.backup_from_device_all_layer = _patched_backup
         host_cls.load_to_device_per_layer = _patched_load
         return True
+
+
+def _install_hicache_retention_hooks(patch: BasePatch, cache_cls: Any) -> None:
+    """Retry retention after HiCache has synchronized and unpinned device KV."""
+    if not callable(getattr(cache_cls, "loading_check", None)):
+        return
+
+    def wrap(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def wrapped(cache: Any, *args: Any, **kwargs: Any) -> Any:
+            depth = getattr(cache, "_kvcached_hicache_retention_depth", 0)
+            cache._kvcached_hicache_retention_depth = depth + 1
+            try:
+                result = original(cache, *args, **kwargs)
+            finally:
+                cache._kvcached_hicache_retention_depth = depth
+            # check_hicache_events calls loading_check internally. Wait for
+            # the whole poll (including storage bookkeeping) before eviction.
+            if depth == 0:
+                cache._enforce_prefix_cache_retention(
+                    get_prefix_cache_retention_limit())
+            return result
+
+        return wrapped
+
+    # loading_check also runs outside the scheduler's event poll. Do not wrap
+    # writing_check: native write-back eviction calls it to finish its copies.
+    marker = "__kvcached_hicache_retention__"
+    for name in ("check_hicache_events", "loading_check"):
+        original = getattr(cache_cls, name, None)
+        if not callable(original) or patch._is_already_patched(original, marker):
+            continue
+        wrapped = wrap(original)
+        patch._mark_as_patched(wrapped, marker)
+        setattr(cache_cls, name, wrapped)
+
+
+class _HiCacheRetentionPatch(VersionAwarePatch, BasePatch):
+    """Enforce device retention after native HiCache completion bookkeeping."""
+
+    library = "sglang"
+
+    def apply(self, target_module: types.ModuleType) -> bool:
+        if not self.is_version_supported():
+            return False
+        return self.patch_retention(target_module)
+
+    @version_range(HICACHE_RANGE)
+    def patch_retention(self, target_module: types.ModuleType) -> bool:
+        cache_cls = self._get_target_class(target_module)
+        if cache_cls is None or not callable(
+            getattr(cache_cls, "_enforce_prefix_cache_retention", None)
+        ):
+            return False
+        _install_hicache_retention_hooks(self, cache_cls)
+        return True
+
+
+class HiRadixCacheRetentionPatch(_HiCacheRetentionPatch):
+    target_module = "sglang.srt.mem_cache.hiradix_cache"
+    target_class = "HiRadixCache"
+    patch_name = "hicache_radix_retention"
+
+
+class UnifiedHiCacheRetentionPatch(_HiCacheRetentionPatch):
+    target_module = "sglang.srt.mem_cache.unified_radix_cache"
+    target_class = "UnifiedRadixCache"
+    patch_name = "hicache_unified_retention"
