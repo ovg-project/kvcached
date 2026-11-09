@@ -225,7 +225,7 @@ def main():
             else:
                 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-                from kvcached.integration.sglang.patches import (
+                from kvcached.integration.sglang.page_eviction import (
                     _evict_radix_cache_page_aware,
                 )
 

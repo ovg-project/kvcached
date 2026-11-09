@@ -28,7 +28,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
-from kvcached.integration.sglang.patches import _evict_radix_cache_page_aware
+from kvcached.integration.sglang.page_eviction import _evict_radix_cache_page_aware
 
 BLOCKS_PER_PHYSICAL_PAGE = 4
 CACHED_OFFSETS = (1, 2, 3)

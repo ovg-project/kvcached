@@ -10,11 +10,11 @@ import pytest
 import torch
 
 import kvcached.prefix_cache_retention as retention
-from kvcached.integration.sglang.patches import (
-    RadixCacheLimitPatch,
+from kvcached.integration.sglang.page_eviction import (
     _evict_radix_cache_page_aware,
     _select_page_aware_plan,
 )
+from kvcached.integration.sglang.patches import RadixCacheLimitPatch
 
 BLOCKS_PER_PAGE = 4
 
