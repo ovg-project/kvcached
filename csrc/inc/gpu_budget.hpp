@@ -51,9 +51,44 @@ struct InstanceControl {
   // and the free bytes higher priorities keep from it on this GPU.
   uint64_t shortfall_bytes = 0;
   uint64_t watermark_bytes = 0;
+  // What the instance last posted it could release on this GPU: pre-mapped
+  // pages that hold no data, prefix cache that whole pages can drop, and
+  // pages already released but not yet refunded.
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t releasing_bytes = 0;
+  // Bytes this instance should release now for higher priorities' headroom
+  // and demand, and how much of it from each tier (see
+  // GpuBudget::reclaim_plan).
+  uint64_t reclaim_bytes = 0;
+  uint64_t reclaim_limit_bytes = 0;
+  uint64_t reclaim_empty_bytes = 0;
+  uint64_t reclaim_cache_bytes = 0;
+  uint64_t reclaim_running_bytes = 0;
   // What the instance can still be granted on this GPU: free memory above
   // its watermark, within its max.
   uint64_t available_bytes = 0;
+};
+
+// What an instance should release now, by tier: pre-mapped pages, prefix
+// cache, then memory of running requests (preemption).
+struct ReclaimPlan {
+  // Maximum additional release above min(min, max), excluding in-flight
+  // release.
+  uint64_t limit_bytes = 0;
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t running_bytes = 0;
+  uint64_t total() const;
+};
+
+// Internal pool detail accompanying one instance's aggregate reclaim levels.
+struct PoolReclaimable {
+  size_t slot;
+  uint64_t owner;
+  uint64_t empty_bytes;
+  uint64_t cache_bytes;
+  uint64_t releasing_bytes;
 };
 
 // The policy an instance starts with, before any control is published.
@@ -204,6 +239,22 @@ public:
   // (vLLM's scheduler under TP > 1). False if the instance is gone.
   bool post_demand(const std::string &instance, uint64_t generation,
                    uint64_t bytes);
+  // What the instance can release on this GPU, by tier: empty (pre-mapped,
+  // no data), cache (prefix cache that frees whole pages) and releasing
+  // (released, not yet refunded). Levels, overwritten when they change.
+  void set_reclaimable(size_t slot, uint64_t empty, uint64_t cache,
+                       uint64_t releasing);
+  bool post_reclaimable(const std::string &instance, uint64_t generation,
+                        uint64_t empty, uint64_t cache, uint64_t releasing);
+  // Publish every live pool together. Invalid identities or an incomplete
+  // batch leave both the aggregate and all pool detail unchanged.
+  bool post_pool_reclaimable(const std::string &instance, uint64_t generation,
+                             const std::vector<PoolReclaimable> &pools);
+  // What the slot's instance should release now so that higher priorities'
+  // max(headroom, demand) fits. Every instance derives the same plan from the
+  // ledger, so all pick the same victims. Nothing is stored: once that fits,
+  // the plan asks for nothing.
+  ReclaimPlan reclaim_plan(size_t slot);
   bool recalibrate(const Sampler &sampler);
   void begin_mutation();
   void end_mutation();
@@ -234,11 +285,13 @@ private:
   void check_owner() const;
   void reclaim_instances_locked();
   void retire_dead_pools();
+  void invalidate_pool_reclaimable_locked(size_t instance);
   BudgetSnapshot snapshot_locked(size_t slot) const;
   bool pool_alive(size_t slot, const Shared *data) const;
   uint64_t allowed_demand(size_t instance, uint64_t charged,
                           const Shared *data) const;
   uint64_t watermark_locked(size_t instance, const Shared *data) const;
+  ReclaimPlan reclaim_locked(size_t instance, const Shared *data) const;
   void return_locked(size_t slot, uint64_t bytes);
   void flush_refunds(LocalMutation &local);
   void accounting_test_hook(int stage);

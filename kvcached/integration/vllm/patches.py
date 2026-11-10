@@ -803,6 +803,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager, "_register_shrink_reclaimer", None)
                 if self._page_eviction is not None and register_reclaimer is not None:
                     register_reclaimer(self._reclaim_for_shrink)
+                register_owner = getattr(
+                    self.kv_cache_manager, "_register_cache_owner", None)
+                if self._page_eviction is not None and register_owner is not None:
+                    register_owner(self._reclaimable_cache_pages,
+                                   self._evict_cache_pages)
                 prefix_cache_retention._policy.register(self)
 
             def _enforce_prefix_cache_retention(self, limit_tokens: int) -> None:
@@ -1053,6 +1058,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if excess > 0:
                     self._evict_block_ids(self._page_eviction.victims(
                         len(self._evictable_blocks), max_pages=excess))
+
+            def _reclaimable_cache_pages(self) -> int:
+                """Pages holding nothing but evictable prefix blocks."""
+                if self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                return self._page_eviction.whole_pages()
+
+            def _evict_cache_pages(self, pages: int) -> int:
+                """Evict up to `pages` whole pages of prefix cache, cheapest
+                first, for a higher priority's demand (#585)."""
+                if pages <= 0 or self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                victims = self._page_eviction.victims(
+                    len(self._evictable_blocks), max_pages=pages)
+                evicted = len({self._page_eviction.page_id(bid) for bid in victims})
+                self._evict_block_ids(victims)
+                return evicted
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -1461,7 +1483,28 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 for manager in managers:
                     manager.apply_resize_target()
                     manager.reclaim_for_shrink()
+                    reclaim = getattr(manager, "reclaim_for_priority", None)
+                    if reclaim is not None:
+                        # An idle engine holds no running requests; its empty
+                        # pages and cache go to a higher priority (#585). The
+                        # last step posted its levels before its last requests
+                        # finished, so post them again first.
+                        try:
+                            manager.post_reclaimable_levels()
+                            reclaim()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not release KV memory for a higher "
+                                "priority: %s", error)
                     _release_retired_pages_if_idle(engine_core, manager)
+                    if reclaim is not None:
+                        # Retired pages are unmapped now; an idle engine posts
+                        # no more steps, so stop counting them as releasing.
+                        try:
+                            manager.post_reclaimable_levels()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not post KV reclaimable levels: %s", error)
                 _publish_kv_cache_events_if_idle(engine_core)
 
             stop = threading.Event()
@@ -1470,8 +1513,11 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 # Read ledger metadata here; physical work stays on the engine.
                 from kvcached import _C  # type: ignore[attr-defined]
 
-                while not stop.wait(0.2):
-                    pending = False
+                reclaiming = False
+                # An idle engine releases one step of a higher priority's
+                # demand per wakeup, so poll faster while one asks.
+                while not stop.wait(0.05 if reclaiming else 0.2):
+                    pending = reclaiming = False
                     try:
                         pending = _read_prefix_cache_retention_update() is not None
                         for manager in managers:
@@ -1481,6 +1527,10 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                                       for source in runtime.sources]
                             pending |= any(state["published"] and
                                            state["convergence"] == "pending" for state in states)
+                            # A higher priority asks this instance for memory.
+                            reclaiming |= any(state.get("reclaim_bytes", 0)
+                                              for state in states)
+                        pending |= reclaiming
                     except (RuntimeError, OSError):
                         # Engine-side polling surfaces participant failures.
                         pending = True
@@ -3417,6 +3467,131 @@ def _record_blocks_to_allocate(coordinator: Any) -> None:
     coordinator._kvcached_records_need = True
 
 
+def _kvcached_target_pages(scheduler: Any, kv: Any, running: list) -> list:
+    """Pages that preempting running requests can empty, cheapest first.
+
+    A request's blocks are spread over pages that other requests share, so
+    preempting in admission order can take many requests to empty one page.
+    Returns ``(page, owners)`` for the pages that running requests alone
+    hold, fewest owners first; empty when the scheduler does not expose its
+    requests' blocks.
+    """
+    get_block_ids = getattr(getattr(scheduler, "kv_cache_manager", None),
+                            "get_block_ids", None)
+    occupancy_of = getattr(kv, "get_page_occupancy", None)
+    block_pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
+    native_blocks = getattr(block_pool, "blocks", getattr(block_pool, "kv_block_pool", None))
+    if get_block_ids is None or occupancy_of is None or native_blocks is None:
+        return []
+    owners: dict[int, list] = {}
+    blocks: dict[int, set[int]] = {}
+    references: dict[int, int] = {}
+    for request in running:
+        try:
+            groups = get_block_ids(request.request_id)
+        except Exception:
+            return []
+        for group in groups:
+            for block_id in group:
+                if block_id <= 0:
+                    continue  # the null block
+                page = block_id * kv.block_mem_size // kv.page_size
+                blocks.setdefault(page, set()).add(block_id)
+                references[block_id] = references.get(block_id, 0) + 1
+                page_owners = owners.setdefault(page, [])
+                if not page_owners or page_owners[-1] is not request:
+                    page_owners.append(request)
+    occupancy = occupancy_of(list(blocks))
+    # Waiting remote loads and deferred frees can hold additional references
+    # to a running request's blocks. Occupancy alone cannot prove they empty.
+    candidates = sorted(
+        (page for page in blocks if len(blocks[page]) >= occupancy.get(page, 0)
+         and all(native_blocks[bid].ref_cnt == references[bid] for bid in blocks[page])),
+        key=lambda page: (len(owners[page]), len(blocks[page])))
+    return [(page, owners[page]) for page in candidates]
+
+
+def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
+    """Preempt running requests until ``pages`` whole pages are released.
+
+    The last tier of #585's reclaim: a higher priority's demand is still
+    short after this instance's empty pages and prefix cache. Requests go
+    back to the waiting queue, as vLLM's own preemption does. Only pages
+    left empty are released, so the owners of the cheapest pages to empty go
+    first (see _kvcached_target_pages), then the scheduler's own order: the
+    last admitted, or the lowest priority under the priority policy.
+
+    With an asynchronous KV connector, vLLM frees a preempted request's
+    blocks only after the step in flight; those pages count as released
+    here and as releasing in the ledger until then. Returns the preempted
+    requests.
+    """
+    preempt = getattr(scheduler, "_preempt_request", None)
+    running = getattr(scheduler, "running", None)
+    if pages <= 0 or preempt is None or not running:
+        return []
+    can_free = getattr(scheduler, "_request_blocks_can_be_freed", None)
+    by_priority = getattr(getattr(scheduler, "policy", None), "name", "") == "PRIORITY"
+    try:
+        takes_drop = "drop_stale_output" in inspect.signature(preempt).parameters
+    except (TypeError, ValueError):
+        takes_drop = False
+    start = kv.occupied_pages()
+    timestamp = time.monotonic()
+    preempted: list = []
+    emptied = 0  # target pages whose owners are all preempted
+    deferred: list = []
+    note = getattr(kv, "note_pending_release", None)
+
+    def released() -> int:
+        return max(start - kv.occupied_pages(), emptied)
+
+    def preempt_one(victim: Any) -> None:
+        running.remove(victim)
+        before = {id(blocks) for _, blocks in getattr(scheduler, "deferred_frees", ())}
+        try:
+            if takes_drop:
+                preempt(victim, timestamp,
+                        drop_stale_output=getattr(scheduler, "requires_kv_delivery", False))
+            else:
+                preempt(victim, timestamp)
+        finally:
+            added = [blocks for _, blocks in getattr(scheduler, "deferred_frees", ()) if id(blocks) not in before]
+            if added:
+                deferred.extend(added)
+                scheduler._kvcached_priority_deferred = (
+                    getattr(scheduler, "_kvcached_priority_deferred", []) + added)
+                if note is not None:
+                    note(0)  # Protect surplus even if a later eviction fails.
+        preempted.append(victim)
+        # Freed blocks of a cached prefix stay in the prefix cache.
+        kv.evict_cache_pages(pages - released())
+
+    # Page efficiency must not override the engine's request-priority policy.
+    targets = [] if by_priority else _kvcached_target_pages(scheduler, kv, running)
+    for _, owners in targets:
+        if released() >= pages:
+            break
+        for victim in owners:
+            if victim in running:
+                preempt_one(victim)
+        emptied += 1
+    candidates = list(running) if by_priority else list(reversed(running))
+    if by_priority:
+        candidates.sort(key=lambda r: (r.priority, r.arrival_time), reverse=True)
+    for victim in candidates:
+        if released() >= pages:
+            break
+        if can_free is not None and not can_free(victim):
+            break  # its blocks free after the step in flight: not countable here
+        preempt_one(victim)
+    if note is not None and deferred:
+        note(max(0, emptied - (start - kv.occupied_pages())))
+    kv._refund_priority_reserve()
+    kv.post_reclaimable_levels()
+    return preempted
+
+
 class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
     """Post each step's need for new memory as the instance's demand.
 
@@ -3425,6 +3600,10 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
     the step allocated plus those of its first request that did not fit,
     beyond what the pool still holds free, so lower priorities leave one more
     step of it free. It is 0 when the pool's own free blocks cover a step.
+
+    Before scheduling, the step also releases what higher priorities' demand
+    asks of this instance: empty pages and prefix cache, then running
+    requests, which it preempts (#585).
     """
 
     library = "vllm"
@@ -3452,6 +3631,22 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
 
         logger = self.logger
 
+        def include_preemptions(scheduler: Any, output: Any) -> None:
+            ids = getattr(output, "preempted_req_ids", None)
+            if ids is not None:
+                ids.update(getattr(scheduler, "_kvcached_priority_preempted_ids", ()))
+
+        build_meta = getattr(Scheduler, "_build_kv_connector_meta", None)
+        if build_meta is not None:
+            @functools.wraps(build_meta)
+            def _patched_build_meta(self, connector, scheduler_output, *args, **kwargs):
+                # Older schedulers construct this set from schedule-local
+                # victims. Connectors must see external victims before metadata.
+                include_preemptions(self, scheduler_output)
+                return build_meta(self, connector, scheduler_output, *args, **kwargs)
+
+            Scheduler._build_kv_connector_meta = _patched_build_meta
+
         @functools.wraps(original_schedule)
         def _patched_schedule(self, *args: Any, **kwargs: Any) -> Any:
             manager = getattr(self, "kv_cache_manager", None)
@@ -3462,13 +3657,55 @@ class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
             begin = getattr(pool, "begin_demand_step", None)
             if begin is not None:
                 begin()
+            kv: Any = getattr(pool, "kv_cache_manager", None)
+            reclaim = getattr(kv, "reclaim_for_priority", None)
+            held: list = []
+            self._kvcached_priority_preempted_ids = set()
+            if reclaim is not None:
+                try:
+                    # Only priority victims extend the guard. Ordinary deferred
+                    # CoW frees must not keep an old allowance alive forever.
+                    live = {id(blocks) for _, blocks in getattr(self, "deferred_frees", ())}
+                    tickets = [blocks for blocks in getattr(self, "_kvcached_priority_deferred", ())
+                               if id(blocks) in live]
+                    self._kvcached_priority_deferred = tickets
+                    reconcile = getattr(kv, "reconcile_pending_release", None)
+                    if reconcile is not None:
+                        reconcile(bool(tickets))
+                    # Release what higher priorities ask of this instance
+                    # before scheduling; the rest is running requests'.
+                    running = reclaim()
+                    self._kvcached_reclaim_running_pages = running
+                    if running > 0:
+                        held = _kvcached_preempt_for_priority(self, kv, running)
+                        self._kvcached_priority_preempted_ids = {req.request_id for req in held}
+                except Exception as error:  # never fail a scheduling step
+                    logger.warning("Could not release KV memory for a higher "
+                                   "priority: %s", error)
+            # vLLM schedules no waiting request in a step that preempted one,
+            # so a preempted request never resumes in the same step (a KV
+            # connector relies on it). Keep this step's victims out of the
+            # waiting queue until it is scheduled.
+            waiting: Any = getattr(self, "waiting", None)
+            if held and getattr(waiting, "remove_requests", None) is not None:
+                waiting.remove_requests(held)
+            else:
+                held = []
             try:
-                return original_schedule(self, *args, **kwargs)
+                output = original_schedule(self, *args, **kwargs)
+                include_preemptions(self, output)
+                return output
             finally:
+                self._kvcached_priority_preempted_ids = set()
+                for request in reversed(held):
+                    waiting.prepend_request(request)
                 post = getattr(pool, "post_demand_blocks", None)
                 if post is not None:
                     try:
                         post(int(manager._kvcached_step_need or 0))
+                        post_levels = getattr(kv, "post_reclaimable_levels", None)
+                        if post_levels is not None:
+                            post_levels()
                     except Exception as error:  # never fail a scheduling step
                         logger.warning("Could not post KV demand: %s", error)
 

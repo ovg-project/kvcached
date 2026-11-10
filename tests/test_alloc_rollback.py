@@ -97,6 +97,12 @@ class FakePageAllocator:
     def get_num_reserved_pages(self) -> int:
         return 0
 
+    def get_allocatable_block_capacity(self, block_mem_size: int,
+                                       new_page_limit: int) -> int:
+        # This fake intentionally forecasts ample capacity; alloc_page() can
+        # still lose the race after fail_after physical pages.
+        return max(0, new_page_limit) * BLOCKS_PER_PAGE
+
 
 def _install_vmm_ops_stub() -> None:
     stub = types.ModuleType("kvcached.vmm_ops")

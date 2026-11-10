@@ -130,6 +130,75 @@ def test_page_capacity_mirrors_get_block_range_not_get_num_blocks():
     assert RichInternalPage.get_num_blocks(4, 3) == 1
 
 
+def test_available_size_uses_capacity_of_next_free_page_ids():
+    """A legal 14/6 geometry has two pages but only three usable blocks."""
+
+    class FreePages:
+        def get_num_free_pages(self):
+            return 2
+
+        def get_num_reserved_pages(self):
+            return 0
+
+        def get_allocatable_block_capacity(self, block_bytes, new_pages):
+            assert (block_bytes, new_pages) == (6, 2)
+            return 3  # page 0 holds two blocks; page 1 holds one
+
+    manager = _make_manager(page_size=14, block_mem_size=6)
+    manager.page_allocator = FreePages()
+    manager.reserved_blocks = []
+    manager.in_shrink = False
+    manager._get_cached_avail_physical_pages = lambda: 2
+
+    assert manager.available_size() == 3
+
+
+def test_available_size_clips_capacity_at_max_block_id():
+    """After reserving ID 0, only ID 1 fits below the exclusive ID cap 3."""
+
+    class FreePages:
+        def get_num_free_pages(self):
+            return 1
+
+        def get_allocatable_block_capacity(self, block_bytes, new_pages,
+                                           max_block_id):
+            assert (block_bytes, new_pages, max_block_id) == (6, 1, 3)
+            return 0  # page 1 starts at ID 3, outside the ID bound
+
+    manager = _make_manager(page_size=14, block_mem_size=6,
+                            num_avail_blocks=1)
+    manager.page_allocator = FreePages()
+    manager.reserved_blocks = []
+    manager.in_shrink = False
+    manager.max_block_id = 3
+    manager.logical_num_blocks = 3
+    manager._logical_allocated_blocks = 1
+    manager._get_cached_avail_physical_pages = lambda: 1
+
+    assert manager.available_size() == 1
+
+
+def test_available_size_classifies_native_snapshot_failure():
+    class FailedPages:
+        def get_num_free_pages(self):
+            return 2
+
+        def get_allocatable_block_capacity(self, block_bytes, new_pages):
+            raise RuntimeError("native transaction failed")
+
+    manager = _make_manager(page_size=14, block_mem_size=6)
+    manager.page_allocator = FailedPages()
+    manager.reserved_blocks = []
+    manager.in_shrink = False
+    manager._get_cached_avail_physical_pages = lambda: 2
+    classified = []
+    manager._record_native_fatal = lambda op, exc: classified.append((op, str(exc)))
+
+    with pytest.raises(RuntimeError, match="native transaction failed"):
+        manager.available_size()
+    assert classified == [("available_size", "native transaction failed")]
+
+
 def test_get_num_alloced_blocks_counts_parked_zero_block_page_as_zero():
     """A parked 0-block page (page_id=1) must contribute 0, not 1.
 

@@ -464,6 +464,7 @@ def _sglang_demand_round(scheduler: Any):
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
+    _sglang_begin_preemption(scheduler, _sglang_reclaim_for_priority(scheduler))
     try:
         yield
     finally:
@@ -483,6 +484,7 @@ def _sglang_demand_round(scheduler: Any):
         elif need is None:
             need = getattr(scheduler, "_kvcached_prefill_demand",
                            getattr(scheduler, "_kvcached_prefill_miss", None))
+        _sglang_end_preemption()
         _sglang_post_demand(scheduler, need or 0)
 
 
@@ -509,6 +511,77 @@ def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
             and getattr(scheduler, "waiting_queue", None)
             and _sglang_prefill_miss_is_backed(scheduler, manager, miss)):
         batch.batch_is_full = False
+
+
+def _sglang_begin_preemption(scheduler: Any, pages: int) -> None:
+    """Let this round's decode retract requests until ``pages`` are free.
+
+    The last tier of #585's reclaim: a higher priority's demand is still
+    short after this pool's empty pages and prefix cache. The decode capacity
+    gate then reports a miss while too few pages have emptied, so SGLang's
+    own retract path picks and requeues the requests. Skipped while frees are
+    grouped: retracted requests would free nothing until the group ends, and
+    the gate would retract every request but one.
+    """
+    _SGLANG_DEMAND.preempt = None
+    manager = _sglang_demand_manager(scheduler)
+    if pages <= 0 or getattr(manager, "occupied_pages", None) is None:
+        return
+    if _frees_are_deferred(getattr(scheduler, "token_to_kv_pool_allocator", None)):
+        return
+    _SGLANG_DEMAND.preempt = (manager, manager.occupied_pages() - pages)
+
+
+def _sglang_end_preemption() -> None:
+    preempt = getattr(_SGLANG_DEMAND, "preempt", None)
+    _SGLANG_DEMAND.preempt = None
+    if preempt is None:
+        return
+    manager, _ = preempt
+    try:
+        group = getattr(manager, "_priority_reclaim_group", None)
+        if group is not None:
+            group.finish()
+            return
+        manager._refund_priority_reserve()
+        manager.post_reclaimable_levels()
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not release KV memory for a higher priority: %s", error)
+
+
+def _sglang_preemption_pending(manager: Any) -> bool:
+    preempt = getattr(_SGLANG_DEMAND, "preempt", None)
+    if preempt is not None:
+        group = getattr(preempt[0], "_priority_reclaim_group", None)
+        if group is not None:
+            return any(manager is member for member in group.members) and group.pending()
+    return (preempt is not None and preempt[0] is manager
+            and manager.occupied_pages() > preempt[1])
+
+
+def _sglang_priority_decode_miss(manager: Any, requests: Any) -> bool:
+    if not _sglang_preemption_pending(manager):
+        return False
+    # Retraction unlocks radix prefixes without necessarily freeing their
+    # pages. Reclaim that cache before asking native code for another victim.
+    group = getattr(manager, "_priority_reclaim_group", None)
+    members = group.members if group is not None else (manager,)
+    for member in members:
+        if group is not None:
+            pages = -(-min(group.asks[2], group.limit) // member._memory_limit_page_bundle_bytes())
+        else:
+            pages = max(0, manager.occupied_pages() - _SGLANG_DEMAND.preempt[1])
+        evict = getattr(member, "evict_cache_pages", None)
+        if pages and evict is not None:
+            evict(pages)
+            member._refund_priority_reserve()
+    # Native retraction aborts the last request and beam groups on a failed
+    # gate. A priority ask must not turn a physically healthy batch into OOM.
+    if requests is None:
+        requests = getattr(_SGLANG_DEMAND, "decode_requests", None)
+    retractable = (requests is not None and len(requests) > 1
+                   and not any(getattr(req, "beam_group", None) is not None for req in requests))
+    return retractable and _sglang_preemption_pending(manager)
 
 
 def _sglang_prefill_miss_is_backed(scheduler: Any, manager: Any, miss: int) -> bool:
@@ -623,6 +696,9 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
             scheduler._kvcached_prefill_demand = miss - min(
                 allocated, getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
         manager.post_demand(manager.demand_pages(need))
+        post_levels = getattr(manager, "post_reclaimable_levels", None)
+        if post_levels is not None:
+            post_levels()
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)
 
@@ -684,7 +760,7 @@ def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
 
 def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
                                     num_tokens: int, need_blocks: int,
-                                    packed: bool = False) -> bool:
+                                    packed: bool = False, requests: Any = None) -> bool:
     """Decode capacity gate for the elastic allocators (SGLang 0.5.19+).
 
     ``ScheduleBatch.check_decode_mem`` asks the allocator whether the next
@@ -706,6 +782,9 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     rank that reserved keeps its blocks, and the retract loop's next gate
     re-reserves the same set.
     """
+    if _sglang_priority_decode_miss(allocator.kvcached_allocator, requests):
+        # A higher priority waits for pages only running requests hold.
+        return not _sglang_group_capacity_miss(True)
     evict = getattr(allocator, "evict_to_free_tokens", None)
     if evict is not None:
         evict(tree_cache, num_tokens)
@@ -1200,11 +1279,16 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
                     if _sglang_pipeline_stages() > 1:
+                        if requests is None and spec_algorithm is None:
+                            # SGLang 0.5.19's native gate accepts only these arguments.
+                            return super().check_decode_capacity(
+                                num_tokens=num_tokens, tree_cache=tree_cache)
                         return super().check_decode_capacity(
                             num_tokens=num_tokens, tree_cache=tree_cache,
                             requests=requests, spec_algorithm=spec_algorithm)
                     return _sglang_reserve_decode_capacity(
-                        self, tree_cache, num_tokens, need_blocks=num_tokens)
+                        self, tree_cache, num_tokens, need_blocks=num_tokens,
+                        requests=requests)
 
                 def free(self, free_index):
                     if _sglang_free_immediately(self):
@@ -1467,6 +1551,10 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                                           requests: Any = None,
                                           spec_algorithm: Any = None) -> bool:
                     if _sglang_pipeline_stages() > 1:
+                        if requests is None and spec_algorithm is None:
+                            # SGLang 0.5.19's native gate accepts only these arguments.
+                            return super().check_decode_capacity(
+                                num_tokens=num_tokens, tree_cache=tree_cache)
                         return super().check_decode_capacity(
                             num_tokens=num_tokens, tree_cache=tree_cache,
                             requests=requests, spec_algorithm=spec_algorithm)
@@ -1474,7 +1562,7 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                     # This allocator's alloc_decode allocates with alloc_packed.
                     return _sglang_reserve_decode_capacity(
                         self, tree_cache, num_tokens, need_blocks=need_blocks,
-                        packed=True)
+                        packed=True, requests=requests)
 
                 def free(self, free_index):
                     if free_index.numel() == 0:
@@ -1633,6 +1721,20 @@ class ElasticSWAAllocatorPatch(VersionAwarePatch, BasePatch):
 
         for name in ("alloc", "alloc_extend", "alloc_decode"):
             _wrap(name)
+        check_decode = getattr(composite, "check_decode_capacity", None)
+        if check_decode is not None:
+            @functools.wraps(check_decode)
+            def _check_decode(self, *args, **kwargs):
+                requests = kwargs.get("requests")
+                # The composite inherits the native gate; it never calls its
+                # elastic sub-allocators' check_decode_capacity methods.
+                for name in ("full_attn_allocator", "swa_attn_allocator"):
+                    manager = getattr(getattr(self, name, None), "kvcached_allocator", None)
+                    if manager is not None and _sglang_priority_decode_miss(manager, requests):
+                        return not _sglang_group_capacity_miss(True)
+                return check_decode(self, *args, **kwargs)
+
+            composite.check_decode_capacity = _check_decode
         self._mark_as_patched(composite, marker)
         return True
 
@@ -3039,6 +3141,44 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             return False
 
 
+class ScheduleBatchDecodeContextPatch(VersionAwarePatch, BasePatch):
+    """Supply the selected requests missing from SGLang 0.5.19's decode gate."""
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.schedule_batch"
+    target_class = "ScheduleBatch"
+    patch_name = "schedule_batch_decode_context"
+
+    def apply(self, batch_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_check_decode_mem(batch_mod)
+
+    @version_range(">=0.5.19,<0.5.20")
+    def patch_check_decode_mem(self, batch_mod: types.ModuleType) -> bool:
+        batch = self._get_target_class(batch_mod)
+        original = getattr(batch, "check_decode_mem", None)
+        if original is None:
+            return False
+        marker = "__kvcached_decode_context__"
+        if self._is_already_patched(original, marker):
+            return True
+
+        @functools.wraps(original)
+        def _check_decode_mem(self, selected_indices=None):
+            previous = getattr(_SGLANG_DEMAND, "decode_requests", None)
+            _SGLANG_DEMAND.decode_requests = (self.reqs if selected_indices is None
+                                              else [self.reqs[i] for i in selected_indices])
+            try:
+                return original(self, selected_indices=selected_indices)
+            finally:
+                _SGLANG_DEMAND.decode_requests = previous
+
+        self._mark_as_patched(_check_decode_mem, marker)
+        batch.check_decode_mem = _check_decode_mem
+        return True
+
+
 class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
     """Turn a prefill allocation miss into a typed, rolled-back signal.
 
@@ -3868,25 +4008,66 @@ class _PrefixCacheShrinkReclaimer:
     def __init__(self, scheduler: Any, manager: Any) -> None:
         self._scheduler = weakref.ref(scheduler)
         self.manager = manager
+        allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+        swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+        full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+        self.swa = manager is swa and swa is not full
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
-    def reclaim(self) -> None:
+    def _cache(self) -> Tuple[Any, Any, int]:
         cache = getattr(self._scheduler(), "tree_cache", None)
-        evictable = getattr(cache, "full_evictable_size", None) or getattr(
-            cache, "evictable_size", None)
-        if not callable(evictable):
-            return
+        evictable = (getattr(cache, "swa_evictable_size", None) if self.swa else
+                     getattr(cache, "full_evictable_size", None) or getattr(cache, "evictable_size", None))
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
+        return cache, evictable if callable(evictable) else None, tokens_per_page
+
+    def count_pages(self) -> int:
+        """Whole pages the evictable prefix cache would fill if packed (#585).
+
+        Evictable tokens can share pages with running requests, so this can
+        overstate what eviction frees; the next plan corrects it. A partial
+        page is not counted: a requester's plan subtracts its own cache from
+        its demand, and a few cached tokens counted as a page would cover a
+        page of demand, so lower priorities would never be asked.
+        """
+        _, evictable, tokens_per_page = self._cache()
+        return int(evictable()) // tokens_per_page if evictable is not None else 0
+
+    def evict_pages(self, pages: int) -> int:
+        """Evict about ``pages`` pages of prefix cache for a higher priority."""
+        cache, evictable, tokens_per_page = self._cache()
+        if pages <= 0 or evictable is None:
+            return 0
+        before = int(evictable())
+        if before <= 0:
+            return 0
+        self._evict(cache, pages * tokens_per_page)
+        return max(0, before - int(evictable())) // tokens_per_page
+
+    def _evict(self, cache: Any, tokens: int) -> None:
+        if self.swa:
+            params = _sglang_evict_params_cls()
+            if params is None:
+                raise RuntimeError("SWA reclaim requires EvictParams")
+            cache.evict(params(num_tokens=0, swa_num_tokens=tokens))
+        else:
+            _evict_prefix_cache(cache, tokens)
+
+    def reclaim(self) -> None:
+        cache, evictable, tokens_per_page = self._cache()
+        if evictable is None:
+            return
+        manager = self.manager
         allocator = getattr(cache, "token_to_kv_pool_allocator", None)
         excess = manager.shrink_excess_pages()
         while excess > 0:
             before = evictable()
             if before <= 0:
                 return
-            _evict_prefix_cache(cache, excess * tokens_per_page)
+            self._evict(cache, excess * tokens_per_page)
             if evictable() >= before or _frees_are_deferred(allocator):
                 # Nothing evicted, or the frees wait for the free group to
                 # end: the next allocation or idle pass continues.
@@ -3936,15 +4117,52 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
                     continue
                 reclaimer = _PrefixCacheShrinkReclaimer(scheduler, manager)
                 register(reclaimer.reclaim)
+                register_owner = getattr(manager, "_register_cache_owner", None)
+                if register_owner is not None:
+                    register_owner(reclaimer.count_pages, reclaimer.evict_pages)
                 reclaimers.append(reclaimer)
         scheduler._kvcached_shrink_reclaimers = reclaimers
     return reclaimers
+
+
+def _sglang_reclaim_for_priority(scheduler: Any) -> int:
+    """Release what higher priorities ask of this rank's token pool (#585).
+
+    Returns the pages still asked of running requests. Under TP or PP the
+    pool cannot shrink, so the ledger never picks it as a victim.
+    """
+    manager = _sglang_demand_manager(scheduler)
+    if (getattr(manager, "_priority_reclaim_group", None) is not None
+            and _frees_are_deferred(getattr(scheduler, "token_to_kv_pool_allocator", None))):
+        return 0  # Keep the previous shared allowance until native grouped frees finish.
+    reclaim = getattr(manager, "reclaim_for_priority", None)
+    if reclaim is None:
+        return 0
+    try:
+        return int(reclaim())
+    except Exception as error:  # never fail a scheduling round
+        logger.warning("Could not release KV memory for a higher priority: %s", error)
+        return 0
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
     for manager in getattr(scheduler, "_kvcached_control_managers", ()):
         manager.apply_resize_target()
     now = time.monotonic()
+    if now - getattr(scheduler, "_kvcached_idle_reclaim_at", 0.0) >= 0.05:
+        # An idle scheduler holds no running requests; its empty pages and
+        # cache go to a higher priority that asks for them.
+        scheduler._kvcached_idle_reclaim_at = now
+        _register_shrink_reclaimers(scheduler)
+        # The last round posted its levels before its last requests finished.
+        manager = _sglang_demand_manager(scheduler)
+        post_levels = getattr(manager, "post_reclaimable_levels", None)
+        if post_levels is not None:
+            try:
+                post_levels()
+            except Exception as error:
+                logger.warning("Could not post KV reclaimable levels: %s", error)
+        _sglang_reclaim_for_priority(scheduler)
     for reclaimer in _register_shrink_reclaimers(scheduler):
         manager = reclaimer.manager
         # kvctl publishes a target; set_memory_limit() bumps a revision.
@@ -4080,6 +4298,13 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
+                    allocator = getattr(sched_self, "token_to_kv_pool_allocator", None)
+                    full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
+                    swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
+                    if ranks == 1 and full is not None and swa is not None and full is not swa:
+                        from kvcached.priority_reclaim import PriorityReclaimGroup
+
+                        PriorityReclaimGroup((full, swa))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init
