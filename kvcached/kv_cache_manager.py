@@ -254,6 +254,17 @@ class KVCacheManager:
             raise KVCachedConfigError(geometry_error)
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
+        if self.max_block_id is not None:
+            # A page can contain a bounded block only if its first block
+            # starts before max_block_id. Exclude the empty tail from the
+            # native arena, including preallocation and later resize growth.
+            # Otherwise an unusable page can consume the last physical grant
+            # ahead of a freed, usable page and make available_size() report 0.
+            bounded_pages = (
+                (self.max_block_id - 1) * self.block_mem_size // self.page_size + 1
+                if self.max_block_id else 0
+            )
+            self.mem_size = min(self.mem_size, bounded_pages * self.page_size)
         self.world_size = world_size
         self.pp_rank = pp_rank
         # Name of the /dev/shm segment the C++ MemInfoTracker creates for
