@@ -788,6 +788,11 @@ class KVCacheManager:
         page: Optional[InternalPage] = None
 
         remaining_need = need_size
+        # Pages mapped by this loop whose whole blocks all sit at or past
+        # max_block_id. They are released together once the loop settles:
+        # releasing one mid-loop would refill the native reserve that
+        # alloc_page() serves first, handing the same page straight back.
+        bound_empty_pages: List[int] = []
 
         num_from_reserved = 0
         if self.reserved_blocks:  # Try to allocate from reserved blocks first
@@ -836,6 +841,7 @@ class KVCacheManager:
                     # dead pool.
                     if self._record_native_fatal("alloc", e):
                         raise
+                    self._release_bound_empty_pages(bound_empty_pages)
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
                         f"alloc_page() failed after partially allocating "
@@ -847,9 +853,17 @@ class KVCacheManager:
                 else:
                     page.init(self.block_mem_size, self.max_block_id)
                 # __init__ rejects geometries where a page can hold no whole
-                # block. Parking such a page would keep it mapped forever
-                # (free() never visits a page without blocks), so fail loud.
+                # block, so with no ID bound a blockless page is an invariant
+                # failure; parking it would keep it mapped forever (free()
+                # never visits a page without blocks), so fail loud. Under
+                # max_block_id, pages at the end of the backing span hold
+                # only IDs past the bound (the #619 exhaustion review), and
+                # the free list can serve one while usable pages sit behind
+                # it: hold it aside and take the next page.
                 if page.num_free_blocks() == 0:
+                    if self.max_block_id is not None:
+                        bound_empty_pages.append(page.page_id)
+                        continue
                     raise StateConsistencyError(
                         f"page {page.page_id} holds no whole "
                         f"{self.block_mem_size}-byte block; the page geometry "
@@ -880,7 +894,28 @@ class KVCacheManager:
             self.num_avail_blocks -= num_from_page
             remaining_need -= num_from_page
 
+        self._release_bound_empty_pages(bound_empty_pages)
         return ret_index
+
+    def _release_bound_empty_pages(self, page_ids: List[int]) -> None:
+        """Unmap pages that hold no usable block under ``max_block_id``.
+
+        _alloc_impl() holds such pages aside while it walks the allocator's
+        free list, so they sit in neither ``avail_pages`` nor ``full_pages``
+        and no block of theirs was ever handed out; no retirement, fence, or
+        priority bookkeeping applies. A release failure carries the same
+        fatal verdict as free_pages() in _free().
+        """
+        if not page_ids:
+            return
+        try:
+            self.page_allocator.free_pages(page_ids)
+        except Exception as e:
+            self._record_native_fatal("free", e)
+            raise
+        self._avail_physical_pages_cache = None
+        self._increment_operation_counter(
+            "manager_page_releases_total", len(page_ids))
 
     def _rollback_partial_alloc(self, ret_index: List[int],
                                 num_from_reserved: int) -> None:
