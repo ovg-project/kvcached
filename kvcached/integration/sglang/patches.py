@@ -3685,7 +3685,7 @@ class _PrefixCacheShrinkReclaimer:
             params = _sglang_evict_params_cls()
             if params is None:
                 raise RuntimeError("SWA reclaim requires EvictParams")
-            evict_prefix_cache(cache, params(swa_num_tokens=tokens))
+            evict_prefix_cache(cache, params(num_tokens=0, swa_num_tokens=tokens))
         else:
             evict_prefix_cache(cache, _make_sglang_evict_arg(tokens, _sglang_evict_params_cls()))
 

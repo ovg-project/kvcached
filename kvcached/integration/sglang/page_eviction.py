@@ -141,7 +141,12 @@ def _evictable_radix_nodes(radix_cache: Any) -> Set[Any]:
 
 
 _RadixSuffixPlan = Tuple[Any, int]
-_RadixCandidate = Tuple[Tuple[Any, ...], Tuple[_RadixSuffixPlan, ...]]
+
+
+class _RadixCandidate(NamedTuple):
+    sort_key: Tuple[Any, ...]
+    suffix_plans: Tuple[_RadixSuffixPlan, ...]
+    closure: Dict[Any, int]
 
 
 class _RadixEvictionSelection(NamedTuple):
@@ -295,23 +300,36 @@ def _select_page_aware_plan(
             priority,
             min(completed_pages),
         )
-        candidates.append((sort_key, tuple(suffix_plans)))
+        candidates.append(_RadixCandidate(sort_key, tuple(suffix_plans), closure))
 
     selected_plans: List[_RadixSuffixPlan] = []
+    selected_closure: Dict[Any, int] = {}
     selected_tokens = 0
-    for _sort_key, candidate_plans in sorted(candidates, key=lambda item: item[0]):
-        plan = _radix_suffix_closure(index, [*selected_plans, *candidate_plans])
-        assert plan is not None
-        merged_plans, closure = plan
-        merged_tokens = index.count_tokens(closure)
-        if merged_tokens <= selected_tokens or merged_tokens > token_budget:
+    for candidate in sorted(candidates, key=lambda item: item.sort_key):
+        # Closures are already expanded and validated. Count only newly freed
+        # tokens: overlapping suffixes keep the smaller retained prefix.
+        additional_tokens = 0
+        for node, split_len in candidate.closure.items():
+            retained = selected_closure.get(node)
+            if retained is None:
+                retained = int(node.value.numel())
+            additional_tokens += max(0, retained - split_len)
+        if additional_tokens == 0 or selected_tokens + additional_tokens > token_budget:
             continue
-        selected_plans = merged_plans
-        selected_tokens = merged_tokens
+        for node, split_len in candidate.closure.items():
+            previous = selected_closure.get(node)
+            selected_closure[node] = split_len if previous is None else min(previous, split_len)
+        selected_plans.extend(candidate.suffix_plans)
+        selected_tokens += additional_tokens
         if selected_tokens == token_budget:
             break
 
-    return _RadixEvictionSelection(selected_plans, selected_tokens)
+    # Normalize roots once, after selection, rather than repeatedly walking
+    # the growing set of previously selected descendants for each candidate.
+    plan = _radix_suffix_closure(index, selected_plans)
+    assert plan is not None
+    roots, _closure = plan
+    return _RadixEvictionSelection(roots, selected_tokens)
 
 
 def _split_eviction_suffixes(

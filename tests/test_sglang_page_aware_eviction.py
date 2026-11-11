@@ -555,6 +555,41 @@ def test_selector_converts_multi_token_logical_pages_to_block_ids(monkeypatch):
     assert concatenated_elements == [len(block_ids)]
 
 
+def test_selector_token_reads_scale_with_independent_pages(monkeypatch):
+    original_numel = torch.Tensor.numel
+    reads = 0
+
+    def count_numel(tensor):
+        nonlocal reads
+        reads += 1
+        return original_numel(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "numel", count_numel)
+    measured_reads = []
+    for size in (128, 256):
+        pages = size // BLOCKS_PER_PAGE
+        blocks = [
+            4 + page * BLOCKS_PER_PAGE + offset
+            for offset in range(BLOCKS_PER_PAGE)
+            for page in range(pages)
+        ]
+        cache, _, nodes = _make_cache(blocks)
+        _select_page_aware_plan(cache, token_budget=size // 2)
+        reads = 0  # Measure with the block index already populated.
+
+        selection = _select_page_aware_plan(cache, token_budget=size // 2)
+
+        assert selection.token_count == size // 2
+        assert _whole_node_suffixes(selection) == {
+            node for node in nodes if int(node.value[0]) // BLOCKS_PER_PAGE < 1 + pages // 2
+        }
+        measured_reads.append(reads)
+
+    # Twice as many independent pages should require roughly twice the work,
+    # without revisiting every previously selected suffix for each candidate.
+    assert measured_reads[1] <= 2.5 * measured_reads[0]
+
+
 def test_selector_caches_block_ids_on_node_values(monkeypatch):
     cache, manager, nodes = _make_cache([4, 5, 6, 7])
     original_cat = torch.cat

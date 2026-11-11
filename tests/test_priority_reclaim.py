@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 import threading
 import types
+from dataclasses import dataclass
 from typing import Any
 from unittest import mock
 
@@ -250,6 +251,14 @@ def test_page_index_counts_pages_of_only_evictable_blocks():
 def test_sglang_cache_owner_counts_and_evicts_pages(monkeypatch, swa):
     from kvcached.integration.sglang import patches
 
+    @dataclass
+    class EvictParams:
+        # SGLang v0.5.11 requires an explicit FULL demand, even for SWA-only requests.
+        num_tokens: int
+        swa_num_tokens: int = 0
+        mamba_num: int = 0
+
+    monkeypatch.setattr(patches, "_sglang_evict_params_cls", lambda: EvictParams)
     evicted: list[int] = []
 
     class Cache:
