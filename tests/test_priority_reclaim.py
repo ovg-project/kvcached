@@ -246,7 +246,8 @@ def test_page_index_counts_pages_of_only_evictable_blocks():
     assert sorted(index.victims(10, max_pages=1)) == [0, 1]
 
 
-def test_sglang_cache_owner_counts_and_evicts_pages(monkeypatch):
+@pytest.mark.parametrize("swa", [False, True], ids=["full", "swa"])
+def test_sglang_cache_owner_counts_and_evicts_pages(monkeypatch, swa):
     from kvcached.integration.sglang import patches
 
     evicted: list[int] = []
@@ -258,18 +259,28 @@ def test_sglang_cache_owner_counts_and_evicts_pages(monkeypatch):
         def evictable_size(self) -> int:
             return self.tokens
 
+        def swa_evictable_size(self) -> int:
+            return self.tokens
+
     cache = Cache()
 
-    def evict(target: Any, num_tokens: int) -> None:
-        evicted.append(num_tokens)
-        target.tokens -= min(target.tokens, num_tokens)
+    def evict(target: Any, params: Any) -> None:
+        tokens = params.swa_num_tokens if swa else params.num_tokens
+        assert (params.num_tokens if swa else params.swa_num_tokens) == 0
+        assert params.mamba_num == 0
+        evicted.append(tokens)
+        target.tokens -= min(target.tokens, tokens)
 
     class Scheduler:
         tree_cache = cache
+        token_to_kv_pool_allocator: Any = None
 
-    monkeypatch.setattr(patches, "_evict_prefix_cache", evict)
+    monkeypatch.setattr(patches, "evict_prefix_cache", evict)
     scheduler = Scheduler()
     manager = types.SimpleNamespace(page_size=8, block_mem_size=2)
+    if swa:
+        scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
+            swa_attn_allocator=types.SimpleNamespace(kvcached_allocator=manager))
     reclaimer = patches._PrefixCacheShrinkReclaimer(scheduler, manager)
     # Eight tokens per page: 20 tokens fill two whole pages; the partial
     # third page is not counted.

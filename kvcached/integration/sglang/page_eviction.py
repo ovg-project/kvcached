@@ -3,7 +3,55 @@
 """Page-aware prefix eviction using SGLang's native caches and eviction."""
 
 import types
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, cast
+from dataclasses import replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+
+def supports_page_aware_eviction(cache: Any) -> bool:
+    try:
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+    except ImportError:
+        return False
+    return type(cache) is RadixCache
+
+
+def evict_prefix_cache(cache: Any, params: Union["EvictParams", int]) -> Any:
+    """Evict KVCached prefix demands, preserving SGLang's result counters.
+
+    FULL-only RadixCache requests use the existing page-aware selection.
+    Other caches and component requests keep native victim selection.
+    Integer requests retain native eviction for older SGLang versions.
+    """
+    if (
+        isinstance(params, int)
+        or params.num_tokens <= 0
+        or params.swa_num_tokens
+        or params.mamba_num
+        or not supports_page_aware_eviction(cache)
+    ):
+        return cache.evict(params)
+    return _evict_radix_cache_page_aware(cache, params)
+
+
+def _add_eviction_result(result: Any, additional: Any) -> None:
+    for field in ("num_tokens_evicted", "swa_num_tokens_evicted", "mamba_num_evicted"):
+        setattr(result, field, getattr(result, field, 0) + getattr(additional, field, 0))
 
 
 class _RadixBlockIndex:
@@ -302,19 +350,13 @@ def _sync_radix_block_index(radix_cache: Any) -> None:
 
 def _evict_radix_cache_page_aware(
     radix_cache: Any,
-    num_tokens: int,
-    evict_params_cls: Callable[..., Any],
+    params: "EvictParams",
 ) -> Any:
-    """Evict at least ``num_tokens`` in legal logical-page units."""
-    eviction_budget = _align_radix_eviction_budget(radix_cache, num_tokens)
+    """Evict a FULL demand in legal logical-page units, counting all frees."""
+    eviction_budget = _align_radix_eviction_budget(radix_cache, params.num_tokens)
     if eviction_budget >= radix_cache.evictable_size_:
         try:
-            return radix_cache.evict(
-                _make_sglang_evict_arg(
-                    num_tokens=eviction_budget,
-                    evict_params_cls=evict_params_cls,
-                )
-            )
+            return radix_cache.evict(replace(params, num_tokens=eviction_budget))
         finally:
             _sync_radix_block_index(radix_cache)
 
@@ -328,9 +370,7 @@ def _evict_radix_cache_page_aware(
             )
         )
         try:
-            result = radix_cache.evict(
-                _make_sglang_evict_arg(token_count, evict_params_cls)
-            )
+            result = radix_cache.evict(replace(params, num_tokens=token_count))
         finally:
             radix_cache.eviction_strategy = original_strategy
         if result is not None and result.num_tokens_evicted != token_count:
@@ -350,12 +390,12 @@ def _evict_radix_cache_page_aware(
         if remaining > 0:
             # Let SGLang choose the remaining victims. Native eviction removes
             # complete radix nodes, so the actual count may exceed `remaining`.
-            native_result = radix_cache.evict(
-                _make_sglang_evict_arg(remaining, evict_params_cls)
-            )
+            native_result = radix_cache.evict(replace(params, num_tokens=remaining))
             if native_result is not None:
-                native_result.num_tokens_evicted += selection.token_count
-                result = native_result
+                if result is None:
+                    result = native_result
+                else:
+                    _add_eviction_result(result, native_result)
         return result
     finally:
         _sync_radix_block_index(radix_cache)

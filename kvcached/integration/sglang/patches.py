@@ -35,8 +35,8 @@ from kvcached import prefix_cache_retention
 from kvcached.control import get_prefix_cache_retention_limit
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.sglang.page_eviction import (
-    _evict_radix_cache_page_aware,
     _make_sglang_evict_arg,
+    evict_prefix_cache,
 )
 from kvcached.integration.version_utils import (
     VersionAwarePatch,
@@ -3623,21 +3623,6 @@ def _sglang_evict_params_cls() -> Optional[Callable[..., Any]]:
     return EvictParams
 
 
-def _evict_prefix_cache(cache: Any, num_tokens: int) -> None:
-    """Evict about ``num_tokens`` cached tokens, preferring whole pages."""
-    evict_params_cls = _sglang_evict_params_cls()
-    try:
-        from sglang.srt.mem_cache.radix_cache import RadixCache
-    except ImportError:
-        RadixCache = None
-    # Same condition as RadixCacheLimitPatch: only RadixCache exposes the
-    # persistent evictable_leaves the page-aware planner needs.
-    if type(cache) is RadixCache and evict_params_cls is not None:
-        _evict_radix_cache_page_aware(cache, num_tokens, evict_params_cls)
-    else:
-        cache.evict(_make_sglang_evict_arg(num_tokens, evict_params_cls))
-
-
 def _frees_are_deferred(allocator: Any) -> bool:
     if allocator is None or not (hasattr(allocator, "is_not_in_free_group")
                                  or hasattr(allocator, "free_group")):
@@ -3700,9 +3685,9 @@ class _PrefixCacheShrinkReclaimer:
             params = _sglang_evict_params_cls()
             if params is None:
                 raise RuntimeError("SWA reclaim requires EvictParams")
-            cache.evict(params(num_tokens=0, swa_num_tokens=tokens))
+            evict_prefix_cache(cache, params(swa_num_tokens=tokens))
         else:
-            _evict_prefix_cache(cache, tokens)
+            evict_prefix_cache(cache, _make_sglang_evict_arg(tokens, _sglang_evict_params_cls()))
 
     def reclaim(self) -> None:
         cache, evictable, tokens_per_page = self._cache()
@@ -4055,19 +4040,9 @@ class RadixCacheLimitPatch(VersionAwarePatch, BasePatch):
             excess = self_rc.evictable_size_ - limit_tokens
             if excess <= 0:
                 return
-            if type(self_rc) is RadixCache and evict_params_cls is not None:
-                _evict_radix_cache_page_aware(
-                    radix_cache=self_rc,
-                    num_tokens=excess,
-                    evict_params_cls=evict_params_cls,
-                )
-            else:
-                self_rc.evict(
-                    _make_sglang_evict_arg(
-                        num_tokens=excess,
-                        evict_params_cls=evict_params_cls,
-                    )
-                )
+            evict_prefix_cache(
+                self_rc, _make_sglang_evict_arg(excess, evict_params_cls)
+            )
 
         _install_prefix_cache_retention_hooks(
             self, RadixCache, original_cache_finished, _enforce)
@@ -4122,7 +4097,7 @@ class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
                 return
             excess = self_rc.full_evictable_size() - limit_tokens
             if excess > 0:
-                self_rc.evict(EvictParams(num_tokens=excess))
+                evict_prefix_cache(self_rc, EvictParams(num_tokens=excess))
 
         _install_prefix_cache_retention_hooks(
             self, cache_cls, original_cache_finished, _enforce)
