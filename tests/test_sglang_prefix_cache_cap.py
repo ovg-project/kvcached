@@ -75,6 +75,14 @@ def _apply(monkeypatch, mod, cap, target):
 
 
 def test_finished_request_trims_the_cache_to_the_cap(monkeypatch, target):
+    original_evict = sgl_patches.evict_prefix_cache
+    requests = []
+
+    def evict_prefix_cache(cache, params):
+        requests.append((cache, params))
+        return original_evict(cache, params)
+
+    monkeypatch.setattr(sgl_patches, "evict_prefix_cache", evict_prefix_cache)
     mod, cache_cls = _modules(monkeypatch, 20000, target)
     _apply(monkeypatch, mod, 16000, target)
 
@@ -83,6 +91,7 @@ def test_finished_request_trims_the_cache_to_the_cap(monkeypatch, target):
 
     assert cache.finished == ["req"]
     assert cache.evicted == [EvictParams(num_tokens=4000)]
+    assert requests == [(cache, EvictParams(num_tokens=4000))]
 
 
 @pytest.mark.parametrize("evictable", [0, 16000])

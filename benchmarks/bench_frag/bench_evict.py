@@ -225,18 +225,17 @@ def main():
             else:
                 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-                from kvcached.integration.sglang.patches import (
-                    _evict_radix_cache_page_aware,
+                from kvcached.integration.sglang.page_eviction import (
+                    evict_prefix_cache,
                 )
 
                 fill_sglang_cache(pool, manager, CACHED, stride)
                 evictable = pool.evictable_size() // BLOCK_SIZE
                 excess = max(0, evictable - KEEP)
                 before = manager.get_mapped_memory_size(unit="gb")
-                result = _evict_radix_cache_page_aware(
-                    radix_cache=pool,
-                    num_tokens=excess * BLOCK_SIZE,
-                    evict_params_cls=EvictParams,
+                result = evict_prefix_cache(
+                    cache=pool,
+                    params=EvictParams(num_tokens=excess * BLOCK_SIZE),
                 )
                 evicted = result.num_tokens_evicted // BLOCK_SIZE
                 after = manager.get_mapped_memory_size(unit="gb")

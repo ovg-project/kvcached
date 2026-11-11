@@ -638,6 +638,8 @@ def sglang_scheduler(monkeypatch):
     prefix cache holding 32 tokens of 8 finished requests on 9 pages."""
     from kvcached.integration.sglang import patches
 
+    # FakeSGLangCache uses the legacy integer eviction contract.
+    monkeypatch.setattr(patches, "_sglang_evict_params_cls", lambda: None)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(kcm, "InternalPage", FakePage)
     manager = _make_manager(defer_physical_release=False)

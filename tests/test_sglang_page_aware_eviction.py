@@ -2,19 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import heapq
+import sys
 import types
 from array import array
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 import torch
 
 import kvcached.prefix_cache_retention as retention
-from kvcached.integration.sglang.patches import (
-    RadixCacheLimitPatch,
+from kvcached.integration.sglang.page_eviction import (
     _evict_radix_cache_page_aware,
     _select_page_aware_plan,
+    evict_prefix_cache,
 )
+from kvcached.integration.sglang.patches import RadixCacheLimitPatch
 
 BLOCKS_PER_PAGE = 4
 
@@ -101,10 +104,66 @@ class FakeAllocator:
         self.free(token_indices)
 
 
+@dataclass
 class FakeEvictParams:
+    num_tokens: int = 0
+    swa_num_tokens: int = 0
+    mamba_num: int = 0
 
-    def __init__(self, num_tokens):
-        self.num_tokens = num_tokens
+
+@pytest.mark.parametrize("page_aware", [False, True])
+@pytest.mark.parametrize("params", [
+    FakeEvictParams(),
+    FakeEvictParams(num_tokens=-1),
+    FakeEvictParams(swa_num_tokens=4),
+    FakeEvictParams(mamba_num=2),
+    FakeEvictParams(num_tokens=8, swa_num_tokens=4),
+    FakeEvictParams(num_tokens=8, mamba_num=2),
+    FakeEvictParams(num_tokens=8, swa_num_tokens=4, mamba_num=2),
+    8,
+])
+def test_evict_prefix_cache_preserves_native_component_request(
+    monkeypatch, params, page_aware,
+):
+    from kvcached.integration.sglang import page_eviction
+
+    monkeypatch.setattr(page_eviction, "supports_page_aware_eviction", lambda cache: page_aware)
+    calls = []
+    result = types.SimpleNamespace(
+        num_tokens_evicted=9,
+        swa_num_tokens_evicted=6,
+        mamba_num_evicted=3,
+    )
+
+    def evict(request):
+        calls.append(request)
+        return result
+
+    cache = types.SimpleNamespace(evict=evict)
+
+    assert evict_prefix_cache(cache, params) is result
+    assert len(calls) == 1
+    assert calls[0] is params
+
+
+def test_evict_prefix_cache_keeps_unsupported_full_request_native():
+    result = types.SimpleNamespace(
+        num_tokens_evicted=12,
+        swa_num_tokens_evicted=5,
+        mamba_num_evicted=2,
+    )
+    calls = []
+
+    def evict(request):
+        calls.append(request)
+        return result
+
+    cache = types.SimpleNamespace(evict=evict)
+    params = FakeEvictParams(num_tokens=8)
+
+    assert evict_prefix_cache(cache, params) is result
+    assert calls == [params]
+    assert calls[0] is params
 
 
 def _make_cache(block_ids, priorities=None, allocated=None, logical_page_size=1):
@@ -496,6 +555,41 @@ def test_selector_converts_multi_token_logical_pages_to_block_ids(monkeypatch):
     assert concatenated_elements == [len(block_ids)]
 
 
+def test_selector_token_reads_scale_with_independent_pages(monkeypatch):
+    original_numel = torch.Tensor.numel
+    reads = 0
+
+    def count_numel(tensor):
+        nonlocal reads
+        reads += 1
+        return original_numel(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "numel", count_numel)
+    measured_reads = []
+    for size in (128, 256):
+        pages = size // BLOCKS_PER_PAGE
+        blocks = [
+            4 + page * BLOCKS_PER_PAGE + offset
+            for offset in range(BLOCKS_PER_PAGE)
+            for page in range(pages)
+        ]
+        cache, _, nodes = _make_cache(blocks)
+        _select_page_aware_plan(cache, token_budget=size // 2)
+        reads = 0  # Measure with the block index already populated.
+
+        selection = _select_page_aware_plan(cache, token_budget=size // 2)
+
+        assert selection.token_count == size // 2
+        assert _whole_node_suffixes(selection) == {
+            node for node in nodes if int(node.value[0]) // BLOCKS_PER_PAGE < 1 + pages // 2
+        }
+        measured_reads.append(reads)
+
+    # Twice as many independent pages should require roughly twice the work,
+    # without revisiting every previously selected suffix for each candidate.
+    assert measured_reads[1] <= 2.5 * measured_reads[0]
+
+
 def test_selector_caches_block_ids_on_node_values(monkeypatch):
     cache, manager, nodes = _make_cache([4, 5, 6, 7])
     original_cat = torch.cat
@@ -583,8 +677,7 @@ def test_native_split_refreshes_index_for_internal_suffix_closure():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=4,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=4),
     )
 
     assert result.num_tokens_evicted == 4
@@ -616,10 +709,9 @@ def test_native_page_aware_evict_trims_reclaimable_leaf_suffix():
         block_ids=list(range(4, 12)),
     )
 
-    result = _evict_radix_cache_page_aware(
-        radix_cache=cache,
-        num_tokens=4,
-        evict_params_cls=evict_params_cls,
+    result = evict_prefix_cache(
+        cache=cache,
+        params=evict_params_cls(num_tokens=4),
     )
 
     retained_values, retained_node = _native_match(
@@ -668,8 +760,7 @@ def test_native_page_aware_evict_combines_multiple_leaf_suffixes():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=4,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=4),
     )
 
     assert result.num_tokens_evicted == 4
@@ -718,8 +809,7 @@ def test_native_page_aware_evict_splits_internal_prefix_and_removes_children():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=8,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=8),
     )
 
     assert result.num_tokens_evicted == 8
@@ -770,8 +860,7 @@ def test_native_page_aware_evict_runs_exact_lru_after_suffix_plan():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=8,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=8),
     )
 
     assert result.num_tokens_evicted == 8
@@ -808,8 +897,7 @@ def test_native_fallback_may_overshoot_with_a_multi_block_leaf():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=2,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=2),
     )
 
     assert result.num_tokens_evicted == 6
@@ -856,8 +944,7 @@ def test_native_page_aware_evict_aligns_fractional_page_budget(
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=requested_tokens,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=requested_tokens),
     )
 
     retained_values, _ = _native_match(
@@ -922,8 +1009,7 @@ def test_native_cancel_keeps_prefix_locked_by_another_request():
 
     result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=2,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=2),
     )
     retained_values, retained_node = _native_match(
         cache,
@@ -1003,8 +1089,7 @@ def test_native_partial_eviction_failure_restores_policy_and_syncs_index():
     with pytest.raises(RuntimeError, match="injected second-free failure"):
         _evict_radix_cache_page_aware(
             radix_cache=cache,
-            num_tokens=2,
-            evict_params_cls=evict_params_cls,
+            params=evict_params_cls(num_tokens=2),
         )
 
     index = cache._kvcached_radix_block_index
@@ -1048,8 +1133,7 @@ def test_native_partial_eviction_failure_restores_policy_and_syncs_index():
 
     retry_result = _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=1,
-        evict_params_cls=evict_params_cls,
+        params=evict_params_cls(num_tokens=1),
     )
     assert retry_result.num_tokens_evicted == 1
     assert allocator.free_calls == 3
@@ -1087,8 +1171,7 @@ def test_page_aware_evict_uses_native_radix_eviction():
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=4,
-        evict_params_cls=FakeEvictParams,
+        params=FakeEvictParams(num_tokens=4),
     )
 
     assert cache.eviction_budgets == [4]
@@ -1110,8 +1193,7 @@ def test_page_aware_evict_passes_budget_to_native_when_page_does_not_fit():
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=1,
-        evict_params_cls=FakeEvictParams,
+        params=FakeEvictParams(num_tokens=1),
     )
 
     assert len(eviction_calls) == 1
@@ -1134,8 +1216,7 @@ def test_page_aware_evict_falls_back_when_no_page_is_reclaimable():
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=2,
-        evict_params_cls=FakeEvictParams,
+        params=FakeEvictParams(num_tokens=2),
     )
 
     assert [budget for budget, _strategy in eviction_calls] == [2]
@@ -1169,8 +1250,10 @@ def test_page_aware_evict_combines_selected_pages_with_native_overshoot():
         token_to_kv_pool_allocator=FakeAllocator(manager),
     )
     eviction_calls = []
+    requests = []
 
     def evict(params):
+        requests.append(params)
         eviction_calls.append((params.num_tokens, cache.eviction_strategy))
         heap = [
             (cache.eviction_strategy.get_priority(node), index, node)
@@ -1185,19 +1268,26 @@ def test_page_aware_evict_combines_selected_pages_with_native_overshoot():
             num_evicted += len(block_ids)
             cache.evictable_leaves.remove(node)
             del cache.root_node.children[int(node.value[0])]
-        return types.SimpleNamespace(num_tokens_evicted=num_evicted)
+        return types.SimpleNamespace(
+            num_tokens_evicted=num_evicted,
+            swa_num_tokens_evicted=6 if params.num_tokens == 4 else 2,
+            mamba_num_evicted=1 if params.num_tokens == 4 else 3,
+        )
 
     cache.evict = evict
-    result = _evict_radix_cache_page_aware(
-        radix_cache=cache,
-        num_tokens=5,
-        evict_params_cls=FakeEvictParams,
-    )
+    params = FakeEvictParams(num_tokens=5)
+    result = _evict_radix_cache_page_aware(radix_cache=cache, params=params)
+
+    assert params == FakeEvictParams(num_tokens=5)
+    assert all(type(request) is type(params) for request in requests)
+    assert all(request is not params for request in requests)
 
     assert [budget for budget, _strategy in eviction_calls] == [4, 1]
     assert eviction_calls[0][1] is not original_strategy
     assert eviction_calls[1][1] is original_strategy
     assert result.num_tokens_evicted == 7
+    assert result.swa_num_tokens_evicted == 8
+    assert result.mamba_num_evicted == 4
     assert manager.allocated == {8, 11, 12, 14, 15}
 
 
@@ -1222,8 +1312,7 @@ def test_page_aware_evict_batches_no_reclaimable_page_fallback():
     cache.evict = evict
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=600,
-        evict_params_cls=FakeEvictParams,
+        params=FakeEvictParams(num_tokens=600),
     )
 
     assert len(eviction_calls) == 1
@@ -1251,8 +1340,7 @@ def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
 
     _evict_radix_cache_page_aware(
         radix_cache=cache,
-        num_tokens=cache.evictable_size_,
-        evict_params_cls=FakeEvictParams,
+        params=FakeEvictParams(num_tokens=cache.evictable_size_),
     )
 
     assert eviction_calls == [cache.evictable_size_]
@@ -1261,6 +1349,7 @@ def test_page_aware_evict_skips_planning_when_evicting_all_tokens(monkeypatch):
 def test_radix_patch_uses_page_aware_order_for_cache_cap(monkeypatch):
     radix_module: Any = types.ModuleType("sglang.srt.mem_cache.radix_cache")
     radix_module.EvictParams = FakeEvictParams
+    monkeypatch.setitem(sys.modules, radix_module.__name__, radix_module)
     monkeypatch.setattr(
         retention, "_policy", retention._PrefixCacheRetentionPolicy(4))
 
