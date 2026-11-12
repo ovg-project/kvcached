@@ -216,6 +216,31 @@ class ElasticPair:
 
 
 @dataclass(frozen=True)
+class PriorityPair:
+    """Two kvcached servers on one GPU with different priorities (#585): L,
+    the lower priority, fills the GPU with prefix cache and goes idle, and H,
+    the higher one, gets a burst it does not have the memory for. kvcached's
+    watermark and reclaim must move L's memory to H without any outside
+    control. Both run with a batch limit of ELASTIC_BATCH; L keeps every
+    finished prompt (its cache retention cap is lifted), so the fill can
+    outgrow the batch limit.
+    """
+    engine_l: str
+    model_l: str
+    engine_h: str
+    model_h: str
+    extra_args_l: tuple[str, ...] = ()
+    extra_args_h: tuple[str, ...] = ()
+    gpu: int = 0
+
+    @property
+    def name(self) -> str:
+        low = f"{self.engine_l}-{self.model_l}"
+        high = f"{self.engine_h}-{self.model_h}"
+        return (f"priority-{low}+{high}" + (f"-gpu{self.gpu}" if self.gpu else ""))
+
+
+@dataclass(frozen=True)
 class LimitTest:
     """One kvcached server whose memory limit is lowered while its prefix
     cache holds most of its KV memory (e2e/limit.py). The limit is set on the
@@ -234,12 +259,14 @@ class Profile:
     groups: tuple[Group, ...]
     elastic: tuple[ElasticPair, ...] = ()
     limit: tuple[LimitTest, ...] = ()
+    priority: tuple[PriorityPair, ...] = ()
 
     @property
     def engines(self) -> tuple[str, ...]:
         names = [g.engine for g in self.groups]
         names += [e for pair in self.elastic for e in (pair.engine_a, pair.engine_b)]
         names += [t.engine for t in self.limit]
+        names += [e for pair in self.priority for e in (pair.engine_l, pair.engine_h)]
         return tuple(dict.fromkeys(names))
 
 
@@ -272,5 +299,11 @@ PROFILES = {
         # leave GPU 1 little room, so the loads the harness sizes to it
         # exceed what is free once both are on it (#577 has the numbers).
         elastic=(ElasticPair("sglang", "qwen35_4b", "vllm", "qwen35_4b", tp_a=2, gpu_b=1),),
+        # The #585 watermark case: an idle lower priority full of prefix
+        # cache, Rixin's A100 setup for #608 and #609, and a higher priority
+        # whose burst is sized past what is free. H is the larger model, so
+        # on an L4 its weights leave the GPU too little free memory for the
+        # burst until L gives its cache back.
+        priority=(PriorityPair("vllm", "qwen05b", "vllm", "qwen35_4b"),),
     ),
 }
