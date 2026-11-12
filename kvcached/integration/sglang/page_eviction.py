@@ -42,7 +42,7 @@ def _evictable_size(cache: Any) -> int:
 
 
 def supports_page_aware_eviction(cache: Any) -> bool:
-    """Support native RadixCache and FULL-only Unified caches on one rank."""
+    """Support native RadixCache and FULL / FULL+SWA Unified caches on one rank."""
     import torch.distributed as dist
 
     # Rollback can change physical page placement independently on each rank.
@@ -60,7 +60,9 @@ def supports_page_aware_eviction(cache: Any) -> bool:
     try:
         from sglang.srt.mem_cache.unified_radix_cache import (
             BASE_COMPONENT_TYPE,
+            ComponentType,
             FullComponent,
+            SWAComponent,
             UnifiedRadixCache,
         )
     except ImportError:
@@ -68,10 +70,16 @@ def supports_page_aware_eviction(cache: Any) -> bool:
     if type(cache) is not UnifiedRadixCache:
         return False
 
-    # Hybrid and custom components retain native victim selection.
-    if cache.tree_components != (BASE_COMPONENT_TYPE,):
+    if cache.tree_components not in (
+        (BASE_COMPONENT_TYPE,),
+        (BASE_COMPONENT_TYPE, ComponentType.SWA),
+    ):
         return False
     if type(cache.components.get(BASE_COMPONENT_TYPE)) is not FullComponent:
+        return False
+    if ComponentType.SWA in cache.tree_components and (
+        type(cache.components.get(ComponentType.SWA)) is not SWAComponent
+    ):
         return False
 
     # Host transfers, sessions and external linkers need their native policies.
@@ -99,15 +107,15 @@ def supports_page_aware_eviction(cache: Any) -> bool:
 def evict_prefix_cache(cache: Any, params: Union["EvictParams", int]) -> Any:
     """Evict KVCached prefix demands, preserving SGLang's result counters.
 
-    Single-rank FULL-only RadixCache and UnifiedRadixCache requests use
-    page-aware selection. Parallel execution, other caches and component
-    requests keep native victim selection.
+    Single-rank FULL demands use page-aware selection. SWA victim selection
+    stays native after accounting for collateral frees from FULL victims.
+    Parallel execution and unsupported caches keep native victim selection.
     Integer requests retain native eviction for older SGLang versions.
     """
     if (
         isinstance(params, int)
         or params.num_tokens <= 0
-        or params.swa_num_tokens
+        or (params.swa_num_tokens and len(getattr(cache, "tree_components", ()) or ()) < 2)
         or params.mamba_num
         or not supports_page_aware_eviction(cache)
     ):
@@ -287,6 +295,8 @@ def _select_page_aware_plan(
         return empty
 
     allocator = getattr(radix_cache, "token_to_kv_pool_allocator", None)
+    # SWA's composite allocator owns separate FULL and SWA token pools.
+    allocator = getattr(allocator, "full_attn_allocator", allocator)
     manager = getattr(allocator, "kvcached_allocator", None)
     if manager is None or getattr(manager, "page_allocator", None) is None:
         return empty
@@ -467,7 +477,9 @@ def _evict_radix_cache_page_aware(
         if has_callback:
             full.session_ref_eviction_strategy = tree.eviction_strategy.get_priority
         try:
-            result = radix_cache.evict(replace(params, num_tokens=token_count))
+            result = radix_cache.evict(
+                replace(params, num_tokens=token_count, swa_num_tokens=0, mamba_num=0)
+            )
         finally:
             tree.eviction_strategy = original_strategy
             if has_callback:
@@ -486,11 +498,20 @@ def _evict_radix_cache_page_aware(
             selected = _split_eviction_suffixes(radix_cache, selection.suffix_plans)
             result = evict_selected(selected, selection.token_count)
 
-        remaining = eviction_budget - selection.token_count
-        if remaining > 0:
+        remaining = eviction_budget - (
+            result.num_tokens_evicted if result is not None else selection.token_count
+        )
+        remaining_swa = max(
+            0, params.swa_num_tokens - (
+                result.swa_num_tokens_evicted if result is not None else 0
+            )
+        )
+        if remaining > 0 or remaining_swa > 0:
             # Let SGLang choose the remaining victims. Native eviction removes
             # complete radix nodes, so the actual count may exceed `remaining`.
-            native_result = radix_cache.evict(replace(params, num_tokens=remaining))
+            native_result = radix_cache.evict(
+                replace(params, num_tokens=max(0, remaining), swa_num_tokens=remaining_swa)
+            )
             if native_result is not None:
                 if result is None:
                     result = native_result
