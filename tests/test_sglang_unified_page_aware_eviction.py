@@ -4,6 +4,7 @@
 
 import types
 from array import array
+from datetime import timedelta
 
 import pytest
 import torch
@@ -108,6 +109,81 @@ def core(cache):
 def check_tree(cache):
     # Check the native tree/LRU/lock counters, not just freed block IDs.
     cache.sanity_check()
+
+
+def _rollback_retention_rank(rank, rendezvous):
+    """Construct a rank-local miss using real allocation and native tree code."""
+    import torch.distributed as dist
+    from sglang.srt.mem_cache import (
+        base_prefix_cache,
+        cache_init_params,
+        unified_radix_cache,
+    )
+    from test_alloc_rollback import make_manager
+
+    from kvcached.integration.sglang.patches import _sglang_return_journaled_blocks
+
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        native = types.SimpleNamespace(
+            unified=unified_radix_cache, base=base_prefix_cache, init=cache_init_params,
+        )
+        manager = make_manager(fail_after=3)
+        manager.world_size = 1  # SGLang's local pool ownership contract.
+        manager._page_release_callbacks = ()
+        assert manager.alloc(12) == list(range(12))
+        # C=[0,1,2] shares page 0 with running block 3. A=[4,5,6]
+        # shares page 1 with a hole; page 2 holds running blocks 8,9,10.
+        manager.free([7, 11])
+        cache = native.unified.UnifiedRadixCache(
+            native.init.CacheInitParams(
+                disable=False, req_to_token_pool=None,
+                token_to_kv_pool_allocator=Allocator(manager, 1), page_size=1,
+                tree_components=(native.unified.BASE_COMPONENT_TYPE,),
+            )
+        )
+        insert(native, cache, [100, 101, 102], [0, 1, 2])  # Oldest: C.
+        insert(native, cache, [200, 201, 202], [4, 5, 6])  # Newer: A.
+        if rank == 0:
+            attempt = manager.alloc(1)
+            assert attempt == [7]
+            _sglang_return_journaled_blocks([(manager, attempt)])
+        # The other rank missed before allocating. The same retry now puts
+        # B beside running blocks on rank 0, but beside cached A on rank 1.
+        retry = manager.alloc(1)
+        assert retry == ([11] if rank == 0 else [7])
+        insert(native, cache, [300], retry)
+        check_tree(cache)
+
+        patch = UnifiedRadixCacheLimitPatch()
+        assert patch.apply(native.unified)
+        # Exercise the installed retention callback, without simulating a
+        # serving request or calling the private eviction planner directly.
+        cache._enforce_prefix_cache_retention(4)
+        check_tree(cache)
+        hits = [
+            len(match(native, cache, tokens)[0])
+            for tokens in ([100, 101, 102], [200, 201, 202], [300])
+        ]
+        all_hits = [None, None]
+        dist.all_gather_object(all_hits, hits)
+        assert all_hits == [[0, 3, 1], [0, 3, 1]], all_hits
+        assert cache.full_evictable_size() == 4
+    finally:
+        dist.destroy_process_group()
+
+
+def test_parallel_rollback_retention_keeps_logical_prefixes(native, tmp_path):
+    """Two Gloo ranks, bounded fake pages, real manager and SGLang FULL trees."""
+    torch.multiprocessing.spawn(
+        _rollback_retention_rank,
+        args=((tmp_path / "gloo").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("policy", ["lru", "lfu"])

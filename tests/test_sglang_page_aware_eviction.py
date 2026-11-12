@@ -166,6 +166,43 @@ def test_evict_prefix_cache_keeps_unsupported_full_request_native():
     assert calls[0] is params
 
 
+@pytest.mark.parametrize("initialized,world_size", [(False, 1), (True, 1), (True, 2), (True, 4)])
+def test_page_aware_support_uses_process_topology(monkeypatch, initialized, world_size):
+    from kvcached.integration.sglang import page_eviction
+
+    calls = []
+    result = object()
+
+    class RadixCache:
+        def __init__(self):
+            self.token_to_kv_pool_allocator = types.SimpleNamespace(
+                kvcached_allocator=types.SimpleNamespace(world_size=1),
+            )
+
+        def evict(self, request):
+            calls.append(request)
+            return result
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.mem_cache.radix_cache",
+        types.SimpleNamespace(RadixCache=RadixCache),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
+
+    def get_world_size():
+        assert initialized
+        return world_size
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", get_world_size)
+    cache = RadixCache()
+    assert page_eviction.supports_page_aware_eviction(cache) is (world_size == 1)
+    if world_size > 1:
+        params = FakeEvictParams(num_tokens=3)
+        assert evict_prefix_cache(cache, params) is result
+        assert len(calls) == 1 and calls[0] is params
+        assert not hasattr(cache, "_kvcached_radix_block_index")
+
+
 def _make_cache(block_ids, priorities=None, allocated=None, logical_page_size=1):
     if priorities is None:
         priorities = list(range(len(block_ids)))
