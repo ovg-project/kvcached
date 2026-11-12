@@ -52,7 +52,8 @@ class Allocator:
         if self.free_group is not None:
             self.free_group.append(indices.clone())
         else:
-            self.kvcached_allocator.free([int(index) // self.page_size for index in indices])
+            block_ids = torch.unique(indices // self.page_size).cpu().tolist()
+            self.kvcached_allocator.free(block_ids)
 
     def free_segment(self, indices, start_pos):
         self.free(indices)
@@ -467,6 +468,7 @@ def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffe
     evict_prefix_cache(cache, native.base.EvictParams(num_tokens=8))
 
     torch.cuda.synchronize()
+    assert manager.operation_snapshot().operation_errors_total == 0
     assert manager.page_allocator.get_num_inuse_pages() == before - 1
     retained = [
         block
@@ -481,4 +483,5 @@ def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffe
     torch.cuda.synchronize()
     evict_prefix_cache(cache, native.base.EvictParams(num_tokens=cache.full_evictable_size()))
     manager.free([1, 2, 3])
+    assert manager.operation_snapshot().operation_errors_total == 0
     check_tree(cache)
