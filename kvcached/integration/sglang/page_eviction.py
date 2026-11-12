@@ -42,7 +42,15 @@ def _evictable_size(cache: Any) -> int:
 
 
 def supports_page_aware_eviction(cache: Any) -> bool:
-    """Support native RadixCache and standard FULL-only Unified caches."""
+    """Support native RadixCache and FULL-only Unified caches on one rank."""
+    import torch.distributed as dist
+
+    # Rollback can change physical page placement independently on each rank.
+    # Local victim selection would then diverge the logical prefix trees.
+    # Use the engine's process topology: SGLang managers own local pools and
+    # deliberately report world_size=1 even when TP/CP/PP is enabled.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        return False
     try:
         from sglang.srt.mem_cache.radix_cache import RadixCache
     except ImportError:
@@ -91,8 +99,9 @@ def supports_page_aware_eviction(cache: Any) -> bool:
 def evict_prefix_cache(cache: Any, params: Union["EvictParams", int]) -> Any:
     """Evict KVCached prefix demands, preserving SGLang's result counters.
 
-    FULL-only RadixCache and UnifiedRadixCache requests use page-aware selection.
-    Other caches and component requests keep native victim selection.
+    Single-rank FULL-only RadixCache and UnifiedRadixCache requests use
+    page-aware selection. Parallel execution, other caches and component
+    requests keep native victim selection.
     Integer requests retain native eviction for older SGLang versions.
     """
     if (
