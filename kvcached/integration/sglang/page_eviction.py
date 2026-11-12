@@ -23,18 +23,75 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
 
+def _tree(cache: Any) -> Any:
+    return getattr(cache, "tree_core", cache)
+
+
+def _component_type(cache: Any) -> Any:
+    return getattr(cache, "tree_components", (None,))[0]
+
+
+def _node_lock_ref(node: Any, component_type: Any) -> int:
+    return node.lock_ref if component_type is None else node.component_data[component_type].lock_ref
+
+
+def _evictable_size(cache: Any) -> int:
+    return int(
+        cache.evictable_size_ if _component_type(cache) is None else cache.full_evictable_size()
+    )
+
+
 def supports_page_aware_eviction(cache: Any) -> bool:
+    """Support native RadixCache and standard FULL-only Unified caches."""
     try:
         from sglang.srt.mem_cache.radix_cache import RadixCache
     except ImportError:
         return False
-    return type(cache) is RadixCache
+    if type(cache) is RadixCache:
+        return True
+    try:
+        from sglang.srt.mem_cache.unified_radix_cache import (
+            BASE_COMPONENT_TYPE,
+            FullComponent,
+            UnifiedRadixCache,
+        )
+    except ImportError:
+        return False
+    if type(cache) is not UnifiedRadixCache:
+        return False
+
+    # Hybrid and custom components retain native victim selection.
+    if cache.tree_components != (BASE_COMPONENT_TYPE,):
+        return False
+    if type(cache.components.get(BASE_COMPONENT_TYPE)) is not FullComponent:
+        return False
+
+    # Host transfers, sessions and external linkers need their native policies.
+    tree = _tree(cache)
+    if (
+        cache.cache_controller is not None
+        or getattr(cache, "enable_session_radix_cache", False)
+        or getattr(tree, "enable_hicache", False)
+        or getattr(tree, "enable_external_cache_linker", False)
+    ):
+        return False
+    if not hasattr(tree, "evictable_device_leaves"):
+        return False
+
+    # 0.5.16 owns its tree directly; 0.5.17+ must use the standard TreeCore.
+    if tree is cache:
+        return True
+    try:
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    except ImportError:
+        return False
+    return type(tree) is UnifiedTreeCore
 
 
 def evict_prefix_cache(cache: Any, params: Union["EvictParams", int]) -> Any:
     """Evict KVCached prefix demands, preserving SGLang's result counters.
 
-    FULL-only RadixCache requests use the existing page-aware selection.
+    FULL-only RadixCache and UnifiedRadixCache requests use page-aware selection.
     Other caches and component requests keep native victim selection.
     Integer requests retain native eviction for older SGLang versions.
     """
@@ -55,12 +112,26 @@ def _add_eviction_result(result: Any, additional: Any) -> None:
 
 
 class _RadixBlockIndex:
-    def __init__(self, root_node: Any, logical_page_size: int) -> None:
+    def __init__(
+        self,
+        root_node: Any,
+        logical_page_size: int,
+        component_type: Any = None,
+    ) -> None:
         self.root_node = root_node
         self.logical_page_size = logical_page_size
+        self.component_type = component_type
         self.block_owners: Dict[int, Any] = {}
         self.block_offsets: Dict[int, int] = {}
         self.node_blocks: Dict[Any, Tuple[int, ...]] = {}
+
+    def node_value(self, node: Any) -> Any:
+        if self.component_type is None:
+            return node.value
+        return node.component_data[self.component_type].value
+
+    def node_lock_ref(self, node: Any) -> int:
+        return _node_lock_ref(node, self.component_type)
 
     def sync(self, nodes: Set[Any]) -> None:
         # node_blocks and the tensor attribute reference the same immutable
@@ -71,7 +142,7 @@ class _RadixBlockIndex:
             for node in nodes
             if node not in self.node_blocks
             or self.node_blocks[node]
-            is not getattr(node.value, "_kvcached_block_ids", None)
+            is not getattr(self.node_value(node), "_kvcached_block_ids", None)
         ]
         removed_nodes = self.node_blocks.keys() - nodes
         for node in removed_nodes:
@@ -90,30 +161,28 @@ class _RadixBlockIndex:
         uncached = [
             node
             for node in changed_nodes
-            if getattr(node.value, "_kvcached_block_ids", None) is None
+            if getattr(self.node_value(node), "_kvcached_block_ids", None) is None
         ]
         if uncached:
             import torch
 
-            values = [node.value for node in uncached]
+            values = [self.node_value(node) for node in uncached]
             lengths = [int(value.numel()) // self.logical_page_size for value in values]
             if self.logical_page_size > 1:
-                flattened = torch.cat(
-                    [value[:: self.logical_page_size] for value in values]
-                )
+                flattened = torch.cat([value[:: self.logical_page_size] for value in values])
                 flattened = flattened // self.logical_page_size
             else:
                 flattened = torch.cat(values)
             new_block_ids = cast(List[int], cast(Any, flattened).tolist())
             offset = 0
             for node, length in zip(uncached, lengths):
-                node.value._kvcached_block_ids = tuple(
+                self.node_value(node)._kvcached_block_ids = tuple(
                     new_block_ids[offset : offset + length]
                 )
                 offset += length
 
         for node in changed_nodes:
-            block_ids = cast(Tuple[int, ...], node.value._kvcached_block_ids)
+            block_ids = cast(Tuple[int, ...], self.node_value(node)._kvcached_block_ids)
             self.node_blocks[node] = block_ids
             for offset, block_id in enumerate(block_ids):
                 self.block_owners[block_id] = node
@@ -121,18 +190,22 @@ class _RadixBlockIndex:
 
     def count_tokens(self, nodes: Dict[Any, int]) -> int:
         return sum(
-            int(node.value.numel()) - split_len
-            for node, split_len in nodes.items()
+            int(self.node_value(node).numel()) - split_len for node, split_len in nodes.items()
         )
 
 
 def _evictable_radix_nodes(radix_cache: Any) -> Set[Any]:
     """Return every node reachable by repeatedly evicting current leaves."""
-    root = radix_cache.root_node
+    tree = _tree(radix_cache)
+    root = tree.root_node
+    component_type = _component_type(radix_cache)
+    leaves = (
+        radix_cache.evictable_leaves if component_type is None else tree.evictable_device_leaves
+    )
     nodes: Set[Any] = set()
-    for leaf in radix_cache.evictable_leaves:
+    for leaf in leaves:
         node = leaf
-        while node is not root and node.lock_ref == 0:
+        while node is not root and _node_lock_ref(node, component_type) == 0:
             if node in nodes:
                 break
             nodes.add(node)
@@ -162,10 +235,8 @@ def _align_radix_eviction_budget(radix_cache: Any, num_tokens: int) -> int:
     split; the cache's evictable size remains the upper bound.
     """
     logical_page_size = max(1, int(radix_cache.page_size))
-    aligned_tokens = (
-        num_tokens + logical_page_size - 1
-    ) // logical_page_size * logical_page_size
-    return min(aligned_tokens, int(radix_cache.evictable_size_))
+    aligned_tokens = (num_tokens + logical_page_size - 1) // logical_page_size * logical_page_size
+    return min(aligned_tokens, _evictable_size(radix_cache))
 
 
 def _radix_suffix_closure(
@@ -176,9 +247,7 @@ def _radix_suffix_closure(
     split_by_node: Dict[Any, int] = {}
     for node, split_len in plans:
         previous = split_by_node.get(node)
-        split_by_node[node] = (
-            split_len if previous is None else min(previous, split_len)
-        )
+        split_by_node[node] = split_len if previous is None else min(previous, split_len)
 
     planned_ids = {id(node) for node in split_by_node}
     roots: List[_RadixSuffixPlan] = []
@@ -193,7 +262,7 @@ def _radix_suffix_closure(
     stack = list(roots)
     while stack:
         node, retained_prefix = stack.pop()
-        if node not in index.node_blocks or node.lock_ref != 0:
+        if node not in index.node_blocks or index.node_lock_ref(node) != 0:
             return None
         closure[node] = retained_prefix
         stack.extend((child, 0) for child in node.children.values())
@@ -216,7 +285,8 @@ def _select_page_aware_plan(
     logical_page_size = max(1, int(getattr(radix_cache, "page_size", 1)))
     if int(getattr(allocator, "page_size", logical_page_size)) != logical_page_size:
         return empty
-    can_split = callable(getattr(radix_cache, "_split_node", None))
+    tree = _tree(radix_cache)
+    can_split = callable(getattr(tree, "_split_node", None))
 
     evictable_nodes = _evictable_radix_nodes(radix_cache)
     if not evictable_nodes:
@@ -225,10 +295,14 @@ def _select_page_aware_plan(
     index = getattr(radix_cache, "_kvcached_radix_block_index", None)
     if (
         index is None
-        or index.root_node is not radix_cache.root_node
+        or index.root_node is not tree.root_node
         or index.logical_page_size != logical_page_size
     ):
-        index = _RadixBlockIndex(radix_cache.root_node, logical_page_size)
+        index = _RadixBlockIndex(
+            tree.root_node,
+            logical_page_size,
+            _component_type(radix_cache),
+        )
         radix_cache._kvcached_radix_block_index = index
     index.sync(evictable_nodes)
 
@@ -253,9 +327,7 @@ def _select_page_aware_plan(
             owner = index.block_owners[block_id]
             block_offset = index.block_offsets[block_id]
             previous = split_by_node.get(owner)
-            split_by_node[owner] = (
-                block_offset if previous is None else min(previous, block_offset)
-            )
+            split_by_node[owner] = block_offset if previous is None else min(previous, block_offset)
         plan = _radix_suffix_closure(
             index,
             [
@@ -290,9 +362,7 @@ def _select_page_aware_plan(
             for page_id, count in selected_blocks.items()
             if count == occupancy.get(page_id, 0)
         ]
-        priority = max(
-            radix_cache.eviction_strategy.get_priority(node) for node in closure
-        )
+        priority = max(tree.eviction_strategy.get_priority(node) for node in closure)
         sort_key = (
             token_cost / len(completed_pages),
             -len(completed_pages),
@@ -312,7 +382,7 @@ def _select_page_aware_plan(
         for node, split_len in candidate.closure.items():
             retained = selected_closure.get(node)
             if retained is None:
-                retained = int(node.value.numel())
+                retained = int(index.node_value(node).numel())
             additional_tokens += max(0, retained - split_len)
         if additional_tokens == 0 or selected_tokens + additional_tokens > token_budget:
             continue
@@ -338,7 +408,7 @@ def _split_eviction_suffixes(
 ) -> Set[Any]:
     for node, split_len in plans:
         if split_len > 0:
-            radix_cache._split_node(node.key, node, split_len)
+            _tree(radix_cache)._split_node(node.key, node, split_len)
 
     suffix_closures: Set[Any] = set()
     stack = [node for node, _split_len in plans]
@@ -351,9 +421,7 @@ def _split_eviction_suffixes(
     return suffix_closures
 
 
-def _make_sglang_evict_arg(
-    num_tokens: int, evict_params_cls: Optional[Callable[..., Any]]
-) -> Any:
+def _make_sglang_evict_arg(num_tokens: int, evict_params_cls: Optional[Callable[..., Any]]) -> Any:
     """Build the eviction argument used by the installed SGLang version."""
     if evict_params_cls is None:
         return num_tokens
@@ -372,34 +440,39 @@ def _evict_radix_cache_page_aware(
 ) -> Any:
     """Evict a FULL demand in legal logical-page units, counting all frees."""
     eviction_budget = _align_radix_eviction_budget(radix_cache, params.num_tokens)
-    if eviction_budget >= radix_cache.evictable_size_:
-        try:
-            return radix_cache.evict(replace(params, num_tokens=eviction_budget))
-        finally:
-            _sync_radix_block_index(radix_cache)
-
-    original_strategy = radix_cache.eviction_strategy
 
     def evict_selected(selected: Set[Any], token_count: int) -> Any:
-        radix_cache.eviction_strategy = types.SimpleNamespace(
+        tree = _tree(radix_cache)
+        original_strategy = tree.eviction_strategy
+        tree.eviction_strategy = types.SimpleNamespace(
             get_priority=lambda node: (
                 node not in selected,
                 original_strategy.get_priority(node),
             )
         )
+        component_type = _component_type(radix_cache)
+        full = radix_cache.components[component_type] if component_type is not None else None
+        # FullComponent may already have cached the original bound priority.
+        has_callback = hasattr(full, "session_ref_eviction_strategy")
+        callback = getattr(full, "session_ref_eviction_strategy", None)
+        if has_callback:
+            full.session_ref_eviction_strategy = tree.eviction_strategy.get_priority
         try:
             result = radix_cache.evict(replace(params, num_tokens=token_count))
         finally:
-            radix_cache.eviction_strategy = original_strategy
+            tree.eviction_strategy = original_strategy
+            if has_callback:
+                full.session_ref_eviction_strategy = callback
         if result is not None and result.num_tokens_evicted != token_count:
-            raise RuntimeError(
-                "SGLang radix eviction did not honor the exact selected-node budget"
-            )
+            raise RuntimeError("SGLang radix eviction did not honor the exact selected-node budget")
         return result
 
-    selection = _select_page_aware_plan(radix_cache, eviction_budget)
-    result = None
     try:
+        if eviction_budget >= _evictable_size(radix_cache):
+            return radix_cache.evict(replace(params, num_tokens=eviction_budget))
+
+        selection = _select_page_aware_plan(radix_cache, eviction_budget)
+        result = None
         if selection.suffix_plans:
             selected = _split_eviction_suffixes(radix_cache, selection.suffix_plans)
             result = evict_selected(selected, selection.token_count)

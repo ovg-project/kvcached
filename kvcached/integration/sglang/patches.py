@@ -4102,6 +4102,17 @@ class _FullTokenCacheLimitPatch(RadixCacheLimitPatch):
         _install_prefix_cache_retention_hooks(
             self, cache_cls, original_cache_finished, _enforce)
 
+        original_reset = getattr(cache_cls, "reset", None)
+        if self.target_class == "UnifiedRadixCache" and original_reset is not None:
+            @functools.wraps(original_reset)
+            def wrapped_reset(cache: Any, *args: Any, **kwargs: Any) -> Any:
+                result = original_reset(cache, *args, **kwargs)
+                cache._kvcached_radix_block_index = None
+                return result
+
+            self._mark_as_patched(wrapped_reset)
+            cache_cls.reset = wrapped_reset
+
         logger.info(
             "[kvcached] %s retention limit initialized at %d tokens",
             self.target_class,
