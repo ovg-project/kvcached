@@ -146,6 +146,35 @@ def test_evict_prefix_cache_preserves_native_component_request(
     assert calls[0] is params
 
 
+def test_evict_prefix_cache_routes_supported_full_swa_to_planner(monkeypatch):
+    from kvcached.integration.sglang import page_eviction
+
+    cache = types.SimpleNamespace(tree_components=("full", "swa"))
+    params = FakeEvictParams(num_tokens=8, swa_num_tokens=4)
+    sentinel = object()
+    calls = []
+    monkeypatch.setattr(page_eviction, "supports_page_aware_eviction", lambda _: True)
+
+    def planned(cache_arg, params_arg):
+        calls.append((cache_arg, params_arg))
+        return sentinel
+
+    monkeypatch.setattr(page_eviction, "_evict_radix_cache_page_aware", planned)
+    assert evict_prefix_cache(cache, params) is sentinel
+    assert calls == [(cache, params)]
+
+
+def test_evict_prefix_cache_keeps_unsupported_full_swa_native(monkeypatch):
+    from kvcached.integration.sglang import page_eviction
+
+    params = FakeEvictParams(num_tokens=8, swa_num_tokens=4)
+    calls = []
+    cache = types.SimpleNamespace(evict=lambda request: calls.append(request))
+    monkeypatch.setattr(page_eviction, "supports_page_aware_eviction", lambda _: False)
+    evict_prefix_cache(cache, params)
+    assert calls == [params]
+
+
 def test_evict_prefix_cache_keeps_unsupported_full_request_native():
     result = types.SimpleNamespace(
         num_tokens_evicted=12,
