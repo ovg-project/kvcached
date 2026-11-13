@@ -374,10 +374,13 @@ async def test_concurrent_wakeup_calls_issue_one_upstream_request(manager,
     assert calls == 1
 
 
-@pytest.mark.parametrize("engine", ["vllm", "sglang"])
-async def test_concurrent_request_wakeups_both_succeed(manager, monkeypatch, engine):
+@pytest.mark.parametrize("engine,backup", [("vllm", False), ("sglang", False),
+                                          ("sglang", True)])
+async def test_concurrent_request_wakeups_both_succeed(manager, monkeypatch, engine, backup):
     """Requests waiting for another wakeup must proceed without repeating it."""
     getattr(manager, f"add_{engine}_model")("model")
+    if engine == "sglang":
+        manager.config.sglang_models_config["model"]["weights_cpu_backup"] = backup
     manager.sleeping_models["model"] = 0
     manager.config.min_sleep_duration = 0
     entered = asyncio.Event()
@@ -424,7 +427,7 @@ async def test_concurrent_request_wakeups_both_succeed(manager, monkeypatch, eng
         await asyncio.gather(*(task for task in (first, second) if task is not None),
                              return_exceptions=True)
 
-    assert calls == (["wake"] if engine == "vllm" else ["wake", "recovery"])
+    assert calls == (["wake"] if engine == "vllm" or backup else ["wake", "recovery"])
     assert not manager.is_model_sleeping("model")
 
 
@@ -600,3 +603,44 @@ async def test_vllm_sleep_timeout_applies_to_http_request(manager):
             assert ok is False
         finally:
             release.set()
+
+
+@pytest.mark.parametrize("backup", [False, True])
+async def test_sglang_wakeup_uses_cpu_backup_when_enabled(manager, backup):
+    calls = []
+
+    async def resume(request):
+        calls.append("resume")
+        return web.Response()
+
+    async def reload(request):
+        calls.append("reload")
+        assert await request.json() == {"model_path": "model"}
+        return web.json_response({"success": True})
+
+    app = web.Application()
+    app.router.add_post("/resume_memory_occupation", resume)
+    app.router.add_post("/update_weights_from_disk", reload)
+    async with TestServer(app) as server:
+        manager.add_sglang_model("model", server.host, str(server.port),
+                                 weights_cpu_backup=backup)
+        manager.sleeping_models["model"] = 0
+        assert await manager.handle_model_wakeup_on_request("model")
+    assert calls == (["resume"] if backup else ["resume", "reload"])
+    assert not manager.is_model_sleeping("model")
+
+
+@pytest.mark.parametrize("args,expected", [
+    ("--port 30000 --enable-memory-saver --enable-weights-cpu-backup", True),
+    (["--port=30000", "--enable-weights-cpu-backup"], True),
+    (["--port=30000", "--enable-memory-saver", ["--enable-weights-cpu-backup"]], True),
+    ([["--port", "30000"], ["--enable-weights-cpu-backup"]], True),
+    (["--port 30000", "--enable-memory-saver"], False),
+])
+def test_yaml_detects_sglang_weights_cpu_backup(args, expected):
+    from controller.frontend import _extract_sleep_config
+
+    config = _extract_sleep_config({"instances": [{
+        "model": "model", "engine": "sglang", "engine_args": args,
+    }]})
+    assert config.sglang_models_config["model"]["weights_cpu_backup"] is expected
