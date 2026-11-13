@@ -36,6 +36,60 @@ class ModelConfig:
                 f"No endpoint configured for model {self.model_name}")
 
 
+class RouteError(Exception):
+    """A routing failure the frontend must translate into an HTTP response."""
+
+    status: int = 500
+    error_type: str = "RouterError"
+    content_type: str = "application/json"
+
+    def payload(self) -> Any:
+        return {
+            "error": {
+                "message": str(self),
+                "type": self.error_type,
+                "code": self.status,
+            }
+        }
+
+
+class ModelNotFoundError(RouteError):
+    """No endpoint is configured for the requested model name."""
+
+    status = 404
+    error_type = "NotFoundError"
+
+
+class BackendUnavailableError(RouteError):
+    """The engine cannot be reached right now."""
+
+    status = 503
+    error_type = "ServiceUnavailableError"
+
+
+class GatewayTimeoutError(RouteError):
+    """The engine did not answer within the router timeout."""
+
+    status = 504
+    error_type = "TimeoutError"
+
+
+class UpstreamError(RouteError):
+    """The engine answered with a non-2xx status; forward it unchanged."""
+
+    def __init__(self,
+                 status: int,
+                 body: Any,
+                 content_type: str = "application/json") -> None:
+        self.status = status
+        self.content_type = content_type
+        self._body = body
+        super().__init__(f"upstream returned HTTP {status}")
+
+    def payload(self) -> Any:
+        return self._body
+
+
 class LLMRouter:
 
     def __init__(self, models_config: Dict[str, Any], *,
@@ -127,8 +181,13 @@ class LLMRouter:
         model_name: str,
         request_data: Dict[str, Any],
         endpoint_path: str = "/v1/completions"
-    ) -> Optional[Union[Dict[str, Any], aiohttp.ClientResponse]]:
-        """Route a request to the appropriate endpoint"""
+    ) -> Union[Dict[str, Any], aiohttp.ClientResponse]:
+        """Route a request to the engine that serves ``model_name``.
+
+        Raises a :class:`RouteError` subclass when the request cannot be
+        served, so the frontend can answer with the engine's own status code
+        instead of collapsing every failure into a generic 500.
+        """
         # Record request start for traffic monitoring
         request_stats = self.traffic_monitor.record_request_start(
             model_name, endpoint_path)
@@ -139,7 +198,8 @@ class LLMRouter:
                 request_stats,
                 success=False,
                 error_message=f"Model {model_name} not found")
-            return None
+            raise ModelNotFoundError(
+                f"Model {model_name!r} is not configured")
 
         # Check if model is sleeping and try to wake it up
         if self.sleep_manager.is_model_sleeping(model_name):
@@ -154,14 +214,15 @@ class LLMRouter:
                     success=False,
                     error_message=
                     f"Failed to wake up sleeping model {model_name}")
-                return None
+                raise BackendUnavailableError(
+                    f"Failed to wake up sleeping model {model_name}")
 
         if self.session is None or self.session.closed:
             self.traffic_monitor.record_request_end(
                 request_stats,
                 success=False,
                 error_message="Session not initialized")
-            raise Exception("Session not initialized")
+            raise BackendUnavailableError("Router session is not initialized")
 
         try:
             url = f"{endpoint.base_url}{endpoint_path}"
@@ -184,55 +245,83 @@ class LLMRouter:
                     self.traffic_monitor.record_request_end(request_stats,
                                                             success=True)
                     return response
-                else:
-                    error_text = await response.text()
-                    logger.error(
-                        f"Streaming request failed with status {response.status}: {error_text}"
-                    )
-                    self.traffic_monitor.record_request_end(
-                        request_stats,
-                        success=False,
-                        error_message=f"HTTP {response.status}: {error_text}")
-                    await response.release()
-                    return None
-            else:
-                # For non-streaming requests, handle as before
-                async with self.session.post(url,
-                                             json=request_data,
-                                             timeout=timeout) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(
-                            f"Successfully routed request for model {model_name} to {endpoint.base_url}"
-                        )
-                        self.traffic_monitor.record_request_end(request_stats,
-                                                                success=True)
-                        return result
-                    else:
-                        error_text = await response.text()
-                        logger.error(
-                            f"Request failed with status {response.status}: {error_text}"
-                        )
-                        self.traffic_monitor.record_request_end(
-                            request_stats,
-                            success=False,
-                            error_message=
-                            f"HTTP {response.status}: {error_text}")
-                        return None
 
-        except asyncio.TimeoutError:
+                body = await self._read_error_body(response)
+                await response.release()
+                logger.error(
+                    f"Streaming request failed with status {response.status}: {body}"
+                )
+                self.traffic_monitor.record_request_end(
+                    request_stats,
+                    success=False,
+                    error_message=f"HTTP {response.status}: {body}")
+                raise UpstreamError(
+                    response.status, body,
+                    response.headers.get("Content-Type", "application/json"))
+
+            # For non-streaming requests, handle as before
+            async with self.session.post(url,
+                                         json=request_data,
+                                         timeout=timeout) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info(
+                        f"Successfully routed request for model {model_name} to {endpoint.base_url}"
+                    )
+                    self.traffic_monitor.record_request_end(request_stats,
+                                                            success=True)
+                    return result
+
+                body = await self._read_error_body(response)
+                logger.error(
+                    f"Request failed with status {response.status}: {body}")
+                self.traffic_monitor.record_request_end(
+                    request_stats,
+                    success=False,
+                    error_message=f"HTTP {response.status}: {body}")
+                raise UpstreamError(
+                    response.status, body,
+                    response.headers.get("Content-Type", "application/json"))
+
+        except asyncio.TimeoutError as exc:
             logger.error(
                 f"Request timeout for model {model_name} at {endpoint.base_url}"
             )
             self.traffic_monitor.record_request_end(
                 request_stats, success=False, error_message="Request timeout")
-            return None
-        except Exception as e:
-            logger.error(f"Error routing request for model {model_name}: {e}")
-            self.traffic_monitor.record_request_end(request_stats,
-                                                    success=False,
-                                                    error_message=str(e))
-            return None
+            raise GatewayTimeoutError(
+                f"Request to {endpoint.base_url} timed out") from exc
+        except aiohttp.ClientError as exc:
+            logger.error(
+                f"Cannot reach {endpoint.base_url} for model {model_name}: {exc}"
+            )
+            self.traffic_monitor.record_request_end(
+                request_stats, success=False, error_message=str(exc))
+            raise BackendUnavailableError(
+                f"{endpoint.base_url} is unreachable: {exc}") from exc
+        except RouteError:
+            raise
+        except Exception:
+            self.traffic_monitor.record_request_end(
+                request_stats,
+                success=False,
+                error_message="Unexpected routing error")
+            raise
+
+    @staticmethod
+    async def _read_error_body(response: aiohttp.ClientResponse) -> Any:
+        """Return the engine's error payload, wrapping non-JSON bodies."""
+        try:
+            return await response.json(content_type=None)
+        except (TypeError, ValueError):
+            text = await response.text()
+            return {
+                "error": {
+                    "message": text[:2000],
+                    "type": response.headers.get("Content-Type", "text/plain"),
+                    "code": response.status,
+                }
+            }
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:
         """Check health of all endpoints for a model"""
