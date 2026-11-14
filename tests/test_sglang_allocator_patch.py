@@ -418,3 +418,71 @@ def test_swa_allocator_uses_elastic_sub_allocators(monkeypatch):
     assert patch.alias_swa_sub_allocators(swa_mod) is True
     assert swa_mod.TokenToKVPoolAllocator is ElasticTokenAllocator
     assert swa_mod.PagedTokenToKVPoolAllocator is ElasticPagedAllocator
+
+
+@pytest.mark.parametrize("sentinel", [False, True])
+@pytest.mark.parametrize("size,page_size,backing_blocks", [
+    (1024, 1, 8192),
+    (8192, 64, 171),
+    (8192, 64, 256),
+    (8191, 1, 8192),
+    (8192, 64, None),
+])
+def test_swa_mapping_covers_backing_ids_without_increasing_capacity(
+        monkeypatch, sentinel, size, page_size, backing_blocks):
+    import torch
+
+    allocator_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
+    allocator_mod.ElasticTokenToKVPoolAllocator = object()
+    allocator_mod.ElasticPagedTokenToKVPoolAllocator = object()
+    mem_cache_mod: Any = types.ModuleType("sglang.srt.mem_cache")
+    mem_cache_mod.allocator = allocator_mod
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache", mem_cache_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.allocator", allocator_mod)
+
+    class NativeSWAAllocator:
+        def __init__(self, size, size_swa, page_size, cache, *, need_sort):
+            self._size_full = size
+            self._size_swa = size_swa
+            self.page_size = page_size
+            self.need_sort = need_sort
+            self.full_attn_allocator = types.SimpleNamespace(
+                size=size,
+                kvcached_allocator=(types.SimpleNamespace(num_blocks=backing_blocks)
+                                    if backing_blocks is not None else None),
+            )
+            self.full_to_swa_index_mapping = torch.zeros(
+                size + page_size + int(sentinel), dtype=torch.int64)
+            self.full_to_swa_index_mapping[1] = 7
+            if sentinel:
+                self.full_to_swa_index_mapping[-1] = -1
+            self._kvcache = cache
+            cache.register_mapping(self.full_to_swa_index_mapping)
+
+    swa_mod: Any = types.ModuleType("sglang.srt.mem_cache.allocator.swa")
+    swa_mod.SWATokenToKVPoolAllocator = NativeSWAAllocator
+    patch = ElasticSWAAllocatorPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    assert patch.apply(swa_mod)
+    wrapped_init = NativeSWAAllocator.__init__
+    assert patch.apply(swa_mod)
+    assert NativeSWAAllocator.__init__ is wrapped_init
+
+    cache = types.SimpleNamespace(register_mapping=Mock())
+    allocator = NativeSWAAllocator(size, size // 2, page_size, cache, need_sort=True)
+    mapping = allocator.full_to_swa_index_mapping
+    extent = backing_blocks * page_size if backing_blocks is not None else size + page_size
+    assert mapping.numel() == extent + int(sentinel)
+    assert mapping[1].item() == 7
+    assert allocator._size_full == size
+    assert allocator._size_swa == size // 2
+    assert allocator.full_attn_allocator.size == size
+    assert allocator.need_sort is True
+    assert cache.register_mapping.call_args.args[0] is mapping
+    # The highest possible token ID is data, even when the old last entry
+    # was the no-prefix sentinel. Clearing data must preserve that sentinel.
+    mapping[extent - 1] = 123
+    if sentinel:
+        assert mapping[-1].item() == -1
+        mapping[:-1].zero_()
+        assert mapping[-1].item() == -1

@@ -401,6 +401,42 @@ def test_seam_layout_rejects_quantized_recipes(elastic_env):
         _make_mha_pool(module, quant_method=object())
 
 
+@pytest.mark.parametrize("pool_cls", [SeamMHATokenToKVPool, PreSeamMHATokenToKVPool])
+@pytest.mark.parametrize("size,page_size,head_dim,page_mb,logical,backing", [
+    (8192, 64, 64, 2, 129, 256),
+    (8128, 64, 64, 2, 128, 128),
+    (1024, 1, 64, 2, 1025, 8192),
+    (8192, 1, 64, 2, 8193, 16384),
+    (8191, 1, 64, 2, 8192, 8192),
+    (8192, 64, 96, 2, 129, 171),
+    (8192, 64, 64, 6, 129, 384),
+])
+def test_mha_manager_backs_the_requested_capacity(
+        elastic_env, monkeypatch, pool_cls, size, page_size,
+        head_dim, page_mb, logical, backing):
+    from kvcached.integration.sglang import patches
+
+    monkeypatch.setenv("KVCACHED_PAGE_SIZE_MB", str(page_mb))
+    monkeypatch.setattr(patches, "PAGE_SIZE", page_mb * 1024 * 1024)
+    module = _inject_mha(pool_cls)
+
+    pool = module.ElasticMHATokenToKVPool(
+        size, page_size, torch.bfloat16, 2, head_dim, 1, "cpu", False
+    )
+
+    manager_args, manager_kwargs = elastic_env["get_kv_cache_manager"]
+    assert manager_args[:3] == (backing, page_size, 2 * head_dim * 2)
+    assert manager_kwargs.get("logical_num_blocks", manager_args[0]) == logical
+    assert manager_kwargs["pool_name"] == "mha"
+    # Native write/copy bounds cover backing IDs; logical admission stays
+    # independent and nominal requested-capacity accounting is preserved.
+    assert pool.size + page_size == backing * page_size
+    assert pool._kvcached_logical_size == size
+    assert pool.get_kv_size_bytes_phy() == ((size + page_size) * 2 * head_dim * 2,) * 2
+    assert elastic_env["alloc_kv_cache"]["kvcache_shape"] == (
+        size + page_size, 2, head_dim)
+
+
 def test_pre_seam_layout_still_replaces_create_buffers(elastic_env):
     module = _inject_mha(PreSeamMHATokenToKVPool)
 
