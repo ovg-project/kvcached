@@ -16,6 +16,7 @@ import threading
 import time
 import weakref
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
@@ -66,14 +67,28 @@ def synchronized(method):
 
     @functools.wraps(method)
     def synchronized_method(self, *args, **kwargs):
-        with self._lock:
-            return method(self, *args, **kwargs)
+        group = getattr(self, "_priority_reclaim_group", None)
+        with group.lock if group is not None else nullcontext():
+            with self._lock:
+                return method(self, *args, **kwargs)
 
     return synchronized_method
 
 
+def _after_post_init(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Wait before serialization; place outside ``@synchronized``."""
+
+    @functools.wraps(method)
+    def initialized_method(self, *args, **kwargs):
+        self._wait_post_init()
+        return method(self, *args, **kwargs)
+
+    return initialized_method
+
+
 def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
-                   *, internal_page: Any = None) -> int:
+                   *, internal_page: Any = None,
+                   max_block_id: Optional[int] = None) -> int:
     """Return the number of usable blocks on a page.
 
     Blocks straddling a page boundary belong to neither page (see the
@@ -98,10 +113,17 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
     ip = internal_page if internal_page is not None else InternalPage
     start, end = ip.get_block_range(page_id, page_size,
                                     block_mem_size)
+    if max_block_id is not None:
+        start = min(start, max_block_id)
+        end = min(end, max_block_id)
     return end - start
 
 
 class KVCacheManager:
+    max_block_id: Optional[int] = None
+    # The initializer may reenter resize while reserving the null block; it
+    # cannot wait for the completion event it is responsible for publishing.
+    _post_init_thread_id: Optional[int] = None
     # Cached get_avail_physical_pages() result + its monotonic timestamp.
     # Class-level defaults keep the no-__init__ test-stub pattern
     # (tests/test_alloc_rollback.py) working without each stub knowing
@@ -110,7 +132,16 @@ class KVCacheManager:
     _avail_physical_pages_ts: float = 0.0
     _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
     _shrink_reclaimers: tuple[weakref.WeakMethod, ...] = ()
+    # Prefix caches that higher priorities can reclaim (#585): pairs of bound
+    # methods counting and evicting the whole pages they could free.
+    _cache_owners: tuple[tuple[weakref.WeakMethod, weakref.WeakMethod], ...] = ()
     _reclaiming_for_shrink = False
+    # The native resize watcher retains the last quota kvctl published and
+    # reports it on every read. _apply_resize_target() keeps applying it
+    # while it is the latest published target, which completes a deferred
+    # shrink, and skips it once resize() published a later one.
+    _kvctl_target: Optional[int] = None
+    _kvctl_target_is_latest = False
 
     def __init__(
         self,
@@ -128,6 +159,8 @@ class KVCacheManager:
         defer_physical_release: bool = False,
         own_segment: bool = False,
         page_size: Optional[int] = None,
+        logical_num_blocks: Optional[int] = None,
+        max_block_id: Optional[int] = None,
     ):
         """
         Args:
@@ -153,8 +186,34 @@ class KVCacheManager:
                 one, for pools whose sizes differ (SGLang SWA and Mamba pools).
             page_size: Physical page size, matching this pool's backing tensors.
                 Defaults to KVCACHED_PAGE_SIZE_MB.
+            logical_num_blocks: Optional allocation limit when ``num_blocks``
+                includes extra backing for physical-page rounding and packing.
+                The limit includes any reserved null block. When omitted with
+                ``max_block_id``, it defaults to that ID bound.
+            max_block_id: Optional exclusive bound on block IDs returned from
+                backing pages. SGLang Mamba slots use it to hide padding IDs.
         """
+        if max_block_id is not None and not (0 <= max_block_id <= num_blocks):
+            raise ValueError("max_block_id must be between 0 and num_blocks")
+        if logical_num_blocks is None and max_block_id is not None:
+            logical_num_blocks = max_block_id
+        if logical_num_blocks is not None and not (
+            0 <= logical_num_blocks <= num_blocks
+        ):
+            raise ValueError(
+                "logical_num_blocks must be between 0 and num_blocks"
+            )
+        if (max_block_id is not None and logical_num_blocks is not None
+                and logical_num_blocks > max_block_id):
+            raise ValueError("logical_num_blocks cannot exceed max_block_id")
+        if reserve_null_block and logical_num_blocks == 0:
+            raise ValueError("logical_num_blocks must include the reserved null block")
         self.num_blocks = num_blocks
+        self.logical_num_blocks = logical_num_blocks
+        self.max_block_id = max_block_id
+        # Blocks handed out of pages, including the null block and reservations.
+        # Keep logical admission independent of resident-page scans and resize.
+        self._logical_allocated_blocks = 0
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -171,6 +230,15 @@ class KVCacheManager:
         self.physical_release_barrier: Optional[Callable[[], None]] = None
         self._physical_release_epoch = 0
         self._retired_pages: List[tuple[int, List[int]]] = []
+        # Engine KV copies (CPU offload stores and loads) pin the pages they
+        # read or write until the copy has completed on the GPU. With an
+        # offload fence, a retired page also waits for the next copy-job build
+        # after its retirement, the latest point at which a copy of its old
+        # contents can still be created (see enable_copy_fence()).
+        self._copy_pins: Dict[int, int] = {}
+        self._copy_job_pages: Dict[Any, List[int]] = {}
+        self._copy_fence: Optional[int] = None
+        self._retire_fence: Dict[int, int] = {}
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE if page_size is None else page_size
@@ -186,6 +254,17 @@ class KVCacheManager:
             raise KVCachedConfigError(geometry_error)
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
+        if self.max_block_id is not None:
+            # A page can contain a bounded block only if its first block
+            # starts before max_block_id. Exclude the empty tail from the
+            # native arena, including preallocation and later resize growth.
+            # Otherwise an unusable page can consume the last physical grant
+            # ahead of a freed, usable page and make available_size() report 0.
+            bounded_pages = (
+                (self.max_block_id - 1) * self.block_mem_size // self.page_size + 1
+                if self.max_block_id else 0
+            )
+            self.mem_size = min(self.mem_size, bounded_pages * self.page_size)
         self.world_size = world_size
         self.pp_rank = pp_rank
         # Name of the /dev/shm segment the C++ MemInfoTracker creates for
@@ -227,6 +306,8 @@ class KVCacheManager:
         except ImportError:
             use_worker_ipc = False
         self.page_allocator.set_use_worker_ipc(use_worker_ipc)
+        # The ledger lives in the workers then; see post_demand().
+        self._uses_worker_ipc = use_worker_ipc
 
         if self.world_size > 1 or use_worker_ipc:
             try:
@@ -267,6 +348,11 @@ class KVCacheManager:
                 #   the ledger dropped. That is an unknown cross-rank outcome
                 #   and degrades the pool per the #375 rule.
                 lifecycle_ref = weakref.ref(self._lifecycle)
+                # Native callbacks use scheduler geometry; uneven PP stages
+                # translate the same logical page IDs to their local stride.
+                offset_stride = self.page_size
+                if CONTIGUOUS_LAYOUT:
+                    offset_stride *= self.num_layers * self.num_kv_buffers
 
                 # Wrap Python functions to match C++ callback signature
                 def map_callback(
@@ -276,7 +362,8 @@ class KVCacheManager:
                     group_id: int = self.group_id,
                 ) -> None:
                     """Wrapper for Python broadcast function"""
-                    broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+                    broadcast_map_to_kv_tensors(
+                        world_size, offsets, pp_rank, group_id, offset_stride=offset_stride)
 
                 def unmap_callback(
                     world_size: int,
@@ -286,7 +373,8 @@ class KVCacheManager:
                 ) -> None:
                     """Wrapper for Python broadcast function"""
                     try:
-                        broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+                        broadcast_unmap_from_kv_tensors(
+                            world_size, offsets, pp_rank, group_id, offset_stride=offset_stride)
                     except Exception as exc:
                         lifecycle = lifecycle_ref()
                         if lifecycle is not None:
@@ -312,12 +400,9 @@ class KVCacheManager:
         self.null_block: Optional[list[int]] = None
 
         self.in_shrink: bool = False
-        self.target_num_blocks: Optional[int] = None
+        self.target_num_pages: Optional[int] = None
         self._resize_rejected: bool = False
         self._rejected_resize_target: Optional[int] = None
-        self._memory_limit_bytes: Optional[int] = None
-        self._memory_limit_effective_bytes: Optional[int] = None
-        self._memory_limit_revision = -1
         # TTL cache for get_avail_physical_pages() (a cudaMemGetInfo driver
         # call); see _AVAIL_PHYSICAL_PAGES_TTL_S. Invalidated after every
         # physical-pool mutation the manager drives (alloc, free, resize,
@@ -375,6 +460,8 @@ class KVCacheManager:
         threading.Thread(target=self._post_init, daemon=True).start()
 
     def _post_init(self):
+        self._post_init_thread_id = threading.get_ident()
+
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
@@ -444,7 +531,14 @@ class KVCacheManager:
                 self._lifecycle.mark_failed("initialization cancelled by shutdown")
 
     def _wait_post_init(self):
-        if not self._post_init_done.is_set():
+        """Wait for setup unless this thread is performing that setup.
+
+        Foreground entry points call this before acquiring the manager lock.
+        This remains the legacy completion gate; ``wait_ready`` propagates
+        captured initialization failures.
+        """
+        if (not self._post_init_done.is_set()
+                and threading.get_ident() != self._post_init_thread_id):
             self._post_init_done.wait()
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
@@ -625,9 +719,12 @@ class KVCacheManager:
             return
 
 
+    @_after_post_init
     def alloc(self, need_size: int) -> Optional[List[int]]:
+        """Wait for initial setup without holding the lock, then allocate blocks."""
         return self._alloc(need_size)
 
+    @_after_post_init
     def alloc_packed(self, need_size: int) -> Optional[List[int]]:
         """Allocate by draining the smallest existing holes first.
 
@@ -635,7 +732,8 @@ class KVCacheManager:
         single request. Treating that request as one long run skips partially
         free pages that cannot fit the whole batch. Packed allocation preserves
         the placement of repeated one-block allocations while keeping one lock
-        acquisition and one capacity check.
+        acquisition and one capacity check. Waits for initial setup before
+        entering the manager lock.
         """
         return self._alloc(need_size, pack_pages=True)
 
@@ -647,6 +745,7 @@ class KVCacheManager:
         counters = getattr(self, "_operation_counters", None) if not _skip_wait else None
         if counters is not None:
             counters["allocation_requests_total"] = counters.get("allocation_requests_total", 0) + 1
+        reserved_before = len(self.reserved_blocks)
         try:
             indices = self._alloc_impl(need_size, _skip_wait=_skip_wait, pack_pages=pack_pages)
         except Exception:
@@ -665,6 +764,10 @@ class KVCacheManager:
             else:
                 counters["allocation_successes_total"] = counters.get("allocation_successes_total", 0) + 1
                 counters["allocated_blocks_total"] = counters.get("allocated_blocks_total", 0) + len(indices)
+        if indices is not None and not _skip_wait:
+            # Blocks set aside by try_to_reserve() were counted when reserved.
+            taken = len(indices) - (reserved_before - len(self.reserved_blocks))
+            self._step_alloc_blocks = getattr(self, "_step_alloc_blocks", 0) + taken
         return indices
 
     def _alloc_impl(self,
@@ -675,8 +778,9 @@ class KVCacheManager:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
             self._wait_post_init()
+            self._apply_resize_target()
 
-        self._apply_resize_target()
+        self._refund_priority_reserve()
         if getattr(self, "in_shrink", False):
             # alloc() runs on the engine thread, which may evict cached
             # prefixes; resize() may not, see reclaim_for_shrink().
@@ -686,15 +790,20 @@ class KVCacheManager:
             logger.warning(f"available_size()={self.available_size()} < "
                            f"need_size={need_size}")
             return None
-        # A pending shrink waits for retired pages to be released; reusing
-        # them would undo the pages its reclaimers just emptied.
-        retiring = (self._retiring_page_ids()
-                    if getattr(self, "in_shrink", False) else frozenset())
+        # A pending shrink, or a release for a higher priority, waits for
+        # retired pages to be released; reusing them would undo the pages
+        # its reclaimers just emptied.
+        retiring = self._unreusable_page_ids()
 
         ret_index = []
         page: Optional[InternalPage] = None
 
         remaining_need = need_size
+        # Pages mapped by this loop whose whole blocks all sit at or past
+        # max_block_id. They are released together once the loop settles:
+        # releasing one mid-loop would refill the native reserve that
+        # alloc_page() serves first, handing the same page straight back.
+        bound_empty_pages: List[int] = []
 
         num_from_reserved = 0
         if self.reserved_blocks:  # Try to allocate from reserved blocks first
@@ -705,7 +814,8 @@ class KVCacheManager:
             remaining_need -= num_from_reserved
 
         while remaining_need > 0:  # Allocate the remaining blocks from pages
-            if not self.avail_pages:
+            if not self.avail_pages or (retiring and all(pid in retiring for pid in self.avail_pages)):
+                # Guarded local pages do not prevent using spare native capacity.
                 # Only alloc_page() is recoverable here. available_size() saw
                 # enough logical capacity, but another instance sharing the
                 # physical pool consumed pages before we reached this call, so
@@ -742,17 +852,29 @@ class KVCacheManager:
                     # dead pool.
                     if self._record_native_fatal("alloc", e):
                         raise
+                    self._release_bound_empty_pages(bound_empty_pages)
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
                     logger.warning(
                         f"alloc_page() failed after partially allocating "
                         f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
                     return None
                 self._increment_operation_counter("manager_page_allocations_total")
-                page.init(self.block_mem_size)
+                if self.max_block_id is None:
+                    page.init(self.block_mem_size)
+                else:
+                    page.init(self.block_mem_size, self.max_block_id)
                 # __init__ rejects geometries where a page can hold no whole
-                # block. Parking such a page would keep it mapped forever
-                # (free() never visits a page without blocks), so fail loud.
+                # block, so with no ID bound a blockless page is an invariant
+                # failure; parking it would keep it mapped forever (free()
+                # never visits a page without blocks), so fail loud. Under
+                # max_block_id, pages at the end of the backing span hold
+                # only IDs past the bound (the #619 exhaustion review), and
+                # the free list can serve one while usable pages sit behind
+                # it: hold it aside and take the next page.
                 if page.num_free_blocks() == 0:
+                    if self.max_block_id is not None:
+                        bound_empty_pages.append(page.page_id)
+                        continue
                     raise StateConsistencyError(
                         f"page {page.page_id} holds no whole "
                         f"{self.block_mem_size}-byte block; the page geometry "
@@ -772,6 +894,8 @@ class KVCacheManager:
                     ]
             num_from_page = min(page.num_free_blocks(), remaining_need)
             alloced_index = page.alloc(num_from_page)
+            if getattr(self, "logical_num_blocks", None) is not None:
+                self._logical_allocated_blocks += len(alloced_index)
             ret_index.extend(alloced_index)
             if page.full():
                 self.full_pages[page.page_id] = page
@@ -781,7 +905,28 @@ class KVCacheManager:
             self.num_avail_blocks -= num_from_page
             remaining_need -= num_from_page
 
+        self._release_bound_empty_pages(bound_empty_pages)
         return ret_index
+
+    def _release_bound_empty_pages(self, page_ids: List[int]) -> None:
+        """Unmap pages that hold no usable block under ``max_block_id``.
+
+        _alloc_impl() holds such pages aside while it walks the allocator's
+        free list, so they sit in neither ``avail_pages`` nor ``full_pages``
+        and no block of theirs was ever handed out; no retirement, fence, or
+        priority bookkeeping applies. A release failure carries the same
+        fatal verdict as free_pages() in _free().
+        """
+        if not page_ids:
+            return
+        try:
+            self.page_allocator.free_pages(page_ids)
+        except Exception as e:
+            self._record_native_fatal("free", e)
+            raise
+        self._avail_physical_pages_cache = None
+        self._increment_operation_counter(
+            "manager_page_releases_total", len(page_ids))
 
     def _rollback_partial_alloc(self, ret_index: List[int],
                                 num_from_reserved: int) -> None:
@@ -855,6 +1000,7 @@ class KVCacheManager:
             ref for ref in self._page_release_callbacks if ref() is not None
         ) + (weakref.WeakMethod(callback),)
 
+    @_after_post_init
     @synchronized
     def free(self, indices: List[int]):
         counters = getattr(self, "_operation_counters", None)
@@ -900,6 +1046,13 @@ class KVCacheManager:
                 callback(idx_dict)
 
         pages_to_free: List[int] = []
+        group = getattr(self, "_priority_reclaim_group", None)
+        priority_active = ((group.active if group is not None else getattr(self, "_priority_reclaim_active", False))
+                           and not getattr(self, "in_shrink", False))
+        allowance = (getattr(self, "_priority_release_allowance", 0)
+                     + getattr(self, "_pending_release_pages", 0))
+        retained = set(getattr(self, "_priority_retained_ids", ()))
+        surplus = []
         freed_blocks = 0
         had_inconsistency = False
         for page_id, idxs in idx_dict.items():
@@ -929,12 +1082,25 @@ class KVCacheManager:
 
             self.num_avail_blocks += len(idxs)
             page.free_batch(idxs)
+            if getattr(self, "logical_num_blocks", None) is not None:
+                self._logical_allocated_blocks -= len(idxs)
             freed_blocks += len(idxs)
             if counters is not None:
                 # Later pages, unmap, or deferred resize may still fail.
                 counters["freed_blocks_total"] = counters.get("freed_blocks_total", 0) + len(idxs)
 
             if page.empty():
+                permitted = (group.claim(self, page_id) if group is not None and priority_active
+                             else len(pages_to_free) < allowance)
+                if priority_active and not permitted:
+                    # Whole-request eviction may empty more pages than the
+                    # byte plan permits. Never pass that surplus to native
+                    # free_pages: a full reserve unmaps it immediately.
+                    retained.add(page_id)
+                    surplus.append(page_id)
+                    self.avail_pages[page_id] = page
+                    continue
+                retained.discard(page_id)
                 pages_to_free.append(page.page_id)
                 if getattr(self, "defer_physical_release", False):
                     self.avail_pages[page_id] = page
@@ -943,7 +1109,10 @@ class KVCacheManager:
             else:
                 self.avail_pages[page_id] = page
 
-        if pages_to_free:
+        self._priority_retained_ids = retained
+        if pages_to_free or surplus:
+            if priority_active:
+                self._claim_priority_retired_pages(pages_to_free)
             if getattr(self, "defer_physical_release", False):
                 self._physical_release_epoch = (
                     getattr(self, "_physical_release_epoch", 0) + 1
@@ -952,14 +1121,31 @@ class KVCacheManager:
                 if retired_pages is None:
                     retired_pages = self._retired_pages = []
                 retired_pages.append(
-                    (self._physical_release_epoch, pages_to_free)
+                    (self._physical_release_epoch, pages_to_free + surplus)
                 )
+                fence = getattr(self, "_copy_fence", None)
+                if fence is not None:
+                    if getattr(self, "_retire_fence", None) is None:
+                        self._retire_fence = {}
+                    self._retire_fence[self._physical_release_epoch] = fence
             else:
+                promised = set(getattr(self, "_priority_retired_ids", ())).intersection(pages_to_free)
+                pages_to_free.sort(key=lambda page_id: page_id not in promised)
                 try:
-                    self.page_allocator.free_pages(pages_to_free)
+                    if promised:
+                        retained_count = self.page_allocator._free_pages_with_receipt(pages_to_free)
+                    else:
+                        self.page_allocator.free_pages(pages_to_free)
                 except Exception as e:
+                    if group is not None:
+                        group.failed = True
                     self._record_native_fatal("free", e)
                     raise
+                if promised:
+                    self._priority_retired_ids.difference_update(promised)
+                    self._priority_reserve_debt = (getattr(self, "_priority_reserve_debt", 0)
+                                                   + min(len(promised), retained_count))
+                    self._refund_priority_reserve()
                 self._avail_physical_pages_cache = None
                 self._increment_operation_counter(
                     "manager_page_releases_total", len(pages_to_free))
@@ -968,22 +1154,40 @@ class KVCacheManager:
         return freed_blocks, had_inconsistency
 
     def _maybe_finish_shrink(self) -> None:
-        if getattr(self, "_retired_pages", None):
-            # PageAllocator.resize() cannot shrink past pages that are still
-            # physically mapped for an in-flight worker batch.
-            return
         if self.in_shrink:
-            assert self.target_num_blocks is not None
-            if self._get_num_alloced_blocks() <= self.target_num_blocks:
+            group = getattr(self, "_priority_reclaim_group", None)
+            if group is not None:
+                group.cancel()
+            retained = self._priority_empty_ids()
+            if retained:
+                # These empty pages still count as native in-use pages. An
+                # explicit shrink must not wait for an engine cache owner
+                # that no longer owns them. Pins/fences exclude unsafe IDs.
+                excess = min(len(retained), self.shrink_excess_pages())
+                if excess:
+                    self.release_empty_pages(
+                        self.page_allocator.get_num_reserved_pages() + excess)
+            assert self.target_num_pages is not None
+            target_blocks = self.target_num_pages * self.page_size // self.block_mem_size
+            get_state = getattr(self.page_allocator, "get_transaction_state", None)
+            healthy = get_state is None or get_state()["state"] == "HEALTHY"
+            # A late preallocation failure must reach resize()'s native verdict
+            # even while live blocks or a physical-release barrier prevent
+            # completion. Healthy pending polls do not resize or drop the cache.
+            if not healthy or (not getattr(self, "_retired_pages", None)
+                               and self._get_num_alloced_blocks() <= target_blocks):
                 try:
                     resized = self.page_allocator.resize(
-                        self.target_num_blocks * self.block_mem_size)
+                        self.target_num_pages * self.page_size)
                 except QuarantinedResizeError:
                     # Reject the pending limit without blocking healthy pages.
                     self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
                     self.in_shrink = False
-                    self.target_num_blocks = None
+                    self.target_num_pages = None
+                    control = getattr(self, "_runtime_control", None)
+                    if control is not None:
+                        control.fail()
                     logger.warning("Deferred resize rejected: pool has quarantined pages")
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can
@@ -998,12 +1202,15 @@ class KVCacheManager:
                         # footprint and this toggle bypasses resize(), so drop the
                         # cached value so available_size() re-reads the driver.
                         self._avail_physical_pages_cache = None
-                        self.target_num_blocks = None
+                        self.target_num_pages = None
+                        control = getattr(self, "_runtime_control", None)
+                        if control is not None:
+                            control.acknowledge()
                     else:
                         logger.warning(
-                            "shrink to %d blocks refused by allocator "
+                            "shrink to %d pages refused by allocator "
                             "(in-use pages above target); keeping shrink pending",
-                            self.target_num_blocks)
+                            self.target_num_pages)
 
     @synchronized
     def capture_physical_release_marker(self) -> int:
@@ -1022,18 +1229,48 @@ class KVCacheManager:
     def _release_retired_pages_through(self, marker: int) -> None:
         pages_to_free: List[int] = []
         still_retired: List[tuple[int, List[int]]] = []
+        pins = getattr(self, "_copy_pins", None) or {}
+        fence = getattr(self, "_copy_fence", None)
+        retire_fence = getattr(self, "_retire_fence", None) or {}
         for epoch, page_ids in getattr(self, "_retired_pages", []):
-            if epoch <= marker:
-                pages_to_free.extend(page_ids)
-            else:
+            if epoch > marker or (
+                    fence is not None and retire_fence.get(epoch, -1) >= fence):
+                # Not yet past the batch that may use it, or no copy-job build
+                # has run since it was retired.
                 still_retired.append((epoch, page_ids))
+                continue
+            held = [page_id for page_id in page_ids if pins.get(page_id)]
+            pages_to_free.extend(page_id for page_id in page_ids
+                                 if not pins.get(page_id))
+            if held:
+                still_retired.append((epoch, held))
 
-        if pages_to_free:
+        ready_to_retire = bool(pages_to_free)
+        retained: set[int] = getattr(self, "_priority_retained_ids", set())
+        pages_to_free = [page_id for page_id in pages_to_free if page_id not in retained]
+        priority_ids: set[int] = getattr(self, "_priority_retired_ids", set())
+        promised = priority_ids.intersection(pages_to_free)
+        retained_count = 0
+        if promised:
+            # Native free_pages fills its reserve in input order. Put the
+            # promised pages first so any excess request pages need not trim.
+            pages_to_free.sort(key=lambda page_id: page_id not in promised)
+        if ready_to_retire:
             barrier = getattr(self, "physical_release_barrier", None)
             try:
                 if barrier is not None:
                     barrier()
-                self.page_allocator.free_pages(pages_to_free)
+                if pages_to_free:
+                    try:
+                        if promised:
+                            retained_count = self.page_allocator._free_pages_with_receipt(pages_to_free)
+                        else:
+                            self.page_allocator.free_pages(pages_to_free)
+                    except Exception:
+                        group = getattr(self, "_priority_reclaim_group", None)
+                        if group is not None:
+                            group.failed = True
+                        raise
             except Exception as e:
                 # With deferred release, a fatal unmap verdict surfaces here
                 # rather than in free(). Keep the readiness gate in agreement.
@@ -1048,14 +1285,97 @@ class KVCacheManager:
             # the cached count only once physical release has succeeded.
             self._avail_physical_pages_cache = None
         self._retired_pages = still_retired
+        priority_ids = getattr(self, "_priority_retired_ids", set())
+        refunded = priority_ids.intersection(pages_to_free)
+        self._priority_retired_ids = priority_ids.difference(refunded)
+        self._priority_reserve_debt = (getattr(self, "_priority_reserve_debt", 0)
+                                       + min(len(refunded), retained_count))
+        self._refund_priority_reserve()
+        if refunded:
+            self.post_reclaimable_levels()
+        if retire_fence:
+            live = {epoch for epoch, _ in still_retired}
+            self._retire_fence = {epoch: value for epoch, value in retire_fence.items()
+                                  if epoch in live}
         self._maybe_finish_shrink()
 
     @synchronized
-    def try_to_reserve(self, need_size: int) -> bool:
+    def enable_copy_fence(self) -> None:
+        """Hold retired pages for engine KV copies (vLLM CPU offloading).
+
+        A copy job that reads a freed block is created at the latest in the
+        first copy-job build after the free, the same bound the engine relies
+        on before it reuses the block. From then on the job's pins keep the
+        page mapped, so a retired page may be released once a build has
+        followed its retirement and no pin is left.
+        """
+        self.defer_physical_release = True
+        for name in ("_copy_pins", "_copy_job_pages", "_retire_fence"):
+            if getattr(self, name, None) is None:
+                setattr(self, name, {})
+        if getattr(self, "_copy_fence", None) is None:
+            self._copy_fence = 0
+
+    @synchronized
+    def pin_copy_job(self, job: Any, block_ids: Iterable[int]) -> None:
+        """Keep the pages under a copy job mapped until unpin_copy_job(job)."""
+        if job in self._copy_job_pages:
+            return
+        indices = [int(block_id) for block_id in block_ids]
+        pages = list(self.page_allocator.group_indices_by_page(
+            indices, self.block_mem_size)) if indices else []
+        for page_id in pages:
+            if page_id not in self.avail_pages and page_id not in self.full_pages:
+                # The page was handed back already, so the copy would read or
+                # write memory that no longer holds this KV.
+                raise StateConsistencyError(
+                    f"KV copy job {job} uses page {page_id}, which kvcached "
+                    "has already released")
+        for page_id in pages:
+            self._copy_pins[page_id] = self._copy_pins.get(page_id, 0) + 1
+        self._copy_job_pages[job] = pages
+
+    @synchronized
+    def unpin_copy_job(self, job: Any) -> bool:
+        """Release a copy job's pins once the copy has completed on the GPU."""
+        pages = self._copy_job_pages.pop(job, None)
+        if pages is None:
+            return False
+        for page_id in pages:
+            count = self._copy_pins.get(page_id, 0) - 1
+            if count > 0:
+                self._copy_pins[page_id] = count
+            else:
+                self._copy_pins.pop(page_id, None)
+        return True
+
+    @synchronized
+    def advance_copy_fence(self) -> None:
+        """Record that a copy-job build has completed (enable_copy_fence())."""
+        fence = getattr(self, "_copy_fence", None)
+        if fence is not None:
+            self._copy_fence = fence + 1
+
+    @synchronized
+    def has_pending_copy_release(self) -> bool:
+        """Whether copy pins or the fence still hold pages back."""
+        return bool(getattr(self, "_copy_job_pages", None)) or (
+            getattr(self, "_copy_fence", None) is not None
+            and bool(getattr(self, "_retired_pages", None)))
+
+    @_after_post_init
+    @synchronized
+    def try_to_reserve(self, need_size: int, packed: bool = False) -> bool:
+        """Set aside blocks that the next allocation takes first.
+
+        ``packed`` places them as ``alloc_packed`` would, for a caller whose
+        next allocation is an ``alloc_packed`` call.
+        """
         self._wait_post_init()
         if self.available_size() < need_size:
             return False
-        reserved = self.alloc(need_size)
+        reserved = (self.alloc_packed(need_size) if packed
+                    else self.alloc(need_size))
         if reserved is None:
             logger.warning("Failed to reserve blocks.")
             return False
@@ -1063,6 +1383,329 @@ class KVCacheManager:
         return True
 
     @synchronized
+    def take_step_alloc_blocks(self) -> int:
+        """Blocks allocated since the last call, and restart the count.
+
+        Engines call it at each scheduling step's boundary. Blocks handed out
+        from ``try_to_reserve()``'s reservation count once, when reserved.
+        """
+        taken = getattr(self, "_step_alloc_blocks", 0)
+        self._step_alloc_blocks = 0
+        return taken
+
+    @synchronized
+    def demand_pages(self, need_blocks: int) -> int:
+        """Pages that ``need_blocks`` more blocks would have to map.
+
+        Free blocks in mapped pages, reserved blocks and pre-mapped pages need
+        no grant, so only the rest counts. Engines pass a step's need (what it
+        allocated plus what did not fit), so the demand is that need as a
+        forecast of the next step, beyond what the pool still holds free.
+        Evictable prefix cache is not subtracted: lower priorities' empty
+        pages and cache go before the instance's own cache (#585).
+        """
+        blocks_per_page = InternalPage.get_num_blocks(self.page_size,
+                                                      self.block_mem_size)
+        if need_blocks <= 0 or blocks_per_page <= 0:
+            return 0
+        reusable = self.num_avail_blocks + len(self.reserved_blocks)
+        for page_id in self._unreusable_page_ids():
+            page = self.avail_pages.get(page_id)
+            if page is not None:
+                reusable -= page.num_free_blocks()
+        reserved = max(0, self.page_allocator.get_num_reserved_pages()
+                       - getattr(self, "_priority_reserve_debt", 0))
+        held = reusable + reserved * blocks_per_page
+        missing = need_blocks - held
+        return -(-missing // blocks_per_page) if missing > 0 else 0
+
+    def _worker_control(self) -> Any:
+        """The runtime control whose sources are worker ledgers, if any."""
+        control = getattr(self, "_runtime_control", None)
+        return control if control is not None and control.worker_ipc else None
+
+    def post_demand(self, pages: int) -> None:
+        """Post the instance's demand on each of its GPUs; 0 clears it.
+
+        Writes only when the level changes. When workers map the pages (TP or
+        PP > 1), the level goes to each worker's ledger in that ledger's page
+        size, which differs between pipeline stages.
+        """
+        pages = max(0, int(pages))
+        if pages == getattr(self, "_posted_demand_pages", 0):
+            return
+        if self.world_size > 1 or getattr(self, "_uses_worker_ipc", False):
+            control = self._worker_control()
+            if control is None:
+                return  # workers are not registered yet
+            from kvcached import _C  # type: ignore[attr-defined]
+
+            for source, state in zip(control.sources, control.poll()):
+                _C.publish_instance_demand(source["gpu"], source["instance"],
+                                           source["generation"],
+                                           pages * state["page_bundle_bytes"])
+        else:
+            from kvcached.vmm_ops import set_kv_demand
+
+            set_kv_demand(pages * self._memory_limit_page_bundle_bytes(),
+                          self.group_id)
+        self._posted_demand_pages = pages
+
+    _RECLAIM_TIERS = ("empty", "cache", "running")
+
+    @synchronized
+    def _register_cache_owner(self, count_pages: Callable[[], int],
+                              evict_pages: Callable[[int], int]) -> None:
+        """Register a prefix cache that higher priorities can reclaim (#585).
+
+        ``count_pages()`` returns how many whole pages the cache could free
+        and ``evict_pages(n)`` frees up to ``n`` of them, returning how many.
+        Both must be bound methods; they run on the engine thread under the
+        manager lock.
+        """
+        self._cache_owners = tuple(
+            pair for pair in self._cache_owners
+            if pair[0]() is not None and pair[1]() is not None
+        ) + ((weakref.WeakMethod(count_pages), weakref.WeakMethod(evict_pages)),)
+
+    def _live_cache_owners(self) -> List[tuple]:
+        owners = []
+        for count_ref, evict_ref in self._cache_owners:
+            count, evict = count_ref(), evict_ref()
+            if count is not None and evict is not None:
+                owners.append((count, evict))
+        return owners
+
+    def post_reclaimable(self, empty_pages: int, cache_pages: int,
+                         releasing_pages: int) -> None:
+        """Post what this instance can release on each GPU, by tier (#585).
+
+        Writes only when a level changes, in each ledger's page size as
+        post_demand() does.
+        """
+        group = getattr(self, "_priority_reclaim_group", None)
+        if group is not None:
+            group.publish()
+            return
+        levels = tuple(max(0, int(v)) for v in (empty_pages, cache_pages, releasing_pages))
+        if levels == getattr(self, "_posted_reclaimable", (0, 0, 0)):
+            return
+        if getattr(self, "world_size", 1) > 1 or getattr(self, "_uses_worker_ipc", False):
+            control = self._worker_control()
+            if control is None:
+                return  # workers are not registered yet
+            from kvcached import _C  # type: ignore[attr-defined]
+
+            for source, state in zip(control.sources, control.poll()):
+                bundle = state["page_bundle_bytes"]
+                _C.publish_instance_reclaimable(
+                    source["gpu"], source["instance"], source["generation"],
+                    *(level * bundle for level in levels))
+        else:
+            from kvcached.vmm_ops import set_kv_reclaimable
+
+            bundle = self._memory_limit_page_bundle_bytes()
+            set_kv_reclaimable(*(level * bundle for level in levels), self.group_id)
+        self._posted_reclaimable = levels
+
+    @synchronized
+    def note_pending_release(self, pages: int) -> None:
+        """Reserve this step's allowance for its engine-deferred block batches."""
+        allowance = getattr(self, "_priority_release_allowance", 0)
+        promised = min(allowance, max(0, int(pages)))
+        self._priority_release_allowance = allowance - promised
+        self._pending_release_pages = getattr(self, "_pending_release_pages", 0) + promised
+        # Even after another free consumes the promise, the deferred request's
+        # surplus must stay protected until its own batch has drained.
+        self._priority_deferred_active = True
+
+    @synchronized
+    def reconcile_pending_release(self, active: bool) -> None:
+        self._priority_deferred_active = active
+        if not active:
+            self._pending_release_pages = 0
+
+    @synchronized
+    def post_reclaimable_levels(self) -> None:
+        """Post this pool's pre-mapped pages, reclaimable cache and retired
+        pages (released, not yet unmapped). Engine thread only."""
+        self.post_reclaimable(*self._reclaimable_levels())
+
+    def _reclaimable_levels(self) -> tuple[int, int, int]:
+        empty = self.page_allocator.get_num_reserved_pages() + len(self._priority_empty_ids())
+        releasing = (len(getattr(self, "_priority_retired_ids", ()))
+                     + getattr(self, "_priority_reserve_debt", 0)
+                     + getattr(self, "_pending_release_pages", 0))
+        empty = max(0, empty - getattr(self, "_priority_reserve_debt", 0))
+        cache = sum(count() for count, _ in self._live_cache_owners())
+        return empty, cache, releasing
+
+    def reclaim_plan_pages(self) -> Dict[str, int]:
+        """Pages to release now for higher priorities' headroom and demand, by tier.
+
+        Under TP each GPU's ledger plans in its own page size; the largest
+        ask wins, since every page spans all of them.
+        """
+        plan = dict.fromkeys(self._RECLAIM_TIERS, 0)
+        if getattr(self, "world_size", 1) > 1 or getattr(self, "_uses_worker_ipc", False):
+            control = self._worker_control()
+            states = control.poll(force=True) if control is not None else ()
+        else:
+            try:
+                from kvcached.vmm_ops import kv_reclaim
+            except ImportError:  # an extension built without it
+                return plan
+            raw = kv_reclaim(self.group_id)
+            states = ({"page_bundle_bytes": self._memory_limit_page_bundle_bytes(),
+                       "reclaim_limit_bytes": raw["limit_bytes"],
+                       **{f"reclaim_{tier}_bytes": raw[f"{tier}_bytes"]
+                          for tier in self._RECLAIM_TIERS}},)
+        limits = []
+        for state in states:
+            bundle = state["page_bundle_bytes"]
+            if not bundle:
+                continue
+            limits.append(int(state["reclaim_limit_bytes"]) // bundle)
+            for tier in self._RECLAIM_TIERS:
+                pages = -(-int(state.get(f"reclaim_{tier}_bytes", 0)) // bundle)
+                plan[tier] = max(plan[tier], pages)
+        # A page spans every worker. Ceil each ask, but never release more
+        # whole pages than ANY worker can spare above its floor. The limit
+        # applies to the sum of tiers, not separately to each tier.
+        left = min(limits, default=0)
+        for tier in self._RECLAIM_TIERS:
+            plan[tier] = min(plan[tier], left)
+            left -= plan[tier]
+        return plan
+
+    def _priority_empty_ids(self) -> list[int]:
+        retiring = self._retiring_page_ids()
+        return [page_id for page_id in getattr(self, "_priority_retained_ids", ())
+                if page_id not in retiring and page_id in self.avail_pages
+                and self.avail_pages[page_id].empty()]
+
+    @synchronized
+    def occupied_pages(self) -> int:
+        """Mapped pages that still hold blocks or wait to be reused.
+
+        Pages retired for a deferred physical release count as released.
+        """
+        retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", None) or ())
+        return len(self.full_pages) + len(self.avail_pages) - retiring
+
+    @synchronized
+    def evict_cache_pages(self, pages: int) -> int:
+        """Evict up to ``pages`` whole pages of prefix cache; returns how many."""
+        left = pages
+        for _, evict in self._live_cache_owners():
+            if left <= 0:
+                break
+            left -= max(0, int(evict(left)))
+        return pages - max(0, left)
+
+    @synchronized
+    def release_empty_pages(self, max_pages: int) -> int:
+        """Unmap up to ``max_pages`` pre-mapped pages; returns how many."""
+        if max_pages <= 0:
+            return 0
+        try:
+            to_trim = min(max_pages, self.page_allocator.get_num_reserved_pages())
+            self._priority_reserve_debt = getattr(self, "_priority_reserve_debt", 0) + to_trim
+            released = int(self.page_allocator.trim(to_trim)) if to_trim else 0
+            self._priority_reserve_debt -= released
+            # Surplus pages kept above min live in the Python pool, not the
+            # native reserve. Only already-barrier-safe empty pages qualify.
+            page_ids = self._priority_empty_ids()[:max_pages - released]
+            if page_ids:
+                landed = self.page_allocator._free_pages_with_receipt(page_ids)
+                for page_id in page_ids:
+                    page = self.avail_pages.pop(page_id)
+                    self.num_avail_blocks -= page.num_free_blocks()
+                    self._priority_retained_ids.discard(page_id)
+                released += len(page_ids) - landed
+                # Record the reserve obligation before trim can throw.
+                self._priority_reserve_debt = getattr(self, "_priority_reserve_debt", 0) + landed
+                trimmed = int(self.page_allocator.trim(landed)) if landed else 0
+                self._priority_reserve_debt -= trimmed
+                released += trimmed
+        except Exception as e:
+            self._record_native_fatal("trim", e)
+            raise
+        self._avail_physical_pages_cache = None
+        return released
+
+    def _claim_priority_retired_pages(self, page_ids: Iterable[int]) -> None:
+        group = getattr(self, "_priority_reclaim_group", None)
+        if group is not None:
+            if group.active:
+                for page_id in page_ids:
+                    group.claim(self, page_id)
+            return
+        pending = getattr(self, "_pending_release_pages", 0)
+        allowance = getattr(self, "_priority_release_allowance", 0) + pending
+        claimed = set(getattr(self, "_priority_retired_ids", ()))
+        for page_id in page_ids:
+            if allowance <= 0:
+                break
+            if page_id not in claimed:
+                claimed.add(page_id)
+                retained = getattr(self, "_priority_retained_ids", None)
+                if retained is not None:
+                    retained.discard(page_id)
+                allowance -= 1
+                pending = max(0, pending - 1)
+        self._priority_retired_ids = claimed
+        self._pending_release_pages = pending
+        self._priority_release_allowance = allowance - pending
+
+    def _refund_priority_reserve(self) -> None:
+        debt = getattr(self, "_priority_reserve_debt", 0)
+        if not debt:
+            return
+        try:
+            released = int(self.page_allocator.trim(debt))
+        except Exception as e:
+            self._record_native_fatal("trim", e)
+            raise
+        self._avail_physical_pages_cache = None
+        self._priority_reserve_debt = debt - released
+        self.post_reclaimable_levels()
+        if self._priority_reserve_debt:
+            raise RuntimeError("priority release is still awaiting physical refund")
+
+    @_after_post_init
+    @synchronized
+    def reclaim_for_priority(self) -> int:
+        """Release what higher priorities' headroom and demand ask of this pool (#585).
+
+        Empty pre-mapped pages go first, then whole pages of prefix cache;
+        pages that eviction puts back on the reserve are unmapped too. Engine
+        thread only. Returns the pages still asked of running requests, which
+        only the engine can preempt.
+        """
+        self._wait_post_init()
+        group = getattr(self, "_priority_reclaim_group", None)
+        if group is not None:
+            return group.reclaim()
+        self._refund_priority_reserve()
+        self.post_reclaimable_levels()
+        plan = self.reclaim_plan_pages()
+        # Unfulfilled asks may change each step. Retired pages already promised
+        # to peers remain guarded until their actual native trim/refund.
+        self._priority_reclaim_active = (any(plan.values())
+                                         or getattr(self, "_priority_deferred_active", False))
+        self._priority_release_allowance = plan["cache"] + plan["running"]
+        self._claim_priority_retired_pages(self._retiring_page_ids())
+        if not plan["empty"] and not plan["cache"]:
+            self.post_reclaimable_levels()
+            return min(plan["running"], self._priority_release_allowance)
+        # Existing retirements already consume part of this step's release ask.
+        self.evict_cache_pages(min(plan["cache"], self._priority_release_allowance))
+        self.release_empty_pages(plan["empty"])
+        self._increment_operation_counter("priority_reclaims_total")
+        self.post_reclaimable_levels()
+        return min(plan["running"], self._priority_release_allowance)
+
     def free_reserved(self):
         if self.reserved_blocks:
             # Detach first: once off the ledger the blocks are ordinary
@@ -1073,17 +1716,11 @@ class KVCacheManager:
             self.free(blocks)
 
     def _apply_resize_target(self) -> None:
-        new_mem_size = self.page_allocator.get_resize_target()
-        # -1 means nothing published; 0 is a valid limit.
-        if (new_mem_size >= 0 and
-                new_mem_size != getattr(self, "_rejected_resize_target", None)):
-            try:
-                self.resize(new_mem_size)
-            except QuarantinedResizeError:
-                self._rejected_resize_target = new_mem_size
-                self._resize_rejected = True
-                logger.warning("Automatic resize rejected: pool has quarantined pages")
+        control = getattr(self, "_runtime_control", None)
+        if control is not None:
+            control.apply()
 
+    @_after_post_init
     @synchronized
     def apply_resize_target(self) -> None:
         """Apply the limit published through the shared segment (kvctl).
@@ -1093,6 +1730,7 @@ class KVCacheManager:
         self._wait_post_init()
         self._apply_resize_target()
 
+    @_after_post_init
     @synchronized
     def reclaim_for_shrink(self) -> None:
         """Evict cached pages a pending shrink waits for. Engine thread only.
@@ -1124,10 +1762,19 @@ class KVCacheManager:
             return
         self._reclaiming_for_shrink = True
         try:
+            if self._priority_empty_ids():
+                # Consume already-empty pages before asking an engine to evict
+                # useful prefixes. The remaining excess then reflects live KV.
+                self._maybe_finish_shrink()
             for ref in self._shrink_reclaimers:
                 callback = ref()
                 if callback is not None and self.in_shrink:
                     callback()
+            # resize() may have released the last reserved blocks before it
+            # entered shrink. Complete that target on the engine thread even
+            # when there are no cache owners left to free anything. Retired
+            # pages still wait for their existing physical-release barrier.
+            self._maybe_finish_shrink()
         finally:
             self._reclaiming_for_shrink = False
 
@@ -1137,23 +1784,41 @@ class KVCacheManager:
 
         Retired pages are already empty and only wait for physical release.
         """
-        if not self.in_shrink or self.target_num_blocks is None:
+        if not self.in_shrink or self.target_num_pages is None:
             return 0
-        target_pages = (self.target_num_blocks * self.block_mem_size
-                        // self.page_size)
         retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
         occupied = len(self.full_pages) + len(self.avail_pages) - retiring
-        return max(0, occupied - target_pages)
+        return max(0, occupied - self.target_num_pages)
+
+    @property
+    def target_num_blocks(self) -> Optional[int]:
+        """Block equivalent for diagnostics; shrink execution uses whole pages."""
+        target_pages = getattr(self, "target_num_pages", None)
+        if target_pages is None:
+            return None
+        return target_pages * self.page_size // self.block_mem_size
+
+    def _unreusable_page_ids(self) -> frozenset:
+        if getattr(self, "in_shrink", False):
+            return self._retiring_page_ids()
+        return (frozenset(getattr(self, "_priority_retired_ids", ()))
+                | (self._retiring_page_ids()
+                   & frozenset(getattr(self, "_priority_retained_ids", ()))))
 
     def _retiring_page_ids(self) -> frozenset:
         return frozenset(
             page_id for _, page_ids in getattr(self, "_retired_pages", [])
             for page_id in page_ids)
 
+    @_after_post_init
     @synchronized
     def resize(self, new_mem_size: int):
         self._increment_operation_counter("resize_requests_total")
         try:
+            # A watcher value already visible at API entry is older than this
+            # target, even if the engine has not applied it yet. Commit the
+            # snapshot only after a successful (possibly deferred) resize.
+            observed_target = self.page_allocator.get_resize_target()
             resized = self._resize(new_mem_size)
         except Exception:
             self._record_operation_error(
@@ -1166,6 +1831,11 @@ class KVCacheManager:
             self._increment_operation_counter("resize_successes_total")
         else:
             self._increment_operation_counter("resize_deferred_total")
+        # The latest published target wins: the retained kvctl quota is not
+        # applied again over this one. _apply_resize_target() marks the quota
+        # as the latest when it is the caller.
+        self._kvctl_target = observed_target
+        self._kvctl_target_is_latest = False
         return resized
 
     def _resize(self, new_mem_size: int):
@@ -1179,12 +1849,20 @@ class KVCacheManager:
         # re-reads the driver instead of serving pre-resize data.
         self._avail_physical_pages_cache = None
         assert new_mem_size >= 0, "new_mem_size must be non-negative"
+        # A kvctl quota can exceed the startup size, but the KV tensors only
+        # reserve mem_size, so the pool cannot grow past it.
+        new_mem_size = min(new_mem_size, self.mem_size)
+        # The permanent null block pins one page. Keep the control limit
+        # unchanged, but give the allocator a reachable physical target so
+        # it reclaims every other page before background preallocation resumes.
+        target_pages = max(int(getattr(self, "null_block", None) is not None),
+                           new_mem_size // self.page_size)
         try:
-            resized = self.page_allocator.resize(new_mem_size)
+            resized = self.page_allocator.resize(target_pages * self.page_size)
         except QuarantinedResizeError:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
                 self._resize_rejected = True
             raise
         except Exception as e:
@@ -1197,7 +1875,7 @@ class KVCacheManager:
         if resized:
             if self.in_shrink:
                 self.in_shrink = False
-                self.target_num_blocks = None
+                self.target_num_pages = None
             return True  # Successfully resized.
         # Failed to resize due to too many in-use blocks. Free any
         # outstanding reserved blocks before entering the lazy shrink wait.
@@ -1207,9 +1885,10 @@ class KVCacheManager:
         assert (len(self.reserved_blocks) == 0
                 ), "Reserved blocks must be freed before resizing."
         self.in_shrink = True
-        self.target_num_blocks = new_mem_size // self.block_mem_size
+        self.target_num_pages = target_pages
         return False
 
+    @_after_post_init
     @synchronized
     def trim(self) -> None:
         self._increment_operation_counter("trim_requests_total")
@@ -1239,128 +1918,90 @@ class KVCacheManager:
         # for the same grow-direction mutation, so trim() does too.
         self._avail_physical_pages_cache = None
 
-    @synchronized
-    def set_memory_limit(
-        self,
-        limit_bytes: int,
-        *,
-        revision: int,
-    ) -> Dict[str, Any]:
-        """Apply a revisioned memory limit through the existing resize path."""
-        limit_bytes = int(limit_bytes)
-        revision = int(revision)
-        if limit_bytes < 0:
-            raise ValueError("limit_bytes must be non-negative")
-        if revision < 0:
-            raise ValueError("revision must be non-negative")
+    def set_memory_limit(self, limit_bytes: int, *, revision=None, generations=None):
+        """Publish an instance-per-GPU limit through the common native authority."""
+        from kvcached.control import set_instance_memory_limit
 
-        current_revision = self._memory_limit_revision
-        current_limit = self._memory_limit_bytes
-        if revision < current_revision:
-            return self._memory_limit_state(status="stale")
-        if revision == current_revision and current_limit == limit_bytes:
-            return self._memory_limit_state()
-        if revision == current_revision:
-            return self._memory_limit_state(status="conflict")
+        if not isinstance(limit_bytes, int) or not 0 <= limit_bytes <= (1 << 64) - 1:
+            raise ValueError("limit_bytes must be a uint64 byte count")
+        if getattr(self, "_runtime_control", None) is None:
+            raise RuntimeError("runtime control is unavailable before engine initialization")
+        return set_instance_memory_limit(limit_bytes, revision=revision,
+                                         generations=generations,
+                                         instance_name=self._control_instance_name())
 
-        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
-        max_pages = self.mem_size // self.page_size
-        target_pages = min(limit_bytes // page_bundle_bytes, max_pages)
-        effective_limit_bytes = target_pages * page_bundle_bytes
-
-        self.resize(target_pages * self.page_size)
-        self._memory_limit_bytes = limit_bytes
-        self._memory_limit_effective_bytes = effective_limit_bytes
-        self._memory_limit_revision = revision
-        return self._memory_limit_state()
+    def _control_instance_name(self) -> str:
+        runtime = getattr(self, "_runtime_control", None)
+        if runtime is None:
+            raise RuntimeError("runtime control is unavailable before engine initialization")
+        names = {source["instance"] for source in runtime.sources}
+        if len(names) != 1:
+            raise RuntimeError("runtime control sources disagree on instance identity")
+        return names.pop()
 
     def _memory_limit_page_bundle_bytes(self) -> int:
         return self.page_size * self.num_layers * self.num_kv_buffers
 
-    def _memory_limit_state(
-        self,
-        *,
-        status: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        page_state = self.page_allocator.get_page_state()
-        page_bundle_bytes = self._memory_limit_page_bundle_bytes()
-        mapped_pages = (int(page_state["inuse_pages"])
-                        + int(page_state["reserved_pages"]))
-        mapped_bytes = mapped_pages * page_bundle_bytes
-        effective_limit_bytes = self._memory_limit_effective_bytes
-        if status is None:
-            status = ("rejected" if getattr(self, "_resize_rejected", False) else
-                      "deferred" if self.in_shrink else "applied")
-        return {
-            "status": status,
-            "pool_name": str(self.pool_name or ""),
-            "group_id": self.group_id,
-            "limit_bytes": self._memory_limit_bytes,
-            "effective_limit_bytes": effective_limit_bytes,
-            "current_capacity_bytes": (
-                int(page_state["total_pages"]) * page_bundle_bytes
-            ),
-            "revision": self._memory_limit_revision,
-            "mapped_bytes": mapped_bytes,
-            "remaining_bytes": (
-                None if effective_limit_bytes is None else
-                max(0, effective_limit_bytes - mapped_bytes)
-            ),
-            "overage_bytes": (
-                0 if effective_limit_bytes is None else
-                max(0, mapped_bytes - effective_limit_bytes)
-            ),
-            "reason": {
-                "deferred": "inuse_capacity_above_limit",
-                "rejected": "quarantined_pages_prevent_resize",
-                "conflict": "revision_reused_with_different_limit",
-            }.get(status, ""),
-        }
-
-    @synchronized
     def memory_limit_state(self) -> Dict[str, Any]:
-        """Return the current revisioned resize limit and apply state."""
-        return self._memory_limit_state()
+        """Read instance-wide control state from the native ledger."""
+        from kvcached.control import get_instance_memory_limit
+
+        return get_instance_memory_limit(self._control_instance_name())
 
     @synchronized
     def available_size(self) -> int:
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
-        if self.in_shrink:
-            # alloc() does not reuse pages retired for a pending shrink.
-            for page_id in self._retiring_page_ids():
+        if self.in_shrink or self._unreusable_page_ids():
+            # alloc() does not reuse pages retired for a pending shrink or a
+            # higher priority.
+            for page_id in self._unreusable_page_ids():
                 page = self.avail_pages.get(page_id)
                 if page is not None:
                     avail_blocks -= page.num_free_blocks()
-        # Also surfaces a fatal background-preallocation failure during shrink.
+        # Every native capacity read can observe a background-preallocation
+        # failure, including one that races after the first read.
         try:
             virtual_free_pages = self.page_allocator.get_num_free_pages()
+            if self.in_shrink:
+                blocks_from_free_pages = 0
+            else:
+                physical_free_pages = self._get_cached_avail_physical_pages()
+                if self.page_size % self.block_mem_size == 0:
+                    free_pages = min(
+                        virtual_free_pages,
+                        physical_free_pages
+                        + self.page_allocator.get_num_reserved_pages())
+                    blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
+                        self.page_size, self.block_mem_size)
+                else:
+                    # The actual capacity depends on page ID. The native
+                    # snapshot follows alloc_page(): backed reserved pages
+                    # first, then affordable pages from its free list.
+                    max_block_id = getattr(self, "max_block_id", None)
+                    if max_block_id is None:
+                        blocks_from_free_pages = (
+                            self.page_allocator.get_allocatable_block_capacity(
+                                self.block_mem_size, physical_free_pages))
+                    else:
+                        blocks_from_free_pages = (
+                            self.page_allocator.get_allocatable_block_capacity(
+                                self.block_mem_size, physical_free_pages,
+                                max_block_id))
         except Exception as e:
-            # This is the capacity check on the alloc path: it raises before
-            # _alloc()'s own alloc_page() classification is reached, so the
-            # verdict must be recorded here or the phase never leaves
-            # DEGRADED (the #478 review's T4 repro).
+            # This check precedes _alloc()'s alloc_page() classification.
             self._record_native_fatal("available_size", e)
             raise
-        if self.in_shrink:
-            blocks_from_free_pages = 0
-        else:
-            physical_free_pages = (
-                self._get_cached_avail_physical_pages()
-                + self.page_allocator.get_num_reserved_pages())
-            free_pages = min(virtual_free_pages, physical_free_pages)
-            # The allocator exposes only a COUNT of free pages, not their ids,
-            # so this term can't use the boundary-aware _page_capacity
-            # (capacity depends on page_id; some ids yield zero usable blocks
-            # when block_mem_size does not divide page_size — see _alloc's
-            # 0-block parking at kv_cache_manager.py:335). get_num_blocks is
-            # the theoretical page_size // block_mem_size, so this is an UPPER
-            # BOUND; the precise accounting in _get_num_alloced_blocks and
-            # get_page_occupancy uses _page_capacity / get_block_range. A
-            # precise fix here needs page-id enumeration from the allocator
-            # (a C++ change, out of scope).
-            blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
-                self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        available = avail_blocks + blocks_from_free_pages
+        logical_num_blocks = getattr(self, "logical_num_blocks", None)
+        if logical_num_blocks is not None:
+            # Reserved blocks have left their pages but remain available for
+            # the next alloc(), just as in the physical capacity above.
+            logical_available = max(
+                0, logical_num_blocks - self._logical_allocated_blocks
+                + len(self.reserved_blocks)
+            )
+            available = min(available, logical_available)
+        return available
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().
@@ -1390,6 +2031,13 @@ class KVCacheManager:
                 < _AVAIL_PHYSICAL_PAGES_TTL_S):
             return cached
         result: int = self.page_allocator.get_avail_physical_pages()
+        control = self._worker_control()
+        if control is not None:
+            # The ledgers are the workers'. Each GPU's state carries what this
+            # instance can still be granted there, net of its watermark.
+            result = min([result] + [
+                state["available_bytes"] // state["page_bundle_bytes"]
+                for state in control.poll() if state["page_bundle_bytes"]])
         self._avail_physical_pages_cache = result
         self._avail_physical_pages_ts = now
         return result
@@ -1414,9 +2062,10 @@ class KVCacheManager:
             # Blocks straddling a page boundary belong to neither page, so a
             # page's capacity comes from its own block range rather than from
             # page_size // block_mem_size.
-            start, end = InternalPage.get_block_range(page_id, self.page_size,
-                                                      self.block_mem_size)
-            occupancy[page_id] = (end - start) - page.num_free_blocks()
+            capacity = _page_capacity(
+                page_id, self.page_size, self.block_mem_size,
+                max_block_id=getattr(self, "max_block_id", None))
+            occupancy[page_id] = capacity - page.num_free_blocks()
         return occupancy
 
     @synchronized
@@ -1515,6 +2164,7 @@ class KVCacheManager:
         return (counters, getattr(self, "_last_error_code", None),
                 getattr(self, "_last_error_timestamp_ns", None))
 
+    @_after_post_init
     @synchronized
     def clear(self):
         self._increment_operation_counter("clear_requests_total")
@@ -1559,6 +2209,10 @@ class KVCacheManager:
             raise
 
     def _clear_locked(self) -> None:
+        if getattr(self, "_copy_job_pages", None):
+            # clear() releases every page, including those a pending KV copy
+            # still uses; only SGLang calls it, and SGLang never pins pages.
+            raise StateConsistencyError("clear() while KV copy jobs are pending")
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
@@ -1568,6 +2222,13 @@ class KVCacheManager:
 
         # Clear reserved blocks
         self.free_reserved()
+
+        # A runtime zero cap forbids new physical grants. Keep the mandatory
+        # null page charged across clear(), rather than temporarily overriding
+        # the instance cap to rebuild it.
+        retained_null_page = None
+        if getattr(self, "_runtime_control", None) is not None and self.null_block == [0]:
+            retained_null_page = self.avail_pages.get(0, self.full_pages.get(0))
 
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = [
@@ -1579,6 +2240,8 @@ class KVCacheManager:
             pages_to_free.append(page.page_id)
         for page in self.full_pages.values():
             pages_to_free.append(page.page_id)
+        if retained_null_page is not None:
+            pages_to_free = [page_id for page_id in pages_to_free if page_id != 0]
         if pages_to_free:
             pages_to_free = list(dict.fromkeys(pages_to_free))
             self.page_allocator.free_pages(pages_to_free)
@@ -1590,8 +2253,17 @@ class KVCacheManager:
                 len(pages_to_free),
             )
         self._retired_pages = []
+        self._priority_retired_ids = set()
+        self._priority_retained_ids = set()
+        self._priority_reclaim_active = False
+        self._priority_release_allowance = 0
+        self._pending_release_pages = 0
+        self._priority_deferred_active = False
+        self._priority_reserve_debt = 0
+        self._retire_fence = {}
         self.avail_pages.clear()
         self.full_pages.clear()
+        self._logical_allocated_blocks = 0
         self.null_block = None
 
         # Trim the page allocator to free up reserved pages
@@ -1604,15 +2276,39 @@ class KVCacheManager:
         # (which yields block 0 — the null block SGLang requires).
         self.page_allocator.reset_free_page_order()
 
-        self.target_num_blocks = None
+        self.target_num_pages = None
         self.in_shrink = False
         # clear() freed every page and trimmed; drop the cached value so
         # the next available_size() re-reads the post-clear physical state.
         self._avail_physical_pages_cache = None
         self.num_avail_blocks = 0
 
-        # Possibly reserve the first block as null block for padding tokens
-        self._reserve_null_block()
+        # Possibly reserve the first block as null block for padding tokens.
+        group = getattr(self, "_priority_reclaim_group", None)
+        if group is not None:
+            group.cancel()
+            group.publish()
+        if retained_null_page is None:
+            self._reserve_null_block()
+        else:
+            if self.max_block_id is None:
+                retained_null_page.init(self.block_mem_size)
+            else:
+                retained_null_page.init(self.block_mem_size, self.max_block_id)
+            reserved_null = retained_null_page.alloc(1)
+            assert reserved_null == [0]
+            self.null_block = [0]
+            self._logical_allocated_blocks = 1
+            self.num_avail_blocks = retained_null_page.num_free_blocks()
+            target = self.avail_pages if self.num_avail_blocks else self.full_pages
+            target[0] = retained_null_page
+        # Reapply the accepted revision after clear reset the execution state.
+        runtime = getattr(self, "_runtime_control", None)
+        if runtime is not None:
+            runtime.executing = ()
+            runtime.acknowledged = ()
+        if not self._shutdown_requested.is_set():
+            self._apply_resize_target()
 
     # Private methods
     @synchronized
@@ -1629,13 +2325,15 @@ class KVCacheManager:
         # kv_cache_manager.py:335) contributes nothing here, whereas the
         # previous len(self.full_pages) * get_num_blocks(...) inflated it.
         blocks_from_full_pages = sum(
-            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            _page_capacity(page_id, self.page_size, self.block_mem_size,
+                           max_block_id=getattr(self, "max_block_id", None))
             for page_id in self.full_pages)
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
         blocks_from_avail_pages = sum(
-            _page_capacity(page_id, self.page_size, self.block_mem_size)
+            _page_capacity(page_id, self.page_size, self.block_mem_size,
+                           max_block_id=getattr(self, "max_block_id", None))
             for page_id in self.avail_pages) - self.num_avail_blocks
         return blocks_from_full_pages + blocks_from_avail_pages

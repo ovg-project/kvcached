@@ -24,6 +24,10 @@ class EngineSpec:
     env: tuple[tuple[str, str], ...] = ()
 
 
+# The servers never ask the Hub, which rate-limits anonymous requests: the run
+# fetches the weights once before any server starts (run.py fetch_models).
+OFFLINE = (("HF_HUB_OFFLINE", "1"),)
+
 ENGINES = {
     "vllm": EngineSpec(
         name="vllm",
@@ -34,7 +38,7 @@ ENGINES = {
         tokens_re=r"GPU KV cache size: ([\d,]+) tokens",
         # MRV2 explicitly, so an unsupported model fails instead of silently
         # falling back to the V1 runner. DEV_MODE enables /reset_prefix_cache.
-        env=(("VLLM_USE_V2_MODEL_RUNNER", "1"), ("VLLM_SERVER_DEV_MODE", "1")),
+        env=(*OFFLINE, ("VLLM_USE_V2_MODEL_RUNNER", "1"), ("VLLM_SERVER_DEV_MODE", "1")),
     ),
     "sglang": EngineSpec(
         name="sglang",
@@ -43,6 +47,7 @@ ENGINES = {
         required_patches=("elastic_allocator", "elastic_memory_pool"),
         capacity_re=r"max_total_num_tokens=(\d+)",
         tokens_re=r"max_total_num_tokens=(\d+)",
+        env=OFFLINE,
     ),
 }
 
@@ -190,7 +195,9 @@ class Group:
 class ElasticPair:
     """Two kvcached servers sharing one GPU. Both run with a batch limit of
     ELASTIC_BATCH, so that their load can fill most of the free GPU memory;
-    the extra arguments are appended after it.
+    the extra arguments are appended after it. With tp_a, A spans the run's
+    first tp_a GPUs and B is pinned to the run's GPU gpu_b, the one whose
+    memory they contend for: a shortfall there reaches one rank of A only.
     """
     engine_a: str
     model_a: str
@@ -198,10 +205,14 @@ class ElasticPair:
     model_b: str
     extra_args_a: tuple[str, ...] = ()
     extra_args_b: tuple[str, ...] = ()
+    tp_a: int = 1
+    gpu_b: int = 0
 
     @property
     def name(self) -> str:
-        return f"elastic-{self.engine_a}-{self.model_a}+{self.engine_b}-{self.model_b}"
+        a = f"{self.engine_a}-{self.model_a}" + (f"-tp{self.tp_a}" if self.tp_a > 1 else "")
+        b = f"{self.engine_b}-{self.model_b}" + (f"-gpu{self.gpu_b}" if self.gpu_b else "")
+        return f"elastic-{a}+{b}"
 
 
 @dataclass(frozen=True)
@@ -242,7 +253,8 @@ PROFILES = {
     "smoke": Profile(groups=groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",))),
     # Run inside the weekly H100 sandbox, next to the performance runs.
     "hopper": Profile(groups=(Group("vllm", "qwen38_27b", layouts=("c1",)),)),
-    "nightly": Profile(
+    # On pull requests, by /ci run.
+    "basic": Profile(
         groups=groups(("vllm", "sglang"), ("qwen05b", "qwen35_4b", "gemma4e2b")),
         elastic=(ElasticPair("vllm", "qwen05b", "vllm", "qwen35_4b"),
                  ElasticPair("sglang", "qwen05b", "sglang", "qwen35_4b")),
@@ -255,7 +267,10 @@ PROFILES = {
                     tp=2),
             *groups(("vllm", "sglang"), ("qwen05b",), layouts=("c1",), fp8_kv=True),
         ),
-        # Two different engines sharing GPU 0.
-        elastic=(ElasticPair("vllm", "qwen05b", "sglang", "qwen35_4b"),),
+        # A TP=2 server whose rank 1 shares GPU 1 with a vLLM server, so that
+        # only that rank runs short, and two engines share a GPU. B's weights
+        # leave GPU 1 little room, so the loads the harness sizes to it
+        # exceed what is free once both are on it (#577 has the numbers).
+        elastic=(ElasticPair("sglang", "qwen35_4b", "vllm", "qwen35_4b", tp_a=2, gpu_b=1),),
     ),
 }

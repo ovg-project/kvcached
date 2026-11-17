@@ -185,8 +185,14 @@ class SGLangClient(EngineClient):
                       mi.get("cached_tokens"), dt)
 
     def reset_prefix_cache(self) -> bool:
-        status, _, _ = _post(self.base + "/flush_cache", {}, 120)
-        return status == 200
+        # The scheduler drops finished requests on its next iteration, so a
+        # flush right after the last response can be refused (400) as pending.
+        deadline = time.time() + 30
+        while True:
+            status, _, _ = _post(self.base + "/flush_cache", {}, 120)
+            if status != 400 or time.time() > deadline:
+                return status == 200
+            time.sleep(0.5)
 
 
 def make_client(engine: str, host: str, port: int) -> EngineClient:

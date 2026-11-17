@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
-import importlib
+import importlib.util
 import sys
 import types
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -95,10 +96,22 @@ def _load_sglang_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "posix_ipc", mock.MagicMock())
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
 
-    from kvcached.integration.sglang import interfaces, patches
+    import kvcached.integration.sglang as package
 
-    importlib.reload(interfaces)
-    importlib.reload(patches)
+    # Reloading a shared module changes exception identities in tests that
+    # already imported its classes. Restore both import paths at teardown.
+    modules = []
+    for name in ("interfaces", "patches"):
+        qualified = f"kvcached.integration.sglang.{name}"
+        path = Path(__file__).resolve().parents[1] / "kvcached/integration/sglang" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(qualified, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, qualified, module)
+        monkeypatch.setattr(package, name, module, raising=False)
+        spec.loader.exec_module(module)
+        modules.append(module)
+    interfaces, patches = modules
     return interfaces, patches, torch_mock
 
 
