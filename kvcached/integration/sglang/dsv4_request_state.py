@@ -43,7 +43,7 @@ class RequestStateBacking:
         self.failed = False
         self.admission_budget: int | None = None
         self.capacity_override: int | None = None
-        self.demand_rows: set[int] = set()
+        self.demand_rows: list[int] = []
         self.standby_reclaimable = lambda: True
         self._alloc_rows = pool.alloc_rows
         self._free_rows = pool.free_rows
@@ -67,7 +67,6 @@ class RequestStateBacking:
                 ids = self._ids(rows, stride, banks)
                 added = ids - backing.live
                 if not backing.acquire(ids):
-                    self.demand_rows.update(rows)
                     for previous, additions in reversed(acquired):
                         previous.release(additions)
                     return False
@@ -111,6 +110,7 @@ class RequestStateBacking:
             if self._acquire(requested):
                 selected = requested
             else:
+                self.demand_rows = list(rows)
                 # Native allocation consumes the ordered tail. Find the largest
                 # backed tail instead of hiding a smaller usable batch after a
                 # full-window miss. Successful probes are nested and retained.
@@ -141,11 +141,15 @@ class RequestStateBacking:
     def managers(self) -> list[Any]:
         return [backing.manager for backing, _, _ in self.entries]
 
-    def backing_demand(self, needs_admission: bool) -> list[tuple[Any, int]]:
-        if not needs_admission:
+    def backing_demand(self, pending_rows: int) -> list[tuple[Any, int]]:
+        if pending_rows <= 0:
             self.demand_rows.clear()
+        # Probes cover the entire logical window. Forecast only the native
+        # tail needed by actual admissions, excluding rows already consumed.
+        rows = [row for row in self.demand_rows if row not in self.active]
+        needed = set(rows[-pending_rows:]) if pending_rows > 0 else set()
         return [(backing.manager, len(backing.missing_physical_pages(
-            self._ids(self.demand_rows, stride, banks))))
+            self._ids(needed, stride, banks))))
             for backing, stride, banks in self.entries]
 
     def can_reclaim_standby(self) -> bool:
@@ -232,6 +236,7 @@ class RequestStateBacking:
                 owner._free_rows(rows)
                 raise
             if not success:
+                owner.demand_rows = list(rows)
                 owner._free_rows(rows)
                 return None
             owner.active.update(rows)

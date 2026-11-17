@@ -444,13 +444,13 @@ def test_row_miss_reports_exact_bank_demand_until_recovery(request_module):
     for backing in backings:
         backing.manager.budget = 0
     assert owner.reserve(2) == 0
-    assert owner.backing_demand(True) == [(backing.manager, 3) for backing in backings]
+    assert owner.backing_demand(2) == [(backing.manager, 3) for backing in backings]
     for backing in backings:
         backing.manager.budget = 3
     assert owner.reserve(2) == 2
-    assert owner.backing_demand(True) == [(backing.manager, 0) for backing in backings]
-    owner.demand_rows = {1, 8}
-    owner.backing_demand(False)
+    assert owner.backing_demand(2) == [(backing.manager, 0) for backing in backings]
+    owner.demand_rows = [1, 8]
+    owner.backing_demand(0)
     assert not owner.demand_rows
 
 
@@ -481,7 +481,9 @@ def test_row_reclaimers_keep_active_and_promised_rows(request_module):
     assert all(backing.live == {8, 18} for backing in backings)
 
 
-def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, monkeypatch):
+@pytest.mark.parametrize("beam_width,pending,expected", [(1, 0, 8), (3, 2, 40)])
+def test_scheduler_posts_row_pressure_when_token_backing_fits(
+        request_module, monkeypatch, beam_width, pending, expected):
     from test_sglang_dsv4_native_backing import MODULE, Composite
     from test_sglang_dsv4_priority import PriorityManager
     from test_sglang_dsv4_runtime_reservation_patch import _load_sglang_modules
@@ -490,7 +492,7 @@ def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, mo
     token_manager, row_manager = PriorityManager(), PriorityManager()
     token_backing = MODULE.SWABacking(token_manager, native_pages=13, native_page_bytes=1,
                                      physical_page_bytes=32)
-    row_backing = MODULE.SWABacking(row_manager, native_pages=32, native_page_bytes=2,
+    row_backing = MODULE.SWABacking(row_manager, native_pages=32, native_page_bytes=8,
                                    physical_page_bytes=8)
     pool = NativeRows()
     owner = request_module.RequestStateBacking(pool, [dict(backing=row_backing, bank_stride=0, bank_count=1)])
@@ -499,18 +501,88 @@ def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, mo
     allocator = Composite(4)
     MODULE.bind_native_swa(allocator, token_backing)
     request = SimpleNamespace(origin_input_ids=[1, 2, 3, 4], prefix_indices=[], output_ids=[],
-                              sampling_params=SimpleNamespace(max_new_tokens=0))
+                              sampling_params=SimpleNamespace(max_new_tokens=0),
+                              beam_group=SimpleNamespace(beam_width=beam_width))
     scheduler = SimpleNamespace(token_to_kv_pool_allocator=allocator, req_to_token_pool=pool,
-                                waiting_queue=[request], chunked_req=None)
+                                waiting_queue=[request], chunked_req=None,
+                                beam_coordinator=SimpleNamespace(pending_member_rows=lambda _: pending))
     row_manager.step = 5
     with patches._sglang_demand_round(scheduler):
         assert row_manager.step == 0
-        assert owner.reserve(1) == 0
+        assert owner.reserve(pool.size) == 0
     post = getattr(sys.modules["kvcached.vmm_ops"], "set_kv_demand")
-    post.assert_called_once_with(8, 0)
+    post.assert_called_once_with(expected, 0)
+    # A chunk already holding a request row adds no new C128 pressure.
     scheduler.waiting_queue.clear()
+    request.kv = SimpleNamespace(req_pool_idx=8)
+    scheduler.chunked_req = request
+    pending = 0
     patches._sglang_post_demand(scheduler, 0)
     assert post.call_args.args == (0, 0)
+
+
+def test_busy_round_drives_real_c128_shrink_without_freeing_active_rows(request_module, monkeypatch):
+    import test_prefix_cache_shrink as fixture
+    from test_sglang_dsv4_native_backing import MODULE, Composite
+    from test_sglang_dsv4_priority import PriorityManager
+    from test_sglang_dsv4_runtime_reservation_patch import _load_sglang_modules
+
+    _, patches, _ = _load_sglang_modules(monkeypatch)
+    monkeypatch.setattr(fixture, "BLOCKS_PER_PAGE", 1)
+    monkeypatch.setattr(fixture.kcm, "InternalPage", fixture.FakePage)
+
+    def exact(page, ids):
+        if not set(ids) <= set(page.free_list):
+            return False
+        page.free_list = [value for value in page.free_list if value not in ids]
+        return True
+
+    def at(allocator, page_id):
+        if len(allocator.inuse) >= allocator.total_pages:
+            return None
+        assert page_id not in allocator.inuse
+        allocator.inuse.add(page_id)
+        return fixture.FakePage(page_id)
+
+    monkeypatch.setattr(fixture.FakePage, "get_free_blocks", lambda page: list(page.free_list), raising=False)
+    monkeypatch.setattr(fixture.FakePage, "alloc_exact", exact, raising=False)
+    monkeypatch.setattr(fixture.ShrinkablePageAllocator, "try_alloc_page_at", at, raising=False)
+    manager = fixture._make_manager(False)
+    manager._virtual_num_blocks = 16
+    manager.reserve_null_block = True
+    pool = NativeRows()
+    backing = SWABacking(manager, native_pages=9, native_page_bytes=1, physical_page_bytes=1)
+    owner = request_module.RequestStateBacking(pool, [dict(backing=backing, bank_stride=0, bank_count=1)])
+    owner.bind()
+    owner.register_reclaimers()
+    assert owner.reserve(8) == 8
+    assert pool.alloc_rows(1) == [8]
+    manager.resize(3)
+    assert manager.in_shrink and len(manager.page_allocator.inuse) == 9
+    token_backing = SWABacking(PriorityManager(), native_pages=13, native_page_bytes=1,
+                               physical_page_bytes=32)
+    allocator = Composite(4)
+    MODULE.bind_native_swa(allocator, token_backing)
+    scheduler = SimpleNamespace(token_to_kv_pool_allocator=allocator, req_to_token_pool=pool,
+                                waiting_queue=[], chunked_req=None)
+    # A promised lease remains protected even at the scheduling boundary.
+    owner.admission_budget = 1
+    with patches._sglang_demand_round(scheduler):
+        assert manager.in_shrink and len(owner.standby) == 7
+    owner.end_admission()
+    with patches._sglang_demand_round(scheduler):
+        assert not manager.in_shrink
+        assert owner.active == {8} and not owner.standby
+        assert manager.page_allocator.inuse == {0, 8}
+
+    def failed_resize():
+        raise RuntimeError("native resize failed")
+
+    monkeypatch.setattr(manager, "apply_resize_target", failed_resize)
+    with pytest.raises(RuntimeError, match="native resize failed"):
+        with patches._sglang_demand_round(scheduler):
+            pytest.fail("failed backing must stop before forward")
+    assert not patches._SGLANG_DEMAND.open
 
 
 def test_scheduler_registers_state_shrink_and_shared_allowance(request_module, monkeypatch):

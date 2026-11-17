@@ -460,6 +460,13 @@ def _sglang_demand_round(scheduler: Any):
     if getattr(_SGLANG_DEMAND, "open", False):
         yield
         return
+    request_state = _sglang_request_state(scheduler)
+    if request_state is not None and _sglang_parallel_size(scheduler) == 1:
+        # Exact claims do not drive shrink callbacks. Reclaim before promising
+        # row leases; backend failures must escape the best-effort reporting.
+        for member in request_state.managers():
+            member.apply_resize_target()
+            member.reclaim_for_shrink()
     _SGLANG_DEMAND.open = True
     _SGLANG_DEMAND.need = None
     _SGLANG_DEMAND.prefill_tried = False
@@ -760,7 +767,16 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
     demands = allocator._kvcached_backing_demand(need)
     request_state = _sglang_request_state(scheduler)
     if request_state is not None:
-        demands += request_state.backing_demand(bool(queue or getattr(scheduler, "chunked_req", None)))
+        candidates = list(queue)
+        chunked = getattr(scheduler, "chunked_req", None)
+        if chunked is not None and all(chunked is not request for request in candidates):
+            candidates.append(chunked)
+        pending = getattr(getattr(scheduler, "beam_coordinator", None), "pending_member_rows", None)
+        rows = pending(getattr(scheduler, "running_batch", None)) if callable(pending) else 0
+        for request in candidates:
+            if getattr(getattr(request, "kv", None), "req_pool_idx", None) is None:
+                rows += max(1, getattr(getattr(request, "beam_group", None), "beam_width", 1))
+        demands += request_state.backing_demand(rows)
     total_bytes = 0
     for manager, physical in demands:
         allocated = manager.take_step_alloc_blocks()
