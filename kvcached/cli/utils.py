@@ -27,6 +27,26 @@ def get_ipc_name(ipc_path: str) -> str:
     return os.path.basename(ipc_path)
 
 
+def get_segment_control(ipc_name: str, *, observe: bool = True):
+    """Resolve an advertised SGLang group segment to its instance ledger."""
+    from kvcached.control import _get_instance_memory_limit, get_instance_memory_limit
+
+    def query(name: str):
+        if observe:
+            return get_instance_memory_limit(name)
+        return _get_instance_memory_limit(name, observe=False)
+
+    name = get_ipc_name(ipc_name)
+    state = query(name)
+    # Prefer an exact instance, including user names that end in _g<digits>.
+    base, separator, group = name.rpartition("_g")
+    if not state["gpus"] and separator and base and group.isdecimal() and int(group) > 0:
+        owner = query(base)
+        if owner["gpus"]:
+            return owner
+    return state
+
+
 @dataclass
 class MemInfoStruct:
     total_size: int
@@ -59,21 +79,23 @@ class RwLockedShm:
 
     def __init__(self, file_path: str, size: int, lock_type: int, *, retain_usage: bool = False, create: bool = True):
         self.file_path = get_ipc_path(file_path)
-        # Always use r+b mode for memory mapping
-        self.mode = "r+b"
+        # Readers open read-only so a segment owned by another user (e.g. root
+        # in a container sharing /dev/shm) stays readable; flock(LOCK_SH)
+        # works on a read-only fd.
+        self.mode = "rb" if lock_type == self.RLOCK else "r+b"
         self.size = size
         self.lock_type = lock_type
         self.retain_usage = retain_usage
         self.create = create
 
     def __enter__(self):
-        flags = os.O_RDWR | os.O_CLOEXEC
+        flags = (os.O_RDONLY if self.mode == "rb" else os.O_RDWR) | os.O_CLOEXEC
         if self.lock_type == self.WLOCK and self.create:
             flags |= os.O_CREAT
         if self.retain_usage:
             flags |= getattr(os, "O_NOFOLLOW", 0)
         for _ in range(4):
-            self.file = os.fdopen(os.open(self.file_path, flags, 0o666), "r+b")
+            self.file = os.fdopen(os.open(self.file_path, flags, 0o666), self.mode)
             try:
                 if self.retain_usage and sys.platform.startswith("linux"):
                     control_segment.lock(self.file.fileno())
@@ -127,30 +149,30 @@ def get_kv_cache_limit(ipc_name: str) -> Optional[MemInfoStruct]:
         return None
 
 
-def update_kv_cache_limit(ipc_name: str,
-                          kv_cache_limit: int) -> Optional[MemInfoStruct]:
-    """
-    Update the kv cache limit for the current process.
-    """
-    try:
-        with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK, retain_usage=True, create=False) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            delta = kv_cache_limit - mem_info.total_size
-            if delta < 0:
-                if mem_info.used_size > kv_cache_limit:
-                    print(
-                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
-                    )
-            mem_info.total_size = kv_cache_limit
-            mem_info.write_to_buffer(mm)
-            human_limit = _format_size(kv_cache_limit)
-            print(
-                f"Updated kv cache limit for {ipc_name} to {human_limit} ({kv_cache_limit} bytes)"
-            )
-            return mem_info
-    except FileNotFoundError:
-        return None
+def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
+    """Publish through the same native path as the Python control frontend."""
+    import json
+
+    from kvcached.control import set_instance_memory_limit
+
+    result = set_instance_memory_limit(kv_cache_limit, instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+def update_kv_cache_controls(ipc_name: str, *, min_bytes: Optional[int] = None,
+                             priority: Optional[int] = None,
+                             headroom_bytes: Optional[int] = None):
+    """Publish min, priority or headroom like update_kv_cache_limit()."""
+    import json
+
+    from kvcached.control import set_instance_controls
+
+    result = set_instance_controls(
+        min_bytes=min_bytes, priority=priority, headroom_bytes=headroom_bytes,
+        instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
 
 
 # ---------------------------------------------------------------------------

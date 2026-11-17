@@ -5,6 +5,7 @@ import ast
 import functools
 import operator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event, RLock
 from types import SimpleNamespace
@@ -32,8 +33,10 @@ class Page:
         return ((page_id * page_size + block_size - 1) // block_size,
                 (page_id + 1) * page_size // block_size)
 
-    def init(self, block_size):
+    def init(self, block_size, max_block_id=None):
         start, end = self.get_block_range(self.page_id, self.page_size, block_size)
+        if max_block_id is not None:
+            end = min(end, max_block_id)
         self.free = list(range(start, end))
 
     def get_free_blocks(self):
@@ -100,7 +103,7 @@ def make_manager():
                  'StateConsistencyError': UnsafeMapping,
                  'QuarantinedResizeError': RejectedResize,
                  'logger': SimpleNamespace(warning=lambda message: None),
-                 'functools': functools}
+                 'functools': functools, 'nullcontext': nullcontext}
     exec(compile(ast.fix_missing_locations(module), str(source), 'exec'), namespace)
     manager = namespace['KVCacheManager']()
     manager._lock = RLock()
@@ -292,7 +295,7 @@ def test_zero_resize_target_is_applied_before_an_exact_claim():
         manager.available_size = lambda: 0
 
     manager.resize = resize
-    manager.page_allocator.resize_target = 0
+    manager._runtime_control = SimpleNamespace(apply=lambda: resize(0))
     assert manager.alloc_exact([2]) is None
     assert applied == [0]
     assert page.free == [2, 3]
@@ -350,3 +353,37 @@ def test_exact_claim_can_use_preallocated_physical_backing():
     manager.page_allocator.reserved_pages = 1
     assert manager.alloc_exact([4]) == [4]
     assert manager.page_allocator.calls == [1]
+
+
+def test_exact_claim_rejects_logical_id_tail_before_mapping():
+    manager = make_manager()
+    manager.max_block_id = 6
+    with pytest.raises(ValueError, match='logical ID bound'):
+        manager.alloc_exact([4, 6])
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([4]) == [4]
+    assert manager.avail_pages[1].free == [5]
+
+
+def test_unrequested_reservations_cannot_pay_for_fresh_exact_ids():
+    manager = make_manager()
+    manager.logical_num_blocks = 4
+    manager._logical_allocated_blocks = 4
+    manager.reserved_blocks = [1, 2]
+    page_for(manager, 0, [3])
+    assert manager.alloc_exact([3]) is None
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([1, 2]) == [1, 2]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 0
+
+
+def test_exact_claim_accounts_only_fresh_blocks_in_logical_and_step_limits():
+    manager = make_manager()
+    manager.logical_num_blocks = 6
+    manager._logical_allocated_blocks = 2
+    manager.reserved_blocks = [1]
+    page_for(manager, 0, [2, 3])
+    assert manager.alloc_exact([1, 2, 4]) == [1, 2, 4]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 2

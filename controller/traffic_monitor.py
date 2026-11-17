@@ -38,7 +38,8 @@ class ModelActivityStats:
     def add_request(self, request_stats: RequestStats):
         """Add a new request to the statistics"""
         self.total_requests += 1
-        self.last_activity_time = request_stats.timestamp
+        # Requests can finish in a different order from when they started.
+        self.last_activity_time = max(self.last_activity_time, request_stats.timestamp)
         self.request_timestamps.append(request_stats.timestamp)
 
         if request_stats.success:

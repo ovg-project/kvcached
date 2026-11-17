@@ -9,6 +9,8 @@ straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
 import functools
 import inspect
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 
@@ -129,6 +131,58 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     failed = False
     native_available = {id(child): child.available_size for child in (full, swa)}
     original_free_pages = {id(child): child.free_page_ids for child in (full, swa)}
+    preparation: ContextVar[Any] = ContextVar("dsv4_native_preparation", default=None)
+    budget: ContextVar[Any] = ContextVar("dsv4_native_budget", default=None)
+    returning: ContextVar[bool] = ContextVar("dsv4_native_return", default=False)
+
+    def move_budget(child: Any, pages: int) -> None:
+        counts = budget.get()
+        if counts is not None:
+            counts[id(child)] += pages * page_size
+
+    @contextmanager
+    def budget_context(counts: tuple[int, int]):
+        token = budget.set({id(full): counts[0], id(swa): counts[1]})
+        try:
+            yield
+        finally:
+            budget.reset(token)
+
+    class Preparation:
+        """Own only newly selected native pages during one prepare call."""
+
+        def __init__(self) -> None:
+            self.pages: dict[int, set[int]] = {id(full): set(), id(swa): set()}
+            self.token: Any = None
+
+        def __enter__(self) -> Any:
+            require_healthy()
+            if preparation.get() is not None:
+                raise RuntimeError("Nested DSV4 preparation transactions are unsupported")
+            self.token = preparation.set(self)
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            preparation.reset(self.token)
+
+        def rollback(self) -> None:
+            nonlocal failed
+            require_healthy()
+            try:
+                # Native preparation queues index writes before the peer verdict.
+                # Only the rejected path waits; never unmap their new pages early.
+                if torch.device(full.device).type == "cuda":
+                    torch.cuda.current_stream(full.device).synchronize()
+                for child in (swa, full):
+                    pages = self.pages[id(child)]
+                    return_pages(child, pages)
+                    for item in reversed(backings[id(child)]):
+                        item.release(pages)
+                    move_budget(child, len(pages))
+                    pages.clear()
+            except Exception:
+                failed = True
+                raise
 
     def require_healthy() -> None:
         if failed:
@@ -140,7 +194,11 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     def return_pages(child: Any, pages: set[int]) -> None:
         if pages:
             indices = torch.tensor(sorted(pages), dtype=torch.int64, device=child.device)
-            original_free_pages[id(child)](indices)
+            token = returning.set(True)
+            try:
+                original_free_pages[id(child)](indices)
+            finally:
+                returning.reset(token)
 
     def wrap_child(child: Any, original: Any) -> Any:
         signature = inspect.signature(original)
@@ -186,7 +244,14 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                         child_backing.manager.apply_resize_target()
                         child_backing.manager.reclaim_for_shrink()
                 try:
-                    return original(*args, **kwargs)
+                    result = original(*args, **kwargs)
+                    for child, pages in pending:
+                        move_budget(child, -len(pages))
+                    transaction = preparation.get()
+                    if transaction is not None:
+                        for child, pages in pending:
+                            transaction.pages[id(child)].update(pages)
+                    return result
                 except _BackingMiss:
                     for child, pages in reversed(pending):
                         return_pages(child, pages)
@@ -211,15 +276,20 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             def release(indices: Any) -> Any:
                 nonlocal release_depth, failed
                 require_healthy()
-                if release_depth:
+                if release_depth or returning.get():
                     return original(indices)
                 pages = page_ids(indices, divisor)
                 release_depth += 1
                 try:
                     result = original(indices)
+                    transaction = preparation.get()
+                    if transaction is not None:
+                        transaction.pages[id(child)].difference_update(pages)
                     if child.free_group is None:
                         for child_backing in child_backings:
                             child_backing.release(pages)
+                        move_budget(child, len(pages))
+                        deferred.difference_update(pages)
                     else:
                         deferred.update(pages)
                     return result
@@ -239,6 +309,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 original_group_end()
                 for child_backing in child_backings:
                     child_backing.release(deferred)
+                move_budget(child, len(deferred))
                 deferred.clear()
             except Exception:
                 failed = True
@@ -260,8 +331,11 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
 
         def available_size() -> int:
             require_healthy()
-            return min(native_available[id(child)](),
-                       *(item.available_pages() * page_size for item in child_backings))
+            counts = budget.get()
+            if counts is not None:
+                return max(0, min(native_available[id(child)](), counts[id(child)]))
+            return min([native_available[id(child)](),
+                        *(item.available_pages() * page_size for item in child_backings)])
 
         child.free = wrap_release(child.free, page_size)
         child.free_page_ids = wrap_release(child.free_page_ids, 1)
@@ -293,8 +367,10 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         if original is not None:
             setattr(allocator, name, wrap_composite(original))
     for child in (full, swa):
-        if backings[id(child)]:
-            bind_release(child, backings[id(child)])
+        bind_release(child, backings[id(child)])
+    allocator._kvcached_prepare_transaction = Preparation
+    allocator._kvcached_budget_context = budget_context
+    allocator._kvcached_budget_counts = lambda: (full.available_size(), swa.available_size())
     # Slot conservation counts logical IDs, not the current physical budget.
     allocator._conserve_swa_available_size = native_available[id(swa)]
     allocator._conserve_full_available_size = native_available[id(full)]

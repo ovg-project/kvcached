@@ -38,6 +38,15 @@ class FakePage:
         out, self.free_list = self.free_list[:num], self.free_list[num:]
         return out
 
+    def get_free_blocks(self) -> List[int]:
+        return list(self.free_list)
+
+    def alloc_exact(self, ids: List[int]) -> bool:
+        if not set(ids) <= set(self.free_list):
+            return False
+        self.free_list = [idx for idx in self.free_list if idx not in ids]
+        return True
+
     def free_batch(self, idxs: List[int]) -> None:
         self.free_list.extend(idxs)
 
@@ -54,7 +63,9 @@ class FakePage:
     @staticmethod
     def get_block_range(page_id: int, page_size: int,
                         block_mem_size: int) -> tuple[int, int]:
-        return page_id * BLOCKS_PER_PAGE, (page_id + 1) * BLOCKS_PER_PAGE
+        start = (page_id * page_size + block_mem_size - 1) // block_mem_size
+        end = (page_id + 1) * page_size // block_mem_size
+        return start, end
 
 
 class FakePageAllocator:
@@ -95,6 +106,12 @@ class FakePageAllocator:
     def get_num_reserved_pages(self) -> int:
         return 0
 
+    def get_allocatable_block_capacity(self, block_mem_size: int,
+                                       new_page_limit: int) -> int:
+        # This fake intentionally forecasts ample capacity; alloc_page() can
+        # still lose the race after fail_after physical pages.
+        return max(0, new_page_limit) * BLOCKS_PER_PAGE
+
 
 def _install_vmm_ops_stub() -> None:
     stub = types.ModuleType("kvcached.vmm_ops")
@@ -124,6 +141,8 @@ def make_manager(fail_after: int,
     """Build a KVCacheManager around fakes without running __init__ (which
     needs the C++ extension, KV tensors, and background threads)."""
     manager = object.__new__(KVCacheManager)
+    manager.group_id = 0
+    manager.num_layers = manager.num_kv_buffers = 1
     manager.page_size = BLOCKS_PER_PAGE
     manager.block_mem_size = 1
     manager.mem_size = 1024 * BLOCKS_PER_PAGE
@@ -132,9 +151,10 @@ def make_manager(fail_after: int,
     manager.avail_pages = {}
     manager.full_pages = {}
     manager.reserved_blocks = list(reserved_blocks or [])
+    manager._logical_allocated_blocks = len(manager.reserved_blocks)
     manager.null_block = None
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._lock = NoOpLock()
     manager._shutdown_lock = threading.Lock()
     manager._shutdown_requested = threading.Event()
@@ -143,6 +163,17 @@ def make_manager(fail_after: int,
     manager._lifecycle = LifecycleState("rollback-test")
     manager._lifecycle.mark_ready()
     return manager
+
+
+def publish_limit(manager, monkeypatch, limit):
+    if getattr(manager, "_runtime_control", None) is None:
+        from runtime_control_fake import attach_control
+        allocator = manager.page_allocator
+        monkeypatch.setattr(allocator, "get_page_state", lambda: dict(
+            inuse_pages=allocator.num_allocated - len(allocator.freed_pages),
+            reserved_pages=0), raising=False)
+        attach_control(manager, monkeypatch)
+    return manager.set_memory_limit(limit)
 
 
 def enable_operation_counters(manager: KVCacheManager) -> None:
@@ -157,6 +188,195 @@ def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
     assert manager.num_avail_blocks == 2
+
+
+@pytest.mark.parametrize("api_takeover", [False, True])
+def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_takeover):
+    """Construct the clear/reset window with a page-accounting allocator fake."""
+    manager = make_manager(fail_after=4)
+    manager.num_blocks = manager.logical_num_blocks = 4 * BLOCKS_PER_PAGE
+    manager.reserve_null_block = True
+    manager.null_block = manager.alloc(1)
+    allocator = manager.page_allocator
+    calls = []
+
+    def resize(size):
+        # Applying zero during the internal reservation would leave it waiting
+        # forever with the watcher stopped. Fail fast instead of hanging CI.
+        if size == BLOCKS_PER_PAGE:
+            assert manager.null_block == [0]
+        calls.append(size)
+        inuse = allocator.num_allocated - len(allocator.freed_pages)
+        return size >= inuse * BLOCKS_PER_PAGE
+
+    def reset():
+        allocator.num_allocated = 1
+        allocator.freed_pages.clear()
+
+    monkeypatch.setattr(allocator, "resize", resize, raising=False)
+    publish_limit(manager, monkeypatch, 0)
+    monkeypatch.setattr(allocator, "reset_free_page_order", reset, raising=False)
+    for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim"):
+        monkeypatch.setattr(allocator, method, lambda: None, raising=False)
+
+    manager.apply_resize_target()
+    assert not manager.in_shrink
+    assert manager.memory_limit_state()["status"] == "pending"
+    if api_takeover:
+        publish_limit(manager, monkeypatch, 2 * BLOCKS_PER_PAGE)
+        manager.apply_resize_target()
+    calls.clear()
+    manager.clear()
+    assert manager.null_block == [0]
+    assert not manager.in_shrink
+    assert calls == ([2 * BLOCKS_PER_PAGE] if api_takeover else [BLOCKS_PER_PAGE])
+    # A later positive CLI publication can still take control.
+    publish_limit(manager, monkeypatch, 3 * BLOCKS_PER_PAGE)
+    manager.apply_resize_target()
+    assert not manager.in_shrink
+    assert calls[-1] == 3 * BLOCKS_PER_PAGE
+
+
+def test_logical_limit_keeps_reserved_blocks_allocatable():
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = 8
+    manager.logical_num_blocks = 5
+    manager.null_block = manager.alloc(1)
+    assert manager.null_block == [0]
+
+    assert manager.try_to_reserve(4)
+    reserved = list(manager.reserved_blocks)
+    assert len(reserved) == 4
+    assert manager.available_size() == 4
+    first = manager.alloc(2)
+    assert first == reserved[:2]
+    assert manager.available_size() == 2
+    assert manager.alloc(3) is None
+    second = manager.alloc(2)
+    assert second == reserved[2:]
+    assert manager.available_size() == 0
+    assert manager.alloc(1) is None
+    assert manager.reserved_blocks == []
+
+    manager.free(reserved)
+    assert manager.available_size() == 4
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_exact_fit_logical_limit_survives_physical_growth(packed):
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = manager.logical_num_blocks = 2 * BLOCKS_PER_PAGE
+    allocator = manager.page_allocator
+    allocator.get_num_free_pages = lambda: allocator.fail_after - allocator.num_allocated
+
+    def resize(size):
+        allocator.fail_after = size // BLOCKS_PER_PAGE
+        return True
+
+    allocator.resize = resize
+    manager.null_block = manager.alloc(1)
+    blocks = manager.alloc(manager.logical_num_blocks - 1)
+    assert blocks is not None
+    assert manager.available_size() == 0
+
+    assert manager.resize(3 * BLOCKS_PER_PAGE)
+    assert allocator.get_num_free_pages() == 1
+    assert manager.available_size() == 0
+    allocate = manager.alloc_packed if packed else manager.alloc
+    assert allocate(1) is None
+    manager.free(blocks[:2])
+    assert manager.available_size() == 2
+    assert allocate(2) is not None
+    assert manager.available_size() == 0
+
+
+def test_logical_capacity_queries_do_not_scan_resident_pages(monkeypatch):
+    from unittest.mock import Mock
+
+    import kvcached.kv_cache_manager as kcm
+
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    manager = make_manager(fail_after=1024)
+    manager.num_blocks = 4096
+    manager.logical_num_blocks = 4000
+    manager.page_allocator.get_num_free_pages = lambda: 1024
+    manager.page_allocator.get_avail_physical_pages = lambda: 1024
+    assert manager.alloc(3999) is not None
+    ranges = Mock(wraps=FakePage.get_block_range)
+    monkeypatch.setattr(FakePage, "get_block_range", ranges)
+    for _ in range(10):
+        assert manager.available_size() == 1
+    ranges.assert_not_called()
+    assert manager.alloc_packed(1) is not None
+    assert manager.available_size() == 0
+    ranges.assert_not_called()
+
+
+@pytest.mark.parametrize("defer_release", [False, True])
+def test_logical_capacity_rollback_preserves_reservations(defer_release):
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = 16
+    manager.logical_num_blocks = 12
+    manager.defer_physical_release = defer_release
+    manager.null_block = manager.alloc(1)
+    assert manager.try_to_reserve(2)
+    reserved = list(manager.reserved_blocks)
+    # Consume reservations and part of a new page, then exhaust the allocator.
+    assert manager.alloc(10) is None
+    assert manager.reserved_blocks == reserved
+    assert manager._logical_allocated_blocks == 3
+    assert manager.available_size() == 11
+    assert manager.alloc(2) == reserved
+    assert manager.available_size() == 9
+    manager.free(reserved)
+    assert manager._logical_allocated_blocks == 1
+    assert manager.available_size() == 11
+
+
+def test_logical_capacity_counts_blocks_across_page_boundary_gaps(monkeypatch):
+    import kvcached.kv_cache_manager as kcm
+
+    class BoundaryPage(FakePage):
+        def init(self, block_mem_size):
+            start, end = self.get_block_range(self.page_id, 16, block_mem_size)
+            self.free_list = list(range(start, end))
+            self.capacity = end - start
+
+        def empty(self):
+            return len(self.free_list) == self.capacity
+
+    monkeypatch.setattr(kcm, "InternalPage", BoundaryPage)
+    manager = make_manager(fail_after=3)
+    manager.page_size = 16
+    manager.block_mem_size = 3
+    manager.num_blocks = 16
+    manager.logical_num_blocks = 12
+    allocator = manager.page_allocator
+
+    def alloc_page():
+        page = BoundaryPage(allocator.num_allocated)
+        allocator.num_allocated += 1
+        return page
+
+    def group_indices(indices, block_mem_size):
+        grouped: Dict[int, List[int]] = {}
+        for block in indices:
+            grouped.setdefault(block * block_mem_size // manager.page_size, []).append(block)
+        return grouped
+
+    allocator.alloc_page = alloc_page
+    allocator.group_indices_by_page = group_indices
+    manager.null_block = manager.alloc(1)
+    assert manager.try_to_reserve(3)
+    assert manager.available_size() == 11
+    blocks = manager.alloc_packed(11)
+    assert blocks is not None
+    assert 5 not in blocks and 10 not in blocks  # Straddle physical pages.
+    assert manager._logical_allocated_blocks == manager._get_num_alloced_blocks() == 12
+    assert manager.available_size() == 0
+    manager.free(blocks)
+    assert manager._logical_allocated_blocks == manager._get_num_alloced_blocks() == 1
+    assert manager.available_size() == 11
 
 
 @pytest.mark.parametrize("indexed_before_reservation", [False, True])
@@ -360,7 +580,7 @@ def test_deferred_resize_result_is_not_reported_as_applied(monkeypatch, rejected
     manager.defer_physical_release = defer_release
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     manager.in_shrink = True
-    manager.target_num_blocks = BLOCKS_PER_PAGE
+    manager.target_num_pages = 1
 
     def resize(_size):
         if rejected:
@@ -396,7 +616,7 @@ def test_deferred_resize_completion_is_counted_once(monkeypatch):
     enable_operation_counters(manager)
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     manager.in_shrink = True
-    manager.target_num_blocks = BLOCKS_PER_PAGE
+    manager.target_num_pages = 1
     resize_calls = []
 
     def resize(size):
@@ -424,7 +644,7 @@ def test_caller_free_progress_survives_later_allocator_failure(
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     page = manager.full_pages[0]
     manager.in_shrink = failure_stage == "resize"
-    manager.target_num_blocks = BLOCKS_PER_PAGE if manager.in_shrink else None
+    manager.target_num_pages = 1 if manager.in_shrink else None
     error_type = StateConsistencyError if fatal else RuntimeError
     error = error_type("injected allocator failure")
 
@@ -452,6 +672,7 @@ def test_caller_free_progress_survives_later_allocator_failure(
 @pytest.mark.parametrize("failed_page", [0, 1])
 def test_caller_free_counts_only_completed_page_batches(monkeypatch, failed_page):
     manager = make_manager(fail_after=2)
+    manager.num_blocks = manager.logical_num_blocks = 2 * BLOCKS_PER_PAGE
     enable_operation_counters(manager)
     blocks = manager.alloc(2 * BLOCKS_PER_PAGE)
     pages = dict(manager.full_pages)
@@ -472,6 +693,7 @@ def test_caller_free_counts_only_completed_page_batches(monkeypatch, failed_page
     assert data["free_successes_total"] == 0
     assert data["manager_page_releases_total"] == 0
     assert manager.page_allocator.freed_pages == []
+    assert manager._logical_allocated_blocks == (2 - failed_page) * BLOCKS_PER_PAGE
     for page_id, page in pages.items():
         assert page.num_free_blocks() == (BLOCKS_PER_PAGE if page_id < failed_page else 0)
 
@@ -548,7 +770,7 @@ def test_deferred_release_failure_keeps_logical_free_accounting(monkeypatch, sta
     blocks = manager.alloc(BLOCKS_PER_PAGE)
     assert blocks is not None
     manager.in_shrink = True
-    manager.target_num_blocks = 0
+    manager.target_num_pages = 0
     manager.free(blocks)
     error = (StateConsistencyError if fatal else RuntimeError)("release failed")
 
@@ -609,8 +831,10 @@ def test_fatal_mapping_counts_error_and_closes_readiness(monkeypatch, typed):
     assert readiness_error.value is error
 
 
+
 def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatch):
     manager = make_manager(fail_after=1)
+    manager.num_blocks = manager.logical_num_blocks = BLOCKS_PER_PAGE
     enable_operation_counters(manager)
     manager.defer_physical_release = True
     manager.reserve_null_block = False
@@ -624,6 +848,119 @@ def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatc
     assert manager.page_allocator.freed_pages == [0]
     assert manager.operation_snapshot_dict()["manager_page_releases_total"] == 1
     assert not manager._retired_pages
+    assert manager._logical_allocated_blocks == 0
+
+
+def test_clear_restores_logical_capacity_and_null_block(monkeypatch):
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = 8
+    manager.logical_num_blocks = 5
+    manager.reserve_null_block = True
+    manager.null_block = manager.alloc(1)
+    assert manager.try_to_reserve(2)
+    assert manager.alloc(4) is not None
+    assert manager.available_size() == 0
+    for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim"):
+        monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
+    monkeypatch.setattr(manager.page_allocator, "reset_free_page_order",
+                        lambda: setattr(manager.page_allocator, "num_allocated", 0),
+                        raising=False)
+    manager.clear()
+    assert manager.null_block == [0]
+    assert manager.reserved_blocks == []
+    assert manager._logical_allocated_blocks == 1
+    assert manager.available_size() == 4
+    assert manager.alloc_packed(4) is not None
+    assert manager.available_size() == 0
+
+
+def test_retained_quota_is_applied_until_a_later_resize(monkeypatch):
+    manager = make_manager(fail_after=4)
+    manager.reserve_null_block = False
+    quota = 2 * BLOCKS_PER_PAGE
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        return True
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
+    publish_limit(manager, monkeypatch, quota)
+    assert manager.alloc(1) is not None
+    assert manager.alloc(1) is not None
+    # The watcher keeps reporting the quota and every allocation applies it.
+    assert calls == [quota]
+
+    # A later native publication replaces the earlier target.
+    publish_limit(manager, monkeypatch, 3 * BLOCKS_PER_PAGE)
+    assert manager.alloc(1) is not None
+    assert calls == [quota, 3 * BLOCKS_PER_PAGE]
+
+    for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim", "reset_free_page_order"):
+        monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
+    manager.clear()
+    # clear() reapplies the accepted target without publishing a revision.
+    assert manager.alloc(1) is not None
+    assert calls == [quota, 3 * BLOCKS_PER_PAGE, 3 * BLOCKS_PER_PAGE]
+
+
+def test_kvctl_shrink_completes_after_reserved_blocks_are_freed(monkeypatch):
+    """shipiyouniao's probe on #558: with the reserved pages the only ones in
+    use, resize() refuses the quota, _resize() frees the reserved blocks and
+    only then enters the shrink, so that free() cannot complete it. The
+    engine reclaim pass must finish the shrink before allocating again."""
+    manager = make_manager(fail_after=4)
+    allocator = manager.page_allocator
+
+    def resize(new_mem_size):
+        # PageAllocator::resize's shrink rule: refuse below the pages in use.
+        inuse_pages = allocator.num_allocated - len(allocator.freed_pages)
+        return new_mem_size // BLOCKS_PER_PAGE >= inuse_pages
+
+    monkeypatch.setattr(allocator, "resize", resize, raising=False)
+    assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
+    assert len(manager.reserved_blocks) == 2 * BLOCKS_PER_PAGE
+
+    # kvctl publishes a one-page quota. The engine pass retries after release.
+    publish_limit(manager, monkeypatch, BLOCKS_PER_PAGE)
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
+    assert not manager.in_shrink
+    assert manager.reserved_blocks == []
+    assert allocator.freed_pages == [0, 1]
+
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE + 1]
+    assert not manager.in_shrink
+
+
+@pytest.mark.parametrize("observed_quota", [False, True])
+@pytest.mark.parametrize("idle", [False, True])
+def test_api_shrink_progresses_after_reserved_release(monkeypatch, observed_quota, idle):
+    """Real manager bookkeeping with a constructed allocator and poll window."""
+    manager = make_manager(fail_after=4)
+    allocator = manager.page_allocator
+    calls = []
+
+    def resize(size):
+        calls.append(size)
+        inuse = allocator.num_allocated - len(allocator.freed_pages)
+        return size // BLOCKS_PER_PAGE >= inuse
+
+    monkeypatch.setattr(allocator, "resize", resize, raising=False)
+    if observed_quota:
+        publish_limit(manager, monkeypatch, 4 * BLOCKS_PER_PAGE)
+        manager.apply_resize_target()
+    assert manager.try_to_reserve(2 * BLOCKS_PER_PAGE)
+    publish_limit(manager, monkeypatch, BLOCKS_PER_PAGE)
+    manager.apply_resize_target()
+    assert manager.reserved_blocks == []
+    assert manager.in_shrink
+    calls.clear()
+    if idle:
+        manager.apply_resize_target()
+        manager.reclaim_for_shrink()
+    assert manager.alloc(1) == [2 * BLOCKS_PER_PAGE]
+    assert not manager.in_shrink
+    assert calls == [BLOCKS_PER_PAGE]
 
 
 @pytest.mark.parametrize("pending_shrink", [False, True])
@@ -632,7 +969,7 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
 
     manager = make_manager(fail_after=4)
     manager.in_shrink = pending_shrink
-    manager.target_num_blocks = BLOCKS_PER_PAGE if pending_shrink else None
+    manager.target_num_pages = 1 if pending_shrink else None
     target = [1000]
     calls = []
 
@@ -641,12 +978,13 @@ def test_rejected_automatic_resize_does_not_block_healthy_allocations(monkeypatc
         raise QuarantinedResizeError("quarantined pages")
 
     monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
-    monkeypatch.setattr(manager.page_allocator, "get_resize_target", lambda: target[0])
+    publish_limit(manager, monkeypatch, target[0])
     assert manager.alloc(1) is not None
     assert manager.alloc(1) is not None
     assert calls == [1000]
     assert manager._resize_rejected
     target[0] = 2000
+    publish_limit(manager, monkeypatch, target[0])
     assert manager.alloc(1) is not None
     assert calls == [1000, 2000]
     assert not manager.in_shrink
@@ -721,6 +1059,35 @@ def test_reserved_blocks_restored_on_miss():
     manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
     assert manager.alloc(4) is None
     assert manager.reserved_blocks == [10, 11]
+
+
+def test_deferred_release_counts_only_acknowledged_physical_release(monkeypatch):
+    manager = make_manager(fail_after=2)
+    enable_operation_counters(manager)
+    manager.defer_physical_release = True
+    blocks = manager.alloc(BLOCKS_PER_PAGE)
+    manager.free(blocks)
+    marker = manager.capture_physical_release_marker()
+    assert marker > 0
+    assert manager.page_allocator.freed_pages == []
+    assert manager._get_operation_counter("manager_page_releases_total") == 0
+
+    def fail(_page_ids):
+        raise RuntimeError("release not acknowledged")
+
+    release = manager.page_allocator.free_pages
+    monkeypatch.setattr(manager.page_allocator, "free_pages", fail)
+    with pytest.raises(RuntimeError, match="release not acknowledged"):
+        manager.release_retired_pages_through(marker)
+    assert manager._get_operation_counter("manager_page_releases_total") == 0
+    assert manager._retired_pages
+
+    monkeypatch.setattr(manager.page_allocator, "free_pages", release)
+    manager.release_retired_pages_through(marker)
+    assert manager.page_allocator.freed_pages == [0]
+    assert manager._get_operation_counter("manager_page_releases_total") == 1
+    manager.release_retired_pages_through(marker)
+    assert manager._get_operation_counter("manager_page_releases_total") == 1
 
 
 def test_mixed_reserved_and_page_blocks_restored():
@@ -1091,7 +1458,7 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
     manager.pp_rank = 0
     manager.group_id = 0
     manager._post_init_done.clear()
-    entered_init, entered_free, release_init = (threading.Event() for _ in range(3))
+    entered_init, entered_wait, release_init = (threading.Event() for _ in range(3))
     init_error = RuntimeError("injected initialization failure")
     free_error = RuntimeError("independent foreground free failure")
     init_globals = getattr(KVCacheManager._post_init, "__globals__")
@@ -1104,19 +1471,25 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
         raise init_error
 
     def free(*args, **kwargs):
-        entered_free.set()
         manager._wait_post_init()
         raise free_error
 
+    event_wait = manager._post_init_done.wait
+
+    def wait(timeout=None):
+        entered_wait.set()
+        return event_wait(timeout)
+
     monkeypatch.setattr(manager, "_reserve_null_block", reserve)
     monkeypatch.setattr(manager, "_free", free)
+    monkeypatch.setattr(manager._post_init_done, "wait", wait)
     with ThreadPoolExecutor(max_workers=2) as executor:
         initializing = executor.submit(manager._post_init)
         assert entered_init.wait(5)
         freeing = executor.submit(manager.free, [])
         try:
-            assert entered_free.wait(5)
-            assert manager.operation_snapshot_dict()["free_requests_total"] == 1
+            assert entered_wait.wait(5)
+            assert not freeing.done()
         finally:
             release_init.set()
         for future, expected in ((initializing, init_error), (freeing, free_error)):
@@ -1124,8 +1497,205 @@ def test_post_init_error_does_not_hide_waiting_foreground_free_error(monkeypatch
                 future.result(timeout=5)
             assert raised.value is expected
     data = manager.operation_snapshot_dict()
+    assert data["free_requests_total"] == 1
     assert data["operation_errors_total"] == 2
     assert data["post_init_errors_total"] == data["free_errors_total"] == 1
     assert data["free_failures_total"] == 1
     assert data["last_error_code"] == "free_failed"
     assert data["last_error_timestamp_ns"] is not None
+
+
+# The #619 review's exhaustion geometry: SGLang MLA size=16320 / page_size=64
+# with 512 + 64 fp16 KV dims. One block is one SGLang page of token rows.
+MLA_PAGE_SIZE = 2 * 1024 * 1024
+MLA_BLOCK_MEM = 64 * (512 + 64) * 2
+# backing_blocks_for_capacity(256, MLA_BLOCK_MEM, MLA_PAGE_SIZE): ten physical
+# pages. Under max_block_id=256 only 248 ids are usable; 8 straddle a page
+# boundary and page 9's whole range [256, 284) sits past the bound.
+MLA_BACKING_BLOCKS = 285
+MLA_MAX_BLOCK_ID = 256
+
+
+class BoundedPage(FakePage):
+    """FakePage with the real InternalPage.init semantics: the free list is
+    the page's whole-block range, clipped at ``max_block_id``
+    (csrc/page_allocator.cpp InternalPage::init)."""
+
+    def __init__(self, page_id: int, page_size: int):
+        super().__init__(page_id)
+        self.page_size = page_size
+        self.capacity = 0
+
+    def init(self, block_mem_size: int,
+             max_block_id: Optional[int] = None) -> None:
+        start, end = self.get_block_range(self.page_id, self.page_size,
+                                          block_mem_size)
+        if max_block_id is not None:
+            start, end = min(start, max_block_id), min(end, max_block_id)
+        self.free_list = list(range(start, end))
+        self.capacity = end - start
+
+    def empty(self) -> bool:
+        return len(self.free_list) == self.capacity
+
+
+class BoundedPageAllocator:
+    """Allocator over real page ids: alloc_page() serves the free list from
+    the front and free_pages() appends at the end, the native free_page_list
+    order after a release (see the clear() comment in kv_cache_manager.py)."""
+
+    def __init__(self, page_size: int, num_pages: int):
+        self.page_size = page_size
+        self.free_page_ids = list(range(num_pages))
+        self.mapped: Dict[int, BoundedPage] = {}
+
+    def alloc_page(self) -> BoundedPage:
+        if not self.free_page_ids:
+            raise RuntimeError("physical page pool exhausted")
+        page = BoundedPage(self.free_page_ids.pop(0), self.page_size)
+        self.mapped[page.page_id] = page
+        return page
+
+    def free_pages(self, page_ids: List[int]) -> None:
+        for page_id in page_ids:
+            self.mapped.pop(page_id)
+        self.free_page_ids.extend(page_ids)
+
+    def group_indices_by_page(self, indices: List[int],
+                              block_mem_size: int) -> Dict[int, List[int]]:
+        grouped: Dict[int, List[int]] = {}
+        for block in indices:
+            page_id = block * block_mem_size // self.page_size
+            grouped.setdefault(page_id, []).append(block)
+        return grouped
+
+    def get_resize_target(self) -> int:
+        return -1
+
+    def get_num_free_pages(self) -> int:
+        return len(self.free_page_ids)
+
+    def get_avail_physical_pages(self) -> int:
+        return len(self.free_page_ids)
+
+    def get_num_reserved_pages(self) -> int:
+        return 0
+
+    def get_allocatable_block_capacity(
+            self, block_mem_size: int, new_page_limit: int,
+            max_block_id: Optional[int] = None) -> int:
+        # Mirror of PageAllocator::get_allocatable_block_capacity: the next
+        # new_page_limit free pages in alloc_page() order, each page's range
+        # clipped at max_block_id.
+        capacity = 0
+        for page_id in self.free_page_ids[:max(0, new_page_limit)]:
+            start, end = BoundedPage.get_block_range(page_id, self.page_size,
+                                                     block_mem_size)
+            if max_block_id is not None:
+                start, end = min(start, max_block_id), min(end, max_block_id)
+            capacity += end - start
+        return capacity
+
+
+def make_bounded_mla_manager() -> KVCacheManager:
+    manager = make_manager(fail_after=0)
+    manager.page_size = MLA_PAGE_SIZE
+    manager.block_mem_size = MLA_BLOCK_MEM
+    manager.num_blocks = MLA_BACKING_BLOCKS
+    manager.logical_num_blocks = MLA_MAX_BLOCK_ID
+    manager.max_block_id = MLA_MAX_BLOCK_ID
+    manager.mem_size = MLA_BACKING_BLOCKS * MLA_BLOCK_MEM
+    manager.page_allocator = BoundedPageAllocator(
+        MLA_PAGE_SIZE, manager.mem_size // MLA_PAGE_SIZE)
+    return manager
+
+
+def test_bounded_exhaustion_is_a_miss_not_a_consistency_error():
+    """Filling every usable id must end in available_size() reaching 0 and a
+    None miss. The #619 review hit StateConsistencyError here instead: the
+    pre-#617 forecast counted page 9 at full theoretical capacity, reported
+    8 after exhaustion, and _alloc then mapped the empty page."""
+    manager = make_bounded_mla_manager()
+    blocks = manager.alloc(248)
+    assert blocks is not None
+    assert len(blocks) == 248
+    assert max(blocks) < MLA_MAX_BLOCK_ID
+    assert manager.available_size() == 0
+    assert manager.alloc(1) is None
+    # Nothing ever mapped the page whose bounded id range is empty.
+    assert 9 not in manager.page_allocator.mapped
+
+
+def test_alloc_skips_and_releases_pages_past_the_id_bound():
+    """A bound-empty page ahead of usable capacity must be skipped and
+    unmapped, not fail the pool.
+
+    Freed pages append at the end of the native free list, so after filling
+    all usable ids and freeing page 3's blocks the list reads [9, 3]:
+    alloc_page() hands back page 9, whose whole blocks all sit past
+    max_block_id. _alloc must serve the request from page 3 and release
+    page 9, not raise StateConsistencyError on its empty init."""
+    manager = make_bounded_mla_manager()
+    enable_operation_counters(manager)
+    blocks = manager.alloc(248)
+    assert blocks is not None
+    page3 = [block for block in blocks
+             if block * MLA_BLOCK_MEM // MLA_PAGE_SIZE == 3]
+    assert page3 == list(range(86, 113))
+    manager.free(page3)
+    assert manager.page_allocator.free_page_ids == [9, 3]
+    assert manager.available_size() == 27
+
+    assert manager.alloc(27) == page3
+
+    assert manager.available_size() == 0
+    # Page 9 was mapped once, skipped, and released, not retained or parked.
+    assert 9 not in manager.page_allocator.mapped
+    assert manager.page_allocator.free_page_ids == [9]
+    counters = manager._operation_counters
+    # Nine pages for the fill, then page 9 (skipped) and page 3 again.
+    assert counters["manager_page_allocations_total"] == 11
+    # Page 3 after its blocks were freed, then the skipped page 9.
+    assert counters["manager_page_releases_total"] == 2
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_exact_and_count_allocations_share_logical_limit(packed):
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = manager._virtual_num_blocks = 8
+    manager.logical_num_blocks = 3
+    manager.reserve_null_block = False
+    manager._retired_pages = []
+    allocate = manager.alloc_packed if packed else manager.alloc
+    assert allocate(2) == [0, 1]
+    assert manager._logical_allocated_blocks == 2
+    assert manager.alloc_exact([3]) == [3]
+    assert manager._logical_allocated_blocks == 3
+    assert allocate(1) is None
+    manager.free([1])
+    assert manager._logical_allocated_blocks == 2
+    assert manager.alloc_exact([2]) == [2]
+    manager.free([0, 2, 3])
+    assert manager._logical_allocated_blocks == 0
+    assert manager.available_size() == 3
+
+
+def test_exact_and_count_allocations_share_reserved_ownership():
+    manager = make_manager(fail_after=2)
+    manager.num_blocks = manager._virtual_num_blocks = 8
+    manager.logical_num_blocks = 3
+    manager.reserve_null_block = False
+    manager._retired_pages = []
+    assert manager.try_to_reserve(3)
+    assert manager.reserved_blocks == [0, 1, 2]
+    assert manager._logical_allocated_blocks == 3
+    # Aggregate availability comes from reservations, not unused logical quota.
+    assert manager.available_size() == 3
+    assert manager.alloc_exact([3]) is None
+    assert manager.alloc_exact([2, 0]) == [2, 0]
+    assert manager.alloc(1) == [1]
+    assert manager._logical_allocated_blocks == 3
+    assert manager.reserved_blocks == []
+    manager.free([0, 1, 2])
+    assert manager._logical_allocated_blocks == 0
+    assert manager.available_size() == 3
