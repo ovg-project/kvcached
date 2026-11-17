@@ -78,7 +78,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
-            (DeepSeekV4RuntimeReservationPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4RuntimeReservationPatch(), ">=0.5.12,<0.5.21.dev0"),
             (DeepSeekV4KVPoolPatch(), ">=0.5.13"),
             (DeepSeekV4SWAAllocatorPatch(), ">=0.5.13"),
             (DeepSeekV4RunnerOwnershipPatch(), ">=0.5.13"),
