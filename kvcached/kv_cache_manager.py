@@ -210,12 +210,12 @@ class KVCacheManager:
         if reserve_null_block and logical_num_blocks == 0:
             raise ValueError("logical_num_blocks must include the reserved null block")
         self.num_blocks = num_blocks
+        self._virtual_num_blocks = num_blocks
         self.logical_num_blocks = logical_num_blocks
         self.max_block_id = max_block_id
         # Blocks handed out of pages, including the null block and reservations.
         # Keep logical admission independent of resident-page scans and resize.
         self._logical_allocated_blocks = 0
-        self._virtual_num_blocks = num_blocks
         self.block_mem_size = block_size * cell_size
         self.num_layers = num_layers
         self.num_kv_buffers = num_kv_buffers
@@ -726,8 +726,6 @@ class KVCacheManager:
         """Wait for initial setup without holding the lock, then allocate blocks."""
         return self._alloc(need_size)
 
-    @_after_post_init
-    @synchronized
     def alloc_exact(self, block_ids: Iterable[int]) -> Optional[List[int]]:
         """Claim the requested free block IDs, in caller order, or return None.
 
@@ -737,6 +735,14 @@ class KVCacheManager:
         preserves existing allocations and reservations. Mapping-consistency
         errors remain fatal. Integrations own any cross-pool transaction.
         """
+        # Null-block initialization needs the manager lock before it can
+        # signal readiness. Never wait for it while holding that lock.
+        self.wait_ready()
+        return self._alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _alloc_exact_ready(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        reserved_before = len(self.reserved_blocks)
         counters = getattr(self, "_operation_counters", None)
         if counters is not None:
             self._increment_operation_counter("allocation_requests_total")
@@ -755,6 +761,9 @@ class KVCacheManager:
             else:
                 self._increment_operation_counter("allocation_successes_total")
                 self._increment_operation_counter("allocated_blocks_total", len(result))
+        if result is not None:
+            taken = len(result) - (reserved_before - len(self.reserved_blocks))
+            self._step_alloc_blocks = getattr(self, "_step_alloc_blocks", 0) + taken
         return result
 
     def _alloc_exact_impl(self, block_ids: Iterable[int]) -> Optional[List[int]]:
@@ -769,6 +778,9 @@ class KVCacheManager:
         for block_id in requested:
             if block_id < 0 or block_id >= self._virtual_num_blocks:
                 raise ValueError("Exact block ID exceeds the pool's virtual backing")
+            bound = getattr(self, "max_block_id", None)
+            if bound is not None and block_id >= bound:
+                raise ValueError("Exact block ID exceeds the pool's logical ID bound")
             if self.reserve_null_block and block_id == 0:
                 raise ValueError("The null block cannot be allocated explicitly")
             page_id = block_id * self.block_mem_size // self.page_size
@@ -786,18 +798,17 @@ class KVCacheManager:
 
         reserved = set(self.reserved_blocks)
         logical_limit = getattr(self, "logical_num_blocks", None)
-        # available_size() includes every reserved block, but an exact claim
-        # can only reuse reservations whose IDs were actually requested.
+        # Only requested reservations can be reused by an exact-ID claim.
         fresh_count = sum(block_id not in reserved for block_id in requested)
         if (logical_limit is not None and
                 fresh_count > max(0, logical_limit - self._logical_allocated_blocks)):
             return None
         shrinking = getattr(self, "in_shrink", False)
-        retiring = self._retiring_page_ids() if shrinking else frozenset()
+        retiring = self._unreusable_page_ids()
         # Check every existing page before mapping or claiming any new page.
         for page_id, ids in grouped.items():
             page = self.full_pages.get(page_id) or self.avail_pages.get(page_id)
-            if shrinking and (page_id in retiring or page is None):
+            if page_id in retiring or (shrinking and page is None):
                 return None
             if page is not None:
                 free = set(page.get_free_blocks())
@@ -835,7 +846,10 @@ class KVCacheManager:
                 return None
             self._avail_physical_pages_cache = None
             self._increment_operation_counter("manager_page_allocations_total")
-            page.init(self.block_mem_size)
+            if getattr(self, "max_block_id", None) is None:
+                page.init(self.block_mem_size)
+            else:
+                page.init(self.block_mem_size, self.max_block_id)
             self.avail_pages[page_id] = page
             self.num_avail_blocks += page.num_free_blocks()
             created.append(page_id)
@@ -848,8 +862,6 @@ class KVCacheManager:
                 claim_error = StateConsistencyError("Exact block preflight and claim disagree")
                 self._lifecycle.mark_failed("exact allocation ledger is unsafe", claim_error)
                 raise claim_error
-            if logical_limit is not None:
-                self._logical_allocated_blocks += len(fresh)
             self.num_avail_blocks -= len(fresh)
             if page.full():
                 self.avail_pages.pop(page_id, None)
@@ -863,6 +875,8 @@ class KVCacheManager:
                 if (remaining := [pid for pid in pages if pid != page_id])
             ]
         claimed = set(requested)
+        if getattr(self, "logical_num_blocks", None) is not None:
+            self._logical_allocated_blocks += len(claimed - reserved)
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
 
