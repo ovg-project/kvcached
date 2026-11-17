@@ -854,7 +854,7 @@ def test_clear_restores_logical_capacity_and_null_block(monkeypatch):
     for method in ("stop_prealloc_thread", "start_prealloc_thread", "trim"):
         monkeypatch.setattr(manager.page_allocator, method, lambda: None, raising=False)
     monkeypatch.setattr(manager.page_allocator, "reset_free_page_order",
-                        lambda: setattr(manager.page_allocator, "num_allocated", 0),
+                        lambda: setattr(manager.page_allocator, "num_allocated", 1),
                         raising=False)
     manager.clear()
     assert manager.null_block == [0]
