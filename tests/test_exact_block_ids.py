@@ -89,7 +89,7 @@ def make_manager():
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
-                '_apply_resize_target', '_retiring_page_ids'}
+                '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in selected]
     # Extract the production methods, not copies, without importing torch or
@@ -327,6 +327,27 @@ def test_pending_shrink_can_claim_a_nonretiring_resident_page():
     assert manager.alloc_exact([2]) == [2]
     assert retired.free == [4, 5, 6, 7]
     assert manager._retired_pages == [(9, [1])]
+
+
+@pytest.mark.parametrize('protected', ['promised', 'retained'])
+def test_priority_retirement_rejects_exact_claim_before_any_mutation(protected):
+    manager = make_manager()
+    first = page_for(manager, 0, [2, 3])
+    retired = page_for(manager, 1, [4, 5, 6, 7])
+    manager._retired_pages = [(9, [1])]
+    manager._priority_retired_ids = {1} if protected == 'promised' else set()
+    manager._priority_retained_ids = {1} if protected == 'retained' else set()
+    assert not manager.in_shrink
+    assert manager.alloc_exact([2, 4, 8]) is None
+    assert not manager.page_allocator.calls
+    assert first.free == [2, 3]
+    assert retired.free == [4, 5, 6, 7]
+    assert manager._retired_pages == [(9, [1])]
+    assert manager._priority_retired_ids == ({1} if protected == 'promised' else set())
+    manager._priority_retired_ids.clear()
+    manager._priority_retained_ids.clear()
+    assert manager.alloc_exact([4]) == [4]
+    assert not manager._retired_pages
     assert manager.page_allocator.calls == []
 
 

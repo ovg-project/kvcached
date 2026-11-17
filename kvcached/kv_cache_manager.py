@@ -804,11 +804,11 @@ class KVCacheManager:
                 fresh_count > max(0, logical_limit - self._logical_allocated_blocks)):
             return None
         shrinking = getattr(self, "in_shrink", False)
-        retiring = self._retiring_page_ids() if shrinking else frozenset()
+        retiring = self._unreusable_page_ids()
         # Check every existing page before mapping or claiming any new page.
         for page_id, ids in grouped.items():
             page = self.full_pages.get(page_id) or self.avail_pages.get(page_id)
-            if shrinking and (page_id in retiring or page is None):
+            if page_id in retiring or (shrinking and page is None):
                 return None
             if page is not None:
                 free = set(page.get_free_blocks())
