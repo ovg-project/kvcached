@@ -63,6 +63,12 @@ class SWABacking:
         self.refs += Counter()  # Drop zero counts.
         self.live.difference_update(removals)
 
+    def can_acquire(self, pages: set[int]) -> bool:
+        """Check an already validated placement without taking backing leases."""
+        missing = {physical for page in pages - self.live for physical in self._span(page)}
+        missing.difference_update(self.refs)
+        return not missing or self.manager.can_alloc_exact(sorted(missing))
+
     def available_pages(self) -> int:
         # An upper bound: placement can still fail for the exact native IDs.
         physical = len(self.refs) + 1 + self.manager.available_size()
@@ -111,6 +117,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
     budget: ContextVar[Any] = ContextVar("dsv4_native_budget", default=None)
     returning: ContextVar[bool] = ContextVar("dsv4_native_return", default=False)
     decode_reserved: dict[int, set[int]] = {id(full): set(), id(swa): set()}
+    placement_misses: dict[int, tuple[int, ...]] = {}
 
     def release_decode_reservation() -> None:
         nonlocal failed
@@ -284,7 +291,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
             pending.append((child, new))
             for child_backing in backings[id(child)]:
                 if not child_backing.acquire(pages):
-                    raise _BackingMiss
+                    raise _BackingMiss(child, max(1, len(new)))
+            placement_misses.pop(id(child), None)
             return result
         return allocate
 
@@ -312,13 +320,21 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                             transaction.pages[id(child)].update(pages)
                     release_decode_reservation()
                     return result
-                except _BackingMiss:
+                except _BackingMiss as miss:
                     for child, pages in reversed(pending):
                         return_pages(child, pages)
                         for rollback_backing in reversed(backings[id(child)]):
                             rollback_backing.release(pages)
                         decode_reserved[id(child)].difference_update(pages)
                     release_decode_reservation()
+                    if miss.args:
+                        child, count = miss.args
+                        census = getattr(child, "get_all_free_pages", None)
+                        if census is not None:
+                            normalize = getattr(child, "merge_and_sort_free", None)
+                            if normalize is not None:
+                                normalize()
+                            placement_misses[id(child)] = tuple(census()[:count].tolist())
                     return None
             except Exception:
                 # The error can be after mapping publication. Guessing a
@@ -405,6 +421,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                 for child_backing in child_backings:
                     child_backing.release(set(child_backing.live))
                 decode_reserved[id(child)].clear()
+                placement_misses.pop(id(child), None)
                 deferred.clear()
             except Exception:
                 failed = True
@@ -415,6 +432,13 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
             counts = budget.get()
             if counts is not None:
                 return max(0, min(native_available[id(child)](), counts[id(child)]))
+            missed = placement_misses.get(id(child))
+            if missed:
+                prefix = tuple(child.get_all_free_pages()[:len(missed)].tolist())
+                if prefix == missed and any(not item.can_acquire(set(prefix))
+                                            for item in child_backings):
+                    return 0
+                placement_misses.pop(id(child), None)
             return min([native_available[id(child)](),
                         *((item.available_pages() + len(decode_reserved[id(child)])) * page_size
                           for item in child_backings)])
