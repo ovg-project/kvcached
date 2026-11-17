@@ -89,6 +89,7 @@ def make_manager():
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
+                'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in selected]
@@ -219,6 +220,27 @@ def test_existing_conflict_preflights_the_whole_batch():
     assert manager.alloc_exact([7, 1]) is None
     assert manager.page_allocator.calls == []
     assert original.free == [2, 3]
+
+
+def test_exact_capacity_query_does_not_claim_or_apply_resize():
+    manager = make_manager()
+    original = page_for(manager, 0, [2, 3])
+    manager.page_allocator.resize_target = 64
+    manager.resize = lambda _: pytest.fail('capacity query applied a resize')
+    assert manager.can_alloc_exact([2, 4])
+    assert not manager.can_alloc_exact([1])
+    manager._priority_retired_ids = {1}
+    assert not manager.can_alloc_exact([2, 4])
+    manager._priority_retired_ids.clear()
+    manager._get_cached_avail_physical_pages = lambda: 0
+    assert not manager.can_alloc_exact([2, 4])
+    assert manager.can_alloc_exact([2])
+    assert manager.can_alloc_exact([])
+    assert not manager.page_allocator.calls
+    assert original.free == [2, 3]
+    assert manager.reserved_blocks == []
+    assert not manager._operation_counters
+    assert not hasattr(manager, '_step_alloc_blocks')
 
 
 @pytest.mark.parametrize('failure', [None, RuntimeError('capacity unavailable')])
