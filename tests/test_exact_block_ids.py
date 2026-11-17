@@ -68,6 +68,9 @@ class Backend:
     def get_num_reserved_pages(self):
         return self.reserved_pages
 
+    def get_num_free_pages(self):
+        return 8
+
     def get_resize_target(self):
         return self.resize_target
 
@@ -294,9 +297,41 @@ def test_live_reuse_removes_only_its_own_retirement():
 
 def test_capacity_limit_blocks_even_a_physically_available_exact_page():
     manager = make_manager()
-    manager.available_size = lambda: 0
+    page_for(manager, 0, [2, 3])
+    manager.page_allocator.get_num_free_pages = lambda: 0
+    assert not manager.can_alloc_exact([4])
     assert manager.alloc_exact([4]) is None
     assert manager.page_allocator.calls == []
+    assert manager.can_alloc_exact([2])
+    assert manager.alloc_exact([2]) == [2]
+
+
+def test_exact_capacity_uses_requested_page_geometry():
+    manager = make_manager()
+    manager.block_mem_size = 7
+    manager.page_allocator.get_num_free_pages = lambda: 1
+    manager._get_cached_avail_physical_pages = lambda: 1
+    # Ordinary allocation sees one block on page 1. Exact page 3 has two.
+    manager.available_size = lambda: 1
+    assert manager.can_alloc_exact([7, 8])
+    assert manager.alloc_exact([7, 8]) == [7, 8]
+    assert manager.page_allocator.calls == [3]
+
+
+def test_exact_capacity_propagates_native_health_failure():
+    manager = make_manager()
+    failure = UnsafeMapping('background mapping failed')
+    seen = []
+
+    def fail():
+        raise failure
+
+    manager.page_allocator.get_num_free_pages = fail
+    manager._record_native_fatal = lambda operation, exc: seen.append((operation, exc))
+    with pytest.raises(UnsafeMapping):
+        manager.can_alloc_exact([4])
+    assert seen == [('alloc_exact', failure)]
+    assert not manager.page_allocator.calls
 
 
 def test_empty_request_does_not_map_or_resize():
@@ -314,7 +349,8 @@ def test_zero_resize_target_is_applied_before_an_exact_claim():
 
     def resize(size):
         applied.append(size)
-        manager.available_size = lambda: 0
+        manager.in_shrink = True
+        manager._retired_pages = [(1, [0])]
 
     manager.resize = resize
     manager._runtime_control = SimpleNamespace(apply=lambda: resize(0))
