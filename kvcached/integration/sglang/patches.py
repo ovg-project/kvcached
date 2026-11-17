@@ -3899,9 +3899,10 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                     allocator_self._kvcached_dsv4_request_state = request_state
                 if other_backings or state_backings:
                     bind_native_swa(allocator_self, backing, full_backing,
-                                    full_backings=tuple(other_backings), swa_backings=state_backings)
+                                    full_backings=tuple(other_backings), swa_backings=state_backings, on_capacity_miss=_sglang_capacity_miss)
                 else:
-                    bind_native_swa(allocator_self, backing, full_backing)
+                    bind_native_swa(allocator_self, backing, full_backing,
+                                    on_capacity_miss=_sglang_capacity_miss)
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init
@@ -4419,6 +4420,14 @@ class _PrefixCacheShrinkReclaimer:
         swa = _token_kv_managers(allocator, component="swa")
         full = _token_kv_managers(allocator, component="full")
         self.swa = any(manager is item for item in swa) and not any(manager is item for item in full)
+        native = getattr(allocator, "logical_attn_allocator", allocator)
+        backings = [getattr(native, "_kvcached_dsv4_backing", None)]
+        for name in ("_kvcached_dsv4_full_backings", "_kvcached_dsv4_swa_backings"):
+            backings.extend(getattr(native, name, ()))
+        self.native_backing = next((item for item in backings
+                                    if getattr(item, "manager", None) is manager
+                                    and getattr(item, "native_page_bytes", None)), None)
+        self.native_token_page_size = max(1, int(getattr(native, "page_size", 1) or 1))
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
@@ -4429,6 +4438,9 @@ class _PrefixCacheShrinkReclaimer:
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
+        if self.native_backing is not None:
+            tokens_per_page = (math.ceil(manager.page_size / self.native_backing.native_page_bytes)
+                               * self.native_token_page_size)
         return cache, evictable if callable(evictable) else None, tokens_per_page
 
     def count_pages(self) -> int:

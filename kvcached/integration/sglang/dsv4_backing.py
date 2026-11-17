@@ -87,7 +87,8 @@ class _BackingMiss(Exception):
 def bind_native_swa(allocator: Any, backing: SWABacking,
                     full_backing: SWABacking | None = None, *,
                     full_backings: tuple[SWABacking, ...] = (),
-                    swa_backings: tuple[SWABacking, ...] = ()) -> None:
+                    swa_backings: tuple[SWABacking, ...] = (),
+                    on_capacity_miss: Any = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
@@ -95,7 +96,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     free_page_ids; an unexpected error poisons this adapter until teardown.
     Compressed KV/indexer backing follows full IDs independently of SWA retirement.
     Every selected pool must acquire its backing before native mappings publish.
-    No native free list is read or assigned.
+    Only native public allocation and page-census APIs are used. Native free
+    lists are never assigned by this adapter.
     """
     import torch
 
@@ -134,6 +136,77 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     preparation: ContextVar[Any] = ContextVar("dsv4_native_preparation", default=None)
     budget: ContextVar[Any] = ContextVar("dsv4_native_budget", default=None)
     returning: ContextVar[bool] = ContextVar("dsv4_native_return", default=False)
+    decode_reserved: dict[int, set[int]] = {id(full): set(), id(swa): set()}
+
+    def release_decode_reservation() -> None:
+        nonlocal failed
+        require_healthy()
+        try:
+            for child in (swa, full):
+                for item in reversed(backings[id(child)]):
+                    item.release(decode_reserved[id(child)])
+                decode_reserved[id(child)].clear()
+        except Exception:
+            failed = True
+            raise
+
+    def ready_managers() -> None:
+        for child_backings in backings.values():
+            for item in child_backings:
+                item.manager.wait_ready()
+        for child_backings in backings.values():
+            for item in child_backings:
+                item.manager.apply_resize_target()
+                item.manager.reclaim_for_shrink()
+
+    original_decode_check = getattr(allocator, "check_decode_capacity", None)
+    if original_decode_check is not None:
+        # After this public normalization, the public census has the allocation
+        # prefix used by the audited 0.5.20 native paged/token allocators.
+        for child in (full, swa):
+            original_merge = child.merge_and_sort_free
+
+            def merge(*, _child=child, _original=original_merge):
+                # Decode's bs-based sort is conservative: its kernel consumes
+                # only the new-page count. Keep the promised native prefix even
+                # when window/cache eviction appended other free pages.
+                if pending is None or not decode_reserved[id(_child)]:
+                    return _original()
+                return None
+
+            child.merge_and_sort_free = merge
+
+        @functools.wraps(original_decode_check)
+        def check_decode_capacity(*, num_tokens: int, **kwargs: Any) -> bool:
+            nonlocal failed
+            release_decode_reservation()
+            ready_managers()
+            if not original_decode_check(num_tokens=num_tokens, **kwargs):
+                return False
+            count = (num_tokens + page_size - 1) // page_size
+            try:
+                for child in (full, swa):
+                    child.merge_and_sort_free()
+                    choices = child.get_all_free_pages()[:count].tolist()
+                    if len(choices) != count:
+                        release_decode_reservation()
+                        return False
+                    pages = set(choices)
+                    decode_reserved[id(child)] = pages
+                    for item in backings[id(child)]:
+                        if not item.acquire(pages):
+                            release_decode_reservation()
+                            return False
+                return True
+            except Exception:
+                try:
+                    release_decode_reservation()
+                finally:
+                    failed = True
+                raise
+
+        allocator.check_decode_capacity = check_decode_capacity
+    allocator._kvcached_release_decode_reservation = release_decode_reservation
 
     def move_budget(child: Any, pages: int) -> None:
         counts = budget.get()
@@ -209,6 +282,22 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             if pending is None:
                 raise RuntimeError("Managed SWA allocation requires the composite transaction")
             arguments = signature.bind(*args, **kwargs).arguments
+            reserved = decode_reserved[id(child)]
+            if reserved:
+                if "need_size" in arguments:
+                    required = arguments["need_size"] // page_size
+                elif "prefix_lens_cpu" in arguments:
+                    ends = arguments["seq_lens_cpu"].tolist()
+                    starts = arguments["prefix_lens_cpu"].tolist()
+                    required = sum((end + page_size - 1) // page_size
+                                   - (start + page_size - 1) // page_size
+                                   for start, end in zip(starts, ends))
+                else:
+                    required = sum((length - 1) % page_size == 0
+                                   for length in arguments["seq_lens_cpu"].tolist())
+                choices = child.get_all_free_pages()[:required].tolist()
+                if required > len(reserved) or not set(choices) <= reserved:
+                    raise RuntimeError("Native allocation no longer matches its decode reservation")
             last_loc = arguments.get("last_loc")
             prior = page_ids(last_loc) if last_loc is not None else set()
             result = original(*args, **kwargs)
@@ -234,18 +323,12 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             try:
                 # All initialization must settle before resize/reclaim can
                 # acquire manager locks or release another pool's backing.
-                for child_backings in backings.values():
-                    for child_backing in child_backings:
-                        child_backing.manager.wait_ready()
-                # Reclaim before native IDs or backing reference snapshots are
-                # selected: eviction may release existing SWA backing leases.
-                for child_backings in backings.values():
-                    for child_backing in child_backings:
-                        child_backing.manager.apply_resize_target()
-                        child_backing.manager.reclaim_for_shrink()
+                if not any(decode_reserved.values()):
+                    ready_managers()
                 try:
                     result = original(*args, **kwargs)
                     for child, pages in pending:
+                        decode_reserved[id(child)].difference_update(pages)
                         move_budget(child, -len(pages))
                     transaction = preparation.get()
                     if transaction is not None:
@@ -257,6 +340,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                         return_pages(child, pages)
                         for rollback_backing in reversed(backings[id(child)]):
                             rollback_backing.release(pages)
+                        decode_reserved[id(child)].difference_update(pages)
+                    release_decode_reservation()
                     return None
             except Exception:
                 # The error can be after mapping publication. Guessing a
@@ -265,7 +350,16 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 raise
             finally:
                 pending = None
-        return allocate
+        @functools.wraps(original)
+        def translated(*args: Any, **kwargs: Any) -> Any:
+            result = allocate(*args, **kwargs)
+            if result is None and on_capacity_miss is not None:
+                # Translate only after rollback, outside the fatal-error guard.
+                # The tagged coordinator owns its separate preparation window;
+                # otherwise main's batch journal catches this typed signal.
+                return on_capacity_miss(allocator, "the request", original.__name__, allocator)
+            return result
+        return translated
 
     def bind_release(child: Any, child_backings: tuple[SWABacking, ...]) -> None:
         release_depth = 0
@@ -324,6 +418,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 original_clear()
                 for child_backing in child_backings:
                     child_backing.release(set(child_backing.live))
+                decode_reserved[id(child)].clear()
                 deferred.clear()
             except Exception:
                 failed = True
@@ -335,7 +430,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             if counts is not None:
                 return max(0, min(native_available[id(child)](), counts[id(child)]))
             return min([native_available[id(child)](),
-                        *(item.available_pages() * page_size for item in child_backings)])
+                        *((item.available_pages() + len(decode_reserved[id(child)])) * page_size
+                          for item in child_backings)])
 
         child.free = wrap_release(child.free, page_size)
         child.free_page_ids = wrap_release(child.free_page_ids, 1)
