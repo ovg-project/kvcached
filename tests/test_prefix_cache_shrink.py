@@ -752,20 +752,24 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
 
 
 @pytest.mark.parametrize("hisparse", [False, True])
-def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler, hisparse):
+def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler, hisparse, monkeypatch):
     from kvcached.integration.sglang import patches
 
     scheduler = sglang_scheduler()
     manager = scheduler.tree_cache.manager
     cache = scheduler.tree_cache
-    cache.swa_evictable_size = cache.full_evictable_size
-    cache.full_evictable_size = lambda: 0
     original_evict = cache.evict
+    cache.swa_evictable_size = lambda: len(cache.cached)
+    cache.full_evictable_size = lambda: 0  # The full prefix is still locked.
     cache.evict = lambda params: original_evict(params.swa_num_tokens)
+    monkeypatch.setattr(patches, "_sglang_evict_params_cls", lambda: (
+        lambda num_tokens=0, swa_num_tokens=0, mamba_num=0: SimpleNamespace(
+            num_tokens=num_tokens, swa_num_tokens=swa_num_tokens, mamba_num=mamba_num)))
     # DSV4 keeps native child IDs, exposing only its physical backing manager.
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
         full_attn_allocator=SimpleNamespace(), swa_attn_allocator=SimpleNamespace(),
-        _kvcached_dsv4_backing=SimpleNamespace(manager=manager),
+        _kvcached_dsv4_backing=SimpleNamespace(manager=manager,
+                                               native_page_bytes=manager.block_mem_size),
     )
     if hisparse:
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
@@ -879,3 +883,18 @@ def test_component_limit_reclaims_only_its_unprotected_prefix(
     assert 0 in manager.page_allocator.inuse  # Permanent sentinel survives.
     assert other.page_allocator.inuse == other_pages
     assert cached[component]  # Stop once the physical target is satisfied.
+
+
+def test_dsv4_reclaimer_converts_physical_bytes_to_native_tokens():
+    from kvcached.integration.sglang import patches
+    manager = SimpleNamespace(page_size=16, block_mem_size=16)
+    backing = SimpleNamespace(manager=manager, native_page_bytes=6)
+    scheduler = SimpleNamespace(
+        tree_cache=SimpleNamespace(page_size=4, swa_evictable_size=lambda: 24),
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=4, _kvcached_dsv4_backing=backing))
+    # SimpleNamespace cannot be weak-referenced; use a normal scheduler object.
+    instance = type("Scheduler", (), vars(scheduler))()
+    reclaimer = patches._PrefixCacheShrinkReclaimer(instance, manager)
+    assert reclaimer.swa
+    assert reclaimer._cache()[2] == 12
+    assert reclaimer.count_pages() == 2
