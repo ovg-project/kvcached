@@ -79,7 +79,7 @@ class RankCoordinator:
         self.outer_required = None
         self.token_budget = None
         self.prefill_attempt = None
-        self.row_reservation = None
+        self.row_reservation: Any = None
         self.planned = self.grammar_polled = self.priority_sorted = False
         error = None
         if (
