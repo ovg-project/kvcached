@@ -810,6 +810,7 @@ class DecodeChild(NativeChild):
         super().__init__(4, prefix, None)
         self.choices = list(free)
         self.released = []
+        self.need_sort = True
 
     def merge_and_sort_free(self):
         self.choices = sorted(self.choices + self.released)
@@ -820,7 +821,8 @@ class DecodeChild(NativeChild):
 
     def alloc_decode(self, last_loc, seq_lens=None, seq_lens_cpu=None):
         # Native 0.5.20 may sort for bs even when fewer new pages are needed.
-        self.merge_and_sort_free()
+        if self.need_sort:
+            self.merge_and_sort_free()
         result = []
         for length, previous in zip(seq_lens_cpu.tolist(), last_loc.tolist()):
             if (length - 1) % self.page_size == 0:
@@ -835,7 +837,10 @@ class DecodeChild(NativeChild):
 
     def _release(self, ids):
         super()._release(ids)
-        self.released.extend(ids.tolist())
+        if self.need_sort:
+            self.released.extend(ids.tolist())
+        else:
+            self.choices = ids.tolist() + self.choices
 
 
 class DecodeComposite(Composite):
@@ -902,6 +907,67 @@ def test_decode_reservation_survives_native_window_frees_and_sort_hint(setup):
     allocator.alloc_decode()
     assert allocator.mapping[20] == 12  # The reserved page, not newly freed 2.
     assert backing.live == {1, 3}
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("free_tokens", [False, True])
+def test_unsorted_window_frees_retain_backing_until_decode_chooses_ids(
+    setup, grouped, free_tokens
+):
+    allocator, backing = decode_setup()
+    assert backing.acquire({2})
+    child = allocator.swa_attn_allocator
+    child.need_sort = False
+    child.live.add(2)
+    assert allocator.check_decode_capacity(num_tokens=4)
+    claims = list(backing.manager.claims)
+    backing.manager.budget = len(backing.manager.live)
+    if grouped:
+        child.free_group = []
+    if free_tokens:
+        child.free(Tensor([8, 9, 10, 11]))
+    else:
+        child.free_page_ids(Tensor([2]))
+    if grouped:
+        child.free_group_end()
+    assert child.choices[0] == 2
+    assert backing.live == {1, 2, 3}
+    allocator.alloc_decode()
+    assert allocator.mapping[20] == 8
+    assert backing.manager.claims == claims
+    assert backing.live == {1, 2}  # Unused original reservation is released.
+
+
+def test_outer_decode_gate_keeps_native_limit_and_checks_logical_placement(setup):
+    logical, backing = decode_setup((10,))
+    assert backing.acquire({2})
+    logical.swa_attn_allocator.live.add(2)
+    backing.manager.budget = len(backing.manager.live)
+
+    class Outer:
+        logical_attn_allocator = logical
+        device_tokens = 4
+
+        def check_decode_capacity(self, *, num_tokens, **kwargs):
+            return min(self.device_tokens, logical.swa_attn_allocator.available_size()) >= num_tokens
+
+    outer = Outer()
+    assert outer.check_decode_capacity(num_tokens=4)
+    MODULE.bind_native_decode_wrapper(outer)
+    bound = outer.check_decode_capacity
+    MODULE.bind_native_decode_wrapper(outer)
+    assert outer.check_decode_capacity is bound
+    assert not outer.check_decode_capacity(num_tokens=4)
+    assert backing.live == {1, 2}
+    logical.swa_attn_allocator.choices = [3, 7, 9]
+    assert outer.check_decode_capacity(num_tokens=4)
+    assert backing.live == {1, 2, 3}
+    outer.device_tokens = 0
+    assert not outer.check_decode_capacity(num_tokens=4)
+    assert backing.live == {1, 2}
+    outer.device_tokens = 4
+    assert outer.check_decode_capacity(num_tokens=4)
+    assert logical.alloc_decode().tolist() == [20]
 
 
 def test_peer_decode_rejection_returns_only_reservations(setup):

@@ -3435,7 +3435,11 @@ class DeepSeekV4RunnerOwnershipPatch(VersionAwarePatch, BasePatch):
                 bool(runner.is_draft_worker), runner.token_to_kv_pool_allocator
             ))
             try:
-                return original_init_pools(runner, *args, **kwargs)
+                result = original_init_pools(runner, *args, **kwargs)
+                from kvcached.integration.sglang.dsv4_backing import bind_native_decode_wrapper
+
+                bind_native_decode_wrapper(runner.token_to_kv_pool_allocator)
+                return result
             finally:
                 _dsv4_pool_context.reset(token)
 
