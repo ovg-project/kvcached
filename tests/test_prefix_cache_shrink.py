@@ -763,7 +763,7 @@ def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler)
     )
     scheduler._kvcached_shrink_reclaimers = None
     assert patches._token_kv_managers(scheduler.token_to_kv_pool_allocator) == [manager]
-    manager.page_allocator.resize_target = manager.page_size * LIMIT_PAGES
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
     scheduler.on_idle()
     _assert_sglang_within_limit(scheduler)
     assert len(getattr(scheduler, "_kvcached_shrink_reclaimers")) == 1
