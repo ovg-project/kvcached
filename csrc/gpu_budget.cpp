@@ -536,6 +536,7 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   const auto instance = shared_->pools[slot].instance;
   result.budget_bytes = shared_->budget;
   result.instance_limit_bytes = shared_->instances[instance].limit;
+  result.pool_minimum_bytes = shared_->pools[slot].minimum;
   result.watermark_bytes = watermark_locked(instance, shared_);
   result.sync_acquisitions = sync_acquisitions_;
   result.sync_contentions = sync_contentions_;
@@ -544,9 +545,12 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   result.sync_dead_owner_recoveries = sync_dead_owner_recoveries_;
   for (const auto &entry : shared_->pools) {
     result.charged_bytes = add(result.charged_bytes, entry.charged);
-    if (entry.instance == instance && entry.owner != 0)
+    if (entry.instance == instance && entry.owner != 0) {
       result.instance_charged_bytes =
           add(result.instance_charged_bytes, entry.charged);
+      result.instance_minimum_bytes =
+          add(result.instance_minimum_bytes, entry.minimum);
+    }
   }
   return result;
 }
@@ -1156,7 +1160,11 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
     }
     if (pool.failed && pool.failed_revision == entry.limit_revision) {
       ++state.failed;
-      state.failure_reason = "quarantined_pages_prevent_resize";
+      if (pool.failed == 1 || state.failure_reason.empty()) {
+        state.failure_reason = pool.failed == 2
+                                   ? "retained_mapping_exceeds_limit"
+                                   : "quarantined_pages_prevent_resize";
+      }
     }
     cannot_shrink |= !pool.can_shrink;
     unsupported |= !pool.can_shrink && pool.target < pool.capacity;
@@ -1367,7 +1375,7 @@ bool GpuBudget::acknowledge_control(size_t slot, uint64_t revision) {
 
 bool GpuBudget::fail_control(const std::string &instance, size_t slot,
                              uint64_t owner, uint64_t generation,
-                             uint64_t revision) {
+                             uint64_t revision, bool retained_quota) {
   Locked lock(*this);
   if (slot >= kPools || !owner)
     return false;
@@ -1380,7 +1388,8 @@ bool GpuBudget::fail_control(const std::string &instance, size_t slot,
       entry.limit_revision != revision)
     return false;
   pool.failed_revision = revision;
-  pool.failed = 1;
+  // Keep the shared layout unchanged: legacy readers still see a failure.
+  pool.failed = retained_quota ? 2 : 1;
   pool.acknowledged = 0;
   return true;
 }

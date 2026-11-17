@@ -99,7 +99,7 @@ class CPUAllocator:
         return {"total_pages": self.total_pages, "free_pages": len(self.free_pages_queue),
                 "inuse_pages": self.total_pages - len(self.free_pages_queue), "reserved_pages": 0}
 
-    def alloc_page(self) -> CPUPage:
+    def alloc_page(self, allow_fresh_retry=True) -> CPUPage:
         if not self.capacity_ready.is_set():
             self.allocation_misses += 1
             self.miss_seen.set()

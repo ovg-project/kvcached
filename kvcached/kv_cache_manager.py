@@ -19,11 +19,19 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional
 
-from kvcached.errors import QuarantinedResizeError, StateConsistencyError
+from kvcached.errors import (
+    QuarantinedResizeError,
+    RetainedQuotaResizeError,
+    RetainedResizeError,
+    StateConsistencyError,
+)
 from kvcached.kv_geometry import check_page_geometry
 from kvcached.lifecycle import LifecyclePhase, LifecycleState
 from kvcached.locks import NoOpLock
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+from kvcached.tp_ipc_util import (
+    broadcast_kv_tensors_created,
+    raise_if_physical_growth_unresolved,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
@@ -462,7 +470,7 @@ class KVCacheManager:
     def _post_init(self):
         self._post_init_thread_id = threading.get_ident()
 
-        def _check_kv_tensors_created():
+        def _check_kv_tensors_created(remaining: float):
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
                 vllm_remote = should_use_worker_ipc()
@@ -472,29 +480,29 @@ class KVCacheManager:
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(
                     self.world_size, self.pp_rank,
-                    group_id=self.group_id)
+                    group_id=self.group_id, timeout_s=remaining)
             else:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
             if self.null_block is not None:
                 return
-            total_wait = 0.0
+            deadline = time.monotonic() + KV_TENSOR_WAIT_TIMEOUT
             last_error: Exception | None = None
             while not self._shutdown_requested.is_set():
+                remaining = deadline - time.monotonic()
                 try:
-                    if _check_kv_tensors_created():
+                    if remaining > 0 and _check_kv_tensors_created(remaining):
                         break
                 except Exception as e:
                     last_error = e
-                if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
+                if time.monotonic() >= deadline:
                     message = ("KV tensors not created after "
                                f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
                     if last_error is not None:
                         message = f"{message}; last error: {last_error}"
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
-                total_wait += 0.001
             if self._shutdown_requested.is_set():
                 return
             # KV tensors created now
@@ -827,7 +835,8 @@ class KVCacheManager:
                 # blocks reach ret_index, which rollback therefore cannot
                 # restore) and must stay fail-loud.
                 try:
-                    page = self.page_allocator.alloc_page()
+                    page = (self.page_allocator.alloc_page(allow_fresh_retry=False)
+                            if _skip_wait else self.page_allocator.alloc_page())
                     # A new mapping changes the driver's free capacity.
                     self._avail_physical_pages_cache = None
                 except StateConsistencyError as e:
@@ -844,6 +853,12 @@ class KVCacheManager:
                 except RuntimeError as e:
                     self._increment_operation_counter(
                         "manager_page_allocation_failures_total")
+                    # Older native extensions erase the callback's exception type.
+                    try:
+                        raise_if_physical_growth_unresolved()
+                    except StateConsistencyError as fatal:
+                        self._record_native_fatal("alloc", fatal)
+                        raise
                     # The recoverable-miss classification only holds while
                     # the native pool is healthy. An untyped failure that
                     # left the transaction state FAILED (e.g. one racing in
@@ -854,9 +869,15 @@ class KVCacheManager:
                         raise
                     self._release_bound_empty_pages(bound_empty_pages)
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
-                    logger.warning(
-                        f"alloc_page() failed after partially allocating "
-                        f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+                    failure_count = self._get_operation_counter(
+                        "manager_page_allocation_failures_total"
+                    )
+                    if failure_count & (failure_count - 1) == 0:
+                        logger.warning(
+                            "Physical KV page allocation remains unavailable; "
+                            "returning a recoverable allocation miss "
+                            "(failures=%d): %s", failure_count, e,
+                        )
                     return None
                 self._increment_operation_counter("manager_page_allocations_total")
                 if self.max_block_id is None:
@@ -1179,7 +1200,11 @@ class KVCacheManager:
                 try:
                     resized = self.page_allocator.resize(
                         self.target_num_pages * self.page_size)
-                except QuarantinedResizeError:
+                except RetainedResizeError:
+                    # Keep cache reclamation active: its releases may provide
+                    # the credit needed to recover the retained batch.
+                    pass
+                except (QuarantinedResizeError, RetainedQuotaResizeError) as error:
                     # Reject the pending limit without blocking healthy pages.
                     self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
@@ -1187,8 +1212,8 @@ class KVCacheManager:
                     self.target_num_pages = None
                     control = getattr(self, "_runtime_control", None)
                     if control is not None:
-                        control.fail()
-                    logger.warning("Deferred resize rejected: pool has quarantined pages")
+                        control.fail(retained_quota=isinstance(error, RetainedQuotaResizeError))
+                    logger.warning("Deferred resize rejected: %s", error)
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can
                     # carry the same fatal verdict as free_pages() above.
@@ -1788,7 +1813,11 @@ class KVCacheManager:
             return 0
         retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
         occupied = len(self.full_pages) + len(self.avail_pages) - retiring
-        return max(0, occupied - self.target_num_pages)
+        excess = max(0, occupied - self.target_num_pages)
+        retryable = getattr(self.page_allocator, "get_num_retryable_pages", lambda: 0)()
+        # Even when live pages fit the target, recovery may need another page
+        # temporarily. Ask for one release, retry, and stop once recovery works.
+        return max(excess, int(retryable > 0 and occupied > 0))
 
     @property
     def target_num_blocks(self) -> Optional[int]:
@@ -1859,7 +1888,16 @@ class KVCacheManager:
                            new_mem_size // self.page_size)
         try:
             resized = self.page_allocator.resize(target_pages * self.page_size)
-        except QuarantinedResizeError:
+        except RetainedResizeError:
+            total_pages = self.page_allocator.get_page_state()["total_pages"]
+            if target_pages >= total_pages:
+                self.in_shrink = False
+                self.target_num_pages = None
+                raise
+            # A pending shrink must reach engine-side cache owners even if its
+            # retained batch cannot recover until they release healthy pages.
+            resized = False
+        except (QuarantinedResizeError, RetainedQuotaResizeError):
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_pages = None
@@ -1961,16 +1999,21 @@ class KVCacheManager:
         # Every native capacity read can observe a background-preallocation
         # failure, including one that races after the first read.
         try:
+            # A background preallocator cannot raise on the engine's thread.
+            raise_if_physical_growth_unresolved()
             virtual_free_pages = self.page_allocator.get_num_free_pages()
             if self.in_shrink:
                 blocks_from_free_pages = 0
             else:
                 physical_free_pages = self._get_cached_avail_physical_pages()
                 if self.page_size % self.block_mem_size == 0:
+                    get_retryable_pages = getattr(
+                        self.page_allocator, "get_num_retryable_pages", None)
+                    retryable_pages = get_retryable_pages() if get_retryable_pages else 0
                     free_pages = min(
                         virtual_free_pages,
                         physical_free_pages
-                        + self.page_allocator.get_num_reserved_pages())
+                        + self.page_allocator.get_num_reserved_pages() + retryable_pages)
                     blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                         self.page_size, self.block_mem_size)
                 else:

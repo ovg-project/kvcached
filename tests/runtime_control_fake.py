@@ -46,12 +46,13 @@ def attach_control(manager, monkeypatch):
         acked[0] = revision
         return True
 
-    def fail(path, name, slot, owner, generation, revision):
+    def fail(path, name, slot, owner, generation, revision, retained_quota=False):
         if (slot, owner, generation, revision) != tuple(
                 state[key] for key in ("pool_slot", "pool_owner", "generation", "limit_revision")):
             return False
         failed[0] = revision
-        state["failure_reason"] = "quarantined_pages_prevent_resize"
+        state["failure_reason"] = ("retained_mapping_exceeds_limit" if retained_quota
+                                   else "quarantined_pages_prevent_resize")
         return True
 
     monkeypatch.setattr(kvcached, "_C", SimpleNamespace(

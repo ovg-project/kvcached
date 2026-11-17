@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 PAGE_SIZE = 2 * 1024 * 1024
-MODES = ("one-phase-control", "two-phase", "automatic")
+MODES = ("combined-control", "two-phase", "automatic")
 
 
 def worker(rank, device, layers, pages, pipe):
@@ -52,7 +52,8 @@ async def unmap(mode, count, offsets):
         await ipc._broadcast_unmap_from_kv_tensors(count, offsets)
         return
     transaction_id = uuid.uuid4().hex
-    phases = [("unmap_from_kv_tensors", "success")] if mode == "one-phase-control" else [
+    combined = mode == "combined-control"
+    phases = [("prepare_unmap_from_kv_tensors", "committed")] if combined else [
         ("prepare_unmap_from_kv_tensors", "prepared"),
         ("commit_unmap_from_kv_tensors", "committed"),
     ]
@@ -61,6 +62,7 @@ async def unmap(mode, count, offsets):
             ipc._send_and_receive_message(rank, {
                 "cmd": command, "offsets": offsets, "group_id": 0,
                 "transaction_id": transaction_id,
+                "commit": combined,
             }) for rank in range(count)
         ])
         assert all(reply.get("status") == expected for reply in replies), replies

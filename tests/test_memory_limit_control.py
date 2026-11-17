@@ -21,7 +21,10 @@ def _load_manager_class():
         fake_module,
         "InternalPage",
         types.SimpleNamespace(
-            get_num_blocks=lambda page_size, block_mem_size: page_size // block_mem_size
+            get_num_blocks=lambda page_size, block_mem_size: page_size // block_mem_size,
+            get_block_range=lambda page_id, page_size, block_mem_size: (
+                (page_id * page_size + block_mem_size - 1) // block_mem_size,
+                (page_id + 1) * page_size // block_mem_size),
         ),
     )
     setattr(fake_module, "kv_tensors_created", lambda *args, **kwargs: True)
@@ -190,13 +193,15 @@ class NativeControlFake:
                      pool_target_bytes=min(limit // bundle * bundle, state["pool_capacity_bytes"]))
         return dict(state, status="accepted")
 
-    def fail_instance_control(self, path, instance, slot, owner, generation, revision):
+    def fail_instance_control(self, path, instance, slot, owner, generation, revision,
+                              retained_quota=False):
         state = self.states[path]
         if (slot, owner, generation, revision) != tuple(
                 state[key] for key in ("pool_slot", "pool_owner", "generation", "limit_revision")):
             return False
         state.update(status="failed", convergence="failed", failed=1,
-                     failure_reason="quarantined_pages_prevent_resize")
+                     failure_reason=("retained_mapping_exceeds_limit" if retained_quota
+                                     else "quarantined_pages_prevent_resize"))
         return True
 
     def local_instance_control(self, group_id):
@@ -426,8 +431,9 @@ def test_listing_groups_uses_one_physical_instance_row(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("deferred", [False, True])
-def test_quarantine_failure_is_queryable_without_retry(controls, monkeypatch, deferred):
-    from kvcached.errors import QuarantinedResizeError
+@pytest.mark.parametrize("quota", [False, True])
+def test_resize_rejection_is_queryable_without_retry(controls, monkeypatch, deferred, quota):
+    from kvcached.errors import QuarantinedResizeError, RetainedQuotaResizeError
 
     manager, native, control = controls
     bundle = manager._memory_limit_page_bundle_bytes()
@@ -441,7 +447,8 @@ def test_quarantine_failure_is_queryable_without_retry(controls, monkeypatch, de
 
     def fail(size):
         attempts.append(size)
-        raise QuarantinedResizeError("injected quarantine")
+        error = RetainedQuotaResizeError if quota else QuarantinedResizeError
+        raise error("injected resize rejection")
 
     monkeypatch.setattr(manager.page_allocator, "resize", fail)
     monkeypatch.setattr(manager, "_record_operation_error", lambda *args: None)
@@ -453,7 +460,8 @@ def test_quarantine_failure_is_queryable_without_retry(controls, monkeypatch, de
         manager.apply_resize_target()
     state = control.get_instance_memory_limit()
     assert state["status"] == "failed" and not state["converged"]
-    assert state["gpus"][0]["failure_reason"] == "quarantined_pages_prevent_resize"
+    expected = "retained_mapping_exceeds_limit" if quota else "quarantined_pages_prevent_resize"
+    assert state["gpus"][0]["failure_reason"] == expected
     assert state["gpus"][0]["limit_bytes"] == 4 * bundle
     assert len(attempts) == 1 and not manager.in_shrink and native.acks == []
 
@@ -568,6 +576,81 @@ def test_exact_page_floor_with_nondivisible_blocks(controls, reserve_null, defer
     assert not manager.in_shrink
     assert manager.page_allocator.total_pages == int(reserve_null)
     assert manager.target_num_pages is None
+
+
+@pytest.mark.parametrize("entry", ["initial", "apply_pending", "finish_pending"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_retained_mapping_keeps_control_pending_until_retry(
+        controls, monkeypatch, entry, replacement):
+    """Constructed retained-map failure across the runtime-control boundary."""
+    from kvcached.errors import RetainedResizeError
+
+    manager, native, control = controls
+    bundle = manager._memory_limit_page_bundle_bytes()
+    control.set_instance_memory_limit(4 * bundle)
+    if entry != "initial":
+        manager.page_allocator.inuse_pages = 6
+        manager.apply_resize_target()
+        assert manager.in_shrink and native.acks == []
+        manager.page_allocator.inuse_pages = 2
+    resize = manager.page_allocator.resize
+    attempts = []
+
+    def retained(size):
+        attempts.append(size)
+        raise RetainedResizeError("retained batch pending adoption")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", retained)
+    if entry == "finish_pending":
+        manager._maybe_finish_shrink()
+    else:
+        manager.apply_resize_target()
+    assert manager.in_shrink and manager.target_num_pages == 4
+    assert native.acks == []
+    assert native.states["gpu-a"]["convergence"] == "pending"
+    assert manager._runtime_control.executing
+    # A repeated poll must retry the same revision without failing it.
+    manager.apply_resize_target()
+    assert len(attempts) == 2 and native.acks == []
+    assert native.states["gpu-a"]["convergence"] == "pending"
+
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    if replacement:
+        control.set_instance_memory_limit(8 * bundle)
+        manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
+    assert native.acks == [2 if replacement else 1]
+    assert manager.page_allocator.total_pages == (8 if replacement else 4)
+    assert not manager._resize_rejected
+    manager.apply_resize_target()
+    assert len(native.acks) == 1
+
+
+def test_growing_limit_cancels_old_shrink_while_recovery_waits(controls, monkeypatch):
+    from kvcached.errors import RetainedResizeError
+
+    manager, native, control = controls
+    manager.page_allocator.total_pages = 8
+    resize = manager.page_allocator.resize
+
+    def retained(size):
+        raise RetainedResizeError("retained batch still waiting on another worker")
+
+    monkeypatch.setattr(manager.page_allocator, "resize", retained)
+    bundle = manager._memory_limit_page_bundle_bytes()
+    control.set_instance_memory_limit(4 * bundle)
+    manager.apply_resize_target()
+    assert manager.in_shrink and manager.target_num_pages == 4
+    control.set_instance_memory_limit(12 * bundle)
+    manager._runtime_control.poll(force=True)
+    manager.apply_resize_target()
+    assert not manager.in_shrink and manager.target_num_pages is None
+    assert manager.shrink_excess_pages() == 0
+    assert native.acks == []
+    monkeypatch.setattr(manager.page_allocator, "resize", resize)
+    manager.apply_resize_target()
+    assert native.acks == [2]
+    assert manager.page_allocator.total_pages == 12
 
 
 @pytest.mark.parametrize("phase", ["unpublished", "converged", "pending", "failed"])

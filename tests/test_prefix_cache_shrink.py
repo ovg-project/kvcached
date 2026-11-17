@@ -102,7 +102,7 @@ class ShrinkablePageAllocator:
         self.resize_target = -1
         self.resize_calls: List[int] = []
 
-    def alloc_page(self) -> FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> FakePage:
         if len(self.inuse) >= self.total_pages:
             raise RuntimeError("no free page")
         page_id = min(set(range(MAX_PAGES)) - self.inuse)

@@ -4,45 +4,22 @@
 import asyncio
 import pickle
 
-from kvcached.tp_ipc_util import Message, get_worker_socket_path
+from kvcached.tp_ipc_util import IPC_TIMEOUT_S, Message, get_worker_socket_path
 
 
-async def send_map_cmd_to_worker_async(rank: int, offsets: list[int]):
-    socket_path = get_worker_socket_path(rank)
+async def send_and_receive_message(rank: int, message: Message, pp_rank: int = 0) -> Message:
+    async def exchange():
+        reader, writer = await asyncio.open_unix_connection(get_worker_socket_path(rank, pp_rank))
+        try:
+            data = pickle.dumps(message)
+            writer.write(len(data).to_bytes(4, "big") + data)
+            await writer.drain()
+            length = int.from_bytes(await reader.readexactly(4), "big")
+            return pickle.loads(await reader.readexactly(length))
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
-    reader, writer = await asyncio.open_unix_connection(socket_path)
-
-    try:
-        # Serialize and send the command (with 4-byte length prefix)
-        msg: Message = {"cmd": "map_to_kv_tensors", "offsets": offsets}
-        data = pickle.dumps(msg)
-        writer.write(len(data).to_bytes(4, "big") + data)
-        await writer.drain()
-
-        # Read 4-byte length prefix
-        length_bytes = await reader.readexactly(4)
-        length = int.from_bytes(length_bytes, "big")
-
-        # Read full response
-        data = await reader.readexactly(length)
-        response: Message = pickle.loads(data)
-
-        if response.get("status") != "success":
-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-async def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int]) -> None:
-    """
-    Async version of broadcast_map_to_kv_tensors.
-    Sends 'map_to_kv_tensors' to all TP workers concurrently via asyncio.
-    """
-
-    async def send_to_rank(rank):
-        await send_map_cmd_to_worker_async(rank, offsets)
-
-    # Launch async tasks for all ranks
-    tasks = [send_to_rank(rank) for rank in range(tp_size)]
-    await asyncio.gather(*tasks)
+    if IPC_TIMEOUT_S > 0:
+        return await asyncio.wait_for(exchange(), timeout=IPC_TIMEOUT_S)
+    return await exchange()

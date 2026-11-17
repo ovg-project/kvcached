@@ -535,6 +535,19 @@ int main(int argc, char **argv) {
                                  first.generation, first.revision));
     assert(budget->acknowledge_control(slot, next.revision));
     assert(writer->query_control("failure").status == "converged");
+    auto quota = writer->publish_control("failure", 0, first.generation);
+    assert(writer->fail_control("failure", slot, participant.pool_owner,
+                                quota.generation, quota.revision, true));
+    auto blocked = writer->query_control("failure");
+    assert(blocked.status == "failed" && blocked.failed == 1);
+    assert(blocked.failure_reason == "retained_mapping_exceeds_limit");
+    assert(budget->snapshot(slot).instance_limit_bytes == 0);
+    auto restored = writer->publish_control("failure", 120, first.generation);
+    assert(restored.failed == 0 && restored.failure_reason.empty());
+    assert(!writer->fail_control("failure", slot, participant.pool_owner,
+                                 quota.generation, quota.revision, true));
+    assert(budget->acknowledge_control(slot, restored.revision));
+    assert(writer->query_control("failure").status == "converged");
   }
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
@@ -544,6 +557,9 @@ int main(int argc, char **argv) {
     budget->configure_control_pool(a, 120, 12, true, 3, true);
     budget->configure_control_pool(b, 240, 24, true, 3, true);
     budget->configure_control_pool(c, 120, 12, true, 3, false);
+    assert(budget->snapshot(a).pool_minimum_bytes == 12);
+    assert(budget->snapshot(a).instance_minimum_bytes == 36);
+    assert(budget->snapshot(c).pool_minimum_bytes == 0);
     for (auto slot : {a, b, c})
       budget->ready_control_pool(slot);
     auto grant_a = budget->grant(a, 24);

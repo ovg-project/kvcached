@@ -74,14 +74,24 @@ class RuntimeControl:
         previous = tuple((state["generation"], state["limit_revision"], state["published"])
                          for state in self.executing)
         if signature != previous:
-            from kvcached.errors import QuarantinedResizeError
+            from kvcached.errors import (
+                QuarantinedResizeError,
+                RetainedQuotaResizeError,
+                RetainedResizeError,
+            )
 
             try:
                 manager.resize(pages * manager.page_size)
-            except QuarantinedResizeError:
+            except RetainedResizeError:
+                # The same revision must retry after the retained batch is
+                # adopted, including a revision already executing a shrink.
+                manager._resize_rejected = True
+                self.executing = ()
+                return
+            except (QuarantinedResizeError, RetainedQuotaResizeError) as error:
                 manager._resize_rejected = True
                 self.executing = states
-                self.fail()
+                self.fail(retained_quota=isinstance(error, RetainedQuotaResizeError))
                 return
             self.executing = states
         elif manager.in_shrink:
@@ -94,7 +104,7 @@ class RuntimeControl:
         if not manager.in_shrink and not getattr(manager, "_resize_rejected", False):
             self.acknowledge()
 
-    def fail(self) -> None:
+    def fail(self, *, retained_quota: bool = False) -> None:
         """Report the executing max, even if newer controls were published."""
         from kvcached import _C  # type: ignore[attr-defined]
 
@@ -102,7 +112,8 @@ class RuntimeControl:
             if state["published"]:
                 _C.fail_instance_control(
                     source["gpu"], source["instance"], source["pool_slot"],
-                    source["pool_owner"], state["generation"], state["limit_revision"])
+                    source["pool_owner"], state["generation"], state["limit_revision"],
+                    retained_quota=retained_quota)
 
     def acknowledge(self) -> None:
         from kvcached import _C  # type: ignore[attr-defined]

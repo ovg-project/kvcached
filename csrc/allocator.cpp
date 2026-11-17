@@ -660,13 +660,18 @@ void FTensorAllocator::reserve_targets_(
     // the process-shared accounting lock.
     std::unique_ptr<BudgetGrant> grant;
     size_t required_bytes = 0;
+    size_t batch_bytes = 0;
+    bool includes_page_zero = false;
     for (const auto &[ftensor, offset] : targets) {
-      if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
-        continue;
-      }
-      if (required_bytes >
+      if (batch_bytes >
           std::numeric_limits<size_t>::max() - ftensor->page_size_) {
         throw std::overflow_error("KV mapping transaction size overflow");
+      }
+      batch_bytes += ftensor->page_size_;
+      if (offset == 0)
+        includes_page_zero = true;
+      if (adopt_existing_mappings && ftensor->is_mapped(offset)) {
+        continue;
       }
       required_bytes += ftensor->page_size_;
     }
@@ -697,6 +702,22 @@ void FTensorAllocator::reserve_targets_(
         if (std::string(error.what()).find("capacity_exhausted:") == 0 &&
             stats) {
           stats->capacity_rejections = 1;
+          stats->quota_rejections =
+              state.instance_charged_bytes > state.instance_limit_bytes ||
+              required_bytes >
+                  state.instance_limit_bytes - state.instance_charged_bytes;
+          // Occupied pages may be released later. Only reject recovery when
+          // the intact batch and permanent null-page floors cannot fit, even
+          // after every other page has been freed. Targets include every
+          // layer/buffer of each logical page, so page zero covers this pool's
+          // entire floor (including the separate V region).
+          const auto other_floors =
+              state.instance_minimum_bytes -
+              (includes_page_zero ? state.pool_minimum_bytes : 0);
+          stats->quota_recovery_impossible =
+              stats->quota_rejections &&
+              (batch_bytes > state.instance_limit_bytes ||
+               other_floors > state.instance_limit_bytes - batch_bytes);
           stats->shortfall_bytes = required_bytes > stats->usable_bytes
                                        ? required_bytes - stats->usable_bytes
                                        : 0;

@@ -32,6 +32,8 @@ struct PhysicalGrowthOperationStats {
   uint64_t targets_count = 0;
   uint64_t capacity_checks = 0;
   uint64_t capacity_rejections = 0;
+  uint64_t quota_rejections = 0;
+  uint64_t quota_recovery_impossible = 0;
   uint64_t required_bytes = 0;
   uint64_t free_bytes = 0;
   uint64_t total_bytes = 0;

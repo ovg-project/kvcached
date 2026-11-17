@@ -103,7 +103,7 @@ def _make_manager(pages):
         def get_resize_target(self):
             return -1
 
-        def alloc_page(self):  # pragma: no cover - the tests never run dry
+        def alloc_page(self, allow_fresh_retry=True):  # pragma: no cover - the tests never run dry
             raise AssertionError("test should not need a fresh page")
 
     mgr.page_allocator = StubPageAllocator()
