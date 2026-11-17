@@ -49,6 +49,11 @@ class Manager:
         self.claims.append(list(ids))
         return ids
 
+    def can_alloc_exact(self, ids):
+        if self.fault:
+            raise self.fault
+        return not self.live.intersection(ids) and len(ids) <= self.available_size()
+
     def free(self, ids):
         assert set(ids) <= self.live
         self.live.difference_update(ids)
@@ -883,6 +888,27 @@ def test_decode_gate_checks_placement_before_native_allocation(setup):
     assert not allocator.check_decode_capacity(num_tokens=4)
     assert allocator.swa_attn_allocator.choices == [10]
     assert backing.live == {1, 2}
+
+
+def test_failed_placement_suppresses_admission_until_exact_capacity_recovers(setup):
+    allocator, backing = decode_setup((10,))
+    child = allocator.swa_attn_allocator
+    assert backing.acquire({2})
+    child.live.add(2)
+    child.need_sort = False
+    backing.manager.budget = len(backing.manager.live)
+    assert child.available_size() > 0
+    assert allocator.alloc_decode() is None
+    claims = list(backing.manager.claims)
+    for _ in range(3):
+        assert child.available_size() == 0
+        assert child.choices == [10]
+        assert backing.manager.claims == claims
+    backing.manager.budget += 2
+    assert child.available_size() > 0
+    assert backing.manager.claims == claims
+    assert allocator.alloc_decode().tolist() == [20]
+    assert allocator.mapping[20] == 40
 
 
 def test_decode_gate_retains_backing_until_the_promised_native_ids_are_used(setup):

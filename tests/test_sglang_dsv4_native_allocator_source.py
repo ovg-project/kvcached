@@ -73,3 +73,46 @@ def test_native_free_order_keeps_decode_reservation_backed(need_sort, grouped):
     assert selected.tolist() == list(range(page * 4, page * 4 + 4))
     assert backing.live == {2, 3, page}
     assert backing.manager.claims == claims
+
+
+@pytest.mark.skipif(not (SOURCE / "paged.py").is_file(), reason="native SGLang source unavailable")
+@pytest.mark.parametrize("recovery", ["capacity", "prefix"])
+def test_failed_native_prefix_waits_for_placement_progress(recovery):
+    native = native_paged_allocator()
+    full = native(256, 4, torch.int64, "cpu", None, False)
+    swa = native(256, 4, torch.int64, "cpu", None, False)
+    for child in (full, swa):
+        child.alloc(80)
+        child.free_page_ids(torch.arange(2, 20))
+        child.free_page_ids(torch.tensor([20]))
+    manager = Manager(budget=0)
+    backing = MODULE.SWABacking(manager, native_pages=65, native_page_bytes=6,
+                                physical_page_bytes=32)
+    assert backing.acquire({1})  # This live page shares permanent padding.
+
+    class Composite:
+        page_size = 4
+        full_attn_allocator = full
+        swa_attn_allocator = swa
+
+        def alloc(self):
+            return full.alloc(4), swa.alloc(4)
+
+    allocator = Composite()
+    MODULE.bind_native_swa(allocator, backing)
+    assert swa.available_size() > 0  # Aggregate capacity is initially optimistic.
+    assert allocator.alloc() is None
+    for _ in range(3):
+        assert swa.available_size() == 0
+        assert swa.get_all_free_pages()[0].item() == 20
+        assert not manager.claims
+    if recovery == "capacity":
+        manager.budget = 1
+        expected = 20
+    else:
+        swa.free_page_ids(torch.tensor([1]))
+        expected = 1
+    assert swa.available_size() > 0
+    assert not manager.claims  # Availability did not reserve or reorder anything.
+    _, selected = allocator.alloc()
+    assert selected.tolist() == list(range(expected * 4, expected * 4 + 4))

@@ -766,7 +766,22 @@ class KVCacheManager:
             self._step_alloc_blocks = getattr(self, "_step_alloc_blocks", 0) + taken
         return result
 
-    def _alloc_exact_impl(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+    def can_alloc_exact(self, block_ids: Iterable[int]) -> bool:
+        """Check current exact placement without claiming blocks or applying resize.
+
+        This is an admission hint, not a reservation: another pool may consume
+        physical headroom before alloc_exact performs the actual claim.
+        """
+        self.wait_ready()
+        return self._can_alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _can_alloc_exact_ready(self, block_ids: Iterable[int]) -> bool:
+        return self._exact_claim_preflight(block_ids, apply_resize=False) is not None
+
+    def _exact_claim_preflight(
+        self, block_ids: Iterable[int], *, apply_resize: bool
+    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int]]]:
         requested: List[int] = []
         for value in block_ids:
             if isinstance(value, bool):
@@ -790,9 +805,10 @@ class KVCacheManager:
                 raise ValueError("Exact block crosses a physical-page boundary")
             grouped.setdefault(page_id, []).append(block_id)
         if not requested:
-            return []
+            return requested, grouped, set()
 
-        self._apply_resize_target()
+        if apply_resize:
+            self._apply_resize_target()
         if self.available_size() < len(requested):
             return None
 
@@ -804,11 +820,11 @@ class KVCacheManager:
                 fresh_count > max(0, logical_limit - self._logical_allocated_blocks)):
             return None
         shrinking = getattr(self, "in_shrink", False)
-        retiring = self._retiring_page_ids() if shrinking else frozenset()
+        retiring = self._unreusable_page_ids()
         # Check every existing page before mapping or claiming any new page.
         for page_id, ids in grouped.items():
             page = self.full_pages.get(page_id) or self.avail_pages.get(page_id)
-            if shrinking and (page_id in retiring or page is None):
+            if page_id in retiring or (shrinking and page is None):
                 return None
             if page is not None:
                 free = set(page.get_free_blocks())
@@ -824,6 +840,15 @@ class KVCacheManager:
         if needed_pages > (self._get_cached_avail_physical_pages()
                            + self.page_allocator.get_num_reserved_pages()):
             return None
+        return requested, grouped, reserved
+
+    def _alloc_exact_impl(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        claim = self._exact_claim_preflight(block_ids, apply_resize=True)
+        if claim is None:
+            return None
+        requested, grouped, reserved = claim
+        if not requested:
+            return []
 
         created: List[int] = []
         for page_id in grouped:

@@ -72,6 +72,21 @@ class SWABacking:
         self.refs += Counter()  # Drop zero counts.
         self.live.difference_update(removals)
 
+    def can_acquire(self, pages: set[int]) -> bool:
+        """Check an already validated placement without taking backing leases."""
+        missing = self.missing_physical_pages(pages)
+        return not missing or self.manager.can_alloc_exact(sorted(missing))
+
+    def missing_physical_pages(self, pages: set[int]) -> set[int]:
+        return {physical for page in pages - self.live for physical in self._span(page)} - self.refs.keys()
+
+    def physical_demand(self, native_pages: int) -> int:
+        """Forecast additional physical pages after using held native-page slack."""
+        held_bytes = (len(self.refs) + len(self.permanent_pages)) * self.physical_page_bytes
+        held_bytes -= (len(self.live) + 1) * self.native_page_bytes
+        missing = max(0, native_pages * self.native_page_bytes - held_bytes)
+        return (missing + self.physical_page_bytes - 1) // self.physical_page_bytes
+
     def available_pages(self) -> int:
         # An upper bound: placement can still fail for the exact native IDs.
         physical = len(self.refs) + len(self.permanent_pages) + self.manager.available_size()
@@ -88,7 +103,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                     full_backing: SWABacking | None = None, *,
                     full_backings: tuple[SWABacking, ...] = (),
                     swa_backings: tuple[SWABacking, ...] = (),
-                    on_capacity_miss: Any = None) -> None:
+                    on_capacity_miss: Any = None,
+                    on_priority_miss: Any = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
@@ -137,6 +153,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     budget: ContextVar[Any] = ContextVar("dsv4_native_budget", default=None)
     returning: ContextVar[bool] = ContextVar("dsv4_native_return", default=False)
     decode_reserved: dict[int, set[int]] = {id(full): set(), id(swa): set()}
+    placement_misses: dict[int, tuple[int, ...]] = {}
 
     def release_decode_reservation() -> None:
         nonlocal failed
@@ -183,6 +200,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             nonlocal failed
             release_decode_reservation()
             ready_managers()
+            if on_priority_miss is not None and on_priority_miss(kwargs.get("requests")):
+                return False
             if not original_decode_check(num_tokens=num_tokens, **kwargs):
                 return False
             count = (num_tokens + page_size - 1) // page_size
@@ -198,6 +217,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                     for item in backings[id(child)]:
                         if not item.acquire(pages):
                             release_decode_reservation()
+                            placement_misses[id(child)] = tuple(choices)
                             return False
                 return True
             except Exception:
@@ -310,7 +330,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             pending.append((child, new))
             for child_backing in backings[id(child)]:
                 if not child_backing.acquire(pages):
-                    raise _BackingMiss
+                    raise _BackingMiss(child, max(1, len(new)))
+            placement_misses.pop(id(child), None)
             return result
         return allocate
 
@@ -338,13 +359,21 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                             transaction.pages[id(child)].update(pages)
                     release_decode_reservation()
                     return result
-                except _BackingMiss:
+                except _BackingMiss as miss:
                     for child, pages in reversed(pending):
                         return_pages(child, pages)
                         for rollback_backing in reversed(backings[id(child)]):
                             rollback_backing.release(pages)
                         decode_reserved[id(child)].difference_update(pages)
                     release_decode_reservation()
+                    if miss.args:
+                        child, count = miss.args
+                        census = getattr(child, "get_all_free_pages", None)
+                        if census is not None:
+                            normalize = getattr(child, "merge_and_sort_free", None)
+                            if normalize is not None:
+                                normalize()
+                            placement_misses[id(child)] = tuple(census()[:count].tolist())
                     return None
             except Exception:
                 # The error can be after mapping publication. Guessing a
@@ -431,6 +460,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 for child_backing in child_backings:
                     child_backing.release(set(child_backing.live))
                 decode_reserved[id(child)].clear()
+                placement_misses.pop(id(child), None)
                 deferred.clear()
             except Exception:
                 failed = True
@@ -441,6 +471,13 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             counts = budget.get()
             if counts is not None:
                 return max(0, min(native_available[id(child)](), counts[id(child)]))
+            missed = placement_misses.get(id(child))
+            if missed:
+                prefix = tuple(child.get_all_free_pages()[:len(missed)].tolist())
+                if prefix == missed and any(not item.can_acquire(set(prefix))
+                                            for item in child_backings):
+                    return 0
+                placement_misses.pop(id(child), None)
             return min([native_available[id(child)](),
                         *((item.available_pages() + len(decode_reserved[id(child)])) * page_size
                           for item in child_backings)])
@@ -479,6 +516,22 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     allocator._kvcached_prepare_transaction = Preparation
     allocator._kvcached_budget_context = budget_context
     allocator._kvcached_budget_counts = lambda: (full.available_size(), swa.available_size())
+
+    def backing_demand(native_pages: int) -> list[tuple[Any, int]]:
+        demands = []
+        for child in (full, swa):
+            missed = placement_misses.get(id(child))
+            prefix: tuple[int, ...] = ()
+            if missed and native_pages > 0:
+                current = tuple(child.get_all_free_pages()[:len(missed)].tolist())
+                if current == missed:
+                    prefix = missed
+            for item in backings[id(child)]:
+                demands.append((item.manager, max(item.physical_demand(native_pages),
+                                                 len(item.missing_physical_pages(set(prefix))))))
+        return demands
+
+    allocator._kvcached_backing_demand = backing_demand
     # Slot conservation counts logical IDs, not the current physical budget.
     allocator._conserve_swa_available_size = native_available[id(swa)]
     allocator._conserve_full_available_size = native_available[id(full)]

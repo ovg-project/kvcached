@@ -722,6 +722,7 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
     from kvcached import kv_cache_manager
     from kvcached.priority_reclaim import PriorityReclaimGroup
 
+    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
     members: tuple[Any, ...] = (_make_manager(deferred), _make_manager(deferred))
     ops = sys.modules.get("kvcached.vmm_ops")
     if ops is None:
@@ -736,7 +737,6 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
         return True
 
     monkeypatch.setattr(ops, "_publish_pool_reclaimable", publish_pools, raising=False)
-    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
     for i, member in enumerate(members):
         member.group_id = i
         member.world_size = 1
