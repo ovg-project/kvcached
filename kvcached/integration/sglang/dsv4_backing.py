@@ -398,6 +398,10 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         deferred: set[int] = set()
 
         def release_backing(pages: set[int]) -> None:
+            if pages:
+                # Sorted native frees may be staged behind the old prefix.
+                # Let the next admission normalize and reconsider that progress.
+                placement_misses.pop(id(child), None)
             reserved = decode_reserved[id(child)]
             if reserved:
                 # Unsorted native allocators prepend freed SWA window pages.
@@ -471,16 +475,26 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             counts = budget.get()
             if counts is not None:
                 return max(0, min(native_available[id(child)](), counts[id(child)]))
+            capacity = min([native_available[id(child)](),
+                            *((item.available_pages() + len(decode_reserved[id(child)])) * page_size
+                              for item in child_backings)])
             missed = placement_misses.get(id(child))
             if missed:
                 prefix = tuple(child.get_all_free_pages()[:len(missed)].tolist())
-                if prefix == missed and any(not item.can_acquire(set(prefix))
-                                            for item in child_backings):
-                    return 0
+                if prefix == missed:
+                    # A failed large prefill must not hide a feasible smaller
+                    # decode. Find the affordable prefix without claiming it.
+                    low, high = 0, len(prefix)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        if all(item.can_acquire(set(prefix[:middle])) for item in child_backings):
+                            low = middle
+                        else:
+                            high = middle - 1
+                    if low < len(prefix):
+                        return min(capacity, low * page_size)
                 placement_misses.pop(id(child), None)
-            return min([native_available[id(child)](),
-                        *((item.available_pages() + len(decode_reserved[id(child)])) * page_size
-                          for item in child_backings)])
+            return capacity
 
         child.free = wrap_release(child.free, page_size)
         child.free_page_ids = wrap_release(child.free_page_ids, 1)

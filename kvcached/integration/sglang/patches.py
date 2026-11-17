@@ -476,6 +476,9 @@ def _sglang_demand_round(scheduler: Any):
         if manager is not None:
             native = _sglang_dsv4_demand_allocator(scheduler)
             managers = _token_kv_managers(native) if native is not None else [manager]
+            request_state = _sglang_request_state(scheduler)
+            if native is not None and request_state is not None:
+                managers += request_state.managers()
             for member in managers:
                 member.take_step_alloc_blocks()
             _sglang_retry_prefill_if_backed(scheduler, manager)
@@ -693,6 +696,11 @@ def _sglang_dsv4_demand_allocator(scheduler: Any) -> Any:
     return allocator if callable(getattr(allocator, "_kvcached_backing_demand", None)) else None
 
 
+def _sglang_request_state(scheduler: Any) -> Any:
+    return getattr(getattr(scheduler, "req_to_token_pool", None),
+                   "_kvcached_dsv4_request_state", None)
+
+
 def _sglang_demand_manager(scheduler: Any) -> Any:
     """The token pool's manager, which posts demand on this rank's GPU.
 
@@ -752,6 +760,9 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
         scheduler._kvcached_prefill_demand = max(
             0, miss - getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
     demands = allocator._kvcached_backing_demand(need)
+    request_state = _sglang_request_state(scheduler)
+    if request_state is not None:
+        demands += request_state.backing_demand(bool(queue or getattr(scheduler, "chunked_req", None)))
     total_bytes = 0
     for manager, physical in demands:
         allocated = manager.take_step_alloc_blocks()
@@ -4608,6 +4619,16 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
         # Ranks see a new limit at different iterations; evicting then would
         # make their radix caches, and so their batches, diverge.
         if _sglang_parallel_size(scheduler) == 1:
+            request_state = _sglang_request_state(scheduler)
+            if request_state is not None:
+                def standby_reclaimable():
+                    coordinator = getattr(scheduler, "beam_coordinator", None)
+                    pending = getattr(coordinator, "pending_member_rows", None)
+                    return (coordinator is None or callable(pending)
+                            and pending(scheduler.running_batch) == 0)
+
+                request_state.standby_reclaimable = standby_reclaimable
+                request_state.register_reclaimers()
             for manager in _token_kv_managers(
                     getattr(scheduler, "token_to_kv_pool_allocator", None)):
                 register = getattr(manager, "_register_shrink_reclaimer", None)
@@ -4800,15 +4821,17 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
 
                     token_managers = _token_kv_managers(
                         getattr(sched_self, "token_to_kv_pool_allocator", None))
+                    request_state = _sglang_request_state(sched_self)
+                    managed = token_managers + (request_state.managers() if request_state is not None else [])
                     ranks = _sglang_parallel_size(sched_self)
                     sched_self._kvcached_control_managers = initialize_runtime_controls(
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
-                            manager is token for token in token_managers))
-                    if ranks == 1 and len(token_managers) > 1:
+                            manager is member for member in managed))
+                    if ranks == 1 and len(managed) > 1:
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
-                        PriorityReclaimGroup(tuple(token_managers))
+                        PriorityReclaimGroup(tuple(managed))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

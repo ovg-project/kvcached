@@ -135,6 +135,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         pool_module = importlib.import_module("sglang.srt.mem_cache.deepseek_v4_memory_pool")
         monkeypatch.setattr(pool_module, "ONLINE_C128", online)
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
         from sglang.srt.model_executor.model_runner import ModelRunner
         from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
         from sglang.srt.server_args import (
@@ -147,6 +148,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         # Native 0.5.20 inputs are a msgspec record. Resolution/model discovery
         # is outside this fixed-budget pool-construction regression.
         server_args = ServerArgs(model_path="unused-native-pool-fixture")
+        server_args.cuda_graph_config = CudaGraphConfig(prefill=PhaseConfig(backend="disabled"))
         monkeypatch.setattr(ServerArgs, "resolve_once", lambda self: None)
         server_args.page_size = 256
         server_args.enable_deepseek_v4_fp4_indexer = fp4

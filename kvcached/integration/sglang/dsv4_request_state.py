@@ -4,6 +4,7 @@
 
 import functools
 import types
+from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, NamedTuple
@@ -42,6 +43,8 @@ class RequestStateBacking:
         self.failed = False
         self.admission_budget: int | None = None
         self.capacity_override: int | None = None
+        self.demand_rows: set[int] = set()
+        self.standby_reclaimable = lambda: True
         self._alloc_rows = pool.alloc_rows
         self._free_rows = pool.free_rows
         self._available = pool.available_size
@@ -64,6 +67,7 @@ class RequestStateBacking:
                 ids = self._ids(rows, stride, banks)
                 added = ids - backing.live
                 if not backing.acquire(ids):
+                    self.demand_rows.update(rows)
                     for previous, additions in reversed(acquired):
                         previous.release(additions)
                     return False
@@ -88,6 +92,7 @@ class RequestStateBacking:
 
     def _reserve(self, count: int, *, retain_standby: bool) -> list[int]:
         self._ready()
+        self.demand_rows.clear()
         for backing, _, _ in self.entries:
             backing.manager.wait_ready()
         for backing, _, _ in self.entries:
@@ -132,6 +137,34 @@ class RequestStateBacking:
 
     def logical_available(self) -> int:
         return int(self._available())
+
+    def managers(self) -> list[Any]:
+        return [backing.manager for backing, _, _ in self.entries]
+
+    def backing_demand(self, needs_admission: bool) -> list[tuple[Any, int]]:
+        if not needs_admission:
+            self.demand_rows.clear()
+        return [(backing.manager, len(backing.missing_physical_pages(
+            self._ids(self.demand_rows, stride, banks))))
+            for backing, stride, banks in self.entries]
+
+    def can_reclaim_standby(self) -> bool:
+        return (self.admission_budget is None and self.capacity_override is None
+                and request_admission_context.get() is not self and self.standby_reclaimable())
+
+    def reclaim_standby(self) -> None:
+        if self.can_reclaim_standby():
+            self._release(self.standby)
+            self.standby.clear()
+
+    def register_reclaimers(self) -> None:
+        if hasattr(self, "reclaimers"):
+            return
+        self.reclaimers = [RequestStateReclaimer(self, entry) for entry in self.entries]
+        for reclaimer in self.reclaimers:
+            manager = reclaimer.backing.manager
+            manager._register_shrink_reclaimer(self.reclaim_standby)
+            manager._register_cache_owner(reclaimer.count_pages, reclaimer.evict_pages)
 
     @contextmanager
     def capacity_query(self, count: int):
@@ -224,6 +257,7 @@ class RequestStateBacking:
             owner._release(owner.active | owner.standby)
             owner.active.clear()
             owner.standby.clear()
+            owner.demand_rows.clear()
             owner.admission_rows = 1
 
         self.pool.available_size = types.MethodType(available, self.pool)
@@ -231,6 +265,29 @@ class RequestStateBacking:
         self.pool.free_rows = types.MethodType(free_rows, self.pool)
         self.pool.clear = types.MethodType(clear, self.pool)
         self.pool._kvcached_dsv4_request_state = self
+
+
+class RequestStateReclaimer:
+    """Only unpromised request-row leases; never token-prefix cache entries."""
+
+    def __init__(self, owner: RequestStateBacking, entry: tuple[SWABacking, int, int]):
+        self.owner = owner
+        self.backing, self.stride, self.banks = entry
+
+    def count_pages(self) -> int:
+        if not self.owner.can_reclaim_standby():
+            return 0
+        rows = self.owner._ids(self.owner.standby, self.stride, self.banks)
+        refs = Counter(page for row in rows for page in self.backing._span(row))
+        return sum(count == self.backing.refs[page] for page, count in refs.items())
+
+    def evict_pages(self, count: int) -> int:
+        before = len(self.backing.refs)
+        if count > 0:
+            # Coupled manager retirement enforces the shared byte allowance;
+            # unused row leases need not remain promised to a future request.
+            self.owner.reclaim_standby()
+        return before - len(self.backing.refs)
 
 
 def install_request_state_context(module: Any) -> bool:
