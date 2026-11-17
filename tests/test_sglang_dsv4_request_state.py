@@ -482,7 +482,7 @@ def test_row_reclaimers_keep_active_and_promised_rows(request_module):
 
 
 def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, monkeypatch):
-    from test_sglang_dsv4_native_backing import Composite, MODULE
+    from test_sglang_dsv4_native_backing import MODULE, Composite
     from test_sglang_dsv4_priority import PriorityManager
     from test_sglang_dsv4_runtime_reservation_patch import _load_sglang_modules
 
@@ -515,7 +515,7 @@ def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, mo
 
 def test_scheduler_registers_state_shrink_and_shared_allowance(request_module, monkeypatch):
     from test_sglang_dsv4_kv_pool_patch import _load_modules
-    from test_sglang_dsv4_native_backing import Composite, MODULE
+    from test_sglang_dsv4_native_backing import MODULE, Composite
 
     _, patches, _ = _load_modules(monkeypatch)
     pool, owner, backings = bind(request_module)
