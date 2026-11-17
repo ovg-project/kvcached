@@ -809,8 +809,6 @@ class KVCacheManager:
 
         if apply_resize:
             self._apply_resize_target()
-        if self.available_size() < len(requested):
-            return None
 
         reserved = set(self.reserved_blocks)
         logical_limit = getattr(self, "logical_num_blocks", None)
@@ -837,8 +835,14 @@ class KVCacheManager:
             page_id not in self.full_pages and page_id not in self.avail_pages
             for page_id in grouped
         )
-        if needed_pages > (self._get_cached_avail_physical_pages()
-                           + self.page_allocator.get_num_reserved_pages()):
+        try:
+            capacity = min(self.page_allocator.get_num_free_pages(),
+                           self._get_cached_avail_physical_pages()
+                           + self.page_allocator.get_num_reserved_pages())
+        except Exception as exc:
+            self._record_native_fatal("alloc_exact", exc)
+            raise
+        if needed_pages > capacity:
             return None
         return requested, grouped, reserved
 

@@ -4,6 +4,7 @@
 
 import sys
 from types import SimpleNamespace as NS
+from typing import Any
 
 import pytest
 from test_sglang_dsv4_native_backing import MODULE, Composite, DecodeComposite, Manager
@@ -85,7 +86,7 @@ def test_native_decode_gate_honors_priority_without_aborting_last_request(monkey
     backing = MODULE.SWABacking(manager, native_pages=12, native_page_bytes=6,
                                 physical_page_bytes=8)
     assert backing.acquire({1})
-    allocator = DecodeComposite((3, 7, 9))
+    allocator: Any = DecodeComposite((3, 7, 9))
     MODULE.bind_native_swa(
         allocator, backing,
         on_priority_miss=lambda requests: patches._sglang_priority_decode_miss(manager, requests),
@@ -109,7 +110,7 @@ def test_failed_sparse_prefix_posts_its_exact_physical_cost(monkeypatch):
     backing = MODULE.SWABacking(manager, native_pages=12, native_page_bytes=6,
                                 physical_page_bytes=8)
     assert backing.acquire({1, 2})
-    allocator = DecodeComposite((10,))
+    allocator: Any = DecodeComposite((10,))
     allocator.swa_attn_allocator.live.add(2)
     manager.budget = len(manager.live)
     MODULE.bind_native_swa(allocator, backing)
