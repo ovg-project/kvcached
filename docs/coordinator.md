@@ -55,7 +55,10 @@ capacity = charged + free − margin
 ```
 
 with `free` from `cudaMemGetInfo` and the margin 5% of the GPU
-(`KVCACHED_GPU_UTILIZATION`). A sample overstates the capacity, until the
+(`KVCACHED_GPU_UTILIZATION`). On a unified-memory GPU such as GB10, `free`
+is `MemAvailable` from `/proc/meminfo` instead, because the driver's count
+leaves out page cache that the kernel reclaims for device allocations.
+A sample overstates the capacity, until the
 next one, when it counts a batch both in `charged` and in `free`:
 
 - a batch that is charged but whose pages are not created yet;
@@ -73,7 +76,6 @@ All kvcached processes on a GPU must see the same `/dev/shm`.
 | `min` | not reclaimed below this | 0 |
 | priority | order of watermarks and reclaim | equal |
 | `headroom` | reserve kept from lower priorities | 0 |
-| preemption | whether reclaim may preempt running requests | off |
 
 With the defaults, behavior is today's: first come, first served.
 
@@ -85,10 +87,13 @@ in the engine.
 
 ### 2.4 Reclaim
 
-An instance short of memory posts its `shortfall`. Lower-priority instances
-above their `min` shrink: free pre-mapped pages, then evict prefix cache,
-then, if allowed, preempt running requests through the engine's own
-preemption.
+An instance posts its demand each scheduling step: the memory the step
+needed beyond its own free blocks. While what a higher-priority instance
+needs (2.3) is not free, lower-priority instances above their `min` give
+memory tier by tier, the lowest priority first within a tier: free pre-mapped
+pages, then evict prefix cache. Then the higher-priority instance uses its
+own prefix cache, and only after that are lower priorities' running requests
+preempted through the engine's own preemption.
 
 ### 2.5 CPU tier
 

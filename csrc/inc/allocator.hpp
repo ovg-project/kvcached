@@ -52,6 +52,7 @@ public:
                     int64_t num_kv_buffers = 2, bool unified_pool = false,
                     size_t page_size = 0);
   bool kv_tensors_created();
+  size_t kv_mapping_page_size();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   std::pair<bool, std::vector<offset_t>>
   map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
@@ -75,13 +76,34 @@ public:
   static void init(const std::string &dev_str, size_t page_size = 0,
                    bool contiguous_layout = false,
                    const std::string &instance_name = "");
+  // All groups share the explicit device resolved by init(). Reading it must
+  // not lazily create a group allocator on the querying thread. Returns -1
+  // when there is no initialized GPU backend (standalone IPC allocators).
+  static int device_index();
+  // Queries must not create a missing group or change the calling device.
+  static FTensorAllocator *find_allocator(int64_t group_id);
   static void shutdown();
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();
   BudgetSnapshot physical_budget_state();
   uint64_t available_physical_bytes();
+  // Post the instance's demand on this GPU (see GpuBudget::set_demand).
+  void set_kv_demand(uint64_t bytes);
+  // Post what the instance can release on this GPU, by tier, and read what
+  // it should release now for higher priorities' headroom and demand (#585
+  // reclaim).
+  void set_kv_reclaimable(uint64_t empty, uint64_t cache, uint64_t releasing);
+  ReclaimPlan kv_reclaim();
   std::string set_instance_budget_limit(uint64_t bytes, uint64_t revision);
   bool recalibrate_physical_budget();
+  InstanceControl configure_instance_control(bool can_shrink,
+                                             uint64_t expected_participants,
+                                             uint64_t startup_pages,
+                                             bool reserve_null = false);
+  InstanceControl instance_control_state();
+  bool acknowledge_instance_control(uint64_t revision);
+  std::string instance_control_path();
+  static std::string instance_control_name() { return g_instance_name_; }
 
 private:
   struct ReservedMapping {

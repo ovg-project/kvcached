@@ -128,6 +128,16 @@ class Container:
                      "-v", f"{out_dir}:{OUT_IN_CONTAINER}", "-e", "HF_TOKEN",
                      "--entrypoint", "sleep", engine.image, "infinity"], check=True)
 
+    def host_gpu(self, i: int) -> str:
+        """Host index of the run's i-th GPU, which the container sees as i."""
+        return str(i) if self.gpus == "all" else self.gpus.split(",")[i]
+
+    def gpu_env(self, i: Optional[int] = None) -> dict[str, str]:
+        """Environment that puts a server on the run's i-th GPU, or, with
+        None, on all of the run's GPUs in their order. The container sees
+        only the run's GPUs, as 0, 1, ...; a local server sees the host's."""
+        return {} if i is None else {"CUDA_VISIBLE_DEVICES": str(i)}
+
     def exec(self, script: str, timeout: Optional[float] = None,
              input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
         flags = ["-i"] if input_bytes is not None else []
@@ -240,6 +250,11 @@ class LocalHost(Container):
         self.gpu = "0" if gpus == "all" else gpus.split(",")[0]
         self.out_dir = out_dir
         self.out_path = str(out_dir)
+
+    def gpu_env(self, i: Optional[int] = None) -> dict[str, str]:
+        if i is None:
+            return {} if self.gpus == "all" else {"CUDA_VISIBLE_DEVICES": self.gpus}
+        return {"CUDA_VISIBLE_DEVICES": self.host_gpu(i)}
 
     def exec(self, script: str, timeout: Optional[float] = None,
              input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
@@ -361,13 +376,15 @@ def case_setup(case: Case) -> dict[str, Any]:
 
 
 def launch(ct: Container, case: Case, run_id: str, port: int,
-           extra_args: tuple[str, ...] = ()) -> Server:
+           extra_args: tuple[str, ...] = (),
+           extra_env: Optional[dict[str, str]] = None) -> Server:
     model = MODELS[case.model]
     case_dir = ct.out_dir / case.name
     case_dir.mkdir(parents=True, exist_ok=True)
 
     ipc = ipc_name(case.name, run_id)
     env = server_env(case, ipc)
+    env.update(extra_env or {})
     argv = server_argv(case.engine, model.hf_id, case.args() + extra_args, port)
     cmd = " ".join(f"{k}={v}" for k, v in env.items()) + " " + shlex.join(argv)
     (case_dir / "cmd.txt").write_text(cmd + "\n")

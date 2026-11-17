@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import math
 import os
@@ -14,16 +15,23 @@ import threading
 import time
 import types
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import wraps
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
+from kvcached import prefix_cache_retention
+from kvcached.control import get_prefix_cache_retention_limit
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import (
     VersionAwarePatch,
     VersionManager,
     VersionRange,
     version_range,
+)
+from kvcached.prefix_cache_retention import (
+    _apply_prefix_cache_retention_update,
+    _read_prefix_cache_retention_update,
 )
 from kvcached.utils import KVCachedConfigError, KVCachePoolExhausted, get_kvcached_logger
 
@@ -500,6 +508,27 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
     return isinstance(kv_cache_spec, MLAAttentionSpec)
 
 
+def _max_cached_blocks_for_tokens(
+    max_cached_tokens: int, block_size: int, num_kv_cache_groups: int = 1
+) -> int:
+    """Convert one logical token retention limit to vLLM block units."""
+    if max_cached_tokens < 0:
+        return -1
+    if max_cached_tokens == 0:
+        return 0
+    max_cached_blocks = max_cached_tokens // block_size
+    if max_cached_blocks == 0:
+        logger.warning(
+            "prefix cache retention limit %d is smaller than the KV block size "
+            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
+            "stays enabled. Set the limit to 0 to disable caching explicitly.",
+            max_cached_tokens,
+            block_size,
+        )
+        max_cached_blocks = 1
+    return max_cached_blocks * max(1, num_kv_cache_groups)
+
+
 def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
@@ -516,23 +545,8 @@ def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int
     enabled for the smallest non-zero budget, matching the user's intent; a
     warning is logged so the effective granularity is not silent.
     """
-    from kvcached.utils import MAX_CACHED_TOKENS
-    if MAX_CACHED_TOKENS < 0:
-        return -1
-    if MAX_CACHED_TOKENS == 0:
-        return 0
-    max_cached_blocks = MAX_CACHED_TOKENS // block_size
-    if max_cached_blocks == 0:
-        logger.warning(
-            "KVCACHED_MAX_CACHED_TOKENS=%d is smaller than the KV block size "
-            "(%d tokens); flooring max cached blocks to 1 so prefix caching "
-            "stays enabled. Set KVCACHED_MAX_CACHED_TOKENS=0 to disable "
-            "caching explicitly.",
-            MAX_CACHED_TOKENS,
-            block_size,
-        )
-        max_cached_blocks = 1
-    return max_cached_blocks * max(1, num_kv_cache_groups)
+    return _max_cached_blocks_for_tokens(
+        get_prefix_cache_retention_limit(), block_size, num_kv_cache_groups)
 
 
 def _cache_dtype_str(model_runner: Any) -> Optional[str]:
@@ -711,12 +725,15 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 num_kv_buffers: int = 2,
                 max_cached_blocks: int = 1000,
                 hash_block_size: Optional[int] = None,
+                num_kv_cache_groups: int = 1,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
                 self.enable_caching = enable_caching
                 # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
+                self._retention_block_size = block_size
+                self._retention_kv_cache_groups = max(1, num_kv_cache_groups)
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
 
@@ -786,6 +803,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self.kv_cache_manager, "_register_shrink_reclaimer", None)
                 if self._page_eviction is not None and register_reclaimer is not None:
                     register_reclaimer(self._reclaim_for_shrink)
+                register_owner = getattr(
+                    self.kv_cache_manager, "_register_cache_owner", None)
+                if self._page_eviction is not None and register_owner is not None:
+                    register_owner(self._reclaimable_cache_pages,
+                                   self._evict_cache_pages)
+                prefix_cache_retention._policy.register(self)
+
+            def _enforce_prefix_cache_retention(self, limit_tokens: int) -> None:
+                self.max_cached_blocks = _max_cached_blocks_for_tokens(
+                    limit_tokens,
+                    self._retention_block_size,
+                    self._retention_kv_cache_groups,
+                )
+                if (self.enable_prefix_cache and self.max_cached_blocks >= 0
+                        and len(self._evictable_blocks) > self.max_cached_blocks):
+                    self._evict_blocks_from_pool(
+                        len(self._evictable_blocks) - self.max_cached_blocks)
 
             def _remove_evictable(self, block_id: int) -> Optional[KVCacheBlock]:
                 block = self._evictable_blocks.pop(block_id, None)
@@ -1025,6 +1059,23 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     self._evict_block_ids(self._page_eviction.victims(
                         len(self._evictable_blocks), max_pages=excess))
 
+            def _reclaimable_cache_pages(self) -> int:
+                """Pages holding nothing but evictable prefix blocks."""
+                if self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                return self._page_eviction.whole_pages()
+
+            def _evict_cache_pages(self, pages: int) -> int:
+                """Evict up to `pages` whole pages of prefix cache, cheapest
+                first, for a higher priority's demand (#585)."""
+                if pages <= 0 or self._page_eviction is None or not self._evictable_blocks:
+                    return 0
+                victims = self._page_eviction.victims(
+                    len(self._evictable_blocks), max_pages=pages)
+                evicted = len({self._page_eviction.page_id(bid) for bid in victims})
+                self._evict_block_ids(victims)
+                return evicted
+
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list[KVCacheBlock]:
@@ -1184,6 +1235,17 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_num_free_blocks(self) -> int:
                 return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
 
+            def begin_demand_step(self) -> None:
+                self.kv_cache_manager.take_step_alloc_blocks()
+
+            def post_demand_blocks(self, unfit_blocks: int) -> None:
+                # The step's need: what it allocated, including blocks freed
+                # by evicting this pool's own prefix cache, plus what did not
+                # fit. It forecasts the next step (#585).
+                manager = self.kv_cache_manager
+                need = manager.take_step_alloc_blocks() + max(0, unfit_blocks)
+                manager.post_demand(manager.demand_pages(need))
+
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
 
@@ -1249,18 +1311,18 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         original_init = EngineCore.__init__
         detected_version = self.detected_version
+        from kvcached.integration.vllm.offload_config import patch_offload_initialization
+
+        patch_offload_initialization(EngineCore)
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                # OffloadingConnector allocates cross-layer KV tensors outside
-                # kvcached's VMM path (issue #267). Reject before any startup.
-                kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-                if getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector":
-                    raise KVCachedConfigError(
-                        "kvcached does not support vLLM CPU KV offloading "
-                        "(OffloadingConnector, --kv-offloading-size); "
-                        "remove --kv-offloading-size or disable kvcached"
-                    )
+                # Before 0.29 OffloadingConnector allocates cross-layer KV
+                # tensors outside kvcached's VMM path (issue #267); from 0.29
+                # its copies need the pins installed below. Reject the rest.
+                from kvcached.integration.vllm.offload_pins import check_offloading_config
+
+                check_offloading_config(vllm_config, detected_version)
                 # Reject a partial integration before either allocator or the
                 # native executor starts. vLLM can select V1 automatically.
                 if detected_version and VersionRange(">=0.29.0").contains(detected_version):
@@ -1328,7 +1390,19 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 )
             result = original_init(self, vllm_config, *args, **kwargs)
             if enable_kvcached():
+                from kvcached.runtime_control import initialize_runtime_controls
+
+                self._kvcached_control_managers = initialize_runtime_controls("vllm")
                 self._kvcached_install_ordered_unmap()
+                primary = _get_vllm_kv_cache_manager(self)
+                for manager in self._kvcached_control_managers:
+                    if primary is not None and manager is not primary:
+                        manager.defer_physical_release = primary.defer_physical_release
+                        if hasattr(primary, "physical_release_barrier"):
+                            manager.physical_release_barrier = primary.physical_release_barrier
+                from kvcached.integration.vllm.offload_pins import install_offload_copy_pins
+
+                install_offload_copy_pins(self, primary)
                 self._kvcached_start_limit_watch()
             return result
 
@@ -1389,40 +1463,85 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
             callbacks run on the engine thread, the only thread that may
             change the block pool.
             """
-            manager = _get_vllm_kv_cache_manager(self)
+            managers = getattr(self, "_kvcached_control_managers", ())
             callbacks = getattr(self, "_idle_state_callbacks", None)
-            if manager is None or not isinstance(callbacks, list):
+            if not managers or not isinstance(callbacks, list):
                 return
             try:
                 from vllm.v1.engine import EngineCoreRequestType
-                wakeup = EngineCoreRequestType.WAKEUP
-            except (ImportError, AttributeError):
+            except ImportError:
                 return
+            # Older engines have no WAKEUP. An empty abort only unblocks the
+            # input queue; it leaves requests untouched and runs idle callbacks.
+            wakeup: tuple[EngineCoreRequestType, list[str] | None] = (
+                (EngineCoreRequestType.WAKEUP, None)
+                if hasattr(EngineCoreRequestType, "WAKEUP")
+                else (EngineCoreRequestType.ABORT, []))
 
             def apply_limit(engine_core: Any) -> None:
-                manager.apply_resize_target()
-                manager.reclaim_for_shrink()
-                _release_retired_pages_if_idle(engine_core, manager)
+                _apply_prefix_cache_retention_update(_read_prefix_cache_retention_update(throttle=True))
+                for manager in managers:
+                    manager.apply_resize_target()
+                    manager.reclaim_for_shrink()
+                    reclaim = getattr(manager, "reclaim_for_priority", None)
+                    if reclaim is not None:
+                        # An idle engine holds no running requests; its empty
+                        # pages and cache go to a higher priority (#585). The
+                        # last step posted its levels before its last requests
+                        # finished, so post them again first.
+                        try:
+                            manager.post_reclaimable_levels()
+                            reclaim()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not release KV memory for a higher "
+                                "priority: %s", error)
+                    _release_retired_pages_if_idle(engine_core, manager)
+                    if reclaim is not None:
+                        # Retired pages are unmapped now; an idle engine posts
+                        # no more steps, so stop counting them as releasing.
+                        try:
+                            manager.post_reclaimable_levels()
+                        except Exception as error:
+                            patch_logger.warning(
+                                "Could not post KV reclaimable levels: %s", error)
                 _publish_kv_cache_events_if_idle(engine_core)
 
             stop = threading.Event()
 
-            def limits() -> tuple[int, int]:
-                return (manager.page_allocator.get_resize_target(),
-                        getattr(manager, "_memory_limit_revision", -1))
-
             def watch() -> None:
-                # -1 means no kvctl target and no set_memory_limit() revision.
-                # Starting there also applies a limit set during startup.
-                seen = (-1, -1)
-                while not stop.wait(0.2):
-                    current = limits()
-                    input_queue = getattr(self, "input_queue", None)
-                    if current == seen or input_queue is None:
+                # Read ledger metadata here; physical work stays on the engine.
+                from kvcached import _C  # type: ignore[attr-defined]
+
+                reclaiming = False
+                # An idle engine releases one step of a higher priority's
+                # demand per wakeup, so poll faster while one asks.
+                while not stop.wait(0.05 if reclaiming else 0.2):
+                    pending = reclaiming = False
+                    try:
+                        pending = _read_prefix_cache_retention_update() is not None
+                        for manager in managers:
+                            runtime = manager._runtime_control
+                            states = [_C.query_instance_control(source["gpu"], source["instance"],
+                                                               source["pool_slot"])
+                                      for source in runtime.sources]
+                            pending |= any(state["published"] and
+                                           state["convergence"] == "pending" for state in states)
+                            # A higher priority asks this instance for memory.
+                            reclaiming |= any(state.get("reclaim_bytes", 0)
+                                              for state in states)
+                        pending |= reclaiming
+                    except (RuntimeError, OSError):
+                        # Engine-side polling surfaces participant failures.
+                        pending = True
+                    if not pending:
                         continue
-                    seen = current
-                    callbacks.append(apply_limit)
-                    input_queue.put_nowait((wakeup, None))
+                    input_queue = getattr(self, "input_queue", None)
+                    if input_queue is None:
+                        continue
+                    if apply_limit not in callbacks:
+                        callbacks.append(apply_limit)
+                        input_queue.put_nowait(wakeup)
 
             thread = threading.Thread(target=watch, name="kvcached-limit-watch", daemon=True)
             self._kvcached_limit_watch = (stop, thread)
@@ -1432,6 +1551,25 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
         EngineCore._kvcached_install_ordered_unmap = _kvcached_install_ordered_unmap
         EngineCore._kvcached_start_limit_watch = _kvcached_start_limit_watch
+
+        def wrap_step(original: Callable[..., Any]) -> Callable[..., Any]:
+            @wraps(original)
+            def wrapped(engine_self: Any, *args: Any, **kwargs: Any) -> Any:
+                if enable_kvcached():
+                    _apply_prefix_cache_retention_update(_read_prefix_cache_retention_update(throttle=True))
+                return original(engine_self, *args, **kwargs)
+
+            return wrapped
+
+        for name in ("step", "step_with_batch_queue"):
+            original_step = getattr(EngineCore, name, None)
+            marker = "__kvcached_prefix_retention_step__"
+            if original_step is None or self._is_already_patched(original_step, marker):
+                continue
+
+            wrapped_step = wrap_step(original_step)
+            self._mark_as_patched(wrapped_step, marker)
+            setattr(EngineCore, name, wrapped_step)
         return True
 
     @version_range(VLLM_ALL_RANGE)
@@ -1999,6 +2137,8 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 max_cached_blocks=_get_max_cached_blocks(
                     block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
                 hash_block_size=hash_block_size,
+                num_kv_cache_groups=len(
+                    getattr(kv_cache_config, "kv_cache_groups", ()) or ()),
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -3304,6 +3444,276 @@ class MambaPartialTailPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _record_blocks_to_allocate(coordinator: Any) -> None:
+    """Keep the last block count the coordinator computed for a request.
+
+    ``allocate_slots()`` compares that count with the free blocks and
+    returns None when it does not fit, so after a None it is the need of the
+    request that did not fit.
+    """
+    if getattr(coordinator, "_kvcached_records_need", False):
+        return
+    original = getattr(coordinator, "get_num_blocks_to_allocate", None)
+    if original is None:
+        return
+
+    @functools.wraps(original)
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        need = original(*args, **kwargs)
+        coordinator._kvcached_last_need = need
+        return need
+
+    coordinator.get_num_blocks_to_allocate = recording
+    coordinator._kvcached_records_need = True
+
+
+def _kvcached_target_pages(scheduler: Any, kv: Any, running: list) -> list:
+    """Pages that preempting running requests can empty, cheapest first.
+
+    A request's blocks are spread over pages that other requests share, so
+    preempting in admission order can take many requests to empty one page.
+    Returns ``(page, owners)`` for the pages that running requests alone
+    hold, fewest owners first; empty when the scheduler does not expose its
+    requests' blocks.
+    """
+    get_block_ids = getattr(getattr(scheduler, "kv_cache_manager", None),
+                            "get_block_ids", None)
+    occupancy_of = getattr(kv, "get_page_occupancy", None)
+    block_pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
+    native_blocks = getattr(block_pool, "blocks", getattr(block_pool, "kv_block_pool", None))
+    if get_block_ids is None or occupancy_of is None or native_blocks is None:
+        return []
+    owners: dict[int, list] = {}
+    blocks: dict[int, set[int]] = {}
+    references: dict[int, int] = {}
+    for request in running:
+        try:
+            groups = get_block_ids(request.request_id)
+        except Exception:
+            return []
+        for group in groups:
+            for block_id in group:
+                if block_id <= 0:
+                    continue  # the null block
+                page = block_id * kv.block_mem_size // kv.page_size
+                blocks.setdefault(page, set()).add(block_id)
+                references[block_id] = references.get(block_id, 0) + 1
+                page_owners = owners.setdefault(page, [])
+                if not page_owners or page_owners[-1] is not request:
+                    page_owners.append(request)
+    occupancy = occupancy_of(list(blocks))
+    # Waiting remote loads and deferred frees can hold additional references
+    # to a running request's blocks. Occupancy alone cannot prove they empty.
+    candidates = sorted(
+        (page for page in blocks if len(blocks[page]) >= occupancy.get(page, 0)
+         and all(native_blocks[bid].ref_cnt == references[bid] for bid in blocks[page])),
+        key=lambda page: (len(owners[page]), len(blocks[page])))
+    return [(page, owners[page]) for page in candidates]
+
+
+def _kvcached_preempt_for_priority(scheduler: Any, kv: Any, pages: int) -> list:
+    """Preempt running requests until ``pages`` whole pages are released.
+
+    The last tier of #585's reclaim: a higher priority's demand is still
+    short after this instance's empty pages and prefix cache. Requests go
+    back to the waiting queue, as vLLM's own preemption does. Only pages
+    left empty are released, so the owners of the cheapest pages to empty go
+    first (see _kvcached_target_pages), then the scheduler's own order: the
+    last admitted, or the lowest priority under the priority policy.
+
+    With an asynchronous KV connector, vLLM frees a preempted request's
+    blocks only after the step in flight; those pages count as released
+    here and as releasing in the ledger until then. Returns the preempted
+    requests.
+    """
+    preempt = getattr(scheduler, "_preempt_request", None)
+    running = getattr(scheduler, "running", None)
+    if pages <= 0 or preempt is None or not running:
+        return []
+    can_free = getattr(scheduler, "_request_blocks_can_be_freed", None)
+    by_priority = getattr(getattr(scheduler, "policy", None), "name", "") == "PRIORITY"
+    try:
+        takes_drop = "drop_stale_output" in inspect.signature(preempt).parameters
+    except (TypeError, ValueError):
+        takes_drop = False
+    start = kv.occupied_pages()
+    timestamp = time.monotonic()
+    preempted: list = []
+    emptied = 0  # target pages whose owners are all preempted
+    deferred: list = []
+    note = getattr(kv, "note_pending_release", None)
+
+    def released() -> int:
+        return max(start - kv.occupied_pages(), emptied)
+
+    def preempt_one(victim: Any) -> None:
+        running.remove(victim)
+        before = {id(blocks) for _, blocks in getattr(scheduler, "deferred_frees", ())}
+        try:
+            if takes_drop:
+                preempt(victim, timestamp,
+                        drop_stale_output=getattr(scheduler, "requires_kv_delivery", False))
+            else:
+                preempt(victim, timestamp)
+        finally:
+            added = [blocks for _, blocks in getattr(scheduler, "deferred_frees", ()) if id(blocks) not in before]
+            if added:
+                deferred.extend(added)
+                scheduler._kvcached_priority_deferred = (
+                    getattr(scheduler, "_kvcached_priority_deferred", []) + added)
+                if note is not None:
+                    note(0)  # Protect surplus even if a later eviction fails.
+        preempted.append(victim)
+        # Freed blocks of a cached prefix stay in the prefix cache.
+        kv.evict_cache_pages(pages - released())
+
+    # Page efficiency must not override the engine's request-priority policy.
+    targets = [] if by_priority else _kvcached_target_pages(scheduler, kv, running)
+    for _, owners in targets:
+        if released() >= pages:
+            break
+        for victim in owners:
+            if victim in running:
+                preempt_one(victim)
+        emptied += 1
+    candidates = list(running) if by_priority else list(reversed(running))
+    if by_priority:
+        candidates.sort(key=lambda r: (r.priority, r.arrival_time), reverse=True)
+    for victim in candidates:
+        if released() >= pages:
+            break
+        if can_free is not None and not can_free(victim):
+            break  # its blocks free after the step in flight: not countable here
+        preempt_one(victim)
+    if note is not None and deferred:
+        note(max(0, emptied - (start - kv.occupied_pages())))
+    kv._refund_priority_reserve()
+    kv.post_reclaimable_levels()
+    return preempted
+
+
+class SchedulerDemandPatch(VersionAwarePatch, BasePatch):
+    """Post each step's need for new memory as the instance's demand.
+
+    #585's watermarks keep free memory from lower priorities for a
+    higher-priority instance. The level is overwritten every step: the blocks
+    the step allocated plus those of its first request that did not fit,
+    beyond what the pool still holds free, so lower priorities leave one more
+    step of it free. It is 0 when the pool's own free blocks cover a step.
+
+    Before scheduling, the step also releases what higher priorities' demand
+    asks of this instance: empty pages and prefix cache, then running
+    requests, which it preempts (#585).
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.core.sched.scheduler"
+    target_class = "Scheduler"
+    patch_name = "scheduler_demand"
+
+    def apply(self, scheduler_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        return self.patch_schedule(scheduler_mod)
+
+    @version_range(VLLM_V9_PLUS_RANGE)
+    def patch_schedule(self, scheduler_mod: types.ModuleType) -> bool:
+        Scheduler = self._get_target_class(scheduler_mod)
+        if Scheduler is None:
+            return False
+        original_schedule = getattr(Scheduler, "schedule", None)
+        if original_schedule is None:
+            self.logger.warning(
+                "Scheduler.schedule was not found; kvcached posts no demand")
+            return False
+        if self._is_already_patched(original_schedule, "scheduler_demand"):
+            return True
+
+        logger = self.logger
+
+        def include_preemptions(scheduler: Any, output: Any) -> None:
+            ids = getattr(output, "preempted_req_ids", None)
+            if ids is not None:
+                ids.update(getattr(scheduler, "_kvcached_priority_preempted_ids", ()))
+
+        build_meta = getattr(Scheduler, "_build_kv_connector_meta", None)
+        if build_meta is not None:
+            @functools.wraps(build_meta)
+            def _patched_build_meta(self, connector, scheduler_output, *args, **kwargs):
+                # Older schedulers construct this set from schedule-local
+                # victims. Connectors must see external victims before metadata.
+                include_preemptions(self, scheduler_output)
+                return build_meta(self, connector, scheduler_output, *args, **kwargs)
+
+            Scheduler._build_kv_connector_meta = _patched_build_meta
+
+        @functools.wraps(original_schedule)
+        def _patched_schedule(self, *args: Any, **kwargs: Any) -> Any:
+            manager = getattr(self, "kv_cache_manager", None)
+            if not enable_kvcached() or manager is None:
+                return original_schedule(self, *args, **kwargs)
+            manager._kvcached_step_need = None
+            pool = getattr(manager, "block_pool", None)
+            begin = getattr(pool, "begin_demand_step", None)
+            if begin is not None:
+                begin()
+            kv: Any = getattr(pool, "kv_cache_manager", None)
+            reclaim = getattr(kv, "reclaim_for_priority", None)
+            held: list = []
+            self._kvcached_priority_preempted_ids = set()
+            if reclaim is not None:
+                try:
+                    # Only priority victims extend the guard. Ordinary deferred
+                    # CoW frees must not keep an old allowance alive forever.
+                    live = {id(blocks) for _, blocks in getattr(self, "deferred_frees", ())}
+                    tickets = [blocks for blocks in getattr(self, "_kvcached_priority_deferred", ())
+                               if id(blocks) in live]
+                    self._kvcached_priority_deferred = tickets
+                    reconcile = getattr(kv, "reconcile_pending_release", None)
+                    if reconcile is not None:
+                        reconcile(bool(tickets))
+                    # Release what higher priorities ask of this instance
+                    # before scheduling; the rest is running requests'.
+                    running = reclaim()
+                    self._kvcached_reclaim_running_pages = running
+                    if running > 0:
+                        held = _kvcached_preempt_for_priority(self, kv, running)
+                        self._kvcached_priority_preempted_ids = {req.request_id for req in held}
+                except Exception as error:  # never fail a scheduling step
+                    logger.warning("Could not release KV memory for a higher "
+                                   "priority: %s", error)
+            # vLLM schedules no waiting request in a step that preempted one,
+            # so a preempted request never resumes in the same step (a KV
+            # connector relies on it). Keep this step's victims out of the
+            # waiting queue until it is scheduled.
+            waiting: Any = getattr(self, "waiting", None)
+            if held and getattr(waiting, "remove_requests", None) is not None:
+                waiting.remove_requests(held)
+            else:
+                held = []
+            try:
+                output = original_schedule(self, *args, **kwargs)
+                include_preemptions(self, output)
+                return output
+            finally:
+                self._kvcached_priority_preempted_ids = set()
+                for request in reversed(held):
+                    waiting.prepend_request(request)
+                post = getattr(pool, "post_demand_blocks", None)
+                if post is not None:
+                    try:
+                        post(int(manager._kvcached_step_need or 0))
+                        post_levels = getattr(kv, "post_reclaimable_levels", None)
+                        if post_levels is not None:
+                            post_levels()
+                    except Exception as error:  # never fail a scheduling step
+                        logger.warning("Could not post KV demand: %s", error)
+
+        self._mark_as_patched(_patched_schedule, "scheduler_demand")
+        Scheduler.schedule = _patched_schedule  # type: ignore[method-assign]
+        return True
+
+
 class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
     """Report an exhausted physical KV pool the way vLLM's scheduler expects.
 
@@ -3363,6 +3773,8 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                 return original_allocate_slots(self, *args, **kwargs)
             attempt = None
             coordinator = getattr(self, "coordinator", None)
+            if coordinator is not None:
+                _record_blocks_to_allocate(coordinator)
             if repair_native_retry and coordinator is not None:
                 from kvcached.integration.vllm.allocation_attempt import AllocationAttempt
 
@@ -3373,7 +3785,7 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                 request = args[0] if args else kwargs["request"]
                 attempt.begin(request.request_id)
             try:
-                return original_allocate_slots(self, *args, **kwargs)
+                result = original_allocate_slots(self, *args, **kwargs)
             except KVCachePoolExhausted as exhausted:
                 if attempt is not None:
                     attempt.rollback()
@@ -3383,10 +3795,16 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
                     "Shared physical KV pool is exhausted; reporting a "
                     "scheduling miss so the engine can preempt and retry: %s",
                     exhausted)
-                return None
+                result = None
             finally:
                 if attempt is not None:
                     attempt.end()
+            if result is None and getattr(self, "_kvcached_step_need", None) is None:
+                # The first request of the step that does not fit; the
+                # scheduler patch posts it as the instance's demand.
+                self._kvcached_step_need = getattr(
+                    coordinator, "_kvcached_last_need", None)
+            return result
 
         self._mark_as_patched(_patched_allocate_slots, "allocate_slots")
         KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[assignment]

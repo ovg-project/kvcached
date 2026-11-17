@@ -686,6 +686,17 @@ def test_manager_snapshot_counts_available_blocks_against_logical_capacity(monke
         def get_num_reserved_pages(self):
             return 0
 
+        def get_allocatable_block_capacity(self, block_mem_size, new_page_limit):
+            free_ids = (
+                page_id for page_id in range(self.total_pages)
+                if page_id not in self.inuse)
+            capacity = 0
+            for _, page_id in zip(range(max(0, new_page_limit)), free_ids):
+                start, end = FakeInternalPage.get_block_range(
+                    page_id, page_size, block_mem_size)
+                capacity += end - start
+            return capacity
+
         def get_resize_target(self):
             return -1
 

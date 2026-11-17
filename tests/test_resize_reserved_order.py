@@ -76,14 +76,18 @@ def _make_manager(resize_return=False):
     manager = object.__new__(KVCacheManager)
     manager._lock = NoOpLock()
     manager.block_mem_size = 1024
+    manager.page_size = 4096
     manager.mem_size = 8 * manager.block_mem_size
     manager.reserved_blocks = [1, 2, 3]
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
 
     class StubPageAllocator:
+
+        def get_resize_target(self):
+            return -1
 
         def resize(self, new_mem_size):
             return resize_return
@@ -104,7 +108,7 @@ def test_resize_frees_reserved_blocks_before_entering_shrink_wait():
 
     assert result is False
     assert manager.in_shrink is True
-    assert manager.target_num_blocks == 4096 // manager.block_mem_size
+    assert manager.target_num_pages == 4096 // manager.page_size
     assert manager.reserved_blocks == []
     assert freed == [[1, 2, 3]]
 
@@ -136,15 +140,19 @@ def test_free_reserved_survives_sanity_check():
     manager = object.__new__(KVCacheManager)
     manager._lock = NoOpLock()
     manager.block_mem_size = 1024
+    manager.page_size = 4096
     manager.mem_size = 8 * manager.block_mem_size
     manager.reserved_blocks = [1, 2, 3]
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
     manager.num_avail_blocks = 0
 
     class StubPageAllocator:
+
+        def get_resize_target(self):
+            return -1
 
         def resize(self, new_mem_size):
             return False

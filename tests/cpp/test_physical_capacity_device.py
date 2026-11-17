@@ -58,6 +58,10 @@ int mem_get_info(size_t *free_bytes, size_t *total_bytes) {
   return fail_query ? 1 : 0;
 }
 }
+// Discrete-GPU path of device_mem_info (gpu_utils.hpp).
+int device_mem_info(int, size_t *free_bytes, size_t *total_bytes) {
+  return gpu_vmm::mem_get_info(free_bytes, total_bytes);
+}
 // Match the production CHECK_GPU contract: restoration failure cannot continue.
 #define CHECK_GPU(call) do { if (!gpu_vmm::is_success(call)) std::_Exit(86); } while (false)
 '''

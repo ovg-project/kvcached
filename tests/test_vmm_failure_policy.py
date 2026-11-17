@@ -417,7 +417,7 @@ vmm_ops.shutdown_kvcached()
         manager.reserved_blocks = []
         manager.null_block = None
         manager.in_shrink = False
-        manager.target_num_blocks = None
+        manager.target_num_pages = None
         manager._lock = threading.RLock()
         manager._post_init_done = threading.Event()
         manager._post_init_done.set()
@@ -432,7 +432,7 @@ vmm_ops.shutdown_kvcached()
         with pytest.raises(QuarantinedResizeError):
             manager.resize(3 * page_size)
         assert not manager.in_shrink
-        assert manager.target_num_blocks is None
+        assert manager.target_num_pages is None
         assert manager.available_size() == 12
         for expected in ([4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]):
             assert manager.alloc(4) == expected

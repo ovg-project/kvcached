@@ -30,12 +30,17 @@ unmap_from_kv_tensors = torch.ops.kvcached.unmap_from_kv_tensors.default
 # Transactional map/unmap ops and the page-management classes stay on the
 # pybind11 module (they take no tensor arguments).
 map_to_kv_tensors_with_result = _C.map_to_kv_tensors_with_result
+kv_mapping_page_size = _C.kv_mapping_page_size
 prepare_map_to_kv_tensors = _C.prepare_map_to_kv_tensors
 commit_prepared_map = _C.commit_prepared_map
 abort_prepared_map = _C.abort_prepared_map
 has_prepared_map = _C.has_prepared_map
 physical_budget_state = _C.physical_budget_state
 set_instance_budget_limit = _C.set_instance_budget_limit
+set_kv_demand = _C.set_kv_demand
+kv_reclaim = _C.kv_reclaim
+set_kv_reclaimable = _C.set_kv_reclaimable
+_publish_pool_reclaimable = _C._publish_pool_reclaimable
 recalibrate_physical_budget = _C.recalibrate_physical_budget
 current_device_pci_bus_id = _C.current_device_pci_bus_id
 prepare_unmap_from_kv_tensors = _C.prepare_unmap_from_kv_tensors
@@ -55,11 +60,15 @@ __all__ = [
     "current_device_pci_bus_id",
     "has_prepared_map",
     "init_kvcached",
+    "kv_reclaim",
     "kv_tensors_created",
+    "kv_mapping_page_size",
     "map_to_kv_tensors",
     "map_to_kv_tensors_with_result",
     "physical_budget_state",
     "set_instance_budget_limit",
+    "set_kv_demand",
+    "set_kv_reclaimable",
     "recalibrate_physical_budget",
     "prepare_map_to_kv_tensors",
     "prepare_unmap_from_kv_tensors",

@@ -62,6 +62,13 @@ inline status_t mem_get_info(size_t *free_bytes, size_t *total_bytes) {
   return hipMemGetInfo(free_bytes, total_bytes);
 }
 
+// Unified-memory accounting is not validated on AMD APUs, so treat every HIP
+// device as discrete.
+inline status_t device_is_integrated(int *integrated, int /*dev_idx*/) {
+  *integrated = 0;
+  return hipSuccess;
+}
+
 inline status_t device_synchronize() { return hipDeviceSynchronize(); }
 
 inline status_t get_vmm_support(int *supports_vmm, int dev_idx) {
@@ -186,6 +193,10 @@ inline rt_status_t device_get_pci_bus_id(char *pci_bus_id, int len,
 
 inline rt_status_t mem_get_info(size_t *free_bytes, size_t *total_bytes) {
   return cudaMemGetInfo(free_bytes, total_bytes);
+}
+
+inline rt_status_t device_is_integrated(int *integrated, int dev_idx) {
+  return cudaDeviceGetAttribute(integrated, cudaDevAttrIntegrated, dev_idx);
 }
 
 inline rt_status_t device_synchronize() { return cudaDeviceSynchronize(); }

@@ -14,6 +14,32 @@ if not torch.cuda.is_available():
 from kvcached.vmm_ops import PageAllocator  # noqa: E402
 
 
+def test_allocatable_block_capacity_uses_actual_page_ids(tmp_path):
+    mib = 1024 * 1024
+    allocator = PageAllocator(
+        num_layers=1,
+        mem_size_per_layer=30 * mib,
+        page_size=14 * mib,
+        world_size=1,
+        pp_rank=0,
+        async_sched=False,
+        contiguous_layout=True,
+        enable_page_prealloc=False,
+        num_kv_buffers=1,
+        group_id=os.getpid(),
+        ipc_name=str(tmp_path / "capacity-snapshot"),
+    )
+    try:
+        assert allocator.get_allocatable_block_capacity(6 * mib, 0) == 0
+        assert allocator.get_allocatable_block_capacity(6 * mib, 1) == 2
+        assert allocator.get_allocatable_block_capacity(6 * mib, 2) == 3
+        assert allocator.get_allocatable_block_capacity(6 * mib, 3) == 3
+        assert allocator.get_allocatable_block_capacity(6 * mib, 2, 3) == 2
+    finally:
+        allocator.stop_prealloc_thread()
+        assert allocator.release_shared_segment()
+
+
 def test_page_state_stays_coherent_during_resize():
     page_size = 2 * 1024 * 1024
     lower_pages = 16
