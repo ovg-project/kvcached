@@ -10,6 +10,7 @@ test_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/kvcached-cpp-tests.XXXXXX")"
 trap 'rm -rf "${test_build_dir}"' EXIT
 
 "${PYTHON:-python3}" "${script_dir}/test_physical_capacity_device.py" "${test_build_dir}"
+"${PYTHON:-python3}" "${script_dir}/test_page_release_receipt.py" "${test_build_dir}"
 
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -pthread -DKVCACHED_BUDGET_TESTING \
   -I"${repo_root}/csrc/inc" \

@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+_ABSENT = object()
+
 
 def _install_fake_vmm_ops(monkeypatch):
     fake_torch = types.ModuleType("torch")
@@ -35,7 +37,9 @@ def _install_fake_vmm_ops(monkeypatch):
 
 
 def _import_tp_ipc_util(monkeypatch):
-    previous = sys.modules.pop("kvcached.tp_ipc_util", None)
+    package = importlib.import_module("kvcached")
+    previous = (sys.modules.pop("kvcached.tp_ipc_util", _ABSENT),
+                getattr(package, "tp_ipc_util", _ABSENT))
     _install_fake_vmm_ops(monkeypatch)
     module = importlib.import_module("kvcached.tp_ipc_util")
     module._PHYSICAL_DEVICE_ID_CACHE.clear()
@@ -48,8 +52,15 @@ def _restore_tp_ipc_util(previous):
     if module is not None:
         # This module only creates inert listener/thread fakes.
         module._listeners.clear()
-    if previous is not None:
-        sys.modules["kvcached.tp_ipc_util"] = previous
+    old_module, old_attribute = previous
+    if old_module is not _ABSENT:
+        sys.modules["kvcached.tp_ipc_util"] = old_module
+    package = sys.modules["kvcached"]
+    if old_attribute is _ABSENT:
+        if hasattr(package, "tp_ipc_util"):
+            delattr(package, "tp_ipc_util")
+    else:
+        setattr(package, "tp_ipc_util", old_attribute)
 
 
 def _success_response(command: str) -> dict[str, Any]:
@@ -173,7 +184,8 @@ def test_fatal_native_state_never_becomes_recoverable_or_committed(monkeypatch, 
 
 
 @pytest.mark.parametrize("state", ["prepared", "reserved", "orphaned"])
-def test_prepare_failure_retains_adopted_orphan(monkeypatch, state):
+@pytest.mark.parametrize("quota,impossible", [(False, False), (True, False), (True, True)])
+def test_prepare_failure_retains_adopted_orphan(monkeypatch, state, quota, impossible):
     tp_ipc_util, previous = _import_tp_ipc_util(monkeypatch)
     tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update({(0, 0): "gpu-0", (0, 1): "gpu-1"})
     events: list[tuple[str, int]] = []
@@ -187,6 +199,8 @@ def test_prepare_failure_retains_adopted_orphan(monkeypatch, state):
                 "status": "error",
                 "message": "capacity_exhausted",
                 "transaction_state": "not_prepared",
+                "physical_growth": {"capacity_rejections": 1, "quota_rejections": int(quota),
+                                    "quota_recovery_impossible": int(impossible)},
             }
         if message["cmd"] == "abort_prepared_map":
             return {"status": "success", "transaction_state": "orphaned"}
@@ -194,8 +208,9 @@ def test_prepare_failure_retains_adopted_orphan(monkeypatch, state):
 
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", exchange)
     try:
-        with pytest.raises(tp_ipc_util.MapRetainedError, match="capacity_exhausted"):
+        with pytest.raises(tp_ipc_util.MapRetainedError, match="capacity_exhausted") as caught:
             tp_ipc_util.broadcast_map_to_kv_tensors(2, [0], group_id=7)
+        assert isinstance(caught.value, tp_ipc_util.MapRetainedQuotaError) == impossible
         assert events[-1] == ("orphan_map_transaction", 0)
         assert not tp_ipc_util._UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS
         assert not any("unmap" in command for command, _ in events)

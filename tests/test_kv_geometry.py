@@ -161,6 +161,55 @@ def test_manager_rejects_zero_capacity_geometry(monkeypatch):
     allocator.assert_not_called()
 
 
+def test_manager_defaults_logical_capacity_to_block_id_bound(monkeypatch):
+    _stub_extension(monkeypatch)
+    import kvcached.kv_cache_manager as kcm
+
+    monkeypatch.setattr(kcm, "PageAllocator", mock.Mock())
+    manager = kcm.KVCacheManager(
+        num_blocks=8, block_size=1, cell_size=3 * MIB, num_layers=1,
+        page_size=12 * MIB, max_block_id=2)
+    assert manager.logical_num_blocks == 2
+
+
+def test_manager_rejects_logical_capacity_beyond_block_id_bound(monkeypatch):
+    _stub_extension(monkeypatch)
+    import kvcached.kv_cache_manager as kcm
+
+    allocator = mock.Mock()
+    monkeypatch.setattr(kcm, "PageAllocator", allocator)
+    with pytest.raises(ValueError, match="logical_num_blocks.*max_block_id"):
+        kcm.KVCacheManager(
+            num_blocks=8, block_size=1, cell_size=3 * MIB, num_layers=1,
+            page_size=12 * MIB, logical_num_blocks=3, max_block_id=2)
+    allocator.assert_not_called()
+
+
+@pytest.mark.parametrize("block_bytes,page_bytes,backing,bound,expected_bytes", [
+    (73728, 2 * MIB, 285, 256, 18 * MIB),  # MLA exhaustion geometry
+    (73728, 2 * MIB, 57, 29, 2 * MIB),  # last ID straddles the boundary
+    (73728, 2 * MIB, 57, 30, 4 * MIB),  # next page has one usable block
+    (65536, 2 * MIB, 96, 32, 2 * MIB),  # exact page boundary
+    (3 * MIB, 12 * MIB, 8, 2, 12 * MIB),  # padded Mamba slots
+    (73728, 2 * MIB, 285, 0, 0),
+    (73728, 2 * MIB, 285, None, 285 * 73728),
+])
+def test_manager_excludes_bound_empty_pages_from_native_arena(
+    monkeypatch, block_bytes, page_bytes, backing, bound, expected_bytes,
+):
+    _stub_extension(monkeypatch)
+    import kvcached.kv_cache_manager as kcm
+
+    allocator = mock.Mock()
+    monkeypatch.setattr(kcm, "PageAllocator", allocator)
+    monkeypatch.setattr(kcm.threading, "Thread", mock.Mock())
+    manager = kcm.KVCacheManager(
+        num_blocks=backing, block_size=1, cell_size=block_bytes, num_layers=1,
+        page_size=page_bytes, max_block_id=bound)
+    assert manager.mem_size == expected_bytes
+    assert allocator.call_args.args[1] == expected_bytes
+
+
 class _EmptyPage:
     page_id = 1
 

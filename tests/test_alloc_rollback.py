@@ -68,7 +68,7 @@ class FakePageAllocator:
         self.num_allocated = 0
         self.freed_pages: List[int] = []
 
-    def alloc_page(self) -> FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> FakePage:
         if self.num_allocated >= self.fail_after:
             raise RuntimeError("physical page pool exhausted")
         page = FakePage(self.num_allocated)
@@ -96,6 +96,12 @@ class FakePageAllocator:
 
     def get_num_reserved_pages(self) -> int:
         return 0
+
+    def get_allocatable_block_capacity(self, block_mem_size: int,
+                                       new_page_limit: int) -> int:
+        # This fake intentionally forecasts ample capacity; alloc_page() can
+        # still lose the race after fail_after physical pages.
+        return max(0, new_page_limit) * BLOCKS_PER_PAGE
 
 
 def _install_vmm_ops_stub() -> None:
@@ -155,6 +161,7 @@ def publish_limit(manager, monkeypatch, limit):
         from runtime_control_fake import attach_control
         allocator = manager.page_allocator
         monkeypatch.setattr(allocator, "get_page_state", lambda: dict(
+            total_pages=manager.mem_size // manager.page_size,
             inuse_pages=allocator.num_allocated - len(allocator.freed_pages),
             reserved_pages=0), raising=False)
         attach_control(manager, monkeypatch)
@@ -463,7 +470,7 @@ def test_manager_page_counters_include_retained_page_reuse():
             self.reserved_pages.append(FakePage(self.map_count))
             self.map_count += 1
 
-        def alloc_page(self):
+        def alloc_page(self, allow_fresh_retry=True):
             return self.reserved_pages.pop()
 
         def free_pages(self, page_ids):
@@ -1017,6 +1024,7 @@ def test_retained_resize_target_is_retried_after_recovery(monkeypatch, pending_s
     from kvcached.errors import RetainedResizeError
 
     manager = make_manager(fail_after=2)
+    assert manager.alloc(1) == [0]
     manager.in_shrink = pending_shrink
     manager.target_num_pages = 1 if pending_shrink else None
     pending = [True]
@@ -1031,10 +1039,11 @@ def test_retained_resize_target_is_retried_after_recovery(monkeypatch, pending_s
     monkeypatch.setattr(manager.page_allocator, "resize", resize, raising=False)
     publish_limit(manager, monkeypatch, 1000)
     assert manager.alloc(1) is not None
-    assert not manager.in_shrink
+    assert manager.in_shrink
     pending[0] = False
     assert manager.alloc(1) is not None
-    assert calls == [1000, 1000]
+    assert calls == [1000, 1000, 1000]
+    assert not manager.in_shrink
     assert not manager._resize_rejected
 
 
@@ -1608,3 +1617,157 @@ def test_latched_failure_surfaces_before_capacity_or_miss(monkeypatch, legacy_na
             manager.available_size()
     with pytest.raises(MapTransactionOutcomeUnknownError, match="restart"):
         manager.alloc(2)
+
+
+# The #619 review's exhaustion geometry: SGLang MLA size=16320 / page_size=64
+# with 512 + 64 fp16 KV dims. One block is one SGLang page of token rows.
+MLA_PAGE_SIZE = 2 * 1024 * 1024
+MLA_BLOCK_MEM = 64 * (512 + 64) * 2
+# backing_blocks_for_capacity(256, MLA_BLOCK_MEM, MLA_PAGE_SIZE): ten physical
+# pages. Under max_block_id=256 only 248 ids are usable; 8 straddle a page
+# boundary and page 9's whole range [256, 284) sits past the bound.
+MLA_BACKING_BLOCKS = 285
+MLA_MAX_BLOCK_ID = 256
+
+
+class BoundedPage(FakePage):
+    """FakePage with the real InternalPage.init semantics: the free list is
+    the page's whole-block range, clipped at ``max_block_id``
+    (csrc/page_allocator.cpp InternalPage::init)."""
+
+    def __init__(self, page_id: int, page_size: int):
+        super().__init__(page_id)
+        self.page_size = page_size
+        self.capacity = 0
+
+    def init(self, block_mem_size: int,
+             max_block_id: Optional[int] = None) -> None:
+        start, end = self.get_block_range(self.page_id, self.page_size,
+                                          block_mem_size)
+        if max_block_id is not None:
+            start, end = min(start, max_block_id), min(end, max_block_id)
+        self.free_list = list(range(start, end))
+        self.capacity = end - start
+
+    def empty(self) -> bool:
+        return len(self.free_list) == self.capacity
+
+
+class BoundedPageAllocator:
+    """Allocator over real page ids: alloc_page() serves the free list from
+    the front and free_pages() appends at the end, the native free_page_list
+    order after a release (see the clear() comment in kv_cache_manager.py)."""
+
+    def __init__(self, page_size: int, num_pages: int):
+        self.page_size = page_size
+        self.free_page_ids = list(range(num_pages))
+        self.mapped: Dict[int, BoundedPage] = {}
+
+    def alloc_page(self, allow_fresh_retry=True) -> BoundedPage:
+        if not self.free_page_ids:
+            raise RuntimeError("physical page pool exhausted")
+        page = BoundedPage(self.free_page_ids.pop(0), self.page_size)
+        self.mapped[page.page_id] = page
+        return page
+
+    def free_pages(self, page_ids: List[int]) -> None:
+        for page_id in page_ids:
+            self.mapped.pop(page_id)
+        self.free_page_ids.extend(page_ids)
+
+    def group_indices_by_page(self, indices: List[int],
+                              block_mem_size: int) -> Dict[int, List[int]]:
+        grouped: Dict[int, List[int]] = {}
+        for block in indices:
+            page_id = block * block_mem_size // self.page_size
+            grouped.setdefault(page_id, []).append(block)
+        return grouped
+
+    def get_resize_target(self) -> int:
+        return -1
+
+    def get_num_free_pages(self) -> int:
+        return len(self.free_page_ids)
+
+    def get_avail_physical_pages(self) -> int:
+        return len(self.free_page_ids)
+
+    def get_num_reserved_pages(self) -> int:
+        return 0
+
+    def get_allocatable_block_capacity(
+            self, block_mem_size: int, new_page_limit: int,
+            max_block_id: Optional[int] = None) -> int:
+        # Mirror of PageAllocator::get_allocatable_block_capacity: the next
+        # new_page_limit free pages in alloc_page() order, each page's range
+        # clipped at max_block_id.
+        capacity = 0
+        for page_id in self.free_page_ids[:max(0, new_page_limit)]:
+            start, end = BoundedPage.get_block_range(page_id, self.page_size,
+                                                     block_mem_size)
+            if max_block_id is not None:
+                start, end = min(start, max_block_id), min(end, max_block_id)
+            capacity += end - start
+        return capacity
+
+
+def make_bounded_mla_manager() -> KVCacheManager:
+    manager = make_manager(fail_after=0)
+    manager.page_size = MLA_PAGE_SIZE
+    manager.block_mem_size = MLA_BLOCK_MEM
+    manager.num_blocks = MLA_BACKING_BLOCKS
+    manager.logical_num_blocks = MLA_MAX_BLOCK_ID
+    manager.max_block_id = MLA_MAX_BLOCK_ID
+    manager.mem_size = MLA_BACKING_BLOCKS * MLA_BLOCK_MEM
+    manager.page_allocator = BoundedPageAllocator(
+        MLA_PAGE_SIZE, manager.mem_size // MLA_PAGE_SIZE)
+    return manager
+
+
+def test_bounded_exhaustion_is_a_miss_not_a_consistency_error():
+    """Filling every usable id must end in available_size() reaching 0 and a
+    None miss. The #619 review hit StateConsistencyError here instead: the
+    pre-#617 forecast counted page 9 at full theoretical capacity, reported
+    8 after exhaustion, and _alloc then mapped the empty page."""
+    manager = make_bounded_mla_manager()
+    blocks = manager.alloc(248)
+    assert blocks is not None
+    assert len(blocks) == 248
+    assert max(blocks) < MLA_MAX_BLOCK_ID
+    assert manager.available_size() == 0
+    assert manager.alloc(1) is None
+    # Nothing ever mapped the page whose bounded id range is empty.
+    assert 9 not in manager.page_allocator.mapped
+
+
+def test_alloc_skips_and_releases_pages_past_the_id_bound():
+    """A bound-empty page ahead of usable capacity must be skipped and
+    unmapped, not fail the pool.
+
+    Freed pages append at the end of the native free list, so after filling
+    all usable ids and freeing page 3's blocks the list reads [9, 3]:
+    alloc_page() hands back page 9, whose whole blocks all sit past
+    max_block_id. _alloc must serve the request from page 3 and release
+    page 9, not raise StateConsistencyError on its empty init."""
+    manager = make_bounded_mla_manager()
+    enable_operation_counters(manager)
+    blocks = manager.alloc(248)
+    assert blocks is not None
+    page3 = [block for block in blocks
+             if block * MLA_BLOCK_MEM // MLA_PAGE_SIZE == 3]
+    assert page3 == list(range(86, 113))
+    manager.free(page3)
+    assert manager.page_allocator.free_page_ids == [9, 3]
+    assert manager.available_size() == 27
+
+    assert manager.alloc(27) == page3
+
+    assert manager.available_size() == 0
+    # Page 9 was mapped once, skipped, and released, not retained or parked.
+    assert 9 not in manager.page_allocator.mapped
+    assert manager.page_allocator.free_page_ids == [9]
+    counters = manager._operation_counters
+    # Nine pages for the fill, then page 9 (skipped) and page 3 again.
+    assert counters["manager_page_allocations_total"] == 11
+    # Page 3 after its blocks were freed, then the skipped page 9.
+    assert counters["manager_page_releases_total"] == 2

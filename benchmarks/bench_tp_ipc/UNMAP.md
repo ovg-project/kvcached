@@ -12,8 +12,9 @@ ENABLE_KVCACHED=false KVCACHED_AUTOPATCH=0 PYTHONPATH=. \
 ```
 
 The benchmark compares three paths with the same native extension and real Unix
-sockets: a one-phase unmap control, explicit prepare/commit, and the production
-automatic path. The control intentionally has no cross-worker prepare barrier;
+sockets: prepare/commit combined in one request per worker, explicit two-phase
+prepare/commit, and the production automatic path. The `combined-control` mode
+intentionally has no cross-worker prepare barrier;
 it is a successful-operation timing reference, not a safe failure-handling option.
 It does not recreate an older commit's native allocator implementation.
 

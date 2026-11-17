@@ -172,7 +172,7 @@ class MapThroughPageAllocator(FakePageAllocator):
         super().__init__(*args, **kwargs)
         self.next_page_id = 0
 
-    def alloc_page(self) -> FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> FakePage:
         page_id, self.next_page_id = self.next_page_id, self.next_page_id + 1
         try:
             assert self.map_callback is not None
@@ -224,7 +224,7 @@ class FailClosedPageAllocator(MapThroughPageAllocator):
             result.setdefault(idx // 2, []).append(idx)
         return result
 
-    def alloc_page(self) -> FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> FakePage:
         self._throw_if_failed()
         return super().alloc_page()
 
@@ -269,7 +269,7 @@ class UntypedAllocFailurePageAllocator(FailClosedPageAllocator):
     state records FAILED (a failure racing in from the prealloc thread):
     the recoverable-miss rollback must not swallow it."""
 
-    def alloc_page(self) -> FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> FakePage:
         self.fail_pool("KV map failed in the prealloc worker")
         raise RuntimeError("Failed to map page 0: worker lost")
 
@@ -704,7 +704,8 @@ def test_retained_unmap_callback_does_not_own_failed_manager(monkeypatch):
 def test_unmap_callback_still_propagates_after_lifecycle_is_gone(monkeypatch):
     calls = []
 
-    def broadcast(*args):
+    def broadcast(*args, offset_stride):
+        assert offset_stride > 0
         calls.append(args)
         if len(calls) > 1:
             raise RuntimeError("unmap after lifecycle collection")

@@ -11,7 +11,7 @@ def attach_control(manager, monkeypatch):
 
     bundle = manager._memory_limit_page_bundle_bytes()
     state = dict(status="unpublished", convergence="unpublished", generation=42,
-                 revision=0, published=False, ready=True, pool_owner=1, pool_slot=0,
+                 revision=0, limit_revision=0, published=False, ready=True, pool_owner=1, pool_slot=0,
                  gpu="test-gpu", instance="test", can_shrink=True,
                  pool_capacity_bytes=manager.mem_size // manager.page_size * bundle,
                  pool_target_bytes=manager.mem_size // manager.page_size * bundle,
@@ -25,8 +25,8 @@ def attach_control(manager, monkeypatch):
         state["charged_bytes"] = (pages["inuse_pages"] + pages["reserved_pages"]) * bundle
         if state["published"]:
             state["status"] = state["convergence"] = (
-                "failed" if failed[0] == state["revision"] else
-                "converged" if acked[0] == state["revision"] and
+                "failed" if failed[0] == state["limit_revision"] else
+                "converged" if acked[0] == state["limit_revision"] and
                 state["charged_bytes"] <= min(state["pool_target_bytes"], state["requested_bytes"]) else "pending")
         return dict(state)
 
@@ -36,21 +36,23 @@ def attach_control(manager, monkeypatch):
                      published=True, requested_bytes=limit,
                      pool_target_bytes=max(bundle if getattr(manager, "null_block", None) is not None else 0,
                                            min(limit // bundle * bundle, state["pool_capacity_bytes"])))
+        state["limit_revision"] = state["revision"]
         state["effective_limit_bytes"] = state["pool_target_bytes"]
         return dict(query(), status="accepted")
 
     def ack(group, revision):
-        if revision != state["revision"]:
+        if revision != state["limit_revision"]:
             return False
         acked[0] = revision
         return True
 
-    def fail(path, name, slot, owner, generation, revision):
+    def fail(path, name, slot, owner, generation, revision, retained_quota=False):
         if (slot, owner, generation, revision) != tuple(
-                state[key] for key in ("pool_slot", "pool_owner", "generation", "revision")):
+                state[key] for key in ("pool_slot", "pool_owner", "generation", "limit_revision")):
             return False
         failed[0] = revision
-        state["failure_reason"] = "quarantined_pages_prevent_resize"
+        state["failure_reason"] = ("retained_mapping_exceeds_limit" if retained_quota
+                                   else "quarantined_pages_prevent_resize")
         return True
 
     monkeypatch.setattr(kvcached, "_C", SimpleNamespace(
@@ -58,6 +60,16 @@ def attach_control(manager, monkeypatch):
         publish_instance_control=publish, acknowledge_instance_control=ack,
         fail_instance_control=fail), raising=False)
     monkeypatch.setattr(control.glob, "glob", lambda _: ["test-gpu"])
+    # The fake ledger holds no other instance, so no priority asks this one
+    # to release anything (#585).
+    import sys
+
+    ops = sys.modules.get("kvcached.vmm_ops")
+    if ops is not None:
+        monkeypatch.setattr(ops, "kv_reclaim", lambda group_id=0: dict(
+            limit_bytes=0, empty_bytes=0, cache_bytes=0, running_bytes=0), raising=False)
+        monkeypatch.setattr(ops, "set_kv_reclaimable", lambda *args: None,
+                            raising=False)
     runtime = RuntimeControl(manager, worker_ipc=False, can_shrink=True, expected_participants=1)
     poll = runtime.poll
     monkeypatch.setattr(runtime, "poll", lambda **kwargs: poll(force=True))

@@ -12,7 +12,12 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, NoReturn, Optional, Tuple, cast
 
 from kvcached import vmm_ops
-from kvcached.errors import MapQuarantinedError, MapRetainedError, StateConsistencyError
+from kvcached.errors import (
+    MapQuarantinedError,
+    MapRetainedError,
+    MapRetainedQuotaError,
+    StateConsistencyError,
+)
 from kvcached.utils import (
     get_tp_socket_dir,
     get_tp_worker_socket_path,
@@ -452,6 +457,22 @@ def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
 Message = Dict[str, Any]
 
 
+def _worker_offsets(message: Message, group_id: int) -> list[int]:
+    """Translate scheduler page offsets into this PP stage's byte geometry."""
+    offsets = message["offsets"]
+    if "offset_stride" not in message:
+        # Direct calls and map rollback already carry worker-local offsets.
+        return cast(list[int], offsets)
+    source_stride = message["offset_stride"]
+    if not isinstance(source_stride, int) or source_stride <= 0:
+        raise ValueError("KV offset stride must be a positive integer")
+    if any(not isinstance(offset, int) or offset < 0 or offset % source_stride
+           for offset in offsets):
+        raise ValueError("KV offsets must be nonnegative and page aligned")
+    worker_stride = vmm_ops.kv_mapping_page_size(group_id=group_id)
+    return [offset // source_stride * worker_stride for offset in offsets]
+
+
 def send_msg(sock: socket.socket, msg: Message) -> None:
     """
     Send a message through the socket.
@@ -775,6 +796,10 @@ def _start_worker_listener_thread(
                 )
                 if failed_transaction is not None:
                     raise failed_transaction
+                if "offsets" in msg and "offset_stride" in msg:
+                    msg = dict(msg)
+                    msg["offsets"] = _worker_offsets(msg, group_id)
+                    del msg["offset_stride"]
                 if msg["cmd"] == "get_physical_device_id":
                     send_msg(
                         conn,
@@ -1246,6 +1271,7 @@ async def _reconcile_map_transaction_states(
     offsets: list[int],
     group_id: int,
     transaction_id: str,
+    offset_stride: Optional[int] = None,
 ) -> tuple[dict[tuple[int, int], str], list[str]]:
     fatal_failures = [
         f"Worker pp{pp}/rank{rank} reported unsafe mapping state: {response}"
@@ -1288,6 +1314,8 @@ async def _reconcile_map_transaction_states(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        message["offset_stride"] = offset_stride
     failures: list[str] = []
     # Retry only read-only reconciliation, never prepare/commit. Keep this
     # bounded even when ordinary IPC has its timeout disabled.
@@ -1335,6 +1363,7 @@ async def _broadcast_abort_prepared_map(
     group_id: int,
     transaction_id: str,
     retained_targets: list[tuple[int, int]],
+    offset_stride: Optional[int] = None,
 ) -> list[str]:
     if not targets:
         return []
@@ -1344,6 +1373,8 @@ async def _broadcast_abort_prepared_map(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        message["offset_stride"] = offset_stride
     responses = await asyncio.gather(
         *[_send_and_receive_message(rank, message, pp) for pp, rank in targets],
         return_exceptions=True,
@@ -1370,7 +1401,8 @@ async def _broadcast_map_to_kv_tensors(
     offsets: list[int],
     pp_rank: int = 0,
     group_id: int = 0,
-    record_stats: Optional[Callable[[dict[str, int]], None]] = None,
+    offset_stride: Optional[int] = None,
+    *, record_stats: Optional[Callable[[dict[str, int]], None]] = None,
 ) -> None:
     """Reserve on each GPU, then map only after every worker succeeds."""
     targets = [(pp, rank) for pp in _target_pp_ranks(pp_rank) for rank in range(tp_size)]
@@ -1384,6 +1416,8 @@ async def _broadcast_map_to_kv_tensors(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        prepare_message["offset_stride"] = offset_stride
     # Different GPUs reserve concurrently under their own short process-shared
     # admission guards. Workers sharing one physical GPU reserve in rounds so
     # every later capacity check observes earlier handles from this transaction.
@@ -1407,7 +1441,7 @@ async def _broadcast_map_to_kv_tensors(
         prepare_by_target.update(zip(round_targets, round_responses))
     prepare_responses = [prepare_by_target[target] for target in targets]
     prepare_states, reconcile_failures = await _reconcile_map_transaction_states(
-        targets, prepare_responses, offsets, group_id, transaction_id
+        targets, prepare_responses, offsets, group_id, transaction_id, offset_stride
     )
     if reconcile_failures:
         # A prepare may still be running after the IPC timeout. Preserve its
@@ -1443,11 +1477,11 @@ async def _broadcast_map_to_kv_tensors(
             if state in {"mapped", "partial", "prepared", "orphaned"}
         ]
         cleanup_failures = await _broadcast_abort_prepared_map(
-            reserved_targets, offsets, group_id, transaction_id, retained_targets
+            reserved_targets, offsets, group_id, transaction_id, retained_targets, offset_stride
         )
         cleanup_failures.extend(
             await _broadcast_orphan_map_transaction(
-                retained_targets, offsets, group_id, transaction_id
+                retained_targets, offsets, group_id, transaction_id, offset_stride
             )
             if retained_targets
             else []
@@ -1463,7 +1497,12 @@ async def _broadcast_map_to_kv_tensors(
                 transaction_id, offsets, group_id, "prepare cleanup",
                 prepare_failures + cleanup_failures,
             )
+        quota_impossible = any(
+            isinstance(response, dict)
+            and (response.get("physical_growth") or {}).get("quota_recovery_impossible", 0)
+            for response in prepare_responses)
         error_class = (MapQuarantinedError if "quarantined" in prepare_states.values()
+                       else MapRetainedQuotaError if retained_targets and quota_impossible
                        else MapRetainedError if retained_targets else RuntimeError)
         raise error_class(
             f"KV map transaction {transaction_id} reservation failed: "
@@ -1479,6 +1518,8 @@ async def _broadcast_map_to_kv_tensors(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        commit_message["offset_stride"] = offset_stride
     commit_responses = await asyncio.gather(
         *[
             _send_and_receive_message(rank, commit_message, pp)
@@ -1487,7 +1528,7 @@ async def _broadcast_map_to_kv_tensors(
         return_exceptions=True,
     )
     commit_states, reconcile_failures = await _reconcile_map_transaction_states(
-        targets, commit_responses, offsets, group_id, transaction_id
+        targets, commit_responses, offsets, group_id, transaction_id, offset_stride
     )
     if record_stats is not None:
         record_stats(
@@ -1520,7 +1561,7 @@ async def _broadcast_map_to_kv_tensors(
 
     if commit_failures:
         cleanup_failures = await _broadcast_abort_prepared_map(
-            abort_targets, offsets, group_id, transaction_id, retain_targets
+            abort_targets, offsets, group_id, transaction_id, retain_targets, offset_stride
         )
         prepared_targets = [
             target
@@ -1533,6 +1574,7 @@ async def _broadcast_map_to_kv_tensors(
                 offsets,
                 group_id,
                 transaction_id,
+                offset_stride,
             )
         )
         if cleanup_failures:
@@ -1554,6 +1596,8 @@ async def _broadcast_map_to_kv_tensors(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        finalize_message["offset_stride"] = offset_stride
     pending_targets = targets
     finalize_timeout = min(IPC_TIMEOUT_S, 60.0) if IPC_TIMEOUT_S > 0 else 60.0
     for _ in range(2):
@@ -1570,7 +1614,7 @@ async def _broadcast_map_to_kv_tensors(
             return_exceptions=True,
         )
         finalize_states, failures = await _reconcile_map_transaction_states(
-            pending_targets, finalize_responses, offsets, group_id, transaction_id
+            pending_targets, finalize_responses, offsets, group_id, transaction_id, offset_stride
         )
         failures.extend(
             f"Worker pp{pp}/rank{rank} cannot finalize from state {state}"
@@ -1598,6 +1642,7 @@ async def _broadcast_orphan_map_transaction(
     offsets: list[int],
     group_id: int,
     transaction_id: str,
+    offset_stride: Optional[int] = None,
 ) -> list[str]:
     """Retain partial mappings so a same-offset retry can adopt them safely."""
     orphan_message = {
@@ -1606,6 +1651,8 @@ async def _broadcast_orphan_map_transaction(
         "group_id": group_id,
         "transaction_id": transaction_id,
     }
+    if offset_stride is not None:
+        orphan_message["offset_stride"] = offset_stride
     tasks = [_send_and_receive_message(rank, orphan_message, pp) for pp, rank in targets]
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     failures: list[str] = []
@@ -1624,10 +1671,8 @@ async def _broadcast_orphan_map_transaction(
 
 
 async def _broadcast_unmap_from_kv_tensors(
-    tp_size: int,
-    offsets: list[int],
-    pp_rank: int = 0,
-    group_id: int = 0,
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
 ) -> None:
     """Unmap all TP/PP workers as one recoverable transaction."""
     transaction_id = uuid.uuid4().hex
@@ -1643,6 +1688,8 @@ async def _broadcast_unmap_from_kv_tensors(
         "group_id": group_id,
     }
     single_target = len(targets) == 1
+    if offset_stride is not None:
+        prepare_message["offset_stride"] = offset_stride
     if single_target:
         prepare_message["commit"] = True
     prepare_tasks = [
@@ -1775,28 +1822,19 @@ async def _broadcast_kv_tensors_created(tp_size: int,
 
 # Wrapper functions to call the async function from sync code
 def broadcast_map_to_kv_tensors(
-    tp_size: int,
-    offsets: list[int],
-    pp_rank: int = 0,
-    group_id: int = 0,
-    record_stats: Optional[Callable[[dict[str, int]], None]] = None,
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
+    *, record_stats: Optional[Callable[[dict[str, int]], None]] = None,
 ) -> None:
-    asyncio.run(
-        _broadcast_map_to_kv_tensors(
-            tp_size,
-            offsets,
-            pp_rank,
-            group_id,
-            record_stats,
-        )
-    )
+    asyncio.run(_broadcast_map_to_kv_tensors(
+        tp_size, offsets, pp_rank, group_id, offset_stride, record_stats=record_stats))
 
 
-def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int],
-                                    pp_rank: int = 0,
-                                    group_id: int = 0) -> None:
-    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank,
-                                                 group_id))
+def broadcast_unmap_from_kv_tensors(
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
+) -> None:
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank, group_id, offset_stride))
 
 
 def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0,

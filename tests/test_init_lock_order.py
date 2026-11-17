@@ -99,7 +99,7 @@ class CPUAllocator:
         return {"total_pages": self.total_pages, "free_pages": len(self.free_pages_queue),
                 "inuse_pages": self.total_pages - len(self.free_pages_queue), "reserved_pages": 0}
 
-    def alloc_page(self) -> CPUPage:
+    def alloc_page(self, allow_fresh_retry=True) -> CPUPage:
         if not self.capacity_ready.is_set():
             self.allocation_misses += 1
             self.miss_seen.set()
@@ -304,7 +304,7 @@ def _observe(operation: str, mode: str = "waiting") -> dict[str, Any]:
 
 @pytest.mark.parametrize("operation", [
     "alloc", "alloc_packed", "free", "reserve", "resize", "trim", "clear",
-    "apply_resize_target", "reclaim_for_shrink",
+    "apply_resize_target", "reclaim_for_shrink", "reclaim_for_priority",
 ])
 def test_operation_waits_without_holding_init_lock(operation: str) -> None:
     result = _observe(operation)

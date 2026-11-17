@@ -13,6 +13,11 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class MapRetainedQuotaError : public MapRetainedError {
+public:
+  using MapRetainedError::MapRetainedError;
+};
+
 // Only a newly allocated, unpublished page may be quarantined and bypassed.
 class MapQuarantinedError : public std::runtime_error {
 public:
@@ -33,6 +38,11 @@ public:
 class RetainedResizeError : public QuarantinedResizeError {
 public:
   using QuarantinedResizeError::QuarantinedResizeError;
+};
+
+class RetainedQuotaResizeError : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
 };
 
 } // namespace kvcached

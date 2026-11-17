@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -94,6 +95,12 @@ map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
   return allocator->map_to_kv_tensors_with_result(offsets);
 }
 
+size_t kv_mapping_page_size(int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->kv_mapping_page_size();
+}
+
 std::string current_device_pci_bus_id() {
   py::gil_scoped_release release;
   char pci_bus_id[64] = {};
@@ -124,6 +131,8 @@ py::dict physical_growth_result(bool success,
   result["targets_count"] = stats.targets_count;
   result["capacity_checks"] = stats.capacity_checks;
   result["capacity_rejections"] = stats.capacity_rejections;
+  result["quota_rejections"] = stats.quota_rejections;
+  result["quota_recovery_impossible"] = stats.quota_recovery_impossible;
   result["required_bytes"] = stats.required_bytes;
   result["free_bytes"] = stats.free_bytes;
   result["total_bytes"] = stats.total_bytes;
@@ -180,6 +189,33 @@ py::dict physical_budget_state(int64_t group_id = 0) {
   result["sync_acquire_ns"] = state.sync_acquire_ns;
   result["sync_wait_ns"] = state.sync_wait_ns;
   result["sync_dead_owner_recoveries"] = state.sync_dead_owner_recoveries;
+  result["watermark_bytes"] = state.watermark_bytes;
+  return result;
+}
+
+void set_kv_demand(uint64_t bytes, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  FTensorAllocator::global_allocator(group_id)->set_kv_demand(bytes);
+}
+
+void set_kv_reclaimable(uint64_t empty, uint64_t cache, uint64_t releasing,
+                        int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  FTensorAllocator::global_allocator(group_id)->set_kv_reclaimable(empty, cache,
+                                                                   releasing);
+}
+
+py::dict kv_reclaim(int64_t group_id = 0) {
+  ReclaimPlan plan;
+  {
+    py::gil_scoped_release release;
+    plan = FTensorAllocator::global_allocator(group_id)->kv_reclaim();
+  }
+  py::dict result;
+  result["limit_bytes"] = plan.limit_bytes;
+  result["empty_bytes"] = plan.empty_bytes;
+  result["cache_bytes"] = plan.cache_bytes;
+  result["running_bytes"] = plan.running_bytes;
   return result;
 }
 
@@ -253,8 +289,9 @@ void page_allocator_stop_prealloc_thread(
 }
 
 std::shared_ptr<InternalPage>
-page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
-  return allocator->alloc_page();
+page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator,
+                          bool allow_fresh_retry) {
+  return allocator->alloc_page(allow_fresh_retry);
 }
 
 void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
@@ -267,13 +304,20 @@ void page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
   allocator->free_pages(page_ids);
 }
 
+int64_t
+page_allocator_free_pages_with_receipt(std::shared_ptr<PageAllocator> allocator,
+                                       const std::vector<page_id_t> &page_ids) {
+  return allocator->free_pages_with_receipt(page_ids);
+}
+
 bool page_allocator_resize(std::shared_ptr<PageAllocator> allocator,
                            int64_t new_mem_size) {
   return allocator->resize(new_mem_size);
 }
 
-void page_allocator_trim(std::shared_ptr<PageAllocator> allocator) {
-  allocator->trim();
+int64_t page_allocator_trim(std::shared_ptr<PageAllocator> allocator,
+                            int64_t max_pages) {
+  return allocator->trim(max_pages);
 }
 
 void page_allocator_reset_free_page_order(
@@ -347,6 +391,9 @@ void page_allocator_set_broadcast_map_callback(
           if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
             throw MapQuarantinedError(error.what());
           }
+          if (error.matches(errors.attr("MapRetainedQuotaError").ptr())) {
+            throw MapRetainedQuotaError(error.what());
+          }
           if (error.matches(errors.attr("MapRetainedError").ptr())) {
             throw MapRetainedError(error.what());
           }
@@ -386,6 +433,9 @@ py::dict control_dict(const InstanceControl &state) {
   result["failure_reason"] = state.failure_reason;
   result["generation"] = state.generation;
   result["revision"] = state.revision;
+  result["retention_tokens"] = state.retention_tokens;
+  result["retention_revision"] = state.retention_revision;
+  result["limit_revision"] = state.limit_revision;
   result["limit_bytes"] = state.requested_bytes;
   result["effective_limit_bytes"] = state.effective_bytes;
   result["charged_bytes"] = state.charged_bytes;
@@ -402,6 +452,20 @@ py::dict control_dict(const InstanceControl &state) {
   result["participants"] = state.participants;
   result["completed"] = state.completed;
   result["published"] = state.published;
+  result["min_bytes"] = state.min_bytes;
+  result["priority"] = state.priority;
+  result["headroom_bytes"] = state.headroom_bytes;
+  result["shortfall_bytes"] = state.shortfall_bytes;
+  result["watermark_bytes"] = state.watermark_bytes;
+  result["empty_bytes"] = state.empty_bytes;
+  result["cache_bytes"] = state.cache_bytes;
+  result["releasing_bytes"] = state.releasing_bytes;
+  result["reclaim_bytes"] = state.reclaim_bytes;
+  result["reclaim_limit_bytes"] = state.reclaim_limit_bytes;
+  result["reclaim_empty_bytes"] = state.reclaim_empty_bytes;
+  result["reclaim_cache_bytes"] = state.reclaim_cache_bytes;
+  result["reclaim_running_bytes"] = state.reclaim_running_bytes;
+  result["available_bytes"] = state.available_bytes;
   return result;
 }
 
@@ -447,6 +511,35 @@ py::dict observe_instance_control(const std::string &path,
   return control_dict(state);
 }
 
+bool publish_instance_demand(const std::string &path, const std::string &name,
+                             uint64_t generation, uint64_t bytes) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_demand(name, generation, bytes);
+}
+
+bool publish_instance_reclaimable(const std::string &path,
+                                  const std::string &name, uint64_t generation,
+                                  uint64_t empty, uint64_t cache,
+                                  uint64_t releasing) {
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_reclaimable(
+      name, generation, empty, cache, releasing);
+}
+
+bool publish_pool_reclaimable(
+    const std::string &path, const std::string &name, uint64_t generation,
+    const std::vector<
+        std::tuple<size_t, uint64_t, uint64_t, uint64_t, uint64_t>> &levels) {
+  std::vector<PoolReclaimable> pools;
+  pools.reserve(levels.size());
+  for (const auto &level : levels)
+    pools.push_back({std::get<0>(level), std::get<1>(level), std::get<2>(level),
+                     std::get<3>(level), std::get<4>(level)});
+  py::gil_scoped_release release;
+  return GpuBudget::open_control(path)->post_pool_reclaimable(name, generation,
+                                                              pools);
+}
+
 py::dict publish_instance_control(const std::string &path,
                                   const std::string &name, uint64_t bytes,
                                   uint64_t generation,
@@ -460,12 +553,32 @@ py::dict publish_instance_control(const std::string &path,
   return control_dict(state);
 }
 
+py::dict publish_instance_controls(const std::string &path,
+                                   const std::string &name, uint64_t generation,
+                                   std::optional<uint64_t> revision,
+                                   std::optional<uint64_t> limit_bytes,
+                                   std::optional<uint64_t> min_bytes,
+                                   std::optional<int64_t> priority,
+                                   std::optional<uint64_t> headroom_bytes,
+                                   std::optional<int64_t> retention_tokens) {
+  InstanceControl state;
+  {
+    py::gil_scoped_release release;
+    state = GpuBudget::open_control(path)->publish_control(
+        name,
+        ControlUpdate{limit_bytes, min_bytes, priority, headroom_bytes,
+                      retention_tokens},
+        generation, revision);
+  }
+  return control_dict(state);
+}
+
 bool fail_instance_control(const std::string &path, const std::string &name,
                            size_t slot, uint64_t owner, uint64_t generation,
-                           uint64_t revision) {
+                           uint64_t revision, bool retained_quota) {
   py::gil_scoped_release release;
-  return GpuBudget::open_control(path)->fail_control(name, slot, owner,
-                                                     generation, revision);
+  return GpuBudget::open_control(path)->fail_control(
+      name, slot, owner, generation, revision, retained_quota);
 }
 
 bool acknowledge_instance_control(int64_t group_id, uint64_t revision) {
@@ -505,6 +618,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   auto errors = py::module_::import("kvcached.errors");
   py::register_exception<kvcached::MapRetainedError>(
       m, "MapRetainedError", errors.attr("MapRetainedError").ptr());
+  py::register_exception<kvcached::MapRetainedQuotaError>(
+      m, "MapRetainedQuotaError", errors.attr("MapRetainedQuotaError").ptr());
   py::register_exception<kvcached::MapQuarantinedError>(
       m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
   py::register_exception<kvcached::StateConsistencyError>(
@@ -513,6 +628,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
   py::register_exception<kvcached::RetainedResizeError>(
       m, "RetainedResizeError", errors.attr("RetainedResizeError").ptr());
+  py::register_exception<kvcached::RetainedQuotaResizeError>(
+      m, "RetainedQuotaResizeError",
+      errors.attr("RetainedQuotaResizeError").ptr());
 
   m.def("local_instance_control", &kvcached::local_instance_control,
         py::arg("group_id") = 0, py::arg("configure") = py::none(),
@@ -522,12 +640,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
   m.def("observe_instance_control", &kvcached::observe_instance_control,
         py::arg("path"), py::arg("instance"));
+  m.def("publish_instance_demand", &kvcached::publish_instance_demand,
+        py::arg("path"), py::arg("instance"), py::arg("generation"),
+        py::arg("bytes"));
+  m.def("publish_instance_reclaimable", &kvcached::publish_instance_reclaimable,
+        py::arg("path"), py::arg("instance"), py::arg("generation"),
+        py::arg("empty"), py::arg("cache"), py::arg("releasing"));
   m.def("publish_instance_control", &kvcached::publish_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("bytes"),
         py::arg("generation"), py::arg("revision") = py::none());
+  m.def("publish_instance_controls", &kvcached::publish_instance_controls,
+        py::arg("path"), py::arg("instance"), py::arg("generation"),
+        py::arg("revision") = py::none(), py::arg("limit_bytes") = py::none(),
+        py::arg("min_bytes") = py::none(), py::arg("priority") = py::none(),
+        py::arg("headroom_bytes") = py::none(),
+        py::arg("retention_tokens") = py::none());
   m.def("fail_instance_control", &kvcached::fail_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
-        py::arg("generation"), py::arg("revision"));
+        py::arg("generation"), py::arg("revision"),
+        py::arg("retained_quota") = false);
   m.def("acknowledge_instance_control", &kvcached::acknowledge_instance_control,
         py::arg("group_id"), py::arg("revision"));
   // Torch-free transactional ops (the six core ops are on the stable
@@ -538,10 +669,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("group_id") = 0);
   m.def("physical_budget_state", &kvcached::physical_budget_state,
         py::arg("group_id") = 0);
+  m.def("kv_mapping_page_size", &kvcached::kv_mapping_page_size,
+        py::arg("group_id") = 0);
   m.def("set_instance_budget_limit", &kvcached::set_instance_budget_limit,
         py::arg("bytes"), py::arg("revision"), py::arg("group_id") = 0);
   m.def("recalibrate_physical_budget", &kvcached::recalibrate_physical_budget,
         py::arg("group_id") = 0);
+  m.def("set_kv_demand", &kvcached::set_kv_demand, py::arg("bytes"),
+        py::arg("group_id") = 0);
+  m.def("set_kv_reclaimable", &kvcached::set_kv_reclaimable, py::arg("empty"),
+        py::arg("cache"), py::arg("releasing"), py::arg("group_id") = 0);
+  m.def("kv_reclaim", &kvcached::kv_reclaim, py::arg("group_id") = 0);
+  m.def("_publish_pool_reclaimable", &kvcached::publish_pool_reclaimable,
+        py::arg("path"), py::arg("name"), py::arg("generation"),
+        py::arg("levels"));
   m.def("prepare_map_to_kv_tensors", &kvcached::prepare_map_to_kv_tensors,
         "prepare_map_to_kv_tensors", py::arg("transaction_id"),
         py::arg("offsets"), py::arg("group_id") = 0);
@@ -614,19 +755,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_stop_prealloc_thread,
            py::call_guard<py::gil_scoped_release>())
       .def("alloc_page", &kvcached::page_allocator_alloc_page,
+           py::arg("allow_fresh_retry") = true,
            py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,
            py::call_guard<py::gil_scoped_release>())
+      .def("_free_pages_with_receipt",
+           &kvcached::page_allocator_free_pages_with_receipt,
+           py::call_guard<py::gil_scoped_release>())
       .def("resize", &kvcached::page_allocator_resize,
            py::call_guard<py::gil_scoped_release>())
-      .def("trim", &kvcached::page_allocator_trim,
+      .def("trim", &kvcached::page_allocator_trim, py::arg("max_pages") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
            &kvcached::page_allocator_reset_free_page_order,
            py::call_guard<py::gil_scoped_release>())
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
+      .def("get_allocatable_block_capacity",
+           &kvcached::PageAllocator::get_allocatable_block_capacity,
+           py::arg("block_mem_size"), py::arg("new_page_limit"),
+           py::arg("max_block_id") = -1)
       .def("get_num_inuse_pages", &kvcached::page_allocator_get_num_inuse_pages)
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
@@ -655,7 +804,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("page_size"))
       .def_readonly("page_id", &kvcached::InternalPage::page_id)
       .def_readonly("page_size", &kvcached::InternalPage::page_size)
-      .def("init", &kvcached::InternalPage::init)
+      .def("init", &kvcached::InternalPage::init, py::arg("block_mem_size"),
+           py::arg("max_block_id") = -1)
       .def("alloc", &kvcached::InternalPage::alloc)
       .def("free", &kvcached::InternalPage::free)
       .def("free_batch", &kvcached::InternalPage::free_batch)

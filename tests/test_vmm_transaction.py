@@ -110,6 +110,47 @@ def test_prepared_map_uses_pool_page_size_and_buffer_geometry(page_mib, contiguo
         vmm.shutdown_kvcached()
 
 
+@pytest.mark.parametrize("contiguous,buffers", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_recovery_quota_counts_null_page_once(monkeypatch, tmp_path, contiguous, buffers):
+    vmm = _compiled_vmm_ops()
+    from kvcached import _C
+
+    page = 2 * 1024 * 1024
+    layers = 2
+    bundle = page * layers * buffers
+    stride = bundle if contiguous else page
+    monkeypatch.setenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("KVCACHED_IPC_NAME", "null-recovery-quota")
+    vmm.init_kvcached("cuda:0", page, contiguous)
+    try:
+        tensors = vmm.create_kv_tensors(8 * page, 1, "cuda:0", layers, buffers)
+        assert tensors
+        # Model a rank that still needs page zero while another page is live.
+        # The floor includes every K/V region, not just each tensor's offset 0.
+        control = _C.local_instance_control(0, True, 1, 4, True)
+
+        def publish(limit):
+            state = _C.publish_instance_control(
+                control["gpu"], control["instance"], limit, control["generation"], None)
+            assert state["limit_bytes"] == limit
+
+        assert vmm.map_to_kv_tensors([stride], 0)
+        publish(bundle)
+        denied = vmm.prepare_map_to_kv_tensors("null-busy", [0], 0)
+        assert not denied["success"] and denied["quota_rejections"] == 1
+        assert denied["quota_recovery_impossible"] == 0
+        publish(bundle - 1)
+        denied = vmm.prepare_map_to_kv_tensors("null-too-small", [0], 0)
+        assert not denied["success"] and denied["quota_recovery_impossible"] == 1
+        publish(bundle)
+        assert vmm.unmap_from_kv_tensors([stride], 0)
+        assert vmm.prepare_map_to_kv_tensors("null-recover", [0], 0)["success"]
+        assert vmm.commit_prepared_map("null-recover", 0)["success"]
+        assert vmm.unmap_from_kv_tensors([0], 0)
+    finally:
+        vmm.shutdown_kvcached()
+
+
 def test_native_allocator_preserves_recoverable_callback_error():
     import uuid
 
@@ -537,6 +578,8 @@ def test_shared_budget_covers_local_prepared_growth_and_multiple_pools(monkeypat
         assert native.physical_budget_state()["charged_bytes"] == 2 * page
         denied = native.prepare_map_to_kv_tensors("denied", [page], 0)
         assert not denied["success"] and denied["capacity_rejections"] == 1
+        assert denied["quota_rejections"] == 1
+        assert denied["quota_recovery_impossible"] == 0
         with pytest.raises(RuntimeError, match="capacity_exhausted"):
             native.map_to_kv_tensors_with_result([page], 0)
         assert native.commit_prepared_map("second", 1000)["success"]
@@ -611,6 +654,8 @@ def test_shared_budget_calibration_preserves_headroom_deficit(monkeypatch, tmp_p
         assert native.abort_prepared_map("resident-deficit", 0)
         denied = native.prepare_map_to_kv_tensors("retry-deficit", [0], 0)
         assert not denied["success"] and denied["capacity_rejections"] == 1
+        assert denied["quota_rejections"] == 0
+        assert denied["quota_recovery_impossible"] == 0
     finally:
         native.shutdown_kvcached()
 

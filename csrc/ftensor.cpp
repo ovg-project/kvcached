@@ -399,6 +399,9 @@ void FTensor::validate_offset_(offset_t offset) const {
     throw std::runtime_error(
         "KV tensor page offset is outside the reserved virtual address range");
   }
+  if (static_cast<size_t>(offset) % page_size_ != 0) {
+    throw std::runtime_error("KV tensor page offset is not page aligned");
+  }
 }
 
 bool FTensor::set_access_(generic_ptr_t addr, size_t size) {

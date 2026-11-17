@@ -506,6 +506,7 @@ def get_kv_cache_manager(
     group_id: int = 0,
     pool_name: Optional[str] = None,
     logical_num_blocks: Optional[int] = None,
+    max_block_id: Optional[int] = None,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -526,6 +527,7 @@ def get_kv_cache_manager(
         group_id=group_id,
         pool_name=pool_name,
         logical_num_blocks=logical_num_blocks,
+        max_block_id=max_block_id,
         # SWA and Mamba pools differ in size from the full-attention pool:
         # each needs its own limit and usage, i.e. its own segment.
         own_segment=True,
