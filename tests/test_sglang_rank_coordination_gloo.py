@@ -43,13 +43,16 @@ def _worker(rank, store_path):
         from types import SimpleNamespace as NS
 
         from test_sglang_rank_coordination import Req, coord, mode
-        from test_sglang_rank_prepare import preparation_case
+        from test_sglang_rank_prepare import decode_case, preparation_case
 
         world = ProcessWorld(rank, dist.group.WORLD)
         for chunk in (False, True):
             for failed_rank in (0, 3):
                 preparation_case(world, failing_rank=failed_rank, chunk=chunk)
         preparation_case(world, fatal=True)
+        for failed_rank in (0, 3):
+            decode_case(world, failing_rank=failed_rank)
+        decode_case(world, rollback_error=True)
 
         runtime = coord.RankCoordinator(
             NS(

@@ -584,7 +584,7 @@ def patch_rank_coordination():
                     result = original_new(self, running_batch)
                     running_batch.batch_is_full = False
                     return result
-                preview_matches = {}
+                preview_matches: dict[str, Any] = {}
 
                 def shadow(slots, **kwargs):
                     token = _ACTIVE.set(None)
@@ -658,8 +658,8 @@ def patch_rank_coordination():
             runtime.admission_materialization = None
             return AddReqResult.OTHER
         error, result = (None, None)
-        cache = getattr(self, "tree_cache", None)
-        original_init_load_back = (
+        cache: Any = getattr(self, "tree_cache", None)
+        original_init_load_back: Any = (
             getattr(cache, "init_load_back", None) if cache is not None else None
         )
         original_load_back = getattr(cache, "load_back", None) if cache is not None else None
@@ -754,7 +754,8 @@ def patch_rank_coordination():
         runtime = _ACTIVE.get()
         if runtime is None:
             return original_select(self, req, **kwargs)
-        admission, error = (None, None)
+        admission: Any = None
+        error = None
         token = _ACTIVE.set(None)
         try:
             admission = original_select(self, req, **kwargs)
@@ -866,7 +867,18 @@ def patch_rank_coordination():
         )
         if any((s["ids"] != states[0]["ids"] for s in states[1:])):
             raise RankConsensusError(f"decode retraction membership differs: {states}")
-        return all((s["can_run"] for s in states))
+        accepted = all((s["can_run"] for s in states))
+        if not accepted:
+            rollback_error = None
+            try:
+                release = getattr(getattr(self, "token_to_kv_pool_allocator", None),
+                                  "_kvcached_release_decode_reservation", None)
+                if release is not None:
+                    release()
+            except Exception as exc:
+                rollback_error = f"{type(exc).__name__}: {exc}"
+            runtime.exchange("decode_capacity.release", True, error=rollback_error)
+        return accepted
 
     def wrap_prepare(original, name):
 

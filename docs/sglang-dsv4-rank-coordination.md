@@ -13,8 +13,10 @@ with SGLang. There is no collective between different serving instances.
 A capacity miss during prefill returns only that attempt's newly allocated
 pages and rows on every rank. Existing prefixes and request state remain
 owned. The scheduler can continue decoding and retry prefill after capacity
-returns. A backend error, mismatched phase, or different actual batch is
-fatal; it must not be retried as an ordinary capacity miss.
+returns. Decode checks reserve backing for the native allocator's next pages;
+a capacity miss on any rank releases every rank's unused reservations before
+retraction or retry. A backend error, mismatched phase, or different actual
+batch is fatal; it must not be retried as an ordinary capacity miss.
 
 The coordinated path supports ordinary text generation with PP=1,
 attention-DP disabled and fixed, separate prefill/decode batches. Speculative
@@ -27,4 +29,3 @@ to retain the existing native-storage fallback for multi-rank DSV4.
 CPU regressions cover protocol ordering, asymmetric allocation failures,
 rollback ownership, native admission source and four-process Gloo transport.
 They do not establish full-model CUDA serving correctness or performance.
-

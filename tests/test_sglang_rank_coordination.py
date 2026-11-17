@@ -133,6 +133,7 @@ class CoordinationTests(ContextTestCase):
             allocate: Any
             token_to_kv_pool_allocator: Any
             req_to_token_pool: Any
+            capacity_check: Any
 
             def __init__(self, reqs, name="DECODE", capacity=True):
                 self.reqs = reqs
@@ -146,6 +147,9 @@ class CoordinationTests(ContextTestCase):
                 self.checks += 1
                 if getattr(self, "check_error", False):
                     raise RuntimeError("simulated decode capacity failure")
+                callback = getattr(self, "capacity_check", None)
+                if callback is not None:
+                    return callback()
                 return self.capacity
 
             def prepare_for_extend(self):
@@ -604,7 +608,7 @@ def load_native_policy():
 
 
 @unittest.skipUnless(SOURCE.is_dir(), "native SGLang source unavailable")
-class NativePreviewTests(unittest.TestCase):
+class NativePreviewTests(ContextTestCase):
     def setUp(self):
         super().setUp()
         self.native = load_native_policy()
