@@ -116,3 +116,54 @@ def test_failed_native_prefix_waits_for_placement_progress(recovery):
     assert not manager.claims  # Availability did not reserve or reorder anything.
     _, selected = allocator.alloc()
     assert selected.tolist() == list(range(expected * 4, expected * 4 + 4))
+
+
+@pytest.mark.skipif(not (SOURCE / "paged.py").is_file(), reason="native SGLang source unavailable")
+@pytest.mark.parametrize("scenario", ["smaller", "staged", "grouped"])
+def test_native_decode_recovers_from_larger_or_stale_placement_miss(scenario):
+    native = native_paged_allocator()
+    children = [native(256, 4, torch.int64, "cpu", None, scenario != "smaller") for _ in range(2)]
+    for child in children:
+        child.alloc(80)
+        if scenario == "smaller":
+            for ids in (torch.arange(3, 20), torch.tensor([20]), torch.tensor([2])):
+                child.free_page_ids(ids)
+        else:
+            child.free_page_ids(torch.arange(5, 20))
+    manager = Manager(budget=0 if scenario == "smaller" else 1)
+    backing = MODULE.SWABacking(manager, native_pages=65, native_page_bytes=6,
+                                physical_page_bytes=32)
+    assert backing.acquire({1} if scenario == "smaller" else {1, 2, 3, 4, 20})
+    source = ast.parse((SOURCE / "swa.py").read_text(encoding="utf-8"))
+    definition = next(node for node in source.body
+                      if isinstance(node, ast.ClassDef) and node.name == "SWATokenToKVPoolAllocator")
+    available = next(node for node in definition.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "available_size")
+    namespace: dict[str, Any] = {}
+    exec(compile(ast.Module(body=[available], type_ignores=[]), "swa.py", "exec"), namespace)
+
+    class Composite:
+        page_size = 4
+        _swa_req_ring = False
+        full_attn_allocator, swa_attn_allocator = children
+        available_size = namespace["available_size"]
+        check_decode_capacity = native.check_decode_capacity
+
+        def evict_to_free_tokens(self, tree_cache, num_tokens):
+            pass  # An empty native cache has nothing to evict.
+
+        def alloc(self, count):
+            return children[0].alloc(count), children[1].alloc(count)
+
+    allocator = Composite()
+    MODULE.bind_native_swa(allocator, backing)
+    if scenario == "smaller":
+        assert allocator.alloc(8) is None
+    else:
+        assert not allocator.check_decode_capacity(num_tokens=4, tree_cache=None)
+        if scenario == "grouped":
+            children[1].free_group_begin()
+        children[1].free_page_ids(torch.tensor([1]))
+        if scenario == "grouped":
+            children[1].free_group_end()
+    assert allocator.check_decode_capacity(num_tokens=4, tree_cache=None)
