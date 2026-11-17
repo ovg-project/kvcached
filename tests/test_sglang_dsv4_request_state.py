@@ -384,3 +384,54 @@ def test_factory_context_gates_unaudited_admission_paths(request_module, unsuppo
     Configurator()._build_token_to_kv_pool(req_to_token_pool=pool)
     assert observed == [pool if unsupported is None else None]
     assert request_module.request_pool_context.get() is None
+
+
+def test_coordinated_reservation_keeps_native_tail_and_previous_standby(request_module):
+    pool, owner, backings = bind(request_module)
+    assert owner.reserve(1) == 1
+    previous = list(pool.free_slots)
+    receipt = owner.prepare_admission(5)
+    assert receipt.rows == (4, 5, 6, 7, 8)
+    assert pool.free_slots == previous
+    owner.finish_admission(receipt, 2)
+    assert owner.standby == {7, 8}
+    assert all(backing.live == {7, 8} for backing in backings)
+    assert pool.available_size() == 2
+    assert pool.alloc_rows(2) == [7, 8]
+    assert pool.available_size() == 0
+    assert pool.alloc_rows(1) is None
+    owner.end_admission()
+    assert pool.available_size() == 6
+
+
+def test_peer_rejection_releases_only_new_standby(request_module):
+    pool, owner, backings = bind(request_module)
+    owner.reserve(1)
+    receipt = owner.prepare_admission(5)
+    owner.finish_admission(receipt, 0)
+    assert owner.standby == {8}
+    assert all(backing.live == {8} for backing in backings)
+    assert pool.available_size() == 0
+    owner.end_admission()
+    assert pool.available_size() == 8
+
+
+def test_logical_capacity_query_does_not_map_or_reserve(request_module):
+    pool, owner, backings = bind(request_module)
+    original = list(pool.free_slots)
+    with owner.capacity_query(3):
+        assert pool.available_size() == 3
+    assert pool.available_size() == 8
+    assert pool.free_slots == original
+    assert not owner.standby
+    assert all(not backing.live for backing in backings)
+
+
+@pytest.mark.parametrize("accepted", [-1, 3])
+def test_admission_cannot_publish_unbacked_rows(request_module, accepted):
+    pool, owner, backings = bind(request_module)
+    receipt = owner.prepare_admission(2)
+    with pytest.raises(ValueError, match="locally backed"):
+        owner.finish_admission(receipt, accepted)
+    assert owner.standby == {7, 8}
+    assert owner.admission_budget is None
