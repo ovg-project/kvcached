@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Four CPU processes using Gloo, without model weights or CUDA initialization."""
 
+import gc
 import sys
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
@@ -34,42 +36,56 @@ class ProcessWorld:
         return values
 
 
+def _exercise(rank):
+    from types import SimpleNamespace as NS
+
+    from test_sglang_rank_coordination import Req, coord, mode
+    from test_sglang_rank_prepare import decode_case, preparation_case
+
+    world = ProcessWorld(rank, dist.group.WORLD)
+    for chunk in (False, True):
+        for failed_rank in (0, 3):
+            preparation_case(world, failing_rank=failed_rank, chunk=chunk)
+    preparation_case(world, fatal=True)
+    for failed_rank in (0, 3):
+        decode_case(world, failing_rank=failed_rank)
+    decode_case(world, rollback_error=True)
+
+    runtime = coord.RankCoordinator(
+        NS(
+            tp_group=NS(world_size=4, rank_in_group=rank, ranks=list(range(4))),
+            tp_cpu_group=dist.group.WORLD,
+            ps=NS(pp_size=1, tp_size=4),
+        )
+    )
+    batch = NS(
+        reqs=[Req("decode", tokens=8, host=0)],
+        forward_mode=mode("DECODE"),
+        seq_lens_cpu=[8 if rank != 3 else 9],
+    )
+    with pytest.raises(coord.RankConsensusError):
+        runtime.selected(batch, stage="forward")
+
+
 def _worker(rank, store_path):
     store = dist.FileStore(store_path, 4)
     dist.init_process_group(
         "gloo", store=store, rank=rank, world_size=4, timeout=timedelta(seconds=45)
     )
+    reference = weakref.ref(dist.group.WORLD)
+    completed = False
     try:
-        from types import SimpleNamespace as NS
-
-        from test_sglang_rank_coordination import Req, coord, mode
-        from test_sglang_rank_prepare import decode_case, preparation_case
-
-        world = ProcessWorld(rank, dist.group.WORLD)
-        for chunk in (False, True):
-            for failed_rank in (0, 3):
-                preparation_case(world, failing_rank=failed_rank, chunk=chunk)
-        preparation_case(world, fatal=True)
-        for failed_rank in (0, 3):
-            decode_case(world, failing_rank=failed_rank)
-        decode_case(world, rollback_error=True)
-
-        runtime = coord.RankCoordinator(
-            NS(
-                tp_group=NS(world_size=4, rank_in_group=rank, ranks=list(range(4))),
-                tp_cpu_group=dist.group.WORLD,
-                ps=NS(pp_size=1, tp_size=4),
-            )
-        )
-        batch = NS(
-            reqs=[Req("decode", tokens=8, host=0)],
-            forward_mode=mode("DECODE"),
-            seq_lens_cpu=[8 if rank != 3 else 9],
-        )
-        with pytest.raises(coord.RankConsensusError):
-            runtime.selected(batch, stage="forward")
+        _exercise(rank)
+        dist.barrier()
+        completed = True
     finally:
+        # Drop expected-error tracebacks and scheduler cycles before Gloo's
+        # final native worker threads can meet Python interpreter shutdown.
+        gc.collect()
         dist.destroy_process_group()
+        gc.collect()
+        if completed:
+            assert reference() is None
 
 
 @pytest.mark.skipif(

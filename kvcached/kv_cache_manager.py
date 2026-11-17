@@ -2414,6 +2414,11 @@ class KVCacheManager:
             # clear() releases every page, including those a pending KV copy
             # still uses; only SGLang calls it, and SGLang never pins pages.
             raise StateConsistencyError("clear() while KV copy jobs are pending")
+        barrier = getattr(self, "physical_release_barrier", None)
+        if getattr(self, "defer_physical_release", False) and barrier is not None:
+            # clear() also releases live pages, bypassing the retirement queue.
+            # Fence before mutating ownership or the allocator's free lists.
+            barrier()
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.

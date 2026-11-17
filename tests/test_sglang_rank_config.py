@@ -15,12 +15,13 @@ config = importlib.import_module(consensus.package.__name__ + ".config")
 @pytest.fixture
 def runtime(monkeypatch):
     values = dict(
-        parallel=NS(pp_size=1, enable_dp_attention=False),
+        parallel=NS(pp_size=1, enable_dp_attention=False, pp_async_batch_depth=0),
+        device=NS(device="cuda"),
         spec=NS(speculative_algorithm=None),
         disagg=NS(disaggregation_mode="null"),
         exec=NS(dllm=NS(dllm_algorithm=None)),
         lora=NS(enable_lora=False),
-        memory=NS(hicache_storage_backend=None, enable_hisparse=False),
+        memory=NS(hicache_storage_backend=None, enable_hisparse=False, enable_hierarchical_cache=False),
         schedule=NS(
             enable_mixed_chunk=False,
             enable_dynamic_chunking=False,
@@ -39,7 +40,6 @@ def runtime(monkeypatch):
 @pytest.mark.parametrize(
     "section,field,value",
     [
-        ("parallel", "pp_size", 2),
         ("parallel", "enable_dp_attention", True),
         ("spec", "speculative_algorithm", "EAGLE"),
         ("disagg", "disaggregation_mode", "prefill"),
@@ -97,3 +97,19 @@ def test_enable_flag_does_not_override_disabled_library(monkeypatch):
     monkeypatch.setenv("ENABLE_KVCACHED", "false")
     monkeypatch.setattr(consensus.coord, "_PATCHED", False)
     assert consensus.coord.patch_rank_coordination() == []
+
+
+@pytest.mark.parametrize("section,field,value", [
+    ("parallel", "pp_async_batch_depth", 1),
+    ("device", "device", "xpu"),
+    ("memory", "enable_hierarchical_cache", True),
+])
+def test_pipeline_restrictions_before_backing(runtime, monkeypatch, section, field, value):
+    runtime["parallel"].pp_size = 2
+    test_unsupported_opt_in_rejects_before_managed_pool_construction(
+        runtime, monkeypatch, section, field, value)
+
+
+def test_pipeline_configuration(runtime):
+    runtime["parallel"].pp_size = 4
+    config.validate_runtime_config()

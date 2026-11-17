@@ -3418,7 +3418,7 @@ def _dsv4_single_rank_backing() -> bool:
         return True
     if enabled():
         validate_runtime_config()
-        return tp_size > 1 and pp_size == 1
+        return tp_size > 1 or pp_size > 1
     return False
 
 
@@ -3597,12 +3597,19 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
 
             num_pages = (self.size + self.page_size + 1) // self.page_size
             tp_rank, tp_size, pp_rank = _resolve_sglang_parallel_context()
+            from sglang.srt.distributed import get_pipeline_model_parallel_world_size
+
+            release_policy = (
+                {"defer_physical_release": True}
+                if get_pipeline_model_parallel_world_size() > 1 else {}
+            )
             kvi.init_kvcached(
                 tp_rank=tp_rank,
                 world_size=tp_size,
                 pp_rank=pp_rank,
                 device=self.device,
                 async_sched=True,
+                **release_policy,
             )
             buffers, self._kvcached_raw_tensors = (
                 kvi.alloc_dsv4_swa_cache(
