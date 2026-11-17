@@ -695,8 +695,8 @@ def _sglang_demand_manager(scheduler: Any) -> Any:
     """The token pool's manager, which posts demand on this rank's GPU.
 
     Ordinary composites use their full-attention manager. Native DSV4 uses
-    a backing manager for reclamation and posts each backing's demand in
-    physical units separately. A pipeline posts nothing.
+    a backing manager for reclamation and combines the backings' demand in
+    bytes. A pipeline posts nothing.
     """
     if _sglang_pipeline_stages() > 1:
         return None
