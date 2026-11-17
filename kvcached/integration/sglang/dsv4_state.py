@@ -39,6 +39,19 @@ def install_c4_state_backing(pool_module: Any, top_class: Any,
             # The native HIP constructor initializes the entire offline pool.
             return original_alloc(state, dtype=dtype, device=device,
                                   enable_memory_saver=enable_memory_saver)
+        if request_state:
+            # Prefill capture uses rows 0..bs-1 without calling alloc_rows.
+            # Keep that storage native until capture-specific leases exist.
+            try:
+                from sglang.srt.runtime_context import get_exec
+
+                backend = get_exec().graph.cuda_graph_config.prefill.backend
+                capture_disabled = getattr(backend, "value", backend) == "disabled"
+            except (ImportError, AttributeError, RuntimeError):
+                capture_disabled = False
+            if not capture_disabled:
+                return original_alloc(state, dtype=dtype, device=device,
+                                      enable_memory_saver=enable_memory_saver)
         row_bytes = state.last_dim * dtype.itemsize
         page_bytes = state.ring_size * row_bytes
         native_pages = (state._size + state.ring_size - 1) // state.ring_size

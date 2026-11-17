@@ -850,9 +850,14 @@ def test_c4_state_factory_groups_layers_and_preserves_native_constructor(monkeyp
 
 
 @pytest.mark.parametrize("online", [False, True])
-@pytest.mark.parametrize("unsupported", [None, "hip", "coverage"])
+@pytest.mark.parametrize("unsupported", [None, "hip", "coverage", "prefill_capture", "unknown_capture"])
 def test_c128_state_factory_preserves_native_shape_and_pins_banks(monkeypatch, online, unsupported):
     interfaces, _patches, _ = _load_modules(monkeypatch)
+    backend = "breakable" if unsupported == "prefill_capture" else "disabled"
+    config = (None if unsupported == "unknown_capture" else
+              types.SimpleNamespace(prefill=types.SimpleNamespace(backend=backend)))
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", types.SimpleNamespace(
+        get_exec=lambda: types.SimpleNamespace(graph=types.SimpleNamespace(cuda_graph_config=config))))
     from test_sglang_dsv4_native_backing import Manager
 
     from kvcached.integration.sglang.dsv4_request_state import request_pool_context

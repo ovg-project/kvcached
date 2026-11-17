@@ -342,6 +342,8 @@ def test_request_state_shrink_preserves_prefixes_and_active_or_promised_rows(req
         manager.in_shrink = True
         manager.apply_resize_target = apply
         manager.reclaim_for_shrink = reclaim
+        manager._register_shrink_reclaimer = lambda callback: None
+        manager._register_cache_owner = lambda count, evict: None
     scheduler = SimpleNamespace(
         token_to_kv_pool_allocator=SimpleNamespace(_kvcached_dsv4_request_state=owner),
         req_to_token_pool=pool, running_batch=object(), tree_cache=SimpleNamespace(evict=evict),
@@ -435,3 +437,120 @@ def test_admission_cannot_publish_unbacked_rows(request_module, accepted):
         owner.finish_admission(receipt, accepted)
     assert owner.standby == {7, 8}
     assert owner.admission_budget is None
+
+
+def test_row_miss_reports_exact_bank_demand_until_recovery(request_module):
+    _, owner, backings = bind(request_module, banks=2)
+    for backing in backings:
+        backing.manager.budget = 0
+    assert owner.reserve(2) == 0
+    assert owner.backing_demand(True) == [(backing.manager, 3) for backing in backings]
+    for backing in backings:
+        backing.manager.budget = 3
+    assert owner.reserve(2) == 2
+    assert owner.backing_demand(True) == [(backing.manager, 0) for backing in backings]
+    owner.demand_rows = {1, 8}
+    owner.backing_demand(False)
+    assert not owner.demand_rows
+
+
+def test_row_reclaimers_keep_active_and_promised_rows(request_module):
+    pool, owner, backings = bind(request_module, banks=2)
+    assert owner.reserve(1) == 1
+    active = pool.alloc_rows(1)
+    assert owner.reserve(4) == 4
+    shrink: list[Any] = []
+    cache: list[Any] = []
+    for backing in backings:
+        backing.manager._register_shrink_reclaimer = shrink.append
+        backing.manager._register_cache_owner = lambda count, evict: cache.append((count, evict))
+    owner.register_reclaimers()
+    owner.register_reclaimers()
+    assert len(shrink) == len(cache) == 2
+    assert [count() for count, _ in cache] == [2, 2]
+    owner.admission_budget = 1
+    shrink[0]()
+    assert owner.standby == {4, 5, 6, 7}
+    assert [count() for count, _ in cache] == [0, 0]
+    owner.end_admission()
+    owner.standby_reclaimable = lambda: False
+    assert cache[0][1](1) == 0 and owner.standby
+    owner.standby_reclaimable = lambda: True
+    assert cache[0][1](1) == 2
+    assert owner.active == set(active) and not owner.standby
+    assert all(backing.live == {8, 18} for backing in backings)
+
+
+def test_scheduler_posts_row_pressure_when_token_backing_fits(request_module, monkeypatch):
+    from test_sglang_dsv4_native_backing import Composite, MODULE
+    from test_sglang_dsv4_priority import PriorityManager
+    from test_sglang_dsv4_runtime_reservation_patch import _load_sglang_modules
+
+    _, patches, _ = _load_sglang_modules(monkeypatch)
+    token_manager, row_manager = PriorityManager(), PriorityManager()
+    token_backing = MODULE.SWABacking(token_manager, native_pages=13, native_page_bytes=1,
+                                     physical_page_bytes=32)
+    row_backing = MODULE.SWABacking(row_manager, native_pages=32, native_page_bytes=2,
+                                   physical_page_bytes=8)
+    pool = NativeRows()
+    owner = request_module.RequestStateBacking(pool, [dict(backing=row_backing, bank_stride=0, bank_count=1)])
+    owner.bind()
+    row_manager.budget = 0
+    allocator = Composite(4)
+    MODULE.bind_native_swa(allocator, token_backing)
+    request = SimpleNamespace(origin_input_ids=[1, 2, 3, 4], prefix_indices=[], output_ids=[],
+                              sampling_params=SimpleNamespace(max_new_tokens=0))
+    scheduler = SimpleNamespace(token_to_kv_pool_allocator=allocator, req_to_token_pool=pool,
+                                waiting_queue=[request], chunked_req=None)
+    row_manager.step = 5
+    with patches._sglang_demand_round(scheduler):
+        assert row_manager.step == 0
+        assert owner.reserve(1) == 0
+    post = getattr(sys.modules["kvcached.vmm_ops"], "set_kv_demand")
+    post.assert_called_once_with(8, 0)
+    scheduler.waiting_queue.clear()
+    patches._sglang_post_demand(scheduler, 0)
+    assert post.call_args.args == (0, 0)
+
+
+def test_scheduler_registers_state_shrink_and_shared_allowance(request_module, monkeypatch):
+    from test_sglang_dsv4_kv_pool_patch import _load_modules
+    from test_sglang_dsv4_native_backing import Composite, MODULE
+
+    _, patches, _ = _load_modules(monkeypatch)
+    pool, owner, backings = bind(request_module)
+    token_manager = Manager()
+    allocator = Composite(4)
+    MODULE.bind_native_swa(allocator, SWABacking(token_manager, native_pages=13,
+                                               native_page_bytes=2, physical_page_bytes=8))
+    managers = [token_manager, *owner.managers()]
+    callbacks: list[Any] = []
+    for backing in backings:
+        backing.manager._register_shrink_reclaimer = callbacks.append
+        backing.manager._register_cache_owner = lambda count, evict: None
+
+    def initialize(integration, *, ranks, can_shrink):
+        assert integration == "sglang" and ranks == 1
+        assert all(can_shrink(manager) for manager in managers)
+        assert not can_shrink(object())
+        return tuple(managers)
+
+    groups: list[Any] = []
+    monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls", initialize)
+    monkeypatch.setattr("kvcached.priority_reclaim.PriorityReclaimGroup", groups.append)
+
+    class Scheduler:
+        def __init__(self):
+            self.token_to_kv_pool_allocator = allocator
+            self.req_to_token_pool = pool
+            self.running_batch = None
+            self.ps = SimpleNamespace(tp_size=1, pp_size=1)
+
+        def on_idle(self):
+            pass
+
+    assert patches.SchedulerIdleLimitPatch().patch_idle_hook(SimpleNamespace(Scheduler=Scheduler))
+    scheduler: Any = Scheduler()
+    assert scheduler._kvcached_control_managers == tuple(managers)
+    assert groups == [tuple(managers)]
+    assert len(callbacks) == 2 and all(callback.__self__ is owner for callback in callbacks)
