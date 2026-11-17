@@ -348,6 +348,33 @@ def test_unaudited_version_does_not_take_over_dsv4_storage(monkeypatch, version)
     assert module.DeepSeekV4TokenToKVPool is original
 
 
+def test_runner_connects_constructed_outer_allocator_to_managed_decode_gate(monkeypatch):
+    _interfaces, patches, _torch_mock = _load_modules(monkeypatch)
+    release = mock.Mock()
+    logical_check = mock.Mock(return_value=False)
+    logical = types.SimpleNamespace(
+        _kvcached_release_decode_reservation=release,
+        check_decode_capacity=logical_check,
+    )
+    outer = types.SimpleNamespace(logical_attn_allocator=logical,
+                                  check_decode_capacity=mock.Mock(return_value=True))
+
+    class Runner:
+        is_draft_worker = False
+        token_to_kv_pool_allocator: Any = None
+
+        def alloc_memory_pool(self):
+            self.token_to_kv_pool_allocator = outer
+
+    runner_mod: Any = types.SimpleNamespace(ModelRunner=Runner)
+    assert patches.DeepSeekV4RunnerOwnershipPatch().patch_pool_initialization(runner_mod)
+    runner = Runner()
+    runner.alloc_memory_pool()
+    assert not runner.token_to_kv_pool_allocator.check_decode_capacity(num_tokens=4)
+    release.assert_called_once_with()
+    logical_check.assert_called_once_with(num_tokens=4)
+
+
 def test_dsv4_requires_runner_identity_before_elastic_allocation(monkeypatch):
     _interfaces, patches, _torch_mock = _load_modules(monkeypatch)
     module = _make_dsv4_module()
