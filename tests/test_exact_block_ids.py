@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact-ID manager contracts with a deterministic, GPU-free page backend."""
 import ast
+import functools
 import operator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
+from threading import Event, RLock
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,8 +33,10 @@ class Page:
         return ((page_id * page_size + block_size - 1) // block_size,
                 (page_id + 1) * page_size // block_size)
 
-    def init(self, block_size):
+    def init(self, block_size, max_block_id=None):
         start, end = self.get_block_range(self.page_id, self.page_size, block_size)
+        if max_block_id is not None:
+            end = min(end, max_block_id)
         self.free = list(range(start, end))
 
     def get_free_blocks(self):
@@ -82,22 +88,25 @@ def make_manager():
     tree = ast.parse(source.read_text(encoding='utf-8'))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'KVCacheManager')
-    selected = {'alloc_exact', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
+    selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 '_apply_resize_target', '_retiring_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in selected]
     # Extract the production methods, not copies, without importing torch or
     # loading the compiled GPU extension. Calls to the native layer are fakes.
+    synchronized = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                        and n.name == 'synchronized')
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
-                        names=[ast.alias(name='annotations')], level=0), cls],
+                        names=[ast.alias(name='annotations')], level=0), synchronized, cls],
                         type_ignores=[])
     namespace: dict[str, Any] = {'operator': operator, 'InternalPage': Page,
                  'StateConsistencyError': UnsafeMapping,
                  'QuarantinedResizeError': RejectedResize,
                  'logger': SimpleNamespace(warning=lambda message: None),
-                 'synchronized': lambda method: method}
+                 'functools': functools, 'nullcontext': nullcontext}
     exec(compile(ast.fix_missing_locations(module), str(source), 'exec'), namespace)
     manager = namespace['KVCacheManager']()
+    manager._lock = RLock()
     manager._virtual_num_blocks = 32
     manager.reserve_null_block = True
     manager.block_mem_size = 4
@@ -114,6 +123,7 @@ def make_manager():
         {key: manager._operation_counters.get(key, 0) + value})
     manager._record_operation_error = lambda *args, **kwargs: None
     manager._wait_post_init = lambda: None
+    manager.wait_ready = lambda: None
     manager.available_size = lambda: 32
     manager._get_cached_avail_physical_pages = lambda: 8
     manager.resize = lambda size: None
@@ -121,6 +131,48 @@ def make_manager():
     manager.failures = []
     manager._lifecycle = SimpleNamespace(mark_failed=lambda reason, exc: manager.failures.append(exc))
     return manager
+
+
+@pytest.mark.parametrize('ids', [[], [1]])
+def test_exact_claim_waits_without_holding_initialization_lock(ids):
+    manager = make_manager()
+    waiting, ready = Event(), Event()
+
+    def wait_ready():
+        waiting.set()
+        assert ready.wait(3), 'test initialization was not released'
+
+    manager.wait_ready = wait_ready
+    manager._wait_post_init = wait_ready
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(manager.alloc_exact, ids)
+        try:
+            assert waiting.wait(1)
+            assert not result.done() and not manager.page_allocator.calls
+            acquired = manager._lock.acquire(timeout=1)
+            try:
+                assert acquired, 'exact allocation blocked the initialization thread'
+            finally:
+                if acquired:
+                    manager._lock.release()
+        finally:
+            ready.set()
+        assert result.result(timeout=1) == ids
+
+
+def test_exact_claim_propagates_initialization_failure_before_mapping():
+    manager = make_manager()
+    failure = RuntimeError('null reservation failed')
+
+    def wait_ready():
+        raise failure
+
+    manager.wait_ready = wait_ready
+    with pytest.raises(RuntimeError) as caught:
+        manager.alloc_exact([1])
+    assert caught.value is failure
+    assert not manager.page_allocator.calls
+    assert not manager._operation_counters
 
 
 def page_for(manager, page_id, free):
@@ -243,7 +295,7 @@ def test_zero_resize_target_is_applied_before_an_exact_claim():
         manager.available_size = lambda: 0
 
     manager.resize = resize
-    manager.page_allocator.resize_target = 0
+    manager._runtime_control = SimpleNamespace(apply=lambda: resize(0))
     assert manager.alloc_exact([2]) is None
     assert applied == [0]
     assert page.free == [2, 3]
@@ -301,3 +353,37 @@ def test_exact_claim_can_use_preallocated_physical_backing():
     manager.page_allocator.reserved_pages = 1
     assert manager.alloc_exact([4]) == [4]
     assert manager.page_allocator.calls == [1]
+
+
+def test_exact_claim_rejects_logical_id_tail_before_mapping():
+    manager = make_manager()
+    manager.max_block_id = 6
+    with pytest.raises(ValueError, match='logical ID bound'):
+        manager.alloc_exact([4, 6])
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([4]) == [4]
+    assert manager.avail_pages[1].free == [5]
+
+
+def test_unrequested_reservations_cannot_pay_for_fresh_exact_ids():
+    manager = make_manager()
+    manager.logical_num_blocks = 4
+    manager._logical_allocated_blocks = 4
+    manager.reserved_blocks = [1, 2]
+    page_for(manager, 0, [3])
+    assert manager.alloc_exact([3]) is None
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([1, 2]) == [1, 2]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 0
+
+
+def test_exact_claim_accounts_only_fresh_blocks_in_logical_and_step_limits():
+    manager = make_manager()
+    manager.logical_num_blocks = 6
+    manager._logical_allocated_blocks = 2
+    manager.reserved_blocks = [1]
+    page_for(manager, 0, [2, 3])
+    assert manager.alloc_exact([1, 2, 4]) == [1, 2, 4]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 2
