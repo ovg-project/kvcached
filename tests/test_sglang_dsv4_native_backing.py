@@ -136,6 +136,9 @@ class Tensor:
     def tolist(self):
         return list(self.values)
 
+    def __getitem__(self, index):
+        return Tensor(self.values[index])
+
 
 class NativeChild:
     def __init__(self, page_size, prefix, output):
@@ -162,7 +165,7 @@ class NativeChild:
     def alloc_extend(self, last_loc):
         return self._allocate_result()
 
-    def alloc_decode(self, last_loc):
+    def alloc_decode(self, last_loc, seq_lens=None, seq_lens_cpu=None):
         return self._allocate_result()
 
     # Native paged methods do not call alloc; keep those independent hooks.
@@ -246,11 +249,11 @@ def setup(monkeypatch):
         device=lambda value: SimpleNamespace(type=str(value).split(":")[0]),
         int64=object(), tensor=lambda values, **_: Tensor(values)))
 
-    def create(page_size=4):
+    def create(page_size=4, on_capacity_miss=None):
         backing = make_backing()
         assert backing.acquire({1})
         composite = Composite(page_size)
-        MODULE.bind_native_swa(composite, backing)
+        MODULE.bind_native_swa(composite, backing, on_capacity_miss=on_capacity_miss)
         return composite, backing
     return create
 
@@ -486,3 +489,148 @@ def test_grouped_free_credits_round_budget_once(setup, page_size):
         child.free_group_end()
         assert child.available_size() == 6 * page_size
         assert backing.live == {1}
+
+
+def test_capacity_translation_happens_after_rollback_without_poisoning(setup):
+    class Retry(Exception):
+        pass
+
+    def miss(*args):
+        raise Retry()
+
+    allocator, backing = setup(on_capacity_miss=miss)
+    allocator.swa_attn_allocator.output = None
+    with pytest.raises(Retry):
+        allocator.alloc_extend()
+    assert allocator.full_attn_allocator.live == {2}
+    assert backing.live == {1}
+    allocator.swa_attn_allocator.output = [12]
+    assert allocator.alloc_extend().tolist() == [20]
+
+
+class DecodeChild(NativeChild):
+    def __init__(self, prefix, free):
+        super().__init__(4, prefix, None)
+        self.choices = list(free)
+        self.released = []
+
+    def merge_and_sort_free(self):
+        self.choices = sorted(self.choices + self.released)
+        self.released = []
+
+    def get_all_free_pages(self):
+        return Tensor(self.choices + self.released)
+
+    def alloc_decode(self, last_loc, seq_lens=None, seq_lens_cpu=None):
+        # Native 0.5.20 may sort for bs even when fewer new pages are needed.
+        self.merge_and_sort_free()
+        result = []
+        for length, previous in zip(seq_lens_cpu.tolist(), last_loc.tolist()):
+            if (length - 1) % self.page_size == 0:
+                if not self.choices:
+                    return None
+                page = self.choices.pop(0)
+                self.live.add(page)
+                result.append(page * self.page_size)
+            else:
+                result.append(previous + 1)
+        return Tensor(result)
+
+    def _release(self, ids):
+        super()._release(ids)
+        self.released.extend(ids.tolist())
+
+
+class DecodeComposite(Composite):
+    def __init__(self, swa_choices):
+        super().__init__(4)
+        self.full_attn_allocator = DecodeChild(2, [5, 7, 9])
+        self.swa_attn_allocator = DecodeChild(1, swa_choices)
+
+    def check_decode_capacity(self, *, num_tokens, **kwargs):
+        return min(self.full_attn_allocator.available_size(),
+                   self.swa_attn_allocator.available_size()) >= num_tokens
+
+    def alloc_decode(self, next_length=5):
+        offset = (next_length - 2) % 4
+        full = self.full_attn_allocator.alloc_decode(
+            last_loc=Tensor([8 + offset]), seq_lens=Tensor([next_length]),
+            seq_lens_cpu=Tensor([next_length]))
+        swa = self.swa_attn_allocator.alloc_decode(
+            last_loc=Tensor([4 + offset]), seq_lens=Tensor([next_length]),
+            seq_lens_cpu=Tensor([next_length]))
+        assert full is not None and swa is not None
+        self.mapping.update(zip(full.tolist(), swa.tolist()))
+        return full
+
+
+def decode_setup(swa_choices=(3, 7, 9)):
+    backing = make_backing()
+    assert backing.acquire({1})
+    allocator = DecodeComposite(swa_choices)
+    MODULE.bind_native_swa(allocator, backing)
+    return allocator, backing
+
+
+def test_decode_gate_checks_placement_before_native_allocation(setup):
+    allocator, backing = decode_setup((10,))
+    assert backing.acquire({2})
+    allocator.swa_attn_allocator.live.add(2)
+    backing.manager.budget = len(backing.manager.live)
+    assert allocator.swa_attn_allocator.available_size() >= 4
+    assert not allocator.check_decode_capacity(num_tokens=4)
+    assert allocator.swa_attn_allocator.choices == [10]
+    assert backing.live == {1, 2}
+
+
+def test_decode_gate_retains_backing_until_the_promised_native_ids_are_used(setup):
+    allocator, backing = decode_setup()
+    assert allocator.check_decode_capacity(num_tokens=4)
+    claims = list(backing.manager.claims)
+    backing.manager.budget = len(backing.manager.live)
+    assert allocator.alloc_decode().tolist() == [20]
+    assert allocator.mapping[20] == 12
+    assert backing.manager.claims == claims
+    assert backing.live == {1, 3}
+
+
+def test_decode_reservation_survives_native_window_frees_and_sort_hint(setup):
+    allocator, backing = decode_setup()
+    assert backing.acquire({2})
+    child = allocator.swa_attn_allocator
+    child.live.add(2)
+    assert allocator.check_decode_capacity(num_tokens=4)
+    child.free_page_ids(Tensor([2]))
+    assert child.released == [2]
+    allocator.alloc_decode()
+    assert allocator.mapping[20] == 12  # The reserved page, not newly freed 2.
+    assert backing.live == {1, 3}
+
+
+def test_peer_decode_rejection_returns_only_reservations(setup):
+    allocator, backing = decode_setup()
+    assert allocator.check_decode_capacity(num_tokens=8)
+    assert backing.live == {1, 3, 7}
+    allocator._kvcached_release_decode_reservation()
+    assert backing.live == {1}
+    assert allocator.swa_attn_allocator.choices == [3, 7, 9]
+    assert allocator.check_decode_capacity(num_tokens=4)
+    assert backing.live == {1, 3}
+
+
+def test_decode_inside_existing_pages_needs_no_new_backing(setup):
+    allocator, backing = decode_setup(())
+    allocator.full_attn_allocator.choices = []
+    backing.manager.budget = len(backing.manager.live)
+    assert allocator.check_decode_capacity(num_tokens=0)
+    assert allocator.alloc_decode(next_length=4).tolist() == [11]
+    assert backing.live == {1}
+
+
+def test_decode_gate_backend_error_is_fatal_not_a_capacity_miss(setup):
+    allocator, backing = decode_setup()
+    backing.manager.fault = RuntimeError("mapping outcome unknown")
+    with pytest.raises(RuntimeError, match="mapping outcome unknown"):
+        allocator.check_decode_capacity(num_tokens=4)
+    with pytest.raises(RuntimeError, match="tear down"):
+        allocator.check_decode_capacity(num_tokens=4)

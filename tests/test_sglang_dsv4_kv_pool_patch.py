@@ -447,7 +447,8 @@ def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
     assert managed.full.kind == "native-paged"
     assert managed.swa.kind == "native-paged"
     assert not hasattr(managed_cache, "full_kv_pool")
-    bind.assert_called_once_with(managed, managed_cache.swa_kv_pool._kvcached_dsv4_backing)
+    bind.assert_called_once_with(managed, managed_cache.swa_kv_pool._kvcached_dsv4_backing,
+                                 on_capacity_miss=patches._sglang_capacity_miss)
 
     native_cache = types.SimpleNamespace(
         full_kv_pool=object(), swa_kv_pool=object()

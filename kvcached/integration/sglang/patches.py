@@ -3725,7 +3725,7 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
             if backing is not None:
                 from kvcached.integration.sglang.dsv4_backing import bind_native_swa
 
-                bind_native_swa(allocator_self, backing)
+                bind_native_swa(allocator_self, backing, on_capacity_miss=_sglang_capacity_miss)
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init
@@ -4232,9 +4232,17 @@ class _PrefixCacheShrinkReclaimer:
         self._scheduler = weakref.ref(scheduler)
         self.manager = manager
         allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
-        swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
-        full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
-        self.swa = manager is swa and swa is not full
+        swa = _token_kv_managers(allocator, component="swa")
+        full = _token_kv_managers(allocator, component="full")
+        self.swa = any(manager is item for item in swa) and not any(manager is item for item in full)
+        native = getattr(allocator, "logical_attn_allocator", allocator)
+        backings = [getattr(native, "_kvcached_dsv4_backing", None)]
+        for name in ("_kvcached_dsv4_full_backings", "_kvcached_dsv4_swa_backings"):
+            backings.extend(getattr(native, name, ()))
+        self.native_backing = next((item for item in backings
+                                    if getattr(item, "manager", None) is manager
+                                    and getattr(item, "native_page_bytes", None)), None)
+        self.native_token_page_size = max(1, int(getattr(native, "page_size", 1) or 1))
         self.seen_limits: Optional[Tuple[int, int]] = None
         self.last_attempt = 0.0
 
@@ -4245,6 +4253,9 @@ class _PrefixCacheShrinkReclaimer:
         manager = self.manager
         tokens_per_page = (manager.page_size // manager.block_mem_size
                            * max(1, int(getattr(cache, "page_size", 1) or 1)))
+        if self.native_backing is not None:
+            tokens_per_page = (math.ceil(manager.page_size / self.native_backing.native_page_bytes)
+                               * self.native_token_page_size)
         return cache, evictable if callable(evictable) else None, tokens_per_page
 
     def count_pages(self) -> int:
@@ -4304,7 +4315,7 @@ def _sglang_parallel_size(scheduler: Any) -> int:
             * int(getattr(ps, "pp_size", 1) or 1))
 
 
-def _token_kv_managers(allocator: Any) -> List[Any]:
+def _token_kv_managers(allocator: Any, *, component: Optional[str] = None) -> List[Any]:
     """kvcached managers behind the scheduler's token KV allocator.
 
     Only token KV pools: SGLang allocates those while preparing a batch,
@@ -4312,16 +4323,33 @@ def _token_kv_managers(allocator: Any) -> List[Any]:
     safe as SGLang's own evict-before-alloc. Mamba slots are allocated in the
     middle of tree operations.
     """
+    # DSV4 HiSparse keeps SWA IDs/backing on its logical allocator; its
+    # separate device-cache allocator remains owned by native SGLang.
+    allocator = getattr(allocator, "logical_attn_allocator", allocator)
     managers: List[Any] = []
-    for alloc in (allocator, getattr(allocator, "full_attn_allocator", None),
-                  getattr(allocator, "swa_attn_allocator", None)):
+    for alloc, owner in (
+            (allocator, "full"),
+            (getattr(allocator, "full_attn_allocator", None), "full"),
+            (getattr(allocator, "swa_attn_allocator", None), "swa")):
+        if component is not None and component != owner:
+            continue
         manager = getattr(alloc, "kvcached_allocator", None)
         if manager is not None and all(manager is not m for m in managers):
             managers.append(manager)
-    backing = getattr(allocator, "_kvcached_dsv4_backing", None)
-    manager = getattr(backing, "manager", None)
-    if manager is not None and all(manager is not m for m in managers):
-        managers.append(manager)
+    backings = [
+        (getattr(allocator, "_kvcached_dsv4_backing", None), "swa"),
+        (getattr(allocator, "_kvcached_dsv4_full_backing", None), "full"),
+    ]
+    backings.extend((backing, "full") for backing in
+                    getattr(allocator, "_kvcached_dsv4_full_backings", ()))
+    backings.extend((backing, "swa") for backing in
+                    getattr(allocator, "_kvcached_dsv4_swa_backings", ()))
+    for backing, owner in backings:
+        if component is not None and component != owner:
+            continue
+        manager = getattr(backing, "manager", None)
+        if manager is not None and all(manager is not m for m in managers):
+            managers.append(manager)
     return managers
 
 
