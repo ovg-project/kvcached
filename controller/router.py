@@ -74,6 +74,14 @@ class GatewayTimeoutError(RouteError):
     error_type = "TimeoutError"
 
 
+def _media_type(content_type: str | None) -> str:
+    """Return a bare media type; aiohttp rejects ``type/subtype; charset=...``."""
+    if not content_type:
+        return "application/json"
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type or "application/json"
+
+
 class UpstreamError(RouteError):
     """The engine answered with a non-2xx status; forward it unchanged."""
 
@@ -82,7 +90,9 @@ class UpstreamError(RouteError):
                  body: Any,
                  content_type: str = "application/json") -> None:
         self.status = status
-        self.content_type = content_type
+        # The upstream header may carry parameters ("application/json; charset=utf-8").
+        # web.Response(content_type=...) accepts only the bare media type.
+        self.content_type = _media_type(content_type)
         self._body = body
         super().__init__(f"upstream returned HTTP {status}")
 
@@ -246,7 +256,7 @@ class LLMRouter:
                                                             success=True)
                     return response
 
-                body = await self._read_error_body(response)
+                body, content_type = await self._read_error_body(response)
                 await response.release()
                 logger.error(
                     f"Streaming request failed with status {response.status}: {body}"
@@ -255,9 +265,7 @@ class LLMRouter:
                     request_stats,
                     success=False,
                     error_message=f"HTTP {response.status}: {body}")
-                raise UpstreamError(
-                    response.status, body,
-                    response.headers.get("Content-Type", "application/json"))
+                raise UpstreamError(response.status, body, content_type)
 
             # For non-streaming requests, handle as before
             async with self.session.post(url,
@@ -272,16 +280,14 @@ class LLMRouter:
                                                             success=True)
                     return result
 
-                body = await self._read_error_body(response)
+                body, content_type = await self._read_error_body(response)
                 logger.error(
                     f"Request failed with status {response.status}: {body}")
                 self.traffic_monitor.record_request_end(
                     request_stats,
                     success=False,
                     error_message=f"HTTP {response.status}: {body}")
-                raise UpstreamError(
-                    response.status, body,
-                    response.headers.get("Content-Type", "application/json"))
+                raise UpstreamError(response.status, body, content_type)
 
         except asyncio.TimeoutError as exc:
             logger.error(
@@ -309,10 +315,15 @@ class LLMRouter:
             raise
 
     @staticmethod
-    async def _read_error_body(response: aiohttp.ClientResponse) -> Any:
-        """Return the engine's error payload, wrapping non-JSON bodies."""
+    async def _read_error_body(response: aiohttp.ClientResponse) -> tuple[Any, str]:
+        """Return the engine's error payload and the media type to answer with.
+
+        A JSON body keeps its (parameter-stripped) media type. A non-JSON body is wrapped in the
+        OpenAI error schema, so the response must be labeled ``application/json``.
+        """
         try:
-            return await response.json(content_type=None)
+            return await response.json(content_type=None), _media_type(
+                response.headers.get("Content-Type"))
         except (TypeError, ValueError):
             text = await response.text()
             return {
@@ -321,7 +332,7 @@ class LLMRouter:
                     "type": response.headers.get("Content-Type", "text/plain"),
                     "code": response.status,
                 }
-            }
+            }, "application/json"
 
     async def health_check(self, model_name: str) -> Dict[str, bool]:
         """Check health of all endpoints for a model"""

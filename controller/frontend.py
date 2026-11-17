@@ -160,7 +160,14 @@ class MultiLLMFrontend:
                                         label: str) -> web.StreamResponse:
         """Forward a completion request to the engine picked by the router."""
         try:
-            request_data = await request.json()
+            try:
+                request_data = await request.json()
+            except json.JSONDecodeError as e:
+                # Only the client body is the caller's fault: a decode failure of the upstream
+                # response must stay a server/gateway error.
+                logger.warning(f"Invalid JSON body for {label} request: {e}")
+                return _json_error(400, "BadRequestError",
+                                   f"Invalid JSON body: {e}")
             model_name = request_data.get('model')
 
             if not model_name:
@@ -188,10 +195,6 @@ class MultiLLMFrontend:
                                 status=200,
                                 content_type='application/json')
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON body for {label} request: {e}")
-            return _json_error(400, "BadRequestError",
-                               f"Invalid JSON body: {e}")
         except RouteError as e:
             logger.error(f"{label} request failed: {e}")
             return web.Response(text=json.dumps(e.payload()),

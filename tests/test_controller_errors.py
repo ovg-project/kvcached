@@ -85,12 +85,14 @@ async def _post(port, path, payload=None, raw=None):
 
 
 @pytest.mark.parametrize("path", ENDPOINTS)
-@pytest.mark.parametrize("error,status,error_type", [
-    (ModelNotFoundError("Model 'nope' is not configured"), 404, "NotFoundError"),
-    (BackendUnavailableError("engine is unreachable"), 503,
-     "ServiceUnavailableError"),
-    (GatewayTimeoutError("engine timed out"), 504, "TimeoutError"),
-])
+@pytest.mark.parametrize(
+    "error,status,error_type",
+    [
+        (ModelNotFoundError("Model 'nope' is not configured"), 404, "NotFoundError"),
+        (BackendUnavailableError("engine is unreachable"), 503, "ServiceUnavailableError"),
+        (GatewayTimeoutError("engine timed out"), 504, "TimeoutError"),
+    ],
+)
 async def test_router_failures_keep_their_status(path, error, status, error_type):
     async with _frontend(_FailingRouter(error)) as port:
         code, body = await _post(port, path, {"model": "m", "prompt": "hi"})
@@ -151,8 +153,16 @@ async def _upstream():
         if model == "bad":
             return web.json_response(BAD_REQUEST_BODY, status=400)
         if model == "busy":
-            return web.Response(text="engine overloaded", status=503,
-                                content_type="text/plain")
+            return web.Response(text="engine overloaded", status=503, content_type="text/plain")
+        if model == "charset":
+            # Simulate an engine that echoes the charset parameter in its header.
+            return web.Response(
+                text=json.dumps(BAD_REQUEST_BODY),
+                status=400,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+        if model == "broken-json":
+            return web.Response(text="{broken", status=200, content_type="application/json")
         return web.json_response({"error": {"message": "no such model"}}, status=404)
 
     app = web.Application()
@@ -166,12 +176,12 @@ async def _upstream():
 
 
 def _router(port, names):
-    models = {"models": {name: {"endpoint": {"host": "127.0.0.1", "port": port}}
-                         for name in names}}
-    return LLMRouter(models,
-                     sleep_manager=SleepManager(SleepConfig(),
-                                                traffic_monitor=TrafficMonitor()),
-                     traffic_monitor=TrafficMonitor())
+    models = {"models": {name: {"endpoint": {"host": "127.0.0.1", "port": port}} for name in names}}
+    return LLMRouter(
+        models,
+        sleep_manager=SleepManager(SleepConfig(), traffic_monitor=TrafficMonitor()),
+        traffic_monitor=TrafficMonitor(),
+    )
 
 
 async def test_router_keeps_engine_status_and_payload():
@@ -179,7 +189,8 @@ async def test_router_keeps_engine_status_and_payload():
         router = _router(port, ["ok", "bad", "busy"])
         try:
             assert await router.route_request("ok", {"model": "ok"}) == {
-                "id": "cmpl-1", "choices": []
+                "id": "cmpl-1",
+                "choices": [],
             }
 
             with pytest.raises(UpstreamError) as bad:
@@ -220,3 +231,43 @@ async def test_unreachable_engine_is_a_503():
             await router.route_request("dead", {"model": "dead"})
     finally:
         await router.close()
+
+
+async def test_charset_content_type_is_normalized():
+    """A parameterized upstream Content-Type must not turn the error into a 500."""
+    async with _upstream() as port:
+        router = _router(port, ["charset"])
+        try:
+            async with _frontend(router) as frontend_port:
+                code, body = await _post(frontend_port, "/v1/completions", {"model": "charset"})
+            assert code == 400, body
+            assert json.loads(body) == BAD_REQUEST_BODY
+        finally:
+            await router.close()
+
+
+async def test_plain_text_upstream_error_is_labeled_json():
+    """A wrapped non-JSON body is served as JSON with the upstream status."""
+    async with _upstream() as port:
+        router = _router(port, ["busy"])
+        try:
+            async with _frontend(router) as frontend_port:
+                code, body = await _post(frontend_port, "/v1/completions", {"model": "busy"})
+            assert code == 503, body
+            payload = json.loads(body)
+            assert "engine overloaded" in payload["error"]["message"]
+        finally:
+            await router.close()
+
+
+async def test_malformed_upstream_json_stays_a_server_error():
+    """A decode failure of the upstream response must not be blamed on the client."""
+    async with _upstream() as port:
+        router = _router(port, ["broken-json"])
+        try:
+            async with _frontend(router) as frontend_port:
+                code, body = await _post(frontend_port, "/v1/completions", {"model": "broken-json"})
+            assert code == 500, body
+            assert json.loads(body)["error"]["type"] == "InternalServerError"
+        finally:
+            await router.close()
