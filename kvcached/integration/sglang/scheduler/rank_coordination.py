@@ -79,6 +79,7 @@ class RankCoordinator:
         self.outer_required = None
         self.token_budget = None
         self.prefill_attempt = None
+        self.row_reservation = None
         self.planned = self.grammar_polled = self.priority_sorted = False
         error = None
         if (
@@ -266,6 +267,7 @@ class RankCoordinator:
                     reused = sum((request_slot(by_id[row["rid"]]) is not None for row in rows))
                     target = len(rows) - reused
                 reservation = allocator.prepare_admission(target)
+                self.row_reservation = (allocator, reservation)
                 with allocator.capacity_query(reservation.available + reused):
                     local_slots = int(query())
             else:
@@ -302,6 +304,16 @@ class RankCoordinator:
             self.new_slot_budget = max(0, c128_budget)
             allocator.finish_admission(reservation, c128_budget)
         return self.slot_budget
+
+    def release_slots(self):
+        """Release this attempt's unused leases; active and older rows survive."""
+        pending, self.row_reservation = self.row_reservation, None
+        if pending is not None:
+            allocator, reservation = pending
+            try:
+                allocator.finish_admission(reservation, 0)
+            finally:
+                allocator.end_admission()
 
     def prepare(self, candidates, *, error=None):
         states = self.exchange("candidates", candidates, error=error)
@@ -625,8 +637,7 @@ def patch_rank_coordination():
             finally:
                 runtime.prefill_attempt = None
         finally:
-            if allocator is not None:
-                allocator.end_admission()
+            runtime.release_slots()
 
     @functools.wraps(original_slots)
     def slots(self, *args, **kwargs):

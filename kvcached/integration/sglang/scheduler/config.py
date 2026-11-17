@@ -22,6 +22,10 @@ def validate_runtime_config() -> None:
     )
 
     schedule, parallel = get_schedule(), get_parallel()
+    slot_delay = getattr(schedule, "min_free_slots_delay", None)
+    running_limit = getattr(schedule, "max_running_requests", None)
+    if slot_delay is not None and running_limit is not None:
+        slot_delay = min(slot_delay, running_limit)
     unsupported = (
         parallel.pp_size != 1
         or parallel.enable_dp_attention
@@ -33,6 +37,8 @@ def validate_runtime_config() -> None:
         or get_memory().enable_hisparse
         or schedule.enable_mixed_chunk
         or schedule.enable_dynamic_chunking
+        or getattr(schedule, "enable_prefill_delayer", False)
+        or (slot_delay is not None and slot_delay > 1)
         or (schedule.enable_priority_scheduling and not schedule.disable_priority_preemption)
     )
     if unsupported:
@@ -40,6 +46,7 @@ def validate_runtime_config() -> None:
             "KVCached rank coordination requires PP=1, attention-DP disabled, "
             "non-speculative text generation, fixed separate prefill/decode batches, "
             "and no preemption, LoRA, storage-tier cache or disaggregation. "
+            "Disable --enable-prefill-delayer and use --min-free-slots-delay=1. "
             "Use those settings, or unset KVCACHED_RANK_COORDINATION_ENABLE "
             "to retain native multi-rank DSV4 storage."
         )

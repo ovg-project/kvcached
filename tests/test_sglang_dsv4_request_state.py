@@ -463,7 +463,52 @@ def test_four_ranks_admit_only_common_backed_rows(request_module, monkeypatch, s
             runtime.agree("prepared", len(rows))
             return budget
         finally:
-            owner.end_admission()
+            runtime.release_slots()
     assert world.run(worker) == [1] * 4
     assert all(owner.active == {8} and not owner.standby for _, owner, _ in owners)
     assert all(backing.live == {8} for _, _, backings in owners for backing in backings)
+
+
+def test_deferred_prefill_releases_new_rows_and_smaller_retry_recovers(request_module, monkeypatch):
+    import test_sglang_rank_coordination as consensus
+
+    world = consensus.ThreadWorld(4)
+    dist = SimpleNamespace(all_gather_object=world.gather)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=dist))
+    owners = [bind(request_module, banks=2) for _ in range(4)]
+
+    def worker(rank):
+        pool, owner, backings = owners[rank]
+        assert owner.reserve(1) == 1
+        active = pool.alloc_rows(1)
+        assert owner.reserve(1) == 1
+        previous = set(owner.standby)
+        held = [set(backing.live) for backing in backings]
+        physical = [set(backing.manager.live) for backing in backings]
+        scheduler = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=4, rank_in_group=rank, ranks=list(range(4))),
+            tp_cpu_group="instance", ps=SimpleNamespace(tp_size=4, pp_size=1),
+            req_to_token_pool=pool,
+        )
+        runtime = consensus.coord.RankCoordinator(scheduler)
+        budget = runtime.reserve_slots(lambda: min(6, pool.available_size()))
+        rows = pool.alloc_rows(budget)
+        assert any(set(backing.manager.live) > before for backing, before in zip(backings, physical))
+        # Native rollback returns newly bound rows while admission is active.
+        pool.free_rows(rows)
+        runtime.release_slots()
+        assert owner.active == set(active) and owner.standby == previous
+        assert owner.admission_budget is None
+        assert [set(backing.live) for backing in backings] == held
+        assert [set(backing.manager.live) for backing in backings] == physical
+        assert runtime.reserve_slots(lambda: 0) == 0
+        runtime.release_slots()
+        assert owner.standby == previous
+        budget = runtime.reserve_slots(lambda: min(1, pool.available_size()))
+        admitted = pool.alloc_rows(budget)
+        runtime.release_slots()
+        assert owner.active == set(active + admitted) and not owner.standby
+        return budget
+
+    assert world.run(worker) == [1] * 4
