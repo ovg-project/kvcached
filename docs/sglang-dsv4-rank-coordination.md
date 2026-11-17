@@ -27,6 +27,10 @@ are outside this contract. Unsupported launch settings reject before managed
 backing is constructed; unsupported requests reject before preparation. Unset
 the flag to retain the existing native-storage fallback for multi-rank DSV4.
 
+C128 request-state storage stays native with prefill CUDA graph capture.
+Managed request-state backing requires `--cuda-graph-backend-prefill=disabled`;
+an unknown capture configuration also keeps native state storage.
+
 CPU regressions cover protocol ordering, asymmetric allocation failures,
 rollback ownership, native admission source and four-process Gloo transport.
 They do not establish full-model CUDA serving correctness or performance.
