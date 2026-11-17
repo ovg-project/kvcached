@@ -435,3 +435,35 @@ def test_admission_cannot_publish_unbacked_rows(request_module, accepted):
         owner.finish_admission(receipt, accepted)
     assert owner.standby == {7, 8}
     assert owner.admission_budget is None
+
+
+@pytest.mark.parametrize("short_rank", [0, 3])
+def test_four_ranks_admit_only_common_backed_rows(request_module, monkeypatch, short_rank):
+    import test_sglang_rank_coordination as consensus
+    world = consensus.ThreadWorld(4)
+    dist = SimpleNamespace(all_gather_object=world.gather)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=dist))
+    owners = [bind(request_module) for _ in range(4)]
+    for backing in owners[short_rank][2]:
+        # Row 8 lives on physical page 2; row 7 additionally needs page 1.
+        backing.manager.budget = 1
+
+    def worker(rank):
+        pool, owner, backings = owners[rank]
+        scheduler = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=4, rank_in_group=rank, ranks=list(range(4))),
+            tp_cpu_group="instance", ps=SimpleNamespace(tp_size=4, pp_size=1),
+            req_to_token_pool=pool,
+        )
+        runtime = consensus.coord.RankCoordinator(scheduler)
+        try:
+            budget = runtime.reserve_slots(lambda: min(4, pool.available_size()))
+            rows = pool.alloc_rows(budget)
+            runtime.agree("prepared", len(rows))
+            return budget
+        finally:
+            owner.end_admission()
+    assert world.run(worker) == [1] * 4
+    assert all(owner.active == {8} and not owner.standby for _, owner, _ in owners)
+    assert all(backing.live == {8} for _, _, backings in owners for backing in backings)
