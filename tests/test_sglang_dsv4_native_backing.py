@@ -243,6 +243,7 @@ class Composite:
 @pytest.fixture
 def setup(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        device=lambda value: SimpleNamespace(type=str(value).split(":")[0]),
         int64=object(), tensor=lambda values, **_: Tensor(values)))
 
     def create(page_size=4):
@@ -380,3 +381,108 @@ def test_shrink_reclaims_before_native_ids_and_backing_refs_are_selected(setup, 
     assert backing.live == {3}
     assert dict(backing.refs) == {2: 1}
     assert backing.manager.live == {2}
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_prepare_rollback_returns_only_new_native_pages(setup, page_size):
+    allocator, backing = setup(page_size)
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        assert allocator.alloc_extend() is not None
+    assert allocator.full_attn_allocator.live == {2, 5}
+    assert allocator.swa_attn_allocator.live == {1, 3}
+    journal.rollback()
+    assert allocator.full_attn_allocator.live == {2}
+    assert allocator.swa_attn_allocator.live == {1}
+    assert backing.live == {1}
+
+
+def test_prepare_journal_does_not_return_a_page_already_freed(setup):
+    allocator, backing = setup()
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        allocator.alloc_extend()
+        allocator.swa_attn_allocator.free_page_ids(Tensor([3]))
+    journal.rollback()
+    assert allocator.full_attn_allocator.live == {2}
+    assert allocator.swa_attn_allocator.live == {1}
+    assert backing.live == {1}
+
+
+def test_prepare_miss_keeps_previous_success_in_journal(setup):
+    allocator, backing = setup()
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        allocator.alloc_extend()
+        allocator.full_attn_allocator.output = [24]
+        allocator.swa_attn_allocator.output = None
+        assert allocator.alloc_extend() is None
+    journal.rollback()
+    assert allocator.full_attn_allocator.live == {2}
+    assert allocator.swa_attn_allocator.live == {1}
+    assert backing.live == {1}
+
+
+def test_prepare_rollback_waits_for_index_writes_before_returning_pages(setup, monkeypatch):
+    allocator, backing = setup()
+    allocator.full_attn_allocator.device = "cuda:0"
+    calls = []
+    monkeypatch.setattr(sys.modules["torch"], "cuda", SimpleNamespace(
+        current_stream=lambda device: SimpleNamespace(synchronize=lambda: calls.append("ready"))),
+        raising=False)
+    original = backing.release
+    def release(pages):
+        assert calls == ["ready"]
+        return original(pages)
+    monkeypatch.setattr(backing, "release", release)
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        allocator.alloc_extend()
+    journal.rollback()
+
+
+def test_prepare_rollback_failure_poisoned_adapter_cannot_retry(setup, monkeypatch):
+    allocator, backing = setup()
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        allocator.alloc_extend()
+    def fail(pages):
+        raise RuntimeError("rollback failure")
+    monkeypatch.setattr(backing, "release", fail)
+    with pytest.raises(RuntimeError, match="rollback failure"):
+        journal.rollback()
+    with pytest.raises(RuntimeError, match="tear down"):
+        allocator.alloc_extend()
+
+
+
+def test_round_budget_is_shared_and_tracks_native_alloc_free(setup):
+    allocator, backing = setup()
+    full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+    with allocator._kvcached_budget_context((20, 12)):
+        assert full.available_size() == 20
+        assert swa.available_size() == 12
+        journal = allocator._kvcached_prepare_transaction()
+        with journal:
+            allocator.alloc_extend()
+        assert (full.available_size(), swa.available_size()) == (16, 8)
+        # A newly observed local headroom drop must not split an open round.
+        backing.manager.budget = len(backing.manager.live)
+        assert swa.available_size() == 8
+        journal.rollback()
+        assert (full.available_size(), swa.available_size()) == (20, 12)
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_grouped_free_credits_round_budget_once(setup, page_size):
+    allocator, backing = setup(page_size)
+    child = allocator.swa_attn_allocator
+    with allocator._kvcached_budget_context((10 * page_size, 6 * page_size)):
+        allocator.alloc_extend()
+        assert child.available_size() == 5 * page_size
+        child.free_group = []
+        child.free_page_ids(Tensor([3]))
+        assert child.available_size() == 5 * page_size
+        child.free_group_end()
+        assert child.available_size() == 6 * page_size
+        assert backing.live == {1}

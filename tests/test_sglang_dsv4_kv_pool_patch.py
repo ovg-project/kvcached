@@ -33,6 +33,7 @@ class FakeTensor:
 
 
 def _load_modules(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "true")
     torch_mock = mock.MagicMock()
     torch_mock.__version__ = "2.6.0"
     torch_mock.uint8.itemsize = 1
@@ -43,10 +44,21 @@ def _load_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "posix_ipc", mock.MagicMock())
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
 
-    from kvcached.integration.sglang import interfaces, patches
+    import kvcached.integration.sglang as package
 
-    importlib.reload(interfaces)
-    importlib.reload(patches)
+    # Give each test fresh module globals without invalidating classes already
+    # imported by other CPU regressions during collection.
+    loaded = []
+    for name in ("interfaces", "patches"):
+        original = importlib.import_module(f"{package.__name__}.{name}")
+        spec = importlib.util.spec_from_file_location(original.__name__, original.__file__)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, original.__name__, module)
+        monkeypatch.setattr(package, name, module)
+        spec.loader.exec_module(module)
+        loaded.append(module)
+    interfaces, patches = loaded
     distributed = types.ModuleType("sglang.srt.distributed")
     setattr(distributed, "get_tensor_model_parallel_world_size", lambda: 1)
     setattr(distributed, "get_pipeline_model_parallel_world_size", lambda: 1)
