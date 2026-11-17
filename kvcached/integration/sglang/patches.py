@@ -749,10 +749,20 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
     if miss is not None:
         scheduler._kvcached_prefill_demand = max(
             0, miss - getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
-    for manager, physical in allocator._kvcached_backing_demand(need):
+    demands = allocator._kvcached_backing_demand(need)
+    total_bytes = 0
+    for manager, physical in demands:
         allocated = manager.take_step_alloc_blocks()
-        manager.post_demand(manager.demand_pages(allocated + physical))
+        total_bytes += (manager.demand_pages(allocated + physical)
+                        * manager._memory_limit_page_bundle_bytes())
         manager.post_reclaimable_levels()
+    # Every backing belongs to the rank-local instance. The native demand
+    # field is instance-wide, so publishing each pool would overwrite peers.
+    # Sum byte costs (including different layer counts) and publish once.
+    if demands:
+        from kvcached.vmm_ops import set_kv_demand
+
+        set_kv_demand(total_bytes, demands[0][0].group_id)
 
 
 def _sglang_prefill_input_blocks(adder: Any, page_size: int) -> int:
