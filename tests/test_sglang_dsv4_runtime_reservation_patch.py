@@ -3,6 +3,7 @@
 
 import gc
 import importlib
+import importlib.util
 import sys
 import types
 from typing import Any

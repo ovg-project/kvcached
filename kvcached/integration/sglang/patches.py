@@ -474,7 +474,10 @@ def _sglang_demand_round(scheduler: Any):
     try:
         manager = _sglang_demand_manager(scheduler)
         if manager is not None:
-            manager.take_step_alloc_blocks()
+            native = _sglang_dsv4_demand_allocator(scheduler)
+            managers = _token_kv_managers(native) if native is not None else [manager]
+            for member in managers:
+                member.take_step_alloc_blocks()
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
@@ -604,6 +607,10 @@ def _sglang_prefill_miss_is_backed(scheduler: Any, manager: Any, miss: int) -> b
         # Legacy/ignore_eos retries use the same remaining requirement we post:
         # admitted inputs are now allocated, but output reservations remain.
         demand = getattr(scheduler, "_kvcached_prefill_demand", None)
+        if _sglang_dsv4_demand_allocator(scheduler) is not None:
+            allocator = scheduler.token_to_kv_pool_allocator
+            need = miss if demand is None else demand
+            return allocator.available_size() >= need * allocator.page_size
         return manager.available_size() >= (miss if demand is None else demand)
     reservation = getattr(scheduler, "_kvcached_prefill_retry_reservation", None)
     running = getattr(getattr(scheduler, "running_batch", None), "reqs", None)
@@ -680,15 +687,23 @@ def _sglang_note_unfit(need_blocks: int, allocated_overlap: int = 0) -> None:
         _SGLANG_DEMAND.need_overlap = max(0, allocated_overlap)
 
 
+def _sglang_dsv4_demand_allocator(scheduler: Any) -> Any:
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    allocator = getattr(allocator, "logical_attn_allocator", allocator)
+    return allocator if callable(getattr(allocator, "_kvcached_backing_demand", None)) else None
+
+
 def _sglang_demand_manager(scheduler: Any) -> Any:
     """The token pool's manager, which posts demand on this rank's GPU.
 
-    Only the token pool (the full-attention pool of an SWA composite) is
-    counted, and a pipeline posts nothing.
+    Ordinary composites use their full-attention manager. Native DSV4 uses
+    a backing manager for reclamation and posts each backing's demand in
+    physical units separately. A pipeline posts nothing.
     """
     if _sglang_pipeline_stages() > 1:
         return None
-    managers = _sglang_budget_managers(scheduler)
+    native = _sglang_dsv4_demand_allocator(scheduler)
+    managers = _token_kv_managers(native) if native is not None else _sglang_budget_managers(scheduler)
     manager = managers[0] if managers else None
     return manager if getattr(manager, "post_demand", None) is not None else None
 
@@ -700,6 +715,10 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
     if manager is None:
         return
     try:
+        native = _sglang_dsv4_demand_allocator(scheduler)
+        if native is not None:
+            _sglang_post_dsv4_demand(scheduler, native, unfit_blocks)
+            return
         allocated = manager.take_step_alloc_blocks()
         # A prefill miss includes inputs already admitted in the same pass.
         # Count their allocation once, keeping output reservations and slack.
@@ -715,6 +734,37 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
             post_levels()
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not post KV demand: %s", error)
+
+
+def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) -> None:
+    # Admission uses native token pages; these managers allocate physical pages.
+    # Read the waiting request too: coordinated admission owns its own native
+    # gates and does not use PrefillAdderDemandPatch's resource reads.
+    overlap = getattr(_SGLANG_DEMAND, "need_overlap", 0)
+    need = max(0, unfit_blocks - overlap)
+    queue = getattr(scheduler, "waiting_queue", ())
+    waiting = queue[0] if queue else getattr(scheduler, "chunked_req", None)
+    if waiting is not None:
+        tokens = _sglang_request_need_tokens(waiting)
+        need = max(need, -(-tokens // allocator.page_size))
+    miss = getattr(_SGLANG_DEMAND, "prefill_miss", None)
+    if miss is not None:
+        scheduler._kvcached_prefill_demand = max(
+            0, miss - getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
+    demands = allocator._kvcached_backing_demand(need)
+    total_bytes = 0
+    for manager, physical in demands:
+        allocated = manager.take_step_alloc_blocks()
+        total_bytes += (manager.demand_pages(allocated + physical)
+                        * manager._memory_limit_page_bundle_bytes())
+        manager.post_reclaimable_levels()
+    # Every backing belongs to the rank-local instance. The native demand
+    # field is instance-wide, so publishing each pool would overwrite peers.
+    # Sum byte costs (including different layer counts) and publish once.
+    if demands:
+        from kvcached.vmm_ops import set_kv_demand
+
+        set_kv_demand(total_bytes, demands[0][0].group_id)
 
 
 def _sglang_prefill_input_blocks(adder: Any, page_size: int) -> int:
@@ -3901,12 +3951,16 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                 request_state = getattr(kvcache, "_kvcached_dsv4_request_state", None)
                 if request_state is not None:
                     allocator_self._kvcached_dsv4_request_state = request_state
+                def priority_miss(requests):
+                    return _sglang_priority_decode_miss(backing.manager, requests)
+
                 if other_backings or state_backings:
                     bind_native_swa(allocator_self, backing, full_backing,
-                                    full_backings=tuple(other_backings), swa_backings=state_backings, on_capacity_miss=_sglang_capacity_miss)
+                                    full_backings=tuple(other_backings), swa_backings=state_backings,
+                                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss)
                 else:
                     bind_native_swa(allocator_self, backing, full_backing,
-                                    on_capacity_miss=_sglang_capacity_miss)
+                                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss)
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init
@@ -3918,7 +3972,7 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
 
 
 class ScheduleBatchDecodeContextPatch(VersionAwarePatch, BasePatch):
-    """Supply the selected requests missing from SGLang 0.5.19's decode gate."""
+    """Supply selected requests to decode gates without request-level context."""
 
     library = "sglang"
     target_module = "sglang.srt.managers.schedule_batch"
@@ -3930,7 +3984,7 @@ class ScheduleBatchDecodeContextPatch(VersionAwarePatch, BasePatch):
             return False
         return self.patch_check_decode_mem(batch_mod)
 
-    @version_range(">=0.5.19,<0.5.20")
+    @version_range(">=0.5.19,<=0.5.20")
     def patch_check_decode_mem(self, batch_mod: types.ModuleType) -> bool:
         batch = self._get_target_class(batch_mod)
         original = getattr(batch, "check_decode_mem", None)
@@ -4751,13 +4805,10 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
-                    allocator = getattr(sched_self, "token_to_kv_pool_allocator", None)
-                    full = getattr(getattr(allocator, "full_attn_allocator", None), "kvcached_allocator", None)
-                    swa = getattr(getattr(allocator, "swa_attn_allocator", None), "kvcached_allocator", None)
-                    if ranks == 1 and full is not None and swa is not None and full is not swa:
+                    if ranks == 1 and len(token_managers) > 1:
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
-                        PriorityReclaimGroup((full, swa))
+                        PriorityReclaimGroup(tuple(token_managers))
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

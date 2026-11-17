@@ -20,7 +20,7 @@ class PriorityReclaimGroup:
             source = control.sources[0]
             identities.append(tuple(source[key] for key in ("gpu", "instance", "generation")))
             slots.append((source["pool_slot"], source["pool_owner"]))
-        if len(members) != 2 or len(set(identities)) != 1 or len(set(slots)) != len(members):
+        if len(members) < 2 or len(set(identities)) != 1 or len(set(slots)) != len(members):
             raise ValueError("coupled reclaim requires distinct pools of one instance")
         self.members = members
         self.release_members = tuple(sorted(members, key=lambda member: (

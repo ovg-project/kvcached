@@ -139,7 +139,8 @@ class TestDeepSeekV4SyncCompatibility(unittest.TestCase):
             self.assertIsNone(managed.full.pool)
             self.assertFalse(hasattr(managed_pool, "full_kv_pool"))
             bind.assert_called_once_with(managed, physical._kvcached_dsv4_backing, None,
-                                         on_capacity_miss=ns["_sglang_capacity_miss"])
+                                         on_capacity_miss=ns["_sglang_capacity_miss"],
+                                         on_priority_miss=mock.ANY)
 
 
 if __name__ == "__main__":
