@@ -143,6 +143,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         require_healthy()
         try:
             for child in (swa, full):
+                if not decode_reserved[id(child)]:
+                    continue
                 for item in reversed(backings[id(child)]):
                     item.release(decode_reserved[id(child)])
                 decode_reserved[id(child)].clear()
@@ -334,6 +336,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                     if transaction is not None:
                         for child, pages in pending:
                             transaction.pages[id(child)].update(pages)
+                    release_decode_reservation()
                     return result
                 except _BackingMiss:
                     for child, pages in reversed(pending):
@@ -365,6 +368,17 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         release_depth = 0
         deferred: set[int] = set()
 
+        def release_backing(pages: set[int]) -> None:
+            reserved = decode_reserved[id(child)]
+            if reserved:
+                # Unsorted native allocators prepend freed SWA window pages.
+                # Keep their existing leases until the prepared allocation
+                # chooses its IDs; they may now precede the promised prefix.
+                reserved.update(pages)
+            else:
+                for child_backing in child_backings:
+                    child_backing.release(pages)
+
         def wrap_release(original: Any, divisor: int) -> Any:
             @functools.wraps(original)
             def release(indices: Any) -> Any:
@@ -380,8 +394,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                     if transaction is not None:
                         transaction.pages[id(child)].difference_update(pages)
                     if child.free_group is None:
-                        for child_backing in child_backings:
-                            child_backing.release(pages)
+                        release_backing(pages)
                         move_budget(child, len(pages))
                         deferred.difference_update(pages)
                     else:
@@ -401,8 +414,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             require_healthy()
             try:
                 original_group_end()
-                for child_backing in child_backings:
-                    child_backing.release(deferred)
+                release_backing(deferred)
                 move_budget(child, len(deferred))
                 deferred.clear()
             except Exception:
@@ -477,3 +489,23 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     allocator._kvcached_dsv4_full_backing = full_backing
     allocator._kvcached_dsv4_full_backings = selected_full
     allocator._kvcached_dsv4_swa_backings = selected_swa
+
+
+def bind_native_decode_wrapper(allocator: Any) -> None:
+    """Preserve an outer HiSparse limit and reserve its logical SWA backing."""
+    logical: Any = getattr(allocator, "logical_attn_allocator", None)
+    release = getattr(logical, "_kvcached_release_decode_reservation", None)
+    if release is None or getattr(allocator, "_kvcached_decode_wrapper_bound", False):
+        return
+    original = allocator.check_decode_capacity
+
+    @functools.wraps(original)
+    def check_decode_capacity(*args: Any, **kwargs: Any) -> bool:
+        release()
+        if not original(*args, **kwargs):
+            return False
+        return bool(logical.check_decode_capacity(*args, **kwargs))
+
+    allocator.check_decode_capacity = check_decode_capacity
+    allocator._kvcached_release_decode_reservation = release
+    allocator._kvcached_decode_wrapper_bound = True
