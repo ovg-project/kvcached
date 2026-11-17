@@ -3205,7 +3205,7 @@ class DeepSeekV4RuntimeReservationPatch(VersionAwarePatch, BasePatch):
             return False
         return self.patch_dsv4_pool_init(dsv4_pool_mod)
 
-    @version_range(SGLANG_ALL_RANGE)
+    @version_range(">=0.5.12,<0.5.21.dev0")
     def patch_dsv4_pool_init(self, dsv4_pool_mod: types.ModuleType) -> bool:
         pool_class = getattr(dsv4_pool_mod, "DeepSeekV4TokenToKVPool", None)
         if pool_class is None:
