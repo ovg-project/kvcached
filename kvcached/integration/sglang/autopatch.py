@@ -20,6 +20,7 @@ from kvcached.integration.sglang.hicache import (
 )
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
+    DeepSeekV4RuntimeReservationPatch,
     ElasticAllocatorPatch,
     ElasticHybridLinearKVPoolPatch,
     ElasticMambaPoolPatch,
@@ -72,6 +73,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4RuntimeReservationPatch(), ">=0.5.12,<0.5.21.dev0"),
             # Importing the capacity owner captures memory-pool classes in
             # module globals, so apply these only after every pool alias.
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),

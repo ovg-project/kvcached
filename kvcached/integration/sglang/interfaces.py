@@ -225,6 +225,8 @@ def alloc_kv_cache(
 
     assert torch.cuda.is_available(), "GPU backend is not available via torch.cuda."
     device = normalize_gpu_device(device)
+    if ":" not in device:
+        device = f"{device}:{resolve_gpu_device_index(device)}"
 
     # SGLang named it "page" to be consistent with PagedAttention. But we call
     # it "block" to distinguish a KV cache block and a physical memory page.
@@ -233,6 +235,18 @@ def alloc_kv_cache(
     physical_page_size = get_page_size_for_block(block_mem_size, PAGE_SIZE)
 
     gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+    # This adapter accounts only for the DeepSeek-V4 pools it recognizes.
+    # Other shared reports may already be included by the engine profiler.
+    runtime_reserved_bytes = sum(
+        num_bytes for pool_name, num_bytes in get_runtime_owned_reservation_breakdown(device).items()
+        if pool_name.startswith("dsv4.")
+    )
+    if runtime_reserved_bytes:
+        gpu_mem_bytes = max(0, gpu_mem_bytes - runtime_reserved_bytes)
+        logger.info(
+            "Reserved %.2f GB for runtime-owned DeepSeek-V4 pools on %s; "
+            "remaining kvcached backing budget is %.2f GB",
+            runtime_reserved_bytes / (1024**3), device, gpu_mem_bytes / (1024**3))
     gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
     # Round down to 2 * physical_page_size for MLA backend.
     # The get_v_base_offset() requires the ftensor size (which equals
