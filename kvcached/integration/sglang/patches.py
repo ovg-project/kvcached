@@ -3630,6 +3630,20 @@ def _frees_are_deferred(allocator: Any) -> bool:
     return not _sglang_free_immediately(allocator)
 
 
+def _can_own_free_group(allocator: Any) -> bool:
+    """Whether a reclaimer may batch its frees in a group of its own.
+
+    Groups cannot nest, so inside a scheduler group the frees wait for the
+    scheduler to end it.
+    """
+    full_allocator = getattr(allocator, "full_attn_allocator", allocator)
+    can_group = all(
+        callable(getattr(pool, method, None))
+        for pool in (allocator, full_allocator)
+        for method in ("free_group_begin", "free_group_end"))
+    return can_group and not _frees_are_deferred(allocator)
+
+
 class _PrefixCacheShrinkReclaimer:
     """Evicts a scheduler's prefix cache while one kvcached pool shrinks.
 
@@ -3694,13 +3708,21 @@ class _PrefixCacheShrinkReclaimer:
         if evictable is None:
             return
         manager = self.manager
-        allocator = getattr(cache, "token_to_kv_pool_allocator", None)
+        allocator: Any = getattr(cache, "token_to_kv_pool_allocator", None)
         excess = manager.shrink_excess_pages()
         while excess > 0:
             before = evictable()
             if before <= 0:
                 return
-            self._evict(cache, excess * tokens_per_page)
+            owns_group = _can_own_free_group(allocator)
+            if owns_group:
+                # Free each pool's victims once, then recheck the quota.
+                allocator.free_group_begin()
+            try:
+                self._evict(cache, excess * tokens_per_page)
+            finally:
+                if owns_group:
+                    allocator.free_group_end()
             if evictable() >= before or _frees_are_deferred(allocator):
                 # Nothing evicted, or the frees wait for the free group to
                 # end: the next allocation or idle pass continues.

@@ -749,3 +749,110 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
     excess_pages = 9 - LIMIT_PAGES
     assert len(cache.cached) == 32 - excess_pages * BLOCKS_PER_PAGE
     assert manager.memory_limit_state()["status"] == "pending"
+
+
+def _group_frees(cache, monkeypatch):
+    """Free each evicted token separately, as radix nodes do, unless grouped."""
+    allocator = cache.token_to_kv_pool_allocator
+    groups = []
+    evictions = cache.evictions = []
+
+    def begin():
+        assert allocator.free_group is None, "free groups cannot be nested"
+        allocator.free_group = []
+        groups.append(allocator.free_group)
+
+    def end():
+        pending, allocator.free_group = allocator.free_group, None
+        if pending:
+            cache.manager.free([block for victims in pending for block in victims])
+
+    def evict(num_tokens):
+        cache.evicting_threads.append(threading.current_thread().name)
+        victims, cache.cached = cache.cached[:num_tokens], cache.cached[num_tokens:]
+        evictions.append(len(victims))
+        for block in victims:
+            if allocator.free_group is None:
+                cache.manager.free([block])
+            else:
+                allocator.free_group.append([block])
+
+    monkeypatch.setattr(allocator, "free_group_begin", begin, raising=False)
+    monkeypatch.setattr(allocator, "free_group_end", end, raising=False)
+    monkeypatch.setattr(cache, "evict", evict)
+    return groups
+
+
+def test_sglang_reclaim_frees_each_eviction_once(sglang_scheduler, monkeypatch):
+    scheduler = sglang_scheduler()
+    cache = scheduler.tree_cache
+    manager = cache.manager
+    groups = _group_frees(cache, monkeypatch)
+    frees = []
+    original_free = manager.free
+
+    def free(blocks):
+        frees.append(len(blocks))
+        return original_free(blocks)
+
+    monkeypatch.setattr(manager, "free", free)
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+
+    scheduler.on_idle()
+
+    _assert_sglang_within_limit(scheduler)
+    # One kvcached free per eviction instead of one per evicted token.
+    assert frees == cache.evictions
+    assert len(groups) == len(cache.evictions)
+    assert cache.token_to_kv_pool_allocator.free_group is None
+
+
+def test_sglang_reclaim_keeps_the_schedulers_free_group(sglang_scheduler, monkeypatch):
+    scheduler = sglang_scheduler()
+    cache = scheduler.tree_cache
+    manager = cache.manager
+    groups = _group_frees(cache, monkeypatch)
+    allocator = cache.token_to_kv_pool_allocator
+    allocator.free_group_begin()
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+
+    scheduler.on_idle()
+
+    # Groups cannot nest: the frees wait for the scheduler, and reclaim does
+    # not evict further meanwhile.
+    assert len(groups) == 1
+    assert len(cache.evictions) == 1
+    assert manager.memory_limit_state()["status"] == "pending"
+    allocator.free_group_end()
+    manager.reclaim_for_shrink()
+    _assert_sglang_within_limit(scheduler)
+
+
+def test_sglang_reclaim_ends_its_free_group_when_eviction_fails(sglang_scheduler, monkeypatch):
+    scheduler = sglang_scheduler()
+    cache = scheduler.tree_cache
+    manager = cache.manager
+    _group_frees(cache, monkeypatch)
+    evict = cache.evict
+
+    def failing_evict(num_tokens):
+        evict(num_tokens)
+        raise RuntimeError("injected eviction failure")
+
+    monkeypatch.setattr(cache, "evict", failing_evict)
+    freed = []
+    original_free = manager.free
+
+    def free(blocks):
+        freed.extend(blocks)
+        return original_free(blocks)
+
+    monkeypatch.setattr(manager, "free", free)
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+
+    with pytest.raises(RuntimeError, match="injected eviction failure"):
+        scheduler.on_idle()
+
+    # The evicted blocks are freed, not stranded in an open group.
+    assert cache.token_to_kv_pool_allocator.free_group is None
+    assert len(freed) == cache.evictions[0] > 0
