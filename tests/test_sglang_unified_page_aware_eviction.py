@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Real SGLang FULL-only trees must release pages while retaining prefixes."""
+"""Real SGLang trees must release pages while retaining valid prefixes."""
 
 import types
 from array import array
@@ -68,16 +68,56 @@ def native():
     return types.SimpleNamespace(unified=unified, base=base, init=init)
 
 
-def make_cache(native, blocks, page_size=1, policy="lru"):
+def make_cache(native, blocks, page_size=1, policy="lru", swa=False, device="cpu"):
     manager = Manager(blocks)
     allocator = Allocator(manager, page_size)
+    allocator.device = device
+    if swa:
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        full_allocator = allocator
+
+        class HybridAllocator(SWATokenToKVPoolAllocator):
+            def __init__(self):
+                self.device = full_allocator.device
+                self.page_size = page_size
+                self.full_attn_allocator = full_allocator
+                self.swa_attn_allocator = Allocator(Manager(blocks), page_size)
+
+            def translate_loc_from_full_to_swa(self, indices):
+                return indices.clone()
+
+            def free_full_segment(self, indices, start_pos=0):
+                self.full_attn_allocator.free(indices)
+
+            def free_swa_segment(self, indices, start_pos=0):
+                self.swa_attn_allocator.free(indices)
+
+            def free_full(self, indices):
+                self.free_full_segment(indices)
+
+            def free_swa(self, indices):
+                self.free_swa_segment(indices)
+
+            def free_segment(self, indices, start_pos=0):
+                self.free_swa_segment(indices, start_pos)
+                self.free_full_segment(indices, start_pos)
+
+            def free(self, indices):
+                self.free_segment(indices)
+
+        allocator = HybridAllocator()
     cache = native.unified.UnifiedRadixCache(
         native.init.CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            tree_components=(native.unified.BASE_COMPONENT_TYPE,),
+            tree_components=(
+                (native.unified.BASE_COMPONENT_TYPE, native.unified.ComponentType.SWA)
+                if swa else (native.unified.BASE_COMPONENT_TYPE,)
+            ),
+            sliding_window_size=2 * page_size if swa else None,
             eviction_policy=policy,
         )
     )
@@ -186,6 +226,116 @@ def test_parallel_rollback_retention_keeps_logical_prefixes(native, tmp_path):
     )
 
 
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("swa_demand", [0, 3, 4, 6, 20])
+@pytest.mark.parametrize("full_demand", [4, 5])
+def test_hybrid_collateral_frees_reduce_one_native_fallback(
+    native, monkeypatch, page_size, swa_demand, full_demand,
+):
+    cache, manager = make_cache(native, range(4, 12), page_size, swa=True)
+    for block in [4, 8, 5, 9, 6, 10, 7, 11]:
+        insert(
+            native, cache,
+            list(range(100 + block * page_size, 100 + (block + 1) * page_size)),
+            list(range(block * page_size, (block + 1) * page_size)),
+        )
+    assert supports_page_aware_eviction(cache)
+    calls = []
+    original = cache.evict
+
+    def evict(params):
+        calls.append(params)
+        return original(params)
+
+    monkeypatch.setattr(cache, "evict", evict)
+    params = native.base.EvictParams(
+        num_tokens=full_demand * page_size, swa_num_tokens=swa_demand * page_size,
+    )
+    result = evict_prefix_cache(cache, params)
+    expected = min(8, max(full_demand, swa_demand)) * page_size
+    assert result == native.base.EvictResult(
+        num_tokens_evicted=expected, swa_num_tokens_evicted=expected,
+    )
+    assert calls == [native.base.EvictParams(num_tokens=4 * page_size)] + (
+        [native.base.EvictParams(
+            num_tokens=(full_demand - 4) * page_size,
+            swa_num_tokens=max(0, swa_demand - 4) * page_size,
+        )]
+        if swa_demand > 4 or full_demand > 4 else []
+    )
+    assert params.swa_num_tokens == swa_demand * page_size
+    assert len(manager.allocated) == 8 - expected // page_size
+    swa_manager = cache.token_to_kv_pool_allocator.swa_attn_allocator.kvcached_allocator
+    assert swa_manager.allocated == manager.allocated
+    check_tree(cache)
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_hybrid_native_split_preserves_window_and_tombstones(native, page_size):
+    cache, manager = make_cache(native, range(4, 12), page_size, swa=True)
+    tokens = list(range(100, 100 + 8 * page_size))
+    indices = list(range(4 * page_size, 12 * page_size))
+    # Only the last four logical pages have SWA. Native insertion splits the
+    # window boundary and caps the leaf at a window for lock granularity.
+    cache.insert(native.base.InsertParams(
+        key=native.unified.RadixKey(token_ids=array("q", tokens)),
+        value=torch.tensor(indices), swa_evicted_seqlen=4 * page_size,
+    ))
+    swa_manager = cache.token_to_kv_pool_allocator.swa_attn_allocator.kvcached_allocator
+    swa_manager.allocated.difference_update(range(4, 8))
+    result = evict_prefix_cache(cache, native.base.EvictParams(num_tokens=2 * page_size))
+    assert result.num_tokens_evicted == result.swa_num_tokens_evicted == 2 * page_size
+    assert match(native, cache, tokens)[0] == indices[:6 * page_size]
+    result = evict_prefix_cache(cache, native.base.EvictParams(num_tokens=2 * page_size))
+    assert result.num_tokens_evicted == result.swa_num_tokens_evicted == 2 * page_size
+    # FULL survives but no reusable trailing SWA window remains.
+    assert manager.allocated == {4, 5, 6, 7}
+    assert swa_manager.allocated == set()
+    assert match(native, cache, tokens)[0] == []
+    result = evict_prefix_cache(cache, native.base.EvictParams(num_tokens=2 * page_size))
+    assert result.num_tokens_evicted == 4 * page_size  # native whole-node overshoot
+    assert result.swa_num_tokens_evicted == 0
+    check_tree(cache)
+
+
+def test_hybrid_locked_window_survives_full_and_native_swa_eviction(native):
+    cache, manager = make_cache(native, range(4, 12), swa=True)
+    for block in range(4, 12):
+        insert(native, cache, [100 + block], [block])
+    _, node = match(native, cache, [104])
+    receipt = cache.inc_lock_ref(node)
+    result = evict_prefix_cache(cache, native.base.EvictParams(num_tokens=4, swa_num_tokens=8))
+    assert result.num_tokens_evicted == result.swa_num_tokens_evicted == 7
+    assert manager.allocated == {4}
+    assert match(native, cache, [104])[0] == [4]
+    cache.dec_lock_ref(node, receipt.to_dec_params())
+    check_tree(cache)
+
+
+@pytest.mark.parametrize("swa_demand", [0, 6])
+def test_hybrid_deferred_frees_count_once_before_pool_flush(native, swa_demand):
+    cache, manager = make_cache(native, range(4, 12), swa=True)
+    for block in [4, 8, 5, 9, 6, 10, 7, 11]:
+        insert(native, cache, [100 + block], [block])
+    allocator = cache.token_to_kv_pool_allocator
+    for pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        pool.free_group = []
+    result = evict_prefix_cache(
+        cache, native.base.EvictParams(num_tokens=4, swa_num_tokens=swa_demand),
+    )
+    assert result.num_tokens_evicted == result.swa_num_tokens_evicted == max(4, swa_demand)
+    assert manager.allocated == set(range(4, 12))
+    check_tree(cache)
+    for pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        pending, pool.free_group = pool.free_group, None
+        for indices in pending:
+            pool.free(indices)
+    assert len(manager.allocated) == 8 - max(4, swa_demand)
+    assert allocator.swa_attn_allocator.kvcached_allocator.allocated == manager.allocated
+    assert set(cache._kvcached_radix_block_index.block_owners) == manager.allocated
+    check_tree(cache)
+
+
 @pytest.mark.parametrize("policy", ["lru", "lfu"])
 @pytest.mark.parametrize("session_field", [True, False], ids=["current", "pre_0_5_17"])
 def test_page_selection_retains_scattered_old_prefixes(native, policy, session_field):
@@ -227,8 +377,11 @@ def test_suffix_split_keeps_reusable_prefix(native, page_size, budget):
     check_tree(cache)
 
 
-def test_internal_suffix_closure_removes_children(native):
-    cache, manager = make_cache(native, [4, 5, 6, 7, 100, 150, 151, 152], page_size=2)
+@pytest.mark.parametrize("swa", [False, True])
+def test_internal_suffix_closure_removes_children(native, swa):
+    cache, manager = make_cache(
+        native, [4, 5, 6, 7, 100, 150, 151, 152], page_size=2, swa=swa,
+    )
     first = [10, 11, 12, 13, 14, 15, 20, 21]
     second = [10, 11, 12, 13, 14, 15, 30, 31]
     insert(native, cache, first, [200, 201, 8, 9, 10, 11, 12, 13])
@@ -335,8 +488,9 @@ def test_failure_restores_cached_priority_and_allows_retry(native, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["split", "selected", "fallback", "budget_mismatch"])
-def test_partial_failure_resyncs_index_and_restores_policy(native, monkeypatch, failure):
-    cache, manager = make_cache(native, range(4, 12))
+@pytest.mark.parametrize("swa", [False, True])
+def test_partial_failure_resyncs_index_and_restores_policy(native, monkeypatch, failure, swa):
+    cache, manager = make_cache(native, range(4, 12), swa=swa)
     tokens = list(range(100, 108))
     # Bind the native callback before the operation to verify identity recovery.
     manager.allocated.add(100)
@@ -400,7 +554,8 @@ def test_partial_failure_resyncs_index_and_restores_policy(native, monkeypatch, 
     monkeypatch.setattr(cache, "evict", original_evict)
     result = evict_prefix_cache(cache, native.base.EvictParams(num_tokens=4))
     assert result.num_tokens_evicted == (4 if failure != "fallback" else 0)
-    assert result.swa_num_tokens_evicted == result.mamba_num_evicted == 0
+    assert result.swa_num_tokens_evicted == (result.num_tokens_evicted if swa else 0)
+    assert result.mamba_num_evicted == 0
     assert manager.allocated == (
         {4, 5, 6, 7}
         if failure == "split"
@@ -433,7 +588,7 @@ def test_deferred_frees_keep_pages_mapped_until_group_flush(native):
 @pytest.mark.parametrize(
     "unsupported",
     [
-        "swa",
+        "custom_swa",
         "mamba",
         "hicache",
         "session",
@@ -444,10 +599,12 @@ def test_deferred_frees_keep_pages_mapped_until_group_flush(native):
 )
 def test_unsupported_configurations_keep_native_eviction(native, monkeypatch, unsupported):
     cache, manager = make_cache(native, range(4, 12))
-    if unsupported in ("swa", "mamba"):
+    if unsupported in ("custom_swa", "mamba"):
         cache.tree_components = (
             *cache.tree_components,
-            getattr(native.unified.ComponentType, unsupported.upper()),
+            getattr(
+                native.unified.ComponentType, "SWA" if unsupported == "custom_swa" else "MAMBA",
+            ),
         )
     elif unsupported == "hicache":
         cache.cache_controller = object()
@@ -505,7 +662,8 @@ def test_retention_hook_and_reset_use_unified_page_planner(native, monkeypatch):
 
 
 @pytest.mark.parametrize("attention,buffers", [("MHA", 2), ("MLA", 1)])
-def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffers):
+@pytest.mark.parametrize("swa", [False, True])
+def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffers, swa):
     iface, managers = pools
     cell_bytes = 256 * 1024
     raw = iface.alloc_kv_cache(
@@ -524,15 +682,31 @@ def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffe
     assert allocated == list(range(1, 12))
     allocator = Allocator(manager, page_size=2)
     allocator.device = "cuda:0"
-    cache = native.unified.UnifiedRadixCache(
-        native.init.CacheInitParams(
-            disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=allocator,
-            page_size=2,
-            tree_components=(native.unified.BASE_COMPONENT_TYPE,),
+    swa_manager = None
+    swa_tensors = []
+    if swa:
+        swa_k, swa_v = iface.alloc_kv_cache(
+            (32, 1, cell_bytes // 2), torch.bfloat16, "cuda:0", 2,
+            page_size=2, group_id=1,
         )
-    )
+        swa_tensors = swa_k + swa_v
+        swa_manager = iface.get_kv_cache_manager(16, 2, cell_bytes, 2, group_id=1)
+        managers.append(swa_manager)
+        swa_manager.wait_ready(timeout=10)
+        assert swa_manager.alloc(11) == allocated
+        cache, _ = make_cache(native, [], page_size=2, swa=True, device="cuda:0")
+        composite = cache.token_to_kv_pool_allocator
+        composite.full_attn_allocator = allocator
+        composite.swa_attn_allocator = Allocator(swa_manager, 2)
+    else:
+        cache = native.unified.UnifiedRadixCache(
+            native.init.CacheInitParams(
+                disable=False, req_to_token_pool=None,
+                token_to_kv_pool_allocator=allocator, page_size=2,
+                tree_components=(native.unified.BASE_COMPONENT_TYPE,),
+            )
+        )
+    tensors += swa_tensors
     for block in allocated:
         for tensor in tensors:
             tensor[block * 2 : block * 2 + 2].fill_(block)
@@ -540,12 +714,22 @@ def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffe
     for block in [4, 8, 5, 9, 6, 10, 7, 11]:
         insert(native, cache, [100 + block * 2, 101 + block * 2], [block * 2, block * 2 + 1])
     before = manager.page_allocator.get_num_inuse_pages()
+    swa_before = (
+        swa_manager.page_allocator.get_num_inuse_pages() if swa_manager is not None else 0
+    )
 
-    evict_prefix_cache(cache, native.base.EvictParams(num_tokens=8))
+    result = evict_prefix_cache(
+        cache, native.base.EvictParams(num_tokens=8, swa_num_tokens=8 if swa else 0),
+    )
 
     torch.cuda.synchronize()
     assert manager.operation_snapshot().operation_errors_total == 0
+    assert result.num_tokens_evicted == 8
+    assert result.swa_num_tokens_evicted == (8 if swa else 0)
     assert manager.page_allocator.get_num_inuse_pages() == before - 1
+    if swa_manager is not None:
+        assert swa_manager.operation_snapshot().operation_errors_total == 0
+        assert swa_manager.page_allocator.get_num_inuse_pages() == swa_before - 1
     retained = [
         block
         for block in range(4, 12)
@@ -559,5 +743,8 @@ def test_cuda_page_release_preserves_retained_kv(native, pools, attention, buffe
     torch.cuda.synchronize()
     evict_prefix_cache(cache, native.base.EvictParams(num_tokens=cache.full_evictable_size()))
     manager.free([1, 2, 3])
+    if swa_manager is not None:
+        swa_manager.free([1, 2, 3])
+        assert swa_manager.operation_snapshot().operation_errors_total == 0
     assert manager.operation_snapshot().operation_errors_total == 0
     check_tree(cache)
