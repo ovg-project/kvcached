@@ -737,6 +737,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("alloc_page", &kvcached::page_allocator_alloc_page,
            py::call_guard<py::gil_scoped_release>())
+      .def("try_alloc_page_at", &kvcached::PageAllocator::try_alloc_page_at,
+           py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,
@@ -784,6 +786,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("init", &kvcached::InternalPage::init, py::arg("block_mem_size"),
            py::arg("max_block_id") = -1)
       .def("alloc", &kvcached::InternalPage::alloc)
+      .def("alloc_exact", &kvcached::InternalPage::alloc_exact)
       .def("free", &kvcached::InternalPage::free)
       .def("free_batch", &kvcached::InternalPage::free_batch)
       .def("empty", &kvcached::InternalPage::empty)

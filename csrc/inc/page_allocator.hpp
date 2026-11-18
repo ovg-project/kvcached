@@ -56,6 +56,7 @@ public:
   // max_block_id is an exclusive ID bound; -1 keeps every backing block.
   void init(int64_t block_mem_size, int64_t max_block_id = -1);
   std::vector<int64_t> alloc(int64_t num_blocks = 1);
+  bool alloc_exact(const std::vector<int64_t> &block_ids);
   void free(int64_t block_id);
   void free_batch(const std::vector<int64_t> &block_ids);
   bool empty() const;
@@ -80,6 +81,8 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page();
+  // Nonblocking: nullptr if this particular page is not currently free.
+  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
   // Internal receipt: number of leading input pages placed in the reserve.
@@ -156,6 +159,7 @@ private:
   void resize_watcher();
 
   // Internal methods
+  std::shared_ptr<InternalPage> alloc_page_impl(page_id_t requested_id);
   void map_pages(const std::vector<page_id_t> &page_ids);
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
