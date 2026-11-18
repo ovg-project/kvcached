@@ -5,12 +5,13 @@ import fcntl
 import mmap
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import posix_ipc
 
+from kvcached import control_segment
 from kvcached.utils import SHM_DIR, get_tp_socket_dir
 
 
@@ -24,6 +25,26 @@ def get_ipc_path(ipc_name: str) -> str:
 def get_ipc_name(ipc_path: str) -> str:
     """Convert full path to IPC name for posix_ipc."""
     return os.path.basename(ipc_path)
+
+
+def get_segment_control(ipc_name: str, *, observe: bool = True):
+    """Resolve an advertised SGLang group segment to its instance ledger."""
+    from kvcached.control import _get_instance_memory_limit, get_instance_memory_limit
+
+    def query(name: str):
+        if observe:
+            return get_instance_memory_limit(name)
+        return _get_instance_memory_limit(name, observe=False)
+
+    name = get_ipc_name(ipc_name)
+    state = query(name)
+    # Prefer an exact instance, including user names that end in _g<digits>.
+    base, separator, group = name.rpartition("_g")
+    if not state["gpus"] and separator and base and group.isdecimal() and int(group) > 0:
+        owner = query(base)
+        if owner["gpus"]:
+            return owner
+    return state
 
 
 @dataclass
@@ -56,45 +77,50 @@ class RwLockedShm:
     RLOCK = fcntl.LOCK_SH
     WLOCK = fcntl.LOCK_EX
 
-    def __init__(self, file_path: str, size: int, lock_type: int):
+    def __init__(self, file_path: str, size: int, lock_type: int, *, retain_usage: bool = False, create: bool = True):
         self.file_path = get_ipc_path(file_path)
-        # Always use r+b mode for memory mapping
-        self.mode = "r+b"
+        # Readers open read-only so a segment owned by another user (e.g. root
+        # in a container sharing /dev/shm) stays readable; flock(LOCK_SH)
+        # works on a read-only fd.
+        self.mode = "rb" if lock_type == self.RLOCK else "r+b"
         self.size = size
         self.lock_type = lock_type
+        self.retain_usage = retain_usage
+        self.create = create
 
     def __enter__(self):
-        """Open the shared-memory file with the requested lock.
-
-        If the file does not yet exist *and* we are taking a write lock, the
-        file is created with the requested size so mapping succeeds.  For
-        read-only access when the segment is missing we propagate
-        FileNotFoundError so the caller can decide what to do (usually treat
-        as "no limit set yet").
-        """
-        try:
-            self.file = open(self.file_path, self.mode)
-        except FileNotFoundError:
-            if self.lock_type != RwLockedShm.WLOCK:
+        flags = (os.O_RDONLY if self.mode == "rb" else os.O_RDWR) | os.O_CLOEXEC
+        if self.lock_type == self.WLOCK and self.create:
+            flags |= os.O_CREAT
+        if self.retain_usage:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        for _ in range(4):
+            self.file = os.fdopen(os.open(self.file_path, flags, 0o666), self.mode)
+            try:
+                if self.retain_usage and sys.platform.startswith("linux"):
+                    control_segment.lock(self.file.fileno())
+                fcntl.flock(self.file, self.lock_type)
+                if self.retain_usage and not control_segment.is_current(self.file.fileno(), self.file_path):
+                    self.file.close()
+                    continue
+                if os.fstat(self.file.fileno()).st_size < self.size and self.lock_type == self.WLOCK:
+                    self.file.truncate(self.size)
+                access = mmap.ACCESS_READ if self.lock_type == self.RLOCK else mmap.ACCESS_WRITE
+                self.mm = mmap.mmap(self.file.fileno(), self.size, access=access)
+                return self.mm
+            except BaseException:
+                self.file.close()
                 raise
-            # Create the file and pre-size it
-            self.file = open(self.file_path, "w+b")
-            self.file.truncate(self.size)
-
-        # Ensure the file is large enough for the mapping size
-        stat_info = os.fstat(self.file.fileno())
-        if stat_info.st_size < self.size and self.lock_type == RwLockedShm.WLOCK:
-            self.file.truncate(self.size)
-
-        fcntl.flock(self.file, self.lock_type)
-        access = mmap.ACCESS_READ if self.lock_type == fcntl.LOCK_SH else mmap.ACCESS_WRITE
-        self.mm = mmap.mmap(self.file.fileno(), self.size, access=access)
-        return self.mm
+        raise OSError("control segment changed during initialization")
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.mm.close()
-        fcntl.flock(self.file, fcntl.LOCK_UN)
-        self.file.close()
+        try:
+            self.mm.close()
+        finally:
+            # Only the data flock is unlocked. The OFD lease is close-only, so
+            # a retained duplicate or forked child keeps its usage protection.
+            fcntl.flock(self.file, fcntl.LOCK_UN)
+            self.file.close()
 
 
 def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
@@ -102,17 +128,12 @@ def init_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
     Set the kv cache limit for the current process.
     Creates a persistent shared memory file that remains even after the script exits.
     """
-    shm = posix_ipc.SharedMemory(get_ipc_name(ipc_name),
-                                 posix_ipc.O_CREAT,
-                                 size=MemInfoStruct.SHM_SIZE,
-                                 mode=0o666)
-    shm.close_fd()
-
-    # Now we can safely memory map and write the values
-    with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
-                     RwLockedShm.WLOCK) as mm:
+    shm = RwLockedShm(ipc_name, MemInfoStruct.SHM_SIZE,
+                      RwLockedShm.WLOCK, retain_usage=True)
+    with shm as mm:
         mem_info = MemInfoStruct(kv_cache_limit, 0, 0)
         mem_info.write_to_buffer(mm)
+        control_segment.publish(shm.file.fileno())
         return mem_info
 
 
@@ -128,30 +149,30 @@ def get_kv_cache_limit(ipc_name: str) -> Optional[MemInfoStruct]:
         return None
 
 
-def update_kv_cache_limit(ipc_name: str,
-                          kv_cache_limit: int) -> Optional[MemInfoStruct]:
-    """
-    Update the kv cache limit for the current process.
-    """
-    try:
-        with RwLockedShm(get_ipc_name(ipc_name), MemInfoStruct.SHM_SIZE,
-                         RwLockedShm.WLOCK) as mm:
-            mem_info = MemInfoStruct.from_buffer(mm)
-            delta = kv_cache_limit - mem_info.total_size
-            if delta < 0:
-                if mem_info.used_size > kv_cache_limit:
-                    print(
-                        f"No enough free space to decrease for the new kv_cache_limit for {ipc_name}"
-                    )
-            mem_info.total_size = kv_cache_limit
-            mem_info.write_to_buffer(mm)
-            human_limit = _format_size(kv_cache_limit)
-            print(
-                f"Updated kv cache limit for {ipc_name} to {human_limit} ({kv_cache_limit} bytes)"
-            )
-            return mem_info
-    except FileNotFoundError:
-        return None
+def update_kv_cache_limit(ipc_name: str, kv_cache_limit: int):
+    """Publish through the same native path as the Python control frontend."""
+    import json
+
+    from kvcached.control import set_instance_memory_limit
+
+    result = set_instance_memory_limit(kv_cache_limit, instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+def update_kv_cache_controls(ipc_name: str, *, min_bytes: Optional[int] = None,
+                             priority: Optional[int] = None,
+                             headroom_bytes: Optional[int] = None):
+    """Publish min, priority or headroom like update_kv_cache_limit()."""
+    import json
+
+    from kvcached.control import set_instance_controls
+
+    result = set_instance_controls(
+        min_bytes=min_bytes, priority=priority, headroom_bytes=headroom_bytes,
+        instance_name=get_segment_control(ipc_name, observe=False)["instance"])
+    print(json.dumps(result, sort_keys=True))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -166,24 +187,7 @@ def delete_kv_cache_segment(ipc_name: str) -> bool:
     found. Any other exception is propagated so callers can handle unexpected
     errors.
     """
-    shm_name = get_ipc_name(ipc_name)
-
-    removed = False
-    try:
-        posix_ipc.unlink_shared_memory(shm_name)
-        removed = True
-    except posix_ipc.ExistentialError:
-        # Segment did not exist.
-        pass
-
-    # Best-effort removal of the backing file created by RwLockedShm.
-    try:
-        os.unlink(get_ipc_path(shm_name))
-        removed = True or removed
-    except FileNotFoundError:
-        pass
-
-    return removed
+    return control_segment.delete(get_ipc_path(get_ipc_name(ipc_name)))
 
 
 def delete_tp_socket_dir(ipc_name: str) -> bool:

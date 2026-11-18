@@ -27,6 +27,8 @@ Sentinel values:
 - `KVCACHED_MAX_CACHED_TOKENS=0` — **disabled at the kvcached layer**: the framework's prefix-cache module still runs, but every cached prefix is evicted as soon as it becomes evictable, so there is no cross-request reuse. To fully turn off prefix caching (skip the caching path entirely), use the framework flags below instead.
 - `KVCACHED_MAX_CACHED_TOKENS=N` (`N>0`) — cap cached prefixes at `N` tokens.
 
+A memory limit set with `kvctl limit` or `set_instance_memory_limit` takes precedence: lowering it evicts cached prefixes until the instance fits, whatever the bound above allows (except SGLang with tensor or pipeline parallelism).
+
 ## Usage
 
 Prefix caching is enabled by default when kvcached is active. No additional flags are needed.

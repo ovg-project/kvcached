@@ -23,6 +23,7 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
                 4 * page, 1, "cuda:0", layers, num_kv_buffers=buffers,
                 group_id=group, unified_pool=unified, **kwargs)
             stride = page * layers * buffers if contiguous else page
+            assert vmm.kv_mapping_page_size(group) == stride
             views = ([raw[0][:stride], raw[0][stride:2 * stride]] if contiguous else
                      [tensor[start:start + page]
                       for tensor in raw
@@ -63,5 +64,37 @@ def test_tensor_page_size_cannot_change_after_creation():
         vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=4 * 1024**2)
         with pytest.raises(RuntimeError, match="Cannot change page size"):
             vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=2 * 1024**2)
+    finally:
+        vmm.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("contiguous", [False, True])
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_unaligned_offsets_cannot_alias_a_live_page(contiguous, buffers):
+    import torch
+
+    vmm = _compiled_vmm_ops()
+    page = 2 * 1024**2
+    vmm.init_kvcached("cuda:0", page, contiguous)
+    try:
+        with pytest.raises(RuntimeError, match="initialized"):
+            vmm.kv_mapping_page_size(3)
+        raw = vmm.create_kv_tensors(
+            8 * page, 1, "cuda:0", 2, num_kv_buffers=buffers, group_id=3)
+        stride = vmm.kv_mapping_page_size(3)
+        assert stride == (page * 2 * buffers if contiguous else page)
+        assert vmm.map_to_kv_tensors_with_result([0], 3) == (True, [0])
+        views = [tensor[:128] for tensor in raw]
+        for view in views:
+            view.fill_(17)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="page aligned"):
+            vmm.map_to_kv_tensors_with_result([stride // 2], 3)
+        with pytest.raises(RuntimeError, match="page aligned"):
+            vmm.prepare_unmap_from_kv_tensors([stride // 2], "unaligned", 3)
+        assert vmm.map_to_kv_tensors_with_result([0], 3) == (True, [])
+        assert all(torch.all(view == 17).item() for view in views)
+        torch.cuda.synchronize()
+        assert vmm.unmap_from_kv_tensors([0], 3)
     finally:
         vmm.shutdown_kvcached()

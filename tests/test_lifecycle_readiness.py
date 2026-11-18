@@ -121,7 +121,7 @@ class FakePageAllocator:
         return 4
 
     def get_resize_target(self) -> int:
-        return 0
+        return -1
 
 
 class FakeInternalPage:
@@ -704,7 +704,8 @@ def test_retained_unmap_callback_does_not_own_failed_manager(monkeypatch):
 def test_unmap_callback_still_propagates_after_lifecycle_is_gone(monkeypatch):
     calls = []
 
-    def broadcast(*args):
+    def broadcast(*args, offset_stride):
+        assert offset_stride > 0
         calls.append(args)
         if len(calls) > 1:
             raise RuntimeError("unmap after lifecycle collection")

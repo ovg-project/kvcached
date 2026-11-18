@@ -11,8 +11,16 @@ import sys
 import time
 from typing import List, Optional, TypedDict
 
+from kvcached import control_segment
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import (
+    _format_size,
+    get_ipc_path,
+    get_kv_cache_limit,
+    get_segment_control,
+    update_kv_cache_controls,
+    update_kv_cache_limit,
+)
 
 try:
     import readline  # type: ignore
@@ -60,21 +68,28 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
-    'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'min', 'priority', 'headroom', 'watch',
+    'kvtop', 'delete', 'help', 'exit', 'quit'
 ]
+
+# Commands whose first argument is an IPC name.
+IPC_COMMANDS = ('limit', 'limit-percent', 'min', 'priority', 'headroom',
+                'list', 'watch', 'delete')
 
 # Nicely formatted help text for the interactive shell.
 HELP_TEXT = """\
 Available commands:
-  list [ipc ...]               List IPC segments and usage
+  list [--all] [ipc ...]       List active IPC segments; --all includes unused
   limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
+  min <ipc> <size>             Set the reclaim floor (e.g. 512M, 2G)
+  priority <ipc> <int>         Set the priority (larger is more important)
+  headroom <ipc> <size>        Set the headroom kept from lower priorities
   watch [-n sec] [ipc ...]     Continuously display usage table
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
   help                         Show this help message
-  delete <ipc>                 Delete IPC segment and its worker socket dir
+  delete <ipc>                 Delete an idle control segment (preserve worker sockets)
   exit | quit                  Exit the shell
 """
 
@@ -117,8 +132,8 @@ def _setup_readline():
 
             cmd = tokens[0]
 
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
-                ipc_names = _detect_kvcache_ipc_names()
+            if cmd in IPC_COMMANDS:
+                ipc_names = _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                 # Case-insensitive matching so "VLLM" also matches "vllm".
                 options = [
                     n for n in ipc_names if n.lower().startswith(text.lower())
@@ -127,9 +142,9 @@ def _setup_readline():
                 options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd in IPC_COMMANDS:
                 options = [
-                    n for n in _detect_kvcache_ipc_names()
+                    n for n in _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                     if n.lower().startswith(text.lower())
                 ]
             else:
@@ -210,19 +225,32 @@ class _IpcStats(TypedDict):
     ipc: str
     limit_bytes: int
     used_bytes: int
+    gpus: list
 
 
-def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
-    names = ipcs or _detect_kvcache_ipc_names()
+def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_inactive: bool = False):
+    names = ipcs or _detect_kvcache_ipc_names(include_inactive=include_inactive)
     res: List[_IpcStats] = []
+    seen = set()
     for name in names:
+        active = control_segment.active(get_ipc_path(name))
+        if not include_inactive and active is False:
+            continue
         info = get_kv_cache_limit(name)
         if info is None:
             continue
+        state = (get_segment_control(name)
+                 if active is not False else {"gpus": []})
+        owner = state["instance"] if state["gpus"] else name
+        if owner in seen:
+            continue
+        seen.add(owner)
         res.append({
-            'ipc': name,
-            'limit_bytes': info.total_size,
-            'used_bytes': info.used_size,
+            'ipc': owner,
+            'limit_bytes': sum(gpu['effective_limit_bytes'] for gpu in state['gpus']),
+            'used_bytes': (sum(gpu['charged_bytes'] for gpu in state['gpus'])
+                           if state['gpus'] else info.used_size),
+            'gpus': state['gpus'],
         })
 
     if json_out:
@@ -232,7 +260,7 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
             print("No active KVCached segments found.")
             return
         print(
-            _clr(f"{'IPC':24} {'Limit':>12} {'Used':>12} {'%':>6}",
+            _clr(f"{'IPC':24} {'Effective Σ':>12} {'Used':>12} {'%':>6}",
                  'cyan',
                  bold=True))
         for entry in res:
@@ -252,40 +280,33 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False):
 
 
 def cmd_limit(ipc: str, size_str: str):
-    """Set an absolute limit for an existing IPC segment.
-
-    We first validate that the supplied ``ipc`` name corresponds to a running
-    segment; otherwise we refuse the operation to avoid accidentally creating
-    a new (wrong-case) shared-memory file.
-    """
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        avail = _detect_kvcache_ipc_names()
-        if avail:
-            print("Active IPC names:", ", ".join(avail), file=sys.stderr)
-        return
-
-    size_bytes = _parse_size(size_str)
-    update_kv_cache_limit(ipc, size_bytes)
+    """Set a physical-byte max independently on each live instance GPU."""
+    return update_kv_cache_limit(ipc, _parse_size(size_str))
 
 
 def cmd_limit_percent(ipc: str, percent: float):
-    """Set limit as percentage of total GPU RAM for an existing IPC."""
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        return
-
+    """Set a byte max derived from device zero, preserving CLI syntax."""
     from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        print("CUDA unavailable; cannot compute size from percentage",
-              file=sys.stderr)
-        sys.exit(1)
-    size_bytes = int(total_mem * percent / 100.0)
-    update_kv_cache_limit(ipc, size_bytes)
+        raise RuntimeError("CUDA unavailable; cannot compute size from percentage")
+    return update_kv_cache_limit(ipc, int(total_mem * percent / 100.0))
+
+
+def cmd_min(ipc: str, size_str: str):
+    """Set the reclaim floor in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, min_bytes=_parse_size(size_str))
+
+
+def cmd_priority(ipc: str, priority: int):
+    """Set the priority on each live instance GPU."""
+    return update_kv_cache_controls(ipc, priority=priority)
+
+
+def cmd_headroom(ipc: str, size_str: str):
+    """Set the headroom in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, headroom_bytes=_parse_size(size_str))
 
 
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
@@ -309,17 +330,18 @@ def cmd_top(ipcs: Optional[List[str]] = None, refresh: float = 1.0):
 
 
 def cmd_delete(ipc: str):
-    from kvcached.cli.utils import delete_kv_cache_segment, delete_tp_socket_dir
+    from kvcached.cli.utils import delete_kv_cache_segment
 
-    removed_segment = delete_kv_cache_segment(ipc)
-    removed_socket_dir = delete_tp_socket_dir(ipc)
-    if removed_segment:
+    try:
+        removed = delete_kv_cache_segment(ipc)
+    except (OSError, ValueError) as error:
+        print(_clr(f"Cannot delete IPC '{ipc}': {error}", 'red'), file=sys.stderr)
+        return False
+    if removed:
         print(_clr(f"Deleted IPC '{ipc}'.", 'green'))
-    if removed_socket_dir:
-        print(_clr(f"Removed worker socket dir for IPC '{ipc}'.", 'green'))
-    if not removed_segment and not removed_socket_dir:
-        print(_clr(f"IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
+    else:
+        print(_clr(f"IPC '{ipc}' not found or replaced.", 'red'), file=sys.stderr)
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +378,19 @@ def interactive_shell():
             tokens = shlex.split(line)
             cmd = tokens[0]
             if cmd == 'list':
-                cmd_list(tokens[1:] if len(tokens) > 1 else None)
+                include_inactive = '--all' in tokens[1:]
+                names = [name for name in tokens[1:] if name != '--all']
+                cmd_list(names or None, include_inactive=include_inactive)
             elif cmd == 'limit' and len(tokens) == 3:
                 cmd_limit(tokens[1], tokens[2])
             elif cmd == 'limit-percent' and len(tokens) == 3:
                 cmd_limit_percent(tokens[1], float(tokens[2]))
+            elif cmd == 'min' and len(tokens) == 3:
+                cmd_min(tokens[1], tokens[2])
+            elif cmd == 'priority' and len(tokens) == 3:
+                cmd_priority(tokens[1], int(tokens[2]))
+            elif cmd == 'headroom' and len(tokens) == 3:
+                cmd_headroom(tokens[1], tokens[2])
             elif cmd == 'watch':
                 # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
                 interval: float = 1.0
@@ -429,6 +459,7 @@ def main():
     p_list = sub.add_parser('list', help='List IPC segments and usage')
     p_list.add_argument('ipc', nargs='*', help='Specific IPC names (optional)')
     p_list.add_argument('--json', action='store_true', help='Output JSON')
+    p_list.add_argument('--all', action='store_true', help='Include unused control segments')
 
     # limit
     p_limit = sub.add_parser('limit', help='Set absolute limit')
@@ -439,6 +470,17 @@ def main():
     p_lp = sub.add_parser('limit-percent', help='Set limit as %% of total GPU')
     p_lp.add_argument('ipc')
     p_lp.add_argument('percent', type=float)
+
+    # min, priority, headroom
+    p_min = sub.add_parser('min', help='Set the reclaim floor')
+    p_min.add_argument('ipc')
+    p_min.add_argument('size', help="Size, e.g. 512M, 2G")
+    p_prio = sub.add_parser('priority', help='Set the priority (larger is more important)')
+    p_prio.add_argument('ipc')
+    p_prio.add_argument('priority', type=int)
+    p_head = sub.add_parser('headroom', help='Set the headroom kept from lower priorities')
+    p_head.add_argument('ipc')
+    p_head.add_argument('size', help="Size, e.g. 512M, 2G")
 
     # watch
     p_watch = sub.add_parser('watch', help='Continuously list')
@@ -456,7 +498,7 @@ def main():
 
     # delete
     p_del = sub.add_parser('delete',
-                           help='Delete IPC segment and its worker socket dir')
+                           help='Delete an idle control segment (preserve worker sockets)')
     p_del.add_argument('ipc')
 
     # shell
@@ -465,17 +507,24 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'list':
-        cmd_list(args.ipc if args.ipc else None, json_out=args.json)
+        cmd_list(args.ipc if args.ipc else None, json_out=args.json, include_inactive=args.all)
     elif args.command == 'limit':
         cmd_limit(args.ipc, args.size)
     elif args.command == 'limit-percent':
         cmd_limit_percent(args.ipc, args.percent)
+    elif args.command == 'min':
+        cmd_min(args.ipc, args.size)
+    elif args.command == 'priority':
+        cmd_priority(args.ipc, args.priority)
+    elif args.command == 'headroom':
+        cmd_headroom(args.ipc, args.size)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
         cmd_top(args.ipc if args.ipc else None, args.refresh)
     elif args.command == 'delete':
-        cmd_delete(args.ipc)
+        if not cmd_delete(args.ipc):
+            sys.exit(1)
     elif args.command == 'shell' or args.command is None:
         interactive_shell()
     else:

@@ -17,7 +17,6 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("requires the GPU native extension", allow_module_level=True)
 
-from kvcached.utils import IPCSegmentCleanup  # noqa: E402
 from kvcached.vmm_ops import PageAllocator  # noqa: E402
 
 
@@ -36,13 +35,13 @@ def test_native_identity_syscall_failures_and_retries(tmp_path):
         "-DKVCACHED_USE_ROCM" if torch.version.hip else "-DKVCACHED_USE_CUDA",
         "-I" + str(Path(toolkit) / "include"), "-I" + str(root / "csrc/inc"),
         str(root / "tests/native/shm_cleanup_faults.cpp"),
-        "-Wl,--wrap=fcntl", "-Wl,--wrap=stat", "-Wl,--wrap=fstat", "-Wl,--wrap=unlink",
+        "-Wl,--wrap=fcntl", "-Wl,--wrap=fstat", "-Wl,--wrap=unlink",
         "-o", str(binary),
     ], check=True, timeout=60)
     result = subprocess.run([str(binary), str(tmp_path / "segment")],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "6 native syscall faults" in result.stdout
+    assert "native startup faults" in result.stdout
 
 
 def _allocator(ipc_name, group_id, pages=8):
@@ -79,13 +78,13 @@ def segment(request, tmp_path, monkeypatch):
     path.unlink(missing_ok=True)
 
 
-def test_native_cleanup_removes_original_segment(segment):
+def test_native_close_preserves_idle_segment(segment):
     path, ipc_name, group_id = segment
     allocator = _allocator(ipc_name, group_id)
     assert path.exists()
     del allocator
     gc.collect()
-    assert not path.exists()
+    assert path.exists()
 
 
 def test_explicit_native_release_is_idempotent(segment):
@@ -93,7 +92,7 @@ def test_explicit_native_release_is_idempotent(segment):
     allocator = _allocator(ipc_name, group_id)
     allocator.stop_prealloc_thread()
     assert allocator.release_shared_segment() is True
-    assert not path.exists()
+    assert path.exists()
     replacement = _allocator(ipc_name, group_id)
     identity = path.stat()
     assert allocator.release_shared_segment() is True
@@ -102,7 +101,7 @@ def test_explicit_native_release_is_idempotent(segment):
     assert os.path.samestat(path.stat(), identity)
     del replacement
     gc.collect()
-    assert not path.exists()
+    assert path.exists()
 
 
 @pytest.mark.parametrize("explicit_release", [False, True])
@@ -119,15 +118,14 @@ def test_native_shared_name_waits_for_last_pool(tmp_path, explicit_release):
     assert os.path.samestat(path.stat(), identity)
     second.stop_prealloc_thread()
     assert second.release_shared_segment() is True
-    assert not path.exists()
+    assert path.exists()
 
 
 def test_delayed_native_cleanup_preserves_replacement(segment):
     path, ipc_name, group_id = segment
     old_allocator = _allocator(ipc_name, group_id)
     original = path.stat()
-    cleanup = IPCSegmentCleanup(str(path))
-    assert cleanup.unlink()
+    path.unlink()  # Deliberate external replacement, never a safe-delete path.
     assert not path.exists()
 
     replacement = _allocator(ipc_name, group_id, pages=16)
@@ -141,7 +139,7 @@ def test_delayed_native_cleanup_preserves_replacement(segment):
 
     del replacement
     gc.collect()
-    assert not path.exists()
+    assert path.exists()
 
 
 def test_native_cleanup_tolerates_already_removed_segment(segment):
@@ -155,12 +153,11 @@ def test_native_cleanup_tolerates_already_removed_segment(segment):
 
 def test_failed_initialization_does_not_claim_later_segment(tmp_path):
     path = tmp_path / "not-created-yet" / "segment"
-    allocator = _allocator(str(path), 0)
+    with pytest.raises(RuntimeError, match="control segment"):
+        _allocator(str(path), 0)
     assert not path.exists()
     path.parent.mkdir()
     path.write_bytes(b"replacement")
-    del allocator
-    gc.collect()
     assert path.read_bytes() == b"replacement"
 
 
@@ -182,7 +179,7 @@ def test_native_identity_fd_is_closed_and_close_on_exec(tmp_path):
     gc.collect()
     with pytest.raises(OSError):
         os.fstat(owned_fds[0])
-    assert not path.exists()
+    assert path.exists()
 
 
 def test_shutdown_waits_for_native_pool_initialization(monkeypatch):
@@ -213,7 +210,7 @@ def test_shutdown_waits_for_native_pool_initialization(monkeypatch):
         release.set()
         assert manager._post_init_done.wait(5)
         assert manager.shutdown() is True
-        assert not path.exists()
+        assert path.exists()
     finally:
         release.set()
         manager._post_init_done.wait(5)

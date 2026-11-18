@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The GPU CI job on the runner machine (setup.sh), from the root of the
-# checkout to test: pull the engine images and run the e2e suite. Nightly
+# checkout to test: pull the engine images and run the e2e suite. Basic
 # runs the vLLM and the SGLang cases at the same time, each on its own GPU;
 # the other profiles run once on every GPU. <results-dir>/<part> gets the
 # results of each run (vllm and sglang, or all).
@@ -56,7 +56,7 @@ run() {
 }
 
 rc=0
-if [ "$profile" = nightly ] && [ "$(nvidia-smi -L | wc -l)" -ge 2 ]; then
+if [ "$profile" = basic ] && [ "$(nvidia-smi -L | wc -l)" -ge 2 ]; then
   # Separate ports: the containers share the host's network.
   run vllm --engines vllm --gpus 0 --port 18000 &
   vllm=$!

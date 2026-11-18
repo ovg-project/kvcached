@@ -28,7 +28,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
-from kvcached.integration.sglang.patches import _evict_radix_cache_page_aware
+from kvcached.integration.sglang.page_eviction import evict_prefix_cache
 
 BLOCKS_PER_PHYSICAL_PAGE = 4
 CACHED_OFFSETS = (1, 2, 3)
@@ -152,10 +152,9 @@ def _native_evict(cache, budget):
 
 
 def _page_aware_evict(cache, budget):
-    return _evict_radix_cache_page_aware(
-        radix_cache=cache,
-        num_tokens=budget,
-        evict_params_cls=EvictParams,
+    return evict_prefix_cache(
+        cache=cache,
+        params=EvictParams(num_tokens=budget),
     )
 
 

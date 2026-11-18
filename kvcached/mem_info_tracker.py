@@ -1,50 +1,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-import atexit
 import os
-import signal
-from typing import List, Optional
+from typing import Optional
 
-import posix_ipc
-
-from kvcached.cli.utils import (
-    MemInfoStruct,
-    RwLockedShm,
-    get_ipc_name,
-    get_ipc_path,
-    init_kv_cache_limit,
-)
+from kvcached import control_segment
+from kvcached.cli.utils import MemInfoStruct, RwLockedShm, get_ipc_name
 from kvcached.utils import DEFAULT_IPC_NAME
-
-# Process-wide registry.  Per-tracker signal handlers would clobber each other
-# (signal.signal replaces, not chains), leaving segments from all but the last
-# tracker orphaned on Ctrl-C / SIGTERM.  One handler, many trackers.
-_active_trackers: List["MemInfoTracker"] = []
-_cleanup_installed: bool = False
-
-
-def _cleanup_all(*args):
-    for tracker in list(_active_trackers):
-        tracker._unlink_segment()
-    _active_trackers.clear()
-    if args and isinstance(args[0], int):
-        signum = args[0]
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-
-
-def _install_cleanup_handlers():
-    global _cleanup_installed
-    if _cleanup_installed:
-        return
-    atexit.register(_cleanup_all)
-    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-        try:
-            signal.signal(_sig, _cleanup_all)
-        except Exception:
-            pass
-    _cleanup_installed = True
 
 
 class MemInfoTracker:
@@ -60,9 +22,28 @@ class MemInfoTracker:
         """
         base = DEFAULT_IPC_NAME if group_id == 0 else f"{DEFAULT_IPC_NAME}_g{group_id}"
         self.ipc_name = get_ipc_name(base)
-        init_kv_cache_limit(self.ipc_name, total_mem_size)
-        _active_trackers.append(self)
-        _install_cleanup_handlers()
+        self._fd: Optional[int] = None
+        shm = RwLockedShm(self.ipc_name, MemInfoStruct.SHM_SIZE,
+                          RwLockedShm.WLOCK, retain_usage=True)
+        with shm as mm:
+            fd = os.dup(shm.file.fileno())
+            try:
+                MemInfoStruct(total_mem_size, 0, 0).write_to_buffer(mm)
+                control_segment.publish(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            self._fd = fd
+
+    def close(self):
+        """Release only this reference after users stop; leave removal to kvctl."""
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)
+
+    def __del__(self):
+        if getattr(self, "_fd", None) is not None:
+            self.close()
 
     def check_and_get_resize_target(self, current_mem_size: int,
                                     num_layers: int,
@@ -89,14 +70,3 @@ class MemInfoTracker:
             mem_info.used_size = used_size
             mem_info.prealloc_size = prealloc_size
             mem_info.write_to_buffer(mm)
-
-    def _unlink_segment(self):
-        """Remove the POSIX shared-memory segment and its backing file."""
-        try:
-            posix_ipc.unlink_shared_memory(self.ipc_name)
-        except Exception:
-            pass
-        try:
-            os.unlink(get_ipc_path(self.ipc_name))
-        except FileNotFoundError:
-            pass
