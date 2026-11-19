@@ -11,6 +11,7 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import threading
 import time
 import types
@@ -3772,6 +3773,9 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                 bind_native_swa(
                     allocator_self, backing, on_capacity_miss=_sglang_capacity_miss,
                     on_priority_miss=lambda requests: _sglang_priority_decode_miss(backing.manager, requests),
+                    paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
+                                        "PagedTokenToKVPoolAllocator", None)
+                    if self.detected_version == "0.5.20" else None,
                 )
 
         self._mark_as_patched(_wrapped_init)

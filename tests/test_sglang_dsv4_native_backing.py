@@ -520,6 +520,10 @@ class DecodeChild(NativeChild):
         self.released = []
         self.need_sort = True
 
+    @property
+    def free_pages(self):
+        return self.choices
+
     def merge_and_sort_free(self):
         self.choices = sorted(self.choices + self.released)
         self.released = []
@@ -562,24 +566,73 @@ class DecodeComposite(Composite):
                    self.swa_attn_allocator.available_size()) >= num_tokens
 
     def alloc_decode(self, next_length=5):
-        offset = (next_length - 2) % 4
+        lengths = [next_length] if isinstance(next_length, int) else next_length
+        offsets = [(length - 2) % 4 for length in lengths]
         full = self.full_attn_allocator.alloc_decode(
-            last_loc=Tensor([8 + offset]), seq_lens=Tensor([next_length]),
-            seq_lens_cpu=Tensor([next_length]))
+            last_loc=Tensor([8 + offset for offset in offsets]), seq_lens=Tensor(lengths),
+            seq_lens_cpu=Tensor(lengths))
         swa = self.swa_attn_allocator.alloc_decode(
-            last_loc=Tensor([4 + offset]), seq_lens=Tensor([next_length]),
-            seq_lens_cpu=Tensor([next_length]))
+            last_loc=Tensor([4 + offset for offset in offsets]), seq_lens=Tensor(lengths),
+            seq_lens_cpu=Tensor(lengths))
         assert full is not None and swa is not None
         self.mapping.update(zip(full.tolist(), swa.tolist()))
         return full
 
 
-def decode_setup(swa_choices=(3, 7, 9)):
+def decode_setup(swa_choices=(3, 7, 9), *, paged_v0520=None):
     backing = make_backing()
     assert backing.acquire({1})
     allocator = DecodeComposite(swa_choices)
-    MODULE.bind_native_swa(allocator, backing)
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=paged_v0520)
     return allocator, backing
+
+
+@pytest.mark.parametrize("lengths,crosses", [([4], False), ([4, 5], True)])
+@pytest.mark.parametrize("audited", [False, True])
+def test_decode_reads_touched_pages_and_journals_only_new(setup, monkeypatch, lengths, crosses, audited):
+    allocator, backing = decode_setup(paged_v0520=DecodeChild if audited else None)
+    full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+    assert allocator.check_decode_capacity(num_tokens=4 if crosses else 0)
+    reads = []
+    original_unique = Tensor.unique
+    def read_ids(tensor):
+        reads.append(tensor.tolist())
+        return original_unique(tensor)
+
+    monkeypatch.setattr(Tensor, "unique", read_ids)
+    acquire = backing.acquire
+    touched = []
+    def acquire_touched(pages):
+        touched.append(pages)
+        return acquire(pages)
+
+    monkeypatch.setattr(backing, "acquire", acquire_touched)
+    journal = allocator._kvcached_prepare_transaction()
+    with allocator._kvcached_budget_context((8, 8)):
+        with journal:
+            allocator.alloc_decode(lengths)
+        if audited:
+            assert reads == ([[1, 3]] if crosses else [[1]])
+        else:
+            assert len(reads) == 4
+        assert touched == [{1, 3} if crosses else {1}]
+        assert journal.pages == {id(full): {5} if crosses else set(), id(swa): {3} if crosses else set()}
+        assert full.available_size() == swa.available_size() == (4 if crosses else 8)
+        journal.rollback()
+        assert full.available_size() == swa.available_size() == 8
+    assert full.live == {2} and swa.live == backing.live == {1}
+
+
+def test_reserved_staged_only_prefix_is_not_committed_on_miss(setup):
+    allocator, backing = decode_setup((3,), paged_v0520=DecodeChild)
+    full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+    assert allocator.check_decode_capacity(num_tokens=4)
+    swa.released, swa.choices = swa.choices, []
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        assert allocator.alloc_decode() is None
+    assert not any(journal.pages.values())
+    assert full.live == {2} and swa.live == backing.live == {1}
 
 
 def test_decode_gate_checks_placement_before_native_allocation(setup):

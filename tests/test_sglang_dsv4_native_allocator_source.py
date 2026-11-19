@@ -13,6 +13,8 @@ import torch
 from test_sglang_dsv4_native_backing import MODULE, Manager
 
 SOURCE = Path(os.getenv("SGLANG_SOURCE", "engine_integration/sglang")) / "python/sglang/srt/mem_cache/allocator"
+requires_source = pytest.mark.skipif("SGLANG_SOURCE" not in os.environ and not (SOURCE / "paged.py").is_file(),
+                                     reason="native SGLang source unavailable")
 
 
 def native_paged_allocator():
@@ -31,7 +33,50 @@ def native_paged_allocator():
     return namespace["PagedTokenToKVPoolAllocator"]
 
 
-@pytest.mark.skipif(not (SOURCE / "paged.py").is_file(), reason="native SGLang source unavailable")
+@requires_source
+@pytest.mark.parametrize("end", [4, 6])
+def test_native_extend_journals_new_pages_but_backs_the_borrowed_tail(end):
+    native = native_paged_allocator()
+    namespace = native.alloc_extend.__globals__
+    source = ast.parse((SOURCE / "paged.py").read_text(encoding="utf-8"))
+    reference = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "alloc_extend_naive")
+    exec(compile(ast.Module(body=[reference], type_ignores=[]), "paged.py", "exec"), namespace)
+    namespace["next_power_of_2"] = lambda size: size
+    namespace["alloc_extend_kernel"] = {(1,): lambda starts, ends, last, free, out, bs, page_size:
+                                        namespace["alloc_extend_naive"](starts, ends, last, free, out, page_size, "cpu")}
+    full, swa = [native(48, 4, torch.int64, "cpu", None, True) for _ in range(2)]
+    for child in (full, swa):
+        child.alloc(4)
+    backing = MODULE.SWABacking(Manager(), native_pages=13, native_page_bytes=6, physical_page_bytes=8)
+    starts, ends, last = torch.tensor([2]), torch.tensor([end]), torch.tensor([5])
+    count = int(end > 4)
+
+    class Composite:
+        page_size = 4
+        full_attn_allocator, swa_attn_allocator = full, swa
+
+        def check_decode_capacity(self, *, num_tokens):
+            return True
+
+        def alloc_extend(self):
+            return [child.alloc_extend(starts, starts, ends, ends, last, end - 2, num_new_pages=count)
+                    for child in (full, swa)]
+
+    allocator: Any = Composite()
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
+    assert allocator.check_decode_capacity(num_tokens=count * 4)
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        for result in allocator.alloc_extend():
+            assert result.tolist() == list(range(6, 6 + end - 2))
+    assert journal.pages == {id(child): ({2} if count else set()) for child in (full, swa)}
+    assert backing.live == ({1, 2} if count else {1})
+    journal.rollback()
+    assert backing.live == {1}
+
+
+@requires_source
 @pytest.mark.parametrize("need_sort", [False, True])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_native_free_order_keeps_decode_reservation_backed(need_sort, grouped):
@@ -58,7 +103,7 @@ def test_native_free_order_keeps_decode_reservation_backed(need_sort, grouped):
             return full.alloc(4), swa.alloc(4)
 
     allocator = Composite()
-    MODULE.bind_native_swa(allocator, backing)
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
     assert allocator.check_decode_capacity(num_tokens=4)
     claims = list(backing.manager.claims)
     backing.manager.budget = len(backing.manager.live)
@@ -75,7 +120,7 @@ def test_native_free_order_keeps_decode_reservation_backed(need_sort, grouped):
     assert backing.manager.claims == claims
 
 
-@pytest.mark.skipif(not (SOURCE / "paged.py").is_file(), reason="native SGLang source unavailable")
+@requires_source
 @pytest.mark.parametrize("recovery", ["capacity", "prefix"])
 def test_failed_native_prefix_waits_for_placement_progress(recovery):
     native = native_paged_allocator()
@@ -99,7 +144,7 @@ def test_failed_native_prefix_waits_for_placement_progress(recovery):
             return full.alloc(4), swa.alloc(4)
 
     allocator = Composite()
-    MODULE.bind_native_swa(allocator, backing)
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
     assert swa.available_size() > 0  # Aggregate capacity is initially optimistic.
     assert allocator.alloc() is None
     for _ in range(3):
@@ -118,7 +163,7 @@ def test_failed_native_prefix_waits_for_placement_progress(recovery):
     assert selected.tolist() == list(range(expected * 4, expected * 4 + 4))
 
 
-@pytest.mark.skipif(not (SOURCE / "paged.py").is_file(), reason="native SGLang source unavailable")
+@requires_source
 @pytest.mark.parametrize("scenario", ["smaller", "staged", "grouped"])
 def test_native_decode_recovers_from_larger_or_stale_placement_miss(scenario):
     native = native_paged_allocator()
@@ -156,7 +201,7 @@ def test_native_decode_recovers_from_larger_or_stale_placement_miss(scenario):
             return children[0].alloc(count), children[1].alloc(count)
 
     allocator = Composite()
-    MODULE.bind_native_swa(allocator, backing)
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
     if scenario == "smaller":
         assert allocator.alloc(8) is None
     else:
