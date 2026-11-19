@@ -3775,7 +3775,7 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                     on_priority_miss=lambda requests: _sglang_priority_decode_miss(backing.manager, requests),
                     paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
                                         "PagedTokenToKVPoolAllocator", None)
-                    if self.detected_version == "0.5.20" else None,
+                    if getattr(self, "detected_version", None) == "0.5.20" else None,
                 )
 
         self._mark_as_patched(_wrapped_init)
