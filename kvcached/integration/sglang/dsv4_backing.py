@@ -104,7 +104,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                     full_backings: tuple[SWABacking, ...] = (),
                     swa_backings: tuple[SWABacking, ...] = (),
                     on_capacity_miss: Any = None,
-                    on_priority_miss: Any = None) -> None:
+                    on_priority_miss: Any = None, paged_v0520: type | None = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
@@ -112,8 +112,9 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     free_page_ids; an unexpected error poisons this adapter until teardown.
     Compressed KV/indexer backing follows full IDs independently of SWA retirement.
     Every selected pool must acquire its backing before native mappings publish.
-    Only native public allocation and page-census APIs are used. Native free
-    lists are never assigned by this adapter.
+    On 0.5.20 the reserved census prefix is exact only while it fits in the
+    active free list and merging is suppressed. Staged pages are not active.
+    Native free lists are never assigned by this adapter.
     """
     import torch
 
@@ -295,8 +296,23 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             finally:
                 returning.reset(token)
 
-    def wrap_child(child: Any, original: Any) -> Any:
+    def new_page_count(arguments: dict[str, Any]) -> int:
+        if "need_size" in arguments:
+            return arguments["need_size"] // page_size
+        ends = arguments["seq_lens_cpu"].tolist()
+        if "prefix_lens_cpu" in arguments:
+            starts = arguments["prefix_lens_cpu"].tolist()
+            return sum((end + page_size - 1) // page_size
+                       - (start + page_size - 1) // page_size for start, end in zip(starts, ends))
+        return sum((length - 1) % page_size == 0 for length in ends)
+
+    def wrap_child(child: Any, original: Any, name: str) -> Any:
         signature = inspect.signature(original)
+        child_type = type(child)
+        audited = (paged_v0520 is not None and child_type is paged_v0520
+                   and page_size > 1 and child.page_size == page_size
+                   and getattr(original, "__func__", None) is getattr(child_type, name)
+                   and getattr(child.get_all_free_pages, "__func__", None) is getattr(child_type, "get_all_free_pages"))
 
         @functools.wraps(original)
         def allocate(*args: Any, **kwargs: Any) -> Any:
@@ -305,28 +321,24 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 raise RuntimeError("Managed SWA allocation requires the composite transaction")
             arguments = signature.bind(*args, **kwargs).arguments
             reserved = decode_reserved[id(child)]
+            supplied = arguments.get("num_new_pages")
+            required = new_page_count(arguments) if reserved or (audited and not supplied) else None
+            exact = audited and (supplied is None or supplied == required)
+            known_new: set[int] | None = set() if exact and required == 0 else None
             if reserved:
-                if "need_size" in arguments:
-                    required = arguments["need_size"] // page_size
-                elif "prefix_lens_cpu" in arguments:
-                    ends = arguments["seq_lens_cpu"].tolist()
-                    starts = arguments["prefix_lens_cpu"].tolist()
-                    required = sum((end + page_size - 1) // page_size
-                                   - (start + page_size - 1) // page_size
-                                   for start, end in zip(starts, ends))
-                else:
-                    required = sum((length - 1) % page_size == 0
-                                   for length in arguments["seq_lens_cpu"].tolist())
-                choices = child.get_all_free_pages()[:required].tolist()
-                if required > len(reserved) or not set(choices) <= reserved:
+                assert required is not None
+                choices = set(child.get_all_free_pages()[:required].tolist()) if required else set()
+                if required > len(reserved) or not choices <= reserved:
                     raise RuntimeError("Native allocation no longer matches its decode reservation")
+                if exact and len(choices) == required and required <= len(child.free_pages):
+                    known_new = choices
             last_loc = arguments.get("last_loc")
-            prior = page_ids(last_loc) if last_loc is not None else set()
+            prior = page_ids(last_loc) if known_new is None and last_loc is not None else set()
             result = original(*args, **kwargs)
             if result is None:
                 raise _BackingMiss
-            pages = page_ids(result)
-            new = pages - prior
+            pages = page_ids(result) if known_new is None or backings[id(child)] else set()
+            new = pages - prior if known_new is None else known_new
             pending.append((child, new))
             for child_backing in backings[id(child)]:
                 if not child_backing.acquire(pages):
@@ -520,7 +532,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         for name in ("alloc", "alloc_extend", "alloc_decode"):
             original = getattr(child, name, None)
             if original is not None:
-                setattr(child, name, wrap_child(child, original))
+                setattr(child, name, wrap_child(child, original, name))
     for name in ("alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"):
         original = getattr(allocator, name, None)
         if original is not None:
