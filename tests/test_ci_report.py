@@ -121,6 +121,35 @@ def test_parts_on_two_gpus_make_one_comment_and_setup(tmp_path):
     assert "`lmsysorg/sglang:v0.5.20`" in section and "`vllm/vllm-openai:v0.30.0`" in section
 
 
+def priority_setup() -> dict[str, Any]:
+    setup = json.loads(json.dumps(SETUP))
+    low = dict(SETUP["cases"][0], name="priority-lo-vllm-qwen05b-kv_c1")
+    high = dict(low, name="priority-hi-vllm-qwen35_4b-kv_c1", hf_id="Qwen/Qwen3.5-4B")
+    setup["priority"] = [{"name": "priority-vllm-qwen05b+vllm-qwen35_4b", "kind": "priority",
+                          "gpu": "0", "batch": 128, "priorities": {"l": 0, "h": 1},
+                          "l": low, "h": high}]
+    setup["priority_workload"] = ["fill: L grows its prefix cache and idles"]
+    setup["priority_checks"] = {"h_reused_l_memory": "H grows past what was free"}
+    return setup
+
+
+def test_priority_case_renders_in_section_and_failed_table(tmp_path):
+    setup = priority_setup()
+    section = report.correctness_section("basic", setup, args(pr=12))
+    assert "### Priority tests" in section
+    assert "| priority-vllm-qwen05b+vllm-qwen35_4b | 0 |" in section
+    assert "server L (low priority)" in section and "`h_reused_l_memory`" in section
+    assert "- fill: L grows its prefix cache and idles" in section
+    write(tmp_path, [{"name": "priority-vllm-qwen05b+vllm-qwen35_4b", "ok": False,
+                      "checks": [{"name": "h_reused_l_memory", "ok": False,
+                                  "detail": "H grew 100 MiB"}]}], setup)
+    text = report.correctness_comment("basic", [tmp_path], args())
+    assert ("vLLM Qwen/Qwen2.5-0.5B-Instruct (low priority) + vLLM Qwen/Qwen3.5-4B "
+            "(high priority) on GPU 0, batch limit 128") in text
+    merged = report.merge_setups([("vLLM", setup), ("SGLang", sglang_part())])
+    assert merged["priority"] == setup["priority"]
+
+
 def test_a_part_that_did_not_finish_fails_the_run(tmp_path):
     vllm = write(tmp_path / "vllm", [{"name": "vllm-qwen05b-kv_c1", "ok": True, "checks": []}])
     text = report.correctness_comment("basic", [vllm, tmp_path / "sglang"], args(pr=12))

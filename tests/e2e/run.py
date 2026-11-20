@@ -566,11 +566,11 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
                 gpus: str, engines: dict[str, dict[str, Any]],
                 results: list[CaseResult]) -> None:
     """Record what this run tested, for the CI results issue (tools/ci/report.py)."""
-    from e2e import elastic, limit
+    from e2e import elastic, limit, priority
 
     setups = [{"name": r.name, **r.log["setup"]} for r in results if "setup" in r.log]
     hf_ids = {s["hf_id"] for s in setups if "hf_id" in s}
-    hf_ids |= {s[k]["hf_id"] for s in setups for k in ("a", "b") if k in s}
+    hf_ids |= {s[k]["hf_id"] for s in setups for k in ("a", "b", "l", "h") if k in s}
     for engine, info in engines.items():
         info.update(env=dict(ENGINES[engine].env),
                     server=shlex.join(server_argv(engine, "MODEL", (), port)))
@@ -579,11 +579,13 @@ def write_setup(out: Path, profile: str, sha: Optional[str], hf_cache: Path, por
         "stop_signal": os.environ.get("E2E_STOP_SIGNAL", "INT"),
         "model_revisions": {h: model_revision(hf_cache, h) for h in sorted(hf_ids)},
         "workload": WORKLOAD, "checks": CHECKS,
-        "cases": [s for s in setups if s.get("kind") not in ("elastic", "limit")],
+        "cases": [s for s in setups if s.get("kind") not in ("elastic", "limit", "priority")],
         "elastic": [s for s in setups if s.get("kind") == "elastic"],
         "elastic_workload": elastic.WORKLOAD, "elastic_checks": elastic.CHECKS,
         "limit": [s for s in setups if s.get("kind") == "limit"],
         "limit_workload": limit.WORKLOAD, "limit_checks": limit.CHECKS,
+        "priority": [s for s in setups if s.get("kind") == "priority"],
+        "priority_workload": priority.WORKLOAD, "priority_checks": priority.CHECKS,
     }
     (out / "setup.json").write_text(json.dumps(setup, indent=1))
 
@@ -603,6 +605,7 @@ def main() -> int:
     ap.add_argument("--models", nargs="*", help="subset of the profile's models")
     ap.add_argument("--skip-elastic", action="store_true")
     ap.add_argument("--skip-limit", action="store_true")
+    ap.add_argument("--skip-priority", action="store_true")
     ap.add_argument("--skip-cases", action="store_true",
                     help="run only the elastic and limit tests")
     ap.add_argument("--local", action="store_true",
@@ -614,6 +617,8 @@ def main() -> int:
     ap.add_argument("--elastic-gpu-mib", type=int, default=0,
                     help="hold GPU memory during the elastic test so that only this much "
                          "is usable, to run it on a larger GPU than the CI one")
+    ap.add_argument("--priority-gpu-mib", type=int, default=0,
+                    help="the same, for the priority test")
     a = ap.parse_args()
 
     profile = PROFILES[a.profile]
@@ -654,6 +659,9 @@ def main() -> int:
         if not a.skip_elastic:
             models += [m for p in profile.elastic for m in (p.model_a, p.model_b)
                        if p.engine_a in containers and p.engine_b in containers]
+        if not a.skip_priority:
+            models += [m for p in profile.priority for m in (p.model_l, p.model_h)
+                       if p.engine_l in containers and p.engine_h in containers]
         hf_ids = list(dict.fromkeys(MODELS[m].hf_id for m in models))
         if hf_ids:
             # One cache for the run: every container mounts it.
@@ -693,6 +701,15 @@ def main() -> int:
                 if ct_a and ct_b:
                     results.append(run_elastic(ct_a, ct_b, pair, run_id, a.port,
                                                a.ready_timeout, a.elastic_gpu_mib))
+                    report(results[-1])
+
+        if not a.skip_priority:
+            from e2e.priority import run_priority
+            for prio in profile.priority:
+                ct_l, ct_h = containers.get(prio.engine_l), containers.get(prio.engine_h)
+                if ct_l and ct_h:
+                    results.append(run_priority(ct_l, ct_h, prio, run_id, a.port,
+                                                a.ready_timeout, a.priority_gpu_mib))
                     report(results[-1])
 
         if not a.skip_limit:

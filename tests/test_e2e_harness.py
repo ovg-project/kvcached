@@ -274,3 +274,103 @@ def test_fetch_models_falls_back_to_the_cache(monkeypatch, capsys):
     assert "online/model at /hub/online" in out and "cached/model cached at /hub/cached" in out
     assert out.strip().endswith("not fetched: missing/model")
     assert sleeps == [60, 120, 180]  # only the model that is not cached is retried
+
+
+def test_priority_pair_in_weekly():
+    from e2e.matrix import PriorityPair
+
+    pair = PriorityPair("vllm", "qwen05b", "vllm", "qwen35_4b")
+    assert pair.name == "priority-vllm-qwen05b+vllm-qwen35_4b"
+    assert (PriorityPair("sglang", "qwen05b", "vllm", "qwen05b", gpu=1).name
+            == "priority-sglang-qwen05b+vllm-qwen05b-gpu1")
+    # Weekly's priority case: an idle lower priority full of prefix cache
+    # gives it back to a higher priority's burst, on one GPU (#585).
+    assert PROFILES["weekly"].priority == (pair,)
+    assert PROFILES["weekly"].engines == ("vllm", "sglang")
+    case = Case(pair.engine_l, pair.model_l, "c1", tag="priority-lo")
+    assert case.name == "priority-lo-vllm-qwen05b-kv_c1"
+
+
+# What `kvctl list --json` prints next to the servers: one entry per
+# instance, with the ledger state of each of its GPUs (#605, #608).
+LEDGER_JSON = """\
+[
+ {"ipc": "e2e_1_lo", "limit_bytes": 4096, "used_bytes": 700,
+  "gpus": [{"charged_bytes": 600, "watermark_bytes": 256, "shortfall_bytes": 0},
+           {"charged_bytes": 100, "watermark_bytes": 64}]},
+ {"ipc": "e2e_1_hi", "limit_bytes": 4096, "used_bytes": 50,
+  "gpus": [{"charged_bytes": 50, "watermark_bytes": 0, "shortfall_bytes": 320}]},
+ {"ipc": "another_server", "limit_bytes": 64, "used_bytes": 1,
+  "gpus": [{"charged_bytes": 1, "shortfall_bytes": 999}]}
+]
+"""
+
+
+def test_ledger_stats_reads_only_the_cases_instances():
+    from e2e.priority import ledger_stats
+
+    ipcs = ("e2e_1_lo", "e2e_1_hi")
+    stats = ledger_stats(LEDGER_JSON, ipcs)
+    # Fields are summed over the instance's GPUs; a missing field counts as 0.
+    assert stats["e2e_1_lo"] == {"charged_bytes": 700, "watermark_bytes": 320,
+                                 "shortfall_bytes": 0}
+    assert stats["e2e_1_hi"] == {"charged_bytes": 50, "watermark_bytes": 0,
+                                 "shortfall_bytes": 320}
+    assert set(stats) == set(ipcs)
+    # A failed kvctl run, an old kvcached or a dead server yield no stats, so
+    # the ledger checks fail on missing evidence instead of crashing.
+    assert ledger_stats("", ipcs) == {}
+    assert ledger_stats("kvctl: boom", ipcs) == {}
+    assert ledger_stats("[]", ipcs) == {}
+    assert ledger_stats('{"ipc": "e2e_1_lo"}', ipcs) == {}
+    assert ledger_stats('[{"ipc": "e2e_1_lo"}]', ipcs) == {
+        "e2e_1_lo": {"charged_bytes": 0, "watermark_bytes": 0, "shortfall_bytes": 0}}
+
+
+def test_set_priority_requires_an_accepted_publish():
+    import subprocess
+
+    from e2e.priority import set_priority
+
+    def ct(code, out=b"", err=b""):
+        return types.SimpleNamespace(
+            exec=lambda cmd, timeout=None: subprocess.CompletedProcess(cmd, code, out, err))
+
+    # kvctl prints the publish result and exits 0 even when it was rejected.
+    accepted = b'{"accepted": true, "priority": 1, "status": "accepted"}\n'
+    assert set_priority(ct(0, accepted), "e2e_1_hi", 1) == ""
+    rejected = b'{"accepted": false, "status": "rejected"}'
+    assert "rejected" in set_priority(ct(0, rejected), "e2e_1_hi", 1)
+    assert "incomplete" in set_priority(ct(0, b'{"status": "incomplete"}'), "e2e_1_hi", 1)
+    assert set_priority(ct(0, b""), "e2e_1_hi", 1) == "no kvctl output"
+    assert set_priority(ct(0, b"Traceback (most recent call last)"), "e2e_1_hi", 1)
+    assert "boom" in set_priority(ct(1, b"", b"boom"), "e2e_1_hi", 1)
+    assert set_priority(ct(1), "e2e_1_hi", 1) == "kvctl failed"
+
+
+def _failed_priority_checks(mem, shortfall_h, watermark_l):
+    from e2e.priority import priority_checks
+
+    mib = 1 << 20
+    return {c.name for c in priority_checks({k: v * mib for k, v in mem.items()},
+                                            shortfall_h * mib, watermark_l * mib) if not c.ok}
+
+
+def test_priority_checks_need_the_ledger_and_the_release():
+    failed = _failed_priority_checks
+    # L grew 6000 MiB of cache and held it to the burst, H posted a shortfall,
+    # L kept 300 MiB, and H grew past the 2500 MiB that were free.
+    mem = {"l_idle": 100, "l_growth": 6000, "l_at_burst": 6100, "l_after": 400,
+           "h_growth": 5000, "free_at_burst": 2500}
+    assert failed(mem, 800, 320) == set()
+    # The ledger evidence is required on both sides: H must have posted a
+    # shortfall and L must have seen a watermark.
+    assert failed(mem, 0, 320) == {"h_shortfall_posted"}
+    assert failed(mem, 800, 0) == {"l_watermark_raised"}
+    # L kept its cache: more than half of what it grew is still charged.
+    assert failed(dict(mem, l_after=3200), 800, 320) == {"l_released_for_h"}
+    # H grew into memory that was free anyway, not into what L gave back.
+    assert failed(dict(mem, h_growth=2400), 800, 320) == {"h_reused_l_memory"}
+    # L reached the burst with less than half of what it grew, e.g. with its
+    # retention cap still on: the case must fail its pressure precondition.
+    assert failed(dict(mem, l_at_burst=2900, l_after=200), 800, 320) == {"l_held_at_burst"}
