@@ -56,10 +56,10 @@ def _exercise(rank, tp_size, world):
     decode_case(world, rollback_error=True)
 
     # One stage has C128 layers; the other stages use native request rows.
-    from test_sglang_dsv4_request_state import NativeRows, bind, request_module
+    from test_sglang_dsv4_request_state import NativeRows, bind, load_request_module
 
     with pytest.MonkeyPatch.context() as patch:
-        module = request_module.__wrapped__(patch)
+        module = load_request_module(patch)
         owner = None
         if rank < tp_size:
             pool, owner, backings = bind(module)

@@ -14,8 +14,7 @@ import pytest
 from test_sglang_dsv4_native_backing import Manager, SWABacking
 
 
-@pytest.fixture
-def request_module(monkeypatch):
+def load_request_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "kvcached.integration.sglang.dsv4_backing",
                         SimpleNamespace(SWABacking=SWABacking))
     path = Path(__file__).parents[1] / "kvcached/integration/sglang/dsv4_request_state.py"
@@ -24,6 +23,11 @@ def request_module(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def request_module(monkeypatch):
+    return load_request_module(monkeypatch)
 
 
 class NativeRows:
