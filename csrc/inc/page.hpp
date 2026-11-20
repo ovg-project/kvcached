@@ -4,8 +4,10 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 
 #include "constants.hpp"
+#include "gpu_budget.hpp"
 #include "gpu_vmm.hpp"
 
 namespace kvcached {
@@ -15,6 +17,10 @@ public:
   virtual ~Page() = default;
   virtual bool map(void *vaddr, bool set_access = true) = 0;
   virtual void release() {}
+  virtual void record_unmap() {}
+  virtual void attach_budget(std::unique_ptr<BudgetReceipt>) {
+    throw std::logic_error("budget receipts require a GPU page");
+  }
   // unmap() is left for the caller to implement.
 };
 
@@ -23,6 +29,8 @@ public:
   GPUPage(page_id_t page_id, int dev_idx, size_t page_size = 0);
   ~GPUPage();
   void release() override;
+  void record_unmap() override;
+  void attach_budget(std::unique_ptr<BudgetReceipt> receipt) override;
 
   bool map(void *vaddr, bool set_access = true);
 
@@ -32,6 +40,8 @@ private:
   size_t page_size_;
   gpu_vmm::allocation_handle_t handle_;
   bool released_ = false;
+  size_t mappings_ = 0;
+  std::unique_ptr<BudgetReceipt> budget_receipt_;
 };
 
 class CPUPage : public Page {

@@ -63,10 +63,11 @@ def install_c4_state_backing(pool_module: Any, top_class: Any,
                 num_blocks=physical_pages, block_size=1, cell_size=physical_bytes,
                 num_layers=layers, reserve_null_block=True, num_kv_buffers=1,
                 group_id=group_id, pool_name="dsv4_c4_state",
+                permanent_block_ids=tuple(sorted(permanent - {0})),
             )
             backing = SWABacking(manager, native_pages=native_pages,
                                  native_page_bytes=page_bytes, physical_page_bytes=physical_bytes,
-                                 permanent_pages=permanent)
+                                 permanent_pages=permanent, addressable_pages=swa.native_pages)
             # Padding and sentinel backing must settle before native clear/write.
             manager.wait_ready()
             group = groups[key] = dict(buffers=buffers, raw=raw, backing=backing, used=0)

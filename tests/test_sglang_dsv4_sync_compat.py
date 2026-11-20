@@ -38,6 +38,7 @@ def load_source_slices():
         types=types, functools=functools, math=math,
         VersionAwarePatch=PatchBase, BasePatch=object,
         version_range=lambda *_: lambda fn: fn,
+        _sglang_capacity_miss=mock.Mock(),
     )
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "source-slices", "exec"), ns)
@@ -97,9 +98,11 @@ class TestDeepSeekV4SyncCompatibility(unittest.TestCase):
                 self.swa = alloc(kvcache.swa_kv_pool)
 
         swa.SWATokenToKVPoolAllocator = SWA
-        with mock.patch.dict("sys.modules", {"sglang.srt.mem_cache": mem_cache}), mock.patch(
-            "kvcached.integration.sglang.dsv4_backing.bind_native_swa"
-        ) as bind:
+        bind = mock.Mock()
+        with mock.patch.dict("sys.modules", {
+            "sglang.srt.mem_cache": mem_cache,
+            "kvcached.integration.sglang.dsv4_backing": types.SimpleNamespace(bind_native_swa=bind),
+        }):
             if alias_first:
                 self.assertTrue(ns["ElasticSWAAllocatorPatch"]().alias_swa_sub_allocators(swa))
             patch = ns["DeepSeekV4SWAAllocatorPatch"]()
@@ -135,7 +138,10 @@ class TestDeepSeekV4SyncCompatibility(unittest.TestCase):
             self.assertIs(managed.swa.pool, physical)
             self.assertIsNone(managed.full.pool)
             self.assertFalse(hasattr(managed_pool, "full_kv_pool"))
-            bind.assert_called_once_with(managed, physical._kvcached_dsv4_backing, None)
+            bind.assert_called_once_with(managed, physical._kvcached_dsv4_backing, None,
+                                         full_backings=(), swa_backings=(),
+                                         on_capacity_miss=ns["_sglang_capacity_miss"],
+                                         on_priority_miss=mock.ANY, paged_v0520=None)
 
 
 if __name__ == "__main__":

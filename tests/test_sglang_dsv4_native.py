@@ -106,6 +106,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setattr("sglang.srt.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr("sglang.srt.distributed.get_pipeline_model_parallel_world_size", lambda: 1)
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * 1024 * 1024)
     manager = None
     compressed_pools = []
     state_pools = []
@@ -243,6 +244,11 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                            target.token_to_kv_pool.indexer_compress_state_pools[0]]
             assert all(p._kvcached_managed for p in state_pools)
             for pool in state_pools:
+                state_manager = pool._kvcached_dsv4_backing.manager
+                pins = {i: state_manager.full_pages[i] for i in state_manager.permanent_block_ids}
+                assert pins
+                state_manager.clear()
+                assert all(state_manager.full_pages[i] is page for i, page in pins.items())
                 assert torch.all(pool.kv_score_buffer[-1].kv == 0).item()
                 assert torch.all(torch.isneginf(pool.kv_score_buffer[-1].score)).item()
             breakdown = target.token_to_kv_pool._kvcached_runtime_reservation_breakdown
@@ -405,6 +411,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                     prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
             assert claims and compressed_backing.live == before
             assert logical.available_size() == capacity
+            assert torch.equal(shared.full_to_swa_index_mapping, mapping)
+            compressed_manager.take_step_alloc_blocks(track_exact=True)
+            with monkeypatch.context() as pressure:
+                claimed = mock.Mock(wraps=compressed_manager.alloc_exact)
+                pressure.setattr(compressed_manager, "alloc_exact", claimed)
+                pressure.setattr(shared._kvcached_dsv4_backing, "acquire", lambda pages: False)
+                assert shared.alloc_extend(
+                    prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
+            assert claimed.called and compressed_backing.live == before
+            assert compressed_manager.take_step_alloc_blocks() == 0
             assert torch.equal(shared.full_to_swa_index_mapping, mapping)
             full = shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256)
             assert full is not None
