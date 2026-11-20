@@ -80,28 +80,46 @@ def test_elastic_pair_with_a_tp_server():
     assert case.args()[-2:] == ("--tp-size", "2")
 
 
-def test_host_gpu_is_the_runs_gpu_at_the_container_index(tmp_path):
+def test_host_gpu_is_the_runs_gpu_at_the_container_index(tmp_path, monkeypatch):
     from e2e.run import LocalHost
 
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert LocalHost(ENGINES["sglang"], "x", "all", tmp_path).host_gpu(1) == "1"
     assert LocalHost(ENGINES["sglang"], "x", "1,0", tmp_path).host_gpu(1) == "0"
+    # With --gpus all, a local run's GPUs are the inherited ones, if any.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    assert LocalHost(ENGINES["sglang"], "x", "all", tmp_path).host_gpu(1) == "3"
 
 
-def test_servers_are_pinned_to_the_selected_gpus(tmp_path):
+def test_servers_are_pinned_to_the_selected_gpus(tmp_path, monkeypatch):
     from e2e.run import Container, LocalHost, launch
+
+    def capture_launch(local):
+        captured: dict[str, str] = {}
+        local.start_server = lambda case_dir, env, argv: captured.update(env) or "1"  # type: ignore[method-assign]
+        launch(local, Case("vllm", "qwen35_4b", "c1", tag="elastic"), "1", 1,
+               extra_env=local.gpu_env(1))
+        return captured
 
     # A local run with --gpus 2,3: B goes to host GPU 3, A's ranks to 2 and 3,
     # whatever CUDA_VISIBLE_DEVICES the run inherited.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     local = LocalHost(ENGINES["vllm"], "x", "2,3", tmp_path)
-    captured: dict[str, str] = {}
-    local.start_server = lambda case_dir, env, argv: captured.update(env) or "1"  # type: ignore[method-assign]
-    launch(local, Case("vllm", "qwen35_4b", "c1", tag="elastic"), "1", 1,
-           extra_env=local.gpu_env(1))
-    assert captured["CUDA_VISIBLE_DEVICES"] == local.host_gpu(1) == "3"
+    assert capture_launch(local)["CUDA_VISIBLE_DEVICES"] == local.host_gpu(1) == "3"
     assert local.gpu_env() == {"CUDA_VISIBLE_DEVICES": "2,3"}
+    # --gpus all without CUDA_VISIBLE_DEVICES: the host's GPUs, unpinned for A.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert LocalHost(ENGINES["vllm"], "x", "all", tmp_path).gpu_env() == {}
     assert LocalHost(ENGINES["vllm"], "x", "all", tmp_path).gpu_env(1) == {
         "CUDA_VISIBLE_DEVICES": "1"}
+    # --local --gpus all (the default) with inherited CUDA_VISIBLE_DEVICES=2,3
+    # resolves to the inherited GPUs: B shares host GPU 3 with A's second rank,
+    # and the sampler (host_gpu) and the ballast (gpu_env) target it too.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    local = LocalHost(ENGINES["vllm"], "x", "all", tmp_path)
+    assert capture_launch(local)["CUDA_VISIBLE_DEVICES"] == local.host_gpu(1) == "3"
+    assert local.gpu_env() == {"CUDA_VISIBLE_DEVICES": "2,3"}
+    assert local.gpu == "2"
     # A container sees the run's GPUs as 0, 1, ...
     docker = Container.__new__(Container)
     docker.gpus = "2,3"
