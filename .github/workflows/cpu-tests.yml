@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out SGLang v0.5.20 allocator sources
+      - name: Check out SGLang v0.5.20 sources for CPU tests
         uses: actions/checkout@v4
         with:
           repository: sgl-project/sglang
@@ -27,6 +27,7 @@ jobs:
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
+            /python/sglang/srt/managers/schedule_policy.py
             /python/sglang/srt/mem_cache/allocator/base.py
             /python/sglang/srt/mem_cache/allocator/paged.py
             /python/sglang/srt/mem_cache/allocator/swa.py
