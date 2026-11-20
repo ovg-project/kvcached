@@ -42,3 +42,17 @@ def test_native_pool_rejects_unpinned_blocks():
     # elastic pool never fires; HiSparse itself is rejected at startup.
     with pytest.raises(NotImplementedError, match="unpinned"):
         NativeBlockPoolMixin.unpin_blocks(NativeBlockPoolMixin.__new__(NativeBlockPoolMixin), [])
+
+
+@pytest.mark.parametrize("version", [None, "0.25.0", "0.29.0", "0.31.0"])
+def test_events_reject_unvalidated_versions_before_pool_allocation(version):
+    from kvcached.utils import KVCachedConfigError
+
+    target = ModuleType("_unsupported_event_pool")
+    setattr(target, "BlockPool", type("BlockPool", (), {}))
+    setattr(target, "KVCacheBlock", type("KVCacheBlock", (), {}))
+    patch = ElasticBlockPoolPatch()
+    patch.detected_version = version
+    assert patch.inject_elastic_block_pool(target)
+    with pytest.raises(KVCachedConfigError, match="vLLM 0.30"):
+        target.ElasticBlockPool(8, 16, 32, 1, True, enable_kv_cache_events=True)

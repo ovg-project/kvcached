@@ -11,6 +11,13 @@ from kvcached.integration.patch_base import (
     is_integration_version_supported,
     log_patch_results,
 )
+from kvcached.integration.sglang.hicache import (
+    HICACHE_RANGE,
+    HiCacheKVHostPoolPatch,
+    HiCacheMambaHostPoolPatch,
+    HiCacheMLAHostPoolPatch,
+    HiCacheSizeSplitPatch,
+)
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     DeepSeekV4KVPoolPatch,
@@ -24,9 +31,14 @@ from kvcached.integration.sglang.patches import (
     ElasticMLAMemoryPoolPatch,
     ElasticSWAAllocatorPatch,
     MambaRadixCacheLimitPatch,
+    PrefillAdderDemandPatch,
     RadixCacheLimitPatch,
+    ScheduleBatchCapacityMissPatch,
+    ScheduleBatchDecodeContextPatch,
+    SchedulerCapacityMissPatch,
     SchedulerIdleLimitPatch,
     SchedulerMemoryLeakPatch,
+    SchedulerSharedBudgetPatch,
     SGLangLegacyVirtualKVCapacityPatch,
     SGLangVirtualKVCapacityPatch,
     SWARadixCacheLimitPatch,
@@ -64,7 +76,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMLAMemoryPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
-            (DeepSeekV4RuntimeReservationPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4RuntimeReservationPatch(), ">=0.5.12,<0.5.21.dev0"),
             (DeepSeekV4KVPoolPatch(), ">=0.5.13"),
             (DeepSeekV4SWAAllocatorPatch(), ">=0.5.13"),
             (DeepSeekV4RunnerOwnershipPatch(), ">=0.5.13"),
@@ -73,6 +85,18 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
             (SGLangVirtualKVCapacityPatch(), ">=0.5.16"),
             (SchedulerMemoryLeakPatch(), SGLANG_ALL_RANGE),
+            # A kvcached pool can miss after admission. These turn the
+            # miss into a retried prefill instead of a scheduler exit
+            # (#547); they read the 0.5.20 batch and request shapes.
+            (ScheduleBatchCapacityMissPatch(), ">=0.5.20"),
+            (ScheduleBatchDecodeContextPatch(), ">=0.5.19,<=0.5.20"),
+            (SchedulerCapacityMissPatch(), ">=0.5.20"),
+            # Under TP every rank's pool reports its own GPU's headroom;
+            # this makes the ranks of a waiting queue admit and evict from
+            # one agreed budget per scheduling round.
+            (SchedulerSharedBudgetPatch(), ">=0.5.13"),
+            # Records the waiting request a round cannot admit as KV demand.
+            (PrefillAdderDemandPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
@@ -80,11 +104,20 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),
             (SWARadixCacheLimitPatch(), ">=0.5.13"),
             (MambaRadixCacheLimitPatch(), ">=0.5.13"),
+            # HiCache host copies that assume dense device layers.
+            (HiCacheKVHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheMambaHostPoolPatch(), HICACHE_RANGE),
+            (HiCacheSizeSplitPatch(), HICACHE_RANGE),
         ]
     )
 
     # Apply all patches
     results = patch_manager.apply_all_patches()
+
+    from kvcached.integration.sglang.scheduler.rank_coordination import patch_rank_coordination
+
+    patch_rank_coordination()
 
     # Log results
     log_patch_results("sglang", results)
