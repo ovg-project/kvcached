@@ -56,15 +56,32 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         "ElasticSWAAllocatorPatch"
     )
     assert patch_versions["ElasticSWAAllocatorPatch"] == ">=0.5.13"
+    assert patch_names.index("ElasticSWAAllocatorPatch") < patch_names.index(
+        "DeepSeekV4SWAAllocatorPatch"
+    )
     for pool_patch in (
         "ElasticMemoryPoolPatch",
         "ElasticMLAMemoryPoolPatch",
         "ElasticMambaPoolPatch",
         "ElasticHybridLinearKVPoolPatch",
+        "DeepSeekV4RuntimeReservationPatch",
+        "DeepSeekV4KVPoolPatch",
+        "DeepSeekV4SWAAllocatorPatch",
+        "DeepSeekV4RunnerOwnershipPatch",
+        "DeepSeekV4RequestStatePatch",
     ):
         assert patch_names.index(pool_patch) < legacy_virtual_index
         assert patch_names.index(pool_patch) < virtual_index
 
+    assert patch_versions["DeepSeekV4KVPoolPatch"] == ">=0.5.13"
+    assert patch_versions["DeepSeekV4SWAAllocatorPatch"] == ">=0.5.13"
+    assert patch_versions["DeepSeekV4RunnerOwnershipPatch"] == ">=0.5.13"
+    assert patch_versions["DeepSeekV4RequestStatePatch"] == ">=0.5.20"
+    assert patch_versions["DeepSeekV4RequestAdmissionPatch"] == ">=0.5.20"
+    assert patch_names.index("DeepSeekV4RequestAdmissionPatch") > virtual_index
+    assert patch_names.index("DeepSeekV4RunnerOwnershipPatch") > patch_names.index(
+        "DeepSeekV4KVPoolPatch"
+    )
     assert (
         patch_versions["SGLangLegacyVirtualKVCapacityPatch"]
         == ">=0.5.11,<0.5.16"

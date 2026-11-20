@@ -716,13 +716,14 @@ def test_explicit_shrink_releases_safe_retained_empty_pages(manager_module):
     assert manager.page_allocator.reserved == 0
 
 
-def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
+def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1, count=2):
     from test_prefix_cache_shrink import FakePage, _make_manager
 
     from kvcached import kv_cache_manager
     from kvcached.priority_reclaim import PriorityReclaimGroup
 
-    members: tuple[Any, ...] = (_make_manager(deferred), _make_manager(deferred))
+    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
+    members: tuple[Any, ...] = tuple(_make_manager(deferred) for _ in range(count))
     ops = sys.modules.get("kvcached.vmm_ops")
     if ops is None:
         ops = types.ModuleType("kvcached.vmm_ops")
@@ -736,7 +737,6 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
         return True
 
     monkeypatch.setattr(ops, "_publish_pool_reclaimable", publish_pools, raising=False)
-    monkeypatch.setattr(kv_cache_manager, "InternalPage", FakePage)
     for i, member in enumerate(members):
         member.group_id = i
         member.world_size = 1
@@ -748,6 +748,26 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1):
         assert member.alloc(7) == list(range(1, 8))
     members[1].num_layers = swa_layers
     return members, PriorityReclaimGroup(members)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_multiple_native_backings_share_one_reclaim_allowance(manager_module, monkeypatch, deferred):
+    _, _, plan = manager_module
+    members, group = _coupled_managers(monkeypatch, deferred=deferred, count=4)
+    plan.update(limit_bytes=8, running_bytes=8)
+    assert members[0].reclaim_for_priority() == 2
+    before = sum(len(member.page_allocator.inuse) * member._memory_limit_page_bundle_bytes()
+                 for member in members)
+    for member in reversed(members):
+        member.free([4, 5, 6, 7])
+    assert not group.pending()
+    if deferred:
+        for member in members:
+            member.release_retired_pages_through(member.capture_physical_release_marker())
+    after = sum(len(member.page_allocator.inuse) * member._memory_limit_page_bundle_bytes()
+                for member in members)
+    assert before - after == 8
+    assert sum(len(member._priority_empty_ids()) for member in members) == 2
 
 
 @pytest.mark.parametrize("deferred", [False, True])
