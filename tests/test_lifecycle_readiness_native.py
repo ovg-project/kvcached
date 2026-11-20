@@ -141,27 +141,24 @@ def run_cancelled_clear(group_id, async_sched):
         group_id=group_id, reserve_null_block=True, async_sched=async_sched,
         own_segment=True)
     manager.wait_ready(timeout=5)
-    # Healthy clear still rebuilds the null page and makes it usable.
-    manager.clear()
-    manager.wait_ready(timeout=5)
-    assert manager.page_allocator.get_num_inuse_pages() == 1
+    # Healthy clear retains the null page, including its initialized contents.
     view = tensors[0].reshape(-1)[:16]
     view.fill_(7)
     torch.cuda.synchronize()
+    manager.clear()
+    manager.wait_ready(timeout=5)
+    assert manager.page_allocator.get_num_inuse_pages() == 1
     assert torch.all(view == 7).item()
     del view
-    reserving = threading.Event()
+    resetting = threading.Event()
     errors = []
-    reserve = manager._reserve_null_block
 
-    def reserve_without_capacity():
-        # At this boundary clear has unmapped the old null page. Apply a
-        # real native zero-capacity limit so reservation waits for shutdown.
-        assert manager.page_allocator.get_num_inuse_pages() == 0
-        assert manager.page_allocator.resize(0)
-        assert manager.available_size() == 0
-        reserving.set()
-        reserve()
+    def wait_before_readiness():
+        # Pause after reset but before clear can restart preallocation and
+        # publish READY. Shutdown must win even with padding still mapped.
+        assert manager.page_allocator.get_num_inuse_pages() == 1
+        resetting.set()
+        assert manager._shutdown_requested.wait(5)
 
     def clear():
         try:
@@ -169,11 +166,11 @@ def run_cancelled_clear(group_id, async_sched):
         except Exception as exc:
             errors.append(exc)
 
-    manager._reserve_null_block = reserve_without_capacity
+    manager._apply_resize_target = wait_before_readiness
     clearer = threading.Thread(target=clear, daemon=True)
     clearer.start()
     try:
-        assert reserving.wait(5)
+        assert resetting.wait(5)
         assert manager.lifecycle_phase is LifecyclePhase.INITIALIZING
         assert manager.shutdown()
     finally:
@@ -181,8 +178,8 @@ def run_cancelled_clear(group_id, async_sched):
         clearer.join(5)
     assert not clearer.is_alive() and not errors
     assert manager.lifecycle_phase is LifecyclePhase.FAILED
-    assert manager.null_block is None
-    assert manager.page_allocator.get_num_inuse_pages() == 0
+    assert manager.null_block == [0]
+    assert manager.page_allocator.get_num_inuse_pages() == 1
     try:
         manager.wait_ready(timeout=0)
     except RuntimeError as exc:
