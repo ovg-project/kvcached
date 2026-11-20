@@ -5,11 +5,70 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
+#include <limits>
+#include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace kvcached {
+
+// Quote one exact claim assuming unused reservations can be returned to the
+// driver. Shrink permits swapping reclaimed IDs into free active slots.
+using ExactRecoveryQuote = std::tuple<uint64_t, std::vector<int64_t>, size_t>;
+
+inline std::optional<ExactRecoveryQuote> quote_exact_pages(
+    const std::vector<int64_t> &pages, const std::deque<int64_t> &free,
+    const std::deque<int64_t> &reclaimed, const std::deque<int64_t> &reserved,
+    uint64_t bundle) {
+  std::unordered_set<int64_t> wanted(pages.begin(), pages.end());
+  if (!bundle || wanted.size() != pages.size())
+    throw std::invalid_argument("Invalid exact recovery request");
+  std::vector<int64_t> idle;
+  for (const auto id : reserved) {
+    if (!wanted.erase(id))
+      idle.push_back(id);
+  }
+  const auto fresh = wanted.size();
+  if (fresh > free.size() + idle.size() || fresh > UINT64_MAX / bundle)
+    return std::nullopt;
+  if (!wanted.empty()) {
+    for (const auto id : free) {
+      if (wanted.erase(id) && wanted.empty())
+        break;
+    }
+    if (!wanted.empty()) {
+      for (const auto id : reclaimed) {
+        if (wanted.erase(id) && wanted.empty())
+          break;
+      }
+    }
+    if (!wanted.empty())
+      return std::nullopt;
+  }
+  const size_t local = fresh > free.size() ? fresh - free.size() : 0;
+  return std::make_tuple(fresh * bundle, std::move(idle), local);
+}
+
+// Select only still-idle entries from a recovery quote. A matching reserve
+// or a page claimed since the quote must never be unmapped.
+inline std::vector<int64_t> extract_reserved_pages(
+    std::deque<int64_t> &reserved, const std::vector<int64_t> &eligible) {
+  const std::unordered_set<int64_t> wanted(eligible.begin(), eligible.end());
+  std::vector<int64_t> selected;
+  selected.reserve(std::min(wanted.size(), reserved.size()));
+  auto keep = std::remove_if(reserved.begin(), reserved.end(), [&](auto id) {
+    if (!wanted.count(id))
+      return false;
+    selected.push_back(id);
+    return true;
+  });
+  reserved.erase(keep, reserved.end());
+  return selected;
+}
 
 // Claim exactly these free block IDs, preserving the order of the remaining
 // free list. A conflict is a miss; invalid requests throw before any mutation.

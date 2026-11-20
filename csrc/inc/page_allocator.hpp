@@ -11,9 +11,11 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <tuple>
 #include <vector>
 
 #include "constants.hpp"
@@ -94,6 +96,9 @@ public:
   // Unmap up to max_pages reserved pages (all of them when negative) and
   // return how many were unmapped.
   int64_t trim(int64_t max_pages = -1);
+  int64_t trim_selected(const std::vector<page_id_t> &eligible);
+  std::optional<std::tuple<uint64_t, std::vector<page_id_t>, size_t>>
+  exact_recovery_quote(const std::vector<page_id_t> &pages) const;
 
   // Status queries
   int64_t get_num_free_pages() const;
@@ -113,6 +118,7 @@ public:
   PageState get_page_state() const;
   TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
+  int64_t get_avail_physical_bytes() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
   // (e.g. `kvctl limit`) has written a new total_size. Returns the new
@@ -163,6 +169,7 @@ private:
   void map_pages(const std::vector<page_id_t> &page_ids);
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
+  int64_t trim_impl(int64_t max_pages, const std::vector<page_id_t> *eligible);
   PageState get_page_state_unlocked() const;
   void update_memory_usage_unlocked();
   void trigger_preallocation();

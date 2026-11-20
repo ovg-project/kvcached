@@ -78,6 +78,8 @@ class RankCoordinator:
         self.admission_materialization = None
         self.outer_required = None
         self.token_budget = None
+        self.row_retry_cap = None
+        self.leading_row_reused = False
         self.prefill_attempt = None
         self.row_reservation: Any = None
         self.planned = self.grammar_polled = self.priority_sorted = False
@@ -230,7 +232,7 @@ class RankCoordinator:
             return nullcontext()
         return self.scheduler.token_to_kv_pool_allocator._kvcached_budget_context(self.token_budget)
 
-    def reserve_slots(self, query, *, demand_preview=None):
+    def reserve_slots(self, query, *, demand_preview=None, matches=None):
         """One tagged boundary combines physical C128 readiness and slot MIN.
 
         All ranks participate, including those with a standby, zero logical
@@ -241,6 +243,7 @@ class RankCoordinator:
         allocator: Any = getattr(pool, "_kvcached_dsv4_request_state", None)
         reservation, local_slots, error = (None, 0, None)
         ownership, reused = (None, 0)
+        leading_reuse = False
         try:
             if allocator is not None:
                 with allocator.capacity_query(allocator.logical_available()):
@@ -253,19 +256,26 @@ class RankCoordinator:
                     by_id = {str(req.rid): req for req in reqs}
                     if len(by_id) != len(reqs):
                         raise ValueError("duplicate prefill request IDs")
-                    ownership = [(str(req.rid), request_slot(req) is not None) for req in reqs]
-                    for req in reqs:
-                        slot = request_slot(req)
-                        if slot is not None and (int(slot) not in allocator.active):
-                            raise ValueError(f"request {req.rid} does not own a backed C128 row")
-                    with allocator.capacity_query(
-                        allocator.logical_available() + sum((held for _, held in ownership))
-                    ):
+                    # A streaming session restores its row during prefix matching.
+                    # Let the preview match each queue entry once, even with no free rows.
+                    with allocator.capacity_query(allocator.logical_available() + len(reqs)):
                         logical_slots = int(query())
                     candidate = demand_preview(logical_slots)["p"]
+                    matched = matches if matches is not None else {}
+                    matched_requests = matched.get("requests", {})
+                    slots_by_id = {
+                        rid: request_slot(matched_requests.get(rid, req)) for rid, req in by_id.items()
+                    }
+                    ownership = [(rid, slot is not None) for rid, slot in slots_by_id.items()]
+                    for rid, slot in slots_by_id.items():
+                        if slot is not None and int(slot) not in allocator.active:
+                            raise ValueError(f"request {rid} does not own a backed C128 row")
                     rows = [] if candidate is None else candidate["rows"]
-                    reused = sum((request_slot(by_id[row["rid"]]) is not None for row in rows))
+                    reused = sum(slots_by_id[row["rid"]] is not None for row in rows)
                     target = len(rows) - reused
+                    leading_reuse = bool(rows and slots_by_id[rows[0]["rid"]] is not None)
+                    if self.row_retry_cap is not None and (self.row_retry_cap > 0 or leading_reuse):
+                        target = min(target, self.row_retry_cap)
                 reservation = allocator.prepare_admission(target)
                 self.row_reservation = (allocator, reservation)
                 with allocator.capacity_query(reservation.available + reused):
@@ -277,6 +287,7 @@ class RankCoordinator:
         value = {
             "slots": local_slots,
             "ownership": ownership,
+            "leading_reuse": leading_reuse,
             "c128": None
             if reservation is None
             else {"available": reservation.available, "target": reservation.target},
@@ -290,7 +301,7 @@ class RankCoordinator:
         except Exception as exc:
             if reservation is not None:
                 try:
-                    allocator.finish_admission(reservation, 0)
+                    self.release_slots()
                 except Exception:
                     LOG.exception("C128 rollback failed after rank consensus failure")
             if isinstance(exc, RankConsensusError):
@@ -300,20 +311,58 @@ class RankCoordinator:
             ) from exc
         self.slot_budget = max(0, min((s["slots"] for s in states)))
         if allocator is not None:
+            self.leading_row_reused = all(s["leading_reuse"] for s in states)
             c128_budget = min((s["c128"]["available"] for s in states))
             self.new_slot_budget = max(0, c128_budget)
-            allocator.finish_admission(reservation, c128_budget)
+            finish_error = None
+            try:
+                allocator.finish_admission(reservation, c128_budget)
+            except Exception as exc:
+                finish_error = f"{type(exc).__name__}: {exc}"
+            if self.token_budget is not None:
+                self.refresh_token_budget("token_capacity_after_rows", finish_error)
+            elif finish_error is not None:
+                raise RuntimeError(finish_error)
         return self.slot_budget
 
-    def release_slots(self):
+    def refresh_token_budget(self, stage, error=None):
+        backing = self.scheduler.token_to_kv_pool_allocator
+        local = None
+        try:
+            if error is None:
+                backing._kvcached_invalidate_token_capacity()
+                local = backing._kvcached_budget_counts()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        try:
+            peers = self.exchange(stage, local, error=error)
+        except RankConsensusError:
+            raise
+        except Exception as exc:
+            raise RankConsensusError(f"C128 {stage} exchange failed") from exc
+        self.token_budget = tuple(min(values) for values in zip(*peers))
+        backing._kvcached_update_budget(self.token_budget)
+
+    def release_slots(self, *, refresh=False):
         """Release this attempt's unused leases; active and older rows survive."""
         pending, self.row_reservation = self.row_reservation, None
-        if pending is not None:
-            allocator, reservation = pending
-            try:
-                allocator.finish_admission(reservation, 0)
-            finally:
-                allocator.end_admission()
+        if pending is None:
+            return
+        allocator, reservation = pending
+        refresh = refresh and self.token_budget is not None and bool(self.new_slot_budget)
+        error = None
+        try:
+            allocator.finish_admission(reservation, 0)
+        except Exception as exc:
+            if not refresh:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            allocator.end_admission()
+        if refresh:
+            # The same scheduler round can still admit decode after a parked
+            # prefill. Its budget must see the pages returned by the rollback.
+            self.refresh_token_budget("token_capacity_after_row_release", error)
 
     def prepare(self, candidates, *, error=None):
         states = self.exchange("candidates", candidates, error=error)
@@ -612,6 +661,7 @@ def patch_rank_coordination():
                         self, len(running_batch.reqs), **{"running_batch": running_batch}
                     ),
                     demand_preview=shadow if allocator is not None else None,
+                    matches=preview_matches,
                 )
                 candidates = shadow(
                     runtime.slot_budget,
@@ -622,6 +672,14 @@ def patch_rank_coordination():
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
             runtime.prepare(candidates, error=error)
+            if allocator is not None:
+                # If the row leases left too little room for even one token
+                # prefix, retry a smaller window when the next round starts.
+                minimum = 0 if runtime.leading_row_reused else 1
+                if runtime.prefill_plan is None and (runtime.new_slot_budget or 0) > minimum:
+                    runtime.row_retry_cap = runtime.new_slot_budget // 2
+                elif runtime.prefill_plan is not None or runtime.new_slot_budget == 0:
+                    runtime.row_retry_cap = None
             attempt = PrefillScheduleSnapshot(self)
             runtime.prefill_attempt = attempt
             try:
@@ -636,8 +694,15 @@ def patch_rank_coordination():
                 return empty_prefill(running_batch)
             finally:
                 runtime.prefill_attempt = None
+        except RankConsensusError:
+            try:
+                runtime.release_slots()
+            except Exception:
+                LOG.exception("C128 rollback failed after rank consensus failure")
+            raise
         finally:
-            runtime.release_slots()
+            if runtime.row_reservation is not None:
+                runtime.release_slots(refresh=True)
 
     @functools.wraps(original_slots)
     def slots(self, *args, **kwargs):

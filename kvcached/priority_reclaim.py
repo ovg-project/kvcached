@@ -10,7 +10,7 @@ from typing import Any
 
 
 class PriorityReclaimGroup:
-    def __init__(self, members: tuple[Any, ...]):
+    def __init__(self, members: tuple[Any, ...], *, report_only: bool = False):
         identities = []
         slots = []
         for member in members:
@@ -23,6 +23,7 @@ class PriorityReclaimGroup:
         if len(members) < 2 or len(set(identities)) != 1 or len(set(slots)) != len(members):
             raise ValueError("coupled reclaim requires distinct pools of one instance")
         self.members = members
+        self.report_only = report_only
         self.release_members = tuple(sorted(members, key=lambda member: (
             member._runtime_control.sources[0]["pool_slot"])))
         # Every synchronized member operation takes this before its own lock.
@@ -95,6 +96,10 @@ class PriorityReclaimGroup:
         from kvcached.vmm_ops import kv_reclaim
 
         with self.lock:
+            if self.report_only:
+                # TP ranks publish the sum of local pools, but cannot evict independently.
+                self.publish()
+                return 0
             if self.failed:
                 raise RuntimeError("coupled reclaim has an unconfirmed native release")
             if any(getattr(m, "in_shrink", False) for m in self.members):

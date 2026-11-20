@@ -1071,3 +1071,25 @@ def test_coupled_reclaim_refreshes_pool_metadata_after_legacy_publication(manage
     plan.update(limit_bytes=0)
     group.reclaim()
     assert published.call_count == before + 1
+
+
+def test_rank_local_reporting_never_executes_victim_reclamation(manager_module, monkeypatch):
+    from kvcached.priority_reclaim import PriorityReclaimGroup
+
+    members, _ = _coupled_managers(monkeypatch, swa_layers=2)
+    full, swa = members
+    monkeypatch.setattr(full, "_reclaimable_levels", lambda: (1, 0, 0))
+    monkeypatch.setattr(swa, "_reclaimable_levels", lambda: (2, 0, 0))
+    group = PriorityReclaimGroup(members, report_only=True)
+    _, posted, plan = manager_module
+    plan.update(limit_bytes=8, running_bytes=8)
+    assert group.reclaim() == 0
+    full_bytes = full._memory_limit_page_bundle_bytes()
+    swa_bytes = swa._memory_limit_page_bundle_bytes()
+    posted.assert_called_once_with(full_bytes + 2 * swa_bytes, 0, 0, 0)
+    assert not group.active
+    monkeypatch.setattr(swa, "_reclaimable_levels", lambda: (0, 0, 0))
+    assert group.reclaim() == 0
+    assert posted.call_args_list == [
+        mock.call(full_bytes + 2 * swa_bytes, 0, 0, 0), mock.call(full_bytes, 0, 0, 0),
+    ]
