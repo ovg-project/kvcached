@@ -233,7 +233,12 @@ class RankCoordinator:
             local_slots = int(query())
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-        states = self.exchange("slots", local_slots, error=error)
+        try:
+            states = self.exchange("slots", local_slots, error=error)
+        except RankConsensusError:
+            raise
+        except Exception as exc:
+            raise RankConsensusError("Slot exchange failed; refusing collective retry") from exc
         self.slot_budget = max(0, min(states))
 
     def prepare(self, candidates, *, error=None):

@@ -435,6 +435,22 @@ class CoordinationTests(ContextTestCase):
         self.assertTrue(all(("invalid leader plan" in str(r) for r in results)))
         self.assertEqual([s.forwards for s in schedulers], [0] * 4)
 
+    def test_slot_transport_failure_stops_before_the_next_collective(self):
+        calls: list[list[str]] = [[] for _ in range(4)]
+
+        def gather(output, value, group=None):
+            calls[self.world.local.rank].append(value["stage"])
+            if value["stage"] == "slots":
+                raise OSError("TP peer disconnected")
+            self.world.gather(output, value, group)
+
+        with mock.patch.object(sys.modules["torch.distributed"], "all_gather_object", gather):
+            _, results = self.execute([65536] * 4)
+        for events, error in zip(calls, results):
+            self.assertIsInstance(error, coord.RankConsensusError)
+            self.assertIsInstance(error.__cause__, OSError)
+            self.assertEqual(events[-1], "slots")
+
     def test_slot_capacity_uses_minimum_and_is_frozen_for_native_pass(self):
         schedulers = [self.Scheduler(r, 65536) for r in range(4)]
         for s, available in zip(schedulers, [3, 2, 1, 3]):
