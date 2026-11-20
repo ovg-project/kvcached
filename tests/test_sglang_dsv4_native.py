@@ -105,6 +105,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setattr("sglang.srt.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr("sglang.srt.distributed.get_pipeline_model_parallel_world_size", lambda: 1)
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * 1024 * 1024)
     manager = c128_manager = None
     full_size = 524288 if compress_ratio == 128 else 16384
     c128_size = full_size // 128
@@ -379,6 +380,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                     prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
             assert claims and c128_backing.live == before
             assert logical.available_size() == capacity
+            assert torch.equal(shared.full_to_swa_index_mapping, mapping)
+            c128_manager.take_step_alloc_blocks(track_exact=True)
+            with monkeypatch.context() as pressure:
+                claimed = mock.Mock(wraps=c128_manager.alloc_exact)
+                pressure.setattr(c128_manager, "alloc_exact", claimed)
+                pressure.setattr(shared._kvcached_dsv4_backing, "acquire", lambda pages: False)
+                assert shared.alloc_extend(
+                    prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
+            assert claimed.called and c128_backing.live == before
+            assert c128_manager.take_step_alloc_blocks() == 0
             assert torch.equal(shared.full_to_swa_index_mapping, mapping)
             full = shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256)
             assert full is not None

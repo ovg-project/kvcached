@@ -1,0 +1,319 @@
+// SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace kvcached {
+
+struct InstanceControl {
+  std::string status;
+  std::string convergence;
+  std::string failure_reason;
+  uint64_t failed = 0;
+  uint64_t generation = 0;
+  uint64_t revision = 0;
+  int64_t retention_tokens = -1;
+  uint64_t retention_revision = 0;
+  // Revision of the last max publication, stable across policy-only writes.
+  uint64_t limit_revision = 0;
+  uint64_t requested_bytes = 0;
+  uint64_t effective_bytes = 0;
+  uint64_t charged_bytes = 0;
+  uint64_t pool_slot = 0;
+  uint64_t pool_owner = 0;
+  uint64_t pool_target_bytes = 0;
+  uint64_t pool_capacity_bytes = 0;
+  uint64_t page_bundle_bytes = 0;
+  uint64_t minimum_bytes = 0;
+  bool can_shrink = false;
+  bool ready = false;
+  uint64_t participants = 0;
+  uint64_t registered_participants = 0;
+  uint64_t expected_participants = 0;
+  uint64_t completed = 0;
+  bool published = false; // A max has been published (revision zero is valid).
+  // The instance's policy controls besides max. min_bytes is the reclaim
+  // floor, unrelated to minimum_bytes, the pool's null-page floor.
+  uint64_t min_bytes = 0;
+  int64_t priority = 0;
+  uint64_t headroom_bytes = 0;
+  // The part of the instance's posted demand its headroom does not cover,
+  // and the free bytes higher priorities keep from it on this GPU.
+  uint64_t shortfall_bytes = 0;
+  uint64_t watermark_bytes = 0;
+  // What the instance last posted it could release on this GPU: pre-mapped
+  // pages that hold no data, prefix cache that whole pages can drop, and
+  // pages already released but not yet refunded.
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t releasing_bytes = 0;
+  // Bytes this instance should release now for higher priorities' headroom
+  // and demand, and how much of it from each tier (see
+  // GpuBudget::reclaim_plan).
+  uint64_t reclaim_bytes = 0;
+  uint64_t reclaim_limit_bytes = 0;
+  uint64_t reclaim_empty_bytes = 0;
+  uint64_t reclaim_cache_bytes = 0;
+  uint64_t reclaim_running_bytes = 0;
+  // What the instance can still be granted on this GPU: free memory above
+  // its watermark, within its max.
+  uint64_t available_bytes = 0;
+};
+
+// What an instance should release now, by tier: pre-mapped pages, prefix
+// cache, then memory of running requests (preemption).
+struct ReclaimPlan {
+  // Maximum additional release above min(min, max), excluding in-flight
+  // release.
+  uint64_t limit_bytes = 0;
+  uint64_t empty_bytes = 0;
+  uint64_t cache_bytes = 0;
+  uint64_t running_bytes = 0;
+  uint64_t total() const;
+};
+
+// Internal pool detail accompanying one instance's aggregate reclaim levels.
+struct PoolReclaimable {
+  size_t slot;
+  uint64_t owner;
+  uint64_t empty_bytes;
+  uint64_t cache_bytes;
+  uint64_t releasing_bytes;
+};
+
+// The policy an instance starts with, before any control is published.
+struct InstancePolicy {
+  uint64_t min_bytes = 0;
+  int64_t priority = 0;
+  uint64_t headroom_bytes = 0;
+};
+
+// KVCACHED_MIN and KVCACHED_HEADROOM are byte counts with kvctl's suffixes
+// (512M, 2G); KVCACHED_PRIORITY is an integer, larger is more important.
+// Unset values are 0. Throws on a malformed value.
+InstancePolicy startup_policy_from_env();
+
+// One control publication. Fields left empty keep their current value, and
+// every publication takes the instance's next revision.
+struct ControlUpdate {
+  std::optional<uint64_t> limit_bytes;
+  std::optional<uint64_t> min_bytes;
+  std::optional<int64_t> priority;
+  std::optional<uint64_t> headroom_bytes;
+  std::optional<int64_t> retention_tokens = {};
+};
+
+struct BudgetSnapshot {
+  uint64_t budget_bytes = 0;
+  uint64_t charged_bytes = 0;
+  uint64_t instance_charged_bytes = 0;
+  uint64_t instance_limit_bytes = UINT64_MAX;
+  // Free bytes that higher-priority instances keep from this one: the sum of
+  // max(headroom, demand) over them. Grants and forecasts stop above it.
+  uint64_t watermark_bytes = 0;
+  uint64_t sync_acquisitions = 0;
+  uint64_t sync_contentions = 0;
+  uint64_t sync_acquire_ns = 0;
+  uint64_t sync_wait_ns = 0;
+  uint64_t sync_dead_owner_recoveries = 0;
+};
+
+class GpuBudget;
+
+// A receipt never refunds itself: destroying an owner is not proof that a
+// physical allocation has been released. Only checked release may return it.
+class BudgetReceipt {
+public:
+  BudgetReceipt(std::shared_ptr<GpuBudget> budget, size_t slot, uint64_t bytes);
+  BudgetReceipt(const BudgetReceipt &) = delete;
+  BudgetReceipt &operator=(const BudgetReceipt &) = delete;
+  void release();
+  std::shared_ptr<GpuBudget> budget() const { return budget_; }
+
+private:
+  std::shared_ptr<GpuBudget> budget_;
+  size_t slot_;
+  uint64_t bytes_;
+};
+
+// One grant covers a complete native page batch. Unused bytes are refundable
+// without CUDA work. Issued receipts stay charged until physical release.
+class BudgetGrant {
+public:
+  BudgetGrant(std::shared_ptr<GpuBudget> budget, size_t slot, uint64_t bytes);
+  ~BudgetGrant();
+  BudgetGrant(const BudgetGrant &) = delete;
+  BudgetGrant &operator=(const BudgetGrant &) = delete;
+  std::unique_ptr<BudgetReceipt> take(uint64_t bytes);
+  void finish();
+
+private:
+  friend class GpuBudget;
+  std::shared_ptr<GpuBudget> budget_;
+  size_t slot_;
+  uint64_t unused_;
+  bool active_ = true;
+};
+
+// Batch confirmed refunds on this thread, flushing before another receipt
+// would reach this byte threshold. A larger indivisible handle refunds
+// directly. This is a per-thread batching bound, not a bound on global sampling
+// error.
+inline constexpr uint64_t kBudgetRefundBatchBytes = 64 * 1024 * 1024;
+
+// Nested scopes share a bounded refund batch. They never gate calibration or
+// publish a shared in-flight flag. Physical release must precede refund().
+class BudgetMutation {
+public:
+  explicit BudgetMutation(std::shared_ptr<GpuBudget> budget);
+  ~BudgetMutation();
+  BudgetMutation(const BudgetMutation &) = delete;
+  BudgetMutation &operator=(const BudgetMutation &) = delete;
+  void finish();
+
+private:
+  std::shared_ptr<GpuBudget> budget_;
+  bool active_ = true;
+};
+
+// Linux process-shared accounting. No CUDA or IPC is invoked under its data
+// lock. The sampler runs outside that lock at initialization/recalibration.
+class GpuBudget : public std::enable_shared_from_this<GpuBudget> {
+public:
+  // Signed free bytes minus the safety margin, before clamping.
+  using Sampler = std::function<int64_t()>;
+  static std::shared_ptr<GpuBudget> connect(const std::string &path,
+                                            const Sampler &sampler);
+  // Attach to an existing live ledger without creating or sampling an epoch.
+  static std::shared_ptr<GpuBudget> open_control(const std::string &path,
+                                                 bool observe = false);
+  ~GpuBudget();
+  // The startup policy applies only when this registration creates the
+  // instance; the instance's other pools find it set.
+  size_t register_pool(const std::string &instance, int64_t pool,
+                       const InstancePolicy &startup = {});
+  std::unique_ptr<BudgetGrant> grant(size_t slot, uint64_t bytes,
+                                     BudgetSnapshot *state = nullptr,
+                                     const Sampler &sampler = {});
+  BudgetSnapshot snapshot(size_t slot, const Sampler &sampler = {});
+  // Returns applied, stale or conflict. Shrink may leave existing charges
+  // above the target, in which case new grants are denied until release.
+  std::string set_instance_limit(size_t slot, uint64_t bytes,
+                                 uint64_t revision);
+  void configure_control_pool(size_t slot, uint64_t capacity,
+                              uint64_t page_bundle, bool can_shrink,
+                              uint64_t expected_participants = 0,
+                              bool reserve_null = false);
+  void ready_control_pool(size_t slot);
+  InstanceControl query_control(const std::string &instance,
+                                size_t slot = SIZE_MAX);
+  InstanceControl observe_control(const std::string &instance);
+  InstanceControl publish_control(const std::string &instance, uint64_t bytes,
+                                  uint64_t generation,
+                                  std::optional<uint64_t> revision = {});
+  InstanceControl publish_control(const std::string &instance,
+                                  const ControlUpdate &update,
+                                  uint64_t generation,
+                                  std::optional<uint64_t> revision = {});
+  InstanceControl control_state(size_t slot);
+  // Execution reports use limit_revision, not the all-controls revision.
+  bool acknowledge_control(size_t slot, uint64_t revision);
+  bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
+                    uint64_t generation, uint64_t revision);
+  // The instance's demand on this GPU: the new memory its last scheduling
+  // step needed beyond the pool's free blocks, as a forecast of the next
+  // step. A level that each step overwrites; 0 clears it, and it goes away
+  // with the instance. Only the part its max still allows counts.
+  void set_demand(size_t slot, uint64_t bytes);
+  // The same level, posted by a process that drives the instance's workers
+  // (vLLM's scheduler under TP > 1). False if the instance is gone.
+  bool post_demand(const std::string &instance, uint64_t generation,
+                   uint64_t bytes);
+  // What the instance can release on this GPU, by tier: empty (pre-mapped,
+  // no data), cache (prefix cache that frees whole pages) and releasing
+  // (released, not yet refunded). Levels, overwritten when they change.
+  void set_reclaimable(size_t slot, uint64_t empty, uint64_t cache,
+                       uint64_t releasing);
+  bool post_reclaimable(const std::string &instance, uint64_t generation,
+                        uint64_t empty, uint64_t cache, uint64_t releasing);
+  // Publish every live pool together. Invalid identities or an incomplete
+  // batch leave both the aggregate and all pool detail unchanged.
+  bool post_pool_reclaimable(const std::string &instance, uint64_t generation,
+                             const std::vector<PoolReclaimable> &pools);
+  // What the slot's instance should release now so that higher priorities'
+  // max(headroom, demand) fits. Every instance derives the same plan from the
+  // ledger, so all pick the same victims. Nothing is stored: once that fits,
+  // the plan asks for nothing.
+  ReclaimPlan reclaim_plan(size_t slot);
+  bool recalibrate(const Sampler &sampler);
+  void begin_mutation();
+  void end_mutation();
+  void refund(size_t slot, uint64_t bytes);
+#ifdef KVCACHED_BUDGET_TESTING
+  void set_grant_test_hook(void (*hook)()) { grant_test_hook_ = hook; }
+  void set_accounting_test_hook(void (*hook)(int)) {
+    accounting_test_hook_ = hook;
+  }
+#endif
+
+private:
+  friend class BudgetGrant;
+  struct Shared;
+  struct Locked;
+  struct LocalMutation {
+    size_t depth = 0;
+    uint64_t bytes = 0;
+    std::unordered_map<size_t, uint64_t> refunds;
+  };
+  explicit GpuBudget(const std::string &path, const Sampler &sampler);
+  explicit GpuBudget(const std::string &path, bool observe);
+  InstanceControl control_state_locked(size_t instance, size_t slot = SIZE_MAX,
+                                       const Shared *snapshot = nullptr) const;
+  InstanceControl publish_control_locked(size_t instance,
+                                         const ControlUpdate &update,
+                                         std::optional<uint64_t> revision);
+  void check_owner() const;
+  void reclaim_instances_locked();
+  void retire_dead_pools();
+  void invalidate_pool_reclaimable_locked(size_t instance);
+  BudgetSnapshot snapshot_locked(size_t slot) const;
+  bool pool_alive(size_t slot, const Shared *data) const;
+  uint64_t allowed_demand(size_t instance, uint64_t charged,
+                          const Shared *data) const;
+  uint64_t watermark_locked(size_t instance, const Shared *data) const;
+  ReclaimPlan reclaim_locked(size_t instance, const Shared *data) const;
+  void return_locked(size_t slot, uint64_t bytes);
+  void flush_refunds(LocalMutation &local);
+  void accounting_test_hook(int stage);
+  int fd_ = -1;
+  Shared *shared_ = nullptr;
+  std::string path_;
+  int64_t pid_ = 0;
+  uint64_t owner_ = 0;
+  std::mutex mutex_;
+  // Owned by the budget, so allocator static teardown never accesses dead TLS.
+  std::mutex mutation_mutex_;
+  std::unordered_map<std::thread::id, LocalMutation> mutations_;
+  std::vector<size_t> slots_;
+  uint64_t sync_acquisitions_ = 0;
+  uint64_t sync_contentions_ = 0;
+  uint64_t sync_acquire_ns_ = 0;
+  uint64_t sync_wait_ns_ = 0;
+  uint64_t sync_dead_owner_recoveries_ = 0;
+#ifdef KVCACHED_BUDGET_TESTING
+  void (*grant_test_hook_)() = nullptr;
+  void (*accounting_test_hook_)(int) = nullptr;
+#endif
+};
+
+} // namespace kvcached

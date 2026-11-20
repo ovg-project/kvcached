@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -39,6 +40,8 @@ WORKFLOWS = {"weekly": "gpu-correctness.yml", "smoke": "gpu-correctness.yml",
 ENGINE_NAMES = {"vllm": "vLLM", "sglang": "SGLang"}
 LAYOUTS = {"c1": "kvcached, contiguous", "c0": "kvcached, non-contiguous", None: "native"}
 MAX_FAILED_ROWS = 30
+# Token checks that pass with some prompts differing (tests/e2e/run.py).
+TOKENS_EQUAL = re.compile(r"(gen_seq|apc_\d+)_tokens_equal")
 MAX_COMMENT = 60000  # GitHub's limit is 65536 characters
 
 
@@ -284,6 +287,22 @@ def failed_cases(summary: dict[str, Any], setup: dict[str, Any]) -> list[str]:
     return lines
 
 
+def token_mismatches(summary: dict[str, Any]) -> list[str]:
+    """The prompts whose greedy tokens differ from native in cases that still
+    pass, since fewer than half of their phase's prompts differ."""
+    rows = [(case["name"], c["name"], c["detail"]) for case in summary.get("cases", [])
+            for c in case.get("checks", [])
+            if c.get("ok") and c.get("detail") and TOKENS_EQUAL.fullmatch(c["name"])]
+    if not rows:
+        return []
+    return ["", "These cases pass, though some prompts' greedy tokens differ from native: "
+            "fewer than half of each phase's prompts, which is most likely numerical. Greedy "
+            "decoding flips between near-tied tokens, and the engines also do this between "
+            "their own runs.",
+            "", "| case | check | prompts that differ |", "|---|---|---|",
+            *[f"| {case} | `{name}` | {cell(detail[:300])} |" for case, name, detail in rows]]
+
+
 def logs_line(args: argparse.Namespace, days: int) -> str:
     where = f"[artifact]({args.artifact_url})" if args.artifact_url else f"[run]({args.run_url})"
     return (f"Logs: {where}, kept {days} days: serve.log and cmd.txt per case, summary.json "
@@ -320,6 +339,7 @@ def correctness_comment(profile: str, dirs: list[Path], args: argparse.Namespace
         lines += [f"The {name} cases did not finish; the run log has the details."
                   for name in missing] + [""]
     lines += failed_cases(summary, setup) if failed else [f"All {len(cases)} cases passed."]
+    lines += token_mismatches(summary)
     if args.pr:
         # The pull request may change the cases, so its setup is its own.
         section = correctness_section(profile, setup, args).split("\n", 2)[2]
@@ -397,6 +417,7 @@ def perf_comment(results: Path, args: argparse.Namespace) -> str:
         lines += ["", "Hopper correctness:", "", *failed_cases(e2e, e2e_setup or {})]
     else:
         lines += ["", f"Hopper correctness: all {len(e2e.get('cases', []))} cases passed."]
+    lines += token_mismatches(e2e or {})
     lines += ["", "Setup: the issue description. " + logs_line(args, 90)]
     return "\n".join(lines)[:MAX_COMMENT] + "\n"
 

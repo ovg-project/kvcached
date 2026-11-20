@@ -3,6 +3,7 @@
 
 import gc
 import importlib
+import importlib.util
 import sys
 import types
 from typing import Any
@@ -95,10 +96,20 @@ def _load_sglang_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "posix_ipc", mock.MagicMock())
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", mock.MagicMock())
 
-    from kvcached.integration.sglang import interfaces, patches
+    import kvcached.integration.sglang as package
 
-    importlib.reload(interfaces)
-    importlib.reload(patches)
+    # Do not replace exception classes in modules held by other test files.
+    loaded = []
+    for name in ("interfaces", "patches"):
+        original = importlib.import_module(f"{package.__name__}.{name}")
+        spec = importlib.util.spec_from_file_location(original.__name__, original.__file__)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, original.__name__, module)
+        monkeypatch.setattr(package, name, module)
+        spec.loader.exec_module(module)
+        loaded.append(module)
+    interfaces, patches = loaded
     return interfaces, patches, torch_mock
 
 

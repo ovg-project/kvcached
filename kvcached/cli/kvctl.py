@@ -13,7 +13,14 @@ from typing import List, Optional, TypedDict
 
 from kvcached import control_segment
 from kvcached.cli.kvtop import _detect_kvcache_ipc_names, kvtop as kvtop_ui
-from kvcached.cli.utils import _format_size, get_ipc_path, get_kv_cache_limit, update_kv_cache_limit
+from kvcached.cli.utils import (
+    _format_size,
+    get_ipc_path,
+    get_kv_cache_limit,
+    get_segment_control,
+    update_kv_cache_controls,
+    update_kv_cache_limit,
+)
 
 try:
     import readline  # type: ignore
@@ -61,9 +68,13 @@ def _clr(text: str, color: Optional[str] = None, *, bold: bool = False) -> str:
 
 
 COMMANDS = [
-    'list', 'limit', 'limit-percent', 'watch', 'kvtop', 'delete', 'help',
-    'exit', 'quit'
+    'list', 'limit', 'limit-percent', 'min', 'priority', 'headroom', 'watch',
+    'kvtop', 'delete', 'help', 'exit', 'quit'
 ]
+
+# Commands whose first argument is an IPC name.
+IPC_COMMANDS = ('limit', 'limit-percent', 'min', 'priority', 'headroom',
+                'list', 'watch', 'delete')
 
 # Nicely formatted help text for the interactive shell.
 HELP_TEXT = """\
@@ -71,6 +82,9 @@ Available commands:
   list [--all] [ipc ...]       List active IPC segments; --all includes unused
   limit <ipc> <size>           Set absolute limit (e.g. 512M, 2G)
   limit-percent <ipc> <pct>    Set limit as percentage of total GPU RAM
+  min <ipc> <size>             Set the reclaim floor (e.g. 512M, 2G)
+  priority <ipc> <int>         Set the priority (larger is more important)
+  headroom <ipc> <size>        Set the headroom kept from lower priorities
   watch [-n sec] [ipc ...]     Continuously display usage table
   kvtop [ipc ...] [--refresh r]  Launch curses kvtop UI (q to quit)
   !<shell cmd>                 Run command in system shell
@@ -118,7 +132,7 @@ def _setup_readline():
 
             cmd = tokens[0]
 
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd in IPC_COMMANDS:
                 ipc_names = _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                 # Case-insensitive matching so "VLLM" also matches "vllm".
                 options = [
@@ -128,7 +142,7 @@ def _setup_readline():
                 options = [c for c in COMMANDS if c.startswith(text)]
         else:
             cmd = tokens[0]
-            if cmd in ('limit', 'limit-percent', 'list', 'watch', 'delete'):
+            if cmd in IPC_COMMANDS:
                 options = [
                     n for n in _detect_kvcache_ipc_names(include_inactive=(cmd == "delete"))
                     if n.lower().startswith(text.lower())
@@ -211,21 +225,32 @@ class _IpcStats(TypedDict):
     ipc: str
     limit_bytes: int
     used_bytes: int
+    gpus: list
 
 
 def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_inactive: bool = False):
     names = ipcs or _detect_kvcache_ipc_names(include_inactive=include_inactive)
     res: List[_IpcStats] = []
+    seen = set()
     for name in names:
-        if not include_inactive and control_segment.active(get_ipc_path(name)) is False:
+        active = control_segment.active(get_ipc_path(name))
+        if not include_inactive and active is False:
             continue
         info = get_kv_cache_limit(name)
         if info is None:
             continue
+        state = (get_segment_control(name)
+                 if active is not False else {"gpus": []})
+        owner = state["instance"] if state["gpus"] else name
+        if owner in seen:
+            continue
+        seen.add(owner)
         res.append({
-            'ipc': name,
-            'limit_bytes': info.total_size,
-            'used_bytes': info.used_size,
+            'ipc': owner,
+            'limit_bytes': sum(gpu['effective_limit_bytes'] for gpu in state['gpus']),
+            'used_bytes': (sum(gpu['charged_bytes'] for gpu in state['gpus'])
+                           if state['gpus'] else info.used_size),
+            'gpus': state['gpus'],
         })
 
     if json_out:
@@ -235,7 +260,7 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_i
             print("No active KVCached segments found.")
             return
         print(
-            _clr(f"{'IPC':24} {'Limit':>12} {'Used':>12} {'%':>6}",
+            _clr(f"{'IPC':24} {'Effective Σ':>12} {'Used':>12} {'%':>6}",
                  'cyan',
                  bold=True))
         for entry in res:
@@ -255,40 +280,33 @@ def cmd_list(ipcs: Optional[List[str]] = None, json_out: bool = False, include_i
 
 
 def cmd_limit(ipc: str, size_str: str):
-    """Set an absolute limit for an existing IPC segment.
-
-    We first validate that the supplied ``ipc`` name corresponds to a running
-    segment; otherwise we refuse the operation to avoid accidentally creating
-    a new (wrong-case) shared-memory file.
-    """
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        avail = _detect_kvcache_ipc_names()
-        if avail:
-            print("Active IPC names:", ", ".join(avail), file=sys.stderr)
-        return
-
-    size_bytes = _parse_size(size_str)
-    update_kv_cache_limit(ipc, size_bytes)
+    """Set a physical-byte max independently on each live instance GPU."""
+    return update_kv_cache_limit(ipc, _parse_size(size_str))
 
 
 def cmd_limit_percent(ipc: str, percent: float):
-    """Set limit as percentage of total GPU RAM for an existing IPC."""
-    if get_kv_cache_limit(ipc) is None:
-        print(_clr(f"Error: IPC '{ipc}' not found.", 'red', bold=True),
-              file=sys.stderr)
-        return
-
+    """Set a byte max derived from device zero, preserving CLI syntax."""
     from kvcached.cli.utils import get_total_gpu_memory
 
     total_mem = get_total_gpu_memory()
     if total_mem <= 0:
-        print("CUDA unavailable; cannot compute size from percentage",
-              file=sys.stderr)
-        sys.exit(1)
-    size_bytes = int(total_mem * percent / 100.0)
-    update_kv_cache_limit(ipc, size_bytes)
+        raise RuntimeError("CUDA unavailable; cannot compute size from percentage")
+    return update_kv_cache_limit(ipc, int(total_mem * percent / 100.0))
+
+
+def cmd_min(ipc: str, size_str: str):
+    """Set the reclaim floor in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, min_bytes=_parse_size(size_str))
+
+
+def cmd_priority(ipc: str, priority: int):
+    """Set the priority on each live instance GPU."""
+    return update_kv_cache_controls(ipc, priority=priority)
+
+
+def cmd_headroom(ipc: str, size_str: str):
+    """Set the headroom in bytes per GPU, like cmd_limit()."""
+    return update_kv_cache_controls(ipc, headroom_bytes=_parse_size(size_str))
 
 
 def cmd_watch(interval: float = 1.0, ipcs: Optional[List[str]] = None):
@@ -367,6 +385,12 @@ def interactive_shell():
                 cmd_limit(tokens[1], tokens[2])
             elif cmd == 'limit-percent' and len(tokens) == 3:
                 cmd_limit_percent(tokens[1], float(tokens[2]))
+            elif cmd == 'min' and len(tokens) == 3:
+                cmd_min(tokens[1], tokens[2])
+            elif cmd == 'priority' and len(tokens) == 3:
+                cmd_priority(tokens[1], int(tokens[2]))
+            elif cmd == 'headroom' and len(tokens) == 3:
+                cmd_headroom(tokens[1], tokens[2])
             elif cmd == 'watch':
                 # Syntax: watch [-n SEC] [ipc ...]  (matches CLI behaviour)
                 interval: float = 1.0
@@ -447,6 +471,17 @@ def main():
     p_lp.add_argument('ipc')
     p_lp.add_argument('percent', type=float)
 
+    # min, priority, headroom
+    p_min = sub.add_parser('min', help='Set the reclaim floor')
+    p_min.add_argument('ipc')
+    p_min.add_argument('size', help="Size, e.g. 512M, 2G")
+    p_prio = sub.add_parser('priority', help='Set the priority (larger is more important)')
+    p_prio.add_argument('ipc')
+    p_prio.add_argument('priority', type=int)
+    p_head = sub.add_parser('headroom', help='Set the headroom kept from lower priorities')
+    p_head.add_argument('ipc')
+    p_head.add_argument('size', help="Size, e.g. 512M, 2G")
+
     # watch
     p_watch = sub.add_parser('watch', help='Continuously list')
     p_watch.add_argument('-n', '--interval', type=float, default=1.0)
@@ -477,6 +512,12 @@ def main():
         cmd_limit(args.ipc, args.size)
     elif args.command == 'limit-percent':
         cmd_limit_percent(args.ipc, args.percent)
+    elif args.command == 'min':
+        cmd_min(args.ipc, args.size)
+    elif args.command == 'priority':
+        cmd_priority(args.ipc, args.priority)
+    elif args.command == 'headroom':
+        cmd_headroom(args.ipc, args.size)
     elif args.command == 'watch':
         cmd_watch(args.interval, args.ipc if args.ipc else None)
     elif args.command == 'kvtop':
