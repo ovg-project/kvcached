@@ -24,7 +24,8 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
     sleep_cfg_dict: Dict[str, Any] = raw_cfg.get("sleep_manager", {}) or {}
 
     # Extract model configurations for sleep manager from parsed instances
-    vllm_config, sglang_config = {}, {}
+    vllm_config: Dict[str, Dict[str, str]] = {}
+    sglang_config: Dict[str, Dict[str, Any]] = {}
     endpoints = extract_models_mapping(
         raw_cfg)  # {model: {'endpoint': {...}}}
     for model_name, entry in endpoints.items():
@@ -35,8 +36,13 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
         engine_name = endpoint_info.get("engine") or ""
         engine_name = engine_name.lower()
 
-        target = vllm_config if engine_name == "vllm" else sglang_config
-        target[model_name] = {"host": host, "port": port}
+        if engine_name == "vllm":
+            vllm_config[model_name] = {"host": host, "port": port}
+        else:
+            sglang_config[model_name] = {
+                "host": host, "port": port,
+                "weights_cpu_backup": entry.get("weights_cpu_backup", False),
+            }
 
     # Merge extracted model configs, guaranteeing dict type
     sleep_cfg_dict.update(

@@ -5,7 +5,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 from traffic_monitor import TrafficMonitor
@@ -32,9 +32,7 @@ class SleepConfig:
     vllm_models_config: Dict[str, Dict[
         str,
         str]] = None  # model_name -> {"host": "localhost", "port": "8000"}
-    sglang_models_config: Dict[str, Dict[
-        str,
-        str]] = None  # model_name -> {"host": "localhost", "port": "8000"} for memory occupation control and full model recovery
+    sglang_models_config: Dict[str, Dict[str, Any]] = None
 
     def __post_init__(self):
         """Initialize default model configs if None"""
@@ -211,14 +209,15 @@ class SleepManager:
                     )
                     return False
 
-                # Step 2: Perform full model recovery (load new weights, update, cleanup)
-                recovery_success = await self._perform_sglang_model_recovery(
-                    model_name, model_config)
-                if not recovery_success:
-                    logger.error(
-                        f"Failed to perform full model recovery for SGLang model {model_name}"
-                    )
-                    return False
+                # CPU-backed weights are restored by resume itself.
+                if model_config.get("weights_cpu_backup") is not True:
+                    recovery_success = await self._perform_sglang_model_recovery(
+                        model_name, model_config)
+                    if not recovery_success:
+                        logger.error(
+                            f"Failed to perform full model recovery for SGLang model {model_name}"
+                        )
+                        return False
             else:
                 logger.warning(
                     f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
@@ -508,11 +507,13 @@ class SleepManager:
     def add_sglang_model(self,
                          model_name: str,
                          host: str = "localhost",
-                         port: str = "8000"):
-        """Add a SGLang model configuration for memory occupation control and full model recovery"""
+                         port: str = "8000",
+                         *, weights_cpu_backup: bool = False):
+        """Register a model; set weights_cpu_backup only if enabled in SGLang."""
         self.config.sglang_models_config[model_name] = {
             "host": host,
-            "port": port
+            "port": port,
+            "weights_cpu_backup": weights_cpu_backup,
         }
         logger.info(
             f"Added SGLang model configuration for memory control and recovery: {model_name} at {host}:{port}"
@@ -530,12 +531,12 @@ class SleepManager:
                 f"No SGLang memory control and recovery configuration found for model {model_name}"
             )
 
-    def get_sglang_models(self) -> Dict[str, Dict[str, str]]:
+    def get_sglang_models(self) -> Dict[str, Dict[str, Any]]:
         """Get all configured SGLang models"""
         return self.config.sglang_models_config.copy()
 
     async def _perform_sglang_model_recovery(
-            self, model_name: str, model_config: Dict[str, str]) -> bool:
+            self, model_name: str, model_config: Dict[str, Any]) -> bool:
         """
         Perform complete model recovery for SGLang models after resume_memory_occupation
 
