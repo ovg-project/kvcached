@@ -16,7 +16,12 @@ from kvcached.cli.utils import (
     init_kv_cache_limit,
 )
 from kvcached.mem_info_tracker import MemInfoTracker
-from kvcached.utils import DEFAULT_IPC_NAME
+from kvcached.utils import DEFAULT_IPC_NAME, SHM_DIR
+
+pytestmark = pytest.mark.skipif(
+    not os.path.isdir(SHM_DIR),
+    reason=f"{SHM_DIR} is not available on this platform",
+)
 
 IPC_NAME = DEFAULT_IPC_NAME
 IPC_PATH = get_ipc_path(IPC_NAME)
