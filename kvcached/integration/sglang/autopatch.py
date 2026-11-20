@@ -20,7 +20,10 @@ from kvcached.integration.sglang.hicache import (
 )
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
+    DeepSeekV4KVPoolPatch,
+    DeepSeekV4RunnerOwnershipPatch,
     DeepSeekV4RuntimeReservationPatch,
+    DeepSeekV4SWAAllocatorPatch,
     ElasticAllocatorPatch,
     ElasticHybridLinearKVPoolPatch,
     ElasticMambaPoolPatch,
@@ -74,6 +77,9 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (ElasticMambaPoolPatch(), SGLANG_ALL_RANGE),
             (ElasticHybridLinearKVPoolPatch(), SGLANG_ALL_RANGE),
             (DeepSeekV4RuntimeReservationPatch(), ">=0.5.12,<0.5.21.dev0"),
+            (DeepSeekV4KVPoolPatch(), ">=0.5.13"),
+            (DeepSeekV4SWAAllocatorPatch(), ">=0.5.13"),
+            (DeepSeekV4RunnerOwnershipPatch(), ">=0.5.13"),
             # Importing the capacity owner captures memory-pool classes in
             # module globals, so apply these only after every pool alias.
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
@@ -83,7 +89,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # miss into a retried prefill instead of a scheduler exit
             # (#547); they read the 0.5.20 batch and request shapes.
             (ScheduleBatchCapacityMissPatch(), ">=0.5.20"),
-            (ScheduleBatchDecodeContextPatch(), ">=0.5.19,<0.5.20"),
+            (ScheduleBatchDecodeContextPatch(), ">=0.5.19,<=0.5.20"),
             (SchedulerCapacityMissPatch(), ">=0.5.20"),
             # Under TP every rank's pool reports its own GPU's headroom;
             # this makes the ranks of a waiting queue admit and evict from
@@ -108,6 +114,10 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
 
     # Apply all patches
     results = patch_manager.apply_all_patches()
+
+    from kvcached.integration.sglang.scheduler.rank_coordination import patch_rank_coordination
+
+    patch_rank_coordination()
 
     # Log results
     log_patch_results("sglang", results)
