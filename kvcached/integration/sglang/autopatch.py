@@ -115,5 +115,9 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
     # Apply all patches
     results = patch_manager.apply_all_patches()
 
+    from kvcached.integration.sglang.scheduler.rank_coordination import patch_rank_coordination
+
+    patch_rank_coordination()
+
     # Log results
     log_patch_results("sglang", results)

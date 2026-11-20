@@ -1090,6 +1090,44 @@ def test_alloc_for_extend_wrapper_releases_and_types_the_miss(
     assert all(not req.kv.holds_kv and not req.kv.holds_mamba for req in reqs)
 
 
+def test_tagged_coordination_owns_the_budget_and_prepare_collectives(monkeypatch, cpu_tensors):
+    from kvcached.integration.sglang.scheduler import rank_coordination
+
+    pipeline = Pipeline(monkeypatch, rows=4, mamba_slots=None, tokens=16)
+    batch = FakeBatch([FakeReq("coordinated")], pipeline.pool, pipeline.tree_cache,
+                      pipeline.batch_module, extend_num_tokens=4)
+    monkeypatch.setattr(patches, "_sglang_group_capacity_miss",
+                        lambda *args: pytest.fail("duplicate prepare collective"))
+    monkeypatch.setattr(patches, "_sglang_budget_managers",
+                        lambda *args: pytest.fail("duplicate budget round"))
+    token = rank_coordination._ACTIVE.set(object())
+    try:
+        with _sglang_budget_round(pipeline.scheduler):
+            batch.prepare_for_extend()
+    finally:
+        rank_coordination._ACTIVE.reset(token)
+    assert batch.reqs[0].kv.holds_kv
+
+
+def test_tagged_admission_does_not_consume_a_budget_read_for_demand_reporting(monkeypatch):
+    from kvcached.integration.sglang.scheduler import rank_coordination
+
+    result = object()
+    adder_class = type("PrefillAdder", (), {"add_one_req": lambda *args: result})
+    module = types.ModuleType("test_policy")
+    setattr(module, "PrefillAdder", adder_class)
+    patch = patches.PrefillAdderDemandPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version", lambda library: "0.5.20")
+    assert patch.apply(module)
+    monkeypatch.setattr(patches, "_sglang_prefill_retry_budgets",
+                        lambda *args: pytest.fail("consumed the native admission budget gate"))
+    token = rank_coordination._ACTIVE.set(object())
+    try:
+        assert adder_class().add_one_req(FakeReq("coordinated")) is result
+    finally:
+        rank_coordination._ACTIVE.reset(token)
+
+
 def test_hybrid_miss_exits_the_scheduler_without_the_patches(
         monkeypatch, cpu_tensors, mamba_slot_allocator_cls):
     """The #547 crash: admitted requests, then the Mamba pool misses."""

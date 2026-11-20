@@ -419,7 +419,9 @@ def _sglang_budget_round(scheduler: Any):
     own behaviour there until a stage-wide verdict exists, and the budget
     follows them.
     """
-    if _sglang_open_budget_round() is not None:
+    from kvcached.integration.sglang.scheduler.rank_coordination import active
+
+    if active() is not None or _sglang_open_budget_round() is not None:
         yield
         return
     groups = _sglang_queue_cpu_groups() if _sglang_pipeline_stages() == 1 else []
@@ -3362,18 +3364,24 @@ def _resolve_sglang_parallel_context() -> tuple[int, int, int]:
 
 
 def _dsv4_single_rank_backing() -> bool:
-    # A local backing miss must not split distributed allocation outcomes.
-    # Keep native storage unless both dimensions are known to be single-rank.
+    from kvcached.integration.sglang.scheduler.config import enabled, validate_runtime_config
+
     try:
         from sglang.srt.distributed import (
             get_pipeline_model_parallel_world_size,
             get_tensor_model_parallel_world_size,
         )
 
-        return (int(get_tensor_model_parallel_world_size()) == 1
-                and int(get_pipeline_model_parallel_world_size()) == 1)
+        tp_size = int(get_tensor_model_parallel_world_size())
+        pp_size = int(get_pipeline_model_parallel_world_size())
     except (ImportError, AttributeError, AssertionError, RuntimeError, TypeError, ValueError):
         return False
+    if tp_size == 1 and pp_size == 1:
+        return True
+    if enable_kvcached() and enabled():
+        validate_runtime_config()
+        return tp_size > 1 and pp_size == 1
+    return False
 
 
 def _new_tp_scoped_kvcached_allocator(
@@ -3871,7 +3879,9 @@ class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
 
         @functools.wraps(original)
         def _patched_alloc_for_extend(batch: Any) -> Any:
-            if not enable_kvcached() or _sglang_pipeline_stages() > 1:
+            from kvcached.integration.sglang.scheduler.rank_coordination import active
+
+            if active() is not None or not enable_kvcached() or _sglang_pipeline_stages() > 1:
                 return original(batch)
             pool = batch.req_to_token_pool
             held = [_prefill_entry_state(req) for req in batch.reqs]
@@ -4032,6 +4042,10 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
 
         @functools.wraps(original)
         def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            from kvcached.integration.sglang.scheduler.rank_coordination import active
+
+            if active() is not None:
+                return original(self, req, *args, **kwargs)
             enabled = enable_kvcached()
             if enabled:
                 page_size = max(1, int(getattr(self, "page_size", 1) or 1))
