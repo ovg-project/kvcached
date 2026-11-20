@@ -208,8 +208,6 @@ def preview(scheduler, running_batch, *, slots=None, new_slots=None, match_cache
                 break
             if original.finished():
                 continue
-            if False and adder.dsa_prefill_cp_in_seq_split and adder.can_run_list:
-                break
             needs_row = request_slot(original) is None
             if new_slots is not None and needs_row and (used_new_slots >= new_slots):
                 break

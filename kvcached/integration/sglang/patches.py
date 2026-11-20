@@ -11,6 +11,7 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import threading
 import time
 import types
@@ -3981,13 +3982,14 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                 def priority_miss(requests):
                     return _sglang_priority_decode_miss(backing.manager, requests)
 
-                if other_backings or state_backings:
-                    bind_native_swa(allocator_self, backing, full_backing,
-                                    full_backings=tuple(other_backings), swa_backings=state_backings,
-                                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss)
-                else:
-                    bind_native_swa(allocator_self, backing, full_backing,
-                                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss)
+                bind_native_swa(
+                    allocator_self, backing, full_backing,
+                    full_backings=tuple(other_backings), swa_backings=state_backings,
+                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss,
+                    paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
+                                        "PagedTokenToKVPoolAllocator", None)
+                    if getattr(self, "detected_version", None) == "0.5.20" else None,
+                )
 
         self._mark_as_patched(_wrapped_init)
         allocator_class.__init__ = _wrapped_init

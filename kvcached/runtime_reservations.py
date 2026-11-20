@@ -11,6 +11,7 @@ owns that decision and must avoid counting already-profiled memory twice.
 from __future__ import annotations
 
 import operator
+import os
 import re
 import threading
 import weakref
@@ -22,6 +23,17 @@ from kvcached.utils import normalize_gpu_device
 _Key = Tuple[str, str, str, int]
 _reservations: Dict[_Key, Tuple[weakref.ReferenceType[Any], int]] = {}
 _lock = threading.RLock()
+
+
+def _reset_after_fork() -> None:
+    global _lock, _reservations
+    # A parent thread may have held the old lock when this process forked.
+    _lock = threading.RLock()
+    _reservations = {}
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def _device_key(device: str) -> str:
@@ -116,6 +128,7 @@ def get_runtime_reservation_snapshots(
     if device is not None:
         device = _device_key(device)
     totals: Dict[Tuple[str, str, str], Tuple[int, int]] = {}
+    live_owners: Dict[int, Any] = {}
     with _lock:
         # Copy the dictionary before Python iteration: allocating item tuples
         # can trigger cyclic GC, whose callbacks mutate the original registry
@@ -125,8 +138,12 @@ def get_runtime_reservation_snapshots(
                 continue
             if device is not None and key[1] != device:
                 continue
-            if reference() is None:
-                continue
+            # Keep an owner alive across all of its categories in this snapshot.
+            if key[3] not in live_owners:
+                owner = reference()
+                if owner is None:
+                    continue
+                live_owners[key[3]] = owner
             group = key[:3]
             total, count = totals.get(group, (0, 0))
             totals[group] = (total + num_bytes, count + 1)
@@ -154,6 +171,8 @@ def get_runtime_owned_reservation_breakdown(
     integration: str,
 ) -> Dict[str, int]:
     """Return the reported bytes per pool category on one device."""
+    if device is None or integration is None:
+        raise ValueError("device and integration are required for a per-device query")
     return {snapshot.pool_name: snapshot.num_bytes
             for snapshot in get_runtime_reservation_snapshots(
                 integration=integration, device=device)}

@@ -388,7 +388,8 @@ def test_dsv4_requires_runner_identity_before_elastic_allocation(monkeypatch):
         patches._dsv4_pool_context.reset(token)
 
 
-def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
+@pytest.mark.parametrize("version", ["0.5.20", "0.5.19"])
+def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch, version):
     _interfaces, patches, _torch_mock = _load_modules(monkeypatch)
     allocator_module: Any = types.ModuleType("sglang.srt.mem_cache.allocator")
 
@@ -414,6 +415,8 @@ def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
 
     allocator_module.ElasticTokenToKVPoolAllocator = ElasticTokenAllocator
     allocator_module.ElasticPagedTokenToKVPoolAllocator = ElasticPagedAllocator
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.allocator.paged",
+                        types.SimpleNamespace(PagedTokenToKVPoolAllocator=NativePagedAllocator))
     mem_cache_module: Any = types.ModuleType("sglang.srt.mem_cache")
     mem_cache_module.allocator = allocator_module
     monkeypatch.setitem(sys.modules, "sglang", types.ModuleType("sglang"))
@@ -457,6 +460,7 @@ def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
     # Exercise the registered order, rather than capturing pristine aliases.
     assert patches.ElasticSWAAllocatorPatch().alias_swa_sub_allocators(swa_module)
     patch = patches.DeepSeekV4SWAAllocatorPatch()
+    patch.detected_version = version
     assert patch.patch_swa_allocator(swa_module)
 
     from kvcached.integration.sglang import dsv4_backing
@@ -476,8 +480,10 @@ def test_swa_allocator_dispatches_by_pool_ownership(monkeypatch):
     assert managed.swa.kind == "native-paged"
     assert not hasattr(managed_cache, "full_kv_pool")
     bind.assert_called_once_with(managed, managed_cache.swa_kv_pool._kvcached_dsv4_backing, None,
+                                 full_backings=(), swa_backings=(),
                                  on_capacity_miss=patches._sglang_capacity_miss,
-                                 on_priority_miss=mock.ANY)
+                                 on_priority_miss=mock.ANY,
+                                 paged_v0520=NativePagedAllocator if version == "0.5.20" else None)
 
     native_cache = types.SimpleNamespace(
         full_kv_pool=object(), swa_kv_pool=object()
