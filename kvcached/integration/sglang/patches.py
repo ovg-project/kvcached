@@ -478,7 +478,10 @@ def _sglang_demand_round(scheduler: Any):
             native = _sglang_dsv4_demand_allocator(scheduler)
             managers = _token_kv_managers(native) if native is not None else [manager]
             for member in managers:
-                member.take_step_alloc_blocks()
+                if native is None:
+                    member.take_step_alloc_blocks()
+                else:
+                    member.take_step_alloc_blocks(track_exact=True)
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
@@ -698,8 +701,8 @@ def _sglang_demand_manager(scheduler: Any) -> Any:
     """The token pool's manager, which posts demand on this rank's GPU.
 
     Ordinary composites use their full-attention manager. Native DSV4 uses
-    a backing manager for reclamation and posts each backing's demand in
-    physical units separately. A pipeline posts nothing.
+    a backing manager for reclamation and combines the backings' demand in
+    bytes. A pipeline posts nothing.
     """
     if _sglang_pipeline_stages() > 1:
         return None
@@ -752,10 +755,21 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
     if miss is not None:
         scheduler._kvcached_prefill_demand = max(
             0, miss - getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
-    for manager, physical in allocator._kvcached_backing_demand(need):
+    demands = allocator._kvcached_backing_demand(need)
+    total_bytes = 0
+    for manager, physical in demands:
         allocated = manager.take_step_alloc_blocks()
-        manager.post_demand(manager.demand_pages(allocated + physical))
+        total_bytes += (manager.demand_pages(allocated + physical)
+                        * manager._memory_limit_page_bundle_bytes())
         manager.post_reclaimable_levels()
+    # Every backing belongs to the rank-local instance. The native demand
+    # field is instance-wide, so publishing each pool would overwrite peers.
+    # Sum byte costs (including different layer counts) and publish once.
+    if demands and total_bytes != getattr(allocator, "_kvcached_posted_demand_bytes", 0):
+        from kvcached.vmm_ops import set_kv_demand
+
+        set_kv_demand(total_bytes, demands[0][0].group_id)
+        allocator._kvcached_posted_demand_bytes = total_bytes
 
 
 def _sglang_prefill_input_blocks(adder: Any, page_size: int) -> int:
@@ -3364,6 +3378,8 @@ def _resolve_sglang_parallel_context() -> tuple[int, int, int]:
 
 
 def _dsv4_single_rank_backing() -> bool:
+    if not enable_kvcached():
+        return False
     from kvcached.integration.sglang.scheduler.config import enabled, validate_runtime_config
 
     try:
@@ -3378,7 +3394,7 @@ def _dsv4_single_rank_backing() -> bool:
         return False
     if tp_size == 1 and pp_size == 1:
         return True
-    if enable_kvcached() and enabled():
+    if enabled():
         validate_runtime_config()
         return tp_size > 1 and pp_size == 1
     return False
@@ -3526,10 +3542,11 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
 
         class ElasticDeepSeekV4SWAKVPool(original_single):  # type: ignore[misc, valid-type]
             _next_group_id = 20_000
+            _pool_name = "dsv4_swa_kv"
 
             def __init__(self, *args: Any, **kwargs: Any) -> None:
-                self._group_id = type(self)._next_group_id
-                type(self)._next_group_id += 1
+                self._group_id = ElasticDeepSeekV4SWAKVPool._next_group_id
+                ElasticDeepSeekV4SWAKVPool._next_group_id += 1
                 super().__init__(*args, **kwargs)
 
             def _create_buffers(self) -> None:
@@ -3578,7 +3595,7 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                     reserve_null_block=True,
                     num_kv_buffers=1,
                     group_id=self._group_id,
-                    pool_name="dsv4_swa_kv",
+                    pool_name=self._pool_name,
                 )
                 self._kvcached_dsv4_backing = SWABacking(
                     self.kvcached_allocator,
@@ -3588,8 +3605,14 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                 )
                 self._kvcached_managed = True
 
+        class ElasticDeepSeekV4C128KVPool(ElasticDeepSeekV4SWAKVPool):
+            # Same padded byte layout; native full-page IDs address this pool.
+            _pool_name = "dsv4_c128_kv"
+
         class ElasticDeepSeekV4TokenToKVPool(original_top):  # type: ignore[misc, valid-type]
             def _make_kv_pool(self, *args: Any, **kwargs: Any) -> Any:
+                if not enable_kvcached():
+                    return original_make_pool_fn(self, *args, **kwargs)
                 bound = make_pool_signature.bind(self, *args, **kwargs)
                 bound.apply_defaults()
                 pool_class = bound.arguments["cls"]
@@ -3625,6 +3648,40 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                         "Leaving DeepSeek-V4 SWA KV runtime-owned because "
                         "the layout or parallel topology is not supported"
                     )
+                is_c128_pool = (
+                    int(bound.arguments["page_size"]) * 128
+                    == int(bound.arguments["global_page_size"])
+                    and pool_class is original_single
+                    and self.qk_nope_head_dim == 448
+                    and self.qk_rope_head_dim == 64
+                    and int(bound.arguments["size"]) > 0
+                    and int(bound.arguments["layer_num"]) > 0
+                )
+                if is_c128_pool and not CONTIGUOUS_LAYOUT and _dsv4_single_rank_backing():
+                    context = _dsv4_pool_context.get()
+                    if context is None:
+                        raise KVCachedConfigError("C128 construction requires runner ownership")
+                    is_draft, shared_allocator = context
+                    if is_draft and shared_allocator is not None:
+                        logical = getattr(shared_allocator, "logical_attn_allocator",
+                                          shared_allocator)
+                        if (int(bound.arguments["global_page_size"]) != logical.page_size
+                                or int(bound.arguments["size"]) * 128 < logical.size_full):
+                            raise KVCachedConfigError(
+                                "Draft C128 storage must cover the shared target full IDs")
+                    elif hasattr(getattr(self, "swa_kv_pool", None),
+                                 "_kvcached_dsv4_backing"):
+                        import kvcached.integration.sglang.interfaces as kvi
+
+                        # Small pools keep native storage: their entire payload
+                        # would fit in the permanently mapped padding page.
+                        native_page_size = int(bound.arguments["page_size"])
+                        page_bytes = math.ceil(native_page_size * 584 / 576) * 576
+                        num_pages = (int(bound.arguments["size"])
+                                     + native_page_size + 1) // native_page_size
+                        if num_pages * page_bytes >= kvi.get_page_size_for_block(
+                                page_bytes, kvi.PAGE_SIZE):
+                            bound.arguments["cls"] = ElasticDeepSeekV4C128KVPool
                 return original_make_pool_fn(*bound.args, **bound.kwargs)
 
         setattr(
@@ -3778,8 +3835,14 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
             if backing is not None:
                 from kvcached.integration.sglang.dsv4_backing import bind_native_swa
 
+                c128_pool = getattr(kvcache, "c128_kv_pool", None)
+                full_backing = getattr(c128_pool, "_kvcached_dsv4_backing", None)
+                if (full_backing is not None and c128_pool is not None
+                        and c128_pool.page_size * 128 != page_size):
+                    raise KVCachedConfigError("C128 and full allocator page geometry differs")
                 bind_native_swa(
-                    allocator_self, backing, on_capacity_miss=_sglang_capacity_miss,
+                    allocator_self, backing, full_backing,
+                    on_capacity_miss=_sglang_capacity_miss,
                     on_priority_miss=lambda requests: _sglang_priority_decode_miss(backing.manager, requests),
                     paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
                                         "PagedTokenToKVPoolAllocator", None)
@@ -4004,6 +4067,39 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _release_cuda_cache_for_parked_dsv4(adder: Any) -> None:
+    allocator = _sglang_dsv4_demand_allocator(adder)
+    if allocator is None:
+        return
+    # TP admission previews clone the request on every scheduler round.
+    # The logical allocator outlives those previews on this rank.
+    now = time.monotonic()
+    if now < getattr(allocator, "_kvcached_next_cuda_cache_probe", 0.0):
+        return
+    allocator._kvcached_next_cuda_cache_probe = now + 1.0
+    costs = allocator._kvcached_parked_prefill_growth_costs()
+    if not costs:
+        return
+
+    import torch
+
+    from kvcached.utils import GPU_UTILIZATION
+
+    free, total = torch.cuda.mem_get_info()
+    headroom = int(total * (1.0 - GPU_UTILIZATION))
+    next_cost = min((cost for cost in costs if free < headroom + cost), default=None)
+    if next_cost is None:
+        return
+    stats = torch.cuda.memory_stats()
+    reserved = stats.get("reserved_bytes.all.current", 0)
+    releasable = (reserved - stats.get("active_bytes.all.current", reserved)
+                  - stats.get("inactive_split_bytes.all.current", reserved))
+    if releasable > 0 and free + releasable >= headroom + next_cost:
+        # Even a partial release can cover the actual placement. Admission
+        # rechecks the driver's free memory and the agreed rank budget.
+        torch.cuda.empty_cache()
+
+
 class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
     """Record a waiting request that the prefill budget cannot admit.
 
@@ -4093,6 +4189,17 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_add_one_req, marker)
         PrefillAdder.add_one_req = _patched_add_one_req
+        add_chunked = getattr(PrefillAdder, "add_chunked_req", None)
+        if add_chunked is not None:
+            @functools.wraps(add_chunked)
+            def add_chunked_req(self, req: Any) -> Any:
+                count = len(self.can_run_list)
+                result = add_chunked(self, req)
+                if result is req and len(self.can_run_list) == count:
+                    _release_cuda_cache_for_parked_dsv4(self)
+                return result
+
+            PrefillAdder.add_chunked_req = add_chunked_req
         return True
 
 
@@ -4618,10 +4725,11 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
-                    if ranks == 1 and len(token_managers) > 1:
+                    if len(token_managers) > 1 and (
+                            ranks == 1 or _sglang_dsv4_demand_allocator(sched_self) is not None):
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
-                        PriorityReclaimGroup(tuple(token_managers))
+                        PriorityReclaimGroup(tuple(token_managers), report_only=ranks > 1)
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

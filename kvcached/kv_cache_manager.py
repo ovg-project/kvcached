@@ -904,6 +904,9 @@ class KVCacheManager:
                 if (remaining := [pid for pid in pages if pid != page_id])
             ]
         claimed = set(requested)
+        step_claims = getattr(self, "_step_exact_claims", None)
+        if step_claims is not None:
+            step_claims.update(claimed - reserved)
         if getattr(self, "logical_num_blocks", None) is not None:
             self._logical_allocated_blocks += len(claimed - reserved)
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
@@ -1217,6 +1220,11 @@ class KVCacheManager:
                     self._record_operation_error("free_failed", "free_errors_total")
             raise
 
+        step_claims = getattr(self, "_step_exact_claims", None)
+        if step_claims and not had_inconsistency:
+            returned = step_claims.intersection(indices)
+            self._step_alloc_blocks -= len(returned)
+            step_claims.difference_update(returned)
         if counters is not None:
             name = "free_failures_total" if had_inconsistency else "free_successes_total"
             counters[name] = counters.get(name, 0) + 1
@@ -1584,12 +1592,15 @@ class KVCacheManager:
         return True
 
     @synchronized
-    def take_step_alloc_blocks(self) -> int:
+    def take_step_alloc_blocks(self, *, track_exact: bool = False) -> int:
         """Blocks allocated since the last call, and restart the count.
 
         Engines call it at each scheduling step's boundary. Blocks handed out
         from ``try_to_reserve()``'s reservation count once, when reserved.
         """
+        # DSV4 can return an exact claim when another backing or TP rank misses.
+        # Only cancel IDs freshly charged in this round, never an older reservation.
+        self._step_exact_claims: Optional[set[int]] = set() if track_exact else None
         taken = getattr(self, "_step_alloc_blocks", 0)
         self._step_alloc_blocks = 0
         return taken
