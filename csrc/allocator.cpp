@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include "math_utils.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -416,24 +418,20 @@ BudgetSnapshot FTensorAllocator::physical_budget_state() {
   return budget_ ? budget_->snapshot(budget_slot_) : BudgetSnapshot{};
 }
 
-uint64_t FTensorAllocator::available_physical_bytes() {
+int64_t FTensorAllocator::available_physical_bytes() {
   std::lock_guard<std::mutex> lock(mtx_);
   ensure_budget_locked_();
   if (!budget_)
-    return UINT64_MAX;
+    return INT64_MAX;
   const auto state = budget_->snapshot(
       budget_slot_, [this] { return sample_budget_capacity_(); });
   // The same bound as grants: free memory above the watermark.
   const auto usable = state.budget_bytes > state.watermark_bytes
                           ? state.budget_bytes - state.watermark_bytes
                           : 0;
-  const auto gpu_free =
-      usable > state.charged_bytes ? usable - state.charged_bytes : 0;
-  const auto instance_free =
-      state.instance_limit_bytes > state.instance_charged_bytes
-          ? state.instance_limit_bytes - state.instance_charged_bytes
-          : 0;
-  return std::min(gpu_free, instance_free);
+  return std::min(signed_headroom(usable, state.charged_bytes),
+                  signed_headroom(state.instance_limit_bytes,
+                                  state.instance_charged_bytes));
 }
 
 void FTensorAllocator::set_kv_demand(uint64_t bytes) {

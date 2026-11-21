@@ -751,7 +751,8 @@ def test_sglang_reclaim_stops_while_frees_are_grouped(sglang_scheduler):
     assert manager.memory_limit_state()["status"] == "pending"
 
 
-def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler, monkeypatch):
+@pytest.mark.parametrize("hisparse", [False, True])
+def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler, hisparse, monkeypatch):
     from kvcached.integration.sglang import patches
 
     scheduler = sglang_scheduler()
@@ -770,12 +771,118 @@ def test_dsv4_backing_is_discovered_for_idle_limit_reclamation(sglang_scheduler,
         _kvcached_dsv4_backing=SimpleNamespace(manager=manager,
                                                native_page_bytes=manager.block_mem_size),
     )
+    if hisparse:
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            logical_attn_allocator=scheduler.token_to_kv_pool_allocator,
+            hisparse_attn_allocator=SimpleNamespace(kvcached_allocator=object()),
+        )
     scheduler._kvcached_shrink_reclaimers = None
     assert patches._token_kv_managers(scheduler.token_to_kv_pool_allocator) == [manager]
     manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
-    scheduler.on_idle()
+    with mock.patch.object(patches, "_sglang_evict_params_cls", return_value=SimpleNamespace):
+        scheduler.on_idle()
     _assert_sglang_within_limit(scheduler)
     assert len(getattr(scheduler, "_kvcached_shrink_reclaimers")) == 1
+
+
+@pytest.mark.parametrize("owner", ["native", "dsv4", "hisparse"])
+@pytest.mark.parametrize("component", ["full", "swa"])
+@pytest.mark.parametrize("pending", [None, "free_group", "hicache"])
+def test_component_limit_reclaims_only_its_unprotected_prefix(
+    monkeypatch, owner, component, pending
+):
+    """An active full prefix must not prevent reclaiming its expired SWA window.
+
+    Conversely, shrinking FULL must not spend SWA-only eviction capacity.
+    Real manager accounting verifies the target is applied only after frees.
+    """
+    from kvcached.integration.sglang import patches
+
+    monkeypatch.setattr(kcm, "InternalPage", FakePage)
+    monkeypatch.setattr(patches, "_sglang_evict_params_cls", lambda: lambda num_tokens=0, swa_num_tokens=0:
+                        SimpleNamespace(num_tokens=num_tokens, swa_num_tokens=swa_num_tokens, mamba_num=0))
+    managers = {name: _make_manager(False) for name in ("full", "swa")}
+    cached: Dict[str, List[int]] = {}
+    for name, manager in managers.items():
+        blocks = manager.alloc(8 * BLOCKS_PER_PAGE)
+        assert blocks is not None
+        cached[name] = blocks
+    children = {name: SimpleNamespace(free_group=None) for name in managers}
+    allocator = SimpleNamespace(
+        full_attn_allocator=children["full"], swa_attn_allocator=children["swa"],
+        free_group=[] if pending == "free_group" else None,
+    )
+    if owner == "native":
+        for name, child in children.items():
+            child.kvcached_allocator = managers[name]
+    else:
+        allocator._kvcached_dsv4_backing = SimpleNamespace(manager=managers["swa"])
+        allocator._kvcached_dsv4_full_backings = (SimpleNamespace(manager=managers["full"]),)
+        # Duplicate discovery must not install duplicate callbacks.
+        allocator._kvcached_dsv4_swa_backings = (allocator._kvcached_dsv4_backing,)
+    exposed = (SimpleNamespace(logical_attn_allocator=allocator)
+               if owner == "hisparse" else allocator)
+    evictions = []
+    deferred: List[int] = []
+    writing = pending == "hicache"
+
+    class Cache:
+        page_size = 1
+        token_to_kv_pool_allocator = allocator
+
+        def full_evictable_size(self):
+            return len(cached["full"]) if component == "full" else 0
+
+        def swa_evictable_size(self):
+            return len(cached["swa"]) if component == "swa" else 0
+
+        def evict(self, params):
+            full = params.num_tokens
+            swa = getattr(params, "swa_num_tokens", 0)
+            evictions.append((full, swa))
+            count = full if component == "full" else swa
+            assert count > 0
+            assert (swa if component == "full" else full) == 0
+            if writing:
+                return
+            victims = cached[component][:count]
+            cached[component] = cached[component][count:]
+            if allocator.free_group is not None:
+                deferred.extend(victims)
+            else:
+                managers[component].free(victims)
+
+    class Scheduler:
+        def __init__(self):
+            self.tree_cache = Cache()
+            self.token_to_kv_pool_allocator = exposed
+            self.ps = SimpleNamespace(tp_size=1, pp_size=1)
+
+    scheduler = Scheduler()
+    reclaimers = patches._register_shrink_reclaimers(scheduler)
+    assert len(reclaimers) == 2
+    manager = managers[component]
+    from runtime_control_fake import attach_control
+    attach_control(manager, monkeypatch)
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+    other = managers["swa" if component == "full" else "full"]
+    other_pages = set(other.page_allocator.inuse)
+    patches._apply_kvcached_limits_on_idle(scheduler)
+    assert evictions
+    if pending:
+        assert len(evictions) == 1
+        assert manager.memory_limit_state()["status"] == "pending"
+        assert len(manager.page_allocator.inuse) == 9
+        writing = False
+        allocator.free_group = None
+        if deferred:
+            manager.free(deferred)
+        manager.reclaim_for_shrink()
+    assert manager.memory_limit_state()["status"] == "converged"
+    assert len(manager.page_allocator.inuse) <= LIMIT_PAGES
+    assert 0 in manager.page_allocator.inuse  # Permanent sentinel survives.
+    assert other.page_allocator.inuse == other_pages
+    assert cached[component]  # Stop once the physical target is satisfied.
 
 
 def test_dsv4_reclaimer_converts_physical_bytes_to_native_tokens():
