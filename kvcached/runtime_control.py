@@ -18,16 +18,18 @@ class RuntimeControl:
 
         self.manager = manager
         self.worker_ipc = worker_ipc
+        pins = getattr(manager, "permanent_block_ids", ())
+        floor = {"minimum_pages": len(pins) + 1} if pins else {}
         if worker_ipc:
             sources = control_workers(manager.world_size, manager.pp_rank,
                                       manager.group_id, configure=can_shrink,
                                       expected_participants=expected_participants,
                                       startup_pages=manager.mem_size // manager.page_size,
-                                      reserve_null=getattr(manager, "null_block", None) is not None)
+                                      reserve_null=getattr(manager, "null_block", None) is not None, **floor)
         else:
             sources = [_C.local_instance_control(manager.group_id, can_shrink, expected_participants,
                                                   manager.mem_size // manager.page_size,
-                                                  getattr(manager, "null_block", None) is not None)]
+                                                  getattr(manager, "null_block", None) is not None, **floor)]
         if not sources or any(not source["ready"] for source in sources):
             raise RuntimeError("KV runtime control requires every worker pool ready")
         self.sources = tuple(sources)
