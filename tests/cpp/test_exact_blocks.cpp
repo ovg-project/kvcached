@@ -30,9 +30,11 @@ int main() {
   // native trims the unrelated reserve first. A matching ID is free to use.
   const auto quote = kvcached::quote_exact_pages({2, 7}, {2}, {}, {7, 8}, 20);
   assert(quote && std::get<0>(*quote) == 20 &&
-         std::get<1>(*quote) == std::vector<int64_t>({8}) && std::get<2>(*quote) == 0);
+         std::get<1>(*quote) == std::vector<int64_t>({8}) &&
+         std::get<2>(*quote) == 0);
   const auto local = kvcached::quote_exact_pages({2, 7}, {}, {2}, {7, 8}, 20);
-  assert(local && std::get<2>(*local) == 1 && std::get<1>(*local) == std::vector<int64_t>({8}));
+  assert(local && std::get<2>(*local) == 1 &&
+         std::get<1>(*local) == std::vector<int64_t>({8}));
   assert(!kvcached::quote_exact_pages({9}, {2}, {}, {7}, 20));
   std::deque<int64_t> reserved{5, 9, 10};
   assert(kvcached::extract_reserved_pages(reserved, {9, 17}) ==

@@ -487,7 +487,8 @@ InstanceControl FTensorAllocator::configure_instance_control(
     budget_->ready_control_pool(budget_slot_);
   } else if (state.can_shrink != can_shrink ||
              state.minimum_bytes !=
-                 checked_transaction_bytes(minimum_pages, physical_bytes_per_offset_) ||
+                 checked_transaction_bytes(minimum_pages,
+                                           physical_bytes_per_offset_) ||
              state.pool_capacity_bytes !=
                  checked_transaction_bytes(startup_pages,
                                            physical_bytes_per_offset_) ||

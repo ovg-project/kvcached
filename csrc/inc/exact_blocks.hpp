@@ -20,10 +20,11 @@ namespace kvcached {
 // driver. Shrink permits swapping reclaimed IDs into free active slots.
 using ExactRecoveryQuote = std::tuple<uint64_t, std::vector<int64_t>, size_t>;
 
-inline std::optional<ExactRecoveryQuote> quote_exact_pages(
-    const std::vector<int64_t> &pages, const std::deque<int64_t> &free,
-    const std::deque<int64_t> &reclaimed, const std::deque<int64_t> &reserved,
-    uint64_t bundle) {
+inline std::optional<ExactRecoveryQuote>
+quote_exact_pages(const std::vector<int64_t> &pages,
+                  const std::deque<int64_t> &free,
+                  const std::deque<int64_t> &reclaimed,
+                  const std::deque<int64_t> &reserved, uint64_t bundle) {
   std::unordered_set<int64_t> wanted(pages.begin(), pages.end());
   if (!bundle || wanted.size() != pages.size())
     throw std::invalid_argument("Invalid exact recovery request");
@@ -55,8 +56,9 @@ inline std::optional<ExactRecoveryQuote> quote_exact_pages(
 
 // Select only still-idle entries from a recovery quote. A matching reserve
 // or a page claimed since the quote must never be unmapped.
-inline std::vector<int64_t> extract_reserved_pages(
-    std::deque<int64_t> &reserved, const std::vector<int64_t> &eligible) {
+inline std::vector<int64_t>
+extract_reserved_pages(std::deque<int64_t> &reserved,
+                       const std::vector<int64_t> &eligible) {
   const std::unordered_set<int64_t> wanted(eligible.begin(), eligible.end());
   std::vector<int64_t> selected;
   selected.reserve(std::min(wanted.size(), reserved.size()));
