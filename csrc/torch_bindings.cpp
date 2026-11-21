@@ -764,8 +764,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
-      .def("get_avail_physical_bytes", &kvcached::PageAllocator::get_avail_physical_bytes)
-      .def("exact_recovery_quote", &kvcached::PageAllocator::exact_recovery_quote)
+      .def("get_avail_physical_bytes",
+           &kvcached::PageAllocator::get_avail_physical_bytes)
+      .def("exact_recovery_quote",
+           &kvcached::PageAllocator::exact_recovery_quote)
       .def("trim_selected", &kvcached::PageAllocator::trim_selected,
            py::call_guard<py::gil_scoped_release>())
       .def("check_and_get_resize_target",

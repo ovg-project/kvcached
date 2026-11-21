@@ -529,9 +529,10 @@ int64_t PageAllocator::trim_impl(int64_t max_pages,
     if (eligible) {
       pages_to_unmap = extract_reserved_pages(reserved_page_list_, *eligible);
     } else {
-      const auto count = max_pages < 0 ? reserved_page_list_.size()
-                                       : std::min(reserved_page_list_.size(),
-                                                  static_cast<size_t>(max_pages));
+      const auto count = max_pages < 0
+                             ? reserved_page_list_.size()
+                             : std::min(reserved_page_list_.size(),
+                                        static_cast<size_t>(max_pages));
       pages_to_unmap.assign(reserved_page_list_.end() - count,
                             reserved_page_list_.end());
       reserved_page_list_.erase(reserved_page_list_.end() - count,
@@ -705,7 +706,8 @@ PageAllocator::exact_recovery_quote(const std::vector<page_id_t> &pages) const {
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
-  const auto usable_phy_mem_size = std::max<int64_t>(0, get_avail_physical_bytes());
+  const auto usable_phy_mem_size =
+      std::max<int64_t>(0, get_avail_physical_bytes());
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
