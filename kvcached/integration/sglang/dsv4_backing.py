@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Backing leases for IDs allocated by SGLang's native SWA allocator.
+"""Backing leases for native SGLang SWA and compressed full-page IDs.
 
 The manager uses one block per VMM page. Native token pages can share or
 straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
@@ -16,24 +16,40 @@ from typing import Any
 
 class SWABacking:
     def __init__(self, manager: Any, *, native_pages: int, native_page_bytes: int,
-                 physical_page_bytes: int) -> None:
+                 physical_page_bytes: int, permanent_pages: frozenset[int] = frozenset({0}),
+                 addressable_pages: int | None = None) -> None:
         if min(native_pages, native_page_bytes, physical_page_bytes) <= 0:
             raise ValueError("SWA backing dimensions must be positive")
         if native_page_bytes > physical_page_bytes:
             raise ValueError("The reserved null page must cover native page zero")
         self.manager = manager
-        self.native_pages = native_pages
+        self.native_pages = native_pages if addressable_pages is None else addressable_pages
+        if not 0 < self.native_pages <= native_pages:
+            raise ValueError("Addressable pages must fit the native allocation")
         self.native_page_bytes = native_page_bytes
         self.physical_page_bytes = physical_page_bytes
+        physical_pages = (native_pages * native_page_bytes + physical_page_bytes - 1) // physical_page_bytes
+        if 0 not in permanent_pages or any(p < 0 or p >= physical_pages for p in permanent_pages):
+            raise ValueError("Permanent backing pages must include padding and fit the reservation")
+        self.permanent_pages = permanent_pages
+        extra = permanent_pages - {0}
+        if extra:
+            manager.wait_ready()
+            if extra != manager.permanent_block_ids:
+                raise ValueError("State sentinel pages must be reserved at manager startup")
+        extent = self.native_pages * native_page_bytes
+        self._permanent_bytes = sum(max(0, min(physical_page_bytes, extent - p * physical_page_bytes))
+                                    for p in permanent_pages)
+        self._tail_page, self._tail_bytes = divmod(extent, physical_page_bytes)
         self.live: set[int] = set()
         self.refs: Counter[int] = Counter()
 
-    def _span(self, page: int) -> range:
+    def _span(self, page: int) -> tuple[int, ...]:
         start = page * self.native_page_bytes // self.physical_page_bytes
         end = ((page + 1) * self.native_page_bytes - 1) // self.physical_page_bytes
         # Manager block zero permanently backs padding, including any live
         # native pages sharing that physical page.
-        return range(max(1, start), end + 1)
+        return tuple(p for p in range(start, end + 1) if p not in self.permanent_pages)
 
     def acquire(self, pages: set[int]) -> bool:
         if any(page <= 0 or page >= self.native_pages for page in pages):
@@ -69,34 +85,79 @@ class SWABacking:
         return not missing or self.manager.can_alloc_exact(sorted(missing))
 
     def missing_physical_pages(self, pages: set[int]) -> set[int]:
-        return {physical for page in pages - self.live for physical in self._span(page)} - self.refs.keys()
+        return {physical for page in pages if page not in self.live for physical in self._span(page)
+                if physical not in self.refs}
+
+    def _held_slack_bytes(self) -> int:
+        held = len(self.refs) * self.physical_page_bytes + self._permanent_bytes
+        if self._tail_bytes and self._tail_page in self.refs:
+            held -= self.physical_page_bytes - self._tail_bytes
+        return held - (len(self.live) + 1) * self.native_page_bytes
 
     def physical_demand(self, native_pages: int) -> int:
         """Forecast additional physical pages after using held native-page slack."""
-        held_bytes = (len(self.refs) + 1) * self.physical_page_bytes
-        held_bytes -= (len(self.live) + 1) * self.native_page_bytes
-        missing = max(0, native_pages * self.native_page_bytes - held_bytes)
+        missing = max(0, native_pages * self.native_page_bytes - self._held_slack_bytes())
         return (missing + self.physical_page_bytes - 1) // self.physical_page_bytes
 
     def available_pages(self) -> int:
         # An upper bound: placement can still fail for the exact native IDs.
-        physical = len(self.refs) + 1 + self.manager.available_size()
-        free_bytes = physical * self.physical_page_bytes
-        free_bytes -= (len(self.live) + 1) * self.native_page_bytes
-        return max(0, free_bytes // self.native_page_bytes)
+        free_bytes = self._held_slack_bytes() + self.manager.available_size() * self.physical_page_bytes
+        return max(0, min(self.native_pages - 1 - len(self.live), free_bytes // self.native_page_bytes))
+
+
+def _exact_recovery_plan(pools: tuple[SWABacking, ...], pages: set[int],
+                         room: int) -> list[tuple[Any, list[int]]] | None:
+    """Select only the idle mappings needed to fund this exact prefix."""
+    reclaim = []
+    needed = 0
+    for item in pools:
+        manager = item.manager
+        quote = manager.exact_recovery_quote(sorted(item.missing_physical_pages(pages)))
+        if quote is None:
+            return None
+        fresh, idle, local = quote
+        needed += fresh
+        if idle:
+            reclaim.append((manager, idle, manager._memory_limit_page_bundle_bytes(), local))
+    # A reclaimed ID needs a free virtual slot in its own pool. Unmap
+    # these mandatory reserves first, then fund the shared byte deficit.
+    counts = [local for _, _, _, local in reclaim]
+    deficit = (needed - room if needed else 0) - sum(
+        local * bundle for _, _, bundle, local in reclaim)
+    for i in sorted(range(len(reclaim)), key=lambda i: reclaim[i][2]):
+        if deficit <= 0:
+            break
+        _, idle, bundle, _ = reclaim[i]
+        extra = min(len(idle) - counts[i], -(-deficit // bundle))
+        counts[i] += extra
+        deficit -= extra * bundle
+    if deficit > 0:
+        return None
+    # Rounding up a larger final bundle can cover earlier optional pages.
+    for i, (_, _, bundle, local) in enumerate(reclaim):
+        excess = min(counts[i] - local, -deficit // bundle)
+        counts[i] -= excess
+        deficit += excess * bundle
+    return [(manager, idle[:count]) for (manager, idle, _, _), count in zip(reclaim, counts) if count]
 
 
 class _BackingMiss(Exception):
     pass
 
 
-def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: Any = None,
+def bind_native_swa(allocator: Any, backing: SWABacking,
+                    full_backing: SWABacking | None = None, *,
+                    full_backings: tuple[SWABacking, ...] = (),
+                    swa_backings: tuple[SWABacking, ...] = (),
+                    on_capacity_miss: Any = None,
                     on_priority_miss: Any = None, paged_v0520: type | None = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
     Child allocation returns before the composite publishes full-to-SWA
     mappings. An expected miss returns only newly acquired pages via native
     free_page_ids; an unexpected error poisons this adapter until teardown.
+    Compressed KV/indexer backing follows full IDs independently of SWA retirement.
+    Every selected pool must acquire its backing before native mappings publish.
     On 0.5.20 the reserved census prefix is exact only while it fits in the
     active free list and merging is suppressed. Staged pages are not active.
     Native free lists are never assigned by this adapter.
@@ -118,7 +179,18 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
     if getattr(allocator, "swa_req_ring", False):
         raise ValueError("Per-request SWA rings must retain native storage")
 
-    backings = {id(swa): (backing,), id(full): ()}
+    selected_full = ((full_backing,) if full_backing is not None else ()) + full_backings
+    selected_swa = (backing,) + swa_backings
+    selected = selected_full + selected_swa
+    if len({id(item) for item in selected}) != len(selected):
+        raise ValueError("Duplicate compressed backing")
+    for item in selected_full:
+        if full.size // page_size >= item.native_pages:
+            raise ValueError("Compressed storage cannot cover the native full allocator")
+    for item in swa_backings:
+        if swa.size // page_size >= item.native_pages:
+            raise ValueError("State storage cannot cover the native SWA allocator")
+    backings = {id(swa): selected_swa, id(full): selected_full}
 
     pending: list[tuple[Any, set[int]]] | None = None
     failed = False
@@ -143,6 +215,23 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
         except Exception:
             failed = True
             raise
+
+    def recover_retry(child: Any, pages: set[int]) -> None:
+        pools = backings[id(child)]
+        if id(child) not in placement_misses or len(pools) < 2:
+            return
+        if any(item.manager.page_allocator.get_num_reserved_pages() for item in pools):
+            room = pools[0].manager.page_allocator.get_avail_physical_bytes()
+            plan = _exact_recovery_plan(pools, pages, room)
+            if plan:
+                for manager, idle in plan:
+                    manager.trim_selected_reserves(idle)
+                for item in pools:
+                    item.manager.invalidate_physical_capacity()
+
+    def remember_miss(child: Any, choices: tuple[int, ...]) -> None:
+        placement_misses[id(child)] = choices
+        recover_retry(child, set(choices))
 
     def ready_managers() -> None:
         for child_backings in backings.values():
@@ -188,11 +277,12 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                         release_decode_reservation()
                         return False
                     pages = set(choices)
+                    recover_retry(child, pages)
                     decode_reserved[id(child)] = pages
                     for item in backings[id(child)]:
                         if not item.acquire(pages):
                             release_decode_reservation()
-                            placement_misses[id(child)] = tuple(choices)
+                            remember_miss(child, tuple(choices))
                             return False
                 return True
             except Exception:
@@ -314,6 +404,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
             pages = page_ids(result) if known_new is None or backings[id(child)] else set()
             new = pages - prior if known_new is None else known_new
             pending.append((child, new))
+            recover_retry(child, pages)
             for child_backing in backings[id(child)]:
                 if not child_backing.acquire(pages):
                     raise _BackingMiss(child, max(1, len(new)))
@@ -359,7 +450,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                             normalize = getattr(child, "merge_and_sort_free", None)
                             if normalize is not None:
                                 normalize()
-                            placement_misses[id(child)] = tuple(census()[:count].tolist())
+                            remember_miss(child, tuple(census()[:count].tolist()))
                     return None
             except Exception:
                 # The error can be after mapping publication. Guessing a
@@ -456,6 +547,39 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                 failed = True
                 raise
 
+        def shared_prefix_capacity(census: Any, capacity: int, missed: int) -> tuple[int, bool]:
+            # Idle reserves from any sibling can fund an exact retry, even
+            # when the indexer alone reports zero physical capacity.
+            reserves = any(item.manager.page_allocator.get_num_reserved_pages() for item in child_backings)
+            limit = min(len(census), (native_available[id(child)]() if reserves else capacity) // page_size)
+            if not limit:
+                return 0, False
+            room = child_backings[0].manager.page_allocator.get_avail_physical_bytes()
+            sampled: dict[int, Any] = {}
+
+            def quote(length: int):
+                if length not in sampled:
+                    sampled[length] = _exact_recovery_plan(child_backings, set(census[:length].tolist()), room)
+                return sampled[length]
+
+            # With selective reclamation smaller prefixes need at most as many
+            # new mappings and protect at most as many reserves. Probe a parked
+            # singleton once; expand the search only while requests can grow.
+            low, high = 0, 1
+            while quote(high) is not None:
+                low = high
+                if high == limit:
+                    break
+                high = min(2 * high, limit)
+            while high - low > 1:
+                mid = (low + high) // 2
+                if quote(mid) is None:
+                    high = mid
+                else:
+                    low = mid
+            # Keep the miss until the request can map without an explicit trim.
+            return low, missed <= low and low == min(len(census), capacity // page_size) and quote(low) == []
+
         def available_size() -> int:
             require_healthy()
             counts = budget.get()
@@ -466,19 +590,29 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
                               for item in child_backings)])
             missed = placement_misses.get(id(child))
             if missed:
-                prefix = tuple(child.get_all_free_pages()[:len(missed)].tolist())
+                if len(child_backings) <= 1 and capacity < page_size:
+                    return 0
+                census = child.get_all_free_pages()
+                if len(child_backings) > 1:
+                    largest, recovered = shared_prefix_capacity(census, capacity, len(missed))
+                    if recovered:
+                        placement_misses.pop(id(child), None)
+                    return largest * page_size
+                prefix = tuple(census[:len(missed)].tolist())
                 if prefix == missed:
-                    # A failed large prefill must not hide a feasible smaller
-                    # decode. Find the affordable prefix without claiming it.
-                    low, high = 0, len(prefix)
-                    while low < high:
-                        middle = (low + high + 1) // 2
-                        if all(item.can_acquire(set(prefix[:middle])) for item in child_backings):
-                            low = middle
-                        else:
-                            high = middle - 1
-                    if low < len(prefix):
-                        return min(capacity, low * page_size)
+                    limit = min(len(prefix), capacity // page_size)
+                    if limit and child_backings[0].can_acquire(set(prefix[:limit])):
+                        if limit < len(prefix):
+                            return capacity
+                    else:
+                        low, high = 0, max(0, limit - 1)
+                        while low < high:
+                            middle = (low + high + 1) // 2
+                            if child_backings[0].can_acquire(set(prefix[:middle])):
+                                low = middle
+                            else:
+                                high = middle - 1
+                        return low * page_size
                 placement_misses.pop(id(child), None)
             return capacity
 
@@ -515,7 +649,27 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
         bind_release(child, backings[id(child)])
     allocator._kvcached_prepare_transaction = Preparation
     allocator._kvcached_budget_context = budget_context
-    allocator._kvcached_budget_counts = lambda: (full.available_size(), swa.available_size())
+    def invalidate_token_capacity() -> None:
+        for pools in backings.values():
+            for item in pools:
+                item.manager.invalidate_physical_capacity()
+
+    allocator._kvcached_invalidate_token_capacity = invalidate_token_capacity
+
+    def physical_budget_counts() -> tuple[int, int]:
+        token = budget.set(None)
+        try:
+            return full.available_size(), swa.available_size()
+        finally:
+            budget.reset(token)
+
+    def update_budget(counts: tuple[int, int]) -> None:
+        active_counts = budget.get()
+        if active_counts is not None:
+            active_counts.update({id(full): counts[0], id(swa): counts[1]})
+
+    allocator._kvcached_budget_counts = physical_budget_counts
+    allocator._kvcached_update_budget = update_budget
 
     def backing_demand(native_pages: int) -> list[tuple[Any, int]]:
         demands = []
@@ -532,6 +686,29 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
         return demands
 
     allocator._kvcached_backing_demand = backing_demand
+
+    def parked_prefill_growth_costs() -> set[int]:
+        # Only decide whether driver pressure could matter. Eviction and
+        # native sorting can both change the next IDs after the chunk resumes.
+        costs = {0}
+        for child, count in ((full, 1), (swa, 2)):
+            for item in backings[id(child)]:
+                manager = item.manager
+                if manager.in_shrink:
+                    continue
+                # A native page may straddle two backing pages. SGLang also
+                # counts one spare SWA page when admitting a continuation.
+                span = 2 if item.physical_page_bytes % item.native_page_bytes else 1
+                pool = manager.page_allocator
+                pages = min(count * span, pool.get_num_free_pages())
+                fresh = max(0, pages - pool.get_num_reserved_pages())
+                if fresh:
+                    bundle = manager._memory_limit_page_bundle_bytes()
+                    costs = {prior + n * bundle for prior in costs for n in range(fresh + 1)}
+        costs.discard(0)
+        return costs
+
+    allocator._kvcached_parked_prefill_growth_costs = parked_prefill_growth_costs
     # Slot conservation counts logical IDs, not the current physical budget.
     allocator._conserve_swa_available_size = native_available[id(swa)]
     allocator._conserve_full_available_size = native_available[id(full)]
@@ -539,6 +716,9 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
     # Keep it separate from kvcached_allocator: its block IDs are physical
     # pages, not the native token-page IDs used by page-aware eviction.
     allocator._kvcached_dsv4_backing = backing
+    allocator._kvcached_dsv4_full_backing = full_backing
+    allocator._kvcached_dsv4_full_backings = selected_full
+    allocator._kvcached_dsv4_swa_backings = selected_swa
 
 
 def bind_native_decode_wrapper(allocator: Any) -> None:
