@@ -252,7 +252,7 @@ class LLMRouter:
                 f"Model {model_name!r} is not configured")
 
         # Check if model is sleeping and try to wake it up
-        if self.sleep_manager.is_model_sleeping(model_name):
+        if self.sleep_manager.is_model_sleeping_or_transitioning(model_name):
             logger.info(
                 f"Model {model_name} is sleeping, attempting to wake up for request"
             )

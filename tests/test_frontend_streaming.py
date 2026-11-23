@@ -416,6 +416,30 @@ async def test_an_aborted_generation_is_recorded_as_a_failure():
     assert stats.failed_requests == 1
 
 
+async def test_a_split_abort_event_is_still_recorded_as_a_failure():
+    """The abort marker may straddle two reads; detect it on the full event."""
+    monitor = TrafficMonitor(idle_threshold_seconds=0)
+    chunks = [
+        b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n',
+        b'data: {"choices": [{"delta": {}, "finish_reas',
+        b'on": "abort"}]}\n\n',
+    ]
+    backend = _FakeBackendResponse(_ObservingContent(chunks, lambda: None))
+
+    async with _live_router_frontend(monitor, backend) as (_, port, _):
+        status, body, error = await _post_stream(port)
+
+    assert status == 200
+    assert error is None
+    assert body == b"".join(chunks)
+
+    stats = monitor.get_model_stats("m")
+    assert stats.inflight_requests == 0
+    assert stats.total_requests == 1
+    assert stats.successful_requests == 0
+    assert stats.failed_requests == 1
+
+
 async def test_abort_mentioned_inside_generated_text_is_not_a_failure():
     """Only the structural field counts; escaped content is just text."""
     monitor = TrafficMonitor(idle_threshold_seconds=0)

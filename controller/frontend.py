@@ -106,7 +106,7 @@ _ABORT_MARKERS = (b'"finish_reason": "abort"', b'"finish_reason":"abort"')
 
 
 def _stream_was_aborted(chunk: bytes) -> bool:
-    """Whether an SSE chunk ends the generation with ``finish_reason: abort``.
+    """Whether ``chunk`` carries the unescaped ``finish_reason: abort`` field.
 
     vLLM says so when it kills a generation (sleep in abort mode). Content is
     JSON-escaped, so an unescaped marker is the field, never generated text.
@@ -114,6 +114,23 @@ def _stream_was_aborted(chunk: bytes) -> bool:
     if b'finish_reason' not in chunk:
         return False
     return any(marker in chunk for marker in _ABORT_MARKERS)
+
+
+_SSE_EVENT_SEPARATOR = b"\n\n"
+
+
+def _events_aborted(buffer: bytearray) -> bool:
+    """Consume complete SSE events, reporting whether any carried an abort."""
+    aborted = False
+    while True:
+        end = buffer.find(_SSE_EVENT_SEPARATOR)
+        if end == -1:
+            break
+        event = bytes(buffer[:end])
+        del buffer[:end + len(_SSE_EVENT_SEPARATOR)]
+        if _stream_was_aborted(event):
+            aborted = True
+    return aborted
 
 
 def _abort_downstream_stream(request: web.Request) -> None:
@@ -278,11 +295,16 @@ class MultiLLMFrontend:
 
         stream_error: Optional[BaseException] = None
         upstream_aborted = False
+        pending = bytearray()
         try:
             async for chunk in result.content.iter_chunked(1024):
-                if _stream_was_aborted(chunk):
+                pending.extend(chunk)
+                if _events_aborted(pending):
                     upstream_aborted = True
                 await response.write(chunk)
+
+            if _stream_was_aborted(bytes(pending)):
+                upstream_aborted = True
 
             # Explicitly close the stream to release the connection/FIFO
             # promptly.

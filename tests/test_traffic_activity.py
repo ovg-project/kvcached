@@ -266,6 +266,42 @@ async def test_auto_sleep_rechecks_busy_right_before_sleeping(monkeypatch):
     assert sleep_manager.get_sleeping_models() == {}
 
 
+async def test_auto_sleep_rechecks_the_idle_interval_not_just_busy(monkeypatch):
+    """A model re-busied after nomination must idle out again before sleeping."""
+    clock, monitor, sleep_manager = _monitor_and_manager(
+        monkeypatch, idle_threshold_seconds=1)
+    sleep_manager.config.vllm_models_config["model"] = {
+        "host": "127.0.0.1",
+        "port": "1",
+    }
+    calls = []
+
+    async def fake_sleep(host, port, level=1):
+        calls.append(level)
+        return True
+
+    monkeypatch.setattr(sleep_manager, "_call_vllm_sleep_api", fake_sleep)
+
+    clock["now"] = 0.0
+    first = monitor.record_request_start("model", "/v1/completions")
+    clock["now"] = 1.0
+    monitor.record_request_end(first, success=True)
+
+    # Nomination happened here: idle past the 1 s threshold.
+    clock["now"] = 3.0
+    assert sleep_manager.get_sleep_candidates() == ["model"]
+
+    # The model served another request and finished moments ago: not busy, but
+    # nowhere near the idle threshold.
+    second = monitor.record_request_start("model", "/v1/completions")
+    clock["now"] = 3.003
+    monitor.record_request_end(second, success=True)
+
+    assert await sleep_manager.put_model_to_sleep("model", manual=False) is False
+    assert calls == []
+    assert sleep_manager.get_sleeping_models() == {}
+
+
 async def test_manual_sleep_still_honours_the_operator_while_busy(monkeypatch):
     """Manual sleep proceeds, but it is the operator's call, not an accident."""
     clock, monitor, sleep_manager = _monitor_and_manager(monkeypatch)
