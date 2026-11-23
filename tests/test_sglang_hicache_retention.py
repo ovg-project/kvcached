@@ -69,6 +69,7 @@ def adapter(monkeypatch, request):
             if excess > 0:
                 cache.evict(excess)
 
+    monkeypatch.setenv("ENABLE_KVCACHED", "1")
     patch = request.param()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _: "0.5.20")
     monkeypatch.setattr(retention, "_policy", retention._PrefixCacheRetentionPolicy(-1))
