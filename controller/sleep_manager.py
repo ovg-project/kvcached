@@ -114,6 +114,20 @@ class SleepManager:
             logger.info(f"Model {model_name} is already sleeping")
             return False
 
+        # The candidate list is stale by now: auto-sleep must never abort
+        # traffic, manual sleep is the operator's call.
+        stats = (self.traffic_monitor.get_model_stats(model_name)
+                 if self.traffic_monitor is not None else None)
+        if stats is not None and stats.is_busy():
+            if manual:
+                logger.warning(
+                    f"Model {model_name} has {stats.inflight_requests} "
+                    f"in-flight request(s); manual sleep will abort them")
+            else:
+                logger.info(f"Model {model_name} became busy; skipping "
+                            f"auto-sleep")
+                return False
+
         try:
             # Use vLLM Python API to put model to sleep
             if model_name in self.config.vllm_models_config:
@@ -261,10 +275,20 @@ class SleepManager:
             return []
         idle_models = self.traffic_monitor.get_idle_models(
             self.config.idle_threshold_seconds)
-        # Filter out already sleeping models
-        return [
-            model for model in idle_models if model not in self.sleeping_models
-        ]
+        candidates = []
+        for model in idle_models:
+            if model in self.sleeping_models:
+                continue
+            stats = self.traffic_monitor.get_model_stats(model)
+            # A sleep call kills running requests; unknown state fails closed.
+            if stats is None or stats.is_busy():
+                logger.debug(
+                    f"Model {model} is not a sleep candidate "
+                    f"(in-flight: "
+                    f"{'unknown' if stats is None else stats.inflight_requests})")
+                continue
+            candidates.append(model)
+        return candidates
 
     async def _monitor_idle_models(self):
         """Background task to automatically put idle models to sleep"""

@@ -4,7 +4,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 from aiohttp import web
@@ -86,6 +86,36 @@ def _json_error(status: int, error_type: str, message: str) -> web.Response:
                         content_type='application/json')
 
 
+async def _close_upstream_stream(result: Any,
+                                *,
+                                success: bool,
+                                error_message: Optional[str] = None) -> None:
+    """Release an upstream stream and record the request's end exactly once.
+
+    Objects without ``aclose`` (plain ``ClientResponse``, test doubles) are
+    only released.
+    """
+    aclose = getattr(result, "aclose", None)
+    if aclose is not None:
+        await aclose(success=success, error_message=error_message)
+    else:
+        await result.release()
+
+
+_ABORT_MARKERS = (b'"finish_reason": "abort"', b'"finish_reason":"abort"')
+
+
+def _stream_was_aborted(chunk: bytes) -> bool:
+    """Whether an SSE chunk ends the generation with ``finish_reason: abort``.
+
+    vLLM says so when it kills a generation (sleep in abort mode). Content is
+    JSON-escaped, so an unescaped marker is the field, never generated text.
+    """
+    if b'finish_reason' not in chunk:
+        return False
+    return any(marker in chunk for marker in _ABORT_MARKERS)
+
+
 def _abort_downstream_stream(request: web.Request) -> None:
     """Terminate a response whose headers are already on the wire.
 
@@ -101,7 +131,9 @@ class MultiLLMFrontend:
 
     def __init__(self, port: int, model_config_json: Dict[str, Any],
                  sleep_config: SleepConfig):
-        self.traffic_monitor = TrafficMonitor()
+        # Share the sleep policy's threshold with the traffic monitor.
+        self.traffic_monitor = TrafficMonitor(
+            idle_threshold_seconds=sleep_config.idle_threshold_seconds)
         self.sleep_manager = SleepManager(config=sleep_config,
                                           traffic_monitor=self.traffic_monitor)
         self.router = LLMRouter(models_config=model_config_json,
@@ -188,7 +220,16 @@ class MultiLLMFrontend:
             # Check if this is a streaming response
             if hasattr(result, 'content') and hasattr(result, 'headers'):
                 # This is a streaming response (aiohttp.ClientResponse)
-                return await self._relay_stream_response(request, result, label)
+                try:
+                    return await self._relay_stream_response(
+                        request, result, label)
+                except BaseException:
+                    # The relay never cleaned up; closing twice is a no-op.
+                    await _close_upstream_stream(
+                        result,
+                        success=False,
+                        error_message="Stream relay did not complete")
+                    raise
 
             # This is a regular JSON response
             return web.Response(text=json.dumps(result),
@@ -228,23 +269,47 @@ class MultiLLMFrontend:
                                       })
         try:
             await response.prepare(request)
-        except Exception:
-            await result.release()
+        except Exception as e:
+            await _close_upstream_stream(
+                result,
+                success=False,
+                error_message=f"Downstream stream not committed: {e}")
             raise
 
+        stream_error: Optional[BaseException] = None
+        upstream_aborted = False
         try:
             async for chunk in result.content.iter_chunked(1024):
+                if _stream_was_aborted(chunk):
+                    upstream_aborted = True
                 await response.write(chunk)
 
             # Explicitly close the stream to release the connection/FIFO
             # promptly.
             await response.write_eof()
+        except asyncio.CancelledError as e:
+            # A cancelled relay is not a finished request; let it propagate.
+            stream_error = e
+            _abort_downstream_stream(request)
+            raise
         except Exception as e:
+            stream_error = e
             logger.error(f"Upstream {label} stream failed after the response "
                          f"was committed: {e}")
             _abort_downstream_stream(request)
         finally:
-            await result.release()
+            # The relay is the request: only now is the model done serving it.
+            if stream_error is not None:
+                error_message = str(stream_error) or type(stream_error).__name__
+            elif upstream_aborted:
+                error_message = ("Upstream aborted the generation "
+                                 "(finish_reason=abort)")
+            else:
+                error_message = None
+            await _close_upstream_stream(
+                result,
+                success=error_message is None,
+                error_message=error_message)
 
         return response
 
@@ -305,7 +370,18 @@ class MultiLLMFrontend:
         """Handle traffic statistics requests for all models"""
         try:
             # Get optional query parameters
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be an integer, got "
+                    f"{request.query.get('window')!r}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             stats = self.traffic_monitor.get_traffic_summary(window_seconds)
 
@@ -329,7 +405,18 @@ class MultiLLMFrontend:
         try:
             import urllib.parse
             model_name = urllib.parse.unquote(request.match_info['model_name'])
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be an integer, got "
+                    f"{request.query.get('window')!r}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             model_stats = self.traffic_monitor.get_model_stats(model_name)
             if not model_stats:
@@ -370,8 +457,21 @@ class MultiLLMFrontend:
         """Handle requests for idle models that could be put to sleep"""
         try:
             # Get optional threshold parameter
-            idle_threshold = int(request.query.get('threshold',
-                                                   300))  # Default 5 minutes
+            try:
+                idle_threshold = int(
+                    request.query.get(
+                        'threshold',
+                        self.traffic_monitor.idle_threshold_seconds))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be an integer, got "
+                    f"{request.query.get('threshold')!r}")
+
+            if idle_threshold < 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be non-negative, got {idle_threshold}")
 
             idle_models = self.traffic_monitor.get_idle_models(idle_threshold)
 
@@ -383,6 +483,7 @@ class MultiLLMFrontend:
                     idle_model_stats[model_name] = {
                         'idle_time_seconds': model_stats.get_idle_time(),
                         'total_requests': model_stats.total_requests,
+                        'inflight_requests': model_stats.inflight_requests,
                         'last_activity_time': model_stats.last_activity_time
                     }
 
@@ -409,9 +510,28 @@ class MultiLLMFrontend:
         """Handle requests for active models"""
         try:
             # Get optional threshold parameter
-            idle_threshold = int(request.query.get('threshold',
-                                                   300))  # Default 5 minutes
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                idle_threshold = int(
+                    request.query.get(
+                        'threshold',
+                        self.traffic_monitor.idle_threshold_seconds))
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold and window must be integers, got "
+                    f"threshold={request.query.get('threshold')!r}, "
+                    f"window={request.query.get('window')!r}")
+
+            if idle_threshold < 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be non-negative, got {idle_threshold}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             active_models = self.traffic_monitor.get_active_models(
                 idle_threshold)
@@ -426,6 +546,8 @@ class MultiLLMFrontend:
                         model_stats.get_request_rate(window_seconds),
                         'total_requests':
                         model_stats.total_requests,
+                        'inflight_requests':
+                        model_stats.inflight_requests,
                         'avg_response_time':
                         model_stats.avg_response_time,
                         'last_activity_time':
@@ -492,8 +614,9 @@ class MultiLLMFrontend:
                     candidate_details[model_name] = {
                         'idle_time_seconds': model_stats.get_idle_time(),
                         'total_requests': model_stats.total_requests,
+                        'inflight_requests': model_stats.inflight_requests,
                         'last_activity_time': model_stats.last_activity_time,
-                        'can_sleep': True
+                        'can_sleep': not model_stats.is_busy()
                     }
 
             return web.Response(text=json.dumps({
