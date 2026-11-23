@@ -165,3 +165,12 @@ def test_unified_write_through_ack_requests_native_eviction(native):
     cache.tree_core.finish_write_through.assert_called_once_with([7], 42)
     cache.tree_core.dec_lock_ref.assert_called_once_with(7, receipt, False)
     cache._evict.assert_called_once_with(native.EvictParams(num_tokens=5))
+
+
+def test_retention_hook_skipped_when_kvcached_disabled(native, monkeypatch):
+    cache = native.HiRadixCache.__new__(native.HiRadixCache)
+    cache._enforce_prefix_cache_retention = Mock()
+    monkeypatch.setenv("ENABLE_KVCACHED", "0")
+    cache.loading_check(finish_count=0)
+    cache._enforce_prefix_cache_retention.assert_not_called()
+    assert not hasattr(cache, "_kvcached_hicache_retention_depth")

@@ -462,6 +462,8 @@ def _install_hicache_retention_hooks(patch: BasePatch, cache_cls: Any) -> None:
     def wrap(original: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(original)
         def wrapped(cache: Any, *args: Any, **kwargs: Any) -> Any:
+            if not enable_kvcached():
+                return original(cache, *args, **kwargs)
             depth = getattr(cache, "_kvcached_hicache_retention_depth", 0)
             cache._kvcached_hicache_retention_depth = depth + 1
             try:
