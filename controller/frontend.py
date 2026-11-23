@@ -102,33 +102,66 @@ async def _close_upstream_stream(result: Any,
         await result.release()
 
 
-_ABORT_MARKERS = (b'"finish_reason": "abort"', b'"finish_reason":"abort"')
+def _find_event_end(buf: bytes) -> int:
+    """Index just past the first blank line in ``buf``, or -1 if incomplete."""
+    i = 0
+    n = len(buf)
+    while i < n:
+        if buf[i] == 0x0A:  # LF
+            end = i + 1
+        elif buf[i] == 0x0D:  # CR, or CRLF when followed by LF
+            end = i + (2 if i + 1 < n and buf[i + 1] == 0x0A else 1)
+        else:
+            i += 1
+            continue
+        j = end
+        if j < n and buf[j] in (0x0A, 0x0D):
+            if buf[j] == 0x0D and j + 1 < n and buf[j + 1] == 0x0A:
+                return j + 2
+            return j + 1
+        i = end
+    return -1
 
 
-def _stream_was_aborted(chunk: bytes) -> bool:
-    """Whether ``chunk`` carries the unescaped ``finish_reason: abort`` field.
-
-    vLLM says so when it kills a generation (sleep in abort mode). Content is
-    JSON-escaped, so an unescaped marker is the field, never generated text.
-    """
-    if b'finish_reason' not in chunk:
+def _event_was_aborted(event: bytes) -> bool:
+    """True if the event data has ``choices[].finish_reason == abort``."""
+    data = b""
+    for line in event.splitlines():
+        if line.startswith(b":"):
+            continue
+        field, _, value = line.partition(b":")
+        if field != b"data":
+            continue
+        if value.startswith(b" "):
+            value = value[1:]
+        data += value + b"\n"
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    if not data:
         return False
-    return any(marker in chunk for marker in _ABORT_MARKERS)
-
-
-_SSE_EVENT_SEPARATOR = b"\n\n"
+    try:
+        payload = json.loads(data)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(isinstance(c, dict) and c.get("finish_reason") == "abort"
+               for c in choices)
 
 
 def _events_aborted(buffer: bytearray) -> bool:
     """Consume complete SSE events, reporting whether any carried an abort."""
     aborted = False
     while True:
-        end = buffer.find(_SSE_EVENT_SEPARATOR)
+        end = _find_event_end(buffer)
         if end == -1:
             break
         event = bytes(buffer[:end])
-        del buffer[:end + len(_SSE_EVENT_SEPARATOR)]
-        if _stream_was_aborted(event):
+        del buffer[:end]
+        if _event_was_aborted(event):
             aborted = True
     return aborted
 
@@ -303,7 +336,7 @@ class MultiLLMFrontend:
                     upstream_aborted = True
                 await response.write(chunk)
 
-            if _stream_was_aborted(bytes(pending)):
+            if _event_was_aborted(bytes(pending)):
                 upstream_aborted = True
 
             # Explicitly close the stream to release the connection/FIFO

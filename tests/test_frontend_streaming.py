@@ -456,3 +456,46 @@ async def test_abort_mentioned_inside_generated_text_is_not_a_failure():
     stats = monitor.get_model_stats("m")
     assert stats.successful_requests == 1
     assert stats.failed_requests == 0
+
+
+def test_crlf_event_is_consumed_and_detected():
+    """A CRLF-terminated event is consumed at its blank line."""
+    buffer = bytearray(
+        b'data: {"choices": [{"finish_reason": "abort"}]}\r\n\r\n')
+    assert frontend_module._events_aborted(buffer)
+    assert not buffer
+
+
+def test_split_crlf_blank_line_is_consumed():
+    """A CRLF blank line split across reads is still consumed."""
+    buffer = bytearray(
+        b'data: {"choices": [{"finish_reason": "abort"}]}\r')
+    assert not frontend_module._events_aborted(buffer)
+    buffer.extend(b'\n\r\n')
+    assert frontend_module._events_aborted(buffer)
+    assert not buffer
+
+
+def test_cr_only_event_is_consumed_and_detected():
+    """A CR-terminated event is consumed at its blank line."""
+    buffer = bytearray(
+        b'data: {"choices": [{"finish_reason": "abort"}]}\r\r')
+    assert frontend_module._events_aborted(buffer)
+    assert not buffer
+
+
+def test_whitespace_after_finish_reason_colon_is_still_abort():
+    """JSON whitespace after the colon must not change the result."""
+    buffer = bytearray(
+        b'data: {"choices": [{"finish_reason":\t"abort"}]}\n\n')
+    assert frontend_module._events_aborted(buffer)
+    assert not buffer
+
+
+def test_multiple_data_lines_are_joined_before_parsing():
+    """Multiple data lines in one event are joined before decoding."""
+    buffer = bytearray(
+        b'data: {"choices": [{"finish_reason":\n'
+        b'data: "abort"}]}\n\n')
+    assert frontend_module._events_aborted(buffer)
+    assert not buffer
