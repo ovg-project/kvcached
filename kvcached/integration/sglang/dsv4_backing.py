@@ -90,7 +90,9 @@ class _BackingMiss(Exception):
     pass
 
 
-def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: Any = None,
+def bind_native_swa(allocator: Any, backing: SWABacking,
+                    full_backing: SWABacking | None = None, *,
+                    on_capacity_miss: Any = None,
                     on_priority_miss: Any = None, paged_v0520: type | None = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
 
@@ -118,7 +120,10 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
     if getattr(allocator, "swa_req_ring", False):
         raise ValueError("Per-request SWA rings must retain native storage")
 
-    backings = {id(swa): (backing,), id(full): ()}
+    selected_full = (full_backing,) if full_backing is not None else ()
+    if full_backing is not None and full.size // page_size >= full_backing.native_pages:
+        raise ValueError("C128 storage cannot cover the native full allocator")
+    backings = {id(swa): (backing,), id(full): selected_full}
 
     pending: list[tuple[Any, set[int]]] | None = None
     failed = False
@@ -532,6 +537,29 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
         return demands
 
     allocator._kvcached_backing_demand = backing_demand
+
+    def parked_prefill_growth_costs() -> set[int]:
+        # Only decide whether driver pressure could matter. Eviction and
+        # native sorting can both change the next IDs after the chunk resumes.
+        costs = {0}
+        for child, count in ((full, 1), (swa, 2)):
+            for item in backings[id(child)]:
+                manager = item.manager
+                if manager.in_shrink:
+                    continue
+                # A native page may straddle two backing pages. SGLang also
+                # counts one spare SWA page when admitting a continuation.
+                span = 2 if item.physical_page_bytes % item.native_page_bytes else 1
+                pool = manager.page_allocator
+                pages = min(count * span, pool.get_num_free_pages())
+                fresh = max(0, pages - pool.get_num_reserved_pages())
+                if fresh:
+                    bundle = manager._memory_limit_page_bundle_bytes()
+                    costs = {prior + n * bundle for prior in costs for n in range(fresh + 1)}
+        costs.discard(0)
+        return costs
+
+    allocator._kvcached_parked_prefill_growth_costs = parked_prefill_growth_costs
     # Slot conservation counts logical IDs, not the current physical budget.
     allocator._conserve_swa_available_size = native_available[id(swa)]
     allocator._conserve_full_available_size = native_available[id(full)]
@@ -539,6 +567,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking, *, on_capacity_miss: An
     # Keep it separate from kvcached_allocator: its block IDs are physical
     # pages, not the native token-page IDs used by page-aware eviction.
     allocator._kvcached_dsv4_backing = backing
+    allocator._kvcached_dsv4_full_backing = full_backing
+    allocator._kvcached_dsv4_full_backings = selected_full
 
 
 def bind_native_decode_wrapper(allocator: Any) -> None:

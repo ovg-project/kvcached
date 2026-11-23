@@ -93,6 +93,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
+                'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in selected]
@@ -100,8 +101,10 @@ def make_manager():
     # loading the compiled GPU extension. Calls to the native layer are fakes.
     synchronized = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                         and n.name == 'synchronized')
+    after_init = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == '_after_post_init')
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
-                        names=[ast.alias(name='annotations')], level=0), synchronized, cls],
+                        names=[ast.alias(name='annotations')], level=0), synchronized, after_init, cls],
                         type_ignores=[])
     namespace: dict[str, Any] = {'operator': operator, 'InternalPage': Page,
                  'StateConsistencyError': UnsafeMapping,
@@ -466,3 +469,15 @@ def test_exact_claim_accounts_only_fresh_blocks_in_logical_and_step_limits():
     assert manager.alloc_exact([1, 2, 4]) == [1, 2, 4]
     assert manager._logical_allocated_blocks == 4
     assert manager._step_alloc_blocks == 2
+
+
+def test_returned_exact_claims_only_cancel_this_rounds_fresh_ids():
+    manager = make_manager()
+    manager._wait_post_init = lambda: None
+    manager._free = lambda indices, **kwargs: (len(indices), False)
+    page_for(manager, 0, [1, 2, 3])
+    assert manager.alloc_exact([1]) == [1]
+    manager.take_step_alloc_blocks(track_exact=True)
+    assert manager.alloc_exact([2, 3]) == [2, 3]
+    manager.free([1, 2])
+    assert manager.take_step_alloc_blocks() == 1

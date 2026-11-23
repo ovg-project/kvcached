@@ -6,8 +6,9 @@ import importlib.util
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -102,6 +103,7 @@ def test_backing_covers_crossing_and_shared_physical_pages():
     assert backing.manager.live == {1, 2}
     backing.release({2})
     assert backing.manager.live == {2}
+
     backing.release({3})
     assert not backing.manager.live
     assert not backing.live and not backing.refs
@@ -143,6 +145,9 @@ class Tensor:
 
     def __getitem__(self, index):
         return Tensor(self.values[index])
+
+    def __len__(self):
+        return len(self.values)
 
 
 class NativeChild:
@@ -251,8 +256,8 @@ class Composite:
 @pytest.fixture
 def setup(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
-        device=lambda value: SimpleNamespace(type=str(value).split(":")[0]),
-        int64=object(), tensor=lambda values, **_: Tensor(values)))
+        int64=object(), tensor=lambda values, **_: Tensor(values),
+        device=lambda value: SimpleNamespace(type=str(value).split(":")[0])))
 
     def create(page_size=4, on_capacity_miss=None):
         backing = make_backing()
@@ -322,6 +327,43 @@ def test_null_initialization_failure_prevents_mapping_publication(setup):
     assert not composite.mapping and not backing.live and not manager.claims
     with pytest.raises(RuntimeError, match="tear down"):
         composite.alloc()
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+def test_first_allocation_allows_null_initialization_to_take_manager_lock(setup, monkeypatch, method):
+    composite, backing = setup()
+    manager = backing.manager
+    lock, waiting, ready = RLock(), Event(), Event()
+
+    def wait_ready():
+        waiting.set()
+        assert ready.wait(3), "test initialization was not released"
+
+    def apply_resize_target():
+        # Match KVCacheManager's synchronized resize and post-init wait.
+        with lock:
+            wait_ready()
+
+    monkeypatch.setattr(manager, "wait_ready", wait_ready)
+    monkeypatch.setattr(manager, "apply_resize_target", apply_resize_target)
+    before = dict(composite.mapping)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(getattr(composite, method))
+        try:
+            assert waiting.wait(1)
+            assert not result.done() and composite.mapping == before
+            # The background null reservation must acquire this lock before
+            # it can signal readiness. Waiting inside resize deadlocks it.
+            acquired = lock.acquire(timeout=1)
+            try:
+                assert acquired, "allocation held the lock needed by initialization"
+            finally:
+                if acquired:
+                    lock.release()
+        finally:
+            ready.set()
+        assert result.result(timeout=1) is not None
+    assert composite.mapping[20] == 12
 
 
 @pytest.mark.parametrize("page_size", [1, 4])
@@ -522,7 +564,7 @@ class DecodeChild(NativeChild):
 
     @property
     def free_pages(self):
-        return self.choices
+        return Tensor(self.choices)
 
     def merge_and_sort_free(self):
         self.choices = sorted(self.choices + self.released)
@@ -667,6 +709,55 @@ def test_failed_placement_suppresses_admission_until_exact_capacity_recovers(set
     assert allocator.mapping[20] == 40
 
 
+def test_parked_prefill_growth_is_bounded_after_large_miss(setup):
+    allocator, backing = decode_setup((3, 7, 9))
+    manager = backing.manager
+    manager.budget = len(manager.live)
+    assert allocator.alloc_decode([5, 5, 5]) is None
+    assert allocator._kvcached_backing_demand(1) == [(manager, 4)]
+
+    # A failed large prefix still belongs in demand reporting. The smaller
+    # retry can proceed with one bundle even though the bound covers two.
+    manager.in_shrink = False
+    manager.page_allocator = SimpleNamespace(get_num_free_pages=lambda: 2, get_num_reserved_pages=lambda: 0)
+    manager._memory_limit_page_bundle_bytes = lambda: 20
+    manager.budget += 1
+    assert manager.available_size() == 1
+    assert backing.can_acquire({3})
+    assert allocator._kvcached_parked_prefill_growth_costs() == {20, 40}
+    manager.page_allocator.get_num_reserved_pages = lambda: 1
+    assert allocator._kvcached_parked_prefill_growth_costs() == {20}
+    manager.page_allocator.get_num_free_pages = lambda: 1
+    assert allocator._kvcached_parked_prefill_growth_costs() == set()
+    manager.page_allocator.get_num_free_pages = lambda: 2
+    manager.in_shrink = True
+    assert allocator._kvcached_parked_prefill_growth_costs() == set()
+
+
+def test_parked_prefill_counts_straddling_full_page_and_shared_driver_budget(setup):
+    allocator: Any = DecodeComposite([3, 7])
+    allocator.full_attn_allocator.choices = [2]
+    full = SWABacking(Manager(), native_pages=13, native_page_bytes=6, physical_page_bytes=8)
+    swa = make_backing()
+    MODULE.bind_native_swa(allocator, swa, full)
+    for item, bundle in ((full, 20), (swa, 10)):
+        item.manager.in_shrink = False
+        item.manager.page_allocator = SimpleNamespace(get_num_free_pages=lambda: 2, get_num_reserved_pages=lambda: 0)
+        item.manager._memory_limit_page_bundle_bytes = lambda bundle=bundle: bundle
+
+    # Both pools can map fresh pages from the same driver. Each has its
+    # own bundle size.
+    assert allocator._kvcached_parked_prefill_growth_costs() == {10, 20, 30, 40, 50, 60}
+
+    # Native eviction may satisfy the full side. It cannot veto a useful
+    # release for SWA, even if disaggregated prefill will merge staged IDs.
+    full.manager.page_allocator.get_num_free_pages = lambda: 0
+    allocator.swa_attn_allocator.released = [1]
+    assert allocator._kvcached_parked_prefill_growth_costs() == {10, 20}
+    assert allocator.swa_attn_allocator.choices == [3, 7]
+    assert allocator.swa_attn_allocator.released == [1]
+
+
 def test_decode_gate_retains_backing_until_the_promised_native_ids_are_used(setup):
     allocator, backing = decode_setup()
     assert allocator.check_decode_capacity(num_tokens=4)
@@ -779,3 +870,137 @@ def test_decode_gate_backend_error_is_fatal_not_a_capacity_miss(setup):
         allocator.check_decode_capacity(num_tokens=4)
     with pytest.raises(RuntimeError, match="tear down"):
         allocator.check_decode_capacity(num_tokens=4)
+
+
+@pytest.fixture
+def composite_backings(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values),
+        device=lambda value: SimpleNamespace(type=value)))
+    composite = Composite(256)
+    swa = make_backing()
+    full = SWABacking(Manager(), native_pages=13,
+                      native_page_bytes=3, physical_page_bytes=8)
+    assert swa.acquire({1}) and full.acquire({2})
+    MODULE.bind_native_swa(composite, swa, full)
+    return composite, swa, full
+
+
+@pytest.mark.parametrize("method", ["alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("miss", ["full", "swa"])
+def test_c128_all_child_rollback_preserves_prefix(composite_backings, method, miss):
+    composite, swa, full = composite_backings
+    composite.full_attn_allocator.output.insert(0, 513)
+    composite.swa_attn_allocator.output.insert(0, 257)
+    failed = full if miss == "full" else swa
+    failed.manager.budget = len(failed.manager.live)
+    before = [(set(b.live), dict(b.refs), set(b.manager.live)) for b in (swa, full)]
+    assert getattr(composite, method)() is None
+    assert composite.mapping == {512: 256}
+    assert composite.full_attn_allocator.live == {2}
+    assert composite.swa_attn_allocator.live == {1}
+    assert before == [(set(b.live), dict(b.refs), set(b.manager.live)) for b in (swa, full)]
+    failed.manager.budget = 20
+    assert getattr(composite, method)() is not None
+    assert full.live == {2, 5} and swa.live == {1, 3}
+
+
+def test_c128_prepare_rollback_preserves_prefix_leases(composite_backings):
+    composite, swa, full = composite_backings
+    journal = composite._kvcached_prepare_transaction()
+    with journal:
+        assert composite.alloc_extend() is not None
+    # New native page 5 shares physical page 1 with the prefix and also needs page 2.
+    assert full.live == {2, 5}
+    assert dict(full.refs) == {1: 2, 2: 1}
+    assert full.manager.live == {1, 2}
+
+    # A peer rejected this preparation after the local allocation succeeded.
+    journal.rollback()
+    assert composite.full_attn_allocator.live == full.live == {2}
+    assert composite.swa_attn_allocator.live == swa.live == {1}
+    assert dict(full.refs) == {1: 1}
+    assert full.manager.live == {1}
+    assert composite.alloc_extend() is not None
+    assert full.manager.live == {1, 2}
+
+
+def test_c128_full_pages_outlive_swa_and_deferred_full_free(composite_backings):
+    composite, swa, full = composite_backings
+    assert composite.alloc() is not None
+    composite.swa_attn_allocator.free_page_ids(Tensor([3]))
+    assert swa.live == {1} and full.live == {2, 5}
+    native_full = composite.full_attn_allocator
+    native_full.free_group = []
+    native_full.free_page_ids(Tensor([5]))
+    assert full.live == {2, 5}
+    native_full.free_group_end()
+    assert full.live == {2}
+    native_full.clear()
+    assert not full.live and not full.manager.live
+
+
+def test_c128_limit_and_fatal_failure_are_composite_wide(composite_backings):
+    composite, swa, full = composite_backings
+    full.manager.budget = 0
+    assert composite.full_attn_allocator.available_size() < composite._conserve_full_available_size()
+    full.manager.fault = RuntimeError("C128 map failed")
+    with pytest.raises(RuntimeError, match="C128 map failed"):
+        composite.alloc()
+    for child in (composite.full_attn_allocator, composite.swa_attn_allocator):
+        with pytest.raises(RuntimeError, match="tear down"):
+            child.clear()
+
+
+def test_c128_capacity_rejected_before_binding(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    composite = Composite(256)
+    original_alloc = composite.full_attn_allocator.alloc
+    with pytest.raises(ValueError, match="cannot cover"):
+        MODULE.bind_native_swa(composite, make_backing(), make_backing())
+    assert composite.full_attn_allocator.alloc == original_alloc
+
+
+def _assert_all_backings_ready_before_resize(monkeypatch, composite, pools, waiting_pool, method):
+    lock, waiting, ready = RLock(), Event(), Event()
+    operations = []
+
+    def wait_ready():
+        waiting.set()
+        assert ready.wait(3), "test initialization was not released"
+
+    monkeypatch.setattr(waiting_pool.manager, "wait_ready", wait_ready)
+    for pool in pools:
+        original = pool.manager.apply_resize_target
+
+        def apply(original=original, pool=pool):
+            operations.append(pool)
+            with lock:
+                original()
+
+        monkeypatch.setattr(pool.manager, "apply_resize_target", apply)
+    before = dict(composite.mapping)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(getattr(composite, method))
+        try:
+            assert waiting.wait(1)
+            assert not result.done() and composite.mapping == before
+            acquired = lock.acquire(timeout=1)
+            try:
+                assert acquired, "a side pool held the initialization lock"
+                assert not operations, "resize started before all side pools were ready"
+            finally:
+                if acquired:
+                    lock.release()
+        finally:
+            ready.set()
+        assert result.result(timeout=1) is not None
+    assert set(operations) == set(pools)
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("waiting_side", ["swa", "full"])
+def test_c128_waits_for_both_managers_before_any_resize(composite_backings, monkeypatch, method, waiting_side):
+    composite, swa, full = composite_backings
+    _assert_all_backings_ready_before_resize(
+        monkeypatch, composite, (swa, full), swa if waiting_side == "swa" else full, method)
