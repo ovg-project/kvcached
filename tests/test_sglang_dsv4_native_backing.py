@@ -1021,7 +1021,8 @@ def test_decode_gate_backend_error_is_fatal_not_a_capacity_miss(setup):
 @pytest.fixture
 def composite_backings(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
-        int64=object(), tensor=lambda values, **_: Tensor(values)))
+        int64=object(), tensor=lambda values, **_: Tensor(values),
+        device=lambda value: SimpleNamespace(type=value)))
     composite = Composite(256)
     swa = make_backing()
     full = SWABacking(Manager(), native_pages=13,
@@ -1048,6 +1049,26 @@ def test_c128_all_child_rollback_preserves_prefix(composite_backings, method, mi
     failed.manager.budget = 20
     assert getattr(composite, method)() is not None
     assert full.live == {2, 5} and swa.live == {1, 3}
+
+
+def test_c128_prepare_rollback_preserves_prefix_leases(composite_backings):
+    composite, swa, full = composite_backings
+    journal = composite._kvcached_prepare_transaction()
+    with journal:
+        assert composite.alloc_extend() is not None
+    # New native page 5 shares physical page 1 with the prefix and also needs page 2.
+    assert full.live == {2, 5}
+    assert dict(full.refs) == {1: 2, 2: 1}
+    assert full.manager.live == {1, 2}
+
+    # A peer rejected this preparation after the local allocation succeeded.
+    journal.rollback()
+    assert composite.full_attn_allocator.live == full.live == {2}
+    assert composite.swa_attn_allocator.live == swa.live == {1}
+    assert dict(full.refs) == {1: 1}
+    assert full.manager.live == {1}
+    assert composite.alloc_extend() is not None
+    assert full.manager.live == {1, 2}
 
 
 def test_c128_full_pages_outlive_swa_and_deferred_full_free(composite_backings):
