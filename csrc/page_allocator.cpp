@@ -207,9 +207,10 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
       reserved_page_list_.erase(reserved);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
+      // An exact claim may be followed by a sibling pool's exact claim.
+      // Refilling arbitrary IDs here could take the headroom it needs.
+      if (requested_id < 0 && reserved_page_list_.size() <
+                                  static_cast<size_t>(min_reserved_pages_)) {
         prealloc_needed_ = true;
         cond_.notify_all();
       }
@@ -304,7 +305,7 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
                              ": " + e.what());
   }
 
-  if (enable_page_prealloc_) {
+  if (requested_id < 0 && enable_page_prealloc_) {
     trigger_preallocation();
   }
 
@@ -553,6 +554,8 @@ int64_t PageAllocator::trim_impl(int64_t max_pages,
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
+    // Wake allocations waiting for these IDs without requesting a refill.
+    cond_.notify_all();
   }
   return static_cast<int64_t>(pages_to_unmap.size());
 }
