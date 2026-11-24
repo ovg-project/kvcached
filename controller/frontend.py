@@ -102,14 +102,16 @@ async def _close_upstream_stream(result: Any,
         await result.release()
 
 
-def _find_event_end(buf: bytes) -> int:
-    """Index just past the first blank line in ``buf``, or -1 if incomplete."""
-    i = 0
+def _find_event_end(buf: bytes, start: int = 0) -> tuple[int, int]:
+    """Return (blank_line_end, resume) for the first blank line in buf."""
+    i = start
     n = len(buf)
+    last_start = -1
+    last_end = -1
     while i < n:
-        if buf[i] == 0x0A:  # LF
+        if buf[i] == 0x0A:
             end = i + 1
-        elif buf[i] == 0x0D:  # CR, or CRLF when followed by LF
+        elif buf[i] == 0x0D:
             end = i + (2 if i + 1 < n and buf[i + 1] == 0x0A else 1)
         else:
             i += 1
@@ -117,10 +119,12 @@ def _find_event_end(buf: bytes) -> int:
         j = end
         if j < n and buf[j] in (0x0A, 0x0D):
             if buf[j] == 0x0D and j + 1 < n and buf[j + 1] == 0x0A:
-                return j + 2
-            return j + 1
+                return j + 2, 0
+            return j + 1, 0
+        last_start = i
+        last_end = end
         i = end
-    return -1
+    return -1, (last_start if last_end == n else n)
 
 
 def _event_was_aborted(event: bytes) -> bool:
@@ -152,18 +156,21 @@ def _event_was_aborted(event: bytes) -> bool:
                for c in choices)
 
 
-def _events_aborted(buffer: bytearray) -> bool:
-    """Consume complete SSE events, reporting whether any carried an abort."""
+def _consume_events(buffer: bytearray, scan: int) -> tuple[bool, int]:
+    """Consume complete events, returning (any_aborted, next_scan)."""
     aborted = False
     while True:
-        end = _find_event_end(buffer)
+        end, scan = _find_event_end(buffer, scan)
         if end == -1:
-            break
-        event = bytes(buffer[:end])
-        del buffer[:end]
-        if _event_was_aborted(event):
+            return aborted, scan
+        if _event_was_aborted(bytes(buffer[:end])):
             aborted = True
-    return aborted
+        del buffer[:end]
+        scan = 0
+
+
+def _events_aborted(buffer: bytearray) -> bool:
+    return _consume_events(buffer, 0)[0]
 
 
 def _abort_downstream_stream(request: web.Request) -> None:
@@ -329,10 +336,12 @@ class MultiLLMFrontend:
         stream_error: Optional[BaseException] = None
         upstream_aborted = False
         pending = bytearray()
+        scan = 0
         try:
             async for chunk in result.content.iter_chunked(1024):
                 pending.extend(chunk)
-                if _events_aborted(pending):
+                aborted, scan = _consume_events(pending, scan)
+                if aborted:
                     upstream_aborted = True
                 await response.write(chunk)
 

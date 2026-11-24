@@ -470,9 +470,11 @@ def test_split_crlf_blank_line_is_consumed():
     """A CRLF blank line split across reads is still consumed."""
     buffer = bytearray(
         b'data: {"choices": [{"finish_reason": "abort"}]}\r')
-    assert not frontend_module._events_aborted(buffer)
+    aborted, scan = frontend_module._consume_events(buffer, 0)
+    assert not aborted
     buffer.extend(b'\n\r\n')
-    assert frontend_module._events_aborted(buffer)
+    aborted, _ = frontend_module._consume_events(buffer, scan)
+    assert aborted
     assert not buffer
 
 
