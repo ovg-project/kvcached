@@ -60,7 +60,7 @@ def test_exact_claim_leaves_shared_headroom_for_sibling(tmp_path, claim):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("CUDA required")
-    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
+    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0", PYTHONOPTIMIZE="0",
                KVCACHED_MIN_RESERVED_PAGES="3", KVCACHED_MAX_RESERVED_PAGES="3",
                KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path))
     subprocess.run([sys.executable, "-c", _EXACT_SIBLINGS, claim, str(tmp_path / "pool")],
@@ -128,7 +128,7 @@ def test_ordinary_alloc_waiting_for_trimmed_page(tmp_path):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("CUDA required")
-    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
+    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0", PYTHONOPTIMIZE="0",
                KVCACHED_MIN_RESERVED_PAGES="1", KVCACHED_MAX_RESERVED_PAGES="1",
                KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path))
     subprocess.run([sys.executable, "-c", _TRIM_WAITER, str(tmp_path / "pool")],
