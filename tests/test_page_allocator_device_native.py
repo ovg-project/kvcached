@@ -125,49 +125,59 @@ finally:
 
 
 def test_ordinary_alloc_waiting_for_trimmed_page(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError
-    from threading import Event
-
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("CUDA required")
-    from kvcached import vmm_ops as native
+    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
+               KVCACHED_MIN_RESERVED_PAGES="1", KVCACHED_MAX_RESERVED_PAGES="1",
+               KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path))
+    subprocess.run([sys.executable, "-c", _TRIM_WAITER, str(tmp_path / "pool")],
+                   env=env, check=True, timeout=30)
 
-    page = 2 * 1024**2
-    pool = native.PageAllocator(1, page, page, num_kv_buffers=1, ipc_name=str(tmp_path / "pool"))
-    pool.set_use_worker_ipc(True)
-    pool.set_broadcast_map_callback(lambda world, offsets: None)
-    unmapping, finish, allocating = Event(), Event(), Event()
 
-    def unmap(world, offsets):
-        unmapping.set()
-        assert finish.wait(5)
+_TRIM_WAITER = r'''
+import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from threading import Event
+import pytest
+from kvcached import vmm_ops as native
 
-    def allocate():
-        allocating.set()
-        return pool.alloc_page().page_id
+page = 2 * 1024**2
+pool = native.PageAllocator(1, page, page, num_kv_buffers=1, ipc_name=sys.argv[1])
+pool.set_use_worker_ipc(True)
+pool.set_broadcast_map_callback(lambda world, offsets: None)
+unmapping, finish, allocating = Event(), Event(), Event()
 
-    pool.set_broadcast_unmap_callback(unmap)
-    try:
-        pool.free_page(pool.alloc_page().page_id)
-        with ThreadPoolExecutor(2) as executor:
-            trim = executor.submit(pool.trim)
-            assert unmapping.wait(5)
-            waiting = executor.submit(allocate)
-            try:
-                assert allocating.wait(5)
-                with pytest.raises(TimeoutError):
-                    waiting.result(timeout=.1)
-                finish.set()
-                assert trim.result(timeout=5) == 1
-                assert waiting.result(timeout=5) == 0
-            finally:
-                finish.set()
-                if not waiting.done():
-                    pool.start_prealloc_thread()  # Wake the waiter on a failed assertion.
-    finally:
-        pool.stop_prealloc_thread()
-        pool.release_shared_segment()
+def unmap(world, offsets):
+    unmapping.set()
+    assert finish.wait(5)
+
+def allocate():
+    allocating.set()
+    return pool.alloc_page().page_id
+
+pool.set_broadcast_unmap_callback(unmap)
+try:
+    pool.free_page(pool.alloc_page().page_id)
+    with ThreadPoolExecutor(2) as executor:
+        trim = executor.submit(pool.trim)
+        assert unmapping.wait(5)
+        waiting = executor.submit(allocate)
+        try:
+            assert allocating.wait(5)
+            with pytest.raises(TimeoutError):
+                waiting.result(timeout=.1)
+            finish.set()
+            assert trim.result(timeout=5) == 1
+            assert waiting.result(timeout=5) == 0
+        finally:
+            finish.set()
+            if not waiting.done():
+                pool.start_prealloc_thread()  # Wake the waiter on a failed assertion.
+finally:
+    pool.stop_prealloc_thread()
+    pool.release_shared_segment()
+'''
 
 
 _SCENARIO = r'''
