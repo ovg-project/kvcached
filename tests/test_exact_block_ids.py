@@ -153,6 +153,10 @@ def test_exact_quote_passes_only_unmapped_pages_and_carries_shared_bytes():
         return 32, [3], 0
 
     manager.page_allocator.exact_recovery_quote = quote
+    # The indexer has a virtual slot but a sibling must release physical bytes.
+    manager.available_size = lambda: 0
+    manager._get_cached_avail_physical_pages = lambda: 0
+    assert manager.alloc_exact([5, 8]) is None
     assert manager.exact_recovery_quote([5, 8]) == (32, [3], 0)
     assert calls == [[2]]
     assert manager.page_allocator.calls == [1]

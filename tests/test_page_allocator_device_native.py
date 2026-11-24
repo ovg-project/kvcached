@@ -55,6 +55,74 @@ def test_native_capacity_honors_instance_budget(tmp_path, implicit, group):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("claim", ["reserved", "fresh"])
+def test_exact_claim_leaves_shared_headroom_for_sibling(tmp_path, claim):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.version.hip:
+        pytest.skip("CUDA required")
+    env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
+               KVCACHED_MIN_RESERVED_PAGES="3", KVCACHED_MAX_RESERVED_PAGES="3",
+               KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path))
+    subprocess.run([sys.executable, "-c", _EXACT_SIBLINGS, claim], env=env, check=True, timeout=60)
+
+
+_EXACT_SIBLINGS = r'''
+import sys
+import time
+import uuid
+from kvcached import vmm_ops as native
+
+page = 2 * 1024**2
+ipc = "exact-siblings-" + uuid.uuid4().hex
+native.init_kvcached("cuda:0", page, True, ipc)
+pools, tensors, held = [], [], []
+try:
+    for group in (0, 1):
+        tensors.extend(native.create_kv_tensors(8 * page, 1, "cuda:0", 1, 1, group, False, page))
+        pools.append(native.PageAllocator(1, 8 * page, page, contiguous_layout=True,
+                                          num_kv_buffers=1, group_id=group, ipc_name=f"{ipc}-{group}"))
+    kv, indexer = pools
+    native.set_instance_budget_limit(native.physical_budget_state(0)["instance_charged_bytes"] + 3 * page, 1, 0)
+    kv.start_prealloc_thread()
+    deadline = time.monotonic() + 5
+    while kv.get_num_reserved_pages() < 3 and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert kv.get_num_reserved_pages() == 3 and indexer.get_avail_physical_pages() == 0
+    _, idle, _ = kv.exact_recovery_quote([])
+    reserved = sys.argv[1] == "reserved"
+    to_trim = 1 if reserved else 2
+    assert kv.trim_selected(idle[-to_trim:]) == to_trim
+    claim = kv.try_alloc_page_at(idle[0] if reserved else 7)
+    assert claim is not None
+    held.append(claim.page_id)
+    # Give the running KV worker a chance to consume the indexer's last page.
+    deadline = time.monotonic() + 1
+    while indexer.get_avail_physical_pages() and time.monotonic() < deadline:
+        time.sleep(.01)
+    lease = indexer.try_alloc_page_at(7)
+    assert lease is not None, "KV reserve refill consumed the sibling's last page"
+    indexer.free_page(lease.page_id)
+    assert indexer.trim() == 1
+    assert kv.get_num_reserved_pages() == 1
+    held.append(kv.alloc_page().page_id)
+    # An ordinary claim still wakes this same worker and uses the returned budget.
+    deadline = time.monotonic() + 5
+    while kv.get_num_reserved_pages() == 0 and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert kv.get_num_reserved_pages() == 1
+finally:
+    for pool in pools:
+        pool.stop_prealloc_thread()
+    if held:
+        pools[0].free_pages(held)
+    for pool in pools:
+        pool.trim()
+        pool.release_shared_segment()
+    tensors.clear()
+    native.shutdown_kvcached()
+'''
+
+
 _SCENARIO = r'''
 import sys
 import threading

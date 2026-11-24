@@ -9,6 +9,7 @@ straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
 import functools
 import inspect
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -85,6 +86,24 @@ class SWABacking:
         free_bytes = physical * self.physical_page_bytes
         free_bytes -= (len(self.live) + 1) * self.native_page_bytes
         return max(0, free_bytes // self.native_page_bytes)
+
+
+def _largest_fitting_prefix(limit: int, fits: Callable[[int], bool]) -> int:
+    """Find the last fitting prefix, probing a parked singleton only once."""
+    if limit <= 0:
+        return 0
+    low, high = 0, 1
+    while fits(high):
+        if high == limit:
+            return limit
+        low, high = high, min(2 * high, limit)
+    while high - low > 1:
+        mid = (low + high) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid
+    return low
 
 
 def _exact_recovery_plan(pools: tuple[SWABacking, ...], pages: set[int],
@@ -539,18 +558,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             # With selective reclamation smaller prefixes need at most as many
             # new mappings and protect at most as many reserves. Probe a parked
             # singleton once; expand the search only while requests can grow.
-            low, high = 0, 1
-            while quote(high) is not None:
-                low = high
-                if high == limit:
-                    break
-                high = min(2 * high, limit)
-            while high - low > 1:
-                mid = (low + high) // 2
-                if quote(mid) is None:
-                    high = mid
-                else:
-                    low = mid
+            low = _largest_fitting_prefix(limit, lambda n: quote(n) is not None)
             # Keep the miss until the request can map without an explicit trim.
             return low, missed <= low and low == min(len(census), capacity // page_size) and quote(low) == []
 
@@ -579,14 +587,9 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                         if limit < len(prefix):
                             return capacity
                     else:
-                        low, high = 0, max(0, limit - 1)
-                        while low < high:
-                            middle = (low + high + 1) // 2
-                            if child_backings[0].can_acquire(set(prefix[:middle])):
-                                low = middle
-                            else:
-                                high = middle - 1
-                        return low * page_size
+                        fitting = _largest_fitting_prefix(
+                            limit - 1, lambda n: child_backings[0].can_acquire(set(prefix[:n])))
+                        return fitting * page_size
                 placement_misses.pop(id(child), None)
             return capacity
 
