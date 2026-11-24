@@ -554,6 +554,8 @@ int64_t PageAllocator::trim_impl(int64_t max_pages,
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
+    // Wake allocations waiting for these IDs without requesting a refill.
+    cond_.notify_all();
   }
   return static_cast<int64_t>(pages_to_unmap.size());
 }
