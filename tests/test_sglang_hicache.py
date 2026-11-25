@@ -310,6 +310,11 @@ def test_per_layer_mamba_host_pool_is_sized_from_the_stacked_layers(monkeypatch,
     assert host.temporal_ptrs == [t.data_ptr() for t in device.mamba_cache.temporal_per_layer]
     assert len(host._kvcached_mamba_rows) == 3 * LAYERS
 
+    for ple_device in (_contiguous_mamba_pool(), _per_layer_mamba_pool()):
+        ple_device._slot_siblings = (object(),)
+        with pytest.raises(hicache.KVCachedConfigError, match="HiCache cannot restore PLE"):
+            module.MambaPoolHost(ple_device)
+
 
 def _patched_host_module(monkeypatch):
     calls = []
