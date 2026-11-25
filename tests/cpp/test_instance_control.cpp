@@ -862,6 +862,7 @@ int main(int argc, char **argv) {
     budget->set_demand(high, 10);
     assert(budget->query_control("high").shortfall_bytes == 6);
     assert(budget->query_control("low").available_bytes == 0);
+    assert(budget->query_control("low").signed_available_bytes == -2);
     // Such a scheduler posts the demand by instance name and generation.
     auto writer = GpuBudget::open_control(ledger);
     const auto generation = budget->query_control("high").generation;

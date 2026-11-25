@@ -920,9 +920,10 @@ class KVCacheManager:
             retained_count = sum(pid in retained for pid in missing)
         for index, page_id in enumerate(missing):
             try:
-                if retained_count and index == retained_count:
-                    self._trim_after_exact_retry(missing[index:])
-                page = self.page_allocator.try_alloc_page_at(page_id)
+                if retained_count and index == retained_count and not self._fund_exact_retry(missing[index:]):
+                    page = None
+                else:
+                    page = self.page_allocator.try_alloc_page_at(page_id)
             except StateConsistencyError as exc:
                 self._increment_operation_counter("manager_page_allocation_failures_total")
                 self._lifecycle.mark_failed("exact allocation mapping is unsafe", exc)
@@ -976,18 +977,26 @@ class KVCacheManager:
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
 
-    def _trim_after_exact_retry(self, pending: List[int]) -> None:
-        # C++ sees the local driver. A worker can still be at its instance
-        # limit, so price the remaining IDs against the worker headroom too.
-        room = self._get_cached_avail_physical_pages()
-        if room >= len(pending):
-            return
+    def _fund_exact_retry(self, pending: List[int]) -> bool:
+        # Recovery may have just consumed credit on a different worker.
+        # Reprice the entire suffix before releasing any idle mappings.
         quote = self.page_allocator.exact_recovery_quote(pending)
-        if quote is not None:
-            fresh_bytes, idle, local = quote
-            count = max(local, fresh_bytes // self._memory_limit_page_bundle_bytes() - room)
-            if count > 0 and idle:
-                self.trim_selected_reserves(idle[:count])
+        if quote is None:
+            return False
+        fresh_bytes, idle, count = quote
+        if fresh_bytes:
+            bundle = self._memory_limit_page_bundle_bytes()
+            room = self.page_allocator.get_avail_physical_bytes() // bundle
+            control = self._worker_control()
+            if control is not None:
+                for worker in control.poll(force=True):
+                    room = min(room, worker["signed_available_bytes"] // worker["page_bundle_bytes"])
+            count = max(count, fresh_bytes // bundle - room)
+        if count > len(idle):
+            return False
+        if count:
+            self.trim_selected_reserves(idle[:count])
+        return True
 
     def _release_unclaimed_exact_pages(self, page_ids: List[int]) -> None:
         if not page_ids:

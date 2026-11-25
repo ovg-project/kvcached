@@ -172,10 +172,14 @@ def _case(source, consumer):
             manager.reserve_null_block = False
             manager._retired_pages = []
 
-            def worker_quota():
+            forced = []
+
+            def worker_quota(*, force=False):
                 state = vmm.physical_budget_state()
-                return [{"available_bytes": state["instance_limit_bytes"] - state["instance_charged_bytes"],
-                         "page_bundle_bytes": page}]
+                room = state["instance_limit_bytes"] - state["instance_charged_bytes"]
+                if force:
+                    forced.append(room)
+                return [{"available_bytes": max(0, room), "signed_available_bytes": room, "page_bundle_bytes": page}]
 
             setattr(manager, "_runtime_control", SimpleNamespace(worker_ipc=True, poll=worker_quota, apply=lambda: None))
             assert manager._get_cached_avail_physical_pages() == 0
@@ -184,6 +188,7 @@ def _case(source, consumer):
             assert manager.alloc_exact([8, 4]) == [8, 4]
             assert calls == [(0, page), (0, page), (2 * page,)]
             assert unmapped == [(0,)]
+            assert forced == [0]
             for block in [8, 4]:
                 view = tensors[0][block * (page // 4):block * (page // 4) + 128]
                 view.fill_(41)

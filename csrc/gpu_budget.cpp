@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
+#include "math_utils.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1191,6 +1192,9 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
       usable > total ? usable - total : 0,
       entry.limit > state.charged_bytes ? entry.limit - state.charged_bytes
                                         : 0);
+  state.signed_available_bytes =
+      std::min(signed_headroom(usable, total),
+               signed_headroom(entry.limit, state.charged_bytes));
   state.registered_participants = live;
   state.convergence = state.status;
   return state;

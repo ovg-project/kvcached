@@ -96,7 +96,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state',
+                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_fund_exact_retry',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -478,6 +478,26 @@ def test_exact_preflight_prices_only_matching_retained_pages_at_zero_headroom():
     assert manager.can_alloc_exact([4])
     assert manager.alloc_exact([4]) == [4]
     assert manager.page_allocator.calls == [1]
+
+
+@pytest.mark.parametrize("debt, idle, fits", [(1, [3, 4], True), (2, [3, 4], False)])
+def test_retained_repricing_uses_live_worker_debt_before_trimming(debt, idle, fits):
+    manager = make_manager()
+    manager.page_allocator.get_avail_physical_bytes = lambda: 1024
+    manager.page_allocator.exact_recovery_quote = lambda pending: (32, idle, 0)
+    polls = []
+    trimmed: list[list[int]] = []
+
+    def poll(*, force=False):
+        polls.append(force)
+        # This pipeline stage has a different physical bundle from the manager.
+        return [{"signed_available_bytes": -debt * 16 if force else 128, "page_bundle_bytes": 16}]
+
+    manager._worker_control = lambda: SimpleNamespace(poll=poll)
+    manager.trim_selected_reserves = trimmed.append
+    assert manager._fund_exact_retry([2]) is fits
+    assert polls == [True]
+    assert trimmed == ([idle] if fits else [])
 
 
 def test_exact_claim_rejects_logical_id_tail_before_mapping():

@@ -467,6 +467,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["reclaim_cache_bytes"] = state.reclaim_cache_bytes;
   result["reclaim_running_bytes"] = state.reclaim_running_bytes;
   result["available_bytes"] = state.available_bytes;
+  result["signed_available_bytes"] = state.signed_available_bytes;
   return result;
 }
 

@@ -68,6 +68,8 @@ struct InstanceControl {
   // What the instance can still be granted on this GPU: free memory above
   // its watermark, within its max.
   uint64_t available_bytes = 0;
+  int64_t signed_available_bytes =
+      0; // Includes debt below the grant watermark or instance limit.
 };
 
 // What an instance should release now, by tier: pre-mapped pages, prefix
