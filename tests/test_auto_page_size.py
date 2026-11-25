@@ -158,7 +158,7 @@ def test_mrv2_resolves_page_before_geometry_check_and_native_allocation(
     attention = type("AttentionSpec", (types.SimpleNamespace,), {})
     setattr(specs, "AttentionSpec", attention)
     for name in ("FullAttentionSpec", "SlidingWindowSpec", "MLAAttentionSpec",
-                 "MambaSpec", "UniformTypeKVCacheSpecs"):
+                 "MambaSpec", "CircularBufferSpec", "UniformTypeKVCacheSpecs"):
         setattr(specs, name, type(name, (attention,), {}))
     block_bytes = tokens * cell_bytes
     spec = getattr(specs, "FullAttentionSpec")(block_size=tokens, page_size_bytes=block_bytes)

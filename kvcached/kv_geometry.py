@@ -22,6 +22,15 @@ PAGE_GRANULARITY = 2 * MIB
 MAX_BLOCK_GROWTH = 2
 
 
+def whole_blocks_in_pages(pages: int, block_mem_size: int, page_size: int) -> int:
+    """Count whole blocks, excluding each block cut by an internal page boundary."""
+    if pages == 0:
+        return 0
+    period = block_mem_size // gcd(page_size, block_mem_size)
+    boundaries = pages - 1
+    return pages * page_size // block_mem_size - boundaries + boundaries // period
+
+
 def backing_blocks_for_capacity(logical_num_blocks: int, block_mem_size: int,
                                 page_size: int) -> int:
     """Smallest backing extent that packs the requested whole-block capacity.
@@ -34,21 +43,13 @@ def backing_blocks_for_capacity(logical_num_blocks: int, block_mem_size: int,
         raise ValueError("capacity must be nonnegative and blocks must fit a positive page")
     if logical_num_blocks == 0:
         return 0
-    period = block_mem_size // gcd(page_size, block_mem_size)
-
-    def packed_blocks(pages: int) -> int:
-        boundaries = pages - 1
-        # Each unaligned internal boundary excludes one straddling block.
-        return (pages * page_size // block_mem_size
-                - boundaries + boundaries // period)
-
     low = 1
     high = max(1, (logical_num_blocks * block_mem_size + page_size - 1) // page_size)
-    while packed_blocks(high) < logical_num_blocks:
+    while whole_blocks_in_pages(high, block_mem_size, page_size) < logical_num_blocks:
         high *= 2
     while low < high:
         mid = (low + high) // 2
-        if packed_blocks(mid) < logical_num_blocks:
+        if whole_blocks_in_pages(mid, block_mem_size, page_size) < logical_num_blocks:
             low = mid + 1
         else:
             high = mid

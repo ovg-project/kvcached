@@ -233,7 +233,7 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
         patches, "_get_kv_cache_params", lambda *args, **kwargs: (1024, 2)
     )
     monkeypatch.setattr(patches, "_get_group_size", lambda cfg: 1)
-    monkeypatch.setattr(patches, "_get_max_cached_blocks", lambda block_size, *groups: 0)
+    monkeypatch.setattr(patches, "get_prefix_cache_retention_limit", lambda: 64)
     monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
     monkeypatch.setattr(interfaces, "_kvcached_initialized", True)
     monkeypatch.setattr(interfaces, "get_world_size", lambda: 4)
@@ -251,7 +251,10 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
     class FakeKVCacheCoordinator:
         def __init__(self, *args, **kwargs):
             self.enable_caching = False
-            self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8, kv_cache_groups=[
+                types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(prefix_cacheable=value))
+                for value in (True, False)
+            ])
             self.single_type_managers = [types.SimpleNamespace()]
             self.block_pool = types.SimpleNamespace(hash_block_size=16)
 
@@ -263,6 +266,8 @@ def test_coordinator_uses_recorded_world_size(monkeypatch, vllm_modules):
     assert init_kvcached.call_args.kwargs["world_size"] == 4
     assert isinstance(getattr(coordinator, "block_pool"), FakeElasticBlockPool)
     assert coordinator.block_pool.kwargs["hash_block_size"] == 16
+    assert coordinator.block_pool.kwargs["num_kv_cache_groups"] == 1
+    assert coordinator.block_pool.kwargs["max_cached_blocks"] == 1
 
 
 def test_coordinator_propagates_uninitialized_world_size(
@@ -394,7 +399,8 @@ def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modul
         def __init__(self, *args, **kwargs):
             self.enable_caching = True
             # e.g. one full-attention and two sliding-window groups
-            self.kv_cache_config = types.SimpleNamespace(num_blocks=8, kv_cache_groups=[object()] * 3)
+            group = types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=64))
+            self.kv_cache_config = types.SimpleNamespace(num_blocks=8, kv_cache_groups=[group] * 3)
             self.single_type_managers = [types.SimpleNamespace() for _ in range(3)]
             self.block_pool = types.SimpleNamespace(hash_block_size=16)
 
@@ -404,6 +410,31 @@ def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modul
     coordinator = kvcoord_mod.KVCacheCoordinator()
     # 160 tokens of 64-token blocks is 2 blocks per group.
     assert coordinator.block_pool.kwargs["max_cached_blocks"] == 6
+
+
+@pytest.mark.parametrize("version,pp,checked", [
+    ("0.28.0", 2, False), ("0.29.0", 2, True), ("0.30.0", 2, True), ("0.30.0", 1, True),
+])
+def test_engine_checks_qsa_worker_plans(monkeypatch, vllm_modules, version, pp, checked):
+    from kvcached.integration.vllm import model_runner_v2
+
+    _, patches = vllm_modules
+    configs = [object(), object()]
+    planner = mock.Mock(return_value=configs)
+    module = types.SimpleNamespace(EngineCore=type("EngineCore", (), {}), get_kv_cache_configs=planner)
+    engine = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(hf_text_config=types.SimpleNamespace(indexer_compress_ratio=4)),
+        parallel_config=types.SimpleNamespace(pipeline_parallel_size=pp),
+    )
+    validate = mock.Mock()
+    monkeypatch.setattr(model_runner_v2, "validate_qsa_cache_plan", validate)
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    patch = patches.EngineCorePatch()
+    patch.detected_version = version
+    assert patch.patch_engine_init(module)
+    assert module.get_kv_cache_configs(engine, [], []) is configs
+    planner.assert_called_once_with(engine, [], [])
+    assert validate.call_args_list == ([mock.call(engine, configs)] if checked else [])
 
 
 def test_engine_core_rejects_hisparse(monkeypatch, vllm_modules):

@@ -156,7 +156,7 @@ def test_mla_native_views_preserve_latent_vectors_and_neighboring_pages(monkeypa
         )],
         kv_cache_groups=[KVCacheGroupSpec(["a", "b"], spec)],
     )
-    assert adapter.cache_geometry(config) == adapter.CacheGeometry(64, 73728, 2)
+    assert adapter.cache_geometry(config) == adapter.CacheGeometry(64, 73728, 2, 2 * 1024**2)
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout[layout_name], [64])
     assert captured == [(2 * 1024**2, 1, "cpu", 2, {"num_kv_buffers": 1, "unified_pool": True, "page_size": 2 * 1024**2})]
     for layer, name in enumerate(("a", "b")):
@@ -223,7 +223,7 @@ def _check_borrower_geometry(monkeypatch, config, layout_name, borrower_count):
     captured = mock_native_allocator(monkeypatch, layout_name.startswith("B"))
     scheduler = generate_scheduler_kv_cache_config([config])
     backing = copy.deepcopy(config.kv_cache_tensors)
-    expected = adapter.CacheGeometry(2, 64, 2)
+    expected = adapter.CacheGeometry(2, 64, 2, 64)
     assert adapter.cache_geometry(scheduler) == expected
     sharing = {f"borrower_{index}": "b" for index in range(borrower_count)}
     add_kv_sharing_layers_to_kv_cache_groups(sharing, config.kv_cache_groups)
@@ -479,3 +479,136 @@ def test_mla_storage_block_size_overrides_kernel_block(monkeypatch):
     caches = adapter.allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBNHC, [64])
     assert seen == [32, 32]
     assert caches["a"].shape[0] == 6
+
+
+def make_qsa_plan(layout, tokens, draft_tokens, num_blocks):
+    from vllm.models.qwen4_exp.common.qsa_cache import (
+        QSACompressedKeyCache,
+        QSAKeyStateCache,
+    )
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    engine = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(block_size=tokens, num_gpu_blocks_override=num_blocks,
+                                           prefix_cache_retention_interval=None,
+                                           get_resolved_kv_cache_layout=lambda: layout),
+        model_config=types.SimpleNamespace(max_model_len=1, original_max_model_len=1),
+        device_config=types.SimpleNamespace(device_type="cuda"),
+        parallel_config=types.SimpleNamespace(decode_context_parallel_size=1, prefill_context_parallel_size=1),
+        scheduler_config=types.SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        compilation_config=types.SimpleNamespace(static_forward_context={}),
+        attention_config=types.SimpleNamespace(hisparse_config=None),
+        speculative_config=None,
+        num_speculative_tokens=draft_tokens,
+    )
+    kwargs = dict(head_size=128, dtype=torch.bfloat16, compress_ratio=4,
+                  cache_config=engine.cache_config, vllm_config=engine)
+    ring = QSAKeyStateCache(prefix="ring", cache_rope_positions=True, **kwargs)
+    index = QSACompressedKeyCache(prefix="index", **kwargs)
+    specs = {
+        "ring": ring.get_kv_cache_spec(engine),
+        "main": FullAttentionSpec(block_size=tokens, num_kv_heads=2, head_size=256,
+                                  dtype=torch.bfloat16),
+        "index": index.get_kv_cache_spec(engine),
+    }
+    groups = get_kv_cache_groups(engine, specs)
+    config = get_kv_cache_config_from_groups(engine, groups, available_memory=16 * 1024**2)
+    return engine, specs, config, ring, index
+
+
+@pytest.mark.parametrize("layout", ["BLNHC", "BLHNC"])
+@pytest.mark.parametrize("tokens,draft_tokens,ring_slots,page_mib", [
+    (64, 0, 4, 2), (64, 2, 8, 2), (1024, 0, 4, 4), (1104, 6, 12, 4),
+])
+def test_qsa_ring_and_compressed_index(monkeypatch, layout, tokens, draft_tokens, ring_slots, page_mib):
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.worker.utils import allocate_kv_cache as allocate_native
+
+    layout = KVCacheLayout[layout]
+    allocated = mock_native_allocator(monkeypatch, True)
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * 1024**2)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda _: types.SimpleNamespace(total_memory=32 * 1024**2))
+    num_blocks = 64 if tokens == 64 else 8
+    engine, specs, config, ring, index = make_qsa_plan(layout, tokens, draft_tokens, num_blocks)
+    adapter.validate_qsa_cache_plan(engine, [config])
+    scheduler = generate_scheduler_kv_cache_config([config])
+    geometry = adapter.cache_geometry(scheduler)
+    assert adapter.cache_geometry(config) == geometry
+    assert geometry.block_size == tokens
+    assert geometry.physical_page_size == page_mib * 1024**2
+    other_specs = {**specs, "main": dataclasses.replace(specs["main"], num_kv_heads=1)}
+    other_groups = get_kv_cache_groups(engine, other_specs)
+    other = get_kv_cache_config_from_groups(engine, other_groups, available_memory=16 * 1024**2)
+    with pytest.raises(adapter.KVCachedConfigError, match="different block-to-page mappings"):
+        adapter.validate_qsa_cache_plan(engine, [config, other])
+
+    native = allocate_native(config, torch.device("cpu"), layout)
+    caches = adapter.allocate_kv_cache(config, torch.device("cpu"), layout)
+    assert allocated[0][-1]["page_size"] == geometry.physical_page_size
+    for name, expected in native.items():
+        assert caches[name].shape == expected.shape
+        assert caches[name].stride() == expected.stride()
+        assert caches[name].storage_offset() == expected.storage_offset()
+
+    ring.bind_kv_cache(caches["ring"])
+    index.bind_kv_cache(caches["index"])
+    assert ring.key_cache.shape == (num_blocks, ring_slots, 1, 128)
+    assert index.kv_cache.shape == (num_blocks, tokens // 4, 1, 128)
+    # Main KV and its compressed index share a logical block. The request's
+    # private ring gets a different block ID from vLLM's CircularBufferManager.
+    caches["main"][1].fill_(1)
+    index.kv_cache[1].fill_(2)
+    ring.key_cache[2].fill_(3)
+    ring.rope_position_cache[2].fill_(2**40 + 1)
+    assert torch.all(ring.key_cache[2] == 3)
+    assert torch.all(ring.rope_position_cache[2] == 2**40 + 1)
+    assert torch.all(caches["main"][1] == 1)
+    assert torch.all(index.kv_cache[1] == 2)
+
+
+def test_qsa_admission_and_auto_fit_use_whole_blocks(monkeypatch):
+    monkeypatch.setattr(adapter, "CONTIGUOUS_LAYOUT", True)
+    monkeypatch.setattr(adapter, "PAGE_SIZE", 2 * 1024**2)
+    monkeypatch.delenv("KVCACHED_PAGE_SIZE_MB", raising=False)
+    from vllm.v1.core import kv_cache_utils
+
+    from kvcached.integration.vllm import patches
+
+    engine, specs, config, _, _ = make_qsa_plan(KVCacheLayout.BLNHC, 1024, 0, 128)
+    engine.model_config.hf_text_config = types.SimpleNamespace(indexer_compress_ratio=4)
+    hooks = types.SimpleNamespace(
+        EngineCore=type("EngineCore", (), {}),
+        get_kv_cache_configs=kv_cache_utils.get_kv_cache_configs,
+        update_kv_cache_capacity=kv_cache_utils.update_kv_cache_capacity,
+    )
+    patch = patches.EngineCorePatch()
+    patch.detected_version = importlib.metadata.version("vllm")
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    assert patch.patch_engine_init(hooks)
+    geometry = adapter.cache_geometry(config)
+    assert geometry.page_bytes == 1_081_344
+    assert geometry.usable_blocks(128) == 96
+
+    # One null and one request-private ring leave 94 token blocks.
+    limit = 94 * 1024
+    engine.model_config.original_max_model_len = engine.model_config.max_model_len = limit + 1
+    args = (engine, [specs], [128 * geometry.num_pools * geometry.page_bytes])
+    assert kv_cache_utils.get_kv_cache_configs(*args)[0].num_blocks == 128
+    with pytest.raises(ValueError, match="max|KV cache"):
+        hooks.get_kv_cache_configs(*args)
+    engine.model_config.original_max_model_len = -1
+    configs = hooks.get_kv_cache_configs(*args)
+    assert engine.model_config.max_model_len == limit
+    assert configs[0].num_blocks == 128
+    scheduler = generate_scheduler_kv_cache_config(configs)
+    hooks.update_kv_cache_capacity(engine, scheduler)
+    assert scheduler.num_blocks == 128
+    expected = dataclasses.replace(scheduler, num_blocks=95)
+    assert engine.cache_config.kv_cache_size_tokens == kv_cache_utils.get_kv_cache_capacity(engine, expected)[0]
+    engine.model_config.max_model_len = 1024
+    hooks.update_kv_cache_capacity(engine, scheduler)
+    assert engine.cache_config.kv_cache_max_concurrency == 47.5
+    engine.model_config.max_model_len = limit
+    engine.model_config.original_max_model_len = limit
+    assert hooks.get_kv_cache_configs(*args)[0].num_blocks == 128

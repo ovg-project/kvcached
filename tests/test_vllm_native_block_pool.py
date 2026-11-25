@@ -71,11 +71,12 @@ def native_pool_factory(monkeypatch):
     package = importlib.import_module("kvcached.integration.vllm")
     monkeypatch.setattr(package, "interfaces", interface, raising=False)
 
-    def make(size=8, cache_cap=-1, enable_caching=True, events=False):
+    def make(size=8, cache_cap=-1, enable_caching=True, events=False, geometry=None):
         if events and not installed_version.startswith("0.30."):
             pytest.skip("Elastic KV event checks target vLLM 0.30")
         physical = PhysicalPool(size)
         setattr(interface, "get_kv_cache_manager", lambda *args, **kwargs: physical)
+        setattr(interface, "_create_cache_manager", lambda *args: physical)
         target = types.ModuleType("_native_metadata_elastic_pool")
         setattr(target, "BlockPool", native.BlockPool)
         setattr(target, "KVCacheBlock", native.KVCacheBlock)
@@ -91,6 +92,7 @@ def native_pool_factory(monkeypatch):
             enable_kv_cache_events=events,
             max_cached_blocks=cache_cap,
             hash_block_size=4,
+            mrv2_geometry=geometry,
         )
         assert pool.cache_partial_block.__func__ is native.BlockPool.cache_partial_block
         assert pool.move_block_hashes.__func__ is native.BlockPool.move_block_hashes
@@ -101,6 +103,66 @@ def native_pool_factory(monkeypatch):
 
 def request():
     return types.SimpleNamespace(block_hashes=[b"a", b"b", b"c", b"d"])
+
+
+def test_qsa_watermark_and_utilization_exclude_unallocatable_ids(native_pool_factory, monkeypatch):
+    if not distribution_version("vllm").startswith(("0.29.", "0.30.")):
+        pytest.skip("requires QSA Model Runner V2")
+    from vllm.v1.core import kv_cache_manager
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    from kvcached.integration.vllm.model_runner_v2 import CacheGeometry
+    from kvcached.integration.vllm.patches import KVCacheManagerAllocateSlotsPatch
+
+    geometry = CacheGeometry(1024, 1_081_344, 2, 4 * 1024**2, has_qsa_ring=True)
+    pool, physical = native_pool_factory(size=128, geometry=geometry)
+    assert len(pool.kv_block_pool) == 128
+    physical.reported_free = 95
+    assert pool.get_usage() == 0
+    physical.reported_free = 94
+    assert pool.get_usage() == pytest.approx(1 / 95)
+
+    class Manager(kv_cache_manager.KVCacheManager):
+        pass
+
+    module = types.ModuleType("test_qsa_native_manager")
+    setattr(module, "KVCacheManager", Manager)
+    assert KVCacheManagerAllocateSlotsPatch().apply(module)
+    coordinator = types.SimpleNamespace(block_pool=pool, single_type_managers=[])
+    monkeypatch.setattr(kv_cache_manager, "get_kv_cache_coordinator", lambda **kw: coordinator)
+    config = KVCacheConfig(num_blocks=128, kv_cache_tensors=[], kv_cache_groups=[])
+    manager = Manager(config, max_model_len=4096, scheduler_block_size=1024, hash_block_size=1024, watermark=0.5)
+    assert manager.watermark_blocks == 48
+
+
+def test_qsa_ring_keeps_one_private_block_until_request_free(native_pool_factory):
+    pool, physical = native_pool_factory(size=3)
+    kv = importlib.import_module("vllm.v1.kv_cache_interface")
+    if not hasattr(kv, "CircularBufferSpec"):
+        pytest.skip("vLLM does not provide the QSA ring manager")
+    import torch
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
+    manager = CircularBufferManager(
+        kv.CircularBufferSpec(block_size=4, num_kv_heads=1, head_size=128,
+                              head_size_v=0, dtype=torch.bfloat16),
+        pool, enable_caching=True, kv_cache_group_id=0, scheduler_block_size=16,
+    )
+    first, = manager.allocate_new_blocks("first", 16, 16)
+    assert manager.allocate_new_blocks("first", 128, 128) == []
+    second, = manager.allocate_new_blocks("second", 128, 128)
+    assert first.block_id != second.block_id
+    assert physical.allocated == {first.block_id, second.block_id}
+    # vLLM 0.30 added a required keyword to the cache publication hook.
+    if distribution_version("vllm").startswith("0.30."):
+        manager.cache_blocks(request(), 128, replay_boundaries=[])
+    else:
+        manager.cache_blocks(request(), 128)
+    manager.free("first")
+    assert physical.allocated == {second.block_id}
+    replacement, = manager.allocate_new_blocks("replacement", 16, 16)
+    assert replacement.block_id == first.block_id
+    assert replacement.block_hash is None
 
 
 def cache_full(pool, block):

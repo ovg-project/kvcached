@@ -113,6 +113,17 @@ def _record(iface, group_id=0, num_blocks=CREATED_BLOCKS,
     }
 
 
+@pytest.mark.parametrize(("blocks", "page_size", "message"), [
+    (128, 3 * 1024**2, "positive multiple of 2 MiB"),
+    (3, 4 * 1024**2, "at least 4"),
+])
+def test_manager_rejects_unmappable_page_before_registration(iface, monkeypatch, blocks, page_size, message):
+    managers = _enable_manager_factory(iface, monkeypatch)
+    with pytest.raises(iface.KVCachedConfigError, match=message):
+        iface._create_cache_manager(blocks, 1024, 1056, 1, 1, 0, "block_pool", page_size)
+    assert not managers
+
+
 class FakeManager:
     """Stands in for KVCacheManager with the attributes the guard reads."""
 

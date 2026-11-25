@@ -5,14 +5,21 @@
 
 from __future__ import annotations
 
+import os
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from functools import wraps
+from fractions import Fraction
+from functools import partial, wraps
 from math import prod
 from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
-from kvcached.kv_geometry import check_page_geometry
+from kvcached.kv_geometry import (
+    check_page_geometry,
+    has_zero_capacity_pages,
+    select_page_size,
+    whole_blocks_in_pages,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     PAGE_SIZE,
@@ -61,16 +68,22 @@ class CacheGeometry:
     block_size: int
     page_bytes: int
     num_pools: int
+    physical_page_size: int
+    has_qsa_ring: bool = False
 
     @property
     def cell_size(self) -> int:
         return self.page_bytes // self.block_size
 
+    def usable_blocks(self, backing_blocks: int) -> int:
+        pages = backing_blocks * self.page_bytes // self.physical_page_size
+        return whole_blocks_in_pages(pages, self.page_bytes, self.physical_page_size)
+
 
 def cache_geometry(config: Any) -> CacheGeometry:
     """Derive the same physical block units in coordinator and worker."""
     from vllm.v1.kv_cache_interface import (
-        AttentionSpec,
+        CircularBufferSpec,
         FullAttentionSpec,
         MambaSpec,
         MLAAttentionSpec,
@@ -86,13 +99,16 @@ def cache_geometry(config: Any) -> CacheGeometry:
             specs.append(group.kv_cache_spec)
     # Specialized subclasses can have different manager ownership semantics;
     # inheritance alone does not qualify them for the elastic block pool.
-    supported_specs = (FullAttentionSpec, SlidingWindowSpec, MLAAttentionSpec, MambaSpec)
+    token_attention_specs = (FullAttentionSpec, SlidingWindowSpec, MLAAttentionSpec)
+    # vLLM allocates a single raw-key ring block per QSA request.
+    # Its block_size is the ring capacity, independent of token block size.
+    supported_specs = (*token_attention_specs, MambaSpec, CircularBufferSpec)
     if not specs or any(type(spec) not in supported_specs for spec in specs):
         raise KVCachedConfigError(
             "kvcached MRV2 supports FullAttentionSpec, SlidingWindowSpec, "
-            "MLAAttentionSpec and MambaSpec only"
+            "MLAAttentionSpec, MambaSpec and CircularBufferSpec only"
         )
-    first_attention = next((spec for spec in specs if isinstance(spec, AttentionSpec)), None)
+    first_attention = next((spec for spec in specs if type(spec) in token_attention_specs), None)
     if first_attention is None:
         raise KVCachedConfigError("kvcached MRV2 requires an attention group")
     block_size = first_attention.block_size
@@ -134,10 +150,73 @@ def cache_geometry(config: Any) -> CacheGeometry:
     if page_bytes % block_size:
         raise KVCachedConfigError("KV allocation unit bytes must divide exactly by the attention block size")
     page_size = get_page_size_for_block(page_bytes, PAGE_SIZE)
+    # QSA packs the compressed index beside main K/V. Only the final
+    # descriptors give the size of a block in the elastic pool.
+    has_qsa_ring = CircularBufferSpec in {type(spec) for spec in specs}
+    if (has_qsa_ring
+            and os.getenv("KVCACHED_PAGE_SIZE_MB") is None
+            and has_zero_capacity_pages(page_bytes, page_size)):
+        page_size = select_page_size(page_bytes)
     geometry_error = check_page_geometry(page_bytes, page_size, block_size)
     if geometry_error is not None:
         raise KVCachedConfigError(geometry_error)
-    return CacheGeometry(block_size, page_bytes, num_pools)
+    return CacheGeometry(block_size, page_bytes, num_pools, page_size, has_qsa_ring)
+
+
+def create_cache_manager(num_blocks, geometry):
+    from kvcached.integration.vllm.interfaces import _create_cache_manager
+
+    return _create_cache_manager(num_blocks, geometry.block_size, geometry.cell_size,
+                                 geometry.num_pools, 1, 0, "block_pool", geometry.physical_page_size)
+
+
+def patch_qsa_watermark(manager_cls) -> None:
+    from inspect import signature
+
+    original = manager_cls.__init__
+    parameters = signature(original)
+    if "watermark" not in parameters.parameters:
+        return
+
+    @wraps(original)
+    def initialize(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        capacity = getattr(self.block_pool, "_qsa_whole_blocks", None)
+        if capacity is not None and self.watermark_blocks:
+            watermark = parameters.bind(self, *args, **kwargs).arguments["watermark"]
+            self.watermark_blocks = int(watermark * capacity)
+
+    manager_cls.__init__ = initialize
+
+
+def validate_qsa_cache_plan(vllm_config, configs) -> None:
+    from vllm.v1.core import kv_cache_utils
+
+    # IPC translates physical strides per worker. A shared block ID must
+    # still belong to the same logical page on every pipeline stage.
+    geometries = [cache_geometry(config) for config in configs]
+    mappings = {(g.block_size, Fraction(g.page_bytes, g.physical_page_size)) for g in geometries}
+    if len(mappings) > 1:
+        raise KVCachedConfigError("QSA pipeline stages have different block-to-page mappings")
+
+    # Leave the worker descriptors at their full extent so that high IDs
+    # after a page boundary still address the original native views.
+    groups = [config.kv_cache_groups for config in configs]
+    budgets = [
+        (geometry.usable_blocks(config.num_blocks) - 1) * geometry.page_bytes * geometry.num_pools
+        for geometry, config in zip(geometries, configs)
+    ]
+    if min(budgets) <= 0:
+        raise KVCachedConfigError("QSA pool needs a whole block in addition to its reserved null block")
+    if vllm_config.model_config.original_max_model_len == -1:
+        kv_cache_utils._auto_fit_max_model_len(vllm_config, groups, budgets)
+    else:
+        for worker_groups, budget in zip(groups, budgets):
+            kv_cache_utils._check_enough_kv_cache_memory(
+                budget, partial(kv_cache_utils._max_memory_usage_bytes_from_groups, vllm_config, worker_groups),
+                vllm_config.model_config.max_model_len,
+                partial(kv_cache_utils._estimate_max_model_len_from_groups, vllm_config, worker_groups),
+            )
 
 
 def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=None):
@@ -196,7 +275,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
             )
         placements.append((tensor, spec, kernel_size))
     per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
-    page_size = get_page_size_for_block(geometry.page_bytes, PAGE_SIZE)
+    page_size = geometry.physical_page_size
     per_pool_bytes = per_pool_bytes // page_size * page_size
     if config.num_blocks * geometry.page_bytes > per_pool_bytes:
         raise KVCachedConfigError("Configured KV blocks exceed the native virtual reservation")
