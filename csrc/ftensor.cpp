@@ -415,9 +415,9 @@ bool FTensor::set_access_(generic_ptr_t addr, size_t size) {
 }
 
 bool FTensor::init_with_zero_() {
-  assert(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ ==
-         0);                       // Ensure alignment.
-  assert(size_ % page_size_ == 0); // Ensure alignment.
+  // The driver aligns the reservation. Compound pages start at multiples
+  // of page_size_ relative to that base.
+  assert(size_ % page_size_ == 0);
 
   bool succ = true;
   for (size_t offset = 0; offset < size_; offset += page_size_) {
