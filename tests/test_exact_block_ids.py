@@ -96,7 +96,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_fund_exact_retry',
+                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_exact_retry_trim_plan',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -486,17 +486,14 @@ def test_retained_repricing_uses_live_worker_debt_before_trimming(debt, idle, fi
     manager.page_allocator.get_avail_physical_bytes = lambda: 1024
     manager.page_allocator.exact_recovery_quote = lambda pending: (32, idle, 0)
     polls = []
-    trimmed: list[list[int]] = []
 
     def retry_headroom():
         polls.append(True)
         return -debt
 
     manager._worker_control = lambda: SimpleNamespace(exact_retry_headroom=retry_headroom)
-    manager.trim_selected_reserves = trimmed.append
-    assert manager._fund_exact_retry([2]) is fits
+    assert manager._exact_retry_trim_plan([2]) == (idle if fits else None)
     assert polls == [True]
-    assert trimmed == ([idle] if fits else [])
 
 
 def test_exact_claim_rejects_logical_id_tail_before_mapping():

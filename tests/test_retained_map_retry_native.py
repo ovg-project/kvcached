@@ -19,7 +19,7 @@ fault_library = test_vmm_failure_policy.fault_library
     for source in ("foreground", "background")
     for consumer in ("foreground", "background", "fatal", "gil", "resize",
                      "resize_fatal", "resize_quarantined")
-] + [("background", "fresh"), ("background", "exact"), ("background", "mixed")])
+] + [("background", "fresh"), ("background", "exact"), ("background", "mixed"), ("background", "mixed_contended")])
 def test_retained_batch_retry(fault_library, source, consumer):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -27,7 +27,7 @@ def test_retained_batch_retry(fault_library, source, consumer):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
                ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
                KVCACHED_CONTIGUOUS_LAYOUT="false", KVCACHED_PAGE_SIZE_MB="2",
-               KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="0",
+               KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="2" if consumer == "mixed_contended" else "0",
                KVCACHED_IPC_NAME=f"retained-{os.getpid()}-{source}-{consumer}")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), source, consumer],
                             env=env, capture_output=True, text=True, timeout=60)
@@ -53,6 +53,7 @@ def _case(source, consumer):
     from kvcached.kv_cache_manager import KVCacheManager
     from kvcached.lifecycle import LifecyclePhase, LifecycleState
 
+    mixed = consumer in ("mixed", "mixed_contended")
     page = 2 * 1024 * 1024
     torch.cuda.set_device(0)
     vmm.init_kvcached("cuda:0", page, False)
@@ -77,14 +78,14 @@ def _case(source, consumer):
 
     def map_pages(world_size, offsets):
         if calls and tuple(offsets) != calls[0]:
-            if consumer not in ("fresh", "mixed"):
+            if consumer != "fresh" and not mixed:
                 raise RuntimeError("no headroom for a fresh page")
             assert offsets == [2 * page], "a retained batch was split or reused"
-            if consumer == "mixed":
+            if mixed:
                 # The coordinator has no room; this worker owns the real grant.
                 driver.kvcached_fault_zero_free_memory(0)
         calls.append(tuple(offsets))
-        if len(calls) > 1 and consumer not in ("fresh", "mixed"):
+        if len(calls) > 1 and consumer != "fresh" and not mixed:
             assert calls[-1] == calls[0], "a retained batch was split or reordered"
         transaction = f"retry-{len(calls)}"
         prepared = vmm.prepare_map_to_kv_tensors(transaction, offsets, 0)
@@ -94,7 +95,7 @@ def _case(source, consumer):
         if len(calls) == 1:
             driver.kvcached_fault_zero_free_memory(1)
             raise MapRetainedError("controlled peer commit failure after local mapping")
-        if len(calls) == 2 and consumer != "mixed":
+        if len(calls) == 2 and not mixed:
             if consumer in ("fatal", "resize_fatal"):
                 raise StateConsistencyError("retry outcome is unknown")
             if consumer == "resize_quarantined":
@@ -164,7 +165,7 @@ def _case(source, consumer):
         manager.block_mem_size = block_bytes
         assert manager.available_size() == expected
         manager.block_mem_size = page // 4
-        if consumer == "mixed":
+        if mixed:
             # Force the native budget to two pages. Only the spare from the
             # retained batch can pay for the fresh ID, which is requested first.
             assert vmm.set_instance_budget_limit(2 * page, 1, 0) == "applied"
@@ -184,17 +185,25 @@ def _case(source, consumer):
                 return [{"available_bytes": max(0, room), "signed_available_bytes": room, "page_bundle_bytes": page}]
 
             def retry_headroom():
-                return worker_quota(force=True)[0]["signed_available_bytes"] // page
+                room = worker_quota(force=True)[0]["signed_available_bytes"] // page
+                return None if consumer == "mixed_contended" and len(forced) == 1 else room
 
             setattr(manager, "_runtime_control", SimpleNamespace(
                 worker_ipc=True, poll=worker_quota, exact_retry_headroom=retry_headroom, apply=lambda: None))
             assert manager._get_cached_avail_physical_pages() == 0
             assert manager.exact_recovery_quote([8, 4]) == (0, [], 0)
             assert manager.can_alloc_exact([8, 4])
+            if consumer == "mixed_contended":
+                assert manager.alloc_exact([8, 4]) is None
+                assert allocator.get_num_retryable_pages() == 0
+                assert allocator.get_num_reserved_pages() == 2
+                assert not unmapped
+                assert manager.can_alloc_exact([8, 4])
             assert manager.alloc_exact([8, 4]) == [8, 4]
+            assert not manager._pending_exact_retry_pages
             assert calls == [(0, page), (0, page), (2 * page,)]
             assert unmapped == [(0,)]
-            assert forced == [0]
+            assert forced == ([0, 0, 0] if consumer == "mixed_contended" else [0])
             for block in [8, 4]:
                 view = tensors[0][block * (page // 4):block * (page // 4) + 128]
                 view.fill_(41)
@@ -320,7 +329,7 @@ def _case(source, consumer):
             assert allocator.get_num_reserved_pages() == 0
             assert allocator.resize(4 * page)
         assert required[0] == batch_pages * page
-        if consumer not in ("fresh", "mixed"):
+        if consumer != "fresh" and not mixed:
             assert all(value == 0 for value in required[1:]), required
         print(f"PASS {source}/{consumer}: batch={batch_pages}, required={required}", flush=True)
     finally:
