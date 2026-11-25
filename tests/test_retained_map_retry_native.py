@@ -19,7 +19,7 @@ fault_library = test_vmm_failure_policy.fault_library
     for source in ("foreground", "background")
     for consumer in ("foreground", "background", "fatal", "gil", "resize",
                      "resize_fatal", "resize_quarantined")
-] + [("background", "fresh"), ("background", "exact")])
+] + [("background", "fresh"), ("background", "exact"), ("background", "mixed")])
 def test_retained_batch_retry(fault_library, source, consumer):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -76,11 +76,11 @@ def _case(source, consumer):
 
     def map_pages(world_size, offsets):
         if calls and tuple(offsets) != calls[0]:
-            if consumer != "fresh":
+            if consumer not in ("fresh", "mixed"):
                 raise RuntimeError("no headroom for a fresh page")
             assert offsets == [2 * page], "a retained batch was split or reused"
         calls.append(tuple(offsets))
-        if len(calls) > 1 and consumer != "fresh":
+        if len(calls) > 1 and consumer not in ("fresh", "mixed"):
             assert calls[-1] == calls[0], "a retained batch was split or reordered"
         transaction = f"retry-{len(calls)}"
         prepared = vmm.prepare_map_to_kv_tensors(transaction, offsets, 0)
@@ -90,7 +90,7 @@ def _case(source, consumer):
         if len(calls) == 1:
             driver.kvcached_fault_zero_free_memory(1)
             raise MapRetainedError("controlled peer commit failure after local mapping")
-        if len(calls) == 2:
+        if len(calls) == 2 and consumer != "mixed":
             if consumer in ("fatal", "resize_fatal"):
                 raise StateConsistencyError("retry outcome is unknown")
             if consumer == "resize_quarantined":
@@ -160,7 +160,30 @@ def _case(source, consumer):
         manager.block_mem_size = block_bytes
         assert manager.available_size() == expected
         manager.block_mem_size = page // 4
-        if consumer == "exact":
+        if consumer == "mixed":
+            # Force the native budget to two pages. Only the spare from the
+            # retained batch can pay for the fresh ID, which is requested first.
+            driver.kvcached_fault_zero_free_memory(0)
+            assert vmm.set_instance_budget_limit(2 * page, 1, 0) == "applied"
+            manager._avail_physical_pages_cache = None
+            manager._virtual_num_blocks = 32
+            manager.num_layers = manager.num_kv_buffers = 1
+            manager.reserve_null_block = False
+            manager._retired_pages = []
+            assert allocator.get_avail_physical_pages() == 0
+            assert manager.exact_recovery_quote([8, 4]) == (0, [], 0)
+            assert manager.can_alloc_exact([8, 4])
+            assert manager.alloc_exact([8, 4]) == [8, 4]
+            assert calls == [(0, page), (0, page), (2 * page,)]
+            assert unmapped == [(0,)]
+            for block in [8, 4]:
+                view = tensors[0][block * (page // 4):block * (page // 4) + 128]
+                view.fill_(41)
+                assert torch.all(view == 41).item()
+            torch.cuda.synchronize()
+            manager.free([8, 4])
+            allocator.trim()
+        elif consumer == "exact":
             # No local headroom. An unrelated ID must leave the batch alone,
             # and an exact retry of its second ID must replay both offsets.
             assert allocator.try_alloc_page_at(2) is None
@@ -278,7 +301,7 @@ def _case(source, consumer):
             assert allocator.get_num_reserved_pages() == 0
             assert allocator.resize(4 * page)
         assert required[0] == batch_pages * page
-        if consumer != "fresh":
+        if consumer not in ("fresh", "mixed"):
             assert all(value == 0 for value in required[1:]), required
         print(f"PASS {source}/{consumer}: batch={batch_pages}, required={required}", flush=True)
     finally:
@@ -352,7 +375,7 @@ def _clear_case():
 
 
 @pytest.mark.parametrize("mode", ["queued", "quota", "quota_null", "quota_busy", "quota_busy_null",
-                                  "quota_cache", "quota_reserve", "null_init"])
+                                  "quota_cache", "quota_reserve", "quota_exact", "null_init"])
 def test_retained_recovery_boundaries(mode):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -360,7 +383,7 @@ def test_retained_recovery_boundaries(mode):
     env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
                KVCACHED_CONTIGUOUS_LAYOUT="false", KVCACHED_PAGE_SIZE_MB="2",
                KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_MIN_RESERVED_PAGES="2",
-               KVCACHED_MAX_RESERVED_PAGES="1" if mode == "quota_reserve" else "0",
+               KVCACHED_MAX_RESERVED_PAGES="1" if mode in ("quota_reserve", "quota_exact") else "0",
                KVCACHED_IPC_NAME=f"retained-{mode}-{os.getpid()}")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode],
                             env=env, capture_output=True, text=True, timeout=60)
@@ -553,7 +576,7 @@ def _quota_case(mode):
         vmm.shutdown_kvcached()
 
 
-def _reserved_quota_case():
+def _reserved_quota_case(exact):
     """A healthy native reserve releases real credit before retained recovery."""
     import torch
 
@@ -590,10 +613,14 @@ def _reserved_quota_case():
         allocator.free_page(first.page_id)
         assert allocator.get_num_reserved_pages() == 1
         assert vmm.set_instance_budget_limit(2 * page, 1, 0) == "applied"
-        assert allocator.resize(2 * page)
+        if exact:
+            recovered = allocator.try_alloc_page_at(2)
+            assert calls == [(2 * page,)] * 3
+        else:
+            assert allocator.resize(2 * page)
+            recovered = allocator.alloc_page()
         assert allocator.get_num_retryable_pages() == 0
         assert vmm.physical_budget_state()["instance_charged_bytes"] == 2 * page
-        recovered = allocator.alloc_page()
         assert recovered.page_id == 2
         for pid in (live.page_id, recovered.page_id):
             view = tensors[0][pid * page:pid * page + 128]
@@ -659,8 +686,8 @@ if __name__ == "__main__":
         _queued_case()
     elif sys.argv[1] == "null_init":
         _null_init_case()
-    elif sys.argv[1] == "quota_reserve":
-        _reserved_quota_case()
+    elif sys.argv[1] in ("quota_reserve", "quota_exact"):
+        _reserved_quota_case(sys.argv[1] == "quota_exact")
     elif sys.argv[1].startswith("quota"):
         _quota_case(sys.argv[1])
     else:

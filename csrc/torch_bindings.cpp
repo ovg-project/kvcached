@@ -786,6 +786,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_num_retryable_pages",
            &kvcached::PageAllocator::get_num_retryable_pages)
+      .def("get_retryable_page_ids",
+           &kvcached::PageAllocator::get_retryable_page_ids)
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)

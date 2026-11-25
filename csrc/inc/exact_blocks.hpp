@@ -34,11 +34,17 @@ inline std::optional<ExactRecoveryQuote> quote_exact_pages(
   }
   // Retried IDs can reuse existing backing, subject to peer admission.
   // Unrequested members of these batches are never available to trim.
+  size_t spare_after_retry = 0;
   for (const auto &batch : retained) {
+    size_t matched = 0;
     for (const auto id : batch)
-      wanted.erase(id);
+      matched += wanted.erase(id);
+    if (matched)
+      spare_after_retry += batch.size() - matched;
   }
-  const auto fresh = wanted.size();
+  // Exact allocation adopts matching batches first. Its other requested IDs
+  // may then use surplus backing from those batches within this pool.
+  const auto fresh = wanted.size() - std::min(wanted.size(), spare_after_retry);
   if (fresh > free.size() + idle.size() || fresh > UINT64_MAX / bundle)
     return std::nullopt;
   if (!wanted.empty()) {

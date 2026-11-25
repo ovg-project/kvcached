@@ -867,6 +867,25 @@ def test_growth_latch_closes_readiness_and_preserves_error_accounting(monkeypatc
     assert manager.page_allocator.freed_pages == []
 
 
+@pytest.mark.parametrize("entry", ["alloc_exact", "can_alloc_exact", "exact_recovery_quote"])
+def test_exact_admission_observes_other_pools_unknown_outcome(monkeypatch, entry):
+    from kvcached import tp_ipc_util as ipc
+    from kvcached.lifecycle import LifecyclePhase
+
+    manager = make_manager(fail_after=1)
+    manager._virtual_num_blocks = BLOCKS_PER_PAGE
+    manager.reserve_null_block = False
+    assert manager.alloc(1) == [0]
+    before = manager.num_avail_blocks
+    monkeypatch.setattr(ipc, "_UNRESOLVED_PHYSICAL_GROWTH_TRANSACTIONS",
+                        {"sibling": {"message": "unknown commit outcome"}})
+    with pytest.raises(ipc.MapTransactionOutcomeUnknownError):
+        getattr(manager, entry)([1])
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    assert manager.num_avail_blocks == before
+    assert not manager.page_allocator.freed_pages
+
+
 def test_clear_counts_a_page_in_both_retired_and_available_lists_once(monkeypatch):
     manager = make_manager(fail_after=1)
     manager.num_blocks = manager.logical_num_blocks = BLOCKS_PER_PAGE

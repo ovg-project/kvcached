@@ -629,6 +629,13 @@ class KVCacheManager:
         """The error behind a DEGRADED or FAILED phase, if any."""
         return self._lifecycle.error
 
+    def _check_physical_growth_state(self, op: str) -> None:
+        try:
+            raise_if_physical_growth_unresolved()
+        except StateConsistencyError as fatal:
+            self._record_native_fatal(op, fatal)
+            raise
+
     def _record_native_fatal(self, op: str, exc: BaseException) -> bool:
         """Record #418's fatal verdict where it propagates out of a native call.
 
@@ -844,6 +851,7 @@ class KVCacheManager:
             if not start <= block_id < end:
                 raise ValueError("Exact block crosses a physical-page boundary")
             grouped.setdefault(page_id, []).append(block_id)
+        self._check_physical_growth_state("alloc_exact")
         if not requested:
             return requested, grouped, set()
 
@@ -902,9 +910,13 @@ class KVCacheManager:
             return []
 
         created: List[int] = []
-        for page_id in grouped:
-            if page_id in self.full_pages or page_id in self.avail_pages:
-                continue
+        missing = [pid for pid in grouped if pid not in self.full_pages and pid not in self.avail_pages]
+        if len(missing) > 1 and self.page_allocator.get_num_retryable_pages():
+            # Adopt intact batches first so their surplus becomes an ordinary
+            # reserve before a fresh mapping needs to release that credit.
+            retained = set(self.page_allocator.get_retryable_page_ids())
+            missing.sort(key=lambda pid: pid not in retained)
+        for page_id in missing:
             try:
                 page = self.page_allocator.try_alloc_page_at(page_id)
             except StateConsistencyError as exc:
@@ -913,6 +925,7 @@ class KVCacheManager:
                 raise
             except RuntimeError as exc:
                 self._increment_operation_counter("manager_page_allocation_failures_total")
+                self._check_physical_growth_state("alloc_exact")
                 if self._record_native_fatal("alloc_exact", exc):
                     raise
                 self._release_unclaimed_exact_pages(created)
@@ -1097,11 +1110,7 @@ class KVCacheManager:
                     self._increment_operation_counter(
                         "manager_page_allocation_failures_total")
                     # Older native extensions erase the callback's exception type.
-                    try:
-                        raise_if_physical_growth_unresolved()
-                    except StateConsistencyError as fatal:
-                        self._record_native_fatal("alloc", fatal)
-                        raise
+                    self._check_physical_growth_state("alloc")
                     # The recoverable-miss classification only holds while
                     # the native pool is healthy. An untyped failure that
                     # left the transaction state FAILED (e.g. one racing in

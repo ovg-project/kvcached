@@ -96,7 +96,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote', '_memory_limit_page_bundle_bytes',
+                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -112,6 +112,7 @@ def make_manager():
                         type_ignores=[])
     namespace: dict[str, Any] = {'operator': operator, 'InternalPage': Page,
                  'StateConsistencyError': UnsafeMapping,
+                 'raise_if_physical_growth_unresolved': lambda: None,
                  'QuarantinedResizeError': RejectedResize,
                  'logger': SimpleNamespace(warning=lambda message: None),
                  'functools': functools, 'nullcontext': nullcontext}

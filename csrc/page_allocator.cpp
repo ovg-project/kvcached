@@ -255,11 +255,21 @@ PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry) {
       }
       // Keep the batch intact, but do not make a large preallocation retry
       // prevent a smaller request from using a different, fresh page ID.
-      if (!allow_fresh_retry || free_page_list_.empty()) {
-        std::rethrow_exception(retry_error);
-      }
       if (transaction_failed_.load(std::memory_order_acquire)) {
         throw StateConsistencyError(transaction_error_);
+      }
+      // A peer may need credit still held by this pool's idle reserves.
+      // Release them once before replaying the same complete batch.
+      if (requested_id >= 0 && !trimmed_for_exact &&
+          !reserved_page_list_.empty()) {
+        trimmed_for_exact = true;
+        lock.unlock();
+        trim();
+        lock.lock();
+        continue;
+      }
+      if (!allow_fresh_retry || free_page_list_.empty()) {
+        std::rethrow_exception(retry_error);
       }
     }
 
@@ -711,6 +721,14 @@ int64_t PageAllocator::get_num_retryable_pages_unlocked() const {
 int64_t PageAllocator::get_num_retryable_pages() const {
   std::lock_guard<std::mutex> lock(lock_);
   return get_num_retryable_pages_unlocked();
+}
+
+std::vector<page_id_t> PageAllocator::get_retryable_page_ids() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  std::vector<page_id_t> ids;
+  for (const auto &batch : retained_page_batches_)
+    ids.insert(ids.end(), batch.begin(), batch.end());
+  return ids;
 }
 
 PageState PageAllocator::get_page_state() const {

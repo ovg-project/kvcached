@@ -116,6 +116,7 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   int64_t get_num_retryable_pages() const;
+  std::vector<page_id_t> get_retryable_page_ids() const;
   PageState get_page_state() const;
   TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
