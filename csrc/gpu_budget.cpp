@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
 #include "math_utils.hpp"
+#include "transaction_error.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -268,14 +269,17 @@ std::shared_ptr<GpuBudget> GpuBudget::open_control(const std::string &path,
 GpuBudget::GpuBudget(const std::string &path, bool observe)
     : path_(path), pid_(getpid()) {
   fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-  if (fd_ < 0)
+  if (fd_ < 0) {
+    if (errno == ENOENT)
+      throw StateConsistencyError("KV control instance is not running");
     throw system_error("open live KV control");
+  }
   try {
     // Serialize with epoch initialization, then require an existing user.
     if (lease(fd_, F_WRLCK, !observe, 2) < 0)
       throw system_error("lock KV control attachment");
     if (lease(fd_, F_WRLCK, false) == 0)
-      throw std::runtime_error("KV control instance is not running");
+      throw StateConsistencyError("KV control instance is not running");
     if (errno != EAGAIN && errno != EACCES)
       throw system_error("inspect live KV control");
     if (lease(fd_, F_RDLCK, true) < 0)

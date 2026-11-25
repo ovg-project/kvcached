@@ -259,8 +259,11 @@ def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch,
 def test_exact_retry_detects_worker_replacement_during_final_poll(controls, monkeypatch):
     from kvcached import tp_ipc_util
     from kvcached.errors import StateConsistencyError
+    from kvcached.lifecycle import LifecyclePhase, LifecycleState
 
     manager, native, _ = controls
+    manager._lifecycle = LifecycleState("worker-replacement")
+    manager._lifecycle.mark_ready()
     manager.world_size, manager.pp_rank, manager.group_id = 1, 0, 0
     runtime = manager._runtime_control
 
@@ -271,6 +274,9 @@ def test_exact_retry_detects_worker_replacement_during_final_poll(controls, monk
     monkeypatch.setattr(tp_ipc_util, "control_workers", refresh)
     with pytest.raises(StateConsistencyError, match="participant changed"):
         runtime.exact_retry_headroom()
+    assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    with pytest.raises(StateConsistencyError, match="participant changed"):
+        manager.wait_ready()
 
 
 def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):

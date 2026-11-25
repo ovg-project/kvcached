@@ -534,6 +534,20 @@ def test_unavailable_hinted_id_rejects_the_whole_claim_without_mapping():
     assert not manager.page_allocator.calls
 
 
+def test_reclaimed_hint_can_use_a_slot_from_another_requested_retained_batch():
+    manager = make_manager()
+    manager._pending_exact_retry_pages = {2}
+    manager._get_cached_avail_physical_pages = lambda: 0
+    manager.page_allocator.get_num_retryable_pages = lambda: 2
+
+    def quote(ids):
+        return (0, [], 0) if set(ids) == {1, 2} else None
+
+    manager.page_allocator.exact_recovery_quote = quote
+    assert manager.can_alloc_exact([8, 4])
+    assert not manager.page_allocator.calls
+
+
 def test_unexpected_repricing_error_releases_the_adopted_prefix():
     manager = make_manager()
     backend = manager.page_allocator

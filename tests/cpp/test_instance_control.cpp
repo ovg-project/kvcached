@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
+#include "transaction_error.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -18,6 +19,22 @@
 using namespace kvcached;
 
 void test_pool_reclaim(const std::string &directory) {
+  {
+    const auto ledger = directory + "/exited-control-worker";
+    {
+      auto owner = GpuBudget::connect(ledger, [] { return 40; });
+    }
+    for (const auto &path : {ledger, ledger + "-missing"}) {
+      bool lost = false;
+      try {
+        GpuBudget::open_control(path);
+      } catch (const StateConsistencyError &) {
+        lost = true;
+      }
+      assert(lost);
+    }
+    unlink(ledger.c_str());
+  }
   {
     const auto ledger = directory + "/pool-registration-order";
     auto budget = GpuBudget::connect(ledger, [] { return 40; });

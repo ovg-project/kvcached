@@ -48,7 +48,9 @@ class RuntimeControl:
         identity = ("gpu", "instance", "pool_slot", "pool_owner", "generation")
         if len(workers) != len(self.sources) or any(
                 worker[key] != source[key] for worker, source in zip(workers, self.sources) for key in identity):
-            raise StateConsistencyError("KV control participant changed during exact recovery")
+            error = StateConsistencyError("KV control participant changed during exact recovery")
+            self.manager._record_native_fatal("control poll", error)
+            raise error
 
         sampled = {worker["gpu"] for worker in workers if worker.get("capacity_refreshed")}
         if any(source["gpu"] not in sampled for source in self.sources):
@@ -73,14 +75,18 @@ class RuntimeControl:
         if not force and self.current and now - self.last_poll < 0.1:
             return self.current
         states = []
-        for source in self.sources:
-            state = _C.query_instance_control(source["gpu"], source["instance"],
-                                              source["pool_slot"])
-            if (state["generation"] != source["generation"]
-                    or state["pool_owner"] != source["pool_owner"]
-                    or state["status"] == "unavailable"):
-                raise StateConsistencyError("KV control participant changed or disappeared")
-            states.append(state)
+        try:
+            for source in self.sources:
+                state = _C.query_instance_control(source["gpu"], source["instance"],
+                                                  source["pool_slot"])
+                if (state["generation"] != source["generation"]
+                        or state["pool_owner"] != source["pool_owner"]
+                        or state["status"] == "unavailable"):
+                    raise StateConsistencyError("KV control participant changed or disappeared")
+                states.append(state)
+        except StateConsistencyError as exc:
+            self.manager._record_native_fatal("control poll", exc)
+            raise
         self.current = tuple(states)
         self.last_poll = now
         return self.current

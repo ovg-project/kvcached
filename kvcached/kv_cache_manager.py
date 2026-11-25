@@ -891,8 +891,13 @@ class KVCacheManager:
                 # backed one must not gate fresh IDs in a different request.
                 quote = self.page_allocator.exact_recovery_quote(sorted(candidates))
                 if quote is None:
-                    return None
-                retrying = quote[0] > 0
+                    # A retained batch elsewhere in this same claim can free
+                    # the virtual slot needed for a reclaimed hinted ID.
+                    if self.page_allocator.exact_recovery_quote(needed) is None:
+                        return None
+                    retrying = True
+                else:
+                    retrying = quote[0] > 0
             if retrying:
                 # A previous adoption changed retained pages into reserves.
                 # The actual claim reprices before mapping; admission hints
