@@ -828,7 +828,7 @@ class KVCacheManager:
 
     def _exact_claim_preflight(
         self, block_ids: Iterable[int], *, apply_resize: bool, shared_budget: bool = False
-    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int]]]:
+    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int], bool]]:
         requested: List[int] = []
         for value in block_ids:
             if isinstance(value, bool):
@@ -853,7 +853,7 @@ class KVCacheManager:
             grouped.setdefault(page_id, []).append(block_id)
         self._check_physical_growth_state("alloc_exact")
         if not requested:
-            return requested, grouped, set()
+            return requested, grouped, set(), False
 
         if apply_resize:
             self._apply_resize_target()
@@ -881,10 +881,19 @@ class KVCacheManager:
         # The packed-block capacity estimate above is not sufficient for them.
         needed = [page_id for page_id in grouped
                   if page_id not in self.full_pages and page_id not in self.avail_pages]
+        retrying = False
         try:
             if len(needed) > self.page_allocator.get_num_free_pages():
                 return None
-            if not shared_budget and self._needs_exact_retry(needed):
+            candidates: set[int] = getattr(self, "_pending_exact_retry_pages", set()).intersection(needed)
+            if not shared_budget and candidates:
+                # An unavailable hinted ID cannot be claimed. An already
+                # backed one must not gate fresh IDs in a different request.
+                quote = self.page_allocator.exact_recovery_quote(sorted(candidates))
+                if quote is None:
+                    return None
+                retrying = quote[0] > 0
+            if retrying:
                 # A previous adoption changed retained pages into reserves.
                 # The actual claim reprices before mapping; admission hints
                 # use the same live quote without trimming.
@@ -905,13 +914,13 @@ class KVCacheManager:
         except Exception as exc:
             self._record_native_fatal("alloc_exact", exc)
             raise
-        return requested, grouped, reserved
+        return requested, grouped, reserved, retrying
 
     def _alloc_exact_impl(self, block_ids: Iterable[int], *, apply_resize: bool = True) -> Optional[List[int]]:
         claim = self._exact_claim_preflight(block_ids, apply_resize=apply_resize)
         if claim is None:
             return None
-        requested, grouped, reserved = claim
+        requested, grouped, reserved, retrying = claim
         if not requested:
             return []
 
@@ -926,7 +935,7 @@ class KVCacheManager:
             retained_count = sum(pid in retained for pid in missing)
         pending: set[int] = getattr(self, "_pending_exact_retry_pages", set())
         adopting = 0 < retained_count < len(missing)
-        reprice = adopting or self._needs_exact_retry(missing)
+        reprice = adopting or retrying
         for index, page_id in enumerate(missing):
             try:
                 idle = (self._exact_retry_trim_plan(missing[index:])
@@ -950,6 +959,11 @@ class KVCacheManager:
                     raise
                 self._release_unclaimed_exact_pages(created)
                 return None
+            except Exception as exc:
+                self._check_physical_growth_state("alloc_exact")
+                if not self._record_native_fatal("alloc_exact", exc):
+                    self._release_unclaimed_exact_pages(created)
+                raise
             if page is None:
                 self._release_unclaimed_exact_pages(created)
                 return None
@@ -997,15 +1011,6 @@ class KVCacheManager:
             self._logical_allocated_blocks += len(claimed - reserved)
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
-
-    def _needs_exact_retry(self, missing: List[int]) -> bool:
-        candidates: set[int] = getattr(self, "_pending_exact_retry_pages", set()).intersection(missing)
-        if not candidates:
-            return False
-        # A previous rollback may have cached a hinted page as a reserve.
-        # Its hint must not gate fresh IDs in a different request.
-        quote = self.page_allocator.exact_recovery_quote(sorted(candidates))
-        return quote is not None and quote[0] > 0
 
     def _exact_retry_trim_plan(self, pending: List[int]) -> Optional[List[int]]:
         # Recovery may have just consumed credit on a different worker.

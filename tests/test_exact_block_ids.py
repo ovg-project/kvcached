@@ -96,7 +96,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_needs_exact_retry', '_exact_retry_trim_plan',
+                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_exact_retry_trim_plan',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -523,6 +523,31 @@ def test_backed_retry_id_does_not_gate_an_unrelated_fresh_page():
     assert manager.alloc_exact([4, 8]) == [4, 8]
     assert quotes and all(ids == [1] for ids in quotes)
     assert not manager._pending_exact_retry_pages
+
+
+def test_unavailable_hinted_id_rejects_the_whole_claim_without_mapping():
+    manager = make_manager()
+    manager._pending_exact_retry_pages = {2}
+    manager.page_allocator.exact_recovery_quote = lambda ids: None
+    assert not manager.can_alloc_exact([4, 8])
+    assert manager.alloc_exact([4, 8]) is None
+    assert not manager.page_allocator.calls
+
+
+def test_unexpected_repricing_error_releases_the_adopted_prefix():
+    manager = make_manager()
+    backend = manager.page_allocator
+    backend.get_num_retryable_pages = lambda: 1
+    backend.get_retryable_page_ids = lambda: [1]
+
+    def fail(pending):
+        raise OSError("control socket unavailable")
+
+    manager._exact_retry_trim_plan = fail
+    with pytest.raises(OSError, match="control socket unavailable"):
+        manager.alloc_exact([4, 8])
+    assert backend.calls == [1] and backend.released == [1]
+    assert not manager.avail_pages and manager.num_avail_blocks == 0
 
 
 def test_exact_claim_rejects_logical_id_tail_before_mapping():

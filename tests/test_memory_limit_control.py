@@ -256,6 +256,23 @@ def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch,
     assert runtime.exact_retry_headroom() == expected
 
 
+def test_exact_retry_detects_worker_replacement_during_final_poll(controls, monkeypatch):
+    from kvcached import tp_ipc_util
+    from kvcached.errors import StateConsistencyError
+
+    manager, native, _ = controls
+    manager.world_size, manager.pp_rank, manager.group_id = 1, 0, 0
+    runtime = manager._runtime_control
+
+    def refresh(*args, **kwargs):
+        native.states["gpu-a"]["pool_owner"] += 1
+        return [dict(runtime.sources[0], capacity_refreshed=True)]
+
+    monkeypatch.setattr(tp_ipc_util, "control_workers", refresh)
+    with pytest.raises(StateConsistencyError, match="participant changed"):
+        runtime.exact_retry_headroom()
+
+
 def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):
     from kvcached.cli.utils import update_kv_cache_limit
 

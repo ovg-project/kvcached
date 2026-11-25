@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from kvcached import prefix_cache_retention
+from kvcached.errors import StateConsistencyError
 
 
 class RuntimeControl:
@@ -40,7 +41,6 @@ class RuntimeControl:
 
     def exact_retry_headroom(self) -> int | None:
         """Sample worker GPUs and return the number of complete distributed pages they can fund."""
-        from kvcached.errors import StateConsistencyError
         from kvcached.tp_ipc_util import control_workers
 
         workers = control_workers(self.manager.world_size, self.manager.pp_rank,
@@ -79,7 +79,7 @@ class RuntimeControl:
             if (state["generation"] != source["generation"]
                     or state["pool_owner"] != source["pool_owner"]
                     or state["status"] == "unavailable"):
-                raise RuntimeError("KV control participant changed or disappeared")
+                raise StateConsistencyError("KV control participant changed or disappeared")
             states.append(state)
         self.current = tuple(states)
         self.last_poll = now
