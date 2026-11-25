@@ -246,7 +246,8 @@ def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch,
     state.update(signed_available_bytes=-100, page_bundle_bytes=2)
     runtime.poll(force=True)
 
-    def refresh(tp_size, pp_rank, group_id, *, refresh_capacity):
+    def refresh(tp_size, pp_rank, group_id, *, refresh_capacity, expected_sources):
+        assert expected_sources == runtime.sources
         assert (tp_size, pp_rank, group_id, refresh_capacity) == (2, 0, 0, True)
         state["signed_available_bytes"] = balance
         return [dict(runtime.sources[0], capacity_refreshed=False),
@@ -291,6 +292,38 @@ def test_exact_refresh_keeps_reported_ledger_loss_when_another_worker_times_out(
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", reply)
     with pytest.raises(StateConsistencyError, match="ledger replaced"):
         tp_ipc_util.control_workers(2, 0, 0, refresh_capacity=True)
+
+
+@pytest.mark.parametrize("changed", [True, False])
+def test_exact_refresh_checks_successful_sibling_before_timeout(controls, monkeypatch, changed):
+    from kvcached import tp_ipc_util
+    from kvcached.errors import StateConsistencyError
+    from kvcached.lifecycle import LifecyclePhase, LifecycleState
+
+    manager, _, _ = controls
+    manager._lifecycle = LifecycleState("mixed-refresh")
+    manager._lifecycle.mark_ready()
+    manager.world_size, manager.pp_rank, manager.group_id = 2, 0, 0
+    runtime = manager._runtime_control
+    runtime.sources = tuple(dict(runtime.sources[0], pp_rank=0, rank=rank) for rank in range(2))
+
+    async def reply(rank, message, stage):
+        if rank == 0:
+            raise TimeoutError("temporary worker timeout")
+        worker = dict(runtime.sources[rank])
+        if changed:
+            worker["generation"] += 1
+        return {"status": "success", "control": worker}
+
+    monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", reply)
+    if changed:
+        with pytest.raises(StateConsistencyError, match="participant changed"):
+            runtime.exact_retry_headroom()
+        assert manager.lifecycle_phase is LifecyclePhase.FAILED
+    else:
+        with pytest.raises(RuntimeError, match="temporary worker timeout"):
+            runtime.exact_retry_headroom()
+        assert manager.lifecycle_phase is LifecyclePhase.READY
 
 
 def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):

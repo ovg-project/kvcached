@@ -54,7 +54,7 @@ std::runtime_error system_error(const char *operation) {
 [[noreturn]] void ledger_path_error(const char *operation) {
   if (errno == ENOENT || errno == ENOTDIR)
     throw StateConsistencyError("KV control instance is not running");
-  if (errno == ELOOP)
+  if (errno == ELOOP || errno == EISDIR)
     throw StateConsistencyError("KV budget segment was replaced");
   throw system_error(operation);
 }

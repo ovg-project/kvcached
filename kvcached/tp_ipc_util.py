@@ -1867,7 +1867,7 @@ def query_worker_cuda_mem_get_info(rank: int,
 
 async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
                            configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
-                           minimum_pages=0, refresh_capacity=False):
+                           minimum_pages=0, refresh_capacity=False, expected_sources=None):
     targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
                for rank in range(tp_size)]
     messages = []
@@ -1892,12 +1892,24 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
     results = []
     if refresh_capacity:
         # A timed-out sibling must not hide a confirmed ledger replacement.
-        for (stage, rank), response in zip(targets, responses):
+        if expected_sources is not None and targets != [(s["pp_rank"], s["rank"]) for s in expected_sources]:
+            raise StateConsistencyError("KV control participant set changed during exact recovery")
+        identity = ("gpu", "instance", "pool_slot", "pool_owner", "generation")
+        for index, ((stage, rank), response) in enumerate(zip(targets, responses)):
             if isinstance(response, dict) and response.get("error_type") == "state_consistency":
                 raise StateConsistencyError(f"KV control worker pp{stage}/rank{rank}: {response.get('message')}")
+            if expected_sources is None or not isinstance(response, dict) or response.get("status") != "success":
+                continue
+            worker = response.get("control")
+            if isinstance(worker, dict) and any(
+                    key in worker and worker[key] != expected_sources[index][key] for key in identity):
+                raise StateConsistencyError(f"KV control participant changed at pp{stage}/rank{rank}")
     for (stage, rank), response in zip(targets, responses):
         if isinstance(response, Exception) or not isinstance(response, dict) or response.get("status") != "success":
             raise RuntimeError(f"KV control worker pp{stage}/rank{rank} unavailable: {response}")
+        if refresh_capacity and expected_sources is not None and (
+                not isinstance(response.get("control"), dict) or not all(key in response["control"] for key in identity)):
+            raise RuntimeError(f"KV control worker pp{stage}/rank{rank} returned an incomplete identity")
         if acknowledgements is None:
             results.append(dict(response["control"], pp_rank=stage, rank=rank))
         elif not response.get("accepted"):
@@ -1907,7 +1919,7 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
 
 def control_workers(tp_size: int, pp_rank: int, group_id: int,
                     configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
-                    minimum_pages=0, refresh_capacity=False):
+                    minimum_pages=0, refresh_capacity=False, expected_sources=None):
     return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
                                        configure, acknowledgements, expected_participants, startup_pages, reserve_null,
-                                       minimum_pages, refresh_capacity))
+                                       minimum_pages, refresh_capacity, expected_sources))

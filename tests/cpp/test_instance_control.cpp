@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -36,6 +37,13 @@ void test_pool_reclaim(const std::string &directory) {
         assert(false);
       };
       check_lost();
+      assert(mkdir(ledger.c_str(), 0700) == 0);
+      try {
+        GpuBudget::open_control(ledger);
+        assert(false);
+      } catch (const StateConsistencyError &) {
+      }
+      assert(rmdir(ledger.c_str()) == 0);
       {
         auto replacement = GpuBudget::connect(ledger, [] { return 80; });
         check_lost();

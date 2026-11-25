@@ -45,11 +45,7 @@ class RuntimeControl:
 
         try:
             workers = control_workers(self.manager.world_size, self.manager.pp_rank,
-                                      self.manager.group_id, refresh_capacity=True)
-            identity = ("gpu", "instance", "pool_slot", "pool_owner", "generation")
-            if len(workers) != len(self.sources) or any(
-                    worker[key] != source[key] for worker, source in zip(workers, self.sources) for key in identity):
-                raise StateConsistencyError("KV control participant changed during exact recovery")
+                                      self.manager.group_id, refresh_capacity=True, expected_sources=self.sources)
         except StateConsistencyError as exc:
             self.manager._record_native_fatal("control poll", exc)
             raise
