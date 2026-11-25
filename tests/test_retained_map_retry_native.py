@@ -39,6 +39,7 @@ def _case(source, consumer):
     import ctypes
     import threading
     import time
+    from types import SimpleNamespace
 
     import torch
 
@@ -170,7 +171,14 @@ def _case(source, consumer):
             manager.num_layers = manager.num_kv_buffers = 1
             manager.reserve_null_block = False
             manager._retired_pages = []
-            assert allocator.get_avail_physical_pages() == 0
+
+            def worker_quota():
+                state = vmm.physical_budget_state()
+                return [{"available_bytes": state["instance_limit_bytes"] - state["instance_charged_bytes"],
+                         "page_bundle_bytes": page}]
+
+            setattr(manager, "_runtime_control", SimpleNamespace(worker_ipc=True, poll=worker_quota, apply=lambda: None))
+            assert manager._get_cached_avail_physical_pages() == 0
             assert manager.exact_recovery_quote([8, 4]) == (0, [], 0)
             assert manager.can_alloc_exact([8, 4])
             assert manager.alloc_exact([8, 4]) == [8, 4]
@@ -375,7 +383,7 @@ def _clear_case():
 
 
 @pytest.mark.parametrize("mode", ["queued", "quota", "quota_null", "quota_busy", "quota_busy_null",
-                                  "quota_cache", "quota_reserve", "quota_exact", "null_init"])
+                                  "quota_cache", "quota_reserve", "quota_exact", "quota_impossible_exact", "null_init"])
 def test_retained_recovery_boundaries(mode):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -383,7 +391,7 @@ def test_retained_recovery_boundaries(mode):
     env = dict(os.environ, ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
                KVCACHED_CONTIGUOUS_LAYOUT="false", KVCACHED_PAGE_SIZE_MB="2",
                KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_MIN_RESERVED_PAGES="2",
-               KVCACHED_MAX_RESERVED_PAGES="1" if mode in ("quota_reserve", "quota_exact") else "0",
+               KVCACHED_MAX_RESERVED_PAGES="1" if mode in ("quota_reserve", "quota_exact", "quota_impossible_exact") else "0",
                KVCACHED_IPC_NAME=f"retained-{mode}-{os.getpid()}")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode],
                             env=env, capture_output=True, text=True, timeout=60)
@@ -576,12 +584,12 @@ def _quota_case(mode):
         vmm.shutdown_kvcached()
 
 
-def _reserved_quota_case(exact):
-    """A healthy native reserve releases real credit before retained recovery."""
+def _reserved_quota_case(mode):
+    """A native reserve funds recoverable retries and survives an impossible quota."""
     import torch
 
     from kvcached import vmm_ops as vmm
-    from kvcached.errors import MapRetainedError
+    from kvcached.errors import MapRetainedError, MapRetainedQuotaError
 
     page = 2 * 1024 * 1024
     vmm.init_kvcached("cuda:0", page, False)
@@ -600,6 +608,8 @@ def _reserved_quota_case(exact):
         transaction = f"reserve-{len(calls)}"
         prepared = vmm.prepare_map_to_kv_tensors(transaction, offsets, 0)
         if not prepared["success"]:
+            if prepared["quota_recovery_impossible"]:
+                raise MapRetainedQuotaError("batch exceeds the peer quota")
             raise MapRetainedError("healthy reserve still holds the needed credit")
         assert vmm.commit_prepared_map(transaction, 0)["success"]
 
@@ -612,15 +622,27 @@ def _reserved_quota_case(exact):
             allocator.alloc_page()
         allocator.free_page(first.page_id)
         assert allocator.get_num_reserved_pages() == 1
-        assert vmm.set_instance_budget_limit(2 * page, 1, 0) == "applied"
-        if exact:
+        impossible = mode == "quota_impossible_exact"
+        limit = 0 if impossible else 2 * page
+        assert vmm.set_instance_budget_limit(limit, 1, 0) == "applied"
+        if impossible:
+            with pytest.raises(MapRetainedQuotaError):
+                allocator.try_alloc_page_at(2)
+            assert calls == [(2 * page,)] * 2
+            assert allocator.get_num_reserved_pages() == 1
+            idle = allocator.try_alloc_page_at(first.page_id)
+            assert idle.page_id == first.page_id
+            allocator.free_page(idle.page_id)
+            limit = 3 * page
+            assert vmm.set_instance_budget_limit(limit, 2, 0) == "applied"
+        if mode != "quota_reserve":
             recovered = allocator.try_alloc_page_at(2)
             assert calls == [(2 * page,)] * 3
         else:
             assert allocator.resize(2 * page)
             recovered = allocator.alloc_page()
         assert allocator.get_num_retryable_pages() == 0
-        assert vmm.physical_budget_state()["instance_charged_bytes"] == 2 * page
+        assert vmm.physical_budget_state()["instance_charged_bytes"] == limit
         assert recovered.page_id == 2
         for pid in (live.page_id, recovered.page_id):
             view = tensors[0][pid * page:pid * page + 128]
@@ -686,8 +708,8 @@ if __name__ == "__main__":
         _queued_case()
     elif sys.argv[1] == "null_init":
         _null_init_case()
-    elif sys.argv[1] in ("quota_reserve", "quota_exact"):
-        _reserved_quota_case(sys.argv[1] == "quota_exact")
+    elif sys.argv[1] in ("quota_reserve", "quota_exact", "quota_impossible_exact"):
+        _reserved_quota_case(sys.argv[1])
     elif sys.argv[1].startswith("quota"):
         _quota_case(sys.argv[1])
     else:

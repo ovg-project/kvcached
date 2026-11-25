@@ -911,13 +911,17 @@ class KVCacheManager:
 
         created: List[int] = []
         missing = [pid for pid in grouped if pid not in self.full_pages and pid not in self.avail_pages]
+        retained_count = 0
         if len(missing) > 1 and self.page_allocator.get_num_retryable_pages():
             # Adopt intact batches first so their surplus becomes an ordinary
             # reserve before a fresh mapping needs to release that credit.
             retained = set(self.page_allocator.get_retryable_page_ids())
             missing.sort(key=lambda pid: pid not in retained)
-        for page_id in missing:
+            retained_count = sum(pid in retained for pid in missing)
+        for index, page_id in enumerate(missing):
             try:
+                if retained_count and index == retained_count:
+                    self._trim_after_exact_retry(missing[index:])
                 page = self.page_allocator.try_alloc_page_at(page_id)
             except StateConsistencyError as exc:
                 self._increment_operation_counter("manager_page_allocation_failures_total")
@@ -971,6 +975,19 @@ class KVCacheManager:
             self._logical_allocated_blocks += len(claimed - reserved)
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
+
+    def _trim_after_exact_retry(self, pending: List[int]) -> None:
+        # C++ sees the local driver. A worker can still be at its instance
+        # limit, so price the remaining IDs against the worker headroom too.
+        room = self._get_cached_avail_physical_pages()
+        if room >= len(pending):
+            return
+        quote = self.page_allocator.exact_recovery_quote(pending)
+        if quote is not None:
+            fresh_bytes, idle, local = quote
+            count = max(local, fresh_bytes // self._memory_limit_page_bundle_bytes() - room)
+            if count > 0 and idle:
+                self.trim_selected_reserves(idle[:count])
 
     def _release_unclaimed_exact_pages(self, page_ids: List[int]) -> None:
         if not page_ids:

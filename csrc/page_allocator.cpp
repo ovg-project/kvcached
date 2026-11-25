@@ -242,6 +242,11 @@ PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry) {
       std::exception_ptr retry_error;
       try {
         retry_retained_batch(std::move(retained));
+      } catch (const MapRetainedQuotaError &) {
+        // No amount of trimming can fund this exact batch under its quota.
+        if (requested_id >= 0)
+          throw;
+        retry_error = std::current_exception();
       } catch (const StateConsistencyError &) {
         throw;
       } catch (const MapQuarantinedError &) {
