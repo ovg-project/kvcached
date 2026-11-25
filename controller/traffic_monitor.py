@@ -22,6 +22,7 @@ class RequestStats:
     response_time: Optional[float] = None
     success: bool = True
     error_message: Optional[str] = None
+    finished: bool = False  # set by record_request_end(); closing twice is a no-op
 
 
 @dataclass
@@ -32,14 +33,25 @@ class ModelActivityStats:
     failed_requests: int = 0
     last_activity_time: float = 0.0
     avg_response_time: float = 0.0
+    inflight_requests: int = 0  # requests being served right now
     request_timestamps: deque = field(
         default_factory=lambda: deque(maxlen=1000))
+
+    def note_activity(self, when: float) -> None:
+        """Move the activity clock forward to ``when``, never backwards."""
+        if when > self.last_activity_time:
+            self.last_activity_time = when
+
+    def request_started(self, when: float) -> None:
+        self.inflight_requests += 1
+        self.note_activity(when)
 
     def add_request(self, request_stats: RequestStats):
         """Add a new request to the statistics"""
         self.total_requests += 1
-        # Requests can finish in a different order from when they started.
-        self.last_activity_time = max(self.last_activity_time, request_stats.timestamp)
+        self.inflight_requests = max(0, self.inflight_requests - 1)
+        ended_at = request_stats.timestamp + (request_stats.response_time or 0.0)
+        self.note_activity(ended_at)
         self.request_timestamps.append(request_stats.timestamp)
 
         if request_stats.success:
@@ -74,8 +86,17 @@ class ModelActivityStats:
         return time.time() - self.last_activity_time
 
     def is_idle(self, idle_threshold_seconds: int = 300) -> bool:
-        """Check if the model has been idle longer than the threshold (default 5 minutes)"""
+        """Check if the model has been idle longer than the threshold (default 5 minutes)
+
+        A model that is still serving a request is busy by definition.
+        """
+        if self.inflight_requests > 0:
+            return False
         return self.get_idle_time() > idle_threshold_seconds
+
+    def is_busy(self) -> bool:
+        """Whether the model is serving at least one request right now."""
+        return self.inflight_requests > 0
 
 
 class TrafficMonitor:
@@ -111,7 +132,7 @@ class TrafficMonitor:
 
     def record_request_start(self, model_name: str,
                              endpoint_path: str) -> RequestStats:
-        """Record the start of a request"""
+        """Record the start of a request, and track the model from here."""
         request_stats = RequestStats(timestamp=time.time(),
                                      model_name=model_name,
                                      endpoint_path=endpoint_path)
@@ -121,6 +142,8 @@ class TrafficMonitor:
             # Keep only recent history (last 10000 requests)
             if len(self._request_history) > 10000:
                 self._request_history = self._request_history[-5000:]
+            self.model_stats[model_name].request_started(
+                request_stats.timestamp)
 
         return request_stats
 
@@ -129,13 +152,19 @@ class TrafficMonitor:
                            success: bool = True,
                            response_time: Optional[float] = None,
                            error_message: Optional[str] = None):
-        """Record the end of a request"""
+        """Record the end of a request. Idempotent: closing twice counts once."""
+        if request_stats.finished:
+            logger.debug(
+                f"Ignoring duplicate completion for {request_stats.model_name}")
+            return
+
         if response_time is None:
             response_time = time.time() - request_stats.timestamp
 
         request_stats.response_time = response_time
         request_stats.success = success
         request_stats.error_message = error_message
+        request_stats.finished = True
 
         with self._lock:
             self.model_stats[request_stats.model_name].add_request(
@@ -193,6 +222,7 @@ class TrafficMonitor:
                     'total_requests': stats.total_requests,
                     'successful_requests': stats.successful_requests,
                     'failed_requests': stats.failed_requests,
+                    'inflight_requests': stats.inflight_requests,
                     'request_rate': stats.get_request_rate(window_seconds),
                     'avg_response_time': stats.avg_response_time,
                     'last_activity_time': stats.last_activity_time,

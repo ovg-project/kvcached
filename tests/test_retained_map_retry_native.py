@@ -19,7 +19,7 @@ fault_library = test_vmm_failure_policy.fault_library
     for source in ("foreground", "background")
     for consumer in ("foreground", "background", "fatal", "gil", "resize",
                      "resize_fatal", "resize_quarantined")
-] + [("background", "fresh")])
+] + [("background", "fresh"), ("background", "exact")])
 def test_retained_batch_retry(fault_library, source, consumer):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -160,7 +160,28 @@ def _case(source, consumer):
         manager.block_mem_size = block_bytes
         assert manager.available_size() == expected
         manager.block_mem_size = page // 4
-        if consumer == "fresh":
+        if consumer == "exact":
+            # No local headroom. An unrelated ID must leave the batch alone,
+            # and an exact retry of its second ID must replay both offsets.
+            assert allocator.try_alloc_page_at(2) is None
+            assert len(calls) == 1
+            assert allocator.exact_recovery_quote([1]) == (0, [], 0)
+            assert allocator.exact_recovery_quote([2]) == (page, [], 0)
+            with pytest.raises(RuntimeError, match="peer still has no capacity"):
+                allocator.try_alloc_page_at(1)
+            assert allocator.get_num_retryable_pages() == 2
+            recovered = allocator.try_alloc_page_at(1)
+            assert recovered.page_id == 1
+            assert calls == [(0, page)] * 3
+            assert allocator.try_alloc_page_at(0).page_id == 0
+            assert len(calls) == 3
+            view = tensors[0][page:page + 128]
+            view.fill_(37)
+            assert torch.all(view == 37).item()
+            torch.cuda.synchronize()
+            allocator.free_pages([0, 1])
+            allocator.trim()
+        elif consumer == "fresh":
             driver.kvcached_fault_zero_free_memory(0)
             blocks = manager.alloc(1)
             assert blocks == [8]

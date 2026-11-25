@@ -428,6 +428,31 @@ def test_cancelled_post_init_settles_readiness(monkeypatch, cancel_during_reserv
     assert "start_prealloc_thread" not in manager.page_allocator.calls
 
 
+@pytest.mark.parametrize("success", [True, False])
+def test_state_pins_are_claimed_before_background_preallocation(monkeypatch, success):
+    manager = _bare_manager()
+    manager.permanent_block_ids = frozenset({7})
+    monkeypatch.setattr(kcm, "broadcast_kv_tensors_created", lambda *a, **kw: True)
+    claims = []
+
+    def claim(ids, *, apply_resize):
+        assert not apply_resize and "start_prealloc_thread" not in manager.page_allocator.calls
+        claims.append(ids)
+        return ids if success else None
+
+    monkeypatch.setattr(manager, "_alloc_exact_impl", claim)
+    thread = _run_post_init(manager)
+    thread.join(timeout=5)
+    assert claims == [[7]]
+    if success:
+        manager.wait_ready(timeout=0)
+        assert "start_prealloc_thread" in manager.page_allocator.calls
+    else:
+        with pytest.raises(RuntimeError, match="permanent state pages"):
+            manager.wait_ready(timeout=0)
+        assert "start_prealloc_thread" not in manager.page_allocator.calls
+
+
 def test_post_init_failure_is_re_raised_by_wait_ready(monkeypatch):
     monkeypatch.setattr(kcm, "KV_TENSOR_WAIT_TIMEOUT", 0.02)
     monkeypatch.setattr(kcm, "broadcast_kv_tensors_created",

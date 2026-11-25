@@ -1062,9 +1062,9 @@ std::string GpuBudget::set_instance_limit(size_t slot, uint64_t bytes,
 void GpuBudget::configure_control_pool(size_t slot, uint64_t capacity,
                                        uint64_t page_bundle, bool can_shrink,
                                        uint64_t expected_participants,
-                                       bool reserve_null) {
+                                       uint64_t minimum_pages) {
   if (!page_bundle || capacity % page_bundle ||
-      (reserve_null && capacity < page_bundle))
+      minimum_pages > capacity / page_bundle)
     throw std::invalid_argument(
         "KV control capacity must contain whole page bundles");
   Locked lock(*this);
@@ -1079,7 +1079,7 @@ void GpuBudget::configure_control_pool(size_t slot, uint64_t capacity,
   instance.expected_participants = expected_participants;
   pool.capacity = capacity;
   pool.page_bundle = page_bundle;
-  pool.minimum = reserve_null ? page_bundle : 0;
+  pool.minimum = minimum_pages * page_bundle;
   pool.can_shrink = can_shrink;
 }
 

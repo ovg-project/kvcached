@@ -215,7 +215,7 @@ public:
   void configure_control_pool(size_t slot, uint64_t capacity,
                               uint64_t page_bundle, bool can_shrink,
                               uint64_t expected_participants = 0,
-                              bool reserve_null = false);
+                              uint64_t minimum_pages = 0);
   void ready_control_pool(size_t slot);
   InstanceControl query_control(const std::string &instance,
                                 size_t slot = SIZE_MAX);

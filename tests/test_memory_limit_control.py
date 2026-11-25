@@ -811,3 +811,17 @@ def test_pending_checks_late_allocator_failure(controls, monkeypatch, retired, f
         manager.apply_resize_target()
         assert manager._operation_counters["resize_errors_total"] == 1
     assert manager._operation_counters["resize_requests_total"] == 1
+
+
+def test_state_tail_and_null_page_set_a_reachable_shrink_floor(controls):
+    manager, native, control = controls
+    manager.null_block = [0]
+    manager.permanent_block_ids = frozenset({7})
+    manager.page_allocator.inuse_pages = 2
+    control.set_instance_memory_limit(0)
+    for state in native.states.values():
+        state["pool_target_bytes"] = 0
+        state.update(published=True, revision=1)
+    manager.apply_resize_target()
+    assert manager.page_allocator.resize_calls[-1] == 2
+    assert not manager.in_shrink

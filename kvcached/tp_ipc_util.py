@@ -1084,7 +1084,9 @@ def _start_worker_listener_thread(
                     state = _C.local_instance_control(group_id, msg.get("configure"),
                                                       msg.get("expected_participants", 0),
                                                       msg.get("startup_pages", 0),
-                                                      msg.get("reserve_null", False))
+                                                      msg.get("reserve_null", False),
+                                                      **({"minimum_pages": msg["minimum_pages"]}
+                                                         if msg.get("minimum_pages") else {}))
                     send_msg(conn, {"status": "success", "control": state})
                 elif msg["cmd"] == "ack_instance_control":
                     from kvcached import _C  # type: ignore[attr-defined]
@@ -1860,7 +1862,8 @@ def query_worker_cuda_mem_get_info(rank: int,
 
 
 async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
-                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
+                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
+                           minimum_pages=0):
     targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
                for rank in range(tp_size)]
     messages = []
@@ -1868,7 +1871,8 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
         if acknowledgements is None:
             messages.append({"cmd": "instance_control", "group_id": group_id,
                              "configure": configure, "expected_participants": expected_participants,
-                             "startup_pages": startup_pages, "reserve_null": reserve_null})
+                             "startup_pages": startup_pages, "reserve_null": reserve_null,
+                             "minimum_pages": minimum_pages})
         else:
             messages.append({"cmd": "ack_instance_control", "group_id": group_id,
                              "generation": acknowledgements[(stage, rank)][0],
@@ -1891,6 +1895,8 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
 
 
 def control_workers(tp_size: int, pp_rank: int, group_id: int,
-                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False):
+                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
+                    minimum_pages=0):
     return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
-                                       configure, acknowledgements, expected_participants, startup_pages, reserve_null))
+                                       configure, acknowledgements, expected_participants, startup_pages, reserve_null,
+                                       minimum_pages))

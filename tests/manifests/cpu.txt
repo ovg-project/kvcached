@@ -8,6 +8,7 @@ tests/test_ci_report.py
 tests/test_control_segment.py
 tests/test_controller_errors.py
 tests/test_e2e_harness.py
+tests/test_exact_block_ids.py
 tests/test_frontend_streaming.py
 tests/test_get_max_cached_blocks.py
 tests/test_init_lock_order.py
@@ -34,10 +35,17 @@ tests/test_prefix_cache_shrink.py
 tests/test_priority_preemption.py
 tests/test_priority_reclaim.py
 tests/test_resize_reserved_order.py
+tests/test_runtime_reservations.py
 tests/test_sglang_allocator_patch.py
 tests/test_sglang_auto_page_size.py
 tests/test_sglang_autopatch_order.py
 tests/test_sglang_capacity_miss.py
+tests/test_sglang_dsv4_kv_pool_patch.py
+tests/test_sglang_dsv4_native_allocator_source.py
+tests/test_sglang_dsv4_native_backing.py
+tests/test_sglang_dsv4_priority.py
+tests/test_sglang_dsv4_runtime_reservation_patch.py
+tests/test_sglang_dsv4_sync_compat.py
 tests/test_sglang_free_page_ids.py
 tests/test_sglang_hicache.py
 tests/test_sglang_local_pool_ownership.py
@@ -46,6 +54,10 @@ tests/test_sglang_mamba_slot_allocator.py
 tests/test_sglang_mem_pool_seam.py
 tests/test_sglang_page_aware_eviction.py
 tests/test_sglang_prefix_cache_cap.py
+tests/test_sglang_rank_config.py
+tests/test_sglang_rank_coordination.py
+tests/test_sglang_rank_coordination_gloo.py
+tests/test_sglang_rank_prepare.py
 tests/test_sglang_shutdown.py
 tests/test_sglang_shutdown_process.py
 tests/test_sglang_shutdown_sockets.py

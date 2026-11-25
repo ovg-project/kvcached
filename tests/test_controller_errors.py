@@ -271,3 +271,39 @@ async def test_malformed_upstream_json_stays_a_server_error():
             assert json.loads(body)["error"]["type"] == "InternalServerError"
         finally:
             await router.close()
+
+
+async def test_bad_query_parameters_are_client_errors():
+    """A malformed threshold is the caller's mistake, not a server failure."""
+    monitor = TrafficMonitor(idle_threshold_seconds=300)
+    frontend = object.__new__(frontend_module.MultiLLMFrontend)
+    frontend.traffic_monitor = monitor
+    frontend.sleep_manager = SleepManager(SleepConfig(),
+                                          traffic_monitor=monitor)
+
+    app = web.Application()
+    app.router.add_get("/models/idle", frontend.handle_list_idle_models)
+    app.router.add_get("/models/active", frontend.handle_list_active_models)
+    app.router.add_get("/traffic/stats", frontend.handle_traffic_stats)
+    app.router.add_get("/traffic/stats/{model_name}",
+                       frontend.handle_model_traffic_stats)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        async with aiohttp.ClientSession() as session:
+            for path in ("/models/idle?threshold=abc",
+                         "/models/idle?threshold=-1",
+                         "/models/active?threshold=abc",
+                         "/models/active?window=abc",
+                         "/models/active?window=0",
+                         "/traffic/stats?window=abc",
+                         "/traffic/stats?window=0",
+                         "/traffic/stats?window=-5",
+                         "/traffic/stats/qwen05?window=abc"):
+                url = f"http://127.0.0.1:{server.port}{path}"
+                async with session.get(url) as resp:
+                    body = await resp.json()
+                    assert resp.status == 400, (path, body)
+                    assert body["error"]["type"] == "BadRequestError", path
+    finally:
+        await server.close()

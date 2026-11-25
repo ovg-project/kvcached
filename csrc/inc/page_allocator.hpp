@@ -11,8 +11,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -56,6 +58,7 @@ public:
   // max_block_id is an exclusive ID bound; -1 keeps every backing block.
   void init(int64_t block_mem_size, int64_t max_block_id = -1);
   std::vector<int64_t> alloc(int64_t num_blocks = 1);
+  bool alloc_exact(const std::vector<int64_t> &block_ids);
   void free(int64_t block_id);
   void free_batch(const std::vector<int64_t> &block_ids);
   bool empty() const;
@@ -80,6 +83,8 @@ public:
 
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page(bool allow_fresh_retry = true);
+  // Nonblocking: nullptr if this particular page is not currently free.
+  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
   // Internal receipt: number of leading input pages placed in the reserve.
@@ -91,6 +96,9 @@ public:
   // Unmap up to max_pages reserved pages (all of them when negative) and
   // return how many were unmapped.
   int64_t trim(int64_t max_pages = -1);
+  int64_t trim_selected(const std::vector<page_id_t> &eligible);
+  std::optional<std::tuple<uint64_t, std::vector<page_id_t>, size_t>>
+  exact_recovery_quote(const std::vector<page_id_t> &pages) const;
 
   // Status queries
   int64_t get_num_free_pages() const;
@@ -111,6 +119,7 @@ public:
   PageState get_page_state() const;
   TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
+  int64_t get_avail_physical_bytes() const;
 
   // Poll the shared-memory MemInfoStruct to see if an external controller
   // (e.g. `kvctl limit`) has written a new total_size. Returns the new
@@ -157,11 +166,16 @@ private:
   void resize_watcher();
 
   // Internal methods
+  std::shared_ptr<InternalPage> alloc_page_impl(page_id_t requested_id,
+                                                bool allow_fresh_retry);
   void map_pages(const std::vector<page_id_t> &page_ids);
+  std::vector<page_id_t> take_retained_batch_unlocked(page_id_t requested_id);
+  void retry_retained_batch(std::vector<page_id_t> pages);
   bool retry_retained_pages();
   int64_t get_num_retryable_pages_unlocked() const;
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
+  int64_t trim_impl(int64_t max_pages, const std::vector<page_id_t> *eligible);
   PageState get_page_state_unlocked() const;
   void update_memory_usage_unlocked();
   void trigger_preallocation();

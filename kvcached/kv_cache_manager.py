@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
 from __future__ import annotations
 
 import functools
+import operator
 import threading
 import time
 import weakref
@@ -169,6 +170,7 @@ class KVCacheManager:
         page_size: Optional[int] = None,
         logical_num_blocks: Optional[int] = None,
         max_block_id: Optional[int] = None,
+        permanent_block_ids: tuple[int, ...] = (),
     ):
         """
         Args:
@@ -217,6 +219,7 @@ class KVCacheManager:
         if reserve_null_block and logical_num_blocks == 0:
             raise ValueError("logical_num_blocks must include the reserved null block")
         self.num_blocks = num_blocks
+        self._virtual_num_blocks = num_blocks
         self.logical_num_blocks = logical_num_blocks
         self.max_block_id = max_block_id
         # Blocks handed out of pages, including the null block and reservations.
@@ -250,6 +253,14 @@ class KVCacheManager:
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE if page_size is None else page_size
+        self.permanent_block_ids = frozenset(permanent_block_ids)
+        if self.permanent_block_ids and (
+            not reserve_null_block or self.block_mem_size != self.page_size
+            or any(b <= 0 or b >= (max_block_id if max_block_id is not None else num_blocks)
+                   for b in self.permanent_block_ids)
+            or (logical_num_blocks is not None and 1 + len(self.permanent_block_ids) > logical_num_blocks)
+        ):
+            raise ValueError("Permanent blocks require addressable whole pages plus the null block")
         # Every page must hold a whole block. A block larger than a page leaves
         # the pool empty (warmup deadlocks); an unfavorable block/page alignment
         # can leave some pages with no block, and such a
@@ -458,7 +469,7 @@ class KVCacheManager:
         self._last_error_code: Optional[str] = None
         self._last_error_timestamp_ns: Optional[int] = None
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
-        self._lock = threading.RLock() if async_sched else NoOpLock()
+        self._lock: threading.RLock | NoOpLock = threading.RLock() if async_sched else NoOpLock()
 
         # Event used to signal that _post_init() has finished.
         self._post_init_done = threading.Event()
@@ -509,6 +520,11 @@ class KVCacheManager:
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
+            pins = getattr(self, "permanent_block_ids", ())
+            if pins and not self._shutdown_requested.is_set():
+                with self._lock:
+                    if self._alloc_exact_impl(sorted(pins), apply_resize=False) is None:
+                        raise RuntimeError("Cannot back permanent state pages during initialization")
             if not self._shutdown_requested.is_set():
                 self.page_allocator.start_prealloc_thread()
         except Exception as e:
@@ -731,6 +747,233 @@ class KVCacheManager:
     def alloc(self, need_size: int) -> Optional[List[int]]:
         """Wait for initial setup without holding the lock, then allocate blocks."""
         return self._alloc(need_size)
+
+    def alloc_exact(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        """Claim the requested free block IDs, in caller order, or return None.
+
+        This is an allocation, not a reference-count increment for live IDs.
+        Duplicates, null-block IDs, out-of-range IDs and blocks crossing a
+        physical-page boundary are rejected before a pool mutation. A miss
+        preserves existing allocations and reservations. Mapping-consistency
+        errors remain fatal. Integrations own any cross-pool transaction.
+        """
+        # Null-block initialization needs the manager lock before it can
+        # signal readiness. Never wait for it while holding that lock.
+        self.wait_ready()
+        return self._alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _alloc_exact_ready(self, block_ids: Iterable[int]) -> Optional[List[int]]:
+        reserved_before = len(self.reserved_blocks)
+        counters = getattr(self, "_operation_counters", None)
+        if counters is not None:
+            self._increment_operation_counter("allocation_requests_total")
+        try:
+            result = self._alloc_exact_impl(block_ids)
+        except Exception:
+            if counters is not None:
+                self._record_operation_error(
+                    "allocation_failed", "allocation_errors_total",
+                    failure_counter="allocation_failures_total")
+            raise
+        if counters is not None:
+            if result is None:
+                self._increment_operation_counter("allocation_failures_total")
+                self._increment_operation_counter("capacity_exhausted_total")
+            else:
+                self._increment_operation_counter("allocation_successes_total")
+                self._increment_operation_counter("allocated_blocks_total", len(result))
+        if result is not None:
+            taken = len(result) - (reserved_before - len(self.reserved_blocks))
+            self._step_alloc_blocks = getattr(self, "_step_alloc_blocks", 0) + taken
+        return result
+
+    def can_alloc_exact(self, block_ids: Iterable[int]) -> bool:
+        """Check current exact placement without claiming blocks or applying resize.
+
+        This is an admission hint, not a reservation: another pool may consume
+        physical headroom before alloc_exact performs the actual claim.
+        """
+        self.wait_ready()
+        return self._can_alloc_exact_ready(block_ids)
+
+    @synchronized
+    def _can_alloc_exact_ready(self, block_ids: Iterable[int]) -> bool:
+        return self._exact_claim_preflight(block_ids, apply_resize=False) is not None
+
+    @synchronized
+    def exact_recovery_quote(self, ids: List[int]) -> Optional[tuple[int, List[int], int]]:
+        """Price a rolled-back claim and identify unused native reserves."""
+        claim = self._exact_claim_preflight(ids, apply_resize=False, shared_budget=True)
+        if claim is None:
+            return None
+        new = [page for page in claim[1] if page not in self.full_pages and page not in self.avail_pages]
+        return self.page_allocator.exact_recovery_quote(new)
+
+    @synchronized
+    def trim_selected_reserves(self, idle: List[int]) -> None:
+        try:
+            self.page_allocator.trim_selected(idle)
+        except Exception as exc:
+            self._record_native_fatal("trim", exc)
+            raise
+        self._avail_physical_pages_cache = None
+
+    def _exact_claim_preflight(
+        self, block_ids: Iterable[int], *, apply_resize: bool, shared_budget: bool = False
+    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int]]]:
+        requested: List[int] = []
+        for value in block_ids:
+            if isinstance(value, bool):
+                raise TypeError("Exact block IDs must be integers, not bool")
+            requested.append(operator.index(value))
+        if len(set(requested)) != len(requested):
+            raise ValueError("Exact block IDs must be unique")
+        grouped: Dict[int, List[int]] = {}
+        for block_id in requested:
+            if block_id < 0 or block_id >= self._virtual_num_blocks:
+                raise ValueError("Exact block ID exceeds the pool's virtual backing")
+            bound = getattr(self, "max_block_id", None)
+            if bound is not None and block_id >= bound:
+                raise ValueError("Exact block ID exceeds the pool's logical ID bound")
+            if self.reserve_null_block and block_id == 0:
+                raise ValueError("The null block cannot be allocated explicitly")
+            page_id = block_id * self.block_mem_size // self.page_size
+            start, end = InternalPage.get_block_range(
+                page_id, self.page_size, self.block_mem_size)
+            if not start <= block_id < end:
+                raise ValueError("Exact block crosses a physical-page boundary")
+            grouped.setdefault(page_id, []).append(block_id)
+        if not requested:
+            return requested, grouped, set()
+
+        if apply_resize:
+            self._apply_resize_target()
+
+        reserved = set(self.reserved_blocks)
+        logical_limit = getattr(self, "logical_num_blocks", None)
+        # Only requested reservations can be reused by an exact-ID claim.
+        fresh_count = sum(block_id not in reserved for block_id in requested)
+        if (logical_limit is not None and
+                fresh_count > max(0, logical_limit - self._logical_allocated_blocks)):
+            return None
+        shrinking = getattr(self, "in_shrink", False)
+        retiring = self._unreusable_page_ids()
+        # Check every existing page before mapping or claiming any new page.
+        for page_id, ids in grouped.items():
+            page = self.full_pages.get(page_id) or self.avail_pages.get(page_id)
+            if page_id in retiring or (shrinking and page is None):
+                return None
+            if page is not None:
+                free = set(page.get_free_blocks())
+                if any(i not in free and i not in reserved for i in ids):
+                    return None
+
+        # Sparse IDs can need one new physical page per requested block.
+        # The packed-block capacity estimate above is not sufficient for them.
+        needed = [page_id for page_id in grouped
+                  if page_id not in self.full_pages and page_id not in self.avail_pages]
+        try:
+            if len(needed) > self.page_allocator.get_num_free_pages():
+                return None
+            if not shared_budget:
+                room = self._get_cached_avail_physical_pages()
+                if len(needed) > room + self.page_allocator.get_num_reserved_pages():
+                    if not self.page_allocator.get_num_retryable_pages():
+                        return None
+                    # Only a batch containing a requested ID can help here.
+                    quote = self.page_allocator.exact_recovery_quote(needed)
+                    if quote is None:
+                        return None
+                    fresh_bytes, idle, _ = quote
+                    if fresh_bytes > (room + len(idle)) * self._memory_limit_page_bundle_bytes():
+                        return None
+        except Exception as exc:
+            self._record_native_fatal("alloc_exact", exc)
+            raise
+        return requested, grouped, reserved
+
+    def _alloc_exact_impl(self, block_ids: Iterable[int], *, apply_resize: bool = True) -> Optional[List[int]]:
+        claim = self._exact_claim_preflight(block_ids, apply_resize=apply_resize)
+        if claim is None:
+            return None
+        requested, grouped, reserved = claim
+        if not requested:
+            return []
+
+        created: List[int] = []
+        for page_id in grouped:
+            if page_id in self.full_pages or page_id in self.avail_pages:
+                continue
+            try:
+                page = self.page_allocator.try_alloc_page_at(page_id)
+            except StateConsistencyError as exc:
+                self._increment_operation_counter("manager_page_allocation_failures_total")
+                self._lifecycle.mark_failed("exact allocation mapping is unsafe", exc)
+                raise
+            except RuntimeError as exc:
+                self._increment_operation_counter("manager_page_allocation_failures_total")
+                if self._record_native_fatal("alloc_exact", exc):
+                    raise
+                self._release_unclaimed_exact_pages(created)
+                return None
+            if page is None:
+                self._release_unclaimed_exact_pages(created)
+                return None
+            self._avail_physical_pages_cache = None
+            self._increment_operation_counter("manager_page_allocations_total")
+            if getattr(self, "max_block_id", None) is None:
+                page.init(self.block_mem_size)
+            else:
+                page.init(self.block_mem_size, self.max_block_id)
+            self.avail_pages[page_id] = page
+            self.num_avail_blocks += page.num_free_blocks()
+            created.append(page_id)
+
+        # The manager lock and per-page preflight make these claims exclusive.
+        for page_id, ids in grouped.items():
+            page = self.full_pages.get(page_id) or self.avail_pages[page_id]
+            fresh = [i for i in ids if i not in reserved]
+            if not page.alloc_exact(fresh):
+                claim_error = StateConsistencyError("Exact block preflight and claim disagree")
+                self._lifecycle.mark_failed("exact allocation ledger is unsafe", claim_error)
+                raise claim_error
+            self.num_avail_blocks -= len(fresh)
+            if page.full():
+                self.avail_pages.pop(page_id, None)
+                self.full_pages[page_id] = page
+            else:
+                self.avail_pages[page_id] = page
+            # An empty retired page has become live again, as in alloc().
+            self._retired_pages = [
+                (epoch, remaining)
+                for epoch, pages in self._retired_pages
+                if (remaining := [pid for pid in pages if pid != page_id])
+            ]
+        claimed = set(requested)
+        step_claims = getattr(self, "_step_exact_claims", None)
+        if step_claims is not None:
+            step_claims.update(claimed - reserved)
+        if getattr(self, "logical_num_blocks", None) is not None:
+            self._logical_allocated_blocks += len(claimed - reserved)
+        self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
+        return requested
+
+    def _release_unclaimed_exact_pages(self, page_ids: List[int]) -> None:
+        if not page_ids:
+            return
+        # These pages have never handed a block to the caller. Existing pages
+        # and their deferred-release epochs are untouched by this rollback.
+        try:
+            self.page_allocator.free_pages(page_ids)
+        except Exception as exc:
+            self._record_native_fatal("alloc_exact rollback", exc)
+            raise
+        for page_id in page_ids:
+            page = self.avail_pages.pop(page_id)
+            self.num_avail_blocks -= page.num_free_blocks()
+        self._avail_physical_pages_cache = None
+        self._increment_operation_counter("manager_page_releases_total", len(page_ids))
 
     @_after_post_init
     def alloc_packed(self, need_size: int) -> Optional[List[int]]:
@@ -1037,6 +1280,11 @@ class KVCacheManager:
                     self._record_operation_error("free_failed", "free_errors_total")
             raise
 
+        step_claims = getattr(self, "_step_exact_claims", None)
+        if step_claims and not had_inconsistency:
+            returned = step_claims.intersection(indices)
+            self._step_alloc_blocks -= len(returned)
+            step_claims.difference_update(returned)
         if counters is not None:
             name = "free_failures_total" if had_inconsistency else "free_successes_total"
             counters[name] = counters.get(name, 0) + 1
@@ -1049,6 +1297,10 @@ class KVCacheManager:
 
         if len(indices) == 0:
             return 0, False  # Nothing to free
+
+        pins = getattr(self, "permanent_block_ids", None)
+        if pins and not pins.isdisjoint(indices):
+            raise ValueError("Permanent state pages cannot be freed")
 
         if SANITY_CHECK:
             for idx in indices:
@@ -1408,12 +1660,15 @@ class KVCacheManager:
         return True
 
     @synchronized
-    def take_step_alloc_blocks(self) -> int:
+    def take_step_alloc_blocks(self, *, track_exact: bool = False) -> int:
         """Blocks allocated since the last call, and restart the count.
 
         Engines call it at each scheduling step's boundary. Blocks handed out
         from ``try_to_reserve()``'s reservation count once, when reserved.
         """
+        # DSV4 can return an exact claim when another backing or TP rank misses.
+        # Only cancel IDs freshly charged in this round, never an older reservation.
+        self._step_exact_claims: Optional[set[int]] = set() if track_exact else None
         taken = getattr(self, "_step_alloc_blocks", 0)
         self._step_alloc_blocks = 0
         return taken
@@ -1884,7 +2139,8 @@ class KVCacheManager:
         # The permanent null block pins one page. Keep the control limit
         # unchanged, but give the allocator a reachable physical target so
         # it reclaims every other page before background preallocation resumes.
-        target_pages = max(int(getattr(self, "null_block", None) is not None),
+        minimum_pages = int(getattr(self, "null_block", None) is not None) + len(getattr(self, "permanent_block_ids", ()))
+        target_pages = max(minimum_pages,
                            new_mem_size // self.page_size)
         try:
             resized = self.page_allocator.resize(target_pages * self.page_size)
@@ -2045,6 +2301,11 @@ class KVCacheManager:
             )
             available = min(available, logical_available)
         return available
+
+    @synchronized
+    def invalidate_physical_capacity(self) -> None:
+        """A sibling pool changed the driver headroom during this admission."""
+        self._avail_physical_pages_cache = None
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().
@@ -2272,6 +2533,9 @@ class KVCacheManager:
         retained_null_page = None
         if getattr(self, "_runtime_control", None) is not None and self.null_block == [0]:
             retained_null_page = self.avail_pages.get(0, self.full_pages.get(0))
+        # State sentinels can be read or cleared by the engine at any time.
+        # They each own one whole page and must stay mapped across clear().
+        retained_pins = {i: self.full_pages[i] for i in getattr(self, "permanent_block_ids", ())}
 
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = [
@@ -2285,6 +2549,8 @@ class KVCacheManager:
             pages_to_free.append(page.page_id)
         if retained_null_page is not None:
             pages_to_free = [page_id for page_id in pages_to_free if page_id != 0]
+        if retained_pins:
+            pages_to_free = [page_id for page_id in pages_to_free if page_id not in retained_pins]
         if pages_to_free:
             pages_to_free = list(dict.fromkeys(pages_to_free))
             self.page_allocator.free_pages(pages_to_free)
@@ -2345,6 +2611,8 @@ class KVCacheManager:
             self.num_avail_blocks = retained_null_page.num_free_blocks()
             target = self.avail_pages if self.num_avail_blocks else self.full_pages
             target[0] = retained_null_page
+        self.full_pages.update(retained_pins)
+        self._logical_allocated_blocks += len(retained_pins)
         # Reapply the accepted revision after clear reset the execution state.
         runtime = getattr(self, "_runtime_control", None)
         if runtime is not None:
