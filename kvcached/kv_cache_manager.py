@@ -884,8 +884,7 @@ class KVCacheManager:
         try:
             if len(needed) > self.page_allocator.get_num_free_pages():
                 return None
-            retrying = not getattr(self, "_pending_exact_retry_pages", set()).isdisjoint(needed)
-            if not shared_budget and retrying:
+            if not shared_budget and self._needs_exact_retry(needed):
                 # A previous adoption changed retained pages into reserves.
                 # The actual claim reprices before mapping; admission hints
                 # use the same live quote without trimming.
@@ -926,28 +925,17 @@ class KVCacheManager:
             missing.sort(key=lambda pid: pid not in retained)
             retained_count = sum(pid in retained for pid in missing)
         pending: set[int] = getattr(self, "_pending_exact_retry_pages", set())
-        if 0 < retained_count < len(missing):
-            # Remember the fresh IDs across rollback. The recovered batch
-            # becomes ordinary reserves even when a worker sample is busy.
-            pending.update(missing[retained_count:])
-            self._pending_exact_retry_pages = pending
-        reprice = not pending.isdisjoint(missing)
+        adopting = 0 < retained_count < len(missing)
+        reprice = adopting or self._needs_exact_retry(missing)
         for index, page_id in enumerate(missing):
-            if reprice and index == retained_count:
-                try:
-                    idle = self._exact_retry_trim_plan(missing[index:])
-                    if idle:
-                        self.trim_selected_reserves(idle)
-                except Exception as exc:
-                    self._check_physical_growth_state("alloc_exact")
-                    if not self._record_native_fatal("alloc_exact", exc):
-                        self._release_unclaimed_exact_pages(created)
-                    raise
-                if idle is None:
-                    self._release_unclaimed_exact_pages(created)
-                    return None
             try:
-                if reprice and index >= retained_count and self._worker_control() is not None:
+                idle = (self._exact_retry_trim_plan(missing[index:])
+                        if reprice and index == retained_count else [])
+                if idle:
+                    self.trim_selected_reserves(idle)
+                if idle is None:
+                    page = None
+                elif reprice and index >= retained_count and self._worker_control() is not None:
                     page = self.page_allocator.try_alloc_page_at(page_id, worker_priced=True)
                 else:
                     page = self.page_allocator.try_alloc_page_at(page_id)
@@ -965,6 +953,11 @@ class KVCacheManager:
             if page is None:
                 self._release_unclaimed_exact_pages(created)
                 return None
+            if adopting and index == 0:
+                # Only a successful adoption turns retained backing into reserves.
+                # Keep the affected fresh IDs available to the next attempt.
+                pending.update(missing[retained_count:])
+                self._pending_exact_retry_pages = pending
             self._avail_physical_pages_cache = None
             self._increment_operation_counter("manager_page_allocations_total")
             if getattr(self, "max_block_id", None) is None:
@@ -1005,6 +998,15 @@ class KVCacheManager:
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
 
+    def _needs_exact_retry(self, missing: List[int]) -> bool:
+        candidates: set[int] = getattr(self, "_pending_exact_retry_pages", set()).intersection(missing)
+        if not candidates:
+            return False
+        # A previous rollback may have cached a hinted page as a reserve.
+        # Its hint must not gate fresh IDs in a different request.
+        quote = self.page_allocator.exact_recovery_quote(sorted(candidates))
+        return quote is not None and quote[0] > 0
+
     def _exact_retry_trim_plan(self, pending: List[int]) -> Optional[List[int]]:
         # Recovery may have just consumed credit on a different worker.
         # Reprice the entire suffix before releasing any idle mappings.
@@ -1015,8 +1017,16 @@ class KVCacheManager:
         if fresh_bytes:
             bundle = self._memory_limit_page_bundle_bytes()
             control = self._worker_control()
-            room = (control.exact_retry_headroom() if control is not None
-                    else self.page_allocator.get_avail_physical_bytes() // bundle)
+            if control is None:
+                room = self.page_allocator.get_avail_physical_bytes() // bundle
+            else:
+                try:
+                    room = control.exact_retry_headroom()
+                except RuntimeError as exc:
+                    self._check_physical_growth_state("alloc_exact")
+                    if self._record_native_fatal("alloc_exact", exc):
+                        raise
+                    return None
             if room is None:
                 return None
             count = max(count, fresh_bytes // bundle - room)

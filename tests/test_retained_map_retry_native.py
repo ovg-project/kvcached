@@ -19,7 +19,8 @@ fault_library = test_vmm_failure_policy.fault_library
     for source in ("foreground", "background")
     for consumer in ("foreground", "background", "fatal", "gil", "resize",
                      "resize_fatal", "resize_quarantined")
-] + [("background", "fresh"), ("background", "exact"), ("background", "mixed"), ("background", "mixed_contended")])
+] + [("background", "fresh"), ("background", "exact"), ("background", "mixed"), ("background", "mixed_contended"),
+     ("background", "mixed_transient")])
 def test_retained_batch_retry(fault_library, source, consumer):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -27,7 +28,8 @@ def test_retained_batch_retry(fault_library, source, consumer):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
                ENABLE_KVCACHED="false", KVCACHED_AUTOPATCH="0",
                KVCACHED_CONTIGUOUS_LAYOUT="false", KVCACHED_PAGE_SIZE_MB="2",
-               KVCACHED_MIN_RESERVED_PAGES="2", KVCACHED_MAX_RESERVED_PAGES="2" if consumer == "mixed_contended" else "0",
+               KVCACHED_MIN_RESERVED_PAGES="2",
+               KVCACHED_MAX_RESERVED_PAGES="2" if consumer in ("mixed_contended", "mixed_transient") else "0",
                KVCACHED_IPC_NAME=f"retained-{os.getpid()}-{source}-{consumer}")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), source, consumer],
                             env=env, capture_output=True, text=True, timeout=60)
@@ -53,7 +55,8 @@ def _case(source, consumer):
     from kvcached.kv_cache_manager import KVCacheManager
     from kvcached.lifecycle import LifecyclePhase, LifecycleState
 
-    mixed = consumer in ("mixed", "mixed_contended")
+    retry_mixed = consumer in ("mixed_contended", "mixed_transient")
+    mixed = consumer == "mixed" or retry_mixed
     page = 2 * 1024 * 1024
     torch.cuda.set_device(0)
     vmm.init_kvcached("cuda:0", page, False)
@@ -186,6 +189,8 @@ def _case(source, consumer):
 
             def retry_headroom():
                 room = worker_quota(force=True)[0]["signed_available_bytes"] // page
+                if consumer == "mixed_transient" and len(forced) == 1:
+                    raise RuntimeError("temporary worker control timeout")
                 return None if consumer == "mixed_contended" and len(forced) == 1 else room
 
             setattr(manager, "_runtime_control", SimpleNamespace(
@@ -193,7 +198,7 @@ def _case(source, consumer):
             assert manager._get_cached_avail_physical_pages() == 0
             assert manager.exact_recovery_quote([8, 4]) == (0, [], 0)
             assert manager.can_alloc_exact([8, 4])
-            if consumer == "mixed_contended":
+            if retry_mixed:
                 assert manager.alloc_exact([8, 4]) is None
                 assert allocator.get_num_retryable_pages() == 0
                 assert allocator.get_num_reserved_pages() == 2
@@ -203,7 +208,7 @@ def _case(source, consumer):
             assert not manager._pending_exact_retry_pages
             assert calls == [(0, page), (0, page), (2 * page,)]
             assert unmapped == [(0,)]
-            assert forced == ([0, 0, 0] if consumer == "mixed_contended" else [0])
+            assert forced == ([0, 0, 0] if retry_mixed else [0])
             for block in [8, 4]:
                 view = tensors[0][block * (page // 4):block * (page // 4) + 128]
                 view.fill_(41)
