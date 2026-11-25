@@ -162,6 +162,7 @@ class KVCacheManager:
         page_size: Optional[int] = None,
         logical_num_blocks: Optional[int] = None,
         max_block_id: Optional[int] = None,
+        permanent_block_ids: tuple[int, ...] = (),
     ):
         """
         Args:
@@ -244,6 +245,14 @@ class KVCacheManager:
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE if page_size is None else page_size
+        self.permanent_block_ids = frozenset(permanent_block_ids)
+        if self.permanent_block_ids and (
+            not reserve_null_block or self.block_mem_size != self.page_size
+            or any(b <= 0 or b >= (max_block_id if max_block_id is not None else num_blocks)
+                   for b in self.permanent_block_ids)
+            or (logical_num_blocks is not None and 1 + len(self.permanent_block_ids) > logical_num_blocks)
+        ):
+            raise ValueError("Permanent blocks require addressable whole pages plus the null block")
         # Every page must hold a whole block. A block larger than a page leaves
         # the pool empty (warmup deadlocks); an unfavorable block/page alignment
         # can leave some pages with no block, and such a
@@ -452,7 +461,7 @@ class KVCacheManager:
         self._last_error_code: Optional[str] = None
         self._last_error_timestamp_ns: Optional[int] = None
         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
-        self._lock = threading.RLock() if async_sched else NoOpLock()
+        self._lock: threading.RLock | NoOpLock = threading.RLock() if async_sched else NoOpLock()
 
         # Event used to signal that _post_init() has finished.
         self._post_init_done = threading.Event()
@@ -503,6 +512,11 @@ class KVCacheManager:
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
+            pins = getattr(self, "permanent_block_ids", ())
+            if pins and not self._shutdown_requested.is_set():
+                with self._lock:
+                    if self._alloc_exact_impl(sorted(pins), apply_resize=False) is None:
+                        raise RuntimeError("Cannot back permanent state pages during initialization")
             if not self._shutdown_requested.is_set():
                 self.page_allocator.start_prealloc_thread()
         except Exception as e:
@@ -865,8 +879,8 @@ class KVCacheManager:
             return None
         return requested, grouped, reserved
 
-    def _alloc_exact_impl(self, block_ids: Iterable[int]) -> Optional[List[int]]:
-        claim = self._exact_claim_preflight(block_ids, apply_resize=True)
+    def _alloc_exact_impl(self, block_ids: Iterable[int], *, apply_resize: bool = True) -> Optional[List[int]]:
+        claim = self._exact_claim_preflight(block_ids, apply_resize=apply_resize)
         if claim is None:
             return None
         requested, grouped, reserved = claim
@@ -1256,6 +1270,10 @@ class KVCacheManager:
 
         if len(indices) == 0:
             return 0, False  # Nothing to free
+
+        pins = getattr(self, "permanent_block_ids", None)
+        if pins and not pins.isdisjoint(indices):
+            raise ValueError("Permanent state pages cannot be freed")
 
         if SANITY_CHECK:
             for idx in indices:
@@ -2086,7 +2104,8 @@ class KVCacheManager:
         # The permanent null block pins one page. Keep the control limit
         # unchanged, but give the allocator a reachable physical target so
         # it reclaims every other page before background preallocation resumes.
-        target_pages = max(int(getattr(self, "null_block", None) is not None),
+        minimum_pages = int(getattr(self, "null_block", None) is not None) + len(getattr(self, "permanent_block_ids", ()))
+        target_pages = max(minimum_pages,
                            new_mem_size // self.page_size)
         try:
             resized = self.page_allocator.resize(target_pages * self.page_size)
@@ -2465,6 +2484,9 @@ class KVCacheManager:
         retained_null_page = None
         if getattr(self, "_runtime_control", None) is not None and self.null_block == [0]:
             retained_null_page = self.avail_pages.get(0, self.full_pages.get(0))
+        # State sentinels can be read or cleared by the engine at any time.
+        # They each own one whole page and must stay mapped across clear().
+        retained_pins = {i: self.full_pages[i] for i in getattr(self, "permanent_block_ids", ())}
 
         # Free all blocks from avail_pages and full_pages
         pages_to_free: List[int] = [
@@ -2478,6 +2500,8 @@ class KVCacheManager:
             pages_to_free.append(page.page_id)
         if retained_null_page is not None:
             pages_to_free = [page_id for page_id in pages_to_free if page_id != 0]
+        if retained_pins:
+            pages_to_free = [page_id for page_id in pages_to_free if page_id not in retained_pins]
         if pages_to_free:
             pages_to_free = list(dict.fromkeys(pages_to_free))
             self.page_allocator.free_pages(pages_to_free)
@@ -2538,6 +2562,8 @@ class KVCacheManager:
             self.num_avail_blocks = retained_null_page.num_free_blocks()
             target = self.avail_pages if self.num_avail_blocks else self.full_pages
             target[0] = retained_null_page
+        self.full_pages.update(retained_pins)
+        self._logical_allocated_blocks += len(retained_pins)
         # Reapply the accepted revision after clear reset the execution state.
         runtime = getattr(self, "_runtime_control", None)
         if runtime is not None:

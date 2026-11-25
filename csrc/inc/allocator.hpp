@@ -99,7 +99,7 @@ public:
   InstanceControl configure_instance_control(bool can_shrink,
                                              uint64_t expected_participants,
                                              uint64_t startup_pages,
-                                             bool reserve_null = false);
+                                             uint64_t minimum_pages = 0);
   InstanceControl instance_control_state();
   bool acknowledge_instance_control(uint64_t revision);
   std::string instance_control_path();

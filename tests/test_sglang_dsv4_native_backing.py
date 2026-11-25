@@ -23,13 +23,16 @@ SWABacking = MODULE.SWABacking
 
 
 class Manager:
-    def __init__(self, budget=20):
+    def __init__(self, budget=20, permanent_block_ids=()):
+        self.permanent_block_ids = frozenset(permanent_block_ids)
         self.budget = budget
         self.page_allocator = SimpleNamespace(get_num_reserved_pages=lambda: 0)
         self.live = set()
         self.claims = []
         self.fault = None
         self.init_failure = None
+        if permanent_block_ids and self.alloc_exact(sorted(permanent_block_ids)) is None:
+            self.init_failure = RuntimeError("permanent state sentinel failed")
 
     def wait_ready(self):
         if self.init_failure:
@@ -1171,6 +1174,71 @@ def test_late_compressed_backend_error_poisons_all_children(all_backings):
             child.clear()
 
 
+def test_tail_sentinel_counts_only_addressable_rings():
+    manager = Manager(budget=1, permanent_block_ids=(16,))
+    backing = SWABacking(manager, native_pages=514, addressable_pages=513, native_page_bytes=1,
+                         physical_page_bytes=32, permanent_pages=frozenset({0, 16}))
+    assert backing.acquire(set(range(1, 32)))
+    assert backing.available_pages() == 1
+    assert backing.physical_demand(32) == 1
+    assert backing.can_acquire({512})
+
+
+def test_permanent_sentinel_shares_live_state_page_without_release():
+    manager = Manager(permanent_block_ids=(9,))
+    backing = SWABacking(manager, native_pages=13, native_page_bytes=6,
+                         physical_page_bytes=8, permanent_pages=frozenset({0, 9}))
+    assert manager.claims == [[9]]
+    assert backing.acquire({10, 11, 12})
+    assert manager.live == {7, 8, 9}
+    backing.release({10, 11, 12})
+    assert manager.live == {9}
+    assert not backing.refs and not backing.live
+    assert backing.acquire({12})
+    assert manager.claims == [[9], [7, 8]]
+    backing.release({12})
+    assert manager.live == {9}
+
+
+def test_state_sentinel_failure_stops_before_native_constructor_write():
+    with pytest.raises(RuntimeError, match="permanent.*sentinel"):
+        SWABacking(Manager(budget=0, permanent_block_ids=(9,)), native_pages=13, native_page_bytes=6,
+                   physical_page_bytes=8, permanent_pages=frozenset({0, 9}))
+
+
+@pytest.mark.parametrize("miss_index", [0, 1, 2])
+def test_state_transaction_follows_swa_lifetime_and_retains_sentinel(monkeypatch, miss_index):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values)))
+    swa = make_backing()
+    states = tuple(SWABacking(Manager(permanent_block_ids=(9,)), native_pages=13, native_page_bytes=6,
+                              physical_page_bytes=8, permanent_pages=frozenset({0, 9}))
+                   for _ in range(2))
+    selected = (swa, *states)
+    for backing in selected:
+        assert backing.acquire({1})
+    composite = Composite(256)
+    MODULE.bind_native_swa(composite, swa, swa_backings=states)
+    failed = selected[miss_index]
+    failed.manager.budget = len(failed.manager.live)
+    before = [(set(b.live), dict(b.refs), set(b.manager.live)) for b in selected]
+    assert composite.alloc() is None
+    assert composite.mapping == {512: 256}
+    assert before == [(set(b.live), dict(b.refs), set(b.manager.live)) for b in selected]
+    failed.manager.budget = 20
+    assert composite.alloc() is not None
+    assert all(b.live == {1, 3} for b in selected)
+    composite.swa_attn_allocator.free_group = []
+    composite.swa_attn_allocator.free_page_ids(Tensor([3]))
+    assert all(b.live == {1, 3} for b in selected)
+    composite.swa_attn_allocator.free_group_end()
+    assert all(b.live == {1} for b in selected)
+    assert composite.full_attn_allocator.live == {2, 5}
+    composite.swa_attn_allocator.clear()
+    assert all(not b.live for b in selected)
+    assert all(b.manager.live == {9} for b in states)
+
+
 def _assert_all_backings_ready_before_resize(monkeypatch, composite, pools, waiting_pool, method):
     lock, waiting, ready = RLock(), Event(), Event()
     operations = []
@@ -1222,3 +1290,21 @@ def test_additional_compressed_pools_settle_before_resize(all_backings, monkeypa
     composite, swa, compressed = all_backings
     _assert_all_backings_ready_before_resize(
         monkeypatch, composite, (swa, *compressed), compressed[waiting_index], method)
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("waiting_index", [0, 1])
+def test_swa_state_managers_settle_before_resize(monkeypatch, method, waiting_index):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values)))
+    swa = make_backing()
+    states = tuple(SWABacking(Manager(permanent_block_ids=(9,)), native_pages=13, native_page_bytes=6,
+                              physical_page_bytes=8, permanent_pages=frozenset({0, 9}))
+                   for _ in range(2))
+    pools = (swa, *states)
+    for pool in pools:
+        assert pool.acquire({1})
+    composite = Composite(256)
+    MODULE.bind_native_swa(composite, swa, swa_backings=states)
+    _assert_all_backings_ready_before_resize(
+        monkeypatch, composite, pools, states[waiting_index], method)

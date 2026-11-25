@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -462,7 +463,8 @@ py::dict control_dict(const InstanceControl &state) {
 
 py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
                                 uint64_t expected_participants,
-                                uint64_t startup_pages, bool reserve_null) {
+                                uint64_t startup_pages, bool reserve_null,
+                                uint64_t minimum_pages) {
   InstanceControl state;
   std::string path, name;
   {
@@ -470,7 +472,7 @@ py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
     auto allocator = FTensorAllocator::global_allocator(group_id);
     state = configure ? allocator->configure_instance_control(
                             *configure, expected_participants, startup_pages,
-                            reserve_null)
+                            std::max<uint64_t>(reserve_null, minimum_pages))
                       : allocator->instance_control_state();
     path = allocator->instance_control_path();
     name = FTensorAllocator::instance_control_name();
@@ -617,7 +619,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("local_instance_control", &kvcached::local_instance_control,
         py::arg("group_id") = 0, py::arg("configure") = py::none(),
         py::arg("expected_participants") = 0, py::arg("startup_pages") = 0,
-        py::arg("reserve_null") = false);
+        py::arg("reserve_null") = false, py::arg("minimum_pages") = 0);
   m.def("query_instance_control", &kvcached::query_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
   m.def("observe_instance_control", &kvcached::observe_instance_control,

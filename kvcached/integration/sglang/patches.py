@@ -3763,6 +3763,15 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
             "DeepSeekV4TokenToKVPool",
             ElasticDeepSeekV4TokenToKVPool,
         )
+        from kvcached.integration.sglang.dsv4_state import install_c4_state_backing
+
+        def next_state_group_id() -> int:
+            group_id = ElasticDeepSeekV4SWAKVPool._next_group_id
+            ElasticDeepSeekV4SWAKVPool._next_group_id += 1
+            return group_id
+
+        install_c4_state_backing(dsv4_pool_mod, ElasticDeepSeekV4TokenToKVPool,
+                                 next_state_group_id)
         self._mark_as_patched(dsv4_pool_mod, marker)
         self.logger.info("Enabled kvcached-backed DeepSeek-V4 SWA KV pool")
         return True
@@ -3912,9 +3921,11 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                         if pool.page_size * 4 != page_size:
                             raise KVCachedConfigError("C4 and full allocator page geometry differs")
                         other_backings.append(pool_backing)
+                state_groups = getattr(kvcache, "_kvcached_c4_state_groups", {})
+                state_backings = tuple(group["backing"] for group in state_groups.values())
                 bind_native_swa(
                     allocator_self, backing, full_backing,
-                    full_backings=tuple(other_backings),
+                    full_backings=tuple(other_backings), swa_backings=state_backings,
                     on_capacity_miss=_sglang_capacity_miss,
                     on_priority_miss=lambda requests: _sglang_priority_decode_miss(backing.manager, requests),
                     paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
