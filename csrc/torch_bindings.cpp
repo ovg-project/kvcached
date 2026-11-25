@@ -761,6 +761,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("allow_fresh_retry") = true,
            py::call_guard<py::gil_scoped_release>())
       .def("try_alloc_page_at", &kvcached::PageAllocator::try_alloc_page_at,
+           py::arg("page_id"), py::kw_only(), py::arg("worker_priced") = false,
            py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())

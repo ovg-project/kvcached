@@ -233,8 +233,8 @@ def controls(monkeypatch):
     return manager, native, control
 
 
-@pytest.mark.parametrize("balance, expected", [(-4, -1), (12, 3)])
-def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch, balance, expected):
+@pytest.mark.parametrize("balance, sampled, expected", [(-4, True, -1), (12, True, 3), (12, False, None)])
+def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch, balance, sampled, expected):
     from kvcached import tp_ipc_util
 
     manager, native, _ = controls
@@ -249,7 +249,8 @@ def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch,
     def refresh(tp_size, pp_rank, group_id, *, refresh_capacity):
         assert (tp_size, pp_rank, group_id, refresh_capacity) == (2, 0, 0, True)
         state["signed_available_bytes"] = balance
-        return runtime.sources
+        return [dict(runtime.sources[0], capacity_refreshed=False),
+                dict(runtime.sources[1], capacity_refreshed=sampled)]
 
     monkeypatch.setattr(tp_ipc_util, "control_workers", refresh)
     assert runtime.exact_retry_headroom() == expected

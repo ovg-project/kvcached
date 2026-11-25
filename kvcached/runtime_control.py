@@ -38,7 +38,7 @@ class RuntimeControl:
         self.executing: tuple[dict, ...] = ()
         self.acknowledged: tuple = ()
 
-    def exact_retry_headroom(self) -> int:
+    def exact_retry_headroom(self) -> int | None:
         """Sample worker GPUs and return the number of complete distributed pages they can fund."""
         from kvcached.errors import StateConsistencyError
         from kvcached.tp_ipc_util import control_workers
@@ -49,6 +49,11 @@ class RuntimeControl:
         if len(workers) != len(self.sources) or any(
                 worker[key] != source[key] for worker, source in zip(workers, self.sources) for key in identity):
             raise StateConsistencyError("KV control participant changed during exact recovery")
+
+        sampled = {worker["gpu"] for worker in workers if worker.get("capacity_refreshed")}
+        if any(source["gpu"] not in sampled for source in self.sources):
+            # Another process may still hold this GPU's calibration lease.
+            return None
 
         # Read after all samplers return. Workers sharing a GPU ledger spend
         # and refund their combined bundle for each distributed page ID.

@@ -80,6 +80,9 @@ def _case(source, consumer):
             if consumer not in ("fresh", "mixed"):
                 raise RuntimeError("no headroom for a fresh page")
             assert offsets == [2 * page], "a retained batch was split or reused"
+            if consumer == "mixed":
+                # The coordinator has no room; this worker owns the real grant.
+                driver.kvcached_fault_zero_free_memory(0)
         calls.append(tuple(offsets))
         if len(calls) > 1 and consumer not in ("fresh", "mixed"):
             assert calls[-1] == calls[0], "a retained batch was split or reordered"
@@ -164,7 +167,6 @@ def _case(source, consumer):
         if consumer == "mixed":
             # Force the native budget to two pages. Only the spare from the
             # retained batch can pay for the fresh ID, which is requested first.
-            driver.kvcached_fault_zero_free_memory(0)
             assert vmm.set_instance_budget_limit(2 * page, 1, 0) == "applied"
             manager._avail_physical_pages_cache = None
             manager._virtual_num_blocks = 32

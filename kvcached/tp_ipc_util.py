@@ -1081,14 +1081,16 @@ def _start_worker_listener_thread(
                     )
                 elif msg["cmd"] == "instance_control":
                     from kvcached import _C  # type: ignore[attr-defined]
-                    if msg.get("refresh_capacity"):
-                        _C.recalibrate_physical_budget(group_id)
+                    refreshed = (_C.recalibrate_physical_budget(group_id)
+                                 if msg.get("refresh_capacity") else None)
                     state = _C.local_instance_control(group_id, msg.get("configure"),
                                                       msg.get("expected_participants", 0),
                                                       msg.get("startup_pages", 0),
                                                       msg.get("reserve_null", False),
                                                       **({"minimum_pages": msg["minimum_pages"]}
                                                          if msg.get("minimum_pages") else {}))
+                    if refreshed is not None:
+                        state["capacity_refreshed"] = refreshed
                     send_msg(conn, {"status": "success", "control": state})
                 elif msg["cmd"] == "ack_instance_control":
                     from kvcached import _C  # type: ignore[attr-defined]

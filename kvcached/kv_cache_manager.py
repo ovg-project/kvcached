@@ -922,6 +922,8 @@ class KVCacheManager:
             try:
                 if retained_count and index == retained_count and not self._fund_exact_retry(missing[index:]):
                     page = None
+                elif index >= retained_count > 0 and self._worker_control() is not None:
+                    page = self.page_allocator.try_alloc_page_at(page_id, worker_priced=True)
                 else:
                     page = self.page_allocator.try_alloc_page_at(page_id)
             except StateConsistencyError as exc:
@@ -989,6 +991,8 @@ class KVCacheManager:
             control = self._worker_control()
             room = (control.exact_retry_headroom() if control is not None
                     else self.page_allocator.get_avail_physical_bytes() // bundle)
+            if room is None:
+                return False
             count = max(count, fresh_bytes // bundle - room)
         if count > len(idle):
             return False

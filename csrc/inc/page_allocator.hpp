@@ -84,7 +84,8 @@ public:
   // Page allocation and deallocation
   std::shared_ptr<InternalPage> alloc_page(bool allow_fresh_retry = true);
   // Nonblocking: nullptr if this particular page is not currently free.
-  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id);
+  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id,
+                                                  bool worker_priced = false);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
   // Internal receipt: number of leading input pages placed in the reserve.
@@ -168,7 +169,8 @@ private:
 
   // Internal methods
   std::shared_ptr<InternalPage> alloc_page_impl(page_id_t requested_id,
-                                                bool allow_fresh_retry);
+                                                bool allow_fresh_retry,
+                                                bool worker_priced = false);
   void map_pages(const std::vector<page_id_t> &page_ids);
   std::vector<page_id_t> take_retained_batch_unlocked(page_id_t requested_id);
   void retry_retained_batch(std::vector<page_id_t> pages);

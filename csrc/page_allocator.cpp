@@ -179,15 +179,16 @@ PageAllocator::alloc_page(bool allow_fresh_retry) {
 }
 
 std::shared_ptr<InternalPage>
-PageAllocator::try_alloc_page_at(page_id_t page_id) {
+PageAllocator::try_alloc_page_at(page_id_t page_id, bool worker_priced) {
   if (page_id < 0) {
     throw std::invalid_argument("Exact page ID must be nonnegative");
   }
-  return alloc_page_impl(page_id, false);
+  return alloc_page_impl(page_id, false, worker_priced);
 }
 
 std::shared_ptr<InternalPage>
-PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry) {
+PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry,
+                               bool worker_priced) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
@@ -292,7 +293,13 @@ PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry) {
                               reclaimed != reclaimed_page_list_.end())) {
       // A shrink limits the number of pages, not their virtual placement.
       // Preallocated backing at another ID may need to be unmapped first.
-      if (free_page_list_.empty() || get_avail_physical_pages() <= 0) {
+      // A repriced suffix maps on the workers. Their grants still enforce
+      // the budget; the coordinator's driver cannot price those mappings.
+      const bool worker_mapping =
+          worker_priced && (world_size_ > 1 || should_use_worker_ipc()) &&
+          broadcast_map_callback_;
+      if (free_page_list_.empty() ||
+          (!worker_mapping && get_avail_physical_pages() <= 0)) {
         if (!trimmed_for_exact && !reserved_page_list_.empty()) {
           trimmed_for_exact = true;
           lock.unlock();
