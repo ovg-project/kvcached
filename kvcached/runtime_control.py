@@ -38,6 +38,29 @@ class RuntimeControl:
         self.executing: tuple[dict, ...] = ()
         self.acknowledged: tuple = ()
 
+    def exact_retry_headroom(self) -> int:
+        """Sample worker GPUs and return the number of complete distributed pages they can fund."""
+        from kvcached.errors import StateConsistencyError
+        from kvcached.tp_ipc_util import control_workers
+
+        workers = control_workers(self.manager.world_size, self.manager.pp_rank,
+                                  self.manager.group_id, refresh_capacity=True)
+        identity = ("gpu", "instance", "pool_slot", "pool_owner", "generation")
+        if len(workers) != len(self.sources) or any(
+                worker[key] != source[key] for worker, source in zip(workers, self.sources) for key in identity):
+            raise StateConsistencyError("KV control participant changed during exact recovery")
+
+        # Read after all samplers return. Workers sharing a GPU ledger spend
+        # and refund their combined bundle for each distributed page ID.
+        bundles: dict[tuple[str, str], int] = {}
+        balances: dict[tuple[str, str], int] = {}
+        for source, state in zip(self.sources, self.poll(force=True)):
+            ledger = (source["gpu"], source["instance"])
+            bundles[ledger] = bundles.get(ledger, 0) + state["page_bundle_bytes"]
+            balance = state["signed_available_bytes"]
+            balances[ledger] = min(balances.get(ledger, balance), balance)
+        return min(balances[key] // size for key, size in bundles.items())
+
     def poll(self, *, force: bool = False) -> tuple[dict, ...]:
         from kvcached import _C  # type: ignore[attr-defined]
 

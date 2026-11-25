@@ -488,12 +488,11 @@ def test_retained_repricing_uses_live_worker_debt_before_trimming(debt, idle, fi
     polls = []
     trimmed: list[list[int]] = []
 
-    def poll(*, force=False):
-        polls.append(force)
-        # This pipeline stage has a different physical bundle from the manager.
-        return [{"signed_available_bytes": -debt * 16 if force else 128, "page_bundle_bytes": 16}]
+    def retry_headroom():
+        polls.append(True)
+        return -debt
 
-    manager._worker_control = lambda: SimpleNamespace(poll=poll)
+    manager._worker_control = lambda: SimpleNamespace(exact_retry_headroom=retry_headroom)
     manager.trim_selected_reserves = trimmed.append
     assert manager._fund_exact_retry([2]) is fits
     assert polls == [True]

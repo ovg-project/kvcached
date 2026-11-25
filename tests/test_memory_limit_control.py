@@ -233,6 +233,28 @@ def controls(monkeypatch):
     return manager, native, control
 
 
+@pytest.mark.parametrize("balance, expected", [(-4, -1), (12, 3)])
+def test_exact_retry_samples_and_prices_colocated_workers(controls, monkeypatch, balance, expected):
+    from kvcached import tp_ipc_util
+
+    manager, native, _ = controls
+    manager.world_size, manager.pp_rank, manager.group_id = 2, 0, 0
+    runtime = manager._runtime_control
+    first = runtime.sources[0]
+    runtime.sources = (first, dict(first, pool_slot=1))
+    state = native.states["gpu-a"]
+    state.update(signed_available_bytes=-100, page_bundle_bytes=2)
+    runtime.poll(force=True)
+
+    def refresh(tp_size, pp_rank, group_id, *, refresh_capacity):
+        assert (tp_size, pp_rank, group_id, refresh_capacity) == (2, 0, 0, True)
+        state["signed_available_bytes"] = balance
+        return runtime.sources
+
+    monkeypatch.setattr(tp_ipc_util, "control_workers", refresh)
+    assert runtime.exact_retry_headroom() == expected
+
+
 def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):
     from kvcached.cli.utils import update_kv_cache_limit
 

@@ -986,11 +986,9 @@ class KVCacheManager:
         fresh_bytes, idle, count = quote
         if fresh_bytes:
             bundle = self._memory_limit_page_bundle_bytes()
-            room = self.page_allocator.get_avail_physical_bytes() // bundle
             control = self._worker_control()
-            if control is not None:
-                for worker in control.poll(force=True):
-                    room = min(room, worker["signed_available_bytes"] // worker["page_bundle_bytes"])
+            room = (control.exact_retry_headroom() if control is not None
+                    else self.page_allocator.get_avail_physical_bytes() // bundle)
             count = max(count, fresh_bytes // bundle - room)
         if count > len(idle):
             return False

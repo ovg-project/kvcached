@@ -1081,6 +1081,8 @@ def _start_worker_listener_thread(
                     )
                 elif msg["cmd"] == "instance_control":
                     from kvcached import _C  # type: ignore[attr-defined]
+                    if msg.get("refresh_capacity"):
+                        _C.recalibrate_physical_budget(group_id)
                     state = _C.local_instance_control(group_id, msg.get("configure"),
                                                       msg.get("expected_participants", 0),
                                                       msg.get("startup_pages", 0),
@@ -1863,7 +1865,7 @@ def query_worker_cuda_mem_get_info(rank: int,
 
 async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
                            configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
-                           minimum_pages=0):
+                           minimum_pages=0, refresh_capacity=False):
     targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
                for rank in range(tp_size)]
     messages = []
@@ -1873,6 +1875,8 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
                              "configure": configure, "expected_participants": expected_participants,
                              "startup_pages": startup_pages, "reserve_null": reserve_null,
                              "minimum_pages": minimum_pages})
+            if refresh_capacity:
+                messages[-1]["refresh_capacity"] = True
         else:
             messages.append({"cmd": "ack_instance_control", "group_id": group_id,
                              "generation": acknowledgements[(stage, rank)][0],
@@ -1896,7 +1900,7 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
 
 def control_workers(tp_size: int, pp_rank: int, group_id: int,
                     configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
-                    minimum_pages=0):
+                    minimum_pages=0, refresh_capacity=False):
     return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
                                        configure, acknowledgements, expected_participants, startup_pages, reserve_null,
-                                       minimum_pages))
+                                       minimum_pages, refresh_capacity))

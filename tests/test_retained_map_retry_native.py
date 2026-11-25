@@ -181,7 +181,11 @@ def _case(source, consumer):
                     forced.append(room)
                 return [{"available_bytes": max(0, room), "signed_available_bytes": room, "page_bundle_bytes": page}]
 
-            setattr(manager, "_runtime_control", SimpleNamespace(worker_ipc=True, poll=worker_quota, apply=lambda: None))
+            def retry_headroom():
+                return worker_quota(force=True)[0]["signed_available_bytes"] // page
+
+            setattr(manager, "_runtime_control", SimpleNamespace(
+                worker_ipc=True, poll=worker_quota, exact_retry_headroom=retry_headroom, apply=lambda: None))
             assert manager._get_cached_avail_physical_pages() == 0
             assert manager.exact_recovery_quote([8, 4]) == (0, [], 0)
             assert manager.can_alloc_exact([8, 4])
