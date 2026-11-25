@@ -8,6 +8,7 @@ This test connects to real vLLM instances running on localhost.
 """
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 from unittest.mock import AsyncMock, Mock
@@ -477,6 +478,25 @@ async def test_request_during_sleep_transition_waits_then_wakes(manager,
     assert wake_calls == [1]
     assert not manager.is_model_sleeping("model")
     assert not manager.is_model_sleeping_or_transitioning("model")
+
+
+async def test_request_wakeup_is_not_rejected_by_min_sleep_duration(
+        manager, monkeypatch):
+    """A request wakes the model however recently it fell asleep (503 before)."""
+    manager.add_vllm_model("model")
+    manager.config.min_sleep_duration = 60
+    manager.sleeping_models["model"] = time.time() - 5
+    wake_calls = []
+
+    async def wake_api(*_args, **_kwargs):
+        wake_calls.append(1)
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_wakeup_api", wake_api)
+
+    assert await manager.handle_model_wakeup_on_request("model") is True
+    assert wake_calls == [1]
+    assert not manager.is_model_sleeping("model")
 
 
 async def test_sglang_api_methods_simulation(manager):

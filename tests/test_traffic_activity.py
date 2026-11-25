@@ -322,3 +322,75 @@ async def test_manual_sleep_still_honours_the_operator_while_busy(monkeypatch):
 
     assert await sleep_manager.put_model_to_sleep("model", manual=True) is True
     assert calls == [1]
+
+
+async def test_a_just_woken_model_is_not_slept_again_immediately(monkeypatch):
+    """``min_sleep_duration`` throttles the next auto-sleep, not the wake-up."""
+    clock, monitor, sleep_manager = _monitor_and_manager(
+        monkeypatch, idle_threshold_seconds=30)
+    sleep_manager.config.min_sleep_duration = 60
+    sleep_manager.config.vllm_models_config["model"] = {
+        "host": "127.0.0.1",
+        "port": "1",
+    }
+    calls = []
+
+    async def fake_sleep(host, port, level=1):
+        calls.append(level)
+        return True
+
+    async def fake_wakeup(host, port):
+        return True
+
+    monkeypatch.setattr(sleep_manager, "_call_vllm_sleep_api", fake_sleep)
+    monkeypatch.setattr(sleep_manager, "_call_vllm_wakeup_api", fake_wakeup)
+
+    request = monitor.record_request_start("model", "/v1/completions")
+    monitor.record_request_end(request, success=True)
+
+    # Asleep, then woken by a request ten seconds later.
+    sleep_manager.sleeping_models["model"] = 10.0
+    clock["now"] = 20.0
+    assert await sleep_manager.handle_model_wakeup_on_request("model") is True
+
+    # Idle well past the threshold, but the wake is only forty seconds old.
+    clock["now"] = 60.0
+    assert sleep_manager.get_sleep_candidates() == []
+    assert await sleep_manager.put_model_to_sleep("model", manual=False) is False
+    assert calls == []
+
+    # The cooldown is over: the idle model may be slept again.
+    clock["now"] = 90.0
+    assert sleep_manager.get_sleep_candidates() == ["model"]
+    assert await sleep_manager.put_model_to_sleep("model", manual=False) is True
+    assert calls == [1]
+
+
+async def test_manual_sleep_ignores_the_wakeup_cooldown(monkeypatch):
+    """The cooldown is hysteresis, not a lock the operator cannot override."""
+    clock, monitor, sleep_manager = _monitor_and_manager(
+        monkeypatch, idle_threshold_seconds=1)
+    sleep_manager.config.vllm_models_config["model"] = {
+        "host": "127.0.0.1",
+        "port": "1",
+    }
+
+    async def fake_sleep(host, port, level=1):
+        return True
+
+    async def fake_wakeup(host, port):
+        return True
+
+    monkeypatch.setattr(sleep_manager, "_call_vllm_sleep_api", fake_sleep)
+    monkeypatch.setattr(sleep_manager, "_call_vllm_wakeup_api", fake_wakeup)
+
+    request = monitor.record_request_start("model", "/v1/completions")
+    monitor.record_request_end(request, success=True)
+
+    sleep_manager.sleeping_models["model"] = 0.0
+    clock["now"] = 5.0
+    assert await sleep_manager.handle_model_wakeup_on_request("model") is True
+
+    clock["now"] = 10.0
+    assert await sleep_manager.put_model_to_sleep("model", manual=False) is False
+    assert await sleep_manager.put_model_to_sleep("model", manual=True) is True
