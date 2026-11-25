@@ -1890,6 +1890,11 @@ async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
         for (stage, rank), message in zip(targets, messages)
     ], return_exceptions=True)
     results = []
+    if refresh_capacity:
+        # A timed-out sibling must not hide a confirmed ledger replacement.
+        for (stage, rank), response in zip(targets, responses):
+            if isinstance(response, dict) and response.get("error_type") == "state_consistency":
+                raise StateConsistencyError(f"KV control worker pp{stage}/rank{rank}: {response.get('message')}")
     for (stage, rank), response in zip(targets, responses):
         if isinstance(response, Exception) or not isinstance(response, dict) or response.get("status") != "success":
             raise RuntimeError(f"KV control worker pp{stage}/rank{rank} unavailable: {response}")

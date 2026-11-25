@@ -51,6 +51,25 @@ std::runtime_error system_error(const char *operation) {
   return std::runtime_error(std::string(operation) + ": " +
                             std::strerror(errno));
 }
+[[noreturn]] void ledger_path_error(const char *operation) {
+  if (errno == ENOENT || errno == ENOTDIR)
+    throw StateConsistencyError("KV control instance is not running");
+  if (errno == ELOOP)
+    throw StateConsistencyError("KV budget segment was replaced");
+  throw system_error(operation);
+}
+
+void verify_ledger_path(int fd, const std::string &path) {
+  struct stat held{}, current{};
+  if (fstat(fd, &held) < 0)
+    throw system_error("stat open KV budget");
+  if (lstat(path.c_str(), &current) < 0)
+    ledger_path_error("stat KV budget path");
+  if (held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
+      !S_ISREG(current.st_mode))
+    throw StateConsistencyError("KV budget segment was replaced");
+}
+
 int lease(int fd, short type, bool wait, off_t start = 0) {
 #ifdef F_OFD_SETLK
   struct flock lock{};
@@ -80,7 +99,7 @@ struct CalibrationLease {
   explicit CalibrationLease(const std::string &path)
       : fd(open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW)) {
     if (fd < 0)
-      throw system_error("open calibration lease");
+      ledger_path_error("open calibration lease");
   }
   ~CalibrationLease() { close(fd); }
 };
@@ -234,13 +253,11 @@ struct GpuBudget::Locked {
     value.sync_acquire_ns_ += monotonic_ns() - started;
     if (result < 0)
       throw system_error("lock KV budget");
-    struct stat held{}, current{};
-    if (fstat(value.fd_, &held) < 0 ||
-        lstat(value.path_.c_str(), &current) < 0 ||
-        held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
-        !S_ISREG(current.st_mode)) {
+    try {
+      verify_ledger_path(value.fd_, value.path_);
+    } catch (...) {
       flock(value.fd_, LOCK_UN);
-      throw std::runtime_error("KV budget segment was replaced");
+      throw;
     }
     if (value.shared_ && value.shared_->magic == kMagic) {
       // A subsequent writer also recovers an odd sequence left by a dead
@@ -269,11 +286,8 @@ std::shared_ptr<GpuBudget> GpuBudget::open_control(const std::string &path,
 GpuBudget::GpuBudget(const std::string &path, bool observe)
     : path_(path), pid_(getpid()) {
   fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-  if (fd_ < 0) {
-    if (errno == ENOENT)
-      throw StateConsistencyError("KV control instance is not running");
-    throw system_error("open live KV control");
-  }
+  if (fd_ < 0)
+    ledger_path_error("open live KV control");
   try {
     // Serialize with epoch initialization, then require an existing user.
     if (lease(fd_, F_WRLCK, !observe, 2) < 0)
@@ -1407,9 +1421,10 @@ bool GpuBudget::recalibrate(const Sampler &sampler) {
   {
     Locked lock(*this);
     struct stat held{}, selected{};
-    if (fstat(fd_, &held) < 0 || fstat(calibration.fd, &selected) < 0 ||
-        held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
-      throw std::runtime_error("KV budget calibration segment was replaced");
+    if (fstat(fd_, &held) < 0 || fstat(calibration.fd, &selected) < 0)
+      throw system_error("stat KV budget calibration lease");
+    if (held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
+      throw StateConsistencyError("KV budget calibration segment was replaced");
     if (lease(calibration.fd, F_WRLCK, false, 1) < 0) {
       if (errno == EAGAIN || errno == EACCES)
         return false;

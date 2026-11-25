@@ -279,6 +279,20 @@ def test_exact_retry_detects_worker_replacement_during_final_poll(controls, monk
         manager.wait_ready()
 
 
+def test_exact_refresh_keeps_reported_ledger_loss_when_another_worker_times_out(monkeypatch):
+    from kvcached import tp_ipc_util
+    from kvcached.errors import StateConsistencyError
+
+    async def reply(rank, message, stage):
+        if rank == 0:
+            raise TimeoutError("temporary worker timeout")
+        return {"status": "error", "error_type": "state_consistency", "message": "ledger replaced"}
+
+    monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", reply)
+    with pytest.raises(StateConsistencyError, match="ledger replaced"):
+        tp_ipc_util.control_workers(2, 0, 0, refresh_capacity=True)
+
+
 def test_cli_api_same_value_is_a_new_native_publication(controls, capsys):
     from kvcached.cli.utils import update_kv_cache_limit
 

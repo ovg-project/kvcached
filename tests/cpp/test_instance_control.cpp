@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <fcntl.h>
 #include <set>
 #include <stdexcept>
@@ -21,6 +22,27 @@ using namespace kvcached;
 void test_pool_reclaim(const std::string &directory) {
   {
     const auto ledger = directory + "/exited-control-worker";
+    const auto moved = ledger + "-held";
+    {
+      auto owner = GpuBudget::connect(ledger, [] { return 40; });
+      auto reader = GpuBudget::open_control(ledger);
+      assert(rename(ledger.c_str(), moved.c_str()) == 0);
+      auto check_lost = [&]() {
+        try {
+          reader->query_control("model");
+        } catch (const StateConsistencyError &) {
+          return;
+        }
+        assert(false);
+      };
+      check_lost();
+      {
+        auto replacement = GpuBudget::connect(ledger, [] { return 80; });
+        check_lost();
+      }
+      // Restore the held epoch before its owners tear down.
+      assert(rename(moved.c_str(), ledger.c_str()) == 0);
+    }
     {
       auto owner = GpuBudget::connect(ledger, [] { return 40; });
     }
