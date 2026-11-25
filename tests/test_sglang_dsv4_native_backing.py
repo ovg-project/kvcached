@@ -25,6 +25,7 @@ SWABacking = MODULE.SWABacking
 class Manager:
     def __init__(self, budget=20):
         self.budget = budget
+        self.page_allocator = SimpleNamespace(get_num_reserved_pages=lambda: 0)
         self.live = set()
         self.claims = []
         self.fault = None
@@ -758,6 +759,148 @@ def test_parked_prefill_counts_straddling_full_page_and_shared_driver_budget(set
     assert allocator.swa_attn_allocator.released == [1]
 
 
+def test_retry_prefix_counts_shared_headroom_after_compressed_rollback(setup):
+    capacity = [1]
+    pools: list[Any] = []
+
+    class SharedManager(Manager):
+        def available_size(self):
+            return capacity[0] - sum(len(pool.live) for pool in pools)
+
+        def exact_recovery_quote(self, ids):
+            return len(ids) * 20, [], 0
+
+    pools.extend([SharedManager(), SharedManager()])
+    for pool in pools:
+        pool.page_allocator = SimpleNamespace(get_avail_physical_bytes=lambda: pools[0].available_size() * 20,
+                                              get_num_reserved_pages=lambda: 0)
+    full, indexer = (SWABacking(pool, native_pages=13, native_page_bytes=8, physical_page_bytes=8)
+                     for pool in pools)
+    allocator = DecodeComposite([3, 7, 9])
+    MODULE.bind_native_swa(allocator, make_backing(), full, full_backings=(indexer,))
+    assert allocator.alloc_decode() is None
+    assert all(not pool.live for pool in pools)
+    assert allocator.full_attn_allocator.available_size() == 0
+    capacity[0] = 2
+    assert allocator.full_attn_allocator.available_size() >= allocator.page_size
+    assert allocator.alloc_decode() is not None
+    assert all(pool.live == {5} for pool in pools)
+
+
+@pytest.mark.parametrize("initial", [1, 2])
+def test_trim_on_second_kv_map_can_fund_the_indexer(setup, initial):
+    kv: Any = Manager(0)
+    index: Any = Manager(0)
+    allocator = DecodeComposite([3, 7, 9])
+    full = SWABacking(kv, native_pages=13, native_page_bytes=8, physical_page_bytes=8)
+    indexer = SWABacking(index, native_pages=13, native_page_bytes=2, physical_page_bytes=8)
+    MODULE.bind_native_swa(allocator, make_backing(), full, full_backings=(indexer,))
+    assert allocator.alloc_decode([5] * initial) is None
+    kv.budget = index.budget = 8
+    samples = []
+    room = [20]
+
+    def sample():
+        samples.append(room[0])
+        return room[0]
+
+    kv.page_allocator = SimpleNamespace(get_avail_physical_bytes=sample, get_num_reserved_pages=lambda: 2)
+    index.page_allocator = SimpleNamespace(get_num_reserved_pages=lambda: 0)
+    kv.exact_recovery_quote = lambda ids: (20 * len(ids), [10, 11], 0)
+    kv._memory_limit_page_bundle_bytes = lambda: 20
+    index.exact_recovery_quote = lambda ids: (20 * len(ids), [], 0)
+    assert allocator.full_attn_allocator.available_size() == 2 * allocator.page_size
+    assert samples == [20]
+    # The old one-page miss now fits directly, but the longest prefix still
+    # needs one idle reserve. Two polls must report the same fundable prefix.
+    room[0] = 40
+    assert allocator.full_attn_allocator.available_size() == 2 * allocator.page_size
+    assert allocator.full_attn_allocator.available_size() == 2 * allocator.page_size
+    assert samples == [20, 40, 40]
+    room[0] = 100
+    assert allocator.full_attn_allocator.available_size() >= 2 * allocator.page_size
+    assert allocator.full_attn_allocator.available_size() >= 2 * allocator.page_size
+    assert samples == [20, 40, 40, 100]
+
+
+@pytest.mark.parametrize("local", [0, 1])
+def test_exact_recovery_mixed_bundles_keeps_only_required_reserves(local):
+    small = SimpleNamespace(exact_recovery_quote=lambda ids: (4, [10], local),
+                            _memory_limit_page_bundle_bytes=lambda: 4)
+    large = SimpleNamespace(exact_recovery_quote=lambda ids: (16, [11], 0),
+                            _memory_limit_page_bundle_bytes=lambda: 16)
+    pools = tuple(SWABacking(manager, native_pages=13, native_page_bytes=8, physical_page_bytes=8)
+                  for manager in (small, large))
+    expected = [(small, [10])] if local else []
+    assert MODULE._exact_recovery_plan(pools, {5}, 10) == [*expected, (large, [11])]
+
+
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("shorter_retry", [False, True])
+def test_shared_miss_trims_only_idle_ids_needed_to_fund_retry(setup, gate, shorter_retry):
+    room = [-2 if shorter_retry else 1]
+
+    class Pool(Manager):
+        def __init__(self, reserves):
+            super().__init__()
+            self.reserves = set(reserves)
+            self.page_allocator = SimpleNamespace(get_num_reserved_pages=lambda: len(self.reserves),
+                                                  get_avail_physical_bytes=lambda: room[0])
+
+        def available_size(self):
+            return max(room[0], 0) + len(self.reserves)
+
+        def alloc_exact(self, ids):
+            fresh = set(ids) - self.reserves
+            if fresh and len(fresh) > room[0]:
+                return None
+            room[0] -= len(fresh)
+            self.reserves.difference_update(ids)
+            self.live.update(ids)
+            return ids
+
+        def free(self, ids):
+            self.live.difference_update(ids)
+            self.reserves.update(ids)
+
+        def exact_recovery_quote(self, ids):
+            return len(set(ids) - self.reserves), list(self.reserves - set(ids)), 0
+
+        def trim_selected_reserves(self, ids):
+            self.reserves.difference_update(ids)
+            room[0] += len(ids)
+
+        def _memory_limit_page_bundle_bytes(self):
+            return 1
+
+        def invalidate_physical_capacity(self):
+            pass
+
+    kv, index = Pool([5, 7, 11] if shorter_retry else [9, 10]), Pool([])
+    full, indexer = [SWABacking(pool, native_pages=13, native_page_bytes=8, physical_page_bytes=8)
+                     for pool in (kv, index)]
+    allocator = DecodeComposite([3, 7, 9])
+    MODULE.bind_native_swa(allocator, make_backing(), full, full_backings=(indexer,))
+    count = 2 if shorter_retry else 1
+    if gate and not shorter_retry:
+        assert not allocator.check_decode_capacity(num_tokens=4 * count)
+    else:
+        assert allocator.alloc_decode([5] * count) is None
+    if shorter_retry:
+        assert kv.reserves == {5, 7, 11}
+        assert allocator.full_attn_allocator.available_size() == 0
+        room[0] = 0
+        assert allocator.full_attn_allocator.available_size() == allocator.page_size
+        assert kv.reserves == {5, 7, 11}  # Capacity queries do not trim.
+    else:
+        assert room == [1] and 5 in kv.reserves and len(kv.reserves) == 2
+    if not gate:
+        assert allocator.alloc_decode().tolist() == [20]
+        return
+    assert allocator.check_decode_capacity(num_tokens=4)
+    assert allocator.alloc_decode().tolist() == [20]
+
+
 def test_decode_gate_retains_backing_until_the_promised_native_ids_are_used(setup):
     allocator, backing = decode_setup()
     assert allocator.check_decode_capacity(num_tokens=4)
@@ -961,6 +1104,73 @@ def test_c128_capacity_rejected_before_binding(monkeypatch):
     assert composite.full_attn_allocator.alloc == original_alloc
 
 
+@pytest.fixture
+def all_backings(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int64=object(), tensor=lambda values, **_: Tensor(values)))
+    composite = Composite(256)
+    swa = make_backing()
+    compressed = tuple(SWABacking(Manager(), native_pages=13,
+                                 native_page_bytes=width, physical_page_bytes=8)
+                       for width in (3, 6, 4))
+    assert swa.acquire({1})
+    for backing in compressed:
+        assert backing.acquire({2})
+    MODULE.bind_native_swa(composite, swa, compressed[0], full_backings=compressed[1:])
+    return composite, swa, compressed
+
+
+@pytest.mark.parametrize("method", ["alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("miss_index", [0, 1, 2, 3])
+def test_compressed_transaction_rolls_back_every_pool(all_backings, method, miss_index):
+    composite, swa, compressed = all_backings
+    pools = (*compressed, swa)
+    composite.full_attn_allocator.output.insert(0, 513)
+    composite.swa_attn_allocator.output.insert(0, 257)
+    failed = pools[miss_index]
+    failed.manager.budget = len(failed.manager.live)
+    before = [(set(b.live), dict(b.refs), set(b.manager.live)) for b in pools]
+    assert getattr(composite, method)() is None
+    assert composite.mapping == {512: 256}
+    assert composite.full_attn_allocator.live == {2}
+    assert composite.swa_attn_allocator.live == {1}
+    assert before == [(set(b.live), dict(b.refs), set(b.manager.live)) for b in pools]
+    failed.manager.budget = 20
+    assert getattr(composite, method)() is not None
+    assert all(b.live == {2, 5} for b in compressed)
+    assert swa.live == {1, 3}
+
+
+def test_compressed_lifetimes_and_minimum_capacity(all_backings):
+    composite, swa, compressed = all_backings
+    assert composite.alloc() is not None
+    composite.swa_attn_allocator.free_page_ids(Tensor([3]))
+    assert swa.live == {1}
+    assert all(b.live == {2, 5} for b in compressed)
+    native = composite.full_attn_allocator
+    for backing in compressed:
+        backing.manager.budget = len(backing.manager.live)
+    assert native.available_size() == min(b.available_pages() * 256 for b in compressed)
+    native.free_group = []
+    native.free_page_ids(Tensor([5]))
+    assert all(b.live == {2, 5} for b in compressed)
+    native.free_group_end()
+    assert all(b.live == {2} for b in compressed)
+    native.clear()
+    assert all(not b.live and not b.manager.live for b in compressed)
+
+
+def test_late_compressed_backend_error_poisons_all_children(all_backings):
+    composite, _swa, compressed = all_backings
+    compressed[-1].manager.fault = RuntimeError("indexer map failed")
+    with pytest.raises(RuntimeError, match="indexer map failed"):
+        composite.alloc()
+    assert composite.mapping == {512: 256}
+    for child in (composite.full_attn_allocator, composite.swa_attn_allocator):
+        with pytest.raises(RuntimeError, match="tear down"):
+            child.clear()
+
+
 def _assert_all_backings_ready_before_resize(monkeypatch, composite, pools, waiting_pool, method):
     lock, waiting, ready = RLock(), Event(), Event()
     operations = []
@@ -1004,3 +1214,11 @@ def test_c128_waits_for_both_managers_before_any_resize(composite_backings, monk
     composite, swa, full = composite_backings
     _assert_all_backings_ready_before_resize(
         monkeypatch, composite, (swa, full), swa if waiting_side == "swa" else full, method)
+
+
+@pytest.mark.parametrize("method", ["alloc", "alloc_extend", "alloc_decode", "alloc_extend_swa_tail"])
+@pytest.mark.parametrize("waiting_index", [1, 2])
+def test_additional_compressed_pools_settle_before_resize(all_backings, monkeypatch, method, waiting_index):
+    composite, swa, compressed = all_backings
+    _assert_all_backings_ready_before_resize(
+        monkeypatch, composite, (swa, *compressed), compressed[waiting_index], method)

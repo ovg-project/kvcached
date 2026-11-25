@@ -779,8 +779,26 @@ class KVCacheManager:
     def _can_alloc_exact_ready(self, block_ids: Iterable[int]) -> bool:
         return self._exact_claim_preflight(block_ids, apply_resize=False) is not None
 
+    @synchronized
+    def exact_recovery_quote(self, ids: List[int]) -> Optional[tuple[int, List[int], int]]:
+        """Price a rolled-back claim and identify unused native reserves."""
+        claim = self._exact_claim_preflight(ids, apply_resize=False, shared_budget=True)
+        if claim is None:
+            return None
+        new = [page for page in claim[1] if page not in self.full_pages and page not in self.avail_pages]
+        return self.page_allocator.exact_recovery_quote(new)
+
+    @synchronized
+    def trim_selected_reserves(self, idle: List[int]) -> None:
+        try:
+            self.page_allocator.trim_selected(idle)
+        except Exception as exc:
+            self._record_native_fatal("trim", exc)
+            raise
+        self._avail_physical_pages_cache = None
+
     def _exact_claim_preflight(
-        self, block_ids: Iterable[int], *, apply_resize: bool
+        self, block_ids: Iterable[int], *, apply_resize: bool, shared_budget: bool = False
     ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int]]]:
         requested: List[int] = []
         for value in block_ids:
@@ -836,9 +854,10 @@ class KVCacheManager:
             for page_id in grouped
         )
         try:
-            capacity = min(self.page_allocator.get_num_free_pages(),
-                           self._get_cached_avail_physical_pages()
-                           + self.page_allocator.get_num_reserved_pages())
+            capacity = self.page_allocator.get_num_free_pages()
+            if not shared_budget:
+                capacity = min(capacity, self._get_cached_avail_physical_pages()
+                               + self.page_allocator.get_num_reserved_pages())
         except Exception as exc:
             self._record_native_fatal("alloc_exact", exc)
             raise
@@ -2214,6 +2233,11 @@ class KVCacheManager:
             )
             available = min(available, logical_available)
         return available
+
+    @synchronized
+    def invalidate_physical_capacity(self) -> None:
+        """A sibling pool changed the driver headroom during this admission."""
+        self._avail_physical_pages_cache = None
 
     def _get_cached_avail_physical_pages(self) -> int:
         """Return get_avail_physical_pages(), TTL-cached for available_size().

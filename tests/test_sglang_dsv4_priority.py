@@ -122,29 +122,29 @@ def test_failed_sparse_prefix_posts_its_exact_physical_cost(monkeypatch):
 
 def test_compressed_backing_demands_sum_bytes_without_overwriting_peer_pools(monkeypatch):
     _, patches, _ = _load_sglang_modules(monkeypatch)
-    managers = [PriorityManager() for _ in range(2)]
+    managers = [PriorityManager() for _ in range(3)]
     managers[1].bundle_bytes = 16
     backings = [MODULE.SWABacking(manager, native_pages=13, native_page_bytes=2,
                                   physical_page_bytes=8) for manager in managers]
     for backing in backings:
         assert backing.acquire({1})
     allocator = Composite(4)
-    MODULE.bind_native_swa(allocator, backings[0], full_backing=backings[1])
+    MODULE.bind_native_swa(allocator, backings[0], full_backings=tuple(backings[1:]))
     request = NS(origin_input_ids=list(range(16)), prefix_indices=[], output_ids=[],
                  sampling_params=NS(max_new_tokens=0))
     scheduler = NS(token_to_kv_pool_allocator=allocator, waiting_queue=[request], chunked_req=None)
     with patches._sglang_demand_round(scheduler):
         for manager in managers:
             manager.step = 2
-    assert [manager.forecasts for manager in managers] == [[3], [3]]
+    assert [manager.forecasts for manager in managers] == [[3], [3], [3]]
     # Three physical pages from each pool, with distinct layer bundle costs.
     post = getattr(sys.modules["kvcached.vmm_ops"], "set_kv_demand")
-    post.assert_called_once_with(72, 0)
+    post.assert_called_once_with(96, 0)
     with patches._sglang_demand_round(scheduler):
         for manager in managers:
             manager.step = 2
-    post.assert_called_once_with(72, 0)
+    post.assert_called_once_with(96, 0)
     scheduler.waiting_queue = []
     with patches._sglang_demand_round(scheduler):
         pass
-    assert [call.args for call in post.call_args_list] == [(72, 0), (0, 0)]
+    assert [call.args for call in post.call_args_list] == [(96, 0), (0, 0)]

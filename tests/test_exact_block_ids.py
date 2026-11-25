@@ -93,6 +93,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
+                'exact_recovery_quote',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -118,6 +119,8 @@ def make_manager():
     manager.reserve_null_block = True
     manager.block_mem_size = 4
     manager.page_size = 16
+    manager.num_layers = 2
+    manager.num_kv_buffers = 1
     manager.reserved_blocks = []
     manager.full_pages = {}
     manager.avail_pages = {}
@@ -138,6 +141,30 @@ def make_manager():
     manager.failures = []
     manager._lifecycle = SimpleNamespace(mark_failed=lambda reason, exc: manager.failures.append(exc))
     return manager
+
+
+def test_exact_quote_passes_only_unmapped_pages_and_carries_shared_bytes():
+    manager = make_manager()
+    assert manager.alloc_exact([4]) == [4]
+    calls = []
+
+    def quote(pages):
+        calls.append(pages)
+        return 32, [3], 0
+
+    manager.page_allocator.exact_recovery_quote = quote
+    assert manager.exact_recovery_quote([5, 8]) == (32, [3], 0)
+    assert calls == [[2]]
+    assert manager.page_allocator.calls == [1]
+
+
+def test_exact_quote_with_no_local_headroom_or_reserves():
+    manager = make_manager()
+    manager.available_size = lambda: 0
+    manager._get_cached_avail_physical_pages = lambda: 0
+    manager.page_allocator.exact_recovery_quote = lambda pages: (32 * len(pages), [], 0)
+    assert manager.alloc_exact([8]) is None
+    assert manager.exact_recovery_quote([8]) == (32, [], 0)
 
 
 @pytest.mark.parametrize('ids', [[], [1]])

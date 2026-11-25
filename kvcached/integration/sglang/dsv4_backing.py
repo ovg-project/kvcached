@@ -9,6 +9,7 @@ straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
 import functools
 import inspect
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -69,7 +70,8 @@ class SWABacking:
         return not missing or self.manager.can_alloc_exact(sorted(missing))
 
     def missing_physical_pages(self, pages: set[int]) -> set[int]:
-        return {physical for page in pages - self.live for physical in self._span(page)} - self.refs.keys()
+        return {physical for page in pages if page not in self.live for physical in self._span(page)
+                if physical not in self.refs}
 
     def physical_demand(self, native_pages: int) -> int:
         """Forecast additional physical pages after using held native-page slack."""
@@ -86,12 +88,67 @@ class SWABacking:
         return max(0, free_bytes // self.native_page_bytes)
 
 
+def _largest_fitting_prefix(limit: int, fits: Callable[[int], bool]) -> int:
+    """Find the last fitting prefix, probing a parked singleton only once."""
+    if limit <= 0:
+        return 0
+    low, high = 0, 1
+    while fits(high):
+        if high == limit:
+            return limit
+        low, high = high, min(2 * high, limit)
+    while high - low > 1:
+        mid = (low + high) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def _exact_recovery_plan(pools: tuple[SWABacking, ...], pages: set[int],
+                         room: int) -> list[tuple[Any, list[int]]] | None:
+    """Select only the idle mappings needed to fund this exact prefix."""
+    reclaim = []
+    needed = 0
+    for item in pools:
+        manager = item.manager
+        quote = manager.exact_recovery_quote(sorted(item.missing_physical_pages(pages)))
+        if quote is None:
+            return None
+        fresh, idle, local = quote
+        needed += fresh
+        if idle:
+            reclaim.append((manager, idle, manager._memory_limit_page_bundle_bytes(), local))
+    # A reclaimed ID needs a free virtual slot in its own pool. Unmap
+    # these mandatory reserves first, then fund the shared byte deficit.
+    counts = [local for _, _, _, local in reclaim]
+    deficit = (needed - room if needed else 0) - sum(
+        local * bundle for _, _, bundle, local in reclaim)
+    for i in sorted(range(len(reclaim)), key=lambda i: reclaim[i][2]):
+        if deficit <= 0:
+            break
+        _, idle, bundle, _ = reclaim[i]
+        extra = min(len(idle) - counts[i], -(-deficit // bundle))
+        counts[i] += extra
+        deficit -= extra * bundle
+    if deficit > 0:
+        return None
+    # Rounding up a larger final bundle can cover earlier optional pages.
+    for i, (_, _, bundle, local) in enumerate(reclaim):
+        excess = min(counts[i] - local, -deficit // bundle)
+        counts[i] -= excess
+        deficit += excess * bundle
+    return [(manager, idle[:count]) for (manager, idle, _, _), count in zip(reclaim, counts) if count]
+
+
 class _BackingMiss(Exception):
     pass
 
 
 def bind_native_swa(allocator: Any, backing: SWABacking,
                     full_backing: SWABacking | None = None, *,
+                    full_backings: tuple[SWABacking, ...] = (),
                     on_capacity_miss: Any = None,
                     on_priority_miss: Any = None, paged_v0520: type | None = None) -> None:
     """Bind the public alloc/free boundary of SGLang 0.5.20's native children.
@@ -120,9 +177,12 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     if getattr(allocator, "swa_req_ring", False):
         raise ValueError("Per-request SWA rings must retain native storage")
 
-    selected_full = (full_backing,) if full_backing is not None else ()
-    if full_backing is not None and full.size // page_size >= full_backing.native_pages:
-        raise ValueError("C128 storage cannot cover the native full allocator")
+    selected_full = ((full_backing,) if full_backing is not None else ()) + full_backings
+    if len({id(item) for item in selected_full}) != len(selected_full):
+        raise ValueError("Duplicate compressed backing")
+    for item in selected_full:
+        if full.size // page_size >= item.native_pages:
+            raise ValueError("Compressed storage cannot cover the native full allocator")
     backings = {id(swa): (backing,), id(full): selected_full}
 
     pending: list[tuple[Any, set[int]]] | None = None
@@ -148,6 +208,23 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         except Exception:
             failed = True
             raise
+
+    def recover_retry(child: Any, pages: set[int]) -> None:
+        pools = backings[id(child)]
+        if id(child) not in placement_misses or len(pools) < 2:
+            return
+        if any(item.manager.page_allocator.get_num_reserved_pages() for item in pools):
+            room = pools[0].manager.page_allocator.get_avail_physical_bytes()
+            plan = _exact_recovery_plan(pools, pages, room)
+            if plan:
+                for manager, idle in plan:
+                    manager.trim_selected_reserves(idle)
+                for item in pools:
+                    item.manager.invalidate_physical_capacity()
+
+    def remember_miss(child: Any, choices: tuple[int, ...]) -> None:
+        placement_misses[id(child)] = choices
+        recover_retry(child, set(choices))
 
     def ready_managers() -> None:
         for child_backings in backings.values():
@@ -193,11 +270,12 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                         release_decode_reservation()
                         return False
                     pages = set(choices)
+                    recover_retry(child, pages)
                     decode_reserved[id(child)] = pages
                     for item in backings[id(child)]:
                         if not item.acquire(pages):
                             release_decode_reservation()
-                            placement_misses[id(child)] = tuple(choices)
+                            remember_miss(child, tuple(choices))
                             return False
                 return True
             except Exception:
@@ -319,6 +397,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
             pages = page_ids(result) if known_new is None or backings[id(child)] else set()
             new = pages - prior if known_new is None else known_new
             pending.append((child, new))
+            recover_retry(child, pages)
             for child_backing in backings[id(child)]:
                 if not child_backing.acquire(pages):
                     raise _BackingMiss(child, max(1, len(new)))
@@ -364,7 +443,7 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                             normalize = getattr(child, "merge_and_sort_free", None)
                             if normalize is not None:
                                 normalize()
-                            placement_misses[id(child)] = tuple(census()[:count].tolist())
+                            remember_miss(child, tuple(census()[:count].tolist()))
                     return None
             except Exception:
                 # The error can be after mapping publication. Guessing a
@@ -461,6 +540,28 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                 failed = True
                 raise
 
+        def shared_prefix_capacity(census: Any, capacity: int, missed: int) -> tuple[int, bool]:
+            # Idle reserves from any sibling can fund an exact retry, even
+            # when the indexer alone reports zero physical capacity.
+            reserves = any(item.manager.page_allocator.get_num_reserved_pages() for item in child_backings)
+            limit = min(len(census), (native_available[id(child)]() if reserves else capacity) // page_size)
+            if not limit:
+                return 0, False
+            room = child_backings[0].manager.page_allocator.get_avail_physical_bytes()
+            sampled: dict[int, Any] = {}
+
+            def quote(length: int):
+                if length not in sampled:
+                    sampled[length] = _exact_recovery_plan(child_backings, set(census[:length].tolist()), room)
+                return sampled[length]
+
+            # With selective reclamation smaller prefixes need at most as many
+            # new mappings and protect at most as many reserves. Probe a parked
+            # singleton once; expand the search only while requests can grow.
+            low = _largest_fitting_prefix(limit, lambda n: quote(n) is not None)
+            # Keep the miss until the request can map without an explicit trim.
+            return low, missed <= low and low == min(len(census), capacity // page_size) and quote(low) == []
+
         def available_size() -> int:
             require_healthy()
             counts = budget.get()
@@ -471,19 +572,24 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
                               for item in child_backings)])
             missed = placement_misses.get(id(child))
             if missed:
-                prefix = tuple(child.get_all_free_pages()[:len(missed)].tolist())
+                if len(child_backings) <= 1 and capacity < page_size:
+                    return 0
+                census = child.get_all_free_pages()
+                if len(child_backings) > 1:
+                    largest, recovered = shared_prefix_capacity(census, capacity, len(missed))
+                    if recovered:
+                        placement_misses.pop(id(child), None)
+                    return largest * page_size
+                prefix = tuple(census[:len(missed)].tolist())
                 if prefix == missed:
-                    # A failed large prefill must not hide a feasible smaller
-                    # decode. Find the affordable prefix without claiming it.
-                    low, high = 0, len(prefix)
-                    while low < high:
-                        middle = (low + high + 1) // 2
-                        if all(item.can_acquire(set(prefix[:middle])) for item in child_backings):
-                            low = middle
-                        else:
-                            high = middle - 1
-                    if low < len(prefix):
-                        return min(capacity, low * page_size)
+                    limit = min(len(prefix), capacity // page_size)
+                    if limit and child_backings[0].can_acquire(set(prefix[:limit])):
+                        if limit < len(prefix):
+                            return capacity
+                    else:
+                        fitting = _largest_fitting_prefix(
+                            limit - 1, lambda n: child_backings[0].can_acquire(set(prefix[:n])))
+                        return fitting * page_size
                 placement_misses.pop(id(child), None)
             return capacity
 
