@@ -9,7 +9,7 @@ straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
 import functools
 import inspect
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -18,7 +18,7 @@ from typing import Any
 class SWABacking:
     def __init__(self, manager: Any, *, native_pages: int, native_page_bytes: int,
                  physical_page_bytes: int, permanent_pages: frozenset[int] = frozenset({0}),
-                 addressable_pages: int | None = None) -> None:
+                 addressable_pages: int | None = None, padding_slots: int = 1) -> None:
         if min(native_pages, native_page_bytes, physical_page_bytes) <= 0:
             raise ValueError("SWA backing dimensions must be positive")
         if native_page_bytes > physical_page_bytes:
@@ -27,6 +27,9 @@ class SWABacking:
         self.native_pages = native_pages if addressable_pages is None else addressable_pages
         if not 0 < self.native_pages <= native_pages:
             raise ValueError("Addressable pages must fit the native allocation")
+        if not 1 <= padding_slots <= self.native_pages:
+            raise ValueError("Padding slots must fit the native allocation")
+        self.padding_slots = padding_slots
         self.native_page_bytes = native_page_bytes
         self.physical_page_bytes = physical_page_bytes
         physical_pages = (native_pages * native_page_bytes + physical_page_bytes - 1) // physical_page_bytes
@@ -93,17 +96,17 @@ class SWABacking:
         held = len(self.refs) * self.physical_page_bytes + self._permanent_bytes
         if self._tail_bytes and self._tail_page in self.refs:
             held -= self.physical_page_bytes - self._tail_bytes
-        return held - (len(self.live) + 1) * self.native_page_bytes
+        return held - (len(self.live) + self.padding_slots) * self.native_page_bytes
 
     def physical_demand(self, native_pages: int) -> int:
         """Forecast additional physical pages after using held native-page slack."""
         missing = max(0, native_pages * self.native_page_bytes - self._held_slack_bytes())
         return (missing + self.physical_page_bytes - 1) // self.physical_page_bytes
 
-    def available_pages(self) -> int:
+    def available_pages(self, reclaimable_bytes: int = 0) -> int:
         # An upper bound: placement can still fail for the exact native IDs.
-        free_bytes = self._held_slack_bytes() + self.manager.available_size() * self.physical_page_bytes
-        return max(0, min(self.native_pages - 1 - len(self.live), free_bytes // self.native_page_bytes))
+        free_bytes = self._held_slack_bytes() + self.manager.available_size() * self.physical_page_bytes + reclaimable_bytes
+        return max(0, min(self.native_pages - self.padding_slots - len(self.live), free_bytes // self.native_page_bytes))
 
 
 def _largest_fitting_prefix(limit: int, fits: Callable[[int], bool]) -> int:
@@ -127,11 +130,16 @@ def _largest_fitting_prefix(limit: int, fits: Callable[[int], bool]) -> int:
 def _exact_recovery_plan(pools: tuple[SWABacking, ...], pages: set[int],
                          room: int) -> list[tuple[Any, list[int]]] | None:
     """Select only the idle mappings needed to fund this exact prefix."""
+    return plan_reserve_recovery((
+        (item.manager, item.manager.exact_recovery_quote(sorted(item.missing_physical_pages(pages))))
+        for item in pools
+    ), room)
+
+
+def plan_reserve_recovery(quotes: Iterable, room: int) -> list[tuple[Any, list[int]]] | None:
     reclaim = []
     needed = 0
-    for item in pools:
-        manager = item.manager
-        quote = manager.exact_recovery_quote(sorted(item.missing_physical_pages(pages)))
+    for manager, quote in quotes:
         if quote is None:
             return None
         fresh, idle, local = quote

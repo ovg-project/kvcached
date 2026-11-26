@@ -625,6 +625,8 @@ def get_kv_cache_manager(
     logical_num_blocks: Optional[int] = None,
     max_block_id: Optional[int] = None,
     permanent_block_ids: tuple[int, ...] = (),
+    enable_page_prealloc: Optional[bool] = None,
+    defer_prealloc_until_bound: bool = False,
 ) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
@@ -647,6 +649,8 @@ def get_kv_cache_manager(
         logical_num_blocks=logical_num_blocks,
         max_block_id=max_block_id,
         permanent_block_ids=permanent_block_ids,
+        **({"enable_page_prealloc": enable_page_prealloc} if enable_page_prealloc is not None else {}),
+        **({"defer_prealloc_until_bound": True} if defer_prealloc_until_bound else {}),
         # SWA and Mamba pools differ in size from the full-attention pool:
         # each needs its own limit and usage, i.e. its own segment.
         own_segment=True,

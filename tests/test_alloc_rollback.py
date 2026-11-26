@@ -190,6 +190,31 @@ def test_successful_alloc_unchanged():
     assert manager.num_avail_blocks == 2
 
 
+def test_paired_backing_reservation_rollback_and_reuse():
+    from unittest.mock import Mock
+
+    manager = make_manager(fail_after=8)
+    manager.page_allocator.get_avail_physical_bytes = lambda: 32
+    manager.null_block = manager.alloc(1)
+    backing = Mock()
+    backing.idle_bytes.return_value = 0
+    backing.recover_full.return_value = False
+    backing.available_size.return_value = 12
+    backing.acquire.side_effect = [True, False, True]
+    manager.bind_block_backing(backing)
+    assert manager.try_to_reserve(2, packed=True)
+    reserved = list(manager.reserved_blocks)
+    assert manager.alloc(4) is None
+    assert manager.reserved_blocks == reserved
+    assert manager._get_num_alloced_blocks() == 3
+    result = manager.alloc(4)
+    assert result is not None and result[:2] == reserved
+    assert backing.acquire.call_args.args[0] == result[2:]
+    manager.free(result)
+    backing.release.assert_called_once_with(result)
+    assert manager._get_num_alloced_blocks() == 1
+
+
 @pytest.mark.parametrize("api_takeover", [False, True])
 def test_clear_reserves_null_block_before_current_zero_quota(monkeypatch, api_takeover):
     """Construct the clear/reset window with a page-accounting allocator fake."""

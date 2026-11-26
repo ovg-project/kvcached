@@ -18,7 +18,7 @@ import time
 import weakref
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from kvcached.errors import QuarantinedResizeError, StateConsistencyError
 from kvcached.kv_geometry import check_page_geometry
@@ -120,6 +120,19 @@ def _page_capacity(page_id: int, page_size: int, block_mem_size: int,
     return end - start
 
 
+class BlockBacking(Protocol):
+    """Additional storage addressed by the same logical block IDs."""
+
+    def acquire(self, ids: Iterable[int], *, placement: List[int]) -> bool: ...
+    def can_acquire(self, ids: Iterable[int]) -> bool: ...
+    def release(self, ids: Iterable[int]) -> None: ...
+    def available_size(self) -> int: ...
+    def clear(self) -> None: ...
+    def recover_full(self, count: int, ids: Optional[List[int]]) -> bool: ...
+    def idle_bytes(self) -> int: ...
+    def reserve_decode(self, count: int, *, packed: bool) -> bool: ...
+
+
 class KVCacheManager:
     max_block_id: Optional[int] = None
     # The initializer may reenter resize while reserving the null block; it
@@ -132,6 +145,7 @@ class KVCacheManager:
     _avail_physical_pages_cache: Optional[int] = None
     _avail_physical_pages_ts: float = 0.0
     _page_release_callbacks: tuple[weakref.WeakMethod, ...] = ()
+    _block_backing: Optional[BlockBacking] = None
     _shrink_reclaimers: tuple[weakref.WeakMethod, ...] = ()
     # Prefix caches that higher priorities can reclaim (#585): pairs of bound
     # methods counting and evicting the whole pages they could free.
@@ -163,6 +177,8 @@ class KVCacheManager:
         logical_num_blocks: Optional[int] = None,
         max_block_id: Optional[int] = None,
         permanent_block_ids: tuple[int, ...] = (),
+        enable_page_prealloc: Optional[bool] = None,
+        defer_prealloc_until_bound: bool = False,
     ):
         """
         Args:
@@ -245,6 +261,7 @@ class KVCacheManager:
 
         # The physical page size used by kvcached page allocator.
         self.page_size = PAGE_SIZE if page_size is None else page_size
+        self._defer_prealloc_until_bound = defer_prealloc_until_bound
         self.permanent_block_ids = frozenset(permanent_block_ids)
         if self.permanent_block_ids and (
             not reserve_null_block or self.block_mem_size != self.page_size
@@ -297,7 +314,7 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
-            enable_page_prealloc=PAGE_PREALLOC_ENABLED,
+            enable_page_prealloc=PAGE_PREALLOC_ENABLED if enable_page_prealloc is None else enable_page_prealloc,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
             ipc_name=self.ipc_name,
@@ -517,7 +534,7 @@ class KVCacheManager:
                 with self._lock:
                     if self._alloc_exact_impl(sorted(pins), apply_resize=False) is None:
                         raise RuntimeError("Cannot back permanent state pages during initialization")
-            if not self._shutdown_requested.is_set():
+            if not self._shutdown_requested.is_set() and not getattr(self, "_defer_prealloc_until_bound", False):
                 self.page_allocator.start_prealloc_thread()
         except Exception as e:
             self._record_operation_error(
@@ -761,7 +778,17 @@ class KVCacheManager:
         if counters is not None:
             self._increment_operation_counter("allocation_requests_total")
         try:
-            result = self._alloc_exact_impl(block_ids)
+            backing = getattr(self, "_block_backing", None)
+            if backing is None:
+                result = self._alloc_exact_impl(block_ids)
+            else:
+                ids = list(block_ids)
+                # The joint quote uses live native headroom. A cached zero
+                # from before a peer's release must not veto this claim.
+                self.invalidate_physical_capacity()
+                result = self._alloc_exact_impl(ids)
+                if result is None and backing.recover_full(len(ids), ids):
+                    result = self._alloc_exact_impl(ids)
         except Exception:
             if counters is not None:
                 self._record_operation_error(
@@ -791,7 +818,12 @@ class KVCacheManager:
 
     @synchronized
     def _can_alloc_exact_ready(self, block_ids: Iterable[int]) -> bool:
-        return self._exact_claim_preflight(block_ids, apply_resize=False) is not None
+        backing = getattr(self, "_block_backing", None)
+        if backing is None:
+            return self._exact_claim_preflight(block_ids, apply_resize=False) is not None
+        ids = list(block_ids)
+        claim = self._exact_claim_preflight(ids, apply_resize=False, shared_budget=True)
+        return claim is not None and backing.can_acquire(claim[0])
 
     @synchronized
     def exact_recovery_quote(self, ids: List[int]) -> Optional[tuple[int, List[int], int]]:
@@ -916,6 +948,11 @@ class KVCacheManager:
             self.num_avail_blocks += page.num_free_blocks()
             created.append(page_id)
 
+        if getattr(self, "_block_backing", None) is not None and not self._acquire_block_backing(
+                (i for i in requested if i not in reserved), requested):
+            self._release_unclaimed_exact_pages(created)
+            return None
+
         # The manager lock and per-page preflight make these claims exclusive.
         for page_id, ids in grouped.items():
             page = self.full_pages.get(page_id) or self.avail_pages[page_id]
@@ -985,6 +1022,9 @@ class KVCacheManager:
         reserved_before = len(self.reserved_blocks)
         try:
             indices = self._alloc_impl(need_size, _skip_wait=_skip_wait, pack_pages=pack_pages)
+            backing = getattr(self, "_block_backing", None)
+            if indices is None and not _skip_wait and backing is not None and backing.recover_full(need_size, None):
+                indices = self._alloc_impl(need_size, pack_pages=pack_pages)
         except Exception:
             if counters is not None:
                 self._record_operation_error(
@@ -1143,6 +1183,10 @@ class KVCacheManager:
             remaining_need -= num_from_page
 
         self._release_bound_empty_pages(bound_empty_pages)
+        if (not _skip_wait and getattr(self, "_block_backing", None) is not None
+                and not self._acquire_block_backing(ret_index[num_from_reserved:], ret_index)):
+            self._rollback_partial_alloc(ret_index, num_from_reserved)
+            return None
         return ret_index
 
     def _release_bound_empty_pages(self, page_ids: List[int]) -> None:
@@ -1224,6 +1268,30 @@ class KVCacheManager:
         assert chosen is not None, "caller guarantees avail_pages is non-empty"
         return self.avail_pages.pop(chosen)
 
+    def _acquire_block_backing(self, ids: Iterable[int], placement: List[int]) -> bool:
+        assert self._block_backing is not None
+        try:
+            return self._block_backing.acquire(ids, placement=placement)
+        except Exception as exc:
+            self._lifecycle.mark_failed("additional block backing acquisition failed", exc)
+            raise
+
+    @_after_post_init
+    @synchronized
+    def bind_block_backing(self, backing: BlockBacking) -> None:
+        """Bind before the first user allocation. Reserved IDs retain both stores."""
+        if (self._block_backing is not None or self.null_block != [0]
+                or self._get_num_alloced_blocks() != 1):
+            raise ValueError("Additional backing needs an unused pool with a reserved null block")
+        self._block_backing = backing
+        self.invalidate_physical_capacity()
+        if getattr(self, "_defer_prealloc_until_bound", False):
+            with self._shutdown_lock:
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("Pool shut down before companion backing was bound")
+                self.page_allocator.start_prealloc_thread()
+                self._defer_prealloc_until_bound = False
+
     @synchronized
     def _register_page_release_callback(
         self, callback: Callable[[Iterable[int]], None],
@@ -1246,7 +1314,14 @@ class KVCacheManager:
         errors_before = getattr(self, "_operation_error_state", (0, None, None))[0]
         try:
             _, had_inconsistency = self._free(indices, track_freed_blocks=True)
-        except Exception:
+            backing = getattr(self, "_block_backing", None)
+            if backing is not None:
+                if had_inconsistency:
+                    raise StateConsistencyError("Cannot retire additional backing after inconsistent free")
+                backing.release(indices)
+        except Exception as exc:
+            if getattr(self, "_block_backing", None) is not None:
+                self._lifecycle.mark_failed("paired block release failed", exc)
             if counters is not None:
                 counters["free_failures_total"] = counters.get("free_failures_total", 0) + 1
                 if getattr(self, "_operation_error_state", (0, None, None))[0] == errors_before:
@@ -1643,7 +1718,7 @@ class KVCacheManager:
         return taken
 
     @synchronized
-    def demand_pages(self, need_blocks: int) -> int:
+    def demand_pages(self, need_blocks: int, *, include_reserves: bool = True) -> int:
         """Pages that ``need_blocks`` more blocks would have to map.
 
         Free blocks in mapped pages, reserved blocks and pre-mapped pages need
@@ -1664,7 +1739,7 @@ class KVCacheManager:
                 reusable -= page.num_free_blocks()
         reserved = max(0, self.page_allocator.get_num_reserved_pages()
                        - getattr(self, "_priority_reserve_debt", 0))
-        held = reusable + reserved * blocks_per_page
+        held = reusable + (reserved * blocks_per_page if include_reserves else 0)
         missing = need_blocks - held
         return -(-missing // blocks_per_page) if missing > 0 else 0
 
@@ -2216,6 +2291,10 @@ class KVCacheManager:
                 blocks_from_free_pages = 0
             else:
                 physical_free_pages = self._get_cached_avail_physical_pages()
+                backing = getattr(self, "_block_backing", None)
+                if backing is not None and (idle_bytes := backing.idle_bytes()):
+                    room = self._avail_physical_bytes + idle_bytes
+                    physical_free_pages = max(physical_free_pages, room // self._memory_limit_page_bundle_bytes())
                 if self.page_size % self.block_mem_size == 0:
                     free_pages = min(
                         virtual_free_pages,
@@ -2251,6 +2330,9 @@ class KVCacheManager:
                 + len(self.reserved_blocks)
             )
             available = min(available, logical_available)
+        backing = getattr(self, "_block_backing", None)
+        if backing is not None and self.null_block is not None:
+            available = min(available, len(self.reserved_blocks) + backing.available_size())
         return available
 
     @synchronized
@@ -2285,7 +2367,11 @@ class KVCacheManager:
                 and now - self._avail_physical_pages_ts
                 < _AVAIL_PHYSICAL_PAGES_TTL_S):
             return cached
-        result: int = self.page_allocator.get_avail_physical_pages()
+        if getattr(self, "_block_backing", None) is None:
+            result: int = self.page_allocator.get_avail_physical_pages()
+        else:
+            self._avail_physical_bytes = self.page_allocator.get_avail_physical_bytes()
+            result = max(0, self._avail_physical_bytes) // self._memory_limit_page_bundle_bytes()
         control = self._worker_control()
         if control is not None:
             # The ledgers are the workers'. Each GPU's state carries what this
@@ -2457,7 +2543,8 @@ class KVCacheManager:
                 if self._shutdown_requested.is_set():
                     self._lifecycle.mark_failed("clear() cancelled by shutdown")
                 else:
-                    self.page_allocator.start_prealloc_thread()
+                    if not getattr(self, "_defer_prealloc_until_bound", False):
+                        self.page_allocator.start_prealloc_thread()
                     self._lifecycle.mark_ready()
         except Exception as e:
             self._lifecycle.mark_failed("clear() failed", e)
@@ -2477,6 +2564,9 @@ class KVCacheManager:
 
         # Clear reserved blocks
         self.free_reserved()
+        backing = getattr(self, "_block_backing", None)
+        if backing is not None:
+            backing.clear()
 
         # A runtime zero cap forbids new physical grants. Keep the mandatory
         # null page charged across clear(), rather than temporarily overriding

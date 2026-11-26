@@ -354,6 +354,8 @@ def test_only_interleaved_pools_take_the_strided_backup(monkeypatch, kernels):
 
 def test_host_pools_that_would_assume_dense_rows_are_rejected(monkeypatch, kernels):
     module, _ = _patched_host_module(monkeypatch)
+    with pytest.raises(KVCachedConfigError, match="QSA compressed index"):
+        module.MHATokenToKVPoolHost(types.SimpleNamespace(_kvcached_qsa_full_pool=True))
     with pytest.raises(KVCachedConfigError, match="page_first_direct"):
         module.MHATokenToKVPoolHost(InterleavedKVPool(), layout="page_first_direct")
 

@@ -750,6 +750,20 @@ def _coupled_managers(monkeypatch, *, deferred=False, swa_layers=1, count=2):
     return members, PriorityReclaimGroup(members)
 
 
+def test_reporting_a_passive_hybrid_pool_does_not_make_it_a_reclaim_target(manager_module, monkeypatch):
+    from kvcached.priority_reclaim import PriorityReclaimGroup
+
+    members, _ = _coupled_managers(monkeypatch)
+    source = dict(members[0]._runtime_control.sources[0], pool_slot=2, pool_owner=3)
+    mamba = types.SimpleNamespace(_runtime_control=types.SimpleNamespace(worker_ipc=False, sources=(source,)))
+    group = PriorityReclaimGroup(members, passive=(mamba,))
+    publish = mock.Mock(return_value=True)
+    monkeypatch.setattr(sys.modules["kvcached.vmm_ops"], "_publish_pool_reclaimable", publish)
+    group.publish()
+    assert publish.call_args.args[-1][-1] == (2, 3, 0, 0, 0)
+    assert mamba not in group.release_members
+
+
 @pytest.mark.parametrize("deferred", [False, True])
 def test_multiple_native_backings_share_one_reclaim_allowance(manager_module, monkeypatch, deferred):
     _, _, plan = manager_module
