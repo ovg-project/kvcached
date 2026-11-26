@@ -4,6 +4,7 @@
 import gc
 import importlib.util
 import json
+import multiprocessing
 import sys
 import threading
 import types
@@ -120,6 +121,81 @@ def test_device_aliases_and_engine_categories_are_isolated():
     reports.clear_runtime_owned_reservations(integration="sglang")
     assert total(engine="sglang") == 0
     assert total() == 50
+
+
+def test_snapshot_keeps_one_owner_across_categories():
+    owners = [Owner()]
+
+    class PoolName(str):
+        release_owner = False
+
+        def __hash__(self):
+            # Release the last external reference as the first category is aggregated.
+            if self.release_owner:
+                owners.clear()
+            return super().__hash__()
+
+    first = PoolName("workspace")
+    register(owners[0], 100, pool=first)
+    register(owners[0], 30, pool="graphs")
+    first.release_owner = True
+    rows = reports.get_runtime_reservation_snapshots()
+    assert {row.pool_name: row.num_bytes for row in rows} == {"workspace": 100, "graphs": 30}
+    assert reports.get_runtime_reservation_snapshots() == []
+
+
+@pytest.mark.parametrize("query", [
+    reports.get_runtime_owned_reservation_bytes,
+    reports.get_runtime_owned_reservation_breakdown,
+])
+@pytest.mark.parametrize("device,engine", [(None, "sglang"), ("cuda:0", None)])
+def test_single_device_queries_reject_wildcards(query, device, engine):
+    owner = Owner()
+    register(owner, 100, engine="sglang")
+    register(owner, 30, engine="sglang", device="cuda:1")
+    register(owner, 7, engine="vllm")
+    with pytest.raises(ValueError, match="device and integration"):
+        query(device, integration=engine)
+    assert len(reports.get_runtime_reservation_snapshots(
+        device=device, integration=engine)) == 2
+
+
+def _check_forked_registry():
+    assert reports.get_runtime_reservation_snapshots() == []
+    child_owner = Owner()
+    register(child_owner, 3)
+    assert total() == 3
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_fork_starts_with_an_empty_registry_and_its_own_lock():
+    parent_owner = Owner()
+    register(parent_owner, 10)
+    locked, release = threading.Event(), threading.Event()
+
+    def hold_registry_lock():
+        with reports._lock:
+            locked.set()
+            release.wait()
+
+    thread = threading.Thread(target=hold_registry_lock)
+    thread.start()
+    try:
+        assert locked.wait(timeout=5)
+        child = multiprocessing.get_context("fork").Process(target=_check_forked_registry)
+        child.start()
+        try:
+            child.join(timeout=5)
+            assert child.exitcode == 0
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join()
+            child.close()
+    finally:
+        release.set()
+        thread.join()
+    assert total() == 10
 
 
 @pytest.mark.parametrize("size,error", [

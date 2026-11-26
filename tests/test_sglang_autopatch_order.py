@@ -71,6 +71,7 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         "DeepSeekV4KVPoolPatch",
         "DeepSeekV4SWAAllocatorPatch",
         "DeepSeekV4RunnerOwnershipPatch",
+        "DeepSeekV4RequestStatePatch",
     ):
         assert patch_names.index(pool_patch) < legacy_virtual_index
         assert patch_names.index(pool_patch) < virtual_index
@@ -78,6 +79,9 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
     assert patch_versions["DeepSeekV4KVPoolPatch"] == ">=0.5.13"
     assert patch_versions["DeepSeekV4SWAAllocatorPatch"] == ">=0.5.13"
     assert patch_versions["DeepSeekV4RunnerOwnershipPatch"] == ">=0.5.13"
+    assert patch_versions["DeepSeekV4RequestStatePatch"] == ">=0.5.20"
+    assert patch_versions["DeepSeekV4RequestAdmissionPatch"] == ">=0.5.20"
+    assert patch_names.index("DeepSeekV4RequestAdmissionPatch") > virtual_index
     assert patch_names.index("DeepSeekV4RunnerOwnershipPatch") > patch_names.index(
         "DeepSeekV4KVPoolPatch"
     )
@@ -86,3 +90,17 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         == ">=0.5.11,<0.5.16"
     )
     assert patch_versions["SGLangVirtualKVCapacityPatch"] == ">=0.5.16"
+
+    # The capacity-miss wrappers read the 0.5.20 batch and request shapes
+    # and must run after the pool aliases they rely on.
+    for miss_patch in ("ScheduleBatchCapacityMissPatch", "SchedulerCapacityMissPatch"):
+        assert patch_versions[miss_patch] == ">=0.5.20"
+        assert patch_names.index(miss_patch) > patch_names.index(
+            "ElasticHybridLinearKVPoolPatch"
+        )
+    # The shared budget reads the pools the miss wrappers roll back, and its
+    # reduce precedes theirs in a round, so it registers right after them.
+    assert patch_versions["SchedulerSharedBudgetPatch"] == ">=0.5.13"
+    assert patch_names.index("SchedulerSharedBudgetPatch") == (
+        patch_names.index("SchedulerCapacityMissPatch") + 1
+    )

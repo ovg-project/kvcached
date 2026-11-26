@@ -5,6 +5,7 @@ import ast
 import functools
 import operator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event, RLock
 from types import SimpleNamespace
@@ -32,8 +33,10 @@ class Page:
         return ((page_id * page_size + block_size - 1) // block_size,
                 (page_id + 1) * page_size // block_size)
 
-    def init(self, block_size):
+    def init(self, block_size, max_block_id=None):
         start, end = self.get_block_range(self.page_id, self.page_size, block_size)
+        if max_block_id is not None:
+            end = min(end, max_block_id)
         self.free = list(range(start, end))
 
     def get_free_blocks(self):
@@ -65,6 +68,9 @@ class Backend:
     def get_num_reserved_pages(self):
         return self.reserved_pages
 
+    def get_num_free_pages(self):
+        return 8
+
     def get_resize_target(self):
         return self.resize_target
 
@@ -86,21 +92,26 @@ def make_manager():
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
-                '_apply_resize_target', '_retiring_page_ids'}
+                'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
+                'exact_recovery_quote',
+                'take_step_alloc_blocks', 'free',
+                '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name in selected]
     # Extract the production methods, not copies, without importing torch or
     # loading the compiled GPU extension. Calls to the native layer are fakes.
     synchronized = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                         and n.name == 'synchronized')
+    after_init = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == '_after_post_init')
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
-                        names=[ast.alias(name='annotations')], level=0), synchronized, cls],
+                        names=[ast.alias(name='annotations')], level=0), synchronized, after_init, cls],
                         type_ignores=[])
     namespace: dict[str, Any] = {'operator': operator, 'InternalPage': Page,
                  'StateConsistencyError': UnsafeMapping,
                  'QuarantinedResizeError': RejectedResize,
                  'logger': SimpleNamespace(warning=lambda message: None),
-                 'functools': functools}
+                 'functools': functools, 'nullcontext': nullcontext}
     exec(compile(ast.fix_missing_locations(module), str(source), 'exec'), namespace)
     manager = namespace['KVCacheManager']()
     manager._lock = RLock()
@@ -108,6 +119,8 @@ def make_manager():
     manager.reserve_null_block = True
     manager.block_mem_size = 4
     manager.page_size = 16
+    manager.num_layers = 2
+    manager.num_kv_buffers = 1
     manager.reserved_blocks = []
     manager.full_pages = {}
     manager.avail_pages = {}
@@ -128,6 +141,30 @@ def make_manager():
     manager.failures = []
     manager._lifecycle = SimpleNamespace(mark_failed=lambda reason, exc: manager.failures.append(exc))
     return manager
+
+
+def test_exact_quote_passes_only_unmapped_pages_and_carries_shared_bytes():
+    manager = make_manager()
+    assert manager.alloc_exact([4]) == [4]
+    calls = []
+
+    def quote(pages):
+        calls.append(pages)
+        return 32, [3], 0
+
+    manager.page_allocator.exact_recovery_quote = quote
+    assert manager.exact_recovery_quote([5, 8]) == (32, [3], 0)
+    assert calls == [[2]]
+    assert manager.page_allocator.calls == [1]
+
+
+def test_exact_quote_with_no_local_headroom_or_reserves():
+    manager = make_manager()
+    manager.available_size = lambda: 0
+    manager._get_cached_avail_physical_pages = lambda: 0
+    manager.page_allocator.exact_recovery_quote = lambda pages: (32 * len(pages), [], 0)
+    assert manager.alloc_exact([8]) is None
+    assert manager.exact_recovery_quote([8]) == (32, [], 0)
 
 
 @pytest.mark.parametrize('ids', [[], [1]])
@@ -218,6 +255,27 @@ def test_existing_conflict_preflights_the_whole_batch():
     assert original.free == [2, 3]
 
 
+def test_exact_capacity_query_does_not_claim_or_apply_resize():
+    manager = make_manager()
+    original = page_for(manager, 0, [2, 3])
+    manager.page_allocator.resize_target = 64
+    manager.resize = lambda _: pytest.fail('capacity query applied a resize')
+    assert manager.can_alloc_exact([2, 4])
+    assert not manager.can_alloc_exact([1])
+    manager._priority_retired_ids = {1}
+    assert not manager.can_alloc_exact([2, 4])
+    manager._priority_retired_ids.clear()
+    manager._get_cached_avail_physical_pages = lambda: 0
+    assert not manager.can_alloc_exact([2, 4])
+    assert manager.can_alloc_exact([2])
+    assert manager.can_alloc_exact([])
+    assert not manager.page_allocator.calls
+    assert original.free == [2, 3]
+    assert manager.reserved_blocks == []
+    assert not manager._operation_counters
+    assert not hasattr(manager, '_step_alloc_blocks')
+
+
 @pytest.mark.parametrize('failure', [None, RuntimeError('capacity unavailable')])
 def test_later_page_miss_unwinds_only_new_pages(failure):
     manager = make_manager()
@@ -269,9 +327,41 @@ def test_live_reuse_removes_only_its_own_retirement():
 
 def test_capacity_limit_blocks_even_a_physically_available_exact_page():
     manager = make_manager()
-    manager.available_size = lambda: 0
+    page_for(manager, 0, [2, 3])
+    manager.page_allocator.get_num_free_pages = lambda: 0
+    assert not manager.can_alloc_exact([4])
     assert manager.alloc_exact([4]) is None
     assert manager.page_allocator.calls == []
+    assert manager.can_alloc_exact([2])
+    assert manager.alloc_exact([2]) == [2]
+
+
+def test_exact_capacity_uses_requested_page_geometry():
+    manager = make_manager()
+    manager.block_mem_size = 7
+    manager.page_allocator.get_num_free_pages = lambda: 1
+    manager._get_cached_avail_physical_pages = lambda: 1
+    # Ordinary allocation sees one block on page 1. Exact page 3 has two.
+    manager.available_size = lambda: 1
+    assert manager.can_alloc_exact([7, 8])
+    assert manager.alloc_exact([7, 8]) == [7, 8]
+    assert manager.page_allocator.calls == [3]
+
+
+def test_exact_capacity_propagates_native_health_failure():
+    manager = make_manager()
+    failure = UnsafeMapping('background mapping failed')
+    seen = []
+
+    def fail():
+        raise failure
+
+    manager.page_allocator.get_num_free_pages = fail
+    manager._record_native_fatal = lambda operation, exc: seen.append((operation, exc))
+    with pytest.raises(UnsafeMapping):
+        manager.can_alloc_exact([4])
+    assert seen == [('alloc_exact', failure)]
+    assert not manager.page_allocator.calls
 
 
 def test_empty_request_does_not_map_or_resize():
@@ -289,10 +379,11 @@ def test_zero_resize_target_is_applied_before_an_exact_claim():
 
     def resize(size):
         applied.append(size)
-        manager.available_size = lambda: 0
+        manager.in_shrink = True
+        manager._retired_pages = [(1, [0])]
 
     manager.resize = resize
-    manager.page_allocator.resize_target = 0
+    manager._runtime_control = SimpleNamespace(apply=lambda: resize(0))
     assert manager.alloc_exact([2]) is None
     assert applied == [0]
     assert page.free == [2, 3]
@@ -324,6 +415,27 @@ def test_pending_shrink_can_claim_a_nonretiring_resident_page():
     assert manager.alloc_exact([2]) == [2]
     assert retired.free == [4, 5, 6, 7]
     assert manager._retired_pages == [(9, [1])]
+
+
+@pytest.mark.parametrize('protected', ['promised', 'retained'])
+def test_priority_retirement_rejects_exact_claim_before_any_mutation(protected):
+    manager = make_manager()
+    first = page_for(manager, 0, [2, 3])
+    retired = page_for(manager, 1, [4, 5, 6, 7])
+    manager._retired_pages = [(9, [1])]
+    manager._priority_retired_ids = {1} if protected == 'promised' else set()
+    manager._priority_retained_ids = {1} if protected == 'retained' else set()
+    assert not manager.in_shrink
+    assert manager.alloc_exact([2, 4, 8]) is None
+    assert not manager.page_allocator.calls
+    assert first.free == [2, 3]
+    assert retired.free == [4, 5, 6, 7]
+    assert manager._retired_pages == [(9, [1])]
+    assert manager._priority_retired_ids == ({1} if protected == 'promised' else set())
+    manager._priority_retired_ids.clear()
+    manager._priority_retained_ids.clear()
+    assert manager.alloc_exact([4]) == [4]
+    assert not manager._retired_pages
     assert manager.page_allocator.calls == []
 
 
@@ -350,3 +462,49 @@ def test_exact_claim_can_use_preallocated_physical_backing():
     manager.page_allocator.reserved_pages = 1
     assert manager.alloc_exact([4]) == [4]
     assert manager.page_allocator.calls == [1]
+
+
+def test_exact_claim_rejects_logical_id_tail_before_mapping():
+    manager = make_manager()
+    manager.max_block_id = 6
+    with pytest.raises(ValueError, match='logical ID bound'):
+        manager.alloc_exact([4, 6])
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([4]) == [4]
+    assert manager.avail_pages[1].free == [5]
+
+
+def test_unrequested_reservations_cannot_pay_for_fresh_exact_ids():
+    manager = make_manager()
+    manager.logical_num_blocks = 4
+    manager._logical_allocated_blocks = 4
+    manager.reserved_blocks = [1, 2]
+    page_for(manager, 0, [3])
+    assert manager.alloc_exact([3]) is None
+    assert manager.page_allocator.calls == []
+    assert manager.alloc_exact([1, 2]) == [1, 2]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 0
+
+
+def test_exact_claim_accounts_only_fresh_blocks_in_logical_and_step_limits():
+    manager = make_manager()
+    manager.logical_num_blocks = 6
+    manager._logical_allocated_blocks = 2
+    manager.reserved_blocks = [1]
+    page_for(manager, 0, [2, 3])
+    assert manager.alloc_exact([1, 2, 4]) == [1, 2, 4]
+    assert manager._logical_allocated_blocks == 4
+    assert manager._step_alloc_blocks == 2
+
+
+def test_returned_exact_claims_only_cancel_this_rounds_fresh_ids():
+    manager = make_manager()
+    manager._wait_post_init = lambda: None
+    manager._free = lambda indices, **kwargs: (len(indices), False)
+    page_for(manager, 0, [1, 2, 3])
+    assert manager.alloc_exact([1]) == [1]
+    manager.take_step_alloc_blocks(track_exact=True)
+    assert manager.alloc_exact([2, 3]) == [2, 3]
+    manager.free([1, 2])
+    assert manager.take_step_alloc_blocks() == 1

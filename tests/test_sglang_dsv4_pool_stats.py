@@ -92,14 +92,13 @@ def test_missing_conservation_method_retains_native_component(monkeypatch):
 def test_hisparse_wrapper_uses_inner_backing_without_changing_device_headroom(monkeypatch, managed):
     observer, _, _, _ = make_observer(monkeypatch, managed=managed, physical=5, hisparse=True)
     inner = observer.token_to_kv_pool_allocator
-    del inner._conserve_full_available_size
     observer.token_to_kv_pool_allocator = SimpleNamespace(
         logical_attn_allocator=inner,
         full_available_size=lambda: 5,
         swa_available_size=inner.swa_available_size,
     )
     stats = observer._get_swa_token_info()
-    assert stats.full_num_used == 895
+    assert stats.full_num_used == (200 if managed else 895)
     assert stats.swa_num_used == (10 if managed else 85)
     assert observer.token_to_kv_pool_allocator.full_available_size() == 5
     assert observer.token_to_kv_pool_allocator.swa_available_size() == 5

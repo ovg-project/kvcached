@@ -1,98 +1,191 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
 
-"""Revisioned memory controls for live kvcached KV pools."""
+"""Post-initialization controls for physical KV and prefix retention."""
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import glob
+import os
+from collections.abc import Callable, Mapping
+from typing import Any
 
-from kvcached.pool_registry import get_registered_kv_cache_pools
+from kvcached import prefix_cache_retention
+
+
+def get_prefix_cache_retention_limit() -> int:
+    """Return this engine process's idle prefix retention limit in tokens."""
+    return prefix_cache_retention._policy.limit_tokens
+
+
+def set_prefix_cache_retention_limit(
+    limit_tokens: int, *, instance_name: str | None = None,
+) -> dict[str, Any]:
+    """Publish an instance's prefix retention limit from any process.
+
+    Like set_instance_memory_limit(), this requires initialized runtime-control
+    participants and access to their existing native ledger directory. Limits
+    are -1 (unlimited) or a non-negative int64 token count. GPUs publish
+    independently; inspect status and gpus for partial failures and republish
+    the desired limit to repair them. Engines consume only matching assignments
+    across all GPUs. SGLang TP ranks apply the update together on the scheduler
+    thread. Acceptance does not mean eviction or physical GPU memory release
+    has completed.
+
+    SGLang runtime updates support only pp_size=1. With pipeline parallelism,
+    publication may still return accepted, but schedulers do not apply the
+    update; the existing retention limit remains in effect.
+    """
+    if (not isinstance(limit_tokens, int) or isinstance(limit_tokens, bool)
+            or not -1 <= limit_tokens <= (1 << 63) - 1):
+        raise ValueError("limit_tokens must be -1 or a non-negative int64 integer")
+    name = prefix_cache_retention._policy.instance_name if instance_name is None else instance_name
+    snapshot = _get_instance_memory_limit(name, observe=False)
+    if not snapshot["complete_membership"]:
+        return dict(snapshot, accepted=False)
+    # Use one revision across GPUs. A partial or interleaved publication must
+    # not be consumed until every GPU reports the same revision and value.
+    revision = max(state["revision"] for state in snapshot["gpus"]) + 1
+    if revision > (1 << 64) - 1:
+        raise OverflowError("prefix retention revision exhausted")
+    return _publish(
+        lambda native, gpu, instance, generation, revision: {
+            key: value for key, value in native.publish_instance_controls(
+                gpu, instance, generation, revision, retention_tokens=limit_tokens).items()
+            if key in ("status", "generation", "retention_tokens", "retention_revision")
+        },
+        {"limit_tokens": limit_tokens, "revision": revision}, revision, name,
+        {state["gpu"]: state["generation"] for state in snapshot["gpus"]}, None,
+        snapshot=snapshot)
+
+
+def get_instance_memory_limit(instance_name: str | None = None) -> dict[str, Any]:
+    """Return a bounded observational snapshot, never an admission decision."""
+    return _get_instance_memory_limit(instance_name, observe=True)
+
+
+def _get_instance_memory_limit(instance_name: str | None, *, observe: bool) -> dict[str, Any]:
+    from kvcached import _C  # type: ignore[attr-defined]
+    from kvcached.utils import DEFAULT_IPC_NAME
+
+    name = DEFAULT_IPC_NAME if instance_name is None else instance_name
+    directory = os.getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR", "/dev/shm")
+    query = _C.observe_instance_control if observe else _C.query_instance_control
+    states = []
+    errors = []
+    for path in sorted(glob.glob(os.path.join(directory, "kvcached-physical-growth-*.lock.budget-v2"))):
+        try:
+            state = dict(query(path, name))
+        except (OSError, RuntimeError) as error:
+            errors.append({"gpu": path, "error": str(error)})
+            continue
+        if state["generation"]:
+            states.append(dict(state, gpu=path))
+    expected = {state["expected_participants"] for state in states}
+    complete = (len(expected) == 1 and next(iter(expected)) > 0
+                and sum(state["registered_participants"] for state in states) == next(iter(expected)))
+    converged = complete and all(state["convergence"] == "converged" for state in states)
+    unsupported = any(state["convergence"] == "unsupported" for state in states)
+    unavailable = any(state["convergence"] == "unavailable" for state in states)
+    failed = any(state["convergence"] == "failed" for state in states)
+    return {"instance": name, "status": "unavailable" if not complete or unavailable else
+            "failed" if failed else "unsupported" if unsupported else "converged" if converged else "pending", "complete_membership": complete,
+            "converged": converged, "gpus": states, "discovery_errors": errors}
 
 
 def set_instance_memory_limit(
-    limit_bytes: int,
-    *,
-    revision: int,
-) -> Dict[str, Any]:
-    """Split and apply one instance limit across all live KV pools."""
-    limit_bytes = int(limit_bytes)
-    revision = int(revision)
-    if limit_bytes < 0:
-        raise ValueError("limit_bytes must be non-negative")
-    if revision < 0:
-        raise ValueError("revision must be non-negative")
+    limit_bytes: int, *, revision: int | Mapping[str, int] | None = None,
+    instance_name: str | None = None,
+    generations: Mapping[str, int] | None = None,
+    gpu_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish one max on each selected GPU; callers repair partial failures.
 
-    managers = [manager for manager, _ in get_registered_kv_cache_pools()]
-    if not managers:
-        return {
-            "status": "unavailable",
-            "reason": "no_registered_kv_cache_pool",
-            "limit_bytes": limit_bytes,
-            "effective_limit_bytes": 0,
-            "revision": revision,
-            "mapped_bytes": 0,
-            "remaining_bytes": 0,
-            "overage_bytes": 0,
-            "pools": [],
-        }
+    Explicit revisions require generations from get_instance_memory_limit(),
+    so a retry cannot accidentally target a replacement instance. No revision
+    allocates a new one atomically, even when the byte value is unchanged.
+    """
+    if not isinstance(limit_bytes, int) or not 0 <= limit_bytes <= (1 << 64) - 1:
+        raise ValueError("limit_bytes must be a uint64 byte count")
+    return _publish(
+        lambda native, gpu, instance, generation, revision: native.publish_instance_control(
+            gpu, instance, limit_bytes, generation, revision),
+        {"limit_bytes": limit_bytes}, revision, instance_name, generations, gpu_ids)
 
-    managers.sort(
-        key=lambda manager: (
-            str(manager.pool_name or ""),
-            int(manager.group_id),
-        )
-    )
-    capacities = [
-        max(
-            0,
-            int(manager.mem_size) * int(manager.num_layers) * int(manager.num_kv_buffers),
-        )
-        for manager in managers
-    ]
-    total_capacity = sum(capacities)
-    if total_capacity <= 0:
-        raise ValueError("registered KV pools have no virtual capacity")
 
-    remaining = min(limit_bytes, total_capacity)
-    pool_states = []
-    for index, (manager, capacity) in enumerate(zip(managers, capacities)):
-        share = (
-            remaining
-            if index == len(managers) - 1
-            else min(
-                remaining,
-                min(limit_bytes, total_capacity) * capacity // total_capacity,
-            )
-        )
-        pool_states.append(manager.set_memory_limit(share, revision=revision))
-        remaining -= share
+def set_instance_controls(
+    *, limit_bytes: int | None = None, min_bytes: int | None = None,
+    priority: int | None = None, headroom_bytes: int | None = None,
+    revision: int | Mapping[str, int] | None = None,
+    instance_name: str | None = None,
+    generations: Mapping[str, int] | None = None,
+    gpu_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish an instance's controls on each selected GPU, in one revision.
 
-    mapped = sum(int(state["mapped_bytes"]) for state in pool_states)
-    effective = sum(int(state["effective_limit_bytes"] or 0) for state in pool_states)
-    statuses = {str(state["status"]) for state in pool_states}
-    if "conflict" in statuses:
-        status = "conflict"
-    elif "stale" in statuses:
-        status = "stale"
-    elif "rejected" in statuses:
-        status = "rejected"
-    elif "deferred" in statuses:
-        status = "deferred"
-    else:
-        status = "applied"
-    return {
-        "status": status,
-        "reason": {
-            "deferred": "inuse_capacity_above_limit",
-            "conflict": "revision_reused_with_different_limit",
-            "rejected": "quarantined_pages_prevent_resize",
-        }.get(status, ""),
-        "limit_bytes": limit_bytes,
-        "effective_limit_bytes": effective,
-        "revision": revision,
-        "mapped_bytes": mapped,
-        "remaining_bytes": max(0, effective - mapped),
-        "overage_bytes": max(0, mapped - effective),
-        "pools": pool_states,
-    }
+    Besides max (``limit_bytes``), an instance has a reclaim floor
+    (``min_bytes``), a priority (an integer, larger is more important) and a
+    ``headroom_bytes`` kept from lower priorities, in bytes per GPU as max is.
+    Fields left None keep their value. All controls share one revision, with
+    the retry rules of set_instance_memory_limit(): a retry of a revision must
+    carry the values it published.
+    """
+    given = {"limit_bytes": limit_bytes, "min_bytes": min_bytes,
+             "priority": priority, "headroom_bytes": headroom_bytes}
+    fields = {name: value for name, value in given.items() if value is not None}
+    if not fields:
+        raise ValueError("set_instance_controls needs at least one control")
+    for name, value in fields.items():
+        low, high, kind = ((-(1 << 63), (1 << 63) - 1, "an int64") if name == "priority"
+                           else (0, (1 << 64) - 1, "a uint64 byte count"))
+        if not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"{name} must be {kind}")
+    return _publish(
+        lambda native, gpu, instance, generation, revision: native.publish_instance_controls(
+            gpu, instance, generation, revision, **fields),
+        fields, revision, instance_name, generations, gpu_ids)
+
+
+def _publish(
+    publish_one: Callable[[Any, str, str, int, int | None], Mapping[str, Any]],
+    fields: dict[str, int], revision: int | Mapping[str, int] | None,
+    instance_name: str | None, generations: Mapping[str, int] | None,
+    gpu_ids: list[str] | None,
+    *, snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if revision is not None and generations is None:
+        raise ValueError("explicit revision requires per-GPU generations from get_instance_memory_limit()")
+    from kvcached import _C  # type: ignore[attr-defined]
+
+    if snapshot is None:
+        snapshot = _get_instance_memory_limit(instance_name, observe=False)
+    if not snapshot["complete_membership"]:
+        return dict(snapshot, accepted=False)
+    selected = set(gpu_ids) if gpu_ids is not None else {state["gpu"] for state in snapshot["gpus"]}
+    known = {state["gpu"] for state in snapshot["gpus"]}
+    if not selected or not selected <= known:
+        raise ValueError("gpu_ids must select live GPUs from the instance snapshot")
+    requests = []
+    for state in snapshot["gpus"]:
+        gpu = state["gpu"]
+        if gpu not in selected:
+            continue
+        requested_revision = revision[gpu] if isinstance(revision, Mapping) else revision
+        generation = state["generation"] if generations is None else generations[gpu]
+        if requested_revision is not None and (not isinstance(requested_revision, int)
+                                              or not 0 <= requested_revision <= (1 << 64) - 1):
+            raise ValueError("revision must be a uint64")
+        if not isinstance(generation, int) or not 0 <= generation <= (1 << 64) - 1:
+            raise ValueError("generation must be a uint64")
+        requests.append((gpu, generation, requested_revision))
+    results = []
+    for gpu, generation, requested_revision in requests:
+        try:
+            state = dict(publish_one(_C, gpu, snapshot["instance"], generation, requested_revision))
+        except (OSError, RuntimeError) as error:
+            state = {"status": "error", "convergence": "unknown", "error": str(error)}
+        results.append(dict(state, gpu=gpu))
+    accepted = [state["status"] in ("accepted", "idempotent") for state in results]
+    return {"instance": snapshot["instance"], **fields,
+            "status": "accepted" if all(accepted) else "partial" if any(accepted) else "rejected",
+            "accepted": all(accepted), "converged": False, "gpus": results}

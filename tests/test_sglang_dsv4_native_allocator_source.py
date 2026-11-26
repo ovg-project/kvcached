@@ -1,0 +1,214 @@
+# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
+# SPDX-License-Identifier: Apache-2.0
+"""Execute native allocator page selection/free code on CPU, without CUDA kernels."""
+
+import abc
+import ast
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+from test_sglang_dsv4_native_backing import MODULE, Manager
+
+SOURCE = Path(os.getenv("SGLANG_SOURCE", "engine_integration/sglang")) / "python/sglang/srt/mem_cache/allocator"
+requires_source = pytest.mark.skipif("SGLANG_SOURCE" not in os.environ and not (SOURCE / "paged.py").is_file(),
+                                     reason="native SGLang source unavailable")
+
+
+def native_paged_allocator():
+    namespace: dict[str, Any] = {
+        "abc": abc, "torch": torch, "get_bool_env_var": lambda _: False, "_is_hip": False,
+    }
+    for filename, name in (("base.py", "BaseTokenToKVPoolAllocator"),
+                           ("paged.py", "PagedTokenToKVPoolAllocator")):
+        source = ast.parse((SOURCE / filename).read_text(encoding="utf-8"))
+        definition = next(node for node in source.body
+                          if isinstance(node, ast.ClassDef) and node.name == name)
+        module = ast.Module(body=[ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0), definition],
+            type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), filename, "exec"), namespace)
+    return namespace["PagedTokenToKVPoolAllocator"]
+
+
+@requires_source
+@pytest.mark.parametrize("end", [4, 6])
+def test_native_extend_journals_new_pages_but_backs_the_borrowed_tail(end):
+    native = native_paged_allocator()
+    namespace = native.alloc_extend.__globals__
+    source = ast.parse((SOURCE / "paged.py").read_text(encoding="utf-8"))
+    reference = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "alloc_extend_naive")
+    exec(compile(ast.Module(body=[reference], type_ignores=[]), "paged.py", "exec"), namespace)
+    namespace["next_power_of_2"] = lambda size: size
+    namespace["alloc_extend_kernel"] = {(1,): lambda starts, ends, last, free, out, bs, page_size:
+                                        namespace["alloc_extend_naive"](starts, ends, last, free, out, page_size, "cpu")}
+    full, swa = [native(48, 4, torch.int64, "cpu", None, True) for _ in range(2)]
+    for child in (full, swa):
+        child.alloc(4)
+    backing = MODULE.SWABacking(Manager(), native_pages=13, native_page_bytes=6, physical_page_bytes=8)
+    starts, ends, last = torch.tensor([2]), torch.tensor([end]), torch.tensor([5])
+    count = int(end > 4)
+
+    class Composite:
+        page_size = 4
+        full_attn_allocator, swa_attn_allocator = full, swa
+
+        def check_decode_capacity(self, *, num_tokens):
+            return True
+
+        def alloc_extend(self):
+            return [child.alloc_extend(starts, starts, ends, ends, last, end - 2, num_new_pages=count)
+                    for child in (full, swa)]
+
+    allocator: Any = Composite()
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
+    assert allocator.check_decode_capacity(num_tokens=count * 4)
+    journal = allocator._kvcached_prepare_transaction()
+    with journal:
+        for result in allocator.alloc_extend():
+            assert result.tolist() == list(range(6, 6 + end - 2))
+    assert journal.pages == {id(child): ({2} if count else set()) for child in (full, swa)}
+    assert backing.live == ({1, 2} if count else {1})
+    journal.rollback()
+    assert backing.live == {1}
+
+
+@requires_source
+@pytest.mark.parametrize("need_sort", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_native_free_order_keeps_decode_reservation_backed(need_sort, grouped):
+    native = native_paged_allocator()
+    full = native(48, 4, torch.int64, "cpu", None, need_sort)
+    swa = native(48, 4, torch.int64, "cpu", None, need_sort)
+    full.alloc(12)
+    swa.alloc(12)
+    backing = MODULE.SWABacking(Manager(), native_pages=13, native_page_bytes=6,
+                                physical_page_bytes=8)
+    assert backing.acquire({1, 2, 3})
+
+    class Composite:
+        page_size = 4
+        full_attn_allocator = full
+        swa_attn_allocator = swa
+
+        def check_decode_capacity(self, *, num_tokens):
+            return min(full.available_size(), swa.available_size()) >= num_tokens
+
+        def alloc(self):
+            # The public CPU allocation consumes the same native page prefix
+            # as the CUDA decode kernel; this test does not execute that kernel.
+            return full.alloc(4), swa.alloc(4)
+
+    allocator = Composite()
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
+    assert allocator.check_decode_capacity(num_tokens=4)
+    claims = list(backing.manager.claims)
+    backing.manager.budget = len(backing.manager.live)
+    if grouped:
+        swa.free_group_begin()
+    swa.free_page_ids(torch.tensor([1]))
+    if grouped:
+        swa.free_group_end()
+    assert backing.live == {1, 2, 3, 4}
+    _, selected = allocator.alloc()
+    page = 4 if need_sort else 1
+    assert selected.tolist() == list(range(page * 4, page * 4 + 4))
+    assert backing.live == {2, 3, page}
+    assert backing.manager.claims == claims
+
+
+@requires_source
+@pytest.mark.parametrize("recovery", ["capacity", "prefix"])
+def test_failed_native_prefix_waits_for_placement_progress(recovery):
+    native = native_paged_allocator()
+    full = native(256, 4, torch.int64, "cpu", None, False)
+    swa = native(256, 4, torch.int64, "cpu", None, False)
+    for child in (full, swa):
+        child.alloc(80)
+        child.free_page_ids(torch.arange(2, 20))
+        child.free_page_ids(torch.tensor([20]))
+    manager = Manager(budget=0)
+    backing = MODULE.SWABacking(manager, native_pages=65, native_page_bytes=6,
+                                physical_page_bytes=32)
+    assert backing.acquire({1})  # This live page shares permanent padding.
+
+    class Composite:
+        page_size = 4
+        full_attn_allocator = full
+        swa_attn_allocator = swa
+
+        def alloc(self):
+            return full.alloc(4), swa.alloc(4)
+
+    allocator = Composite()
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
+    assert swa.available_size() > 0  # Aggregate capacity is initially optimistic.
+    assert allocator.alloc() is None
+    for _ in range(3):
+        assert swa.available_size() == 0
+        assert swa.get_all_free_pages()[0].item() == 20
+        assert not manager.claims
+    if recovery == "capacity":
+        manager.budget = 1
+        expected = 20
+    else:
+        swa.free_page_ids(torch.tensor([1]))
+        expected = 1
+    assert swa.available_size() > 0
+    assert not manager.claims  # Availability did not reserve or reorder anything.
+    _, selected = allocator.alloc()
+    assert selected.tolist() == list(range(expected * 4, expected * 4 + 4))
+
+
+@requires_source
+@pytest.mark.parametrize("scenario", ["smaller", "staged", "grouped"])
+def test_native_decode_recovers_from_larger_or_stale_placement_miss(scenario):
+    native = native_paged_allocator()
+    children = [native(256, 4, torch.int64, "cpu", None, scenario != "smaller") for _ in range(2)]
+    for child in children:
+        child.alloc(80)
+        if scenario == "smaller":
+            for ids in (torch.arange(3, 20), torch.tensor([20]), torch.tensor([2])):
+                child.free_page_ids(ids)
+        else:
+            child.free_page_ids(torch.arange(5, 20))
+    manager = Manager(budget=0 if scenario == "smaller" else 1)
+    backing = MODULE.SWABacking(manager, native_pages=65, native_page_bytes=6,
+                                physical_page_bytes=32)
+    assert backing.acquire({1} if scenario == "smaller" else {1, 2, 3, 4, 20})
+    source = ast.parse((SOURCE / "swa.py").read_text(encoding="utf-8"))
+    definition = next(node for node in source.body
+                      if isinstance(node, ast.ClassDef) and node.name == "SWATokenToKVPoolAllocator")
+    available = next(node for node in definition.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "available_size")
+    namespace: dict[str, Any] = {}
+    exec(compile(ast.Module(body=[available], type_ignores=[]), "swa.py", "exec"), namespace)
+
+    class Composite:
+        page_size = 4
+        _swa_req_ring = False
+        full_attn_allocator, swa_attn_allocator = children
+        available_size = namespace["available_size"]
+        check_decode_capacity = native.check_decode_capacity
+
+        def evict_to_free_tokens(self, tree_cache, num_tokens):
+            pass  # An empty native cache has nothing to evict.
+
+        def alloc(self, count):
+            return children[0].alloc(count), children[1].alloc(count)
+
+    allocator = Composite()
+    MODULE.bind_native_swa(allocator, backing, paged_v0520=native)
+    if scenario == "smaller":
+        assert allocator.alloc(8) is None
+    else:
+        assert not allocator.check_decode_capacity(num_tokens=4, tree_cache=None)
+        if scenario == "grouped":
+            children[1].free_group_begin()
+        children[1].free_page_ids(torch.tensor([1]))
+        if scenario == "grouped":
+            children[1].free_group_end()
+    assert allocator.check_decode_capacity(num_tokens=4, tree_cache=None)

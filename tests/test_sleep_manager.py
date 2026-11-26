@@ -441,6 +441,44 @@ async def test_request_wakeup_still_reports_upstream_failure(manager, monkeypatc
     assert manager.is_model_sleeping("model")
 
 
+async def test_request_during_sleep_transition_waits_then_wakes(manager,
+                                                                monkeypatch):
+    """A request landing mid-transition waits for sleep, then wakes the model."""
+    manager.add_vllm_model("model")
+    manager.config.min_sleep_duration = 0
+    sleep_release = asyncio.Event()
+    sleep_calls = []
+    wake_calls = []
+
+    async def sleep_api(*_args, **_kwargs):
+        sleep_calls.append(1)
+        await sleep_release.wait()
+        return True
+
+    async def wake_api(*_args, **_kwargs):
+        wake_calls.append(1)
+        return True
+
+    monkeypatch.setattr(manager, "_call_vllm_sleep_api", sleep_api)
+    monkeypatch.setattr(manager, "_call_vllm_wakeup_api", wake_api)
+
+    sleep_task = asyncio.create_task(manager.put_model_to_sleep("model", manual=True))
+    await asyncio.sleep(0)
+    assert manager.is_model_sleeping_or_transitioning("model")
+    assert not manager.is_model_sleeping("model")
+
+    wake_task = asyncio.create_task(manager.handle_model_wakeup_on_request("model"))
+    await asyncio.sleep(0)
+    assert not wake_task.done(), "wakeup must wait for the sleep transition"
+
+    sleep_release.set()
+    assert await asyncio.gather(sleep_task, wake_task) == [True, True]
+    assert sleep_calls == [1]
+    assert wake_calls == [1]
+    assert not manager.is_model_sleeping("model")
+    assert not manager.is_model_sleeping_or_transitioning("model")
+
+
 async def test_sglang_api_methods_simulation(manager):
     """Test SGLang-specific API method behavior"""
     print("\n=== Testing SGLang API Methods Simulation ===")
