@@ -45,8 +45,15 @@ class PipelineWorld(ProcessWorld):
 
 
 def _exercise(rank, tp_size, world):
-    from test_sglang_rank_coordination import Req, coord, mode
+    import importlib
+
+    from test_sglang_rank_coordination import Req, coord, mode, package
     from test_sglang_rank_prepare import decode_case, preparation_case
+
+    pipeline = importlib.import_module(package.__name__ + ".pipeline")
+    startup = NS()
+    world.configure_scheduler(startup, None)
+    assert pipeline.sum_pipeline_counts(startup, rank) == sum(range(4))
 
     for failed in (0, 3):
         for chunk in (False, True):
@@ -89,6 +96,27 @@ def _exercise(rank, tp_size, world):
         runtime.release_slots()
         if owner is not None:
             assert owner.active == {8} and not owner.standby
+            for backing in backings:
+                backing.manager.budget += 2
+
+        # Stages without C128 layers must join the token-capacity exchanges
+        # both after a fresh row reservation and after returning it unused.
+        updates: list[tuple[int, int]] = []
+        scheduler.token_to_kv_pool_allocator = NS(
+            _kvcached_invalidate_token_capacity=lambda: None,
+            _kvcached_budget_counts=lambda: (10, 10),
+            _kvcached_update_budget=updates.append,
+        )
+        runtime.token_budget = (10, 10)
+        scheduler.waiting_queue = [NS(rid="fresh", kv=NS(req_pool_idx=None))]
+        runtime.reserve_slots(
+            lambda: min(4, pool.available_size()),
+            demand_preview=lambda slots: {"p": {"rows": [{"rid": "chunk"}, {"rid": "fresh"}]}},
+        )
+        assert runtime.new_slot_budget == 1 and runtime.leading_row_reused
+        runtime.release_slots(refresh=True)
+        assert updates == [(10, 10), (10, 10)]
+        assert pool.free_slots == before
 
         # A genuine ownership mismatch is still fatal across stages.
         if rank == 3:

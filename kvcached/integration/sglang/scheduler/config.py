@@ -42,10 +42,12 @@ def validate_runtime_config() -> None:
     )
     if parallel.pp_size > 1:
         from sglang.srt.runtime_context import get_device
+        from sglang.srt.utils.common import is_cuda
 
         unsupported = unsupported or (
             parallel.pp_async_batch_depth != 0
             or str(get_device().device).split(":")[0] != "cuda"
+            or not is_cuda()
             or get_memory().enable_hierarchical_cache
         )
     if unsupported:

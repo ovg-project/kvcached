@@ -41,14 +41,18 @@ They do not establish full-model CUDA serving correctness or performance.
 PP uses the native SGLang pipeline and commits the logical batch across all
 stages before receiving activations. The forward guard stays within each TP
 stage. Physical page IDs and per-stage layer counts can differ, including
-stages with no C128 layers. CUDA, `--pp-async-batch-depth=0` and disabled
-hierarchical cache are required. Other restrictions above still apply.
+stages with no C128 layers. Managed PP requires NVIDIA CUDA,
+`KVCACHED_CONTIGUOUS_LAYOUT=false`, `--pp-async-batch-depth=0` and disabled
+hierarchical cache. Contiguous KV storage uses the native PP scheduler.
 
-Before admission, the adapter relays the previous output and retains its
+The first and last stages warm their return link at startup. Before admission,
+the adapter relays the previous output and retains its
 asynchronous send handles until the receivers have traversed the ring. The
 queue is bounded by the number of stages. Retired KV pages wait for the model
 and scheduling streams before unmapping; they do not wait for outstanding
-output-ring communication through a device-wide barrier.
+output-ring communication through a device-wide barrier. A parked chunk retries
+its CUDA cache probe at a later admission boundary once outstanding GPU sends
+on that stage have completed.
 
 CPU tests exercise the SGLang 0.5.20 loop with simulated transport at PP2/3/4,
 including idle rounds, skipped chunk outputs and a delayed stage. Real Gloo
@@ -67,7 +71,7 @@ backend, graph settings and token limits for each native/managed pair.
 1. Start with TP8/PP1, then TP4/PP2 and TP2/PP4 where model memory permits.
    Test one topology at a time; a native failure stops that pair. Keep the
    native baseline with `ENABLE_KVCACHED=false` and the managed launch with
-   `ENABLE_KVCACHED=true KVCACHED_RANK_COORDINATION_ENABLE=true`. Use
+   `ENABLE_KVCACHED=true KVCACHED_RANK_COORDINATION_ENABLE=true KVCACHED_CONTIGUOUS_LAYOUT=false`. Use
    `--cuda-graph-backend-prefill=disabled` to exercise managed C128 rows.
 2. Bound startup with an external timeout chosen for the prepared weights.
    After readiness, allow at most two minutes per smoke phase. Stop on timeout,

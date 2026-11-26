@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from kvcached import prefix_cache_retention
@@ -18,16 +19,18 @@ class RuntimeControl:
 
         self.manager = manager
         self.worker_ipc = worker_ipc
+        pins = getattr(manager, "permanent_block_ids", ())
+        floor = {"minimum_pages": len(pins) + 1} if pins else {}
         if worker_ipc:
             sources = control_workers(manager.world_size, manager.pp_rank,
                                       manager.group_id, configure=can_shrink,
                                       expected_participants=expected_participants,
                                       startup_pages=manager.mem_size // manager.page_size,
-                                      reserve_null=getattr(manager, "null_block", None) is not None)
+                                      reserve_null=getattr(manager, "null_block", None) is not None, **floor)
         else:
             sources = [_C.local_instance_control(manager.group_id, can_shrink, expected_participants,
                                                   manager.mem_size // manager.page_size,
-                                                  getattr(manager, "null_block", None) is not None)]
+                                                  getattr(manager, "null_block", None) is not None, **floor)]
         if not sources or any(not source["ready"] for source in sources):
             raise RuntimeError("KV runtime control requires every worker pool ready")
         self.sources = tuple(sources)
@@ -133,7 +136,8 @@ class RuntimeControl:
             self.acknowledged = signature
 
 
-def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int = 1) -> tuple[Any, ...]:
+def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int = 1,
+                                count_participants: Callable[[int], int] | None = None) -> tuple[Any, ...]:
     from kvcached.pool_registry import get_registered_kv_cache_pools
 
     managers = tuple(manager for manager, _ in
@@ -147,11 +151,12 @@ def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int
     if worker_ipc and managers:
         from kvcached.tp_ipc_util import _target_pp_ranks
         ranks = managers[0].world_size * len(_target_pp_ranks(managers[0].pp_rank))
+    expected = count_participants(len(managers)) if count_participants is not None else len(managers) * ranks
     for manager in managers:
         supported = True if can_shrink is None else bool(can_shrink(manager))
         manager._runtime_control = RuntimeControl(
             manager, worker_ipc=worker_ipc, can_shrink=supported,
-            expected_participants=len(managers) * ranks)
+            expected_participants=expected)
     if managers:
         prefix_cache_retention._policy.instance_name = managers[0]._control_instance_name()
     return managers

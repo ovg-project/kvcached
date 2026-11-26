@@ -612,10 +612,50 @@ def test_alloc_dsv4_swa_cache_rejects_compound_layout(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (4, 1), (1, 2), (1, 4), (2, 2)])
+def test_dsv4_parallel_retains_native_storage_before_any_backing(monkeypatch, tp_size, pp_size):
+    interfaces, patches, _ = _load_modules(monkeypatch)
+    module = _make_dsv4_module()
+    distributed = sys.modules["sglang.srt.distributed"]
+    monkeypatch.setattr(distributed, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(distributed, "get_pipeline_model_parallel_world_size", lambda: pp_size)
+    create = mock.Mock(side_effect=AssertionError("Distributed pools must retain native backing"))
+    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", create)
+    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
+    pool = module.DeepSeekV4TokenToKVPool()
+    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
+    assert not hasattr(pool.c4_kv_pool, "_kvcached_managed")
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.swa_kv_pool"] == 202
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [AssertionError, RuntimeError, AttributeError, ValueError])
+def test_dsv4_unknown_topology_retains_native_storage(monkeypatch, error):
+    interfaces, patches, _ = _load_modules(monkeypatch)
+    distributed = sys.modules["sglang.srt.distributed"]
+    monkeypatch.setattr(distributed, "get_pipeline_model_parallel_world_size",
+                        mock.Mock(side_effect=error))
+    module = _make_dsv4_module()
+    create = mock.Mock(side_effect=AssertionError("Unknown topology must stay native"))
+    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", create)
+    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
+    pool = module.DeepSeekV4TokenToKVPool()
+    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
+    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.swa_kv_pool"] == 202
+    patches._dsv4_pool_context.set(None)
+    pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+    c128 = pool._make_kv_pool(size=4096, page_size=2, dtype=types.SimpleNamespace(itemsize=1),
+                              layer_num=1, device="cuda:0", enable_memory_saver=False,
+                              global_page_size=256)
+    assert not hasattr(c128, "_kvcached_managed")
+    create.assert_not_called()
+
+
 @pytest.mark.parametrize("size,layers,managed", [(4096, 1, True), (64, 1, False), (4096, 0, False)])
 @pytest.mark.parametrize("ratio", [4, 128])
 def test_compressed_factory_selects_only_useful_supported_storage(monkeypatch, size, layers, managed, ratio):
     interfaces, patches, _ = _load_modules(monkeypatch)
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * 1024 * 1024)
     module = _make_dsv4_module()
     monkeypatch.setattr(module.DeepSeekV4SingleKVPool, "get_bytes_per_token", lambda self: 584)
     monkeypatch.setattr(interfaces, "init_kvcached", lambda **_: None)
@@ -657,43 +697,11 @@ def test_compressed_factory_selects_only_useful_supported_storage(monkeypatch, s
         patches._dsv4_pool_context.reset(token)
 
 
-@pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (4, 1), (1, 2), (1, 4), (2, 2)])
-def test_dsv4_parallel_retains_native_storage_before_any_backing(monkeypatch, tp_size, pp_size):
-    interfaces, patches, _ = _load_modules(monkeypatch)
-    module = _make_dsv4_module()
-    distributed = sys.modules["sglang.srt.distributed"]
-    monkeypatch.setattr(distributed, "get_tensor_model_parallel_world_size", lambda: tp_size)
-    monkeypatch.setattr(distributed, "get_pipeline_model_parallel_world_size", lambda: pp_size)
-    create = mock.Mock(side_effect=AssertionError("Distributed pools must retain native backing"))
-    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", create)
-    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
-    pool = module.DeepSeekV4TokenToKVPool()
-    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
-    assert not hasattr(pool.c4_kv_pool, "_kvcached_managed")
-    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.swa_kv_pool"] == 202
-    create.assert_not_called()
-
-
-@pytest.mark.parametrize("error", [AssertionError, RuntimeError, AttributeError, ValueError])
-def test_dsv4_unknown_topology_retains_native_storage(monkeypatch, error):
-    interfaces, patches, _ = _load_modules(monkeypatch)
-    distributed = sys.modules["sglang.srt.distributed"]
-    monkeypatch.setattr(distributed, "get_pipeline_model_parallel_world_size",
-                        mock.Mock(side_effect=error))
-    module = _make_dsv4_module()
-    create = mock.Mock(side_effect=AssertionError("Unknown topology must stay native"))
-    monkeypatch.setattr(interfaces, "alloc_dsv4_swa_cache", create)
-    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
-    pool = module.DeepSeekV4TokenToKVPool()
-    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
-    assert patches._collect_dsv4_runtime_reservations(pool)["dsv4.swa_kv_pool"] == 202
-    create.assert_not_called()
-
-
 @pytest.mark.parametrize("layout,managed", [("fp8", True), ("fp4", True), ("aiter", False),
                                           ("small", False), ("hisparse", False)])
 def test_c4_indexer_preserves_native_layout_and_ownership(monkeypatch, layout, managed):
     interfaces, patches, _ = _load_modules(monkeypatch)
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * 1024 * 1024)
     module = _make_dsv4_module()
 
     class Indexer:
@@ -830,7 +838,7 @@ def test_c4_state_factory_groups_layers_and_preserves_native_constructor(monkeyp
         return [FakeTensor() for _ in range(kwargs["num_layers"])], []
 
     def manager(**kwargs):
-        result = Manager()
+        result = Manager(permanent_block_ids=kwargs["permanent_block_ids"])
         managers.append(result)
         return result
 
@@ -853,6 +861,33 @@ def test_c4_state_factory_groups_layers_and_preserves_native_constructor(monkeyp
     else:
         assert all(p.native_allocation for p in pools)
         assert not allocations and not managers
+
+
+@pytest.mark.parametrize("setting", [None, "false", "0"])
+def test_dsv4_disabled_autopatch_retains_native_storage(monkeypatch, setting):
+    interfaces, patches, _ = _load_modules(monkeypatch)
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "1")
+    if setting is None:
+        monkeypatch.delenv("ENABLE_KVCACHED", raising=False)
+    else:
+        monkeypatch.setenv("ENABLE_KVCACHED", setting)
+    monkeypatch.setattr(patches, "_dsv4_pool_context", ContextVar("disabled_dsv4", default=None))
+    create = mock.Mock(side_effect=AssertionError("Disabled storage must not initialize a manager"))
+    monkeypatch.setattr(interfaces, "init_kvcached", create)
+    monkeypatch.setattr(patches, "_new_tp_scoped_kvcached_allocator", create)
+    module = _make_dsv4_module()
+    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
+    pool = module.DeepSeekV4TokenToKVPool()
+    assert pool.swa_kv_pool.kv_buffer[0].nbytes == 101
+    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
+    assert not hasattr(pool.c4_kv_pool, "_kvcached_managed")
+    pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+    compressed = pool._make_kv_pool(
+        size=4096, page_size=2, dtype=object(), layer_num=1,
+        device="cuda:0", enable_memory_saver=False, global_page_size=256,
+    )
+    assert not hasattr(compressed, "_kvcached_managed")
+    create.assert_not_called()
 
 
 @pytest.mark.parametrize("online", [False, True])
@@ -908,6 +943,8 @@ def test_c128_state_factory_preserves_native_shape_and_pins_banks(monkeypatch, o
     def manager(**kwargs):
         result = Manager()
         managers.append(result)
+        result.permanent_block_ids = frozenset(kwargs["permanent_block_ids"])
+        result.live.update(result.permanent_block_ids)
         assert kwargs["pool_name"] == "dsv4_c128_state"
         return result
 
@@ -932,29 +969,3 @@ def test_c128_state_factory_preserves_native_shape_and_pins_banks(monkeypatch, o
         assert pools[0].kv_score_buffer.kv_score.view_shape == ((90, 12) if online else (40, 8))
         group = next(iter(getattr(owner, "_kvcached_c128_state_groups").values()))
         assert (group["bank_stride"], group["bank_count"]) == ((30, 3) if online else (0, 1))
-
-@pytest.mark.parametrize("setting", [None, "false", "0"])
-def test_dsv4_disabled_autopatch_retains_native_storage(monkeypatch, setting):
-    interfaces, patches, _ = _load_modules(monkeypatch)
-    monkeypatch.setenv("KVCACHED_AUTOPATCH", "1")
-    if setting is None:
-        monkeypatch.delenv("ENABLE_KVCACHED", raising=False)
-    else:
-        monkeypatch.setenv("ENABLE_KVCACHED", setting)
-    monkeypatch.setattr(patches, "_dsv4_pool_context", ContextVar("disabled_dsv4", default=None))
-    create = mock.Mock(side_effect=AssertionError("Disabled storage must not initialize a manager"))
-    monkeypatch.setattr(interfaces, "init_kvcached", create)
-    monkeypatch.setattr(patches, "_new_tp_scoped_kvcached_allocator", create)
-    module = _make_dsv4_module()
-    assert patches.DeepSeekV4KVPoolPatch().inject_dsv4_swa_pool(module)
-    pool = module.DeepSeekV4TokenToKVPool()
-    assert pool.swa_kv_pool.kv_buffer[0].nbytes == 101
-    assert not hasattr(pool.swa_kv_pool, "_kvcached_managed")
-    assert not hasattr(pool.c4_kv_pool, "_kvcached_managed")
-    pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
-    compressed = pool._make_kv_pool(
-        size=4096, page_size=2, dtype=object(), layer_num=1,
-        device="cuda:0", enable_memory_saver=False, global_page_size=256,
-    )
-    assert not hasattr(compressed, "_kvcached_managed")
-    create.assert_not_called()

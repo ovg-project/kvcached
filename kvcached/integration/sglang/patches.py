@@ -488,7 +488,10 @@ def _sglang_demand_round(scheduler: Any):
             if native is not None and request_state is not None:
                 managers += request_state.managers()
             for member in managers:
-                member.take_step_alloc_blocks()
+                if native is None:
+                    member.take_step_alloc_blocks()
+                else:
+                    member.take_step_alloc_blocks(track_exact=True)
             _sglang_retry_prefill_if_backed(scheduler, manager)
     except Exception as error:  # never fail a scheduling round
         logger.warning("Could not start a KV demand round: %s", error)
@@ -789,10 +792,11 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
     # Every backing belongs to the rank-local instance. The native demand
     # field is instance-wide, so publishing each pool would overwrite peers.
     # Sum byte costs (including different layer counts) and publish once.
-    if demands:
+    if demands and total_bytes != getattr(allocator, "_kvcached_posted_demand_bytes", 0):
         from kvcached.vmm_ops import set_kv_demand
 
         set_kv_demand(total_bytes, demands[0][0].group_id)
+        allocator._kvcached_posted_demand_bytes = total_bytes
 
 
 def _sglang_prefill_input_blocks(adder: Any, page_size: int) -> int:
@@ -3753,7 +3757,7 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
                     and int(bound.arguments["size"]) > 0
                     and int(bound.arguments["layer_num"]) > 0
                 )
-                if is_compressed_pool and not CONTIGUOUS_LAYOUT:
+                if is_compressed_pool and not CONTIGUOUS_LAYOUT and _dsv4_single_rank_backing():
                     context = _dsv4_pool_context.get()
                     if context is None:
                         raise KVCachedConfigError("Compressed KV construction requires runner ownership")
@@ -4218,6 +4222,48 @@ class SchedulerCapacityMissPatch(VersionAwarePatch, BasePatch):
         return True
 
 
+def _release_cuda_cache_for_parked_dsv4(adder: Any) -> None:
+    allocator = _sglang_dsv4_demand_allocator(adder)
+    if allocator is None:
+        return
+    # PP peers may still need a later admission round to receive an output.
+    # The next safe round retries the probe on this rank's persistent allocator.
+    if _sglang_pipeline_stages() > 1:
+        allocator._kvcached_parked_cuda_probe = True
+        return
+    _probe_parked_dsv4_cuda_cache(allocator)
+
+
+def _probe_parked_dsv4_cuda_cache(allocator: Any) -> None:
+    # TP admission previews clone the request on every scheduler round.
+    # The logical allocator outlives those previews on this rank.
+    now = time.monotonic()
+    if now < getattr(allocator, "_kvcached_next_cuda_cache_probe", 0.0):
+        return
+    allocator._kvcached_next_cuda_cache_probe = now + 1.0
+    costs = allocator._kvcached_parked_prefill_growth_costs()
+    if not costs:
+        return
+
+    import torch
+
+    from kvcached.utils import GPU_UTILIZATION
+
+    free, total = torch.cuda.mem_get_info()
+    headroom = int(total * (1.0 - GPU_UTILIZATION))
+    next_cost = min((cost for cost in costs if free < headroom + cost), default=None)
+    if next_cost is None:
+        return
+    stats = torch.cuda.memory_stats()
+    reserved = stats.get("reserved_bytes.all.current", 0)
+    releasable = (reserved - stats.get("active_bytes.all.current", reserved)
+                  - stats.get("inactive_split_bytes.all.current", reserved))
+    if releasable > 0 and free + releasable >= headroom + next_cost:
+        # Even a partial release can cover the actual placement. Admission
+        # rechecks the driver's free memory and the agreed rank budget.
+        torch.cuda.empty_cache()
+
+
 class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
     """Record a waiting request that the prefill budget cannot admit.
 
@@ -4255,7 +4301,7 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
             return True
 
         @functools.wraps(original)
-        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+        def note_demand(self, req: Any, *args: Any, **kwargs: Any) -> Any:
             from kvcached.integration.sglang.scheduler.rank_coordination import active
 
             if active() is not None:
@@ -4305,8 +4351,33 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
                                     estimate, raw_offset, self.new_token_ratio)
             return result
 
+        @functools.wraps(original)
+        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            from kvcached.integration.sglang.dsv4_request_state import (
+                admit_candidate,
+                request_admission_context,
+            )
+
+            if request_admission_context.get() is None:
+                return note_demand(self, req, *args, **kwargs)
+            return admit_candidate(self, req, lambda: note_demand(self, req, *args, **kwargs),
+                                   policy_mod.AddReqResult.NO_TOKEN)
+
         self._mark_as_patched(_patched_add_one_req, marker)
         PrefillAdder.add_one_req = _patched_add_one_req
+        add_chunked = getattr(PrefillAdder, "add_chunked_req", None)
+        if add_chunked is not None:
+            @functools.wraps(add_chunked)
+            def add_chunked_req(self, req: Any) -> Any:
+                count = len(self.can_run_list)
+                from kvcached.integration.sglang.dsv4_request_state import admit_candidate
+
+                result = admit_candidate(self, req, lambda: add_chunked(self, req), req)
+                if result is req and len(self.can_run_list) == count:
+                    _release_cuda_cache_for_parked_dsv4(self)
+                return result
+
+            PrefillAdder.add_chunked_req = add_chunked_req
         return True
 
 
@@ -4849,14 +4920,25 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                     request_state = _sglang_request_state(sched_self)
                     managed = token_managers + (request_state.managers() if request_state is not None else [])
                     ranks = _sglang_parallel_size(sched_self)
+                    control_options: dict[str, Any] = {}
+                    if getattr(getattr(sched_self, "ps", None), "pp_size", 1) > 1:
+                        from kvcached.integration.sglang.scheduler.config import enabled
+                        from kvcached.integration.sglang.scheduler.pipeline import (
+                            sum_pipeline_counts,
+                        )
+
+                        if enabled():
+                            control_options["count_participants"] = functools.partial(
+                                sum_pipeline_counts, sched_self)
                     sched_self._kvcached_control_managers = initialize_runtime_controls(
-                        "sglang", ranks=ranks,
+                        "sglang", ranks=ranks, **control_options,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is member for member in managed))
-                    if ranks == 1 and len(managed) > 1:
+                    if len(managed) > 1 and (
+                            ranks == 1 or _sglang_dsv4_demand_allocator(sched_self) is not None):
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
-                        PriorityReclaimGroup(tuple(managed))
+                        PriorityReclaimGroup(tuple(managed), report_only=ranks > 1)
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

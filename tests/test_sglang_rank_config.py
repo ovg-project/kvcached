@@ -34,6 +34,7 @@ def runtime(monkeypatch):
     )
     module = NS(**{f"get_{name}": lambda value=value: value for name, value in values.items()})
     monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", module)
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils.common", NS(is_cuda=lambda: True))
     return values
 
 
@@ -113,3 +114,10 @@ def test_pipeline_restrictions_before_backing(runtime, monkeypatch, section, fie
 def test_pipeline_configuration(runtime):
     runtime["parallel"].pp_size = 4
     config.validate_runtime_config()
+
+
+def test_pipeline_rejects_hip_with_cuda_device_name(runtime, monkeypatch):
+    runtime["parallel"].pp_size = 2
+    monkeypatch.setattr(sys.modules["sglang.srt.utils.common"], "is_cuda", lambda: False)
+    with pytest.raises(ValueError, match="PP additionally requires CUDA"):
+        config.validate_runtime_config()

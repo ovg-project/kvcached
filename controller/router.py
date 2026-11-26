@@ -3,7 +3,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import aiohttp
 from sleep_manager import SleepManager
@@ -34,6 +34,46 @@ class ModelConfig:
         if not self.endpoint:
             raise ValueError(
                 f"No endpoint configured for model {self.model_name}")
+
+
+class StreamedResponse:
+    """An upstream streaming response that is still being served.
+
+    ``session.post()`` resolves when the headers arrive, not when the body
+    ends. The frontend relays this object and closes it through
+    :meth:`aclose`, which releases the connection and records the end once.
+    """
+
+    def __init__(self, response: aiohttp.ClientResponse,
+                 on_close: Callable[..., None]):
+        self.status = response.status
+        self.headers = response.headers
+        self.content = response.content
+        self._response = response
+        self._on_close = on_close
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def aclose(self,
+                     *,
+                     success: bool = True,
+                     error_message: Optional[str] = None) -> None:
+        """Release the upstream connection and record the request's end."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._response.release()
+        finally:
+            self._on_close(success=success, error_message=error_message)
+
+    async def release(self) -> None:
+        """Release the connection without claiming the request succeeded."""
+        await self.aclose(success=False,
+                          error_message="Stream released before completion")
 
 
 class RouteError(Exception):
@@ -191,7 +231,7 @@ class LLMRouter:
         model_name: str,
         request_data: Dict[str, Any],
         endpoint_path: str = "/v1/completions"
-    ) -> Union[Dict[str, Any], aiohttp.ClientResponse]:
+    ) -> Union[Dict[str, Any], "StreamedResponse"]:
         """Route a request to the engine that serves ``model_name``.
 
         Raises a :class:`RouteError` subclass when the request cannot be
@@ -212,7 +252,7 @@ class LLMRouter:
                 f"Model {model_name!r} is not configured")
 
         # Check if model is sleeping and try to wake it up
-        if self.sleep_manager.is_model_sleeping(model_name):
+        if self.sleep_manager.is_model_sleeping_or_transitioning(model_name):
             logger.info(
                 f"Model {model_name} is sleeping, attempting to wake up for request"
             )
@@ -252,9 +292,11 @@ class LLMRouter:
                     logger.info(
                         f"Successfully routed streaming request for model {model_name} to {endpoint.base_url}"
                     )
-                    self.traffic_monitor.record_request_end(request_stats,
-                                                            success=True)
-                    return response
+                    # The body is still being generated; the relay ends it.
+                    return StreamedResponse(
+                        response,
+                        lambda **kwargs: self.traffic_monitor.record_request_end(
+                            request_stats, **kwargs))
 
                 body, content_type = await self._read_error_body(response)
                 await response.release()

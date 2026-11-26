@@ -23,7 +23,7 @@ class PriorityManager(Manager):
         self.events = []
         self.occupied = 10
 
-    def take_step_alloc_blocks(self):
+    def take_step_alloc_blocks(self, *, track_exact=False):
         result, self.step = self.step, 0
         self.events.append(("take", result))
         return result
@@ -138,4 +138,13 @@ def test_compressed_backing_demands_sum_bytes_without_overwriting_peer_pools(mon
             manager.step = 2
     assert [manager.forecasts for manager in managers] == [[3], [3], [3]]
     # Three physical pages from each pool, with distinct layer bundle costs.
-    getattr(sys.modules["kvcached.vmm_ops"], "set_kv_demand").assert_called_once_with(96, 0)
+    post = getattr(sys.modules["kvcached.vmm_ops"], "set_kv_demand")
+    post.assert_called_once_with(96, 0)
+    with patches._sglang_demand_round(scheduler):
+        for manager in managers:
+            manager.step = 2
+    post.assert_called_once_with(96, 0)
+    scheduler.waiting_queue = []
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert [call.args for call in post.call_args_list] == [(96, 0), (0, 0)]

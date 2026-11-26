@@ -208,7 +208,7 @@ def preview(scheduler, running_batch, *, slots=None, new_slots=None, match_cache
                 break
             if original.finished():
                 continue
-            needs_row = request_slot(original) is None
+            needs_row = request_slot(matched[str(original.rid)]) is None
             if new_slots is not None and needs_row and (used_new_slots >= new_slots):
                 break
             req = _clone_request(matched[str(original.rid)])

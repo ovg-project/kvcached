@@ -169,48 +169,96 @@ def test_new_row_callback_is_rejected_before_preflight(request_module):
     assert not calls and pool.free_slots == list(range(1, 9))
 
 
-def test_beam_admission_reserves_pending_rows_before_native_gate(request_module):
-    pool, owner, backings = bind(request_module)
-
+def single_rank_scheduler(module, pool, queue, *, pending=0, accept=lambda req: True):
     class Scheduler:
         req_to_token_pool = pool
+        ps = SimpleNamespace(tp_size=1)
         running_batch = object()
-        beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 2)
+        waiting_queue = queue
+        chunked_req = None
+        beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: pending)
 
         def get_num_allocatable_reqs(self, running_bs, beam_width=None, running_batch=None):
-            available = max(0, self.req_to_token_pool.available_size() - 2)
-            return min(8 - running_bs, available, available // beam_width if beam_width else available)
+            available = max(0, self.req_to_token_pool.available_size() - pending)
+            return min(8 - running_bs, available // (beam_width or 1))
 
-    assert request_module.install_request_admission(Scheduler)
-    assert request_module.install_request_admission(Scheduler)
-    assert Scheduler().get_num_allocatable_reqs(0, 3) == 2
+        def _get_new_batch_prefill_raw(self, running, running_batch):
+            adder = SimpleNamespace(can_run_list=[])
+            for req in self.waiting_queue:
+                width = getattr(req.beam_group, "beam_width", None)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running, width, running_batch):
+                    break
+
+                def admit():
+                    if accept(req):
+                        adder.can_run_list.append(req)
+                        return True
+                    return False
+
+                if not module.admit_candidate(adder, req, admit, False):
+                    break
+            return adder.can_run_list
+
+    assert module.install_request_admission(Scheduler)
+    assert module.install_request_admission(Scheduler)
+    return Scheduler()
+
+
+def requests(count, width=1):
+    beam = SimpleNamespace(beam_width=width) if width > 1 else None
+    return [SimpleNamespace(rid=str(i), beam_group=beam, req_pool_idx=None) for i in range(count)]
+
+
+def test_tp1_pipeline_preserves_distributed_row_reservation(request_module, monkeypatch):
+    pool, owner, _ = bind(request_module)
+    owner.reserve(2)
+    standby = owner.standby.copy()
+    queue = requests(1)
+    scheduler = single_rank_scheduler(request_module, pool, queue)
+    scheduler.ps.pp_size = 2
+    monkeypatch.setattr(owner, "reserve", lambda n: pytest.fail("duplicate row reservation"))
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue
+    assert owner.standby == standby
+
+
+def test_beam_admission_reserves_pending_rows_before_native_gate(request_module):
+    pool, owner, backings = bind(request_module)
+    queue = requests(2, width=3)
+    scheduler = single_rank_scheduler(request_module, pool, queue, pending=2)
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue
     assert owner.standby == set(range(1, 9))
-    for b in backings:
-        b.manager.budget = len(b.manager.live)
-    assert pool.alloc_rows(2) == [7, 8]  # Two new leaders.
-    assert pool.alloc_rows(2) == [5, 6]  # Previously admitted pending members.
-    assert pool.alloc_rows(4) == [1, 2, 3, 4]  # Both leaders' members.
+    for backing in backings:
+        backing.manager.budget = len(backing.manager.live)
+    assert pool.alloc_rows(2) == [7, 8]
+    assert pool.alloc_rows(2) == [5, 6]
+    assert pool.alloc_rows(4) == [1, 2, 3, 4]
     assert owner.active == set(range(1, 9))
 
 
 @pytest.mark.parametrize("running,expected", [(0, 8), (3, 5), (7, 1), (8, 0)])
 def test_native_batch_limit_preserved_with_sufficient_backing(request_module, running, expected):
     pool, owner, _ = bind(request_module)
-
-    class Scheduler:
-        req_to_token_pool = pool
-        running_batch = object()
-        beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-
-        def get_num_allocatable_reqs(self, running_bs, beam_width=None, running_batch=None):
-            return min(8 - running_bs, self.req_to_token_pool.available_size())
-
-    request_module.install_request_admission(Scheduler)
+    queue = requests(pool.size)
+    scheduler = single_rank_scheduler(request_module, pool, queue)
     before = list(pool.free_slots)
-    assert Scheduler().get_num_allocatable_reqs(running) == expected
+    assert scheduler._get_new_batch_prefill_raw(running, scheduler.running_batch) == queue[:expected]
     assert pool.free_slots == before and len(owner.standby) == expected
     assert request_module.request_admission_context.get() is None
     assert pool.alloc_rows(expected) == (before[-expected:] if expected else [])
+
+
+def test_single_rank_leases_only_admitted_rows_and_releases_surplus(request_module):
+    pool, owner, backings = bind(request_module)
+    queue = requests(2)
+    scheduler = single_rank_scheduler(request_module, pool, queue, accept=lambda req: req is queue[0])
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue[:1]
+    assert owner.standby == {8}
+    queue[0].req_pool_idx, = pool.alloc_rows(1)
+    owner.reserve(3)
+    for backing in backings:
+        backing.manager.budget = 0
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue[:1]
+    assert not owner.standby and owner.active == {8}
 
 
 @pytest.mark.parametrize("banks", [1, 3])
@@ -231,19 +279,15 @@ def test_admission_reports_largest_backed_native_tail(request_module, monkeypatc
 def test_native_admission_query_restores_context_after_error(request_module):
     pool, owner, _ = bind(request_module)
 
-    class Scheduler:
-        req_to_token_pool = pool
-        running_batch = object()
-        beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+    def fail(req):
+        raise ValueError("native gate failure")
 
-        def get_num_allocatable_reqs(self, *args):
-            raise ValueError("native gate failure")
-
-    request_module.install_request_admission(Scheduler)
+    scheduler = single_rank_scheduler(request_module, pool, requests(1), accept=fail)
     with pytest.raises(ValueError, match="native gate failure"):
-        Scheduler().get_num_allocatable_reqs(0)
+        scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch)
+    assert not owner.standby
     assert request_module.request_admission_context.get() is None
-    assert owner.reserve(owner.admission_rows) == 1
+    assert owner.reserve(1) == 1
 
 
 def test_partial_preflight_exception_releases_earlier_probe_leases(request_module, monkeypatch):
@@ -269,21 +313,14 @@ def test_partial_preflight_exception_releases_earlier_probe_leases(request_modul
 def test_logical_request_capacity_is_independent_of_admission_pressure(request_module):
     pool, owner, backings = bind(request_module)
 
-    class Scheduler:
-        req_to_token_pool = pool
-        running_batch = object()
-        beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-
-        def get_num_allocatable_reqs(self, running_bs, beam_width=None, running_batch=None):
-            return min(8 - running_bs, self.req_to_token_pool.available_size())
-
-    request_module.install_request_admission(Scheduler)
+    queue = requests(3)
+    scheduler = single_rank_scheduler(request_module, pool, queue)
     assert pool.available_size() == pool.size and not owner.standby
     backings[-1].manager.budget = 0
-    assert Scheduler().get_num_allocatable_reqs(0) == 0
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == []
     assert pool.available_size() == pool.size and not owner.standby
     backings[-1].manager.budget = 30
-    assert Scheduler().get_num_allocatable_reqs(0) == pool.size
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue
     rows = pool.alloc_rows(3)
     assert pool.available_size() == pool.size - 3
     pool.free_rows(rows)
@@ -473,6 +510,90 @@ def test_four_ranks_admit_only_common_backed_rows(request_module, monkeypatch, s
     assert world.run(worker) == [1] * 4
     assert all(owner.active == {8} and not owner.standby for _, owner, _ in owners)
     assert all(backing.live == {8} for _, _, backings in owners for backing in backings)
+
+
+def test_slot_exchange_uses_matched_session_and_refreshes_token_headroom(request_module):
+    import test_sglang_rank_coordination as consensus
+
+    pool, owner, _ = bind(request_module)
+    held, = pool.alloc_rows(1)
+    queue = requests(2)
+    snapshots = {"requests": {queue[0].rid: SimpleNamespace(req_pool_idx=held)}}
+    updates: list[tuple[int, int]] = []
+    backing = SimpleNamespace(_kvcached_invalidate_token_capacity=lambda: None, _kvcached_budget_counts=lambda: (12 - len(owner.standby), 10),
+                              _kvcached_update_budget=updates.append)
+    scheduler = SimpleNamespace(tp_group=SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0]),
+                                tp_cpu_group=None, ps=SimpleNamespace(tp_size=1, pp_size=1),
+                                waiting_queue=queue, chunked_req=None, req_to_token_pool=pool,
+                                token_to_kv_pool_allocator=backing)
+    coord = consensus.coord.RankCoordinator(scheduler)
+    coord.token_budget = (12, 10)
+    assert coord.reserve_slots(lambda: pool.available_size(), matches=snapshots,
+                               demand_preview=lambda slots: {"p": {"rows": [{"rid": r.rid} for r in queue]}}) == 2
+    assert owner.standby == {7} and updates == [(11, 10)]
+    coord.release_slots(refresh=True)
+    assert updates == [(11, 10), (12, 10)]
+    assert not owner.standby and owner.active == {held}
+    coord.row_retry_cap = 0
+    assert coord.reserve_slots(lambda: pool.available_size(), matches=snapshots,
+                               demand_preview=lambda slots: {"p": {"rows": [{"rid": r.rid} for r in queue]}}) == 1
+    assert coord.leading_row_reused and coord.new_slot_budget == 0
+    assert not owner.standby
+    before = list(updates)
+    coord.release_slots(refresh=True)
+    assert updates == before
+
+
+def test_post_reservation_transport_failure_stops_collectives(request_module, monkeypatch):
+    import test_sglang_rank_coordination as consensus
+
+    pool, owner, _ = bind(request_module)
+    backing = SimpleNamespace(_kvcached_invalidate_token_capacity=lambda: None,
+                              _kvcached_budget_counts=lambda: (10, 10))
+    scheduler = SimpleNamespace(tp_group=SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0]),
+                                tp_cpu_group=None, ps=SimpleNamespace(tp_size=1, pp_size=1),
+                                req_to_token_pool=pool, token_to_kv_pool_allocator=backing)
+    coord = consensus.coord.RankCoordinator(scheduler)
+    coord.token_budget = (12, 12)
+    stages = []
+
+    def exchange(stage, value, **kwargs):
+        stages.append(stage)
+        if stage == "slots":
+            return [value]
+        raise RuntimeError("transport closed")
+
+    monkeypatch.setattr(coord, "exchange", exchange)
+    with pytest.raises(consensus.coord.RankConsensusError, match="exchange failed"):
+        coord.reserve_slots(lambda: 1)
+    coord.release_slots()
+    assert stages == ["slots", "token_capacity_after_rows"]
+    assert not owner.standby
+
+
+def test_slot_exchange_failure_releases_once_and_preserves_consensus_error(request_module, monkeypatch):
+    import test_sglang_rank_coordination as consensus
+
+    pool, owner, _ = bind(request_module)
+    scheduler = SimpleNamespace(tp_group=SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0]),
+                                tp_cpu_group=None, ps=SimpleNamespace(tp_size=1, pp_size=1),
+                                req_to_token_pool=pool)
+    coord = consensus.coord.RankCoordinator(scheduler)
+    releases = []
+
+    def fail_exchange(*args, **kwargs):
+        raise consensus.coord.RankConsensusError("peer failed")
+
+    def fail_cleanup(*args):
+        releases.append(args)
+        raise RuntimeError("unmap failed")
+
+    monkeypatch.setattr(coord, "exchange", fail_exchange)
+    monkeypatch.setattr(owner, "finish_admission", fail_cleanup)
+    with pytest.raises(consensus.coord.RankConsensusError, match="peer failed"):
+        coord.reserve_slots(lambda: 1)
+    coord.release_slots()
+    assert len(releases) == 1 and owner.admission_budget is None
 
 
 def test_deferred_prefill_releases_new_rows_and_smaller_retry_recovers(request_module, monkeypatch):
@@ -690,7 +811,8 @@ def test_scheduler_registers_state_shrink_and_shared_allowance(request_module, m
 
     groups: list[Any] = []
     monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls", initialize)
-    monkeypatch.setattr("kvcached.priority_reclaim.PriorityReclaimGroup", groups.append)
+    monkeypatch.setattr("kvcached.priority_reclaim.PriorityReclaimGroup",
+                        lambda members, *, report_only: groups.append((members, report_only)))
 
     class Scheduler:
         def __init__(self):
@@ -705,5 +827,5 @@ def test_scheduler_registers_state_shrink_and_shared_allowance(request_module, m
     assert patches.SchedulerIdleLimitPatch().patch_idle_hook(SimpleNamespace(Scheduler=Scheduler))
     scheduler: Any = Scheduler()
     assert scheduler._kvcached_control_managers == tuple(managers)
-    assert groups == [tuple(managers)]
+    assert groups == [(tuple(managers), False)]
     assert len(callbacks) == 2 and all(callback.__self__ is owner for callback in callbacks)

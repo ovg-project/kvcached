@@ -1124,3 +1124,118 @@ def test_sglang_decode_miss_does_not_deduct_later_prefill_inputs():
         patches._sglang_note_unfit(11, allocated_overlap=4)
         manager.allocated = 4
     assert manager.posted == [9]
+
+
+def test_parked_dsv4_releases_only_unused_cuda_segments(monkeypatch):
+    import torch
+
+    from kvcached import utils
+    from kvcached.integration.sglang import patches
+
+    class PrefillAdder:
+        def __init__(self, allocator):
+            self.can_run_list = []
+            self.token_to_kv_pool_allocator = allocator
+
+        def add_one_req(self, req):
+            return req
+
+        def add_chunked_req(self, req):
+            return req  # Native hybrid SWA parks the chunk.
+
+    module = types.ModuleType("sglang.srt.managers.schedule_policy")
+    module.PrefillAdder = PrefillAdder  # type: ignore[attr-defined]
+    patch = patches.PrefillAdderDemandPatch()
+    assert patch.patch_add_one_req(module)
+    cost = mock.Mock(return_value={20})
+    logical = types.SimpleNamespace(_kvcached_backing_demand=mock.Mock(), _kvcached_parked_prefill_growth_costs=cost)
+    wrapper = types.SimpleNamespace(logical_attn_allocator=logical)
+
+    def preview():
+        adder = PrefillAdder(wrapper)
+        request = types.SimpleNamespace()
+        assert adder.add_chunked_req(request) is request
+
+    clock = [10.0]
+    monkeypatch.setattr(patches.time, "monotonic", lambda: clock[0])
+    trim = mock.Mock()
+    monkeypatch.setattr(torch.cuda, "empty_cache", trim)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 1000))
+    monkeypatch.setattr(utils, "GPU_UTILIZATION", 0.9)
+    stats = {"reserved_bytes.all.current": 300, "active_bytes.all.current": 150,
+             "inactive_split_bytes.all.current": 100}
+    monkeypatch.setattr(torch.cuda, "memory_stats", lambda: stats)
+
+    preview()
+    trim.assert_not_called()  # Idle pieces of live segments cannot be returned.
+    stats["inactive_split_bytes.all.current"] = 0
+    preview()
+    trim.assert_not_called()
+    cost.assert_called_once_with()
+    clock[0] += 1.0
+    preview()
+    preview()
+    trim.assert_called_once()
+
+    # A PP receiver can be waiting for this admission pass to complete.
+    with monkeypatch.context() as pipeline:
+        from kvcached.integration.sglang.scheduler.pipeline import PipelineProgress
+
+        pipeline.setattr(patches, "_sglang_pipeline_stages", lambda: 2)
+        pp_trim = mock.Mock()
+        pipeline.setattr(torch.cuda, "empty_cache", pp_trim)
+        clock[0] += 1.0
+        preview()
+        pp_trim.assert_not_called()
+        output = types.SimpleNamespace(payload=types.SimpleNamespace(is_cuda=True), work=mock.Mock())
+        proxy = types.SimpleNamespace(payload=types.SimpleNamespace(is_cuda=True), work=mock.Mock())
+        output.work.is_completed.return_value = proxy.work.is_completed.return_value = False
+        scheduler = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=2), send_output_work=[output],
+                                          send_proxy_work=[proxy], _pp_commit_comm_work=list.clear)
+        progress = PipelineProgress(scheduler, logical)
+        progress.defer_output_work()
+        progress.after_agreement()
+        proxy.work.is_completed.return_value = True
+        progress.after_agreement()
+        pp_trim.assert_not_called()
+        assert logical._kvcached_parked_cuda_probe
+        output.work.is_completed.return_value = True
+        progress.after_agreement()
+        pp_trim.assert_called_once()
+        assert not logical._kvcached_parked_cuda_probe
+        progress.after_agreement()
+        pp_trim.assert_called_once()
+
+    # No prefix progress: a later change in physical pressure can rearm the probe.
+    clock[0] += 1.0
+    cost.return_value = set()
+    preview()
+    trim.assert_called_once()
+    clock[0] += 1.0
+    cost.return_value = {20, 40}
+    # The driver can cover one 20-byte bundle but needs 20 more for two.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (120, 1000))
+    preview()
+    assert trim.call_count == 2
+
+    # Admission reserves a second SWA page, but the actual extension may
+    # map only one. A partial release must still reach the driver.
+    clock[0] += 1.0
+    stats["reserved_bytes.all.current"] = 170
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (100, 1000))
+    preview()
+    assert trim.call_count == 3
+    clock[0] += 1.0
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (200, 1000))
+    preview()
+    assert trim.call_count == 3
+
+    clock[0] += 1.0
+    stats["reserved_bytes.all.current"] = 152
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (100, 1000))
+    preview()
+    assert trim.call_count == 3
+    clock[0] += 1.0
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (120, 1000))
+    preview()  # One bundle fits before and after releasing the two bytes.
+    assert trim.call_count == 3

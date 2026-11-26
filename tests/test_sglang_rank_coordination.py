@@ -223,6 +223,7 @@ class CoordinationTests(ContextTestCase):
                 return []
 
         class Scheduler:
+            _kvcached_native_pipeline: bool
             token_to_kv_pool_allocator: Any
             req_to_token_pool: Any
             available_slots: int
@@ -351,6 +352,16 @@ class CoordinationTests(ContextTestCase):
         schedulers, results = self.execute([65536] * 4)
         self.assertEqual([b.forward_mode.name for b in results], ["EXTEND"] * 4)
         self.assertEqual([b.reqs[0].extend_range.length for b in results], [4096] * 4)
+
+    def test_native_pipeline_selects_and_runs_without_managed_collectives(self):
+        scheduler = self.Scheduler(0, 65536, bypass=True)
+        scheduler.ps.pp_size = 2
+        scheduler._kvcached_native_pipeline = True
+        running = self.Batch([Req("decode")])
+        self.assertIs(scheduler.get_next_batch_to_run(running, None).batch_to_run, running)
+        scheduler.run_batch(running)
+        self.assertEqual(scheduler.forwards, 1)
+        self.assertFalse(hasattr(scheduler, "_kvcached_rank_coordinator"))
 
     def test_registration_is_idempotent(self):
         next_batch = self.Scheduler.get_next_batch_to_run
@@ -580,7 +591,7 @@ SOURCE = Path(os.environ.get("SGLANG_SOURCE", "__sglang_source_unavailable__"))
 def load_native_policy():
     """Execute the real source classes; stub imports, not admission control flow."""
     source = SOURCE / "python/sglang/srt/managers/schedule_policy.py"
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(source.read_text(encoding="utf-8"))
     nodes: list[ast.stmt] = [
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     ]
@@ -703,6 +714,17 @@ class NativePreviewTests(ContextTestCase):
         self.assertIsNone(second["p"])
         self.assertEqual(shared["requests"][self.req.rid].extend_range.start, 0)
         self.assertEqual(self.req.extend_range.start, 0)
+
+    def test_matched_session_row_admits_with_zero_new_slots(self):
+        self.available = 65536
+
+        def restore(req, *args, **kwargs):
+            req.kv.req_pool_idx = 8
+
+        with mock.patch.object(Req, "init_next_round_input", restore):
+            result = plans.preview(self.scheduler, self.running, slots=1, new_slots=0)
+        self.assertEqual(result["p"]["rows"][0]["rid"], self.req.rid)
+        self.assertIsNone(plans.request_slot(self.req))
 
     def test_fixed_match_traversal_is_bounded_by_common_running_limit(self):
         self.scheduler.max_running_requests = 2

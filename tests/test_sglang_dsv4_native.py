@@ -108,6 +108,7 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
     monkeypatch.setattr("sglang.srt.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr("sglang.srt.distributed.get_pipeline_model_parallel_world_size", lambda: 1)
     monkeypatch.setenv("SGLANG_OPT_USE_ONLINE_COMPRESS", "0")
+    monkeypatch.setattr(interfaces, "PAGE_SIZE", 2 * 1024 * 1024)
     monkeypatch.setenv("SGLANG_EXPERIMENTAL_ONLINE_C128_MTP", "1" if online else "0")
     manager = None
     compressed_pools = []
@@ -258,6 +259,11 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
                            target.token_to_kv_pool.indexer_compress_state_pools[0]]
             assert all(p._kvcached_managed for p in state_pools)
             for pool in state_pools:
+                state_manager = pool._kvcached_dsv4_backing.manager
+                pins = {i: state_manager.full_pages[i] for i in state_manager.permanent_block_ids}
+                assert pins
+                state_manager.clear()
+                assert all(state_manager.full_pages[i] is page for i, page in pins.items())
                 assert torch.all(pool.kv_score_buffer[-1].kv == 0).item()
                 assert torch.all(torch.isneginf(pool.kv_score_buffer[-1].score)).item()
             breakdown = target.token_to_kv_pool._kvcached_runtime_reservation_breakdown
@@ -428,6 +434,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert claims and compressed_backing.live == before
             assert logical.available_size() == capacity
             assert torch.equal(shared.full_to_swa_index_mapping, mapping)
+            compressed_manager.take_step_alloc_blocks(track_exact=True)
+            with monkeypatch.context() as pressure:
+                claimed = mock.Mock(wraps=compressed_manager.alloc_exact)
+                pressure.setattr(compressed_manager, "alloc_exact", claimed)
+                pressure.setattr(shared._kvcached_dsv4_backing, "acquire", lambda pages: False)
+                assert shared.alloc_extend(
+                    prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256) is None
+            assert claimed.called and compressed_backing.live == before
+            assert compressed_manager.take_step_alloc_blocks() == 0
+            assert torch.equal(shared.full_to_swa_index_mapping, mapping)
             full = shared.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, 32 * 256)
             assert full is not None
             saved.append(full)
@@ -540,10 +556,30 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             scheduler = types.SimpleNamespace(
                 req_to_token_pool=req_pool, running_batch=object(),
                 beam_coordinator=types.SimpleNamespace(pending_member_rows=lambda batch: 2))
-            assert scheduler_module.Scheduler.get_num_allocatable_reqs(scheduler, 0) == 4
-            assert len(owner.standby) == 6  # Four ordinary requests plus pending members.
-            assert scheduler_module.Scheduler.get_num_allocatable_reqs(scheduler, 0, 3) == 4
-            # Reserve four beam leaders, their members and previously pending rows.
+            from kvcached.integration.sglang.dsv4_request_state import (
+                admit_candidate,
+                request_admission_context,
+            )
+
+            pending = scheduler.beam_coordinator.pending_member_rows(scheduler.running_batch)
+            owner.admission_rows = pending
+            assert owner.reserve(pending) == pending
+            adder = types.SimpleNamespace(can_run_list=[])
+            token = request_admission_context.set(owner)
+            try:
+                pending_rows = owner.standby.copy()
+                assert len(pending_rows) == pending
+                for width in (None, 3):
+                    assert scheduler_module.Scheduler.get_num_allocatable_reqs(scheduler, 0, width) == 4
+                    assert owner.standby == pending_rows
+                for _ in range(4):
+                    candidate = types.SimpleNamespace(beam_group=types.SimpleNamespace(beam_width=3))
+                    assert admit_candidate(adder, candidate, lambda req=candidate: adder.can_run_list.append(req),
+                                           False) is None
+                    assert len(owner.standby) == pending + 3 * len(adder.can_run_list)
+            finally:
+                request_admission_context.reset(token)
+            # The four admitted leaders, their members and pending rows now have backing.
             selected = req_pool.alloc_rows(4) + req_pool.alloc_rows(2) + req_pool.alloc_rows(8)
             assert len(set(selected)) == 14 and set(selected) == owner.active
             req_pool.free_rows(selected)
