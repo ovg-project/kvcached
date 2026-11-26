@@ -463,6 +463,13 @@ def _sglang_demand_round(scheduler: Any):
     if getattr(_SGLANG_DEMAND, "open", False):
         yield
         return
+    request_state = _sglang_request_state(scheduler)
+    if request_state is not None and _sglang_parallel_size(scheduler) == 1:
+        # Exact claims do not drive shrink callbacks. Reclaim before promising
+        # row leases; backend failures must escape the best-effort reporting.
+        for member in request_state.managers():
+            member.apply_resize_target()
+            member.reclaim_for_shrink()
     _SGLANG_DEMAND.open = True
     _SGLANG_DEMAND.need = None
     _SGLANG_DEMAND.prefill_tried = False
@@ -477,6 +484,9 @@ def _sglang_demand_round(scheduler: Any):
         if manager is not None:
             native = _sglang_dsv4_demand_allocator(scheduler)
             managers = _token_kv_managers(native) if native is not None else [manager]
+            request_state = _sglang_request_state(scheduler)
+            if native is not None and request_state is not None:
+                managers += request_state.managers()
             for member in managers:
                 if native is None:
                     member.take_step_alloc_blocks()
@@ -697,6 +707,11 @@ def _sglang_dsv4_demand_allocator(scheduler: Any) -> Any:
     return allocator if callable(getattr(allocator, "_kvcached_backing_demand", None)) else None
 
 
+def _sglang_request_state(scheduler: Any) -> Any:
+    return getattr(getattr(scheduler, "req_to_token_pool", None),
+                   "_kvcached_dsv4_request_state", None)
+
+
 def _sglang_demand_manager(scheduler: Any) -> Any:
     """The token pool's manager, which posts demand on this rank's GPU.
 
@@ -756,6 +771,18 @@ def _sglang_post_dsv4_demand(scheduler: Any, allocator: Any, unfit_blocks: int) 
         scheduler._kvcached_prefill_demand = max(
             0, miss - getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
     demands = allocator._kvcached_backing_demand(need)
+    request_state = _sglang_request_state(scheduler)
+    if request_state is not None:
+        candidates = list(queue)
+        chunked = getattr(scheduler, "chunked_req", None)
+        if chunked is not None and all(chunked is not request for request in candidates):
+            candidates.append(chunked)
+        pending = getattr(getattr(scheduler, "beam_coordinator", None), "pending_member_rows", None)
+        rows = pending(getattr(scheduler, "running_batch", None)) if callable(pending) else 0
+        for request in candidates:
+            if getattr(getattr(request, "kv", None), "req_pool_idx", None) is None:
+                rows += max(1, getattr(getattr(request, "beam_group", None), "beam_width", 1))
+        demands += request_state.backing_demand(rows)
     total_bytes = 0
     for manager, physical in demands:
         allocated = manager.take_step_alloc_blocks()
@@ -3428,6 +3455,36 @@ def _new_tp_scoped_kvcached_allocator(
     )
 
 
+class DeepSeekV4RequestStatePatch(VersionAwarePatch, BasePatch):
+    """Bind supported C128 state before constructing the native token allocator."""
+
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.kv_cache_configurator"
+    patch_name = "deepseek_v4_request_state"
+
+    def apply(self, module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        from kvcached.integration.sglang.dsv4_request_state import install_request_state_context
+
+        return install_request_state_context(module)
+
+
+class DeepSeekV4RequestAdmissionPatch(VersionAwarePatch, BasePatch):
+    """Reserve C128 state for native request and pending beam-row admission."""
+
+    library = "sglang"
+    target_module = "sglang.srt.managers.scheduler"
+    patch_name = "deepseek_v4_request_admission"
+
+    def apply(self, module: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            return False
+        from kvcached.integration.sglang.dsv4_request_state import install_request_admission
+
+        return install_request_admission(getattr(module, "Scheduler", None))
+
+
 class DeepSeekV4RunnerOwnershipPatch(VersionAwarePatch, BasePatch):
     """Carry the runner's allocation ownership into DeepSeek-V4 construction."""
 
@@ -3923,11 +3980,16 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
                         other_backings.append(pool_backing)
                 state_groups = getattr(kvcache, "_kvcached_c4_state_groups", {})
                 state_backings = tuple(group["backing"] for group in state_groups.values())
+                request_state = getattr(kvcache, "_kvcached_dsv4_request_state", None)
+                if request_state is not None:
+                    allocator_self._kvcached_dsv4_request_state = request_state
+                def priority_miss(requests):
+                    return _sglang_priority_decode_miss(backing.manager, requests)
+
                 bind_native_swa(
                     allocator_self, backing, full_backing,
                     full_backings=tuple(other_backings), swa_backings=state_backings,
-                    on_capacity_miss=_sglang_capacity_miss,
-                    on_priority_miss=lambda requests: _sglang_priority_decode_miss(backing.manager, requests),
+                    on_capacity_miss=_sglang_capacity_miss, on_priority_miss=priority_miss,
                     paged_v0520=getattr(sys.modules.get("sglang.srt.mem_cache.allocator.paged"),
                                         "PagedTokenToKVPoolAllocator", None)
                     if getattr(self, "detected_version", None) == "0.5.20" else None,
@@ -3940,6 +4002,8 @@ class DeepSeekV4SWAAllocatorPatch(VersionAwarePatch, BasePatch):
         self._mark_as_patched(swa_allocator_mod, marker)
         self.logger.info("Enabled DeepSeek-V4-aware SGLang SWA allocators")
         return True
+
+
 class ScheduleBatchDecodeContextPatch(VersionAwarePatch, BasePatch):
     """Supply selected requests to decode gates without request-level context."""
 
@@ -4221,7 +4285,7 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
             return True
 
         @functools.wraps(original)
-        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+        def note_demand(self, req: Any, *args: Any, **kwargs: Any) -> Any:
             from kvcached.integration.sglang.scheduler.rank_coordination import active
 
             if active() is not None:
@@ -4271,6 +4335,18 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
                                     estimate, raw_offset, self.new_token_ratio)
             return result
 
+        @functools.wraps(original)
+        def _patched_add_one_req(self, req: Any, *args: Any, **kwargs: Any) -> Any:
+            from kvcached.integration.sglang.dsv4_request_state import (
+                admit_candidate,
+                request_admission_context,
+            )
+
+            if request_admission_context.get() is None:
+                return note_demand(self, req, *args, **kwargs)
+            return admit_candidate(self, req, lambda: note_demand(self, req, *args, **kwargs),
+                                   policy_mod.AddReqResult.NO_TOKEN)
+
         self._mark_as_patched(_patched_add_one_req, marker)
         PrefillAdder.add_one_req = _patched_add_one_req
         add_chunked = getattr(PrefillAdder, "add_chunked_req", None)
@@ -4278,7 +4354,9 @@ class PrefillAdderDemandPatch(VersionAwarePatch, BasePatch):
             @functools.wraps(add_chunked)
             def add_chunked_req(self, req: Any) -> Any:
                 count = len(self.can_run_list)
-                result = add_chunked(self, req)
+                from kvcached.integration.sglang.dsv4_request_state import admit_candidate
+
+                result = admit_candidate(self, req, lambda: add_chunked(self, req), req)
                 if result is req and len(self.can_run_list) == count:
                     _release_cuda_cache_for_parked_dsv4(self)
                 return result
@@ -4621,6 +4699,16 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
         # Ranks see a new limit at different iterations; evicting then would
         # make their radix caches, and so their batches, diverge.
         if _sglang_parallel_size(scheduler) == 1:
+            request_state = _sglang_request_state(scheduler)
+            if request_state is not None:
+                def standby_reclaimable():
+                    coordinator = getattr(scheduler, "beam_coordinator", None)
+                    pending = getattr(coordinator, "pending_member_rows", None)
+                    return (coordinator is None or callable(pending)
+                            and pending(scheduler.running_batch) == 0)
+
+                request_state.standby_reclaimable = standby_reclaimable
+                request_state.register_reclaimers()
             for manager in _token_kv_managers(
                     getattr(scheduler, "token_to_kv_pool_allocator", None)):
                 register = getattr(manager, "_register_shrink_reclaimer", None)
@@ -4657,6 +4745,15 @@ def _sglang_reclaim_for_priority(scheduler: Any) -> int:
 
 
 def _apply_kvcached_limits_on_idle(scheduler: Any) -> None:
+    request_state = getattr(getattr(scheduler, "req_to_token_pool", None),
+                            "_kvcached_dsv4_request_state", None)
+    if request_state is not None:
+        pending_rows = getattr(getattr(scheduler, "beam_coordinator", None),
+                               "pending_member_rows", None)
+        # A beam can own promised backing before native member-row allocation.
+        # Unknown pending state conservatively retains the standby leases.
+        keep = not callable(pending_rows) or pending_rows(scheduler.running_batch) > 0
+        request_state.reclaim_on_idle(keep_standby=keep)
     for manager in getattr(scheduler, "_kvcached_control_managers", ()):
         manager.apply_resize_target()
     now = time.monotonic()
@@ -4804,16 +4901,18 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
 
                     token_managers = _token_kv_managers(
                         getattr(sched_self, "token_to_kv_pool_allocator", None))
+                    request_state = _sglang_request_state(sched_self)
+                    managed = token_managers + (request_state.managers() if request_state is not None else [])
                     ranks = _sglang_parallel_size(sched_self)
                     sched_self._kvcached_control_managers = initialize_runtime_controls(
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
-                            manager is token for token in token_managers))
-                    if len(token_managers) > 1 and (
+                            manager is member for member in managed))
+                    if len(managed) > 1 and (
                             ranks == 1 or _sglang_dsv4_demand_allocator(sched_self) is not None):
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
-                        PriorityReclaimGroup(tuple(token_managers), report_only=ranks > 1)
+                        PriorityReclaimGroup(tuple(managed), report_only=ranks > 1)
 
             self._mark_as_patched(_patched_init, init_marker)
             Scheduler.__init__ = _patched_init

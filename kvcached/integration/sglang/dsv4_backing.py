@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 # SPDX-License-Identifier: Apache-2.0
-"""Backing leases for IDs allocated by SGLang's native SWA allocator.
+"""Backing leases for native SGLang SWA and compressed full-page IDs.
 
 The manager uses one block per VMM page. Native token pages can share or
 straddle those pages; neither their IDs nor SGLang's mappings are rewritten.
@@ -175,6 +175,8 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
     Child allocation returns before the composite publishes full-to-SWA
     mappings. An expected miss returns only newly acquired pages via native
     free_page_ids; an unexpected error poisons this adapter until teardown.
+    Compressed KV/indexer backing follows full IDs independently of SWA retirement.
+    Every selected pool must acquire its backing before native mappings publish.
     On 0.5.20 the reserved census prefix is exact only while it fits in the
     active free list and merging is suppressed. Staged pages are not active.
     Native free lists are never assigned by this adapter.
@@ -650,7 +652,27 @@ def bind_native_swa(allocator: Any, backing: SWABacking,
         bind_release(child, backings[id(child)])
     allocator._kvcached_prepare_transaction = Preparation
     allocator._kvcached_budget_context = budget_context
-    allocator._kvcached_budget_counts = lambda: (full.available_size(), swa.available_size())
+    def invalidate_token_capacity() -> None:
+        for pools in backings.values():
+            for item in pools:
+                item.manager.invalidate_physical_capacity()
+
+    allocator._kvcached_invalidate_token_capacity = invalidate_token_capacity
+
+    def physical_budget_counts() -> tuple[int, int]:
+        token = budget.set(None)
+        try:
+            return full.available_size(), swa.available_size()
+        finally:
+            budget.reset(token)
+
+    def update_budget(counts: tuple[int, int]) -> None:
+        active_counts = budget.get()
+        if active_counts is not None:
+            active_counts.update({id(full): counts[0], id(swa): counts[1]})
+
+    allocator._kvcached_budget_counts = physical_budget_counts
+    allocator._kvcached_update_budget = update_budget
 
     def backing_demand(native_pages: int) -> list[tuple[Any, int]]:
         demands = []

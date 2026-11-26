@@ -21,6 +21,8 @@ from kvcached.integration.sglang.hicache import (
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     DeepSeekV4KVPoolPatch,
+    DeepSeekV4RequestAdmissionPatch,
+    DeepSeekV4RequestStatePatch,
     DeepSeekV4RunnerOwnershipPatch,
     DeepSeekV4RuntimeReservationPatch,
     DeepSeekV4SWAAllocatorPatch,
@@ -80,6 +82,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (DeepSeekV4KVPoolPatch(), ">=0.5.13"),
             (DeepSeekV4SWAAllocatorPatch(), ">=0.5.13"),
             (DeepSeekV4RunnerOwnershipPatch(), ">=0.5.13"),
+            (DeepSeekV4RequestStatePatch(), ">=0.5.20"),
             # Importing the capacity owner captures memory-pool classes in
             # module globals, so apply these only after every pool alias.
             (SGLangLegacyVirtualKVCapacityPatch(), ">=0.5.11,<0.5.16"),
@@ -99,6 +102,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (PrefillAdderDemandPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
+            (DeepSeekV4RequestAdmissionPatch(), ">=0.5.20"),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),

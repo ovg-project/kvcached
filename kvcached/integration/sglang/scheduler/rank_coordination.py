@@ -24,7 +24,7 @@ from .prefill_transaction import (
     PrefillPrepareDeferred,
     PrefillScheduleSnapshot,
 )
-from .rank_plan import batch_signature, common_plan, preview
+from .rank_plan import batch_signature, common_plan, preview, request_slot
 
 LOG = logging.getLogger(__name__)
 _ACTIVE: ContextVar[Any] = ContextVar("kvcached_rank_coordination", default=None)
@@ -73,11 +73,15 @@ class RankCoordinator:
                 "KVCACHED_RANK_COORDINATION_PREFILL_BACKOFF_MS must be numeric"
             ) from exc
         self.slot_budget = None
+        self.new_slot_budget = None
         self.prefill_plan = None
         self.admission_materialization = None
         self.outer_required = None
         self.token_budget = None
+        self.row_retry_cap = None
+        self.leading_row_reused = False
         self.prefill_attempt = None
+        self.row_reservation: Any = None
         self.planned = self.grammar_polled = self.priority_sorted = False
         error = None
         if (
@@ -165,6 +169,7 @@ class RankCoordinator:
         self.round += 1
         self.prefill_plan = None
         self.slot_budget = None
+        self.new_slot_budget = None
         self.planned = self.grammar_polled = self.priority_sorted = False
         self.has_running_decode = bool(
             running is not None
@@ -227,19 +232,137 @@ class RankCoordinator:
             return nullcontext()
         return self.scheduler.token_to_kv_pool_allocator._kvcached_budget_context(self.token_budget)
 
-    def agree_slots(self, query):
-        local_slots, error = 0, None
+    def reserve_slots(self, query, *, demand_preview=None, matches=None):
+        """One tagged boundary combines physical C128 readiness and slot MIN.
+
+        All ranks participate, including those with a standby, zero logical
+        rows, or a previously blocked allocator. No conditional inner AND can
+        collide with the scheduler's next collective.
+        """
+        pool = getattr(self.scheduler, "req_to_token_pool", None)
+        allocator: Any = getattr(pool, "_kvcached_dsv4_request_state", None)
+        reservation, local_slots, error = (None, 0, None)
+        ownership, reused = (None, 0)
+        leading_reuse = False
         try:
-            local_slots = int(query())
+            if allocator is not None:
+                with allocator.capacity_query(allocator.logical_available()):
+                    target = max(0, int(query()))
+                if demand_preview is not None:
+                    chunk = getattr(self.scheduler, "chunked_req", None)
+                    reqs = ([chunk] if chunk is not None else []) + list(
+                        self.scheduler.waiting_queue
+                    )
+                    by_id = {str(req.rid): req for req in reqs}
+                    if len(by_id) != len(reqs):
+                        raise ValueError("duplicate prefill request IDs")
+                    # A streaming session restores its row during prefix matching.
+                    # Let the preview match each queue entry once, even with no free rows.
+                    with allocator.capacity_query(allocator.logical_available() + len(reqs)):
+                        logical_slots = int(query())
+                    candidate = demand_preview(logical_slots)["p"]
+                    matched = matches if matches is not None else {}
+                    matched_requests = matched.get("requests", {})
+                    slots_by_id = {
+                        rid: request_slot(matched_requests.get(rid, req)) for rid, req in by_id.items()
+                    }
+                    ownership = [(rid, slot is not None) for rid, slot in slots_by_id.items()]
+                    for rid, slot in slots_by_id.items():
+                        if slot is not None and int(slot) not in allocator.active:
+                            raise ValueError(f"request {rid} does not own a backed C128 row")
+                    rows = [] if candidate is None else candidate["rows"]
+                    reused = sum(slots_by_id[row["rid"]] is not None for row in rows)
+                    target = len(rows) - reused
+                    leading_reuse = bool(rows and slots_by_id[rows[0]["rid"]] is not None)
+                    if self.row_retry_cap is not None and (self.row_retry_cap > 0 or leading_reuse):
+                        target = min(target, self.row_retry_cap)
+                reservation = allocator.prepare_admission(target)
+                self.row_reservation = (allocator, reservation)
+                with allocator.capacity_query(reservation.available + reused):
+                    local_slots = int(query())
+            else:
+                local_slots = int(query())
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        value = {
+            "slots": local_slots,
+            "ownership": ownership,
+            "leading_reuse": leading_reuse,
+            "c128": None
+            if reservation is None
+            else {"available": reservation.available, "target": reservation.target},
+        }
+        try:
+            states = self.exchange("slots", value, error=error)
+            if any(((s["c128"] is None) != (states[0]["c128"] is None) for s in states)):
+                raise RankConsensusError(f"C128 allocator presence differs: {states}")
+            if any((s["ownership"] != states[0]["ownership"] for s in states)):
+                raise RankConsensusError(f"C128 request row ownership differs: {states}")
+        except Exception as exc:
+            if reservation is not None:
+                try:
+                    self.release_slots()
+                except Exception:
+                    LOG.exception("C128 rollback failed after rank consensus failure")
+            if isinstance(exc, RankConsensusError):
+                raise
+            raise RankConsensusError(
+                "C128 slot exchange failed; refusing collective retry"
+            ) from exc
+        self.slot_budget = max(0, min((s["slots"] for s in states)))
+        if allocator is not None:
+            self.leading_row_reused = all(s["leading_reuse"] for s in states)
+            c128_budget = min((s["c128"]["available"] for s in states))
+            self.new_slot_budget = max(0, c128_budget)
+            finish_error = None
+            try:
+                allocator.finish_admission(reservation, c128_budget)
+            except Exception as exc:
+                finish_error = f"{type(exc).__name__}: {exc}"
+            if self.token_budget is not None:
+                self.refresh_token_budget("token_capacity_after_rows", finish_error)
+            elif finish_error is not None:
+                raise RuntimeError(finish_error)
+        return self.slot_budget
+
+    def refresh_token_budget(self, stage, error=None):
+        backing = self.scheduler.token_to_kv_pool_allocator
+        local = None
+        try:
+            if error is None:
+                backing._kvcached_invalidate_token_capacity()
+                local = backing._kvcached_budget_counts()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         try:
-            states = self.exchange("slots", local_slots, error=error)
+            peers = self.exchange(stage, local, error=error)
         except RankConsensusError:
             raise
         except Exception as exc:
-            raise RankConsensusError("Slot exchange failed; refusing collective retry") from exc
-        self.slot_budget = max(0, min(states))
+            raise RankConsensusError(f"C128 {stage} exchange failed") from exc
+        self.token_budget = tuple(min(values) for values in zip(*peers))
+        backing._kvcached_update_budget(self.token_budget)
+
+    def release_slots(self, *, refresh=False):
+        """Release this attempt's unused leases; active and older rows survive."""
+        pending, self.row_reservation = self.row_reservation, None
+        if pending is None:
+            return
+        allocator, reservation = pending
+        refresh = refresh and self.token_budget is not None and bool(self.new_slot_budget)
+        error = None
+        try:
+            allocator.finish_admission(reservation, 0)
+        except Exception as exc:
+            if not refresh:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            allocator.end_admission()
+        if refresh:
+            # The same scheduler round can still admit decode after a parked
+            # prefill. Its budget must see the pages returned by the rollback.
+            self.refresh_token_budget("token_capacity_after_row_release", error)
 
     def prepare(self, candidates, *, error=None):
         states = self.exchange("candidates", candidates, error=error)
@@ -482,68 +605,104 @@ def patch_rank_coordination():
         runtime = _ACTIVE.get()
         if runtime is None:
             return original_new(self, running_batch)
-        candidates, error = (None, None)
+        allocator = getattr(
+            getattr(self, "req_to_token_pool", None), "_kvcached_dsv4_request_state", None
+        )
         try:
-            if self.grammar_manager.has_waiting_grammars():
-                for req in self.grammar_manager.get_ready_grammar_requests():
-                    self._add_request_to_queue(req)
-            runtime.agree(
-                "prefill_input",
-                {
-                    "waiting": [str(r.rid) for r in self.waiting_queue],
-                    "chunk": str(self.chunked_req.rid)
-                    if self.chunked_req is not None
-                    else None,
-                },
-            )
-            self.policy.calc_priority(
-                self.waiting_queue,
-                running_batch,
-                **{"processed_tokens": self.processed_tokens_counter},
-            )
-            runtime.priority_sorted = True
-            backoff_states = runtime.exchange(
-                "prefill_backoff", {"active": runtime.prefill_backoff_active()}
-            )
-            if self.chunked_req is not None and any(
-                (state["active"] for state in backoff_states)
-            ):
-                runtime.prepare({"p": None})
-                return empty_prefill(running_batch)
-            if self.chunked_req is None and any((state["active"] for state in backoff_states)):
-                runtime.slot_budget = 0
-                candidates = {"p": None}
-                runtime.prepare(candidates)
-                result = original_new(self, running_batch)
-                running_batch.batch_is_full = False
-                return result
-            runtime.agree_slots(
-                lambda: original_slots(self, len(running_batch.reqs), running_batch=running_batch)
-            )
-            token = _ACTIVE.set(None)
+            candidates, error = (None, None)
             try:
-                candidates = preview(self, running_batch, slots=runtime.slot_budget)
-            finally:
-                _ACTIVE.reset(token)
-        except RankConsensusError:
-            raise
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        runtime.prepare(candidates, error=error)
-        attempt = PrefillScheduleSnapshot(self)
-        runtime.prefill_attempt = attempt
-        try:
-            return original_new(self, running_batch)
-        except PrefillPrepareDeferred:
-            rollback_error = None
-            try:
-                attempt.rollback(running_batch)
+                if self.grammar_manager.has_waiting_grammars():
+                    for req in self.grammar_manager.get_ready_grammar_requests():
+                        self._add_request_to_queue(req)
+                runtime.agree(
+                    "prefill_input",
+                    {
+                        "waiting": [str(r.rid) for r in self.waiting_queue],
+                        "chunk": str(self.chunked_req.rid)
+                        if self.chunked_req is not None
+                        else None,
+                    },
+                )
+                self.policy.calc_priority(
+                    self.waiting_queue,
+                    running_batch,
+                    **{"processed_tokens": self.processed_tokens_counter},
+                )
+                runtime.priority_sorted = True
+                backoff_states = runtime.exchange(
+                    "prefill_backoff", {"active": runtime.prefill_backoff_active()}
+                )
+                if self.chunked_req is not None and any(
+                    (state["active"] for state in backoff_states)
+                ):
+                    runtime.prepare({"p": None})
+                    return empty_prefill(running_batch)
+                if self.chunked_req is None and any((state["active"] for state in backoff_states)):
+                    runtime.slot_budget = 0
+                    runtime.new_slot_budget = 0
+                    candidates = {"p": None}
+                    runtime.prepare(candidates)
+                    result = original_new(self, running_batch)
+                    running_batch.batch_is_full = False
+                    return result
+                preview_matches: dict[str, Any] = {}
+
+                def shadow(slots, **kwargs):
+                    token = _ACTIVE.set(None)
+                    try:
+                        return preview(
+                            self, running_batch, slots=slots, match_cache=preview_matches, **kwargs
+                        )
+                    finally:
+                        _ACTIVE.reset(token)
+
+                runtime.reserve_slots(
+                    lambda: original_slots(
+                        self, len(running_batch.reqs), **{"running_batch": running_batch}
+                    ),
+                    demand_preview=shadow if allocator is not None else None,
+                    matches=preview_matches,
+                )
+                candidates = shadow(
+                    runtime.slot_budget,
+                    **{"new_slots": runtime.new_slot_budget} if allocator is not None else {},
+                )
+            except RankConsensusError:
+                raise
             except Exception as exc:
-                rollback_error = f"{type(exc).__name__}: {exc}"
-            runtime.exchange("prepare_extend.schedule_rollback", True, error=rollback_error)
-            return empty_prefill(running_batch)
+                error = f"{type(exc).__name__}: {exc}"
+            runtime.prepare(candidates, error=error)
+            if allocator is not None:
+                # If the row leases left too little room for even one token
+                # prefix, retry a smaller window when the next round starts.
+                minimum = 0 if runtime.leading_row_reused else 1
+                if runtime.prefill_plan is None and (runtime.new_slot_budget or 0) > minimum:
+                    runtime.row_retry_cap = runtime.new_slot_budget // 2
+                elif runtime.prefill_plan is not None or runtime.new_slot_budget == 0:
+                    runtime.row_retry_cap = None
+            attempt = PrefillScheduleSnapshot(self)
+            runtime.prefill_attempt = attempt
+            try:
+                return original_new(self, running_batch)
+            except PrefillPrepareDeferred:
+                rollback_error = None
+                try:
+                    attempt.rollback(running_batch)
+                except Exception as exc:
+                    rollback_error = f"{type(exc).__name__}: {exc}"
+                runtime.exchange("prepare_extend.schedule_rollback", True, error=rollback_error)
+                return empty_prefill(running_batch)
+            finally:
+                runtime.prefill_attempt = None
+        except RankConsensusError:
+            try:
+                runtime.release_slots()
+            except Exception:
+                LOG.exception("C128 rollback failed after rank consensus failure")
+            raise
         finally:
-            runtime.prefill_attempt = None
+            if runtime.row_reservation is not None:
+                runtime.release_slots(refresh=True)
 
     @functools.wraps(original_slots)
     def slots(self, *args, **kwargs):
