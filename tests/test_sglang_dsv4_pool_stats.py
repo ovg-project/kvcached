@@ -4,6 +4,7 @@
 import importlib.util
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +13,10 @@ import pytest
 if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
-from kvcached.integration.sglang.dsv4_pool_stats import DeepSeekV4PoolStatsPatch  # noqa: E402
+from kvcached.integration.sglang.dsv4_pool_stats import (  # noqa: E402
+    DeepSeekV4FullPoolCheckPatch,
+    DeepSeekV4PoolStatsPatch,
+)
 
 
 def make_observer(monkeypatch, *, managed=True, physical=0, full_capacity=1000,
@@ -20,12 +24,15 @@ def make_observer(monkeypatch, *, managed=True, physical=0, full_capacity=1000,
     calls: list[str] = []
 
     class Observer:
+        token_to_kv_pool_allocator: Any
+
         def _get_swa_token_info(self):
             calls.append("native")
+            full_available = self.token_to_kv_pool_allocator.full_available_size() if full_capacity else 0
             return SimpleNamespace(
-                full_available_size=physical if full_capacity else 0,
-                full_evictable_size=100, full_num_used=900 - physical if full_capacity else 0,
-                full_token_usage=(900 - physical) / full_capacity if full_capacity else 0,
+                full_available_size=full_available,
+                full_evictable_size=100, full_num_used=900 - full_available if full_capacity else 0,
+                full_token_usage=(900 - full_available) / full_capacity if full_capacity else 0,
                 swa_available_size=physical, swa_evictable_size=10,
                 swa_num_used=90 - physical, swa_token_usage=(90 - physical) / 100,
                 native_extra="preserved",
@@ -89,19 +96,62 @@ def test_missing_conservation_method_retains_native_component(monkeypatch):
 
 
 @pytest.mark.parametrize("managed", [False, True])
-def test_hisparse_wrapper_uses_inner_backing_without_changing_device_headroom(monkeypatch, managed):
+@pytest.mark.parametrize(("full_headroom", "device_slots", "expected_available"), [
+    (700, 10, 40),  # Device slots limit FULL even without physical pressure.
+    (0, 200, 700),  # Physical pressure alone does not occupy logical slots.
+])
+def test_hisparse_full_stats_preserve_device_limit(monkeypatch, managed, full_headroom, device_slots,
+                                                  expected_available):
     observer, _, _, _ = make_observer(monkeypatch, managed=managed, physical=5, hisparse=True)
     inner = observer.token_to_kv_pool_allocator
-    observer.token_to_kv_pool_allocator = SimpleNamespace(
+    inner.full_available_size = lambda: full_headroom
+    wrapper = SimpleNamespace(
         logical_attn_allocator=inner,
-        full_available_size=lambda: 5,
+        hisparse_attn_allocator=SimpleNamespace(available_size=lambda: device_slots),
+        compress_ratio=4,
         swa_available_size=inner.swa_available_size,
     )
+    wrapper.full_available_size = lambda: min(
+        inner.full_available_size(), wrapper.hisparse_attn_allocator.available_size() * wrapper.compress_ratio)
+    observer.token_to_kv_pool_allocator = wrapper
     stats = observer._get_swa_token_info()
-    assert stats.full_num_used == (200 if managed else 895)
+    native_available = min(full_headroom, device_slots * 4)
+    available = expected_available if managed else native_available
+    assert stats.full_available_size == available
+    assert stats.full_num_used == 900 - available
+    assert stats.full_token_usage == (900 - available) / 1000
     assert stats.swa_num_used == (10 if managed else 85)
-    assert observer.token_to_kv_pool_allocator.full_available_size() == 5
-    assert observer.token_to_kv_pool_allocator.swa_available_size() == 5
+    assert wrapper.full_available_size() == native_available
+    assert wrapper.swa_available_size() == 5
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_hisparse_full_check_counts_logical_slots_without_changing_report(monkeypatch, managed):
+    @dataclass
+    class Stats:
+        full_available_size: int
+
+    class Checker:
+        full_tokens_per_layer = 1000
+        token_to_kv_pool_allocator = SimpleNamespace(
+            logical_attn_allocator=SimpleNamespace(
+                _kvcached_dsv4_backing=object() if managed else None,
+                _conserve_full_available_size=lambda: 700,
+            ),
+            hisparse_attn_allocator=object(),
+        )
+
+        def _check_full_pool(self, ps, uncached=0):
+            return ps.full_available_size + uncached != self.full_tokens_per_layer
+
+    patch = DeepSeekV4FullPoolCheckPatch()
+    monkeypatch.setattr(patch, "initialize_version_info", lambda: True)
+    assert patch.apply(SimpleNamespace(SchedulerInvariantChecker=Checker))
+    stats = Stats(full_available_size=40)
+    checker = Checker()
+    assert checker._check_full_pool(stats, uncached=300) is (not managed)
+    assert checker._check_full_pool(stats, uncached=299)  # One slot really is missing.
+    assert stats.full_available_size == 40
 
 
 def test_conservation_error_is_not_hidden(monkeypatch):
