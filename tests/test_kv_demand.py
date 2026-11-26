@@ -309,6 +309,30 @@ def test_sglang_round_posts_what_it_allocated_and_its_first_unfit_request():
     assert manager.posted == [9, 0]
 
 
+def test_sglang_preserves_the_selected_batch_and_local_allocator_units():
+    from kvcached.integration.sglang import patches
+
+    scheduler, manager = _sglang_scheduler()
+    selected, unselected = object(), object()
+    scheduler.waiting_queue = [unselected]
+    for unit, pool, count in (("pages", manager, 3), ("mamba slots", manager, 2),
+                              ("alloc_extend", object(), "the request")):
+        with patches._sglang_demand_round(scheduler):
+            with patches._sglang_prefill_requests([selected]):
+                # Coordinated TP receives None. A single rank translates the
+                # same local miss into SGLangPrefillCapacityMiss and unwinds.
+                patches._sglang_capacity_miss(None, count, unit, pool)
+                # A composite can propagate the same miss after its child.
+                patches._sglang_capacity_miss(None, "the request", "alloc_extend", object())
+            manager.allocated = 2  # Decode still ran.
+            assert patches.native_prefill_allocation_miss() == (pool, count, unit, (selected,))
+        assert manager.posted[-1] == 2
+        assert patches.native_prefill_allocation_miss() is None
+    with patches._sglang_demand_round(scheduler):
+        pass
+    assert manager.posted[-1] == 0
+
+
 def test_sglang_prefill_budget_miss_is_recorded(monkeypatch):
     import enum
 

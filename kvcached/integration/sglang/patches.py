@@ -146,7 +146,18 @@ _SGLANG_BATCH_ALLOCATION = threading.local()
 
 
 @contextlib.contextmanager
-def _sglang_batch_allocation_zone():
+def _sglang_prefill_requests(requests):
+    """The requests native admission passed to this extend allocation."""
+    previous = getattr(_SGLANG_BATCH_ALLOCATION, "requests", ())
+    _SGLANG_BATCH_ALLOCATION.requests = requests
+    try:
+        yield
+    finally:
+        _SGLANG_BATCH_ALLOCATION.requests = previous
+
+
+@contextlib.contextmanager
+def _sglang_batch_allocation_zone(requests=()):
     """Mark the window in which an allocation miss is fatal to SGLang.
 
     SGLang's allocators report a miss by returning None, and every caller
@@ -171,7 +182,8 @@ def _sglang_batch_allocation_zone():
     _SGLANG_BATCH_ALLOCATION.active = True
     _SGLANG_BATCH_ALLOCATION.journal = journal
     try:
-        yield journal
+        with _sglang_prefill_requests(requests):
+            yield journal
     finally:
         _SGLANG_BATCH_ALLOCATION.active = previous
         _SGLANG_BATCH_ALLOCATION.journal = previous_journal
@@ -442,6 +454,19 @@ def _sglang_budget_round(scheduler: Any):
 _SGLANG_DEMAND = threading.local()
 
 
+class _PrefillAllocationMiss(NamedTuple):
+    """First local allocator rejection in the selected native extend."""
+    pool: Any
+    requested: Any
+    unit: str
+    requests: tuple
+
+
+def native_prefill_allocation_miss() -> Optional[_PrefillAllocationMiss]:
+    """Local miss from the current scheduling round, through demand publication."""
+    return getattr(_SGLANG_DEMAND, "allocation_miss", None)
+
+
 @contextlib.contextmanager
 def _sglang_demand_round(scheduler: Any):
     """Post the round's need for new memory as the KV demand.
@@ -464,6 +489,7 @@ def _sglang_demand_round(scheduler: Any):
         yield
         return
     _SGLANG_DEMAND.open = True
+    _SGLANG_DEMAND.allocation_miss = None
     _SGLANG_DEMAND.need = None
     _SGLANG_DEMAND.prefill_tried = False
     _SGLANG_DEMAND.prefill_miss = None
@@ -506,7 +532,10 @@ def _sglang_demand_round(scheduler: Any):
             need = getattr(scheduler, "_kvcached_prefill_demand",
                            getattr(scheduler, "_kvcached_prefill_miss", None))
         _sglang_end_preemption()
-        _sglang_post_demand(scheduler, need or 0)
+        try:
+            _sglang_post_demand(scheduler, need or 0)
+        finally:
+            _SGLANG_DEMAND.allocation_miss = None
 
 
 def _sglang_retry_prefill_if_backed(scheduler: Any, manager: Any) -> None:
@@ -814,8 +843,12 @@ def _sglang_capacity_miss(owner: Any, need_size: Any, unit: str,
     manager returns None only for a capacity shortfall; its contract
     violations and native fatal errors raise on their own and never reach
     this call, which keeps the translation as narrow as the vLLM one (#453,
-    #511). ``pool`` is read for the message only, after the verdict.
+    #511). Preserve the native units for the consumer that owns this pool.
     """
+    requests = getattr(_SGLANG_BATCH_ALLOCATION, "requests", ())
+    if (requests and getattr(_SGLANG_DEMAND, "open", False)
+            and native_prefill_allocation_miss() is None):
+        _SGLANG_DEMAND.allocation_miss = _PrefillAllocationMiss(pool, need_size, unit, tuple(requests))
     if not getattr(_SGLANG_BATCH_ALLOCATION, "active", False):
         return None
     try:
@@ -4088,13 +4121,18 @@ class ScheduleBatchCapacityMissPatch(VersionAwarePatch, BasePatch):
         def _patched_alloc_for_extend(batch: Any) -> Any:
             from kvcached.integration.sglang.scheduler.rank_coordination import active
 
-            if active() is not None or not enable_kvcached() or _sglang_pipeline_stages() > 1:
+            if active() is not None:
+                # Coordinated TP owns its transaction and peer verdict. The
+                # local allocator still observes the actual selected batch.
+                with _sglang_prefill_requests(getattr(batch, "reqs", ())):
+                    return original(batch)
+            if not enable_kvcached() or _sglang_pipeline_stages() > 1:
                 return original(batch)
             pool = batch.req_to_token_pool
             held = [_prefill_entry_state(req) for req in batch.reqs]
             local_miss: Optional[KVCachePoolExhausted] = None
             result = None
-            with _sglang_batch_allocation_zone() as journal:
+            with _sglang_batch_allocation_zone(batch.reqs) as journal:
                 try:
                     result = original(batch)
                 except KVCachePoolExhausted as miss:
