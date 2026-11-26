@@ -215,8 +215,8 @@ def _tp_retention_worker(rank, directory, states, results, attention_groups):
     torch.distributed.init_process_group("gloo", init_method=f"file://{directory}/gloo",
                             rank=rank, world_size=2)
     try:
-        sgl_patches._sglang_queue_cpu_groups = lambda: [torch.distributed.group.WORLD]
-        sgl_patches._sglang_pipeline_stages = lambda: 1
+        sgl_patches.queue_cpu_groups = lambda: [torch.distributed.group.WORLD]
+        sgl_patches.pipeline_stages = lambda: 1
         broadcasts = []
         collectives = []
         original_broadcast = torch.distributed.broadcast_object_list
@@ -328,8 +328,8 @@ def test_scheduler_consumes_update_after_receiving_requests(
 
     monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(sgl_patches, "_register_shrink_reclaimers", no_reclaimers)
-    monkeypatch.setattr(sgl_patches, "_sglang_queue_cpu_groups", list)
-    monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: 1)
+    monkeypatch.setattr(sgl_patches, "queue_cpu_groups", list)
+    monkeypatch.setattr(sgl_patches, "pipeline_stages", lambda: 1)
     monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls", lambda *a, **k: ())
     patch = sgl_patches.SchedulerIdleLimitPatch()
     assert patch.patch_idle_hook(module)
@@ -382,8 +382,8 @@ def test_scheduler_reuses_request_broadcast_before_dispatch(
     setattr(receiver, "recv_requests", receive)
     setattr(module, "Scheduler", Scheduler)
     monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: True)
-    monkeypatch.setattr(sgl_patches, "_sglang_queue_cpu_groups", lambda: [object()])
-    monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: 1)
+    monkeypatch.setattr(sgl_patches, "queue_cpu_groups", lambda: [object()])
+    monkeypatch.setattr(sgl_patches, "pipeline_stages", lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *a: 0)
     patch = sgl_patches.SchedulerIdleLimitPatch()
     assert patch.patch_idle_hook(module)
@@ -402,7 +402,7 @@ def test_scheduler_reuses_request_broadcast_before_dispatch(
 @pytest.mark.parametrize("enabled,pp_size", [(False, 1), (True, 2)])
 def test_retention_leaves_other_broadcasts_unchanged(monkeypatch, enabled, pp_size):
     monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: enabled)
-    monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: pp_size)
+    monkeypatch.setattr(sgl_patches, "pipeline_stages", lambda: pp_size)
 
     def forbidden_read(**kwargs):
         raise AssertionError("unexpected retention poll")
@@ -423,8 +423,8 @@ def test_retention_leaves_other_broadcasts_unchanged(monkeypatch, enabled, pp_si
 def test_split_tp_cp_broadcast_keeps_one_assignment_in_flight(monkeypatch, shared_control):
     tp, cp = object(), object()
     monkeypatch.setattr(sgl_patches, "enable_kvcached", lambda: True)
-    monkeypatch.setattr(sgl_patches, "_sglang_pipeline_stages", lambda: 1)
-    monkeypatch.setattr(sgl_patches, "_sglang_queue_cpu_groups", lambda: [tp, cp])
+    monkeypatch.setattr(sgl_patches, "pipeline_stages", lambda: 1)
+    monkeypatch.setattr(sgl_patches, "queue_cpu_groups", lambda: [tp, cp])
     monkeypatch.setattr(torch.distributed, "get_rank", lambda *a: 0)
     cache = Enforcer()
     retention._policy.register(cache)
