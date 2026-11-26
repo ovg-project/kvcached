@@ -20,6 +20,7 @@ from kvcached.integration.sglang.hicache import (
     HiRadixCacheRetentionPatch,
     UnifiedHiCacheRetentionPatch,
 )
+from kvcached.integration.sglang.hicache_retention import DistributedHiCacheRetentionPatch
 from kvcached.integration.sglang.patches import (
     SGLANG_ALL_RANGE,
     DeepSeekV4KVPoolPatch,
@@ -118,6 +119,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),
             (HiCacheMambaHostPoolPatch(), HICACHE_RANGE),
             (HiCacheSizeSplitPatch(), HICACHE_RANGE),
+            (DistributedHiCacheRetentionPatch(), HICACHE_RANGE),
         ]
     )
 
