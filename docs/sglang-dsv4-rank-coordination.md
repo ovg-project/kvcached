@@ -68,8 +68,10 @@ starting a paid session. Record both repository SHAs, weight revision, CUDA,
 PyTorch, driver and topology. Use the same model, quantization, attention
 backend, graph settings and token limits for each native/managed pair.
 
-1. Start with TP8/PP1, then TP4/PP2 and TP2/PP4 where model memory permits.
-   Test one topology at a time; a native failure stops that pair. Keep the
+1. On four GPUs, start with TP2/PP2. Use TP1/PP4 on the same GPUs to exercise
+   four pipeline stages if the model fits that layout. On eight GPUs, TP4/PP2
+   and TP2/PP4 provide additional coverage. Run the native and managed pair on
+   the same topology. If the native run fails, stop that pair. Keep the
    native baseline with `ENABLE_KVCACHED=false` and the managed launch with
    `ENABLE_KVCACHED=true KVCACHED_RANK_COORDINATION_ENABLE=true KVCACHED_CONTIGUOUS_LAYOUT=false`. Use
    `--cuda-graph-backend-prefill=disabled` to exercise managed C128 rows.
