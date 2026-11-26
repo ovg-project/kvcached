@@ -1204,8 +1204,11 @@ def test_token_miss_returns_rows_and_mamba_slots(
     pipeline.enqueue(*reqs)
     before = pipeline.free_state()
 
-    assert pipeline.round() == (None, pipeline.running_batch)
-
+    with patches._sglang_demand_round(pipeline.scheduler):
+        assert pipeline.round() == (None, pipeline.running_batch)
+        failed = patches._SGLANG_DEMAND.allocation_miss
+        assert failed.pool is pipeline.token_manager and failed.requests == tuple(reqs)
+    assert patches._SGLANG_DEMAND.allocation_miss is None
     assert pipeline.free_state() == before
     assert pipeline.pool.freed == [3, 4]
     assert pipeline.scheduler.waiting_queue == reqs
