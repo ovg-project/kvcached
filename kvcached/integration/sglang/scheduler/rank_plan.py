@@ -124,7 +124,7 @@ def match_preview_requests(scheduler, running_batch):
     return matched
 
 
-def preview(scheduler, running_batch, *, slots=None):
+def preview(scheduler, running_batch, *, slots=None, new_slots=None, match_cache=None):
     """Preview native resource gates on private requests in native queue order.
 
     Radix matching runs in a fixed queue order before local gates, since it
@@ -157,7 +157,11 @@ def preview(scheduler, running_batch, *, slots=None):
         or (getattr(scheduler, "prefill_delayer", None) is not None)
     ):
         raise ValueError("unsupported rank-coordinated admission configuration")
-    matched = match_preview_requests(scheduler, running_batch)
+    if match_cache is None:
+        match_cache = {}
+    if "requests" not in match_cache:
+        match_cache["requests"] = match_preview_requests(scheduler, running_batch)
+    matched = match_cache["requests"]
     result = {"p": None, "d": None}
     if running and (not running_batch.is_prefill_only):
         indices = [i for i, r in enumerate(running_batch.reqs) if r in running]
@@ -188,18 +192,25 @@ def preview(scheduler, running_batch, *, slots=None):
         prefill_tile_block_m=getattr(backend, "extend_attention_block_m", 64),
     )
     rows = []
+    used_new_slots = 0
     with ExitStack() as pins:
         if chunk is not None:
+            if new_slots is not None and new_slots <= 0 and (request_slot(chunk) is None):
+                return result
             shadow = _clone_request(chunk)
             shadow.init_next_round_input()
             adder.add_chunked_req(shadow)
             if adder.can_run_list:
                 rows.append(request_row(shadow, "P"))
+                used_new_slots += request_slot(chunk) is None
         for original in queue:
             if len(adder.can_run_list) >= slots:
                 break
             if original.finished():
                 continue
+            needs_row = request_slot(matched[str(original.rid)]) is None
+            if new_slots is not None and needs_row and (used_new_slots >= new_slots):
+                break
             req = _clone_request(matched[str(original.rid)])
             if req.sampling_params.ignore_eos and getattr(scheduler.tree_cache, "disable", True):
                 raise ValueError(
@@ -253,6 +264,7 @@ def preview(scheduler, running_batch, *, slots=None):
             row = request_row(req, "P")
             row["host_load"] = bool(req.needs_host_load_back())
             rows.append(row)
+            used_new_slots += needs_row
             if adder.budget_state() != AddReqResult.CONTINUE:
                 break
     result["p"] = plan("P", rows)

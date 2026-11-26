@@ -207,9 +207,10 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
       reserved_page_list_.erase(reserved);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
+      // An exact claim may be followed by a sibling pool's exact claim.
+      // Refilling arbitrary IDs here could take the headroom it needs.
+      if (requested_id < 0 && reserved_page_list_.size() <
+                                  static_cast<size_t>(min_reserved_pages_)) {
         prealloc_needed_ = true;
         cond_.notify_all();
       }
@@ -304,7 +305,7 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
                              ": " + e.what());
   }
 
-  if (enable_page_prealloc_) {
+  if (requested_id < 0 && enable_page_prealloc_) {
     trigger_preallocation();
   }
 
@@ -512,18 +513,32 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 }
 
 int64_t PageAllocator::trim(int64_t max_pages) {
+  return trim_impl(max_pages, nullptr);
+}
+
+int64_t PageAllocator::trim_selected(const std::vector<page_id_t> &eligible) {
+  return trim_impl(-1, &eligible);
+}
+
+int64_t PageAllocator::trim_impl(int64_t max_pages,
+                                 const std::vector<page_id_t> *eligible) {
   throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    const auto count = max_pages < 0 ? reserved_page_list_.size()
-                                     : std::min(reserved_page_list_.size(),
-                                                static_cast<size_t>(max_pages));
-    pages_to_unmap.assign(reserved_page_list_.end() - count,
-                          reserved_page_list_.end());
-    reserved_page_list_.erase(reserved_page_list_.end() - count,
-                              reserved_page_list_.end());
+    if (eligible) {
+      pages_to_unmap = extract_reserved_pages(reserved_page_list_, *eligible);
+    } else {
+      const auto count = max_pages < 0
+                             ? reserved_page_list_.size()
+                             : std::min(reserved_page_list_.size(),
+                                        static_cast<size_t>(max_pages));
+      pages_to_unmap.assign(reserved_page_list_.end() - count,
+                            reserved_page_list_.end());
+      reserved_page_list_.erase(reserved_page_list_.end() - count,
+                                reserved_page_list_.end());
+    }
 
     if (pages_to_unmap.empty()) {
       update_memory_usage_unlocked();
@@ -539,6 +554,8 @@ int64_t PageAllocator::trim(int64_t max_pages) {
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
+    // Wake allocations waiting for these IDs without requesting a refill.
+    cond_.notify_all();
   }
   return static_cast<int64_t>(pages_to_unmap.size());
 }
@@ -647,7 +664,7 @@ PageState PageAllocator::get_page_state_unlocked() const {
                    static_cast<int64_t>(reserved_page_list_.size())};
 }
 
-int64_t PageAllocator::get_avail_physical_pages() const {
+int64_t PageAllocator::get_avail_physical_bytes() const {
   const int previous_device = gpu_vmm::current_device();
   const int pool_device = FTensorAllocator::device_index();
   const bool change_device = pool_device >= 0 && previous_device != pool_device;
@@ -667,8 +684,7 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  size_t usable_phy_mem_size =
-      saturating_subtract(avail_phy_mem_size, headroom);
+  int64_t usable_phy_mem_size = signed_headroom(avail_phy_mem_size, headroom);
   // The local scheduler must honor the same GPU/instance limits as grants.
   // Worker-IPC allocators own their ledgers in the workers, not this process.
   // This remains an estimate; the actual map still performs atomic admission.
@@ -679,7 +695,22 @@ int64_t PageAllocator::get_avail_physical_pages() const {
           std::min(usable_phy_mem_size, allocator->available_physical_bytes());
   }
 
-  // Calculate available pages considering layers and KV buffers
+  return usable_phy_mem_size;
+}
+
+std::optional<ExactRecoveryQuote>
+PageAllocator::exact_recovery_quote(const std::vector<page_id_t> &pages) const {
+  std::lock_guard<std::mutex> guard(lock_);
+  if (transaction_failed_.load(std::memory_order_acquire))
+    throw StateConsistencyError(transaction_error_);
+  const auto bundle = page_size_ * num_layers_ * num_kv_buffers_;
+  return quote_exact_pages(pages, free_page_list_, reclaimed_page_list_,
+                           reserved_page_list_, bundle);
+}
+
+int64_t PageAllocator::get_avail_physical_pages() const {
+  const auto usable_phy_mem_size =
+      std::max<int64_t>(0, get_avail_physical_bytes());
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
