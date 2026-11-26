@@ -8,7 +8,7 @@ from array import array
 from dataclasses import dataclass
 from datetime import timedelta
 from types import ModuleType, SimpleNamespace
-from weakref import ref
+from weakref import WeakKeyDictionary, ref
 
 import pytest
 import torch
@@ -69,11 +69,23 @@ def _priority_cache(parent_locked):
     return cache, order, (parent, cold, hot, active)
 
 
+def _poll_to_limit(cache, limit):
+    """Drive the scheduler's bounded victim plan to a verdict for protocol tests."""
+    plan = retention._VictimPlan()
+    demand, _, proposer = retention._group_demand(cache, limit, True)
+    while demand:
+        result = plan.poll(cache, demand, proposer, False)
+        if result is not None:
+            return result
+        demand, _, proposer = retention._group_demand(cache, limit, False)
+    return True
+
+
 @pytest.mark.parametrize("locked, expected, resident", [
     (False, [11, 10], [20, 30]), (True, [11, 20], [10, 30])])
 def test_retention_reconsiders_new_device_leaves(locked, expected, resident):
     cache, order, nodes = _priority_cache(locked)
-    retention.trim_parallel_hicache(cache, cache.evictable_size_ - 2)
+    _poll_to_limit(cache, cache.evictable_size_ - 2)
     assert order == expected
     assert [node.key[0] for node in nodes if not node.evicted] == resident
 
@@ -84,11 +96,11 @@ def test_unbacked_parent_above_cap_retries_after_host_child_leaves():
     parent.backuped = False
     cache.evictable_leaves = {parent}
     cache.evictable_size_ = 1
-    assert not retention.trim_parallel_hicache(cache, 0)
+    assert not _poll_to_limit(cache, 0)
     assert order == [11]
     parent.children.clear()
     cache._evict_regular = cache._evict_backuped
-    assert retention.trim_parallel_hicache(cache, 0)
+    assert _poll_to_limit(cache, 0)
     assert order == [11, 10]
 
 
@@ -381,12 +393,12 @@ def test_shared_search_indexes_deep_disjoint_paths_in_bounded_steps(monkeypatch)
         return original(key)
 
     monkeypatch.setattr(Key, "raw_token_ids", count_reads)
-    pages = retention._signature_pages(leaves)
+    pages = retention._signature_pages(leaves, WeakKeyDictionary())
     indexed: set[Leaf] = set()
-    for entries, more in pages:
+    for entries, more, _ in pages:
         assert calls <= retention._INDEX_PER_POLL
         calls = 0
-        indexed.update(node for node, _, _ in entries)
+        indexed.update(node for node, _ in entries)
         if not more:
             break
     assert indexed == leaves
@@ -562,7 +574,8 @@ def test_zero_limit_matches_only_new_requests_cold(monkeypatch):
                                            "released": SimpleNamespace(kv=SimpleNamespace(holds_kv=False))})
     scheduler = SimpleNamespace(tree_cache=cache, enable_hierarchical_cache=True, _engine_paused=False,
                                 process_input_requests=lambda _: None)
-    monkeypatch.setattr(retention, "get_prefix_cache_retention_limit", lambda: 0)
+    policy = retention.prefix_cache_retention
+    monkeypatch.setattr(policy, "_policy", policy._PrefixCacheRetentionPolicy(0))
     retention.install_parallel_hicache_retention(scheduler)
     cache.check_hicache_events()
     key = (10, 11)
@@ -579,8 +592,8 @@ def test_zero_limit_matches_only_new_requests_cold(monkeypatch):
     newer = SimpleNamespace(**{k: v for k, v in fields.items() if k != "req_pool_idx"},
                             kv=SimpleNamespace(req_pool_idx=0))
     assert cache.match_prefix(Match(key, newer)) == key
-    monkeypatch.setattr(retention, "get_prefix_cache_retention_limit", lambda: 10)
-    cache.check_hicache_events()
+    policy._apply_prefix_cache_retention_update({"revision": (1,), "limit_tokens": 10})
+    scheduler.process_input_requests([])
     assert cache.match_prefix(fresh) == key
 
 
@@ -785,9 +798,9 @@ def test_shared_prefix_hashed_once_per_plan(monkeypatch):
         _evict_backuped=lambda node: len(node.key), update_eviction_metrics=lambda *_: None)
     votes = []
     cache._all_reduce_attn_groups = lambda vote, op: votes.append(vote[:8].tolist())
-    retention.trim_parallel_hicache(cache, 0)
+    _poll_to_limit(cache, 0)
     parent.key.cache_salt = "new namespace"
-    retention.trim_parallel_hicache(cache, 0)
+    _poll_to_limit(cache, 0)
     assert prefix_bytes == [32768 * 8] * 2
     proofs = [words for words in votes if len(words) == 8]
     assert len(proofs) == 2 and proofs[0] != proofs[1]
@@ -942,7 +955,7 @@ def _exercise_unequal_batches(rank, attention, pipeline):
 
     cache.eviction_strategy.get_priority = priority
     cache._evict_backuped = evict
-    assert retention.trim_parallel_hicache(cache, len(initial))
+    assert _poll_to_limit(cache, len(initial))
     assert freed == list(range(count))
     assert initial <= evaluations
 
@@ -987,7 +1000,7 @@ def _exercise(rank, uri):
         cache, order, nodes = _priority_cache(rank == 3)
         cache.pp_size, cache.pp_group = 2, pipeline
         cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
-        retention.trim_parallel_hicache(cache, 0)
+        _poll_to_limit(cache, 0)
         assert order == [11, 20]
         assert [node.key[0] for node in nodes if not node.evicted] == [10, 30]
 
@@ -1000,7 +1013,7 @@ def _exercise(rank, uri):
             priority = cache.eviction_strategy.get_priority
             hot_leaf = nodes[2]
             cache.eviction_strategy.get_priority = lambda n: -1 if n is hot_leaf else priority(n)
-        assert retention.trim_parallel_hicache(cache, 1)
+        assert _poll_to_limit(cache, 1)
         assert order == [11, 10]
 
         # An entire page of rank-local prefixes precedes the only common
@@ -1029,7 +1042,7 @@ def _exercise(rank, uri):
         cache.eviction_strategy.get_priority = lambda n: int((n is hot) != (rank == 3))
         cache.pp_size, cache.pp_group = 2, pipeline
         cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
-        retention.trim_parallel_hicache(cache, 0)
+        _poll_to_limit(cache, 0)
         assert order == [11, 10, 20]
         assert [node.key[0] for node in nodes if not node.evicted] == [30]
 
@@ -1050,7 +1063,7 @@ def _exercise(rank, uri):
             return 1
 
         cache._evict_backuped = evict_common
-        retention.trim_parallel_hicache(cache, 1)
+        _poll_to_limit(cache, 1)
         assert freed_tokens == [10, 20]
 
         # Disagreeing native priorities choose the proposer's order, even
@@ -1069,7 +1082,7 @@ def _exercise(rank, uri):
             # An explicitly unlimited PP follower still participates when
             # a finite stage asks it to release a common prefix.
             limit = -1 if pp_size > 1 and stage else 2
-            assert retention.trim_parallel_hicache(cache, limit)
+            assert _poll_to_limit(cache, limit)
             assert freed_tokens == [30 if first_rank % 2 else 10]
             if pp_size > 1:
                 if stage:
@@ -1077,7 +1090,7 @@ def _exercise(rank, uri):
                     cache.evictable_size_ += 1
                 # The finite stage is now at its cap. An unlimited follower
                 # with an extra leaf has no further demand of its own.
-                assert retention.trim_parallel_hicache(cache, limit)
+                assert _poll_to_limit(cache, limit)
                 assert len(freed_tokens) == 1
         cache.eviction_strategy.get_priority = lambda n: n.key[0]
 
@@ -1161,7 +1174,7 @@ def _exercise(rank, uri):
             dist.all_reduce(tensor, op=op, group=attention)
         cache._all_reduce_attn_groups = count_round
         freed_tokens.clear()
-        assert retention.trim_parallel_hicache(cache, 0) is False
+        assert _poll_to_limit(cache, 0) is False
         assert len(rounds) == 4 and freed_tokens == list(range(limit - 1))
 
         # PP0 has exactly the cap. Only the far stage needs to reclaim. Its
@@ -1261,11 +1274,11 @@ def _exercise(rank, uri):
                     assert vote_sizes == [4]  # One startup vote before the first match.
                     vote_sizes.clear()
                     cache.check_hicache_events()
-                    assert not freed and all(n == 4 for n in vote_sizes)
+                    assert not freed and all(n == 3 for n in vote_sizes)
                     if topology == "TP":
                         # The shared startup poll determined that the limit is off.
                         cache.check_hicache_events()
-                        assert ack_sizes == [4, 2]
+                        assert ack_sizes == [3, 2]
                         retention.prefix_cache_retention._apply_prefix_cache_retention_update(
                             {"revision": (1,), "limit_tokens": 0})
                         scheduler.process_input_requests([])
@@ -1280,10 +1293,6 @@ def _exercise(rank, uri):
                         assert len(ack_sizes) == retention._RECHECK_POLLS
                         assert vote_sizes == ([] if stage else ack_sizes)
                     scheduler.process_input_requests([SimpleNamespace(hicache_write_policy="write_through")])
-                    if topology == "TP" and difference is None:
-                        # Both enabled startup limits participate. Only the
-                        # tighter one has excess; the wider one may contribute.
-                        patch.setattr(policy, "limit_tokens", 100 if lane else 0)
                     if rank == 0:
                         cache._enforce_prefix_cache_retention(0)
                     cache.check_hicache_events()
@@ -1309,7 +1318,6 @@ def _exercise(rank, uri):
                             cache.check_hicache_events()
                         assert freed == [leaf]
                     if topology == "TP" and difference is None:
-                        patch.setattr(policy, "limit_tokens", 0)
                         scheduler._engine_paused = True
                         for revision, limit in [(2, -1), (3, 0)]:
                             if limit < 0:

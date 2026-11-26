@@ -186,24 +186,26 @@ def test_parallel_rollback_retention_keeps_logical_prefixes(native, tmp_path):
     )
 
 
-def _check_retracted_host_match(cache):
+def _check_retracted_host_match(scheduler):
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     from kvcached.integration.sglang import hicache_retention as retention
 
+    cache = scheduler.tree_cache
     cache.tree_core.set_hicache_enabled()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(retention, "get_prefix_cache_retention_limit", lambda: 0)
-        cache.check_hicache_events()
-        for resumed in (False, True):
-            req = Req(str(resumed), "", array("q", [10, 99]), SamplingParams(max_new_tokens=3))
-            if resumed:
-                req.output_ids.append(101)
-                req.reset_for_retract()
-            assert retention.request_slot(req) is None
-            req.init_next_round_input(cache)
-            assert req.prefix_indices.numel() == 0 and req.host_hit_length == int(resumed)
+    retention.prefix_cache_retention._apply_prefix_cache_retention_update(
+        {"revision": (1,), "limit_tokens": 0})
+    scheduler.process_input_requests([])
+    cache.check_hicache_events()
+    for resumed in (False, True):
+        req = Req(str(resumed), "", array("q", [10, 99]), SamplingParams(max_new_tokens=3))
+        if resumed:
+            req.output_ids.append(101)
+            req.reset_for_retract()
+        assert retention.request_slot(req) is None
+        req.init_next_round_input(cache)
+        assert req.prefix_indices.numel() == 0 and req.host_hit_length == int(resumed)
 
 
 def _install_retention_scheduler(cache, patch):
@@ -259,20 +261,21 @@ def _hicache_retention_rank(rank, rendezvous):
                     cache.tree_core.commit_backup(node.id, torch.tensor([50 + i]), {})
                 nodes.append(node)
             with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(retention, "get_prefix_cache_retention_limit", lambda: 1)
+                policy = retention.prefix_cache_retention
+                patch.setattr(policy, "_policy", policy._PrefixCacheRetentionPolicy(1))
                 scheduler = _install_retention_scheduler(cache, patch)
                 for _ in range(4):
                     scheduler.tree_cache.check_hicache_events()
-            assert manager.allocated == {"different_keys": {0, 1}, "different_backup": {0}, "same": {1}}[scenario]
-            assert [node.evicted for node in nodes] == [scenario == "same", scenario == "different_backup"]
-            first_backup = nodes[0].component(component).host_value
-            if scenario == "different_backup" and rank == 1:
-                assert first_backup is None
-            else:
-                assert first_backup.tolist() == [50]
-            assert nodes[1].component(component).host_value.tolist() == [51]
-            if scenario == "same":
-                _check_retracted_host_match(cache)
+                assert manager.allocated == {"different_keys": {0, 1}, "different_backup": {0}, "same": {1}}[scenario]
+                assert [node.evicted for node in nodes] == [scenario == "same", scenario == "different_backup"]
+                first_backup = nodes[0].component(component).host_value
+                if scenario == "different_backup" and rank == 1:
+                    assert first_backup is None
+                else:
+                    assert first_backup.tolist() == [50]
+                assert nodes[1].component(component).host_value.tolist() == [51]
+                if scenario == "same":
+                    _check_retracted_host_match(scheduler)
     finally:
         dist.destroy_process_group()
 

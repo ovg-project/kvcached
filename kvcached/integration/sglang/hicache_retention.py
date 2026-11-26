@@ -16,7 +16,7 @@ from dataclasses import replace
 from enum import Enum, auto
 from itertools import chain, islice
 from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
-from weakref import ReferenceType, ref
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from kvcached import prefix_cache_retention
 from kvcached.control import get_prefix_cache_retention_limit
@@ -73,7 +73,7 @@ def _leaf_pages(leaves: Any, width: int) -> Iterator[List[Any]]:
     if isinstance(leaves, _DeviceLeaves):
         yield from leaves.pages(width)
     else:
-        # The standalone synchronous trimmer may receive native sets.
+        # Some cache implementations expose their own iterable leaf collection.
         stream = iter(leaves)
         while page := list(islice(stream, width)):
             yield page
@@ -195,33 +195,22 @@ def _extend_path(segment: Any, path: Any, namespace: Any) -> Tuple[Any, Any]:
     return path, scope
 
 
-def _leaf_signature(node: Any, paths: Dict[Any, Tuple[Any, Any]],
-                    ancestors: Optional[OrderedDict] = None) -> bytes:
+def _remember_ancestor(ancestors: WeakKeyDictionary, node: Any, path: Any, scope: Any) -> None:
+    # The sweep must not keep a detached subtree alive through its parent.
+    parent = ref(node.parent) if node.parent.parent is not None else None
+    ancestors[node] = node.key, parent, path, scope
+
+
+def _leaf_signature(node: Any, paths: Dict[Any, Tuple[Any, Any]]) -> bytes:
     missing = []
     ancestor = node
     while ancestor.parent is not None and ancestor not in paths:
-        if ancestors is not None and ancestor is not node:
-            saved = ancestors.get(ancestor)
-            key = ancestor.key
-            if (saved is not None and saved[0] is key and saved[1] is ancestor.parent
-                    and saved[3] == (key.extra_key, key.cache_salt, key.is_bigram)):
-                paths[ancestor] = saved[2], saved[3]
-                break
         missing.append(ancestor)
         ancestor = ancestor.parent
     path, namespace = (hashlib.sha256(), None) if ancestor.parent is None else paths[ancestor]
     for segment in reversed(missing):
         path, namespace = _extend_path(segment, path, namespace)
         paths[segment] = path, namespace
-        if ancestors is not None and segment is not node:
-            # A surviving radix node always represents the same full prefix.
-            # A split replaces its edge key and parent. Keep recent ancestor
-            # states for promotions, but evaluate each victim's own edge and
-            # live component/backup state at the ballot.
-            ancestors[segment] = segment.key, segment.parent, path, namespace
-            ancestors.move_to_end(segment)
-            if len(ancestors) > _INDEX_PER_POLL:
-                ancestors.popitem(last=False)
     digest = path.copy()
     digest.update(struct.pack("<Q", len(node.key)))
     digest.update(bytes([node.backuped]))
@@ -230,6 +219,30 @@ def _leaf_signature(node: Any, paths: Dict[Any, Tuple[Any, Any]],
     for cd in getattr(node, "component_data", ()):
         digest.update(bytes([cd.value is not None, cd.host_value is not None]))
     return digest.digest()
+
+
+def _ballot_signature(node: Any, paths: Dict[Any, Tuple[Any, Any]], ancestors: WeakKeyDictionary,
+                      edge_limit: int) -> Optional[bytes]:
+    # A busy scheduler may have inserted an entire chain above this leaf.
+    # Leave long repairs to the paged index; peers are waiting for this vote.
+    missing: List[Any] = []
+    cursor = node
+    while cursor.parent is not None and cursor not in paths:
+        saved = ancestors.get(cursor) if cursor is not node else None
+        key = cursor.key
+        if (saved is not None and saved[0] is key
+                and (saved[1]() is cursor.parent if saved[1] is not None else cursor.parent.parent is None)
+                and saved[3] == (key.extra_key, key.cache_salt, key.is_bigram)):
+            paths[cursor] = saved[2], saved[3]
+            break
+        if len(missing) >= edge_limit:
+            return None
+        missing.append(cursor)
+        cursor = cursor.parent
+    signature = _leaf_signature(node, paths)
+    for segment in missing[1:]:
+        _remember_ancestor(ancestors, segment, *paths[segment])
+    return signature
 
 
 def _evict(cache: Any, nodes: List[Any]) -> int:
@@ -245,7 +258,7 @@ def _evict(cache: Any, nodes: List[Any]) -> int:
     return freed
 
 
-def _signature_pages(leaves: Any) -> Iterator[Tuple[List[Any], bool]]:
+def _signature_pages(leaves: Any, ancestors: WeakKeyDictionary) -> Iterator[Tuple[List[Any], bool, int]]:
     """Index a leaf page across multiple polls if its radix paths are deep."""
     remaining = len(leaves)
     for page in _leaf_pages(leaves, _VICTIMS_PER_BATCH):
@@ -259,14 +272,14 @@ def _signature_pages(leaves: Any) -> Iterator[Tuple[List[Any], bool]]:
             chain = []
             while cursor.parent is not None and cursor not in paths:
                 if steps >= _INDEX_PER_POLL:
-                    yield indexed, True
+                    yield indexed, True, steps
                     indexed, steps = [], 0
                 chain.append(cursor)
                 cursor = cursor.parent
                 steps += 1
             for node in reversed(chain):
                 if steps >= _INDEX_PER_POLL:
-                    yield indexed, True
+                    yield indexed, True, steps
                     indexed, steps = [], 0
                 # The scheduler may have split the edge while we yielded.
                 # Leave such a path for a later sweep.
@@ -274,21 +287,17 @@ def _signature_pages(leaves: Any) -> Iterator[Tuple[List[Any], bool]]:
                     break
                 base = (hashlib.sha256(), None) if node.parent.parent is None else paths[node.parent]
                 paths[node] = _extend_path(node, *base)
+                if node is not leaf:
+                    _remember_ancestor(ancestors, node, *paths[node])
                 steps += 1
             if leaf in paths and leaf in leaves:
-                parent = leaf.parent
-                checkpoint = None
-                if parent.parent is not None and parent in paths:
-                    key = parent.key
-                    digest, scope = paths[parent]
-                    checkpoint = ref(parent), key, id(parent.parent), digest, scope
-                indexed.append((leaf, _leaf_signature(leaf, paths), checkpoint))
+                indexed.append((leaf, _leaf_signature(leaf, paths)))
             if len(paths) > _INDEX_PER_POLL:
                 paths.clear()
         remaining -= len(page)
-        yield indexed, remaining > 0
+        yield indexed, remaining > 0, steps
     if remaining:
-        yield [], False
+        yield [], False, 0
 
 
 def _reduce_victims(cache: Any, data: Any, op: Any) -> None:
@@ -441,24 +450,25 @@ class _VictimPlan:
 
         proposing = not dist.is_initialized() or dist.get_rank() == proposer
         width = hashlib.sha256().digest_size
-        ancestors: OrderedDict = OrderedDict()
         while True:
             leaves, priority = _eviction_order(cache)
-            pages = _signature_pages(leaves)
+            ancestors: WeakKeyDictionary = WeakKeyDictionary()
+            pages = _signature_pages(leaves, ancestors)
             indexing = True
             by_signature: Dict[bytes, ReferenceType] = {}
-            checkpoints: Dict[bytes, Any] = {}
             keys: List[Tuple[Any, bytes]] = []
             # Keep the lowest eviction-priority child as a live witness.
             # It normally outlasts all earlier pages from the same parent.
             witnesses: Dict[int, Tuple[Tuple[Any, bytes], ReferenceType]] = {}
             self.search_changed = False
             progressed = False
+            reindex = False
             while True:
                 leaves, priority = _eviction_order(cache)
                 paths: Dict[Any, Tuple[Any, Any]] = {}
-                candidates, indexing = next(pages, ([], False)) if indexing else ([], False)
-                for candidate, signature, checkpoint in candidates:
+                candidates, indexing, steps = next(pages, ([], False, 0)) if indexing else ([], False, 0)
+                ballot_budget = _INDEX_PER_POLL - steps
+                for candidate, signature in candidates:
                     if candidate in leaves and (candidate.backuped or not candidate.children):
                         if proposing and signature not in by_signature:
                             entry = priority(candidate), signature
@@ -469,8 +479,6 @@ class _VictimPlan:
                                 if previous is None or entry > previous[0]:
                                     witnesses[parent_id] = entry, ref(candidate)
                         by_signature[signature] = ref(candidate)
-                        if checkpoint is not None:
-                            checkpoints[signature] = checkpoint
                 paths.clear()
                 packet = bytearray(_VICTIMS_PER_BATCH * width + 4)
                 page: List[Tuple[Any, bytes]] = []
@@ -510,7 +518,9 @@ class _VictimPlan:
                             break
                     packet[:len(page) * width] = b"".join(key for _, key in page)
                     packet[-4:-1] = bytes((len(page), bool(keys), may_promote))
-                packet[-1] = indexing
+                # If the final index page used most of the slot, every rank
+                # resumes the ballot next poll with its full budget.
+                packet[-1] = indexing or ballot_budget < 2 * _VICTIMS_PER_BATCH
                 _reduce_victims(cache, torch.frombuffer(packet, dtype=torch.uint8), dist.ReduceOp.MAX)
                 count, more, last_may_promote, building = packet[-4:]
                 if building:
@@ -525,35 +535,33 @@ class _VictimPlan:
                 leaves, _ = _eviction_order(cache)
                 paths = {}
                 nodes = []
+                votes = []
+                # Allow the same number of promoted parents after eviction.
+                edge_limit = ballot_budget // (2 * max(1, count))
                 for i in range(count):
                     signature = bytes(packet[i * width:(i + 1) * width])
                     reference = by_signature.get(signature)
                     node = reference() if reference is not None else None
-                    checkpoint = checkpoints.get(signature)
-                    if node is not None and checkpoint is not None:
-                        parent_ref, parent_key, grandparent, digest, scope = checkpoint
-                        parent = node.parent
-                        if (parent is not parent_ref() or parent is None or parent_key is not parent.key
-                                or id(parent.parent) != grandparent
-                                or scope != (parent_key.extra_key, parent_key.cache_salt, parent_key.is_bigram)):
-                            node = None
-                        else:
-                            paths[parent] = digest, scope
-                    if (node is None or node not in leaves or not (node.backuped or not node.children)
-                            or _leaf_signature(node, paths, ancestors) != signature):
-                        node = None
+                    vote = 0
+                    if node is not None and node in leaves and (node.backuped or not node.children):
+                        proof = _ballot_signature(node, paths, ancestors, edge_limit)
+                        # MIN rejects an absent or changed leaf (0), defers an
+                        # incomplete proof (1), and accepts only unanimity (2).
+                        vote = 1 if proof is None else 2 * int(proof == signature)
+                    votes.append(vote)
                     nodes.append(node)
                 paths.clear()
                 if count:
-                    accepted = torch.tensor([n is not None for n in nodes], dtype=torch.uint8, device="cpu")
+                    accepted = torch.tensor(votes, dtype=torch.uint8, device="cpu")
                     _reduce_victims(cache, accepted, dist.ReduceOp.MIN)
                     votes = accepted.tolist()
+                    reindex |= 1 in votes
                     # An accepted final child can refill the proposer's heap.
                     # Vote on its parent before re-indexing discarded leaves.
-                    more = more or (last_may_promote and votes[-1])
+                    more = more or (last_may_promote and votes[-1] == 2)
                     agreed = []
-                    for node, safe in zip(nodes, votes):
-                        if safe:
+                    for node, vote in zip(nodes, votes):
+                        if vote == 2:
                             assert node is not None  # Local membership participated in MIN.
                             agreed.append(node)
                             self.remaining -= len(node.key)
@@ -565,15 +573,17 @@ class _VictimPlan:
                         progressed = True
                         for parent in parents:
                             if parent in leaves and (parent.backuped or not parent.children):
-                                key = _leaf_signature(parent, paths, ancestors)
-                                if proposing and key not in by_signature:
-                                    heapq.heappush(keys, (priority(parent), key))
-                                by_signature[key] = ref(parent)
+                                parent_key = _ballot_signature(parent, paths, ancestors, edge_limit)
+                                if parent_key is None:
+                                    continue
+                                if proposing and parent_key not in by_signature:
+                                    heapq.heappush(keys, (priority(parent), parent_key))
+                                by_signature[parent_key] = ref(parent)
                         paths.clear()
                 if self.remaining <= 0:
                     yield True
                     return
-                if not more and not progressed:
+                if not more and not progressed and not reindex:
                     yield False
                     return
                 yield None
@@ -595,18 +605,6 @@ def _group_demand(cache: Any, limit: int, changed: bool) -> Tuple[int, bool, Opt
     _reduce_victims(cache, status, dist.ReduceOp.MAX)
     excess, changed_flag, election = status.tolist()
     return excess, bool(changed_flag), -election if election <= 0 else None
-
-
-def trim_parallel_hicache(cache: Any, limit: int) -> bool:
-    """Trim synchronously. The scheduler advances the same plan one poll at a time."""
-    plan = _VictimPlan()
-    demand, _, proposer = _group_demand(cache, limit, True)
-    while demand:
-        result = plan.poll(cache, demand, proposer, False)
-        if result is not None:
-            return result
-        demand, _, proposer = _group_demand(cache, limit, False)
-    return True
 
 
 def _prepare_pipeline_vote(scheduler: Any, cache: Any) -> Callable[[], None]:
@@ -971,7 +969,7 @@ def install_parallel_hicache_retention(scheduler: Any) -> None:
 
     @functools.wraps(original_reduce)
     def reduce(data: Any, tp_reduce_op: Any) -> Any:
-        nonlocal count_slots, needs_vote, enabled, periodic_probe, stamp, group_write_through
+        nonlocal count_slots, needs_vote, enabled, periodic_probe, stamp
         nonlocal retry_delay, skip_votes
         if not count_slots:
             return original_reduce(data, tp_reduce_op)
@@ -990,26 +988,16 @@ def install_parallel_hicache_retention(scheduler: Any) -> None:
             else:
                 eligible, locked = cache.evictable_size_, cache.protected_size_
             needed = eligible > limit or (eligible + locked > limit and bool(flat[:2].any()))
-        extended = data.new_empty(flat.numel() + 2)
-        extended[:-2].copy_(flat)
-        # Keep demand separate from admission. MIN selects the most urgent
-        # state: trim now (0), monitor a finite cap (1), or unlimited (2).
-        # MIN selects write-back (0), then cold (1), then warm (2).
-        cold = group_zero if cache.pp_size > 1 else limit == 0
-        extended[-2] = (1 if cold else 2) if write_through else 0
+        extended = data.new_empty(flat.numel() + 1)
+        extended[:-1].copy_(flat)
+        # MIN selects trim now (0), monitor a finite cap (1), or unlimited (2).
         extended[-1] = 0 if needed else 1 + int(limit < 0)
         original_reduce(extended, tp_reduce_op)
-        data.copy_(extended[:-2].view_as(data))
-        mode = int(extended[-2])
+        data.copy_(extended[:-1].view_as(data))
         pressure = int(extended[-1])
         enabled = pp_has_cap or pressure < 2
         if not enabled:
             forget_plan()
-        # Only the TP-only ACK is an all-rank reduction. A PP ACK carries
-        # stage zero's policy downstream and cannot decide group admission.
-        if cache.pp_size == 1:
-            group_write_through = mode > 0
-            set_cold_admission(mode == 1)
         periodic_probe = enabled and group_write_through
         needs_vote |= periodic_probe and pressure == 0
         # A write/load completion can unlock a new common victim. Storage
