@@ -343,16 +343,16 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             get_last_batch=lambda: None, get_running_batch=lambda: None,
         )
         with monkeypatch.context() as pressure:
-            patch = DeepSeekV4PoolStatsPatch()
+            observer_patch = DeepSeekV4PoolStatsPatch()
             method = observer_class._get_swa_token_info
             # An installed .pth can apply this wrapper during SGLang import.
-            native_method = method.__wrapped__ if patch._is_already_patched(method) else method
+            native_method = method.__wrapped__ if observer_patch._is_already_patched(method) else method
             pressure.setattr(observer_class, "_get_swa_token_info", native_method)
             pressure.setattr(manager, "available_size", lambda: 0)
             physical_available = shared.swa_available_size()
             native_stats = observer._get_swa_token_info()
             assert native_stats.swa_num_used > 0
-            assert patch.apply(observer_module)
+            assert observer_patch.apply(observer_module)
             stats = observer._get_swa_token_info()
             assert stats.full_num_used == stats.swa_num_used == 0
             assert stats.full_available_size == observer.full_tokens_per_layer
