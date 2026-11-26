@@ -39,6 +39,19 @@ def install_c4_state_backing(pool_module: Any, top_class: Any,
             # The native HIP constructor initializes the entire offline pool.
             return original_alloc(state, dtype=dtype, device=device,
                                   enable_memory_saver=enable_memory_saver)
+        if request_state:
+            # Prefill capture uses rows 0..bs-1 without calling alloc_rows.
+            # Keep that storage native until capture-specific leases exist.
+            try:
+                from sglang.srt.runtime_context import get_exec
+
+                backend = get_exec().graph.cuda_graph_config.prefill.backend
+                capture_disabled = getattr(backend, "value", backend) == "disabled"
+            except (ImportError, AttributeError, RuntimeError):
+                capture_disabled = False
+            if not capture_disabled:
+                return original_alloc(state, dtype=dtype, device=device,
+                                      enable_memory_saver=enable_memory_saver)
         row_bytes = state.last_dim * dtype.itemsize
         page_bytes = state.ring_size * row_bytes
         native_pages = (state._size + state.ring_size - 1) // state.ring_size
@@ -82,10 +95,11 @@ def install_c4_state_backing(pool_module: Any, top_class: Any,
                 num_blocks=physical_pages, block_size=1, cell_size=physical_bytes,
                 num_layers=layers, reserve_null_block=True, num_kv_buffers=1,
                 group_id=group_id, pool_name=f"dsv4_c{state.ratio}_state",
+                permanent_block_ids=tuple(sorted(permanent - {0})),
             )
             backing = SWABacking(manager, native_pages=native_pages,
                                  native_page_bytes=page_bytes, physical_page_bytes=physical_bytes,
-                                 permanent_pages=permanent)
+                                 permanent_pages=permanent, addressable_pages=required_pages)
             # Padding and sentinel backing must settle before native clear/write.
             manager.wait_ready()
             group = groups[key] = dict(buffers=buffers, raw=raw, backing=backing, used=0,

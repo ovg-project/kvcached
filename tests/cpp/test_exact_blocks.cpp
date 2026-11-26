@@ -25,5 +25,20 @@ int main() {
   assert(claim_exact_blocks(free, {}));
   assert(claim_exact_blocks(free, {7, 1}));
   assert(free.empty());
+  // One unrelated reserve, one free driver bundle: map the requested ID,
+  // leaving no driver bytes for a sibling. If the driver is already full,
+  // native trims the unrelated reserve first. A matching ID is free to use.
+  const auto quote = kvcached::quote_exact_pages({2, 7}, {2}, {}, {7, 8}, 20);
+  assert(quote && std::get<0>(*quote) == 20 &&
+         std::get<1>(*quote) == std::vector<int64_t>({8}) &&
+         std::get<2>(*quote) == 0);
+  const auto local = kvcached::quote_exact_pages({2, 7}, {}, {2}, {7, 8}, 20);
+  assert(local && std::get<2>(*local) == 1 &&
+         std::get<1>(*local) == std::vector<int64_t>({8}));
+  assert(!kvcached::quote_exact_pages({9}, {2}, {}, {7}, 20));
+  std::deque<int64_t> reserved{5, 9, 10};
+  assert(kvcached::extract_reserved_pages(reserved, {9, 17}) ==
+         std::vector<int64_t>({9}));
+  assert(reserved == std::deque<int64_t>({5, 10}));
   std::cout << "exact block selection contracts passed\n";
 }

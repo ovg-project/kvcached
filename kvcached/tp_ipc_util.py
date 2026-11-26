@@ -80,6 +80,22 @@ def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
 Message = Dict[str, Any]
 
 
+def _worker_offsets(message: Message, group_id: int) -> list[int]:
+    """Translate scheduler page offsets into this PP stage's byte geometry."""
+    offsets = message["offsets"]
+    if "offset_stride" not in message:
+        # Direct calls and map rollback already carry worker-local offsets.
+        return cast(list[int], offsets)
+    source_stride = message["offset_stride"]
+    if not isinstance(source_stride, int) or source_stride <= 0:
+        raise ValueError("KV offset stride must be a positive integer")
+    if any(not isinstance(offset, int) or offset < 0 or offset % source_stride
+           for offset in offsets):
+        raise ValueError("KV offsets must be nonnegative and page aligned")
+    worker_stride = vmm_ops.kv_mapping_page_size(group_id=group_id)
+    return [offset // source_stride * worker_stride for offset in offsets]
+
+
 def send_msg(sock: socket.socket, msg: Message) -> None:
     """
     Send a message through the socket.
@@ -241,6 +257,13 @@ _listeners_lock = threading.Lock()
 _atexit_registered = False
 
 
+def worker_socket_paths() -> list[str]:
+    """The socket paths this process's registered IPC listeners bound, for
+    the launching process to remember (issue #548)."""
+    with _listeners_lock:
+        return sorted(listener.socket_path for listener in _listeners.values())
+
+
 def stop_worker_listener_threads(
         drain_timeout_s: float = STOP_DRAIN_TIMEOUT_S) -> bool:
     """Stop every worker IPC listener started in this process: cancel reads
@@ -349,7 +372,8 @@ def _start_worker_listener_thread(
                     break  # stop() is waiting; do not start a dispatch
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    success, newly_mapped = _map_to_kv_tensors_with_result(msg["offsets"], group_id)
+                    success, newly_mapped = _map_to_kv_tensors_with_result(
+                        _worker_offsets(msg, group_id), group_id)
                     if not success:
                         raise RuntimeError(f"Failed to map KV tensors for group_id={group_id}")
                     send_msg(
@@ -361,7 +385,7 @@ def _start_worker_listener_thread(
                     )
                 elif msg["cmd"] == "unmap_from_kv_tensors":
                     _sync_before_unmap()
-                    if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
+                    if not unmap_from_kv_tensors(_worker_offsets(msg, group_id), group_id=group_id):
                         raise RuntimeError(f"Failed to unmap KV tensors for group_id={group_id}")
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "prepare_unmap_from_kv_tensors":
@@ -372,7 +396,7 @@ def _start_worker_listener_thread(
                         raise RuntimeError("VMM extension does not support transactional unmap")
                     _sync_before_unmap()
                     if not prepare_unmap_from_kv_tensors(
-                        msg["offsets"], msg["transaction_id"], group_id=group_id
+                        _worker_offsets(msg, group_id), msg["transaction_id"], group_id=group_id
                     ):
                         raise RuntimeError(f"Failed to prepare KV unmap for group_id={group_id}")
                     if msg.get("commit"):
@@ -397,6 +421,22 @@ def _start_worker_listener_thread(
                     if not abort_unmap_from_kv_tensors(msg["transaction_id"], group_id=group_id):
                         raise RuntimeError(f"Failed to abort KV unmap for group_id={group_id}")
                     send_msg(conn, {"status": "aborted"})
+                elif msg["cmd"] == "instance_control":
+                    from kvcached import _C  # type: ignore[attr-defined]
+                    state = _C.local_instance_control(group_id, msg.get("configure"),
+                                                      msg.get("expected_participants", 0),
+                                                      msg.get("startup_pages", 0),
+                                                      msg.get("reserve_null", False),
+                                                      **({"minimum_pages": msg["minimum_pages"]}
+                                                         if msg.get("minimum_pages") else {}))
+                    send_msg(conn, {"status": "success", "control": state})
+                elif msg["cmd"] == "ack_instance_control":
+                    from kvcached import _C  # type: ignore[attr-defined]
+                    state = _C.local_instance_control(group_id)
+                    accepted = (not msg["published"] or
+                                (state["generation"] == msg["generation"] and
+                                 _C.acknowledge_instance_control(group_id, msg["revision"])))
+                    send_msg(conn, {"status": "success", "accepted": accepted})
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
@@ -484,12 +524,15 @@ async def _send_and_receive_message(rank: int, message: Message, pp_rank: int = 
 
 
 async def _broadcast_map_to_kv_tensors(
-    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
 ) -> None:
     """
     Broadcast the "map_to_kv_tensors" operation to all workers concurrently.
     """
     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets, "group_id": group_id}
+    if offset_stride is not None:
+        map_message["offset_stride"] = offset_stride
     targets = [
         (target_pp_rank, rank)
         for target_pp_rank in _target_pp_ranks(pp_rank)
@@ -575,7 +618,8 @@ async def _broadcast_map_to_kv_tensors(
 
 
 async def _broadcast_unmap_from_kv_tensors(
-    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
 ) -> None:
     """
     Broadcast the "unmap_from_kv_tensors" operation to all workers concurrently.
@@ -593,6 +637,8 @@ async def _broadcast_unmap_from_kv_tensors(
         "group_id": group_id,
     }
     single_target = len(targets) == 1
+    if offset_stride is not None:
+        prepare_message["offset_stride"] = offset_stride
     if single_target:
         prepare_message["commit"] = True
     prepare_tasks = [
@@ -724,16 +770,59 @@ async def _broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0, group_id
 
 # Wrapper functions to call the async function from sync code
 def broadcast_map_to_kv_tensors(
-    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
 ) -> None:
-    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank, group_id))
+    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank, group_id, offset_stride))
 
 
 def broadcast_unmap_from_kv_tensors(
-    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0
+    tp_size: int, offsets: list[int], pp_rank: int = 0, group_id: int = 0,
+    offset_stride: Optional[int] = None,
 ) -> None:
-    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank, group_id))
+    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank, group_id, offset_stride))
 
 
 def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0, group_id: int = 0) -> bool:
     return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank, group_id))
+
+
+async def _control_workers(tp_size: int, pp_rank: int, group_id: int,
+                           configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
+                           minimum_pages=0):
+    targets = [(stage, rank) for stage in _target_pp_ranks(pp_rank)
+               for rank in range(tp_size)]
+    messages = []
+    for stage, rank in targets:
+        if acknowledgements is None:
+            messages.append({"cmd": "instance_control", "group_id": group_id,
+                             "configure": configure, "expected_participants": expected_participants,
+                             "startup_pages": startup_pages, "reserve_null": reserve_null,
+                             "minimum_pages": minimum_pages})
+        else:
+            messages.append({"cmd": "ack_instance_control", "group_id": group_id,
+                             "generation": acknowledgements[(stage, rank)][0],
+                             "revision": acknowledgements[(stage, rank)][1],
+                             "published": acknowledgements[(stage, rank)][2]})
+
+    responses = await asyncio.gather(*[
+        _send_and_receive_message(rank, message, stage)
+        for (stage, rank), message in zip(targets, messages)
+    ], return_exceptions=True)
+    results = []
+    for (stage, rank), response in zip(targets, responses):
+        if isinstance(response, Exception) or not isinstance(response, dict) or response.get("status") != "success":
+            raise RuntimeError(f"KV control worker pp{stage}/rank{rank} unavailable: {response}")
+        if acknowledgements is None:
+            results.append(dict(response["control"], pp_rank=stage, rank=rank))
+        elif not response.get("accepted"):
+            return False
+    return results if acknowledgements is None else True
+
+
+def control_workers(tp_size: int, pp_rank: int, group_id: int,
+                    configure=None, acknowledgements=None, expected_participants=0, startup_pages=0, reserve_null=False,
+                    minimum_pages=0):
+    return asyncio.run(_control_workers(tp_size, pp_rank, group_id,
+                                       configure, acknowledgements, expected_participants, startup_pages, reserve_null,
+                                       minimum_pages))

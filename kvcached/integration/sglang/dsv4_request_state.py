@@ -4,13 +4,26 @@
 
 import functools
 import types
+from collections import Counter
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, NamedTuple
 
 from kvcached.integration.sglang.dsv4_backing import SWABacking
+from kvcached.integration.sglang.scheduler.rank_plan import request_slot
 
 request_pool_context: ContextVar[Any] = ContextVar("dsv4_state_request_pool", default=None)
 request_admission_context: ContextVar[Any] = ContextVar("dsv4_request_admission", default=None)
+
+
+class AdmissionReservation(NamedTuple):
+    previous: frozenset[int]
+    rows: tuple[int, ...]
+    target: int
+
+    @property
+    def available(self) -> int:
+        return len(self.rows)
 
 
 class RequestStateBacking:
@@ -29,6 +42,11 @@ class RequestStateBacking:
         self.standby: set[int] = set()
         self.admission_rows = 1
         self.failed = False
+        self.admission_budget: int | None = None
+        self.capacity_override: int | None = None
+        self.reusable_allowance: int | None = None
+        self.demand_rows: list[int] = []
+        self.standby_reclaimable = lambda: True
         self._alloc_rows = pool.alloc_rows
         self._free_rows = pool.free_rows
         self._available = pool.available_size
@@ -71,17 +89,24 @@ class RequestStateBacking:
             raise
 
     def reserve(self, count: int) -> int:
+        return len(self._reserve(count, retain_standby=False))
+
+    def _reserve(self, count: int, *, retain_standby: bool) -> list[int]:
         self._ready()
+        self.demand_rows.clear()
         for backing, _, _ in self.entries:
             backing.manager.wait_ready()
         for backing, _, _ in self.entries:
             backing.manager.apply_resize_target()
         count = min(max(0, count), int(self._available()))
         if not count:
-            return 0
+            if not retain_standby:
+                self._release(self.standby)
+                self.standby.clear()
+            return []
         rows = self._alloc_rows(count)
         if rows is None:
-            return 0
+            return []
         # Preflight increments native generations only for free rows. Returning
         # the same ordered vector restores native tail allocation order.
         selected: set[int] = set()
@@ -90,6 +115,7 @@ class RequestStateBacking:
             if self._acquire(requested):
                 selected = requested
             else:
+                self.demand_rows = list(rows)
                 # Native allocation consumes the ordered tail. Find the largest
                 # backed tail instead of hiding a smaller usable batch after a
                 # full-window miss. Successful probes are nested and retained.
@@ -102,14 +128,79 @@ class RequestStateBacking:
                         low = middle
                     else:
                         high = middle - 1
-            self._release(self.standby - selected)
-            self.standby = selected
-            return len(selected)
+            if retain_standby:
+                self.standby.update(selected)
+            else:
+                self._release(self.standby - selected)
+                self.standby = selected
+            return [row for row in rows if row in selected]
         except Exception:
             self._release(selected - self.standby)
             raise
         finally:
             self._free_rows(rows)
+
+    def logical_available(self) -> int:
+        return int(self._available())
+
+    def managers(self) -> list[Any]:
+        return [backing.manager for backing, _, _ in self.entries]
+
+    def backing_demand(self, pending_rows: int) -> list[tuple[Any, int]]:
+        if pending_rows <= 0:
+            self.demand_rows.clear()
+        # Probes cover the entire logical window. Forecast only the native
+        # tail needed by actual admissions, excluding rows already consumed.
+        rows = [row for row in self.demand_rows if row not in self.active]
+        needed = set(rows[-pending_rows:]) if pending_rows > 0 else set()
+        return [(backing.manager, len(backing.missing_physical_pages(
+            self._ids(needed, stride, banks))))
+            for backing, stride, banks in self.entries]
+
+    def can_reclaim_standby(self) -> bool:
+        return (self.admission_budget is None and self.capacity_override is None
+                and request_admission_context.get() is not self and self.standby_reclaimable())
+
+    def reclaim_standby(self) -> None:
+        if self.can_reclaim_standby():
+            self._release(self.standby)
+            self.standby.clear()
+
+    def register_reclaimers(self) -> None:
+        if hasattr(self, "reclaimers"):
+            return
+        self.reclaimers = [RequestStateReclaimer(self, entry) for entry in self.entries]
+        for reclaimer in self.reclaimers:
+            manager = reclaimer.backing.manager
+            manager._register_shrink_reclaimer(self.reclaim_standby)
+            manager._register_cache_owner(reclaimer.count_pages, reclaimer.evict_pages)
+
+    @contextmanager
+    def capacity_query(self, count: int):
+        previous = self.capacity_override
+        self.capacity_override = count
+        try:
+            yield
+        finally:
+            self.capacity_override = previous
+
+    def prepare_admission(self, count: int) -> AdmissionReservation:
+        previous = frozenset(self.standby)
+        rows = self._reserve(count, retain_standby=True)
+        return AdmissionReservation(previous, tuple(rows), max(0, count))
+
+    def finish_admission(self, reservation: AdmissionReservation, count: int) -> None:
+        """Return only newly reserved surplus; retain a previous standby lease."""
+        if not 0 <= count <= reservation.available:
+            raise ValueError("Admission exceeds the locally backed native rows")
+        keep = set(reservation.rows[-count:]) if count else set()
+        retained = set(reservation.previous) | keep
+        self._release(self.standby - retained)
+        self.standby.intersection_update(retained)
+        self.admission_budget = count
+
+    def end_admission(self) -> None:
+        self.admission_budget = None
 
     def reclaim_on_idle(self, *, keep_standby: bool) -> None:
         """Apply request-state limits without evicting unrelated KV prefixes."""
@@ -129,12 +220,16 @@ class RequestStateBacking:
         owner = self
 
         def available(_pool: Any) -> int:
-            if request_admission_context.get() is owner:
-                return owner.reserve(owner.admission_rows)
+            if owner.capacity_override is not None:
+                return owner.capacity_override
+            if owner.admission_budget is not None:
+                return min(owner.admission_budget, int(owner._available()))
             return int(owner._available())
 
         def alloc_rows(_pool: Any, count: int) -> Any:
             owner._ready()
+            if owner.admission_budget is not None and count > owner.admission_budget:
+                return None
             rows = owner._alloc_rows(count)
             if rows is None or not rows:
                 return rows
@@ -144,10 +239,13 @@ class RequestStateBacking:
                 owner._free_rows(rows)
                 raise
             if not success:
+                owner.demand_rows = list(rows)
                 owner._free_rows(rows)
                 return None
             owner.active.update(rows)
             owner.standby.difference_update(rows)
+            if owner.admission_budget is not None:
+                owner.admission_budget -= len(rows)
             return rows
 
         def free_rows(_pool: Any, rows: list[int]) -> None:
@@ -158,7 +256,8 @@ class RequestStateBacking:
             # backing. Retain only the next admission window, using the public
             # row API to preserve its exact order while releasing surplus.
             owner.standby.update(rows)
-            owner.reserve(min(owner.admission_rows, len(owner.standby)))
+            if owner.admission_budget is None:
+                owner.reserve(min(owner.admission_rows, len(owner.standby)))
 
         def clear(_pool: Any) -> None:
             owner._ready()
@@ -166,6 +265,7 @@ class RequestStateBacking:
             owner._release(owner.active | owner.standby)
             owner.active.clear()
             owner.standby.clear()
+            owner.demand_rows.clear()
             owner.admission_rows = 1
 
         self.pool.available_size = types.MethodType(available, self.pool)
@@ -173,6 +273,29 @@ class RequestStateBacking:
         self.pool.free_rows = types.MethodType(free_rows, self.pool)
         self.pool.clear = types.MethodType(clear, self.pool)
         self.pool._kvcached_dsv4_request_state = self
+
+
+class RequestStateReclaimer:
+    """Only unpromised request-row leases; never token-prefix cache entries."""
+
+    def __init__(self, owner: RequestStateBacking, entry: tuple[SWABacking, int, int]):
+        self.owner = owner
+        self.backing, self.stride, self.banks = entry
+
+    def count_pages(self) -> int:
+        if not self.owner.can_reclaim_standby():
+            return 0
+        rows = self.owner._ids(self.owner.standby, self.stride, self.banks)
+        refs = Counter(page for row in rows for page in self.backing._span(row))
+        return sum(count == self.backing.refs[page] for page, count in refs.items())
+
+    def evict_pages(self, count: int) -> int:
+        before = len(self.backing.refs)
+        if count > 0:
+            # Coupled manager retirement enforces the shared byte allowance;
+            # unused row leases need not remain promised to a future request.
+            self.owner.reclaim_standby()
+        return before - len(self.backing.refs)
 
 
 def install_request_state_context(module: Any) -> bool:
@@ -219,30 +342,88 @@ def install_request_state_context(module: Any) -> bool:
     return True
 
 
+def admit_candidate(adder: Any, req: Any, admit: Any, rejected: Any) -> Any:
+    """Price this matched request while its token admission sees the held row bytes."""
+    owner = request_admission_context.get()
+    if owner is None:
+        return admit()
+    slot = request_slot(req)
+    if slot is not None and int(slot) not in owner.active:
+        raise RuntimeError(f"Request {req.rid} has an unbacked C128 row")
+    width = getattr(getattr(req, "beam_group", None), "beam_width", 1)
+    previous = owner.admission_rows
+    target = previous + width - int(slot is not None)
+    allocator = getattr(adder, "token_to_kv_pool_allocator", None)
+    logical = getattr(allocator, "logical_attn_allocator", allocator)
+    invalidate = getattr(logical, "_kvcached_invalidate_token_capacity", None)
+    if target == previous:
+        if invalidate is not None:
+            invalidate()
+        return admit()
+    if owner.reserve(target) < target:
+        missing = owner.demand_rows.copy()
+        owner.reserve(previous)
+        owner.demand_rows = missing
+        return rejected
+    if invalidate is not None:
+        invalidate()
+    count = len(adder.can_run_list)
+    try:
+        return admit()
+    finally:
+        if len(adder.can_run_list) == count:
+            owner.reserve(previous)
+        else:
+            owner.admission_rows = target
+
+
 def install_request_admission(scheduler: Any) -> bool:
     original = getattr(scheduler, "get_num_allocatable_reqs", None)
-    if original is None:
+    raw = getattr(scheduler, "_get_new_batch_prefill_raw", None)
+    if original is None or raw is None:
         return False
     if getattr(original, "_kvcached_request_state", False):
         return True
 
+    @functools.wraps(raw)
+    def prefill(this: Any, *args: Any, **kwargs: Any) -> Any:
+        owner = getattr(this.req_to_token_pool, "_kvcached_dsv4_request_state", None)
+        if owner is None or this.ps.tp_size != 1:
+            return raw(this, *args, **kwargs)
+        batch = kwargs.get("running_batch", args[-1] if args else this.running_batch)
+        pending = this.beam_coordinator.pending_member_rows(batch)
+        token = request_admission_context.set(owner)
+        owner.reusable_allowance = None
+        try:
+            # Return speculative or previously freed rows before token admission.
+            # Existing beam members have already been promised these rows.
+            owner.admission_rows = pending
+            owner.reserve(pending)
+            return raw(this, *args, **kwargs)
+        finally:
+            request_admission_context.reset(token)
+
     @functools.wraps(original)
     def available(this: Any, running_bs: int, beam_width: Any = None,
                   running_batch: Any = None) -> Any:
-        owner = getattr(this.req_to_token_pool, "_kvcached_dsv4_request_state", None)
-        if owner is not None:
-            pending = this.beam_coordinator.pending_member_rows(running_batch or this.running_batch)
-            # Ask the native gate for its logical batch limit without reserving
-            # physical storage, then preflight that many complete requests.
-            count = original(this, running_bs, beam_width, running_batch)
-            owner.admission_rows = pending + max(0, count) * (beam_width or 1)
-            token = request_admission_context.set(owner)
-            try:
-                return original(this, running_bs, beam_width, running_batch)
-            finally:
-                request_admission_context.reset(token)
-        return original(this, running_bs, beam_width, running_batch)
+        owner = request_admission_context.get()
+        if owner is None:
+            return original(this, running_bs, beam_width, running_batch)
+        # A streaming session may restore its row when native code matches
+        # its prefix, after this gate. The adder verifies its actual ownership.
+        if owner.reusable_allowance is None:
+            reusable = 0
+            if owner.active:
+                reusable = sum(request_slot(req) is not None or
+                               bool(getattr(getattr(req, "session", None), "streaming", False))
+                               for req in this.waiting_queue)
+                chunk = this.chunked_req
+                reusable += int(chunk is not None and request_slot(chunk) is not None)
+            owner.reusable_allowance = min(len(owner.active), reusable)
+        with owner.capacity_query(owner.logical_available() + owner.reusable_allowance):
+            return original(this, running_bs, beam_width, running_batch)
 
     available._kvcached_request_state = True  # type: ignore[attr-defined]
     scheduler.get_num_allocatable_reqs = available
+    scheduler._get_new_batch_prefill_raw = prefill
     return True

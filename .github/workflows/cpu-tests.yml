@@ -18,6 +18,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check out SGLang v0.5.20 sources for CPU tests
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: 94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+          path: .ci-sglang
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /python/sglang/srt/managers/schedule_policy.py
+            /python/sglang/srt/mem_cache/base_prefix_cache.py
+            /python/sglang/srt/mem_cache/hiradix_cache.py
+            /python/sglang/srt/mem_cache/radix_cache.py
+            /python/sglang/srt/mem_cache/unified_radix_cache.py
+            /python/sglang/srt/mem_cache/allocator/base.py
+            /python/sglang/srt/mem_cache/allocator/paged.py
+            /python/sglang/srt/mem_cache/allocator/swa.py
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -38,4 +56,6 @@ jobs:
         run: python tools/check_test_classification.py
 
       - name: Run CPU-only pytest suite
+        env:
+          SGLANG_SOURCE: ${{ github.workspace }}/.ci-sglang
         run: bash tools/run_cpu_tests.sh
