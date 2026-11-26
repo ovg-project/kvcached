@@ -10,19 +10,22 @@ from typing import Any
 
 
 class PriorityReclaimGroup:
-    def __init__(self, members: tuple[Any, ...], *, report_only: bool = False):
+    def __init__(self, members: tuple[Any, ...], *, report_only: bool = False, passive: tuple[Any, ...] = ()):
         identities = []
         slots = []
-        for member in members:
+        for member in (*members, *passive):
             control = member._runtime_control
             if control.worker_ipc or len(control.sources) != 1:
                 raise ValueError("coupled reclaim requires local single-rank pools")
             source = control.sources[0]
             identities.append(tuple(source[key] for key in ("gpu", "instance", "generation")))
             slots.append((source["pool_slot"], source["pool_owner"]))
-        if len(members) < 2 or len(set(identities)) != 1 or len(set(slots)) != len(members):
+        if len(members) < 2 or len(set(identities)) != 1 or len(set(slots)) != len(slots):
             raise ValueError("coupled reclaim requires distinct pools of one instance")
         self.members = members
+        # The native snapshot covers every live pool for the instance. Pools
+        # outside the token eviction group promise no reclaimable bytes.
+        self.passive_levels = tuple((*slot, 0, 0, 0) for slot in slots[len(members):])
         self.report_only = report_only
         self.release_members = tuple(sorted(members, key=lambda member: (
             member._runtime_control.sources[0]["pool_slot"])))
@@ -48,7 +51,7 @@ class PriorityReclaimGroup:
                 levels.append((source["pool_slot"], source["pool_owner"],
                                *(count * bundle for count in member._reclaimable_levels())))
             # Pool ownership matters even when the instance totals do not change.
-            snapshot = tuple(levels)
+            snapshot = (*levels, *self.passive_levels)
             if force or snapshot != self.posted:
                 source = self.members[0]._runtime_control.sources[0]
                 if not _publish_pool_reclaimable(source["gpu"], source["instance"],

@@ -93,7 +93,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote',
+                'exact_recovery_quote', '_acquire_block_backing', 'invalidate_physical_capacity',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -165,6 +165,47 @@ def test_exact_quote_with_no_local_headroom_or_reserves():
     manager.page_allocator.exact_recovery_quote = lambda pages: (32 * len(pages), [], 0)
     assert manager.alloc_exact([8]) is None
     assert manager.exact_recovery_quote([8]) == (32, [], 0)
+
+
+def test_paired_exact_miss_preserves_existing_page_and_reserved_ids():
+    from unittest.mock import Mock
+
+    manager = make_manager()
+    assert manager.alloc_exact([4]) == [4]
+    manager.reserved_blocks = [4]
+    backing = Mock()
+    manager._block_backing = backing
+    backing.recover_full.return_value = False
+    backing.can_acquire.return_value = False
+    assert not manager.can_alloc_exact([4, 8])
+    claims = []
+
+    def acquire(ids, *, placement):
+        assert placement == [4, 8]
+        claims.append(list(ids))
+        return len(claims) > 1
+
+    backing.acquire.side_effect = acquire
+    assert manager.alloc_exact([4, 8]) is None
+    assert manager.reserved_blocks == [4] and set(manager.avail_pages) == {1}
+    assert manager.page_allocator.released == [2]
+    assert manager.alloc_exact([4, 8]) == [4, 8]
+    assert claims == [[8], [8]]
+
+
+def test_paired_exact_claim_refreshes_a_cached_miss_after_peer_release():
+    from unittest.mock import Mock
+
+    manager = make_manager()
+    manager._block_backing = Mock()
+    manager._block_backing.can_acquire.return_value = True
+    manager._block_backing.acquire.return_value = True
+    manager._block_backing.recover_full.return_value = False
+    manager._avail_physical_pages_cache = 0
+    manager._get_cached_avail_physical_pages = lambda: 1 if manager._avail_physical_pages_cache is None else 0
+    assert manager.can_alloc_exact([4])
+    assert manager.alloc_exact([4]) == [4]
+    assert manager.page_allocator.calls == [1]
 
 
 @pytest.mark.parametrize('ids', [[], [1]])

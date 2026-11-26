@@ -359,6 +359,9 @@ class _HostKVBackupPatch(VersionAwarePatch, BasePatch):
 
         @functools.wraps(original_init)
         def _patched_init(host: Any, device_pool: Any, *args: Any, **kwargs: Any) -> None:
+            if getattr(device_pool, "_kvcached_qsa_full_pool", False) is True:
+                raise KVCachedConfigError(
+                    "HiCache cannot restore the QSA compressed index; disable hierarchical caching")
             original_init(host, device_pool, *args, **kwargs)
             if enable_kvcached() and interleaved(device_pool):
                 check_kv_host_pool(host, device_pool, backup_marker)

@@ -52,6 +52,8 @@ def test_virtual_capacity_patch_runs_after_memory_pool_aliases():
         "SGLangLegacyVirtualKVCapacityPatch"
     )
     virtual_index = patch_names.index("SGLangVirtualKVCapacityPatch")
+    assert patch_versions["QSAIndexPatch"] == "==0.5.20"
+    assert patch_names.index("ElasticHybridLinearKVPoolPatch") < patch_names.index("QSAIndexPatch") < virtual_index
     assert patch_names.index("ElasticAllocatorPatch") < patch_names.index(
         "ElasticSWAAllocatorPatch"
     )

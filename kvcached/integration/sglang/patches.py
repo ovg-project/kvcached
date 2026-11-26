@@ -761,7 +761,15 @@ def _sglang_post_demand(scheduler: Any, unfit_blocks: int) -> None:
         if miss is not None:
             scheduler._kvcached_prefill_demand = miss - min(
                 allocated, getattr(_SGLANG_DEMAND, "prefill_input_blocks", 0))
-        manager.post_demand(manager.demand_pages(need))
+        backing = getattr(manager, "_block_backing", None)
+        if backing is None:
+            manager.post_demand(manager.demand_pages(need))
+        else:
+            failed = native_prefill_allocation_miss()
+            if failed is not None and (failed.pool is not manager or failed.unit not in ("pages", "tokens")):
+                failed = None
+            prefill_need = allocated + scheduler._kvcached_prefill_demand if miss is not None else 0
+            backing.post_demand(need, allocated=allocated, failed=failed, prefill_need=prefill_need)
         post_levels = getattr(manager, "post_reclaimable_levels", None)
         if post_levels is not None:
             post_levels()
@@ -890,8 +898,10 @@ def _sglang_reserve_decode_capacity(allocator: Any, tree_cache: Any,
     evict = getattr(allocator, "evict_to_free_tokens", None)
     if evict is not None:
         evict(tree_cache, num_tokens)
-    local_miss = need_blocks > 0 and not bool(
-        allocator.kvcached_allocator.try_to_reserve(need_blocks, packed=packed))
+    manager = allocator.kvcached_allocator
+    backing = getattr(manager, "_block_backing", None)
+    reserve = backing.reserve_decode if backing is not None else manager.try_to_reserve
+    local_miss = need_blocks > 0 and not bool(reserve(need_blocks, packed=packed))
     if local_miss:
         _sglang_note_unfit(need_blocks)
     return not _sglang_group_capacity_miss(local_miss)
@@ -1987,10 +1997,21 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             f"(group_id={self._group_id})")
                         return
 
+                    num_pages = math.ceil(size / page_size) + 1
+                    max_block_id = None
+                    if getattr(self, "_kvcached_qsa_full_pool", False):
+                        # QSA addresses its companion tensor by the full page
+                        # ID. Rounding physical backing must not expose slack IDs.
+                        max_block_id = num_pages
+                        block_bytes = page_size * self.cell_size
+                        num_pages = backing_blocks_for_capacity(
+                            num_pages, block_bytes, get_page_size_for_block(block_bytes, PAGE_SIZE))
                     self.kvcached_allocator = kvi.get_kv_cache_manager(
-                        math.ceil(size / page_size) + 1, page_size, self.cell_size, layer_num,
+                        num_pages, page_size, self.cell_size, layer_num,
                         group_id=self._group_id,
                         pool_name="mha",
+                        max_block_id=max_block_id,
+                        defer_prealloc_until_bound=max_block_id is not None,
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
@@ -3301,6 +3322,25 @@ class ElasticHybridLinearKVPoolPatch(VersionAwarePatch, BasePatch):
             self.logger.warning(
                 f"Failed to alias HybridLinearKVPool to elastic one: {e}")
             return False
+
+
+class QSAIndexPatch(BasePatch):
+    library = "sglang"
+    target_module = "sglang.srt.mem_cache.qsa_kv_pool"
+    target_class = "QSATokenToKVPool"
+    patch_name = "qsa_compressed_index"
+
+    def apply(self, module: types.ModuleType) -> bool:
+        if not enable_kvcached():
+            return True
+        from kvcached.integration.sglang.qsa import qsa_initializer
+
+        cls = module.QSATokenToKVPool
+        if not self._is_already_patched(cls.__init__):
+            initialize = qsa_initializer(cls)
+            self._mark_as_patched(initialize)
+            cls.__init__ = initialize
+        return True
 
 
 class DeepSeekV4RuntimeReservationPatch(VersionAwarePatch, BasePatch):
@@ -4902,12 +4942,24 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
 
                     token_managers = _token_kv_managers(
                         getattr(sched_self, "token_to_kv_pool_allocator", None))
+                    # The index shares the token pool's budget. Only the main
+                    # pool uses radix IDs for the shrink callbacks registered above.
+                    index = getattr(token_managers[0], "_block_backing", None) if token_managers else None
                     ranks = _sglang_parallel_size(sched_self)
                     sched_self._kvcached_control_managers = initialize_runtime_controls(
                         "sglang", ranks=ranks,
                         can_shrink=lambda manager: ranks == 1 and any(
                             manager is token for token in token_managers))
-                    if len(token_managers) > 1 and (
+                    if index is not None:
+                        from kvcached.priority_reclaim import PriorityReclaimGroup
+
+                        index.forward_stream = (sched_self.tp_worker.model_runner.forward_stream
+                                                if sched_self.enable_overlap or sched_self.ps.pp_size > 1
+                                                else sched_self.schedule_stream)
+                        members = (*token_managers, index.leases.manager)
+                        passive = tuple(pool for pool in sched_self._kvcached_control_managers if pool not in members)
+                        PriorityReclaimGroup(members, report_only=ranks > 1, passive=passive)
+                    elif len(token_managers) > 1 and (
                             ranks == 1 or _sglang_dsv4_demand_allocator(sched_self) is not None):
                         from kvcached.priority_reclaim import PriorityReclaimGroup
 
