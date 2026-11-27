@@ -68,6 +68,8 @@ struct InstanceControl {
   // What the instance can still be granted on this GPU: free memory above
   // its watermark, within its max.
   uint64_t available_bytes = 0;
+  int64_t signed_available_bytes =
+      0; // Includes debt below the grant watermark or instance limit.
 };
 
 // What an instance should release now, by tier: pre-mapped pages, prefix
@@ -118,6 +120,8 @@ struct BudgetSnapshot {
   uint64_t charged_bytes = 0;
   uint64_t instance_charged_bytes = 0;
   uint64_t instance_limit_bytes = UINT64_MAX;
+  uint64_t instance_minimum_bytes = 0;
+  uint64_t pool_minimum_bytes = 0;
   // Free bytes that higher-priority instances keep from this one: the sum of
   // max(headroom, demand) over them. Grants and forecasts stop above it.
   uint64_t watermark_bytes = 0;
@@ -229,7 +233,8 @@ public:
   // Execution reports use limit_revision, not the all-controls revision.
   bool acknowledge_control(size_t slot, uint64_t revision);
   bool fail_control(const std::string &instance, size_t slot, uint64_t owner,
-                    uint64_t generation, uint64_t revision);
+                    uint64_t generation, uint64_t revision,
+                    bool retained_quota = false);
   // The instance's demand on this GPU: the new memory its last scheduling
   // step needed beyond the pool's free blocks, as a forecast of the next
   // step. A level that each step overwrites; 0 clears it, and it goes away

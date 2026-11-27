@@ -33,7 +33,7 @@ def fault_library(tmp_path_factory):
     return library
 
 
-@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup", "retained-teardown", "missing-ledger-teardown", "budget-identity"])
+@pytest.mark.parametrize("case", ["quarantine", "prealloc", "unmap", "callback", "fatal-callback", "manager", "serialize", "release", "commit-release", "rollback-release", "state-gil", "ipc-ack", "ipc-unknown", "ipc-prepare", "ipc-release", "reserved-map", "abort-reserved-1", "abort-reserved-3", "reserve-cleanup", "commit-cleanup", "retained-teardown", "missing-ledger-teardown", "budget-identity", "local-reserve", "local-map"])
 def test_native_failure_policy(fault_library, case, tmp_path):
     env = dict(os.environ, LD_PRELOAD=str(fault_library),
                KVCACHED_PHYSICAL_GROWTH_LOCK_DIR=str(tmp_path),
@@ -68,7 +68,31 @@ def _native_case(case):
     driver.kvcached_fault_arm.argtypes = [ctypes.c_int] * 3
     driver.kvcached_fault_hits.restype = ctypes.c_int
     driver.kvcached_fault_release.argtypes = [ctypes.c_int]
-    if case.startswith("abort-reserved-") or case in ("reserve-cleanup", "commit-cleanup"):
+    if case in ("local-reserve", "local-map"):
+        first = allocator.alloc_page()
+        for tensor in tensors:
+            tensor[:128].fill_(7)
+        torch.cuda.synchronize(device)
+        before = allocator.get_num_free_pages()
+        charged = vmm_ops.physical_budget_state()["charged_bytes"]
+        driver.kvcached_fault_arm(3 if case == "local-reserve" else 0,
+                                  2 if case == "local-map" else 0, 0)
+        with pytest.raises(RuntimeError):
+            allocator.alloc_page()
+        assert driver.kvcached_fault_hits() == 1
+        assert allocator.get_num_free_pages() == before
+        assert vmm_ops.physical_budget_state()["charged_bytes"] == charged
+        assert allocator.get_transaction_state()["state"] == "HEALTHY"
+        for tensor in tensors:
+            assert bool((tensor[:128] == 7).all())
+        driver.kvcached_fault_arm(0, 0, 0)
+        second = allocator.alloc_page()
+        assert second.page_id == 1
+        assert vmm_ops.physical_budget_state()["charged_bytes"] == 2 * charged
+        for tensor in tensors:
+            assert bool((tensor[:128] == 7).all())
+        allocator.free_pages([first.page_id, second.page_id])
+    elif case.startswith("abort-reserved-") or case in ("reserve-cleanup", "commit-cleanup"):
         driver.kvcached_fault_release_calls.restype = ctypes.c_int
         transaction_id = "cleanup-owner"
         if case.startswith("abort-reserved-"):

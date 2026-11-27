@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -172,20 +173,22 @@ PageAllocator::~PageAllocator() {
   }
 }
 
-std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
-  return alloc_page_impl(-1);
+std::shared_ptr<InternalPage>
+PageAllocator::alloc_page(bool allow_fresh_retry) {
+  return alloc_page_impl(-1, allow_fresh_retry);
 }
 
 std::shared_ptr<InternalPage>
-PageAllocator::try_alloc_page_at(page_id_t page_id) {
+PageAllocator::try_alloc_page_at(page_id_t page_id, bool worker_priced) {
   if (page_id < 0) {
     throw std::invalid_argument("Exact page ID must be nonnegative");
   }
-  return alloc_page_impl(page_id);
+  return alloc_page_impl(page_id, false, worker_priced);
 }
 
 std::shared_ptr<InternalPage>
-PageAllocator::alloc_page_impl(page_id_t requested_id) {
+PageAllocator::alloc_page_impl(page_id_t requested_id, bool allow_fresh_retry,
+                               bool worker_priced) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
@@ -196,6 +199,12 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
   while (page_id == -1) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
       throw StateConsistencyError(transaction_error_);
+    }
+    // Null-block initialization must wait for the initial batch, including a
+    // retry already owned by the preallocator, instead of taking another ID.
+    if (requested_id < 0 && !allow_fresh_retry && retry_pages_in_flight_ != 0) {
+      cond_.wait(lock);
+      continue;
     }
     // Fast path: allocate from reserved pages
     auto reserved = requested_id < 0
@@ -226,6 +235,50 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
       return std::make_shared<InternalPage>(page_id, page_size_);
     }
 
+    // Retry confirmed retained mappings before taking a fresh page ID. A
+    // preallocation failure may own a whole batch, which must stay intact.
+    auto retained = take_retained_batch_unlocked(requested_id);
+    if (!retained.empty()) {
+      lock.unlock();
+      std::exception_ptr retry_error;
+      try {
+        retry_retained_batch(std::move(retained));
+      } catch (const MapRetainedQuotaError &) {
+        // No amount of trimming can fund this exact batch under its quota.
+        if (requested_id >= 0)
+          throw;
+        retry_error = std::current_exception();
+      } catch (const StateConsistencyError &) {
+        throw;
+      } catch (const MapQuarantinedError &) {
+        throw;
+      } catch (...) {
+        retry_error = std::current_exception();
+      }
+      lock.lock();
+      if (!retry_error) {
+        continue;
+      }
+      // Keep the batch intact, but do not make a large preallocation retry
+      // prevent a smaller request from using a different, fresh page ID.
+      if (transaction_failed_.load(std::memory_order_acquire)) {
+        throw StateConsistencyError(transaction_error_);
+      }
+      // A peer may need credit still held by this pool's idle reserves.
+      // Release them once before replaying the same complete batch.
+      if (requested_id >= 0 && !trimmed_for_exact &&
+          !reserved_page_list_.empty()) {
+        trimmed_for_exact = true;
+        lock.unlock();
+        trim();
+        lock.lock();
+        continue;
+      }
+      if (!allow_fresh_retry || free_page_list_.empty()) {
+        std::rethrow_exception(retry_error);
+      }
+    }
+
     // Slow path: allocate from free pages
     auto free = requested_id < 0
                     ? free_page_list_.begin()
@@ -240,7 +293,13 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
                               reclaimed != reclaimed_page_list_.end())) {
       // A shrink limits the number of pages, not their virtual placement.
       // Preallocated backing at another ID may need to be unmapped first.
-      if (free_page_list_.empty() || get_avail_physical_pages() <= 0) {
+      // A repriced suffix maps on the workers. Their grants still enforce
+      // the budget; the coordinator's driver cannot price those mappings.
+      const bool worker_mapping =
+          worker_priced && (world_size_ > 1 || should_use_worker_ipc()) &&
+          broadcast_map_callback_;
+      if (free_page_list_.empty() ||
+          (!worker_mapping && get_avail_physical_pages() <= 0)) {
         if (!trimmed_for_exact && !reserved_page_list_.empty()) {
           trimmed_for_exact = true;
           lock.unlock();
@@ -287,6 +346,12 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
 
   try {
     map_pages({page_id});
+  } catch (const MapRetainedError &) {
+    std::lock_guard<std::mutex> guard(lock_);
+    retained_page_batches_.push_back({page_id});
+    num_free_pages_.fetch_add(1, std::memory_order_relaxed);
+    cond_.notify_all();
+    throw;
   } catch (const MapQuarantinedError &e) {
     std::lock_guard<std::mutex> guard(lock_);
     quarantine_pages_unlocked({page_id}, e.what());
@@ -297,12 +362,14 @@ PageAllocator::alloc_page_impl(page_id_t requested_id) {
     transaction_failed_.store(true, std::memory_order_release);
     throw;
   } catch (const std::exception &e) {
+    // A Python callback error may acquire the GIL while formatting what().
+    const std::string message = e.what();
     std::lock_guard<std::mutex> guard(lock_);
     free_page_list_.push_front(page_id);
     num_free_pages_.fetch_add(1, std::memory_order_relaxed);
     cond_.notify_all();
     throw std::runtime_error("Failed to map page " + std::to_string(page_id) +
-                             ": " + e.what());
+                             ": " + message);
   }
 
   if (requested_id < 0 && enable_page_prealloc_) {
@@ -415,15 +482,51 @@ bool PageAllocator::resize(int64_t new_mem_size) {
   std::vector<page_id_t> pages_to_unmap;
 
   {
-    std::lock_guard<std::mutex> lock(lock_);
+    std::unique_lock<std::mutex> lock(lock_);
 
+    if (new_num_pages == num_total_pages_.load(std::memory_order_relaxed)) {
+      return true;
+    }
+
+    // An idle engine may never allocate again. Let each pending resize poll
+    // recover at most one retained batch, without holding the allocator lock
+    // across the worker callback. Failed recovery must leave the quota pending.
+    if (!retained_page_batches_.empty() && retry_pages_in_flight_ == 0 &&
+        quarantined_page_ids_.empty()) {
+      const bool shrinking =
+          new_num_pages < num_total_pages_.load(std::memory_order_relaxed);
+      lock.unlock();
+      // Empty reservations may hold the credit needed to complete this batch.
+      // Release them before recovery; live/cached pages remain manager-owned.
+      if (shrinking)
+        trim();
+      try {
+        retry_retained_pages();
+      } catch (const StateConsistencyError &) {
+        throw;
+      } catch (const MapQuarantinedError &error) {
+        throw QuarantinedResizeError(error.what());
+      } catch (const MapRetainedQuotaError &) {
+        throw RetainedQuotaResizeError(
+            "instance limit prevents retained-map recovery; raise the limit "
+            "to recover the retained batch, then retry the resize");
+      } catch (const std::exception &error) {
+        throw RetainedResizeError(error.what());
+      }
+      lock.lock();
+    }
+
+    if (transaction_failed_.load(std::memory_order_acquire)) {
+      throw StateConsistencyError(transaction_error_);
+    }
     // Resizing must not recycle an ID whose physical state is quarantined.
     if (!quarantined_page_ids_.empty()) {
-      if (new_num_pages == num_total_pages_.load(std::memory_order_relaxed)) {
-        return true;
-      }
       throw QuarantinedResizeError(
           "cannot resize a pool with quarantined pages");
+    }
+    if (!retained_page_batches_.empty() || retry_pages_in_flight_ != 0) {
+      throw RetainedResizeError(
+          "cannot resize until retained map batches recover");
     }
 
     if (new_num_pages < get_num_inuse_pages_unlocked()) {
@@ -590,6 +693,11 @@ PageAllocator::get_allocatable_block_capacity(int64_t block_mem_size,
   for (page_id_t page_id : reserved_page_list_) {
     add_page(page_id);
   }
+  for (const auto &batch : retained_page_batches_) {
+    for (page_id_t page_id : batch) {
+      add_page(page_id);
+    }
+  }
   const auto count =
       std::min(free_page_list_.size(),
                static_cast<size_t>(std::max<int64_t>(0, new_page_limit)));
@@ -614,6 +722,27 @@ int64_t PageAllocator::get_num_reserved_pages() const {
   return reserved_page_list_.size();
 }
 
+int64_t PageAllocator::get_num_retryable_pages_unlocked() const {
+  int64_t count = 0;
+  for (const auto &batch : retained_page_batches_) {
+    count += static_cast<int64_t>(batch.size());
+  }
+  return count;
+}
+
+int64_t PageAllocator::get_num_retryable_pages() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  return get_num_retryable_pages_unlocked();
+}
+
+std::vector<page_id_t> PageAllocator::get_retryable_page_ids() const {
+  std::lock_guard<std::mutex> lock(lock_);
+  std::vector<page_id_t> ids;
+  for (const auto &batch : retained_page_batches_)
+    ids.insert(ids.end(), batch.begin(), batch.end());
+  return ids;
+}
+
 PageState PageAllocator::get_page_state() const {
   std::lock_guard<std::mutex> lock(lock_);
   return get_page_state_unlocked();
@@ -623,8 +752,9 @@ TransactionState PageAllocator::get_transaction_state() const {
   std::lock_guard<std::mutex> lock(lock_);
   return {quarantined_page_ids_, transaction_error_,
           transaction_failed_.load(std::memory_order_relaxed),
-          static_cast<int64_t>(quarantined_page_ids_.size()) * page_size_ *
-              num_layers_ * num_kv_buffers_};
+          (static_cast<int64_t>(quarantined_page_ids_.size()) +
+           get_num_retryable_pages_unlocked() + retry_pages_in_flight_) *
+              page_size_ * num_layers_ * num_kv_buffers_};
 }
 
 void PageAllocator::throw_if_failed() const {
@@ -705,7 +835,7 @@ PageAllocator::exact_recovery_quote(const std::vector<page_id_t> &pages) const {
     throw StateConsistencyError(transaction_error_);
   const auto bundle = page_size_ * num_layers_ * num_kv_buffers_;
   return quote_exact_pages(pages, free_page_list_, reclaimed_page_list_,
-                           reserved_page_list_, bundle);
+                           reserved_page_list_, bundle, retained_page_batches_);
 }
 
 int64_t PageAllocator::get_avail_physical_pages() const {
@@ -820,6 +950,18 @@ void PageAllocator::prealloc_worker() {
     start_time = std::chrono::steady_clock::now();
     prealloc_needed_ = false;
 
+    if (!retained_page_batches_.empty()) {
+      lock.unlock();
+      try {
+        retry_retained_pages();
+      } catch (const StateConsistencyError &) {
+        break;
+      } catch (const std::exception &error) {
+        LOGGER(ERROR, "Retained map retry remains pending: %s", error.what());
+      }
+      continue;
+    }
+
     int64_t current_reserved = reserved_page_list_.size();
     int64_t to_reserve = std::max(0L, min_reserved_pages_ - current_reserved);
     // Only try to reserve up to the available free pages and physical memory
@@ -865,6 +1007,12 @@ void PageAllocator::prealloc_worker() {
         cond_.notify_all();
         LOGGER(INFO, "Preallocated %ld pages, reserved=%ld",
                pages_to_reserve.size(), reserved_page_list_.size());
+      } catch (const MapRetainedError &e) {
+        lock.lock();
+        retained_page_batches_.push_back(pages_to_reserve);
+        cond_.notify_all();
+        LOGGER(ERROR, "Retaining %zu pages for a batch retry: %s",
+               pages_to_reserve.size(), e.what());
       } catch (const MapQuarantinedError &e) {
         lock.lock();
         // Pending prealloc pages are still included in the free counter.
@@ -879,13 +1027,14 @@ void PageAllocator::prealloc_worker() {
         transaction_failed_.store(true, std::memory_order_release);
         break;
       } catch (const std::exception &e) {
+        const std::string message = e.what();
         lock.lock();
         free_page_list_.insert(free_page_list_.begin(),
                                pages_to_reserve.begin(),
                                pages_to_reserve.end());
         cond_.notify_all();
         LOGGER(ERROR, "Failed to preallocate %ld pages: %s",
-               pages_to_reserve.size(), e.what());
+               pages_to_reserve.size(), message.c_str());
       }
 
       auto end_time = std::chrono::steady_clock::now();
@@ -894,6 +1043,78 @@ void PageAllocator::prealloc_worker() {
       LOGGER(INFO, "prealloc cost: %ld us, prealloc %ld pages.",
              duration.count(), pages_to_reserve.size());
     }
+  }
+}
+
+std::vector<page_id_t>
+PageAllocator::take_retained_batch_unlocked(page_id_t requested_id) {
+  auto batch = retained_page_batches_.begin();
+  if (requested_id >= 0) {
+    batch = std::find_if(batch, retained_page_batches_.end(),
+                         [requested_id](const auto &pages) {
+                           return std::find(pages.begin(), pages.end(),
+                                            requested_id) != pages.end();
+                         });
+  }
+  if (batch == retained_page_batches_.end())
+    return {};
+  auto pages = std::move(*batch);
+  retained_page_batches_.erase(batch);
+  retry_pages_in_flight_ += static_cast<int64_t>(pages.size());
+  return pages;
+}
+
+bool PageAllocator::retry_retained_pages() {
+  std::vector<page_id_t> pages;
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    pages = take_retained_batch_unlocked(-1);
+  }
+  if (pages.empty())
+    return false;
+  retry_retained_batch(std::move(pages));
+  return true;
+}
+
+void PageAllocator::retry_retained_batch(std::vector<page_id_t> pages) {
+  try {
+    map_pages(pages);
+  } catch (const MapQuarantinedError &error) {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    num_free_pages_.fetch_sub(pages.size(), std::memory_order_relaxed);
+    quarantine_pages_unlocked(pages, error.what());
+    throw;
+  } catch (const StateConsistencyError &error) {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    num_free_pages_.fetch_sub(pages.size(), std::memory_order_relaxed);
+    quarantine_pages_unlocked(pages, error.what());
+    transaction_failed_.store(true, std::memory_order_release);
+    throw;
+  } catch (const std::exception &error) {
+    // available_size() may hold the GIL while waiting for lock_.
+    const std::string message = error.what();
+    const bool quota_rejected =
+        dynamic_cast<const MapRetainedQuotaError *>(&error) != nullptr;
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    // A blocked large batch must not starve another, smaller retained batch.
+    retained_page_batches_.push_back(std::move(pages));
+    cond_.notify_all();
+    if (quota_rejected) {
+      throw MapRetainedQuotaError(message);
+    }
+    throw std::runtime_error(std::string("Retained map retry failed: ") +
+                             message);
+  }
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    retry_pages_in_flight_ -= static_cast<int64_t>(pages.size());
+    reserved_page_list_.insert(reserved_page_list_.end(), pages.begin(),
+                               pages.end());
+    update_memory_usage_unlocked();
+    cond_.notify_all();
   }
 }
 
@@ -1002,6 +1223,15 @@ void PageAllocator::update_memory_usage_unlocked() {
 }
 
 void PageAllocator::reset_free_page_order() {
+  // clear() must reserve page zero next. Complete unpublished batches before
+  // releasing them normally; never split or physically roll back a partial map.
+  bool recovered = false;
+  while (retry_retained_pages()) {
+    recovered = true;
+  }
+  if (recovered) {
+    trim();
+  }
   std::lock_guard<std::mutex> lock(lock_);
   std::vector<page_id_t> sorted_pages(free_page_list_.begin(),
                                       free_page_list_.end());

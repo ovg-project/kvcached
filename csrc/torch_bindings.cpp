@@ -132,6 +132,8 @@ py::dict physical_growth_result(bool success,
   result["targets_count"] = stats.targets_count;
   result["capacity_checks"] = stats.capacity_checks;
   result["capacity_rejections"] = stats.capacity_rejections;
+  result["quota_rejections"] = stats.quota_rejections;
+  result["quota_recovery_impossible"] = stats.quota_recovery_impossible;
   result["required_bytes"] = stats.required_bytes;
   result["free_bytes"] = stats.free_bytes;
   result["total_bytes"] = stats.total_bytes;
@@ -288,8 +290,9 @@ void page_allocator_stop_prealloc_thread(
 }
 
 std::shared_ptr<InternalPage>
-page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
-  return allocator->alloc_page();
+page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator,
+                          bool allow_fresh_retry) {
+  return allocator->alloc_page(allow_fresh_retry);
 }
 
 void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
@@ -389,6 +392,12 @@ void page_allocator_set_broadcast_map_callback(
           if (error.matches(errors.attr("MapQuarantinedError").ptr())) {
             throw MapQuarantinedError(error.what());
           }
+          if (error.matches(errors.attr("MapRetainedQuotaError").ptr())) {
+            throw MapRetainedQuotaError(error.what());
+          }
+          if (error.matches(errors.attr("MapRetainedError").ptr())) {
+            throw MapRetainedError(error.what());
+          }
           throw;
         }
       });
@@ -458,6 +467,7 @@ py::dict control_dict(const InstanceControl &state) {
   result["reclaim_cache_bytes"] = state.reclaim_cache_bytes;
   result["reclaim_running_bytes"] = state.reclaim_running_bytes;
   result["available_bytes"] = state.available_bytes;
+  result["signed_available_bytes"] = state.signed_available_bytes;
   return result;
 }
 
@@ -568,10 +578,10 @@ py::dict publish_instance_controls(const std::string &path,
 
 bool fail_instance_control(const std::string &path, const std::string &name,
                            size_t slot, uint64_t owner, uint64_t generation,
-                           uint64_t revision) {
+                           uint64_t revision, bool retained_quota) {
   py::gil_scoped_release release;
-  return GpuBudget::open_control(path)->fail_control(name, slot, owner,
-                                                     generation, revision);
+  return GpuBudget::open_control(path)->fail_control(
+      name, slot, owner, generation, revision, retained_quota);
 }
 
 bool acknowledge_instance_control(int64_t group_id, uint64_t revision) {
@@ -609,12 +619,21 @@ STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
   auto errors = py::module_::import("kvcached.errors");
+  py::register_exception<kvcached::MapRetainedError>(
+      m, "MapRetainedError", errors.attr("MapRetainedError").ptr());
+  py::register_exception<kvcached::MapRetainedQuotaError>(
+      m, "MapRetainedQuotaError", errors.attr("MapRetainedQuotaError").ptr());
   py::register_exception<kvcached::MapQuarantinedError>(
       m, "MapQuarantinedError", errors.attr("MapQuarantinedError").ptr());
   py::register_exception<kvcached::StateConsistencyError>(
       m, "StateConsistencyError", errors.attr("StateConsistencyError").ptr());
   py::register_exception<kvcached::QuarantinedResizeError>(
       m, "QuarantinedResizeError", errors.attr("QuarantinedResizeError").ptr());
+  py::register_exception<kvcached::RetainedResizeError>(
+      m, "RetainedResizeError", errors.attr("RetainedResizeError").ptr());
+  py::register_exception<kvcached::RetainedQuotaResizeError>(
+      m, "RetainedQuotaResizeError",
+      errors.attr("RetainedQuotaResizeError").ptr());
 
   m.def("local_instance_control", &kvcached::local_instance_control,
         py::arg("group_id") = 0, py::arg("configure") = py::none(),
@@ -641,7 +660,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("retention_tokens") = py::none());
   m.def("fail_instance_control", &kvcached::fail_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot"), py::arg("owner"),
-        py::arg("generation"), py::arg("revision"));
+        py::arg("generation"), py::arg("revision"),
+        py::arg("retained_quota") = false);
   m.def("acknowledge_instance_control", &kvcached::acknowledge_instance_control,
         py::arg("group_id"), py::arg("revision"));
   // Torch-free transactional ops (the six core ops are on the stable
@@ -738,8 +758,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_stop_prealloc_thread,
            py::call_guard<py::gil_scoped_release>())
       .def("alloc_page", &kvcached::page_allocator_alloc_page,
+           py::arg("allow_fresh_retry") = true,
            py::call_guard<py::gil_scoped_release>())
       .def("try_alloc_page_at", &kvcached::PageAllocator::try_alloc_page_at,
+           py::arg("page_id"), py::kw_only(), py::arg("worker_priced") = false,
            py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
@@ -753,7 +775,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("trim", &kvcached::page_allocator_trim, py::arg("max_pages") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("reset_free_page_order",
-           &kvcached::page_allocator_reset_free_page_order)
+           &kvcached::page_allocator_reset_free_page_order,
+           py::call_guard<py::gil_scoped_release>())
       .def("get_num_free_pages", &kvcached::page_allocator_get_num_free_pages)
       .def("get_allocatable_block_capacity",
            &kvcached::PageAllocator::get_allocatable_block_capacity,
@@ -763,6 +786,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_num_total_pages", &kvcached::page_allocator_get_num_total_pages)
       .def("get_num_reserved_pages",
            &kvcached::page_allocator_get_num_reserved_pages)
+      .def("get_num_retryable_pages",
+           &kvcached::PageAllocator::get_num_retryable_pages)
+      .def("get_retryable_page_ids",
+           &kvcached::PageAllocator::get_retryable_page_ids)
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)

@@ -20,11 +20,10 @@ namespace kvcached {
 // driver. Shrink permits swapping reclaimed IDs into free active slots.
 using ExactRecoveryQuote = std::tuple<uint64_t, std::vector<int64_t>, size_t>;
 
-inline std::optional<ExactRecoveryQuote>
-quote_exact_pages(const std::vector<int64_t> &pages,
-                  const std::deque<int64_t> &free,
-                  const std::deque<int64_t> &reclaimed,
-                  const std::deque<int64_t> &reserved, uint64_t bundle) {
+inline std::optional<ExactRecoveryQuote> quote_exact_pages(
+    const std::vector<int64_t> &pages, const std::deque<int64_t> &free,
+    const std::deque<int64_t> &reclaimed, const std::deque<int64_t> &reserved,
+    uint64_t bundle, const std::deque<std::vector<int64_t>> &retained) {
   std::unordered_set<int64_t> wanted(pages.begin(), pages.end());
   if (!bundle || wanted.size() != pages.size())
     throw std::invalid_argument("Invalid exact recovery request");
@@ -33,7 +32,19 @@ quote_exact_pages(const std::vector<int64_t> &pages,
     if (!wanted.erase(id))
       idle.push_back(id);
   }
-  const auto fresh = wanted.size();
+  // Retried IDs can reuse existing backing, subject to peer admission.
+  // Unrequested members of these batches are never available to trim.
+  size_t spare_after_retry = 0;
+  for (const auto &batch : retained) {
+    size_t matched = 0;
+    for (const auto id : batch)
+      matched += wanted.erase(id);
+    if (matched)
+      spare_after_retry += batch.size() - matched;
+  }
+  // Exact allocation adopts matching batches first. Its other requested IDs
+  // may then use surplus backing from those batches within this pool.
+  const auto fresh = wanted.size() - std::min(wanted.size(), spare_after_retry);
   if (fresh > free.size() + idle.size() || fresh > UINT64_MAX / bundle)
     return std::nullopt;
   if (!wanted.empty()) {

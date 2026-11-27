@@ -20,11 +20,19 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional
 
-from kvcached.errors import QuarantinedResizeError, StateConsistencyError
+from kvcached.errors import (
+    QuarantinedResizeError,
+    RetainedQuotaResizeError,
+    RetainedResizeError,
+    StateConsistencyError,
+)
 from kvcached.kv_geometry import check_page_geometry
 from kvcached.lifecycle import LifecyclePhase, LifecycleState
 from kvcached.locks import NoOpLock
-from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+from kvcached.tp_ipc_util import (
+    broadcast_kv_tensors_created,
+    raise_if_physical_growth_unresolved,
+)
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
@@ -473,7 +481,7 @@ class KVCacheManager:
     def _post_init(self):
         self._post_init_thread_id = threading.get_ident()
 
-        def _check_kv_tensors_created():
+        def _check_kv_tensors_created(remaining: float):
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
                 vllm_remote = should_use_worker_ipc()
@@ -483,29 +491,29 @@ class KVCacheManager:
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(
                     self.world_size, self.pp_rank,
-                    group_id=self.group_id)
+                    group_id=self.group_id, timeout_s=remaining)
             else:
                 return kv_tensors_created(group_id=self.group_id)
 
         try:
             if self.null_block is not None:
                 return
-            total_wait = 0.0
+            deadline = time.monotonic() + KV_TENSOR_WAIT_TIMEOUT
             last_error: Exception | None = None
             while not self._shutdown_requested.is_set():
+                remaining = deadline - time.monotonic()
                 try:
-                    if _check_kv_tensors_created():
+                    if remaining > 0 and _check_kv_tensors_created(remaining):
                         break
                 except Exception as e:
                     last_error = e
-                if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
+                if time.monotonic() >= deadline:
                     message = ("KV tensors not created after "
                                f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
                     if last_error is not None:
                         message = f"{message}; last error: {last_error}"
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
-                total_wait += 0.001
             if self._shutdown_requested.is_set():
                 return
             # KV tensors created now
@@ -620,6 +628,13 @@ class KVCacheManager:
     def lifecycle_error(self) -> Optional[BaseException]:
         """The error behind a DEGRADED or FAILED phase, if any."""
         return self._lifecycle.error
+
+    def _check_physical_growth_state(self, op: str) -> None:
+        try:
+            raise_if_physical_growth_unresolved()
+        except StateConsistencyError as fatal:
+            self._record_native_fatal(op, fatal)
+            raise
 
     def _record_native_fatal(self, op: str, exc: BaseException) -> bool:
         """Record #418's fatal verdict where it propagates out of a native call.
@@ -813,7 +828,7 @@ class KVCacheManager:
 
     def _exact_claim_preflight(
         self, block_ids: Iterable[int], *, apply_resize: bool, shared_budget: bool = False
-    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int]]]:
+    ) -> Optional[tuple[List[int], Dict[int, List[int]], set[int], bool]]:
         requested: List[int] = []
         for value in block_ids:
             if isinstance(value, bool):
@@ -836,8 +851,9 @@ class KVCacheManager:
             if not start <= block_id < end:
                 raise ValueError("Exact block crosses a physical-page boundary")
             grouped.setdefault(page_id, []).append(block_id)
+        self._check_physical_growth_state("alloc_exact")
         if not requested:
-            return requested, grouped, set()
+            return requested, grouped, set(), False
 
         if apply_resize:
             self._apply_resize_target()
@@ -863,49 +879,104 @@ class KVCacheManager:
 
         # Sparse IDs can need one new physical page per requested block.
         # The packed-block capacity estimate above is not sufficient for them.
-        needed_pages = sum(
-            page_id not in self.full_pages and page_id not in self.avail_pages
-            for page_id in grouped
-        )
+        needed = [page_id for page_id in grouped
+                  if page_id not in self.full_pages and page_id not in self.avail_pages]
+        retrying = False
         try:
-            capacity = self.page_allocator.get_num_free_pages()
-            if not shared_budget:
-                capacity = min(capacity, self._get_cached_avail_physical_pages()
-                               + self.page_allocator.get_num_reserved_pages())
+            if len(needed) > self.page_allocator.get_num_free_pages():
+                return None
+            candidates: set[int] = getattr(self, "_pending_exact_retry_pages", set()).intersection(needed)
+            if not shared_budget and candidates:
+                # An unavailable hinted ID cannot be claimed. An already
+                # backed one must not gate fresh IDs in a different request.
+                quote = self.page_allocator.exact_recovery_quote(sorted(candidates))
+                if quote is None:
+                    # A retained batch elsewhere in this same claim can free
+                    # the virtual slot needed for a reclaimed hinted ID.
+                    if self.page_allocator.exact_recovery_quote(needed) is None:
+                        return None
+                    retrying = True
+                else:
+                    retrying = quote[0] > 0
+            if retrying:
+                # A previous adoption changed retained pages into reserves.
+                # The actual claim reprices before mapping; admission hints
+                # use the same live quote without trimming.
+                if not apply_resize and self._exact_retry_trim_plan(needed) is None:
+                    return None
+            elif not shared_budget:
+                room = self._get_cached_avail_physical_pages()
+                if len(needed) > room + self.page_allocator.get_num_reserved_pages():
+                    if not self.page_allocator.get_num_retryable_pages():
+                        return None
+                    # Only a batch containing a requested ID can help here.
+                    quote = self.page_allocator.exact_recovery_quote(needed)
+                    if quote is None:
+                        return None
+                    fresh_bytes, idle, _ = quote
+                    if fresh_bytes > (room + len(idle)) * self._memory_limit_page_bundle_bytes():
+                        return None
         except Exception as exc:
             self._record_native_fatal("alloc_exact", exc)
             raise
-        if needed_pages > capacity:
-            return None
-        return requested, grouped, reserved
+        return requested, grouped, reserved, retrying
 
     def _alloc_exact_impl(self, block_ids: Iterable[int], *, apply_resize: bool = True) -> Optional[List[int]]:
         claim = self._exact_claim_preflight(block_ids, apply_resize=apply_resize)
         if claim is None:
             return None
-        requested, grouped, reserved = claim
+        requested, grouped, reserved, retrying = claim
         if not requested:
             return []
 
         created: List[int] = []
-        for page_id in grouped:
-            if page_id in self.full_pages or page_id in self.avail_pages:
-                continue
+        missing = [pid for pid in grouped if pid not in self.full_pages and pid not in self.avail_pages]
+        retained_count = 0
+        if len(missing) > 1 and self.page_allocator.get_num_retryable_pages():
+            # Adopt intact batches first so their surplus becomes an ordinary
+            # reserve before a fresh mapping needs to release that credit.
+            retained = set(self.page_allocator.get_retryable_page_ids())
+            missing.sort(key=lambda pid: pid not in retained)
+            retained_count = sum(pid in retained for pid in missing)
+        pending: set[int] = getattr(self, "_pending_exact_retry_pages", set())
+        adopting = 0 < retained_count < len(missing)
+        reprice = adopting or retrying
+        for index, page_id in enumerate(missing):
             try:
-                page = self.page_allocator.try_alloc_page_at(page_id)
+                idle = (self._exact_retry_trim_plan(missing[index:])
+                        if reprice and index == retained_count else [])
+                if idle:
+                    self.trim_selected_reserves(idle)
+                if idle is None:
+                    page = None
+                elif reprice and index >= retained_count and self._worker_control() is not None:
+                    page = self.page_allocator.try_alloc_page_at(page_id, worker_priced=True)
+                else:
+                    page = self.page_allocator.try_alloc_page_at(page_id)
             except StateConsistencyError as exc:
                 self._increment_operation_counter("manager_page_allocation_failures_total")
                 self._lifecycle.mark_failed("exact allocation mapping is unsafe", exc)
                 raise
             except RuntimeError as exc:
                 self._increment_operation_counter("manager_page_allocation_failures_total")
+                self._check_physical_growth_state("alloc_exact")
                 if self._record_native_fatal("alloc_exact", exc):
                     raise
                 self._release_unclaimed_exact_pages(created)
                 return None
+            except Exception as exc:
+                self._check_physical_growth_state("alloc_exact")
+                if not self._record_native_fatal("alloc_exact", exc):
+                    self._release_unclaimed_exact_pages(created)
+                raise
             if page is None:
                 self._release_unclaimed_exact_pages(created)
                 return None
+            if adopting and index == 0:
+                # Only a successful adoption turns retained backing into reserves.
+                # Keep the affected fresh IDs available to the next attempt.
+                pending.update(missing[retained_count:])
+                self._pending_exact_retry_pages = pending
             self._avail_physical_pages_cache = None
             self._increment_operation_counter("manager_page_allocations_total")
             if getattr(self, "max_block_id", None) is None:
@@ -936,6 +1007,7 @@ class KVCacheManager:
                 for epoch, pages in self._retired_pages
                 if (remaining := [pid for pid in pages if pid != page_id])
             ]
+        pending.difference_update(grouped)
         claimed = set(requested)
         step_claims = getattr(self, "_step_exact_claims", None)
         if step_claims is not None:
@@ -944,6 +1016,33 @@ class KVCacheManager:
             self._logical_allocated_blocks += len(claimed - reserved)
         self.reserved_blocks = [i for i in self.reserved_blocks if i not in claimed]
         return requested
+
+    def _exact_retry_trim_plan(self, pending: List[int]) -> Optional[List[int]]:
+        # Recovery may have just consumed credit on a different worker.
+        # Reprice the entire suffix before releasing any idle mappings.
+        quote = self.page_allocator.exact_recovery_quote(pending)
+        if quote is None:
+            return None
+        fresh_bytes, idle, count = quote
+        if fresh_bytes:
+            bundle = self._memory_limit_page_bundle_bytes()
+            control = self._worker_control()
+            if control is None:
+                room = self.page_allocator.get_avail_physical_bytes() // bundle
+            else:
+                try:
+                    room = control.exact_retry_headroom()
+                except RuntimeError as exc:
+                    self._check_physical_growth_state("alloc_exact")
+                    if self._record_native_fatal("alloc_exact", exc):
+                        raise
+                    return None
+            if room is None:
+                return None
+            count = max(count, fresh_bytes // bundle - room)
+        if count > len(idle):
+            return None
+        return idle[:count]
 
     def _release_unclaimed_exact_pages(self, page_ids: List[int]) -> None:
         if not page_ids:
@@ -1064,7 +1163,8 @@ class KVCacheManager:
                 # blocks reach ret_index, which rollback therefore cannot
                 # restore) and must stay fail-loud.
                 try:
-                    page = self.page_allocator.alloc_page()
+                    page = (self.page_allocator.alloc_page(allow_fresh_retry=False)
+                            if _skip_wait else self.page_allocator.alloc_page())
                     # A new mapping changes the driver's free capacity.
                     self._avail_physical_pages_cache = None
                 except StateConsistencyError as e:
@@ -1081,6 +1181,8 @@ class KVCacheManager:
                 except RuntimeError as e:
                     self._increment_operation_counter(
                         "manager_page_allocation_failures_total")
+                    # Older native extensions erase the callback's exception type.
+                    self._check_physical_growth_state("alloc")
                     # The recoverable-miss classification only holds while
                     # the native pool is healthy. An untyped failure that
                     # left the transaction state FAILED (e.g. one racing in
@@ -1091,9 +1193,15 @@ class KVCacheManager:
                         raise
                     self._release_bound_empty_pages(bound_empty_pages)
                     self._rollback_partial_alloc(ret_index, num_from_reserved)
-                    logger.warning(
-                        f"alloc_page() failed after partially allocating "
-                        f"{len(ret_index)}/{need_size} blocks; rolled back: {e}")
+                    failure_count = self._get_operation_counter(
+                        "manager_page_allocation_failures_total"
+                    )
+                    if failure_count & (failure_count - 1) == 0:
+                        logger.warning(
+                            "Physical KV page allocation remains unavailable; "
+                            "returning a recoverable allocation miss "
+                            "(failures=%d): %s", failure_count, e,
+                        )
                     return None
                 self._increment_operation_counter("manager_page_allocations_total")
                 if self.max_block_id is None:
@@ -1425,7 +1533,11 @@ class KVCacheManager:
                 try:
                     resized = self.page_allocator.resize(
                         self.target_num_pages * self.page_size)
-                except QuarantinedResizeError:
+                except RetainedResizeError:
+                    # Keep cache reclamation active: its releases may provide
+                    # the credit needed to recover the retained batch.
+                    pass
+                except (QuarantinedResizeError, RetainedQuotaResizeError) as error:
                     # Reject the pending limit without blocking healthy pages.
                     self._record_operation_error("resize_failed", "resize_errors_total")
                     self._resize_rejected = True
@@ -1433,8 +1545,8 @@ class KVCacheManager:
                     self.target_num_pages = None
                     control = getattr(self, "_runtime_control", None)
                     if control is not None:
-                        control.fail()
-                    logger.warning("Deferred resize rejected: pool has quarantined pages")
+                        control.fail(retained_quota=isinstance(error, RetainedQuotaResizeError))
+                    logger.warning("Deferred resize rejected: %s", error)
                 except Exception as e:
                     # The lazy-shrink completion unmaps pages, so it can
                     # carry the same fatal verdict as free_pages() above.
@@ -2037,7 +2149,11 @@ class KVCacheManager:
             return 0
         retiring = sum(len(ids) for _, ids in getattr(self, "_retired_pages", []))
         occupied = len(self.full_pages) + len(self.avail_pages) - retiring
-        return max(0, occupied - self.target_num_pages)
+        excess = max(0, occupied - self.target_num_pages)
+        retryable = getattr(self.page_allocator, "get_num_retryable_pages", lambda: 0)()
+        # Even when live pages fit the target, recovery may need another page
+        # temporarily. Ask for one release, retry, and stop once recovery works.
+        return max(excess, int(retryable > 0 and occupied > 0))
 
     @property
     def target_num_blocks(self) -> Optional[int]:
@@ -2109,7 +2225,16 @@ class KVCacheManager:
                            new_mem_size // self.page_size)
         try:
             resized = self.page_allocator.resize(target_pages * self.page_size)
-        except QuarantinedResizeError:
+        except RetainedResizeError:
+            total_pages = self.page_allocator.get_page_state()["total_pages"]
+            if target_pages >= total_pages:
+                self.in_shrink = False
+                self.target_num_pages = None
+                raise
+            # A pending shrink must reach engine-side cache owners even if its
+            # retained batch cannot recover until they release healthy pages.
+            resized = False
+        except (QuarantinedResizeError, RetainedQuotaResizeError):
             if self.in_shrink:
                 self.in_shrink = False
                 self.target_num_pages = None
@@ -2211,16 +2336,21 @@ class KVCacheManager:
         # Every native capacity read can observe a background-preallocation
         # failure, including one that races after the first read.
         try:
+            # A background preallocator cannot raise on the engine's thread.
+            raise_if_physical_growth_unresolved()
             virtual_free_pages = self.page_allocator.get_num_free_pages()
             if self.in_shrink:
                 blocks_from_free_pages = 0
             else:
                 physical_free_pages = self._get_cached_avail_physical_pages()
                 if self.page_size % self.block_mem_size == 0:
+                    get_retryable_pages = getattr(
+                        self.page_allocator, "get_num_retryable_pages", None)
+                    retryable_pages = get_retryable_pages() if get_retryable_pages else 0
                     free_pages = min(
                         virtual_free_pages,
                         physical_free_pages
-                        + self.page_allocator.get_num_reserved_pages())
+                        + self.page_allocator.get_num_reserved_pages() + retryable_pages)
                     blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                         self.page_size, self.block_mem_size)
                 else:
@@ -2513,6 +2643,7 @@ class KVCacheManager:
                 len(pages_to_free),
             )
         self._retired_pages = []
+        self._pending_exact_retry_pages = set()
         self._priority_retired_ids = set()
         self._priority_retained_ids = set()
         self._priority_reclaim_active = False

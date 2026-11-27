@@ -33,14 +33,14 @@ def test_target_pp_ranks_uses_single_explicit_stage(monkeypatch):
     tp_ipc_util = _import_tp_ipc_util(monkeypatch)
     monkeypatch.setenv("KVCACHED_PP_SIZE", "4")
 
-    assert list(tp_ipc_util._target_pp_ranks(2)) == [2]
+    assert tp_ipc_util._target_pp_ranks(2) == [2]
 
 
 def test_target_pp_ranks_expands_coordinator_marker(monkeypatch):
     tp_ipc_util = _import_tp_ipc_util(monkeypatch)
     monkeypatch.setenv("KVCACHED_PP_SIZE", "3")
 
-    assert list(tp_ipc_util._target_pp_ranks(-1)) == [0, 1, 2]
+    assert tp_ipc_util._target_pp_ranks(-1) == [0, 1, 2]
 
 
 def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
@@ -49,16 +49,31 @@ def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
 
     async def fake_send(rank, message, pp_rank=0):
         calls.append((pp_rank, rank, message))
-        return {"status": "success"}
+        states = {
+            "prepare_map_to_kv_tensors": "reserved",
+            "commit_prepared_map": "prepared",
+            "finalize_map_to_kv_tensors": "committed",
+        }
+        return {
+            "status": "success",
+            "transaction_state": states.get(message["cmd"]),
+        }
 
     monkeypatch.setenv("KVCACHED_PP_SIZE", "2")
+    tp_ipc_util._PHYSICAL_DEVICE_ID_CACHE.update(
+        {(pp, rank): f"gpu-{rank}" for pp in range(2) for rank in range(3)}
+    )
     monkeypatch.setattr(tp_ipc_util, "_send_and_receive_message", fake_send)
 
-    asyncio.run(
-        tp_ipc_util._broadcast_map_to_kv_tensors(3, [7, 11], pp_rank=-1)
-    )
+    asyncio.run(tp_ipc_util._broadcast_map_to_kv_tensors(3, [7, 11], pp_rank=-1))
 
-    assert [(pp_rank, rank) for pp_rank, rank, _ in calls] == [
+    prepare_calls = [
+        call
+        for call in calls
+        if call[2].get("cmd") == "prepare_map_to_kv_tensors"
+        and call[2].get("offsets") == [7, 11]
+    ]
+    assert [(pp_rank, rank) for pp_rank, rank, _ in prepare_calls] == [
         (0, 0),
         (0, 1),
         (0, 2),
@@ -66,7 +81,8 @@ def test_broadcast_map_fans_out_to_all_pp_stages(monkeypatch):
         (1, 1),
         (1, 2),
     ]
-    assert all(call[2]["group_id"] == 0 for call in calls)
+    assert all(call[2]["group_id"] == 0 for call in prepare_calls)
+    assert sum(call[2].get("cmd") == "commit_prepared_map" for call in calls) == 6
 
 
 def test_broadcast_error_reports_pp_and_rank(monkeypatch):
@@ -96,6 +112,7 @@ def test_uneven_pp_maps_and_retires_the_same_logical_pages(
     page = 2 * 1024 * 1024
     strides = [page * n * buffers if contiguous else page for n in layers]
     resident = [{0}, {0}]
+    ipc._PHYSICAL_DEVICE_ID_CACHE.update({(pp, 0): f"gpu-{pp}" for pp in range(2)})
     prepared = {}
     calls = []
 
@@ -105,15 +122,19 @@ def test_uneven_pp_maps_and_retires_the_same_logical_pages(
                             lambda group_id=0: strides[pp_rank], raising=False)
         command = message["cmd"]
         calls.append((pp_rank, command))
-        if command in ("map_to_kv_tensors", "prepare_unmap_from_kv_tensors"):
+        if command in ("prepare_map_to_kv_tensors", "prepare_unmap_from_kv_tensors"):
             assert message["group_id"] == 3
             offsets = ipc._worker_offsets(message, 3)
             assert offsets == [strides[pp_rank], 2 * strides[pp_rank]]
-            if command == "map_to_kv_tensors":
-                resident[pp_rank].update(offsets)
-                return {"status": "success", "newly_mapped_offsets": offsets}
             prepared[pp_rank] = offsets
+            if command == "prepare_map_to_kv_tensors":
+                return {"status": "success", "transaction_state": "reserved"}
             return {"status": "prepared"}
+        if command in ("commit_prepared_map", "finalize_map_to_kv_tensors"):
+            assert ipc._worker_offsets(message, 3) == prepared[pp_rank]
+            resident[pp_rank].update(prepared[pp_rank])
+            state = "prepared" if command == "commit_prepared_map" else "committed"
+            return {"status": "success", "transaction_state": state}
         assert command == "commit_unmap_from_kv_tensors"
         resident[pp_rank].difference_update(prepared.pop(pp_rank))
         return {"status": "committed"}
@@ -132,33 +153,51 @@ def test_uneven_pp_maps_and_retires_the_same_logical_pages(
                          (1, "commit_unmap_from_kv_tensors")]
 
 
-def test_uneven_pp_map_rollback_keeps_worker_local_offsets(monkeypatch):
+@pytest.mark.parametrize("failure", ["prepare", "commit", "lost_reply"])
+def test_uneven_pp_recovery_preserves_worker_local_offsets(monkeypatch, failure):
     ipc = _import_tp_ipc_util(monkeypatch)
-    source_stride, worker_stride = 32, 64
+    strides = [32, 64]
     messages = []
+    ipc._PHYSICAL_DEVICE_ID_CACHE.update({(pp, 0): f"gpu-{pp}" for pp in range(2)})
 
     async def send(rank, message, pp_rank=0):
-        messages.append((pp_rank, message))
-        if message["cmd"] == "map_to_kv_tensors":
-            if pp_rank == 0:
-                return {"status": "error", "message": "capacity exhausted"}
-            monkeypatch.setattr(ipc.vmm_ops, "kv_mapping_page_size",
-                                lambda group_id=0: worker_stride, raising=False)
-            assert ipc._worker_offsets(message, 0) == [0, worker_stride]
-            # The null page was already mapped, so only the new page rolls back.
-            return {"status": "success", "newly_mapped_offsets": [worker_stride]}
-        assert pp_rank == 1
-        assert message["cmd"] == "unmap_from_kv_tensors"
-        assert "offset_stride" not in message
-        assert ipc._worker_offsets(message, 0) == [worker_stride]
-        return {"status": "success"}
+        messages.append((pp_rank, message["cmd"]))
+        monkeypatch.setattr(ipc.vmm_ops, "kv_mapping_page_size",
+                            lambda group_id=0: strides[pp_rank], raising=False)
+        assert ipc._worker_offsets(message, 0) == [0, strides[pp_rank]]
+        command = message["cmd"]
+        states = {
+            "prepare_map_to_kv_tensors": "reserved",
+            "commit_prepared_map": "prepared",
+            "finalize_map_to_kv_tensors": "committed",
+            "get_map_transaction_state": "prepared",
+            "abort_prepared_map": "aborted",
+            "orphan_map_transaction": "orphaned",
+        }
+        state = states[command]
+        if pp_rank == 0:
+            if failure == "prepare" and command == "prepare_map_to_kv_tensors":
+                return {"status": "error", "transaction_state": "not_prepared"}
+            if command == "commit_prepared_map":
+                if failure == "commit":
+                    return {"status": "error", "transaction_state": "partial"}
+                if failure == "lost_reply":
+                    raise RuntimeError("lost reply")
+        return {"status": "success", "transaction_state": state}
 
     monkeypatch.setenv("KVCACHED_PP_SIZE", "2")
     monkeypatch.setattr(ipc, "_send_and_receive_message", send)
-    with pytest.raises(RuntimeError, match="capacity exhausted"):
-        asyncio.run(ipc._broadcast_map_to_kv_tensors(
-            1, [0, source_stride], pp_rank=-1, offset_stride=source_stride))
-    assert len(messages) == 3
+    operation = ipc._broadcast_map_to_kv_tensors(
+        1, [0, strides[0]], pp_rank=-1, offset_stride=strides[0])
+    if failure == "lost_reply":
+        asyncio.run(operation)
+        assert (0, "get_map_transaction_state") in messages
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(operation)
+        cleanup = "abort_prepared_map" if failure == "prepare" else "orphan_map_transaction"
+        assert (1, cleanup) in messages
+    assert not any("unmap" in command for _, command in messages)
 
 
 @pytest.mark.parametrize("stride, offsets", [(0, [0]), (-1, [0]), (32, [16]),

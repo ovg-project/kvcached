@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
+#include "math_utils.hpp"
+#include "transaction_error.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -49,6 +51,25 @@ std::runtime_error system_error(const char *operation) {
   return std::runtime_error(std::string(operation) + ": " +
                             std::strerror(errno));
 }
+[[noreturn]] void ledger_path_error(const char *operation) {
+  if (errno == ENOENT || errno == ENOTDIR)
+    throw StateConsistencyError("KV control instance is not running");
+  if (errno == ELOOP || errno == EISDIR)
+    throw StateConsistencyError("KV budget segment was replaced");
+  throw system_error(operation);
+}
+
+void verify_ledger_path(int fd, const std::string &path) {
+  struct stat held{}, current{};
+  if (fstat(fd, &held) < 0)
+    throw system_error("stat open KV budget");
+  if (lstat(path.c_str(), &current) < 0)
+    ledger_path_error("stat KV budget path");
+  if (held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
+      !S_ISREG(current.st_mode))
+    throw StateConsistencyError("KV budget segment was replaced");
+}
+
 int lease(int fd, short type, bool wait, off_t start = 0) {
 #ifdef F_OFD_SETLK
   struct flock lock{};
@@ -78,7 +99,7 @@ struct CalibrationLease {
   explicit CalibrationLease(const std::string &path)
       : fd(open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW)) {
     if (fd < 0)
-      throw system_error("open calibration lease");
+      ledger_path_error("open calibration lease");
   }
   ~CalibrationLease() { close(fd); }
 };
@@ -232,13 +253,11 @@ struct GpuBudget::Locked {
     value.sync_acquire_ns_ += monotonic_ns() - started;
     if (result < 0)
       throw system_error("lock KV budget");
-    struct stat held{}, current{};
-    if (fstat(value.fd_, &held) < 0 ||
-        lstat(value.path_.c_str(), &current) < 0 ||
-        held.st_dev != current.st_dev || held.st_ino != current.st_ino ||
-        !S_ISREG(current.st_mode)) {
+    try {
+      verify_ledger_path(value.fd_, value.path_);
+    } catch (...) {
       flock(value.fd_, LOCK_UN);
-      throw std::runtime_error("KV budget segment was replaced");
+      throw;
     }
     if (value.shared_ && value.shared_->magic == kMagic) {
       // A subsequent writer also recovers an odd sequence left by a dead
@@ -268,13 +287,13 @@ GpuBudget::GpuBudget(const std::string &path, bool observe)
     : path_(path), pid_(getpid()) {
   fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
   if (fd_ < 0)
-    throw system_error("open live KV control");
+    ledger_path_error("open live KV control");
   try {
     // Serialize with epoch initialization, then require an existing user.
     if (lease(fd_, F_WRLCK, !observe, 2) < 0)
       throw system_error("lock KV control attachment");
     if (lease(fd_, F_WRLCK, false) == 0)
-      throw std::runtime_error("KV control instance is not running");
+      throw StateConsistencyError("KV control instance is not running");
     if (errno != EAGAIN && errno != EACCES)
       throw system_error("inspect live KV control");
     if (lease(fd_, F_RDLCK, true) < 0)
@@ -536,6 +555,7 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   const auto instance = shared_->pools[slot].instance;
   result.budget_bytes = shared_->budget;
   result.instance_limit_bytes = shared_->instances[instance].limit;
+  result.pool_minimum_bytes = shared_->pools[slot].minimum;
   result.watermark_bytes = watermark_locked(instance, shared_);
   result.sync_acquisitions = sync_acquisitions_;
   result.sync_contentions = sync_contentions_;
@@ -544,9 +564,12 @@ BudgetSnapshot GpuBudget::snapshot_locked(size_t slot) const {
   result.sync_dead_owner_recoveries = sync_dead_owner_recoveries_;
   for (const auto &entry : shared_->pools) {
     result.charged_bytes = add(result.charged_bytes, entry.charged);
-    if (entry.instance == instance && entry.owner != 0)
+    if (entry.instance == instance && entry.owner != 0) {
       result.instance_charged_bytes =
           add(result.instance_charged_bytes, entry.charged);
+      result.instance_minimum_bytes =
+          add(result.instance_minimum_bytes, entry.minimum);
+    }
   }
   return result;
 }
@@ -1156,7 +1179,11 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
     }
     if (pool.failed && pool.failed_revision == entry.limit_revision) {
       ++state.failed;
-      state.failure_reason = "quarantined_pages_prevent_resize";
+      if (pool.failed == 1 || state.failure_reason.empty()) {
+        state.failure_reason = pool.failed == 2
+                                   ? "retained_mapping_exceeds_limit"
+                                   : "quarantined_pages_prevent_resize";
+      }
     }
     cannot_shrink |= !pool.can_shrink;
     unsupported |= !pool.can_shrink && pool.target < pool.capacity;
@@ -1183,6 +1210,9 @@ InstanceControl GpuBudget::control_state_locked(size_t instance, size_t slot,
       usable > total ? usable - total : 0,
       entry.limit > state.charged_bytes ? entry.limit - state.charged_bytes
                                         : 0);
+  state.signed_available_bytes =
+      std::min(signed_headroom(usable, total),
+               signed_headroom(entry.limit, state.charged_bytes));
   state.registered_participants = live;
   state.convergence = state.status;
   return state;
@@ -1367,7 +1397,7 @@ bool GpuBudget::acknowledge_control(size_t slot, uint64_t revision) {
 
 bool GpuBudget::fail_control(const std::string &instance, size_t slot,
                              uint64_t owner, uint64_t generation,
-                             uint64_t revision) {
+                             uint64_t revision, bool retained_quota) {
   Locked lock(*this);
   if (slot >= kPools || !owner)
     return false;
@@ -1380,7 +1410,8 @@ bool GpuBudget::fail_control(const std::string &instance, size_t slot,
       entry.limit_revision != revision)
     return false;
   pool.failed_revision = revision;
-  pool.failed = 1;
+  // Keep the shared layout unchanged: legacy readers still see a failure.
+  pool.failed = retained_quota ? 2 : 1;
   pool.acknowledged = 0;
   return true;
 }
@@ -1390,9 +1421,10 @@ bool GpuBudget::recalibrate(const Sampler &sampler) {
   {
     Locked lock(*this);
     struct stat held{}, selected{};
-    if (fstat(fd_, &held) < 0 || fstat(calibration.fd, &selected) < 0 ||
-        held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
-      throw std::runtime_error("KV budget calibration segment was replaced");
+    if (fstat(fd_, &held) < 0 || fstat(calibration.fd, &selected) < 0)
+      throw system_error("stat KV budget calibration lease");
+    if (held.st_dev != selected.st_dev || held.st_ino != selected.st_ino)
+      throw StateConsistencyError("KV budget calibration segment was replaced");
     if (lease(calibration.fd, F_WRLCK, false, 1) < 0) {
       if (errno == EAGAIN || errno == EACCES)
         return false;

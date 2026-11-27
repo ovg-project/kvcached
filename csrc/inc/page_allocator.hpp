@@ -82,9 +82,10 @@ public:
   ~PageAllocator();
 
   // Page allocation and deallocation
-  std::shared_ptr<InternalPage> alloc_page();
+  std::shared_ptr<InternalPage> alloc_page(bool allow_fresh_retry = true);
   // Nonblocking: nullptr if this particular page is not currently free.
-  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id);
+  std::shared_ptr<InternalPage> try_alloc_page_at(page_id_t page_id,
+                                                  bool worker_priced = false);
   void free_page(page_id_t page_id);
   void free_pages(const std::vector<page_id_t> &page_ids);
   // Internal receipt: number of leading input pages placed in the reserve.
@@ -115,6 +116,8 @@ public:
   int64_t get_num_inuse_pages() const;
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
+  int64_t get_num_retryable_pages() const;
+  std::vector<page_id_t> get_retryable_page_ids() const;
   PageState get_page_state() const;
   TransactionState get_transaction_state() const;
   int64_t get_avail_physical_pages() const;
@@ -165,8 +168,14 @@ private:
   void resize_watcher();
 
   // Internal methods
-  std::shared_ptr<InternalPage> alloc_page_impl(page_id_t requested_id);
+  std::shared_ptr<InternalPage> alloc_page_impl(page_id_t requested_id,
+                                                bool allow_fresh_retry,
+                                                bool worker_priced = false);
   void map_pages(const std::vector<page_id_t> &page_ids);
+  std::vector<page_id_t> take_retained_batch_unlocked(page_id_t requested_id);
+  void retry_retained_batch(std::vector<page_id_t> pages);
+  bool retry_retained_pages();
+  int64_t get_num_retryable_pages_unlocked() const;
   void unmap_pages(const std::vector<page_id_t> &page_ids);
   int64_t get_num_inuse_pages_unlocked() const;
   int64_t trim_impl(int64_t max_pages, const std::vector<page_id_t> *eligible);
@@ -204,6 +213,9 @@ private:
   // Page lists
   std::deque<page_id_t> free_page_list_;
   std::deque<page_id_t> reserved_page_list_;
+  // Keep the exact callback payload: orphan adoption is batch-specific.
+  std::deque<std::vector<page_id_t>> retained_page_batches_;
+  int64_t retry_pages_in_flight_ = 0;
   std::deque<page_id_t> reclaimed_page_list_;
   std::vector<page_id_t> quarantined_page_ids_;
   std::string transaction_error_;

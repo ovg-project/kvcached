@@ -126,6 +126,7 @@ def _load_manager_module(monkeypatch, name, *, internal_page, page_allocator):
 
     tp_ipc_module = types.ModuleType("kvcached.tp_ipc_util")
     setattr(tp_ipc_module, "broadcast_kv_tensors_created", lambda *args, **kwargs: True)
+    setattr(tp_ipc_module, "raise_if_physical_growth_unresolved", lambda *args: None)
 
     vllm_interfaces_module = types.ModuleType("kvcached.integration.vllm.interfaces")
     setattr(vllm_interfaces_module, "should_use_worker_ipc", lambda: False)
@@ -193,7 +194,7 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
         def set_use_worker_ipc(self, use_worker_ipc):
             self.use_worker_ipc = use_worker_ipc
 
-        def alloc_page(self):
+        def alloc_page(self, allow_fresh_retry=True):
             if self.fail_alloc:
                 raise RuntimeError("injected allocation failure")
             self.page_inuse = True
@@ -653,7 +654,7 @@ def test_manager_snapshot_counts_available_blocks_against_logical_capacity(monke
         def set_use_worker_ipc(self, use_worker_ipc):
             self.use_worker_ipc = use_worker_ipc
 
-        def alloc_page(self):
+        def alloc_page(self, allow_fresh_retry=True):
             for page_id in range(self.total_pages):
                 if page_id not in self.inuse:
                     page = self.inuse[page_id] = FakeInternalPage(page_id)

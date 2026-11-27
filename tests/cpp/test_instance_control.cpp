@@ -1,14 +1,17 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 #include "gpu_budget.hpp"
+#include "transaction_error.hpp"
 
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <fcntl.h>
 #include <set>
 #include <stdexcept>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -18,6 +21,50 @@
 using namespace kvcached;
 
 void test_pool_reclaim(const std::string &directory) {
+  {
+    const auto ledger = directory + "/exited-control-worker";
+    const auto moved = ledger + "-held";
+    {
+      auto owner = GpuBudget::connect(ledger, [] { return 40; });
+      auto reader = GpuBudget::open_control(ledger);
+      assert(rename(ledger.c_str(), moved.c_str()) == 0);
+      auto check_lost = [&]() {
+        try {
+          reader->query_control("model");
+        } catch (const StateConsistencyError &) {
+          return;
+        }
+        assert(false);
+      };
+      check_lost();
+      assert(mkdir(ledger.c_str(), 0700) == 0);
+      try {
+        GpuBudget::open_control(ledger);
+        assert(false);
+      } catch (const StateConsistencyError &) {
+      }
+      assert(rmdir(ledger.c_str()) == 0);
+      {
+        auto replacement = GpuBudget::connect(ledger, [] { return 80; });
+        check_lost();
+      }
+      // Restore the held epoch before its owners tear down.
+      assert(rename(moved.c_str(), ledger.c_str()) == 0);
+    }
+    {
+      auto owner = GpuBudget::connect(ledger, [] { return 40; });
+    }
+    for (const auto &path : {ledger, ledger + "-missing"}) {
+      bool lost = false;
+      try {
+        GpuBudget::open_control(path);
+      } catch (const StateConsistencyError &) {
+        lost = true;
+      }
+      assert(lost);
+    }
+    unlink(ledger.c_str());
+  }
   {
     const auto ledger = directory + "/pool-registration-order";
     auto budget = GpuBudget::connect(ledger, [] { return 40; });
@@ -535,6 +582,19 @@ int main(int argc, char **argv) {
                                  first.generation, first.revision));
     assert(budget->acknowledge_control(slot, next.revision));
     assert(writer->query_control("failure").status == "converged");
+    auto quota = writer->publish_control("failure", 0, first.generation);
+    assert(writer->fail_control("failure", slot, participant.pool_owner,
+                                quota.generation, quota.revision, true));
+    auto blocked = writer->query_control("failure");
+    assert(blocked.status == "failed" && blocked.failed == 1);
+    assert(blocked.failure_reason == "retained_mapping_exceeds_limit");
+    assert(budget->snapshot(slot).instance_limit_bytes == 0);
+    auto restored = writer->publish_control("failure", 120, first.generation);
+    assert(restored.failed == 0 && restored.failure_reason.empty());
+    assert(!writer->fail_control("failure", slot, participant.pool_owner,
+                                 quota.generation, quota.revision, true));
+    assert(budget->acknowledge_control(slot, restored.revision));
+    assert(writer->query_control("failure").status == "converged");
   }
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
@@ -551,6 +611,9 @@ int main(int argc, char **argv) {
     budget->configure_control_pool(a, 120, 12, true, 3, true);
     budget->configure_control_pool(b, 240, 24, true, 3, true);
     budget->configure_control_pool(c, 120, 12, true, 3, false);
+    assert(budget->snapshot(a).pool_minimum_bytes == 12);
+    assert(budget->snapshot(a).instance_minimum_bytes == 36);
+    assert(budget->snapshot(c).pool_minimum_bytes == 0);
     for (auto slot : {a, b, c})
       budget->ready_control_pool(slot);
     auto grant_a = budget->grant(a, 24);
@@ -846,6 +909,7 @@ int main(int argc, char **argv) {
     budget->set_demand(high, 10);
     assert(budget->query_control("high").shortfall_bytes == 6);
     assert(budget->query_control("low").available_bytes == 0);
+    assert(budget->query_control("low").signed_available_bytes == -2);
     // Such a scheduler posts the demand by instance name and generation.
     auto writer = GpuBudget::open_control(ledger);
     const auto generation = budget->query_control("high").generation;

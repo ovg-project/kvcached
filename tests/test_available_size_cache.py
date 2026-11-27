@@ -215,7 +215,7 @@ class AllocMappingPageAllocator(CountingPageAllocator):
     def get_num_free_pages(self) -> int:
         return self.virtual_free
 
-    def alloc_page(self) -> _FakePage:
+    def alloc_page(self, allow_fresh_retry=True) -> _FakePage:
         # Mapping a page consumes one physical page from the driver pool and
         # one virtual free page, so the next available_size() must re-read.
         self.physical_free -= 1

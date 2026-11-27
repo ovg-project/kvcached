@@ -31,7 +31,7 @@ PAGE = 2 * 1024 * 1024
 torch.cuda.set_device(0)
 native.init_kvcached("cuda:0", PAGE, False)
 kcm.broadcast_kv_tensors_created = (
-    lambda world_size, pp_rank=0, group_id=0: native.kv_tensors_created(group_id))
+    lambda world_size, pp_rank=0, group_id=0, timeout_s=None: native.kv_tensors_created(group_id))
 inject = False
 hits = 0
 

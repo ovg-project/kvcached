@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from kvcached import prefix_cache_retention
+from kvcached.errors import StateConsistencyError
 
 
 class RuntimeControl:
@@ -38,6 +39,33 @@ class RuntimeControl:
         self.executing: tuple[dict, ...] = ()
         self.acknowledged: tuple = ()
 
+    def exact_retry_headroom(self) -> int | None:
+        """Sample worker GPUs and return the number of complete distributed pages they can fund."""
+        from kvcached.tp_ipc_util import control_workers
+
+        try:
+            workers = control_workers(self.manager.world_size, self.manager.pp_rank,
+                                      self.manager.group_id, refresh_capacity=True, expected_sources=self.sources)
+        except StateConsistencyError as exc:
+            self.manager._record_native_fatal("control poll", exc)
+            raise
+
+        sampled = {worker["gpu"] for worker in workers if worker.get("capacity_refreshed")}
+        if any(source["gpu"] not in sampled for source in self.sources):
+            # Another process may still hold this GPU's calibration lease.
+            return None
+
+        # Read after all samplers return. Workers sharing a GPU ledger spend
+        # and refund their combined bundle for each distributed page ID.
+        bundles: dict[tuple[str, str], int] = {}
+        balances: dict[tuple[str, str], int] = {}
+        for source, state in zip(self.sources, self.poll(force=True)):
+            ledger = (source["gpu"], source["instance"])
+            bundles[ledger] = bundles.get(ledger, 0) + state["page_bundle_bytes"]
+            balance = state["signed_available_bytes"]
+            balances[ledger] = min(balances.get(ledger, balance), balance)
+        return min(balances[key] // size for key, size in bundles.items())
+
     def poll(self, *, force: bool = False) -> tuple[dict, ...]:
         from kvcached import _C  # type: ignore[attr-defined]
 
@@ -45,14 +73,18 @@ class RuntimeControl:
         if not force and self.current and now - self.last_poll < 0.1:
             return self.current
         states = []
-        for source in self.sources:
-            state = _C.query_instance_control(source["gpu"], source["instance"],
-                                              source["pool_slot"])
-            if (state["generation"] != source["generation"]
-                    or state["pool_owner"] != source["pool_owner"]
-                    or state["status"] == "unavailable"):
-                raise RuntimeError("KV control participant changed or disappeared")
-            states.append(state)
+        try:
+            for source in self.sources:
+                state = _C.query_instance_control(source["gpu"], source["instance"],
+                                                  source["pool_slot"])
+                if (state["generation"] != source["generation"]
+                        or state["pool_owner"] != source["pool_owner"]
+                        or state["status"] == "unavailable"):
+                    raise StateConsistencyError("KV control participant changed or disappeared")
+                states.append(state)
+        except StateConsistencyError as exc:
+            self.manager._record_native_fatal("control poll", exc)
+            raise
         self.current = tuple(states)
         self.last_poll = now
         return self.current
@@ -76,14 +108,24 @@ class RuntimeControl:
         previous = tuple((state["generation"], state["limit_revision"], state["published"])
                          for state in self.executing)
         if signature != previous:
-            from kvcached.errors import QuarantinedResizeError
+            from kvcached.errors import (
+                QuarantinedResizeError,
+                RetainedQuotaResizeError,
+                RetainedResizeError,
+            )
 
             try:
                 manager.resize(pages * manager.page_size)
-            except QuarantinedResizeError:
+            except RetainedResizeError:
+                # The same revision must retry after the retained batch is
+                # adopted, including a revision already executing a shrink.
+                manager._resize_rejected = True
+                self.executing = ()
+                return
+            except (QuarantinedResizeError, RetainedQuotaResizeError) as error:
                 manager._resize_rejected = True
                 self.executing = states
-                self.fail()
+                self.fail(retained_quota=isinstance(error, RetainedQuotaResizeError))
                 return
             self.executing = states
         elif manager.in_shrink:
@@ -96,7 +138,7 @@ class RuntimeControl:
         if not manager.in_shrink and not getattr(manager, "_resize_rejected", False):
             self.acknowledge()
 
-    def fail(self) -> None:
+    def fail(self, *, retained_quota: bool = False) -> None:
         """Report the executing max, even if newer controls were published."""
         from kvcached import _C  # type: ignore[attr-defined]
 
@@ -104,7 +146,8 @@ class RuntimeControl:
             if state["published"]:
                 _C.fail_instance_control(
                     source["gpu"], source["instance"], source["pool_slot"],
-                    source["pool_owner"], state["generation"], state["limit_revision"])
+                    source["pool_owner"], state["generation"], state["limit_revision"],
+                    retained_quota=retained_quota)
 
     def acknowledge(self) -> None:
         from kvcached import _C  # type: ignore[attr-defined]

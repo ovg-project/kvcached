@@ -68,6 +68,9 @@ class Backend:
     def get_num_reserved_pages(self):
         return self.reserved_pages
 
+    def get_num_retryable_pages(self):
+        return 0
+
     def get_num_free_pages(self):
         return 8
 
@@ -93,7 +96,7 @@ def make_manager():
                and n.name == 'KVCacheManager')
     selected = {'alloc_exact', '_alloc_exact_ready', '_alloc_exact_impl', '_release_unclaimed_exact_pages',
                 'can_alloc_exact', '_can_alloc_exact_ready', '_exact_claim_preflight',
-                'exact_recovery_quote',
+                'exact_recovery_quote', '_memory_limit_page_bundle_bytes', '_check_physical_growth_state', '_exact_retry_trim_plan',
                 'take_step_alloc_blocks', 'free',
                 '_apply_resize_target', '_retiring_page_ids', '_unreusable_page_ids'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
@@ -109,6 +112,7 @@ def make_manager():
                         type_ignores=[])
     namespace: dict[str, Any] = {'operator': operator, 'InternalPage': Page,
                  'StateConsistencyError': UnsafeMapping,
+                 'raise_if_physical_growth_unresolved': lambda: None,
                  'QuarantinedResizeError': RejectedResize,
                  'logger': SimpleNamespace(warning=lambda message: None),
                  'functools': functools, 'nullcontext': nullcontext}
@@ -462,6 +466,102 @@ def test_exact_claim_can_use_preallocated_physical_backing():
     manager.page_allocator.reserved_pages = 1
     assert manager.alloc_exact([4]) == [4]
     assert manager.page_allocator.calls == [1]
+
+
+def test_exact_preflight_prices_only_matching_retained_pages_at_zero_headroom():
+    manager = make_manager()
+    manager._get_cached_avail_physical_pages = lambda: 0
+    manager.page_allocator.get_num_retryable_pages = lambda: 1
+    manager.page_allocator.exact_recovery_quote = lambda ids: (0 if ids == [1] else 32, [], 0)
+    assert not manager.can_alloc_exact([8])
+    assert manager.alloc_exact([8]) is None
+    assert manager.can_alloc_exact([4])
+    assert manager.alloc_exact([4]) == [4]
+    assert manager.page_allocator.calls == [1]
+
+
+@pytest.mark.parametrize("debt, idle, fits", [(1, [3, 4], True), (2, [3, 4], False)])
+def test_retained_repricing_uses_live_worker_debt_before_trimming(debt, idle, fits):
+    manager = make_manager()
+    manager.page_allocator.get_avail_physical_bytes = lambda: 1024
+    manager.page_allocator.exact_recovery_quote = lambda pending: (32, idle, 0)
+    polls = []
+
+    def retry_headroom():
+        polls.append(True)
+        return -debt
+
+    manager._worker_control = lambda: SimpleNamespace(exact_retry_headroom=retry_headroom)
+    assert manager._exact_retry_trim_plan([2]) == (idle if fits else None)
+    assert polls == [True]
+
+
+def test_failed_adoption_leaves_fresh_id_on_the_ordinary_path():
+    manager = make_manager()
+    backend = manager.page_allocator
+    backend.get_num_retryable_pages = lambda: 1
+    backend.get_retryable_page_ids = lambda: [1]
+    backend.fail_page = 1
+    assert manager.alloc_exact([8, 4]) is None
+    assert not getattr(manager, "_pending_exact_retry_pages", set())
+    assert manager.alloc_exact([8]) == [8]
+    assert backend.calls == [1, 2]
+
+
+def test_backed_retry_id_does_not_gate_an_unrelated_fresh_page():
+    manager = make_manager()
+    manager._pending_exact_retry_pages = {1}
+    manager.page_allocator.reserved_pages = 1
+    quotes = []
+
+    def quote(ids):
+        quotes.append(ids)
+        return 0, [], 0
+
+    manager.page_allocator.exact_recovery_quote = quote
+    assert manager.can_alloc_exact([4, 8])
+    assert manager.alloc_exact([4, 8]) == [4, 8]
+    assert quotes and all(ids == [1] for ids in quotes)
+    assert not manager._pending_exact_retry_pages
+
+
+def test_unavailable_hinted_id_rejects_the_whole_claim_without_mapping():
+    manager = make_manager()
+    manager._pending_exact_retry_pages = {2}
+    manager.page_allocator.exact_recovery_quote = lambda ids: None
+    assert not manager.can_alloc_exact([4, 8])
+    assert manager.alloc_exact([4, 8]) is None
+    assert not manager.page_allocator.calls
+
+
+def test_reclaimed_hint_can_use_a_slot_from_another_requested_retained_batch():
+    manager = make_manager()
+    manager._pending_exact_retry_pages = {2}
+    manager._get_cached_avail_physical_pages = lambda: 0
+    manager.page_allocator.get_num_retryable_pages = lambda: 2
+
+    def quote(ids):
+        return (0, [], 0) if set(ids) == {1, 2} else None
+
+    manager.page_allocator.exact_recovery_quote = quote
+    assert manager.can_alloc_exact([8, 4])
+    assert not manager.page_allocator.calls
+
+
+def test_unexpected_repricing_error_releases_the_adopted_prefix():
+    manager = make_manager()
+    backend = manager.page_allocator
+    backend.get_num_retryable_pages = lambda: 1
+    backend.get_retryable_page_ids = lambda: [1]
+
+    def fail(pending):
+        raise OSError("control socket unavailable")
+
+    manager._exact_retry_trim_plan = fail
+    with pytest.raises(OSError, match="control socket unavailable"):
+        manager.alloc_exact([4, 8])
+    assert backend.calls == [1] and backend.released == [1]
+    assert not manager.avail_pages and manager.num_avail_blocks == 0
 
 
 def test_exact_claim_rejects_logical_id_tail_before_mapping():
