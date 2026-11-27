@@ -8,8 +8,8 @@ SGLang 0.5.16 made ``HybridReqToTokenPool`` build its Mamba pool through the
 ``mamba_pool_cls`` class attribute, which captured the native ``MambaPool``
 before any aliasing ran, and added the ``enable_gdn_replayssm_spec``
 constructor kwarg (renamed ``enable_linear_replayssm_spec`` in 0.5.17).
-0.5.20 added the deferred ``clear_slots`` call and the PD-transfer metadata
-readers, whose native bodies index ``(layers, slots, *)`` tensors that the
+0.5.15 moved deferred slot clearing into ModelRunner. 0.5.20 added PLE
+slot state and PD-transfer metadata. The native methods index tensors that the
 non-contiguous per-layer container does not have.
 
 The state-op tests build pools through the real constructor on CPU torch
@@ -300,15 +300,6 @@ def test_ctor_sets_attributes_inherited_methods_read(elastic_mamba_pool_cls):
     assert pool.replayssm_is_flush is None
 
 
-def test_register_slot_state_refused(elastic_mamba_pool_cls):
-    """0.5.20 registers Qwen4-Exp PLE sibling states that must follow slot
-    clears and copies; the elastic pool refuses rather than dropping them."""
-    pool = elastic_mamba_pool_cls(**_mamba_pool_kwargs())
-
-    with pytest.raises(NotImplementedError, match="slot-sibling"):
-        pool.register_slot_state(object())
-
-
 def test_ctor_is_isolated_from_installed_sglang(monkeypatch):
     """The rank helpers must come from the test's own fakes, never from
     whatever sglang the environment has (importing a real one under the
@@ -396,6 +387,9 @@ class _Native0520MambaPool:
 
         def mem_usage_bytes(self):
             return 0
+
+    def register_slot_state(self, state):
+        self._slot_siblings = (*self._slot_siblings, state)
 
     def clear_slots(self, indices):
         for sibling in self._slot_siblings:
@@ -489,7 +483,7 @@ def elastic_state_pool_factory(monkeypatch):
         lambda device: True,
     )
 
-    def factory(*, contiguous):
+    def factory(*, contiguous, version="0.5.20", native_pool=None):
         kvi: Any = types.ModuleType("kvcached.integration.sglang.interfaces")
         kvi.init_kvcached = lambda **kwargs: None
 
@@ -524,10 +518,13 @@ def elastic_state_pool_factory(monkeypatch):
         _install_interfaces_module(monkeypatch, kvi)
 
         module: Any = types.ModuleType("sglang.srt.mem_cache.memory_pool")
-        module.MambaPool = _Native0520MambaPool
+        module.current_platform = types.SimpleNamespace(synchronize=lambda: None)
+        if not version.startswith(("0.5.11", "0.5.12")):
+            module.MambaSlotAllocator = object
+        module.MambaPool = native_pool or _Native0520MambaPool
         patch = ElasticMambaPoolPatch()
         monkeypatch.setattr(
-            patch.version_manager, "detect_version", lambda library: "0.5.20"
+            patch.version_manager, "detect_version", lambda library: version
         )
         assert patch.apply(module) is True
         return module.ElasticMambaPool(**_mamba_pool_kwargs(device="cpu"))
@@ -609,3 +606,180 @@ def test_transfer_iterator_orders_like_buf_infos(elastic_state_pool_factory,
     assert [f for f, _, _, _ in entries] == [
         "conv", "conv", "temporal", "temporal"
     ]
+
+
+@pytest.mark.parametrize("version", [
+    "0.5.11", "0.5.12.post1", "0.5.13", "0.5.14", "0.5.15", "0.5.19",
+])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_legacy_pool_alloc_clears_only_selected_slots(
+        elastic_state_pool_factory, version, contiguous):
+    class LegacyPool:
+        State = _Native0520MambaPool.State
+
+    # The slot method predates the shared ModelRunner hook in 0.5.15.
+    if version in ("0.5.13", "0.5.14", "0.5.15", "0.5.19"):
+        LegacyPool._slot_siblings = ()  # type: ignore[attr-defined]
+        LegacyPool.clear_slots = _Native0520MambaPool.clear_slots  # type: ignore[attr-defined]
+    pool = elastic_state_pool_factory(
+        contiguous=contiguous, version=version, native_pool=LegacyPool)
+    pool.kvcached_allocator.alloc = lambda count: [3]
+    selected = pool.alloc(1)
+    assert selected.tolist() == [3]
+    state = pool.mamba_cache
+    conv, temporal = ((state.conv[0], state.temporal) if contiguous else
+                      (state.conv_per_layer[0], state.temporal_per_layer))
+    if version in ("0.5.13", "0.5.14", "0.5.15", "0.5.19"):
+        assert all((rows[3] == 7).all() for rows in [*conv, *temporal])
+        pool.clear_slots(selected)
+    for rows in [*conv, *temporal]:
+        assert not rows[3].any()
+        assert (rows[2] == 7).all()
+
+
+@pytest.mark.parametrize("version,needs_hook", [
+    ("0.5.12.post1", False), ("0.5.13", True), ("0.5.13.post1", True),
+    ("0.5.14", True), ("0.5.15", False), ("0.5.20", False),
+])
+def test_lightning_runs_pending_slot_ops_before_metadata(
+        monkeypatch, elastic_state_pool_factory, version, needs_hook):
+    calls = []
+
+    class Lightning:
+        def __init__(self, pool):
+            self.req_to_token_pool = types.SimpleNamespace(mamba_pool=pool)
+
+        def _execute_deferred_mamba_cow_and_clear(self, forward_batch):
+            calls.append(("slot ops", forward_batch))
+
+        def init_forward_metadata(self, forward_batch):
+            calls.append(("metadata", forward_batch))
+
+    name = "sglang.srt.layers.attention.linear.lightning_backend"
+    module: Any = types.ModuleType(name)
+    module.LightningAttentionBackend = Lightning
+    monkeypatch.setitem(sys.modules, name, module)
+    pool = elastic_state_pool_factory(contiguous=False, version=version)
+    elastic_state_pool_factory(contiguous=False, version=version)
+    backend = Lightning(pool)
+    backend.init_forward_metadata(3)
+    assert calls == ([("slot ops", 3), ("metadata", 3)] if needs_hook else [("metadata", 3)])
+
+    calls.clear()
+    backend.req_to_token_pool.mamba_pool = object()
+    backend.init_forward_metadata(4)
+    assert calls == [("metadata", 4)]
+
+
+class _SlotState:
+    def __init__(self, rows, layer_id):
+        self.rows = rows
+        self.layer_id = layer_id
+
+    def reset_slots(self, indices):
+        self.rows[indices] = 0
+
+    def copy_slots(self, src, dst):
+        self.rows[dst] = self.rows[src]
+
+    def get_cpu_slots(self, indices):
+        return self.rows[indices].clone()
+
+    def load_cpu_slots(self, data, indices):
+        self.rows[indices] = data
+
+    def iter_transfer_state_entries(self):
+        yield "ple", self.rows, None, self.layer_id
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_ple_slots_reset_on_reuse(elastic_state_pool_factory, contiguous):
+    pool = elastic_state_pool_factory(contiguous=contiguous)
+    state = _SlotState(torch.arange(6).reshape(3, 2), 7)
+    pool.register_slot_state(state)
+    pool.kvcached_allocator.alloc = lambda count: [1]
+
+    for previous in ([2, 3], [99, 99]):
+        slot = pool.alloc(1)
+        assert state.rows[1].tolist() == previous
+        pool.clear_slots(slot)
+        assert state.rows.tolist() == [[0, 1], [0, 0], [4, 5]]
+        state.rows[slot] = 99
+        pool.free(slot)
+
+
+def test_per_layer_ple_copy_and_host_checkpoint(elastic_state_pool_factory):
+    pool = elastic_state_pool_factory(contiguous=False)
+    src, dst = torch.tensor([2, 1]), torch.tensor([3, 4])
+    layers = [*pool.mamba_cache.conv_per_layer, pool.mamba_cache.temporal_per_layer]
+    for group in layers:
+        for i, tensor in enumerate(group):
+            tensor[2], tensor[1] = i + 10, i + 20
+
+    plain = pool.get_cpu_copy(src)
+    assert len(plain) == 2
+    siblings = [_SlotState(torch.arange(12).reshape(6, 2) + i, i) for i in (7, 9)]
+    for sibling in siblings:
+        pool.register_slot_state(sibling)
+    host = pool.get_cpu_copy(src)
+    assert torch.equal(plain[0][0], host[0][0])
+    assert torch.equal(plain[1], host[1])
+    assert pool.get_state_layer_ids()[-2:] == [7, 9]
+    assert pool.get_contiguous_buf_infos()[0][-2:] == [
+        sibling.rows.data_ptr() for sibling in siblings
+    ]
+
+    pool.copy_from(src, dst)
+    for sibling, expected in zip(siblings, host[2]):
+        assert torch.equal(sibling.rows[dst], expected)
+    pool.clear_slots(src)
+    pool.clear_slots(dst)
+    pool.load_cpu_copy(host, dst)
+    for group, expected in zip(layers, [*host[0], host[1]]):
+        for tensor, rows in zip(group, expected):
+            assert torch.equal(tensor[dst], rows)
+            assert not tensor[src].any()
+    for sibling, expected in zip(siblings, host[2]):
+        assert torch.equal(sibling.rows[dst], expected)
+        assert not sibling.rows[src].any()
+
+
+def test_failed_slot_reset_returns_all_ids(elastic_state_pool_factory, monkeypatch):
+    pool = elastic_state_pool_factory(contiguous=False, version="0.5.12")
+    released: list[int] = []
+    monkeypatch.setattr(pool.kvcached_allocator, "alloc", lambda count: [2, 1])
+    monkeypatch.setattr(pool.kvcached_allocator, "free", released.extend)
+
+    def fail(indices):
+        raise RuntimeError("reset failed")
+
+    monkeypatch.setattr(pool, "clear_slots", fail)
+    with pytest.raises(RuntimeError, match="reset failed"):
+        pool.alloc(2)
+    assert released == [2, 1]
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_ple_disaggregation_rejects_strided_rows(elastic_state_pool_factory, contiguous):
+    pool = elastic_state_pool_factory(contiguous=contiguous)
+    pool.register_slot_state(_SlotState(torch.ones(9, 2), 7))
+    convs = pool.mamba_cache.conv if contiguous else pool.mamba_cache.conv_per_layer[0]
+    convs[0] = torch.empty((*convs[0].shape, 2))[..., 0]
+    with pytest.raises(RuntimeError, match="PLE disaggregation requires dense Mamba slot rows"):
+        pool.get_contiguous_buf_infos()
+
+
+def test_per_layer_single_request_cpu_checkpoint(elastic_state_pool_factory):
+    pool = elastic_state_pool_factory(contiguous=False)
+    src, dst = torch.tensor(1), torch.tensor(3)
+    sibling = _SlotState(torch.arange(12).reshape(6, 2), 7)
+    pool.register_slot_state(sibling)
+    cache = pool.mamba_cache
+    for i, layer in enumerate(cache.temporal_per_layer):
+        layer[src] = i + 10
+    payload = pool.get_cpu_copy(src)
+    assert payload[1].shape == (2, *cache.temporal_per_layer[0].shape[1:])
+    pool.load_cpu_copy(payload, dst)
+    for i, layer in enumerate(cache.temporal_per_layer):
+        assert (layer[dst] == i + 10).all()
+    assert torch.equal(sibling.rows[src], sibling.rows[dst])

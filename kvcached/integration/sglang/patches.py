@@ -2458,6 +2458,8 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             success &= self.rebind_hybrid_mamba_pool_cls(mem_pool_mod)
         if success and self.patch_mamba_slot_allocator in self.applicable_methods:
             success &= self.patch_mamba_slot_allocator(mem_pool_mod)
+        if success and self.hook_legacy_lightning in self.applicable_methods:
+            self.hook_legacy_lightning()
         return success
 
     @version_range(SGLANG_ALL_RANGE)
@@ -2478,6 +2480,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
             import torch
 
             State = getattr(MambaPool, "State")
+            pool_owns_slots = not hasattr(mem_pool_mod, "MambaSlotAllocator")
 
             class _PerLayerMambaState:
                 """Mamba state holder for kvcached non-contiguous layout.
@@ -2805,22 +2808,17 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         return _sglang_capacity_miss(
                             self, need_size, "mamba slots",
                             self.kvcached_allocator)
-                    select_index = torch.tensor(
-                        block_ids, dtype=torch.int64, device=self.device,
-                    )
-                    if self._is_contiguous:
-                        for i in range(len(self.mamba_cache.conv)):
-                            self.mamba_cache.conv[i][:, select_index] = 0
-                        self.mamba_cache.temporal[:, select_index] = 0
-                    else:
-                        # Per-layer zeroing: each layer's state tensor is
-                        # (slots, *), so [select_index] slices on the slot
-                        # dim directly.
-                        for shape_list in self.mamba_cache.conv_per_layer:
-                            for t in shape_list:
-                                t[select_index] = 0
-                        for t in self.mamba_cache.temporal_per_layer:
-                            t[select_index] = 0
+                    try:
+                        select_index = torch.tensor(
+                            block_ids, dtype=torch.int64, device=self.device,
+                        )
+                        # From 0.5.13 the scheduler reserves IDs. The forward
+                        # stream clears or copies the slots after their last reader.
+                        if pool_owns_slots:
+                            self.clear_slots(select_index)
+                    except Exception:
+                        self.kvcached_allocator.free(block_ids)
+                        raise
                     return select_index
 
                 def free(self, free_index: Any) -> None:
@@ -2831,35 +2829,22 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                 def clear(self) -> None:
                     self.kvcached_allocator.clear()
 
-                def register_slot_state(self, state: Any) -> None:
-                    # SGLang 0.5.20 attaches Qwen4-Exp PLE side states
-                    # (ShortConvPool / NGramPool) that must follow every slot
-                    # clear, copy, and host round-trip.  The elastic pool
-                    # does not implement that ride-along yet, so refuse
-                    # instead of dropping sibling state silently.
-                    raise NotImplementedError(
-                        "ElasticMambaPool does not support SGLang PLE "
-                        "slot-sibling states (register_slot_state) yet."
-                    )
-
                 def clear_slots(self, indices: "torch.Tensor") -> None:
-                    # 0.5.20's deferred COW/clear on the extend path
-                    # (ModelRunner._maybe_execute_deferred_mamba_cow_and_clear)
-                    # calls this; the native body indexes (layers, slots, *)
-                    # tensors, which on per-layer state would zero the wrong
-                    # axis of layer 0 and miss every other layer.
                     if self._is_contiguous:
                         if hasattr(MambaPool, "clear_slots"):
-                            super().clear_slots(indices)
+                            return super().clear_slots(indices)
+                        # Older SGLang releases clear new slots in alloc().
+                        for conv in self.mamba_cache.conv:
+                            conv[:, indices] = 0
+                        self.mamba_cache.temporal[:, indices] = 0
                     else:
-                        # Per-layer state is (slots, *shape); index the slot
-                        # dim directly.  No _slot_siblings pass here:
-                        # register_slot_state refuses, so none can exist.
-                        for shape_list in self.mamba_cache.conv_per_layer:
-                            for t in shape_list:
-                                t[indices] = 0
-                        for t in self.mamba_cache.temporal_per_layer:
-                            t[indices] = 0
+                        for sibling in getattr(self, "_slot_siblings", ()):
+                            sibling.reset_slots(indices)
+                        for group in self.mamba_cache.conv_per_layer:
+                            for conv in group:
+                                conv[indices] = 0
+                        for temporal in self.mamba_cache.temporal_per_layer:
+                            temporal[indices] = 0
 
                 def copy_from(
                     self, src_index: "torch.Tensor", dst_index: "torch.Tensor"
@@ -2873,6 +2858,49 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                 t[dst_index] = t[src_index]
                         for t in self.mamba_cache.temporal_per_layer:
                             t[dst_index] = t[src_index]
+                        for sibling in getattr(self, "_slot_siblings", ()):
+                            sibling.copy_slots(src_index, dst_index)
+
+                # 0.5.20 adds sibling state to host checkpoints. Keep the
+                # native format when the layers use separate VMM allocations.
+                if hasattr(MambaPool, "register_slot_state"):
+                    def get_cpu_copy(self, indices):
+                        if self._is_contiguous:
+                            return super().get_cpu_copy(indices)
+                        mem_pool_mod.current_platform.synchronize()
+                        state = self.mamba_cache
+                        groups = [*state.conv_per_layer, state.temporal_per_layer]
+                        slot = indices.item() if indices.ndim == 0 else indices
+                        host = []
+                        for group in groups:
+                            # Under memory pressure only gather one layer on
+                            # the device at a time. Stack directly on the host.
+                            first = group[0][slot]
+                            rows = first.new_empty((len(group), *first.shape), device="cpu")
+                            rows[0].copy_(first, non_blocking=True)
+                            for dst, layer in zip(rows[1:], group[1:]):
+                                dst.copy_(layer[slot], non_blocking=True)
+                            host.append(rows)
+                        siblings = [s.get_cpu_slots(indices) for s in self._slot_siblings]
+                        mem_pool_mod.current_platform.synchronize()
+                        payload = (host[:-1], host[-1])
+                        return (*payload, siblings) if siblings else payload
+
+                    def load_cpu_copy(self, mamba_cache_cpu, indices):
+                        if self._is_contiguous:
+                            return super().load_cpu_copy(mamba_cache_cpu, indices)
+                        conv, temporal = mamba_cache_cpu[:2]
+                        state = self.mamba_cache
+                        groups = [*state.conv_per_layer, state.temporal_per_layer]
+                        mem_pool_mod.current_platform.synchronize()
+                        slot = indices.item() if indices.ndim == 0 else indices
+                        for group, host in zip(groups, [*conv, temporal]):
+                            for layer, rows in zip(group, host):
+                                layer[slot] = rows.to(layer.device, non_blocking=True)
+                        if self._slot_siblings:
+                            for sibling, data in zip(self._slot_siblings, mamba_cache_cpu[-1]):
+                                sibling.load_cpu_slots(data, indices)
+                        mem_pool_mod.current_platform.synchronize()
 
                 def _iter_transfer_state_entries(self):
                     # The 0.5.20 PD-transfer readers (get_state_layer_ids,
@@ -2908,8 +2936,17 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                                     0,
                                     layer_id,
                                 )
+                        for sibling in getattr(self, "_slot_siblings", ()):
+                            yield from sibling.iter_transfer_state_entries()
 
                 def get_contiguous_buf_infos(self):
+                    if getattr(self, "_slot_siblings", ()):
+                        # PD addresses slot i as base + i * row_bytes.
+                        for _, state, _, _ in self._iter_transfer_state_entries():
+                            if not state.is_contiguous():
+                                raise KVCachedConfigError(
+                                    "PLE disaggregation requires dense Mamba slot rows; "
+                                    "use colocated serving with this elastic layout")
                     if self._is_contiguous:
                         if hasattr(MambaPool, "get_contiguous_buf_infos"):
                             return super().get_contiguous_buf_infos()
@@ -3001,6 +3038,29 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
 
         HybridReqToTokenPool.mamba_pool_cls = ElasticMambaPool
         return True
+
+    @version_range(">=0.5.13,<0.5.15.dev0")
+    def hook_legacy_lightning(self) -> None:
+        from wrapt.importer import when_imported
+
+        # Lightning overrides the base metadata method without running its
+        # deferred clear/COW. In 0.5.15 this moved to the common ModelRunner.
+        @when_imported("sglang.srt.layers.attention.linear.lightning_backend")
+        def patch_lightning(module):
+            backend = module.LightningAttentionBackend
+            original = backend.init_forward_metadata
+            marker = "__kvcached_lightning_slot_ops__"
+            if self._is_already_patched(original, marker):
+                return
+
+            @functools.wraps(original)
+            def init_forward_metadata(self, forward_batch):
+                if hasattr(self.req_to_token_pool.mamba_pool, "kvcached_allocator"):
+                    self._execute_deferred_mamba_cow_and_clear(forward_batch)
+                return original(self, forward_batch)
+
+            self._mark_as_patched(init_forward_metadata, marker)
+            backend.init_forward_metadata = init_forward_metadata
 
     @version_range(">=0.5.13")
     def patch_mamba_slot_allocator(self, mem_pool_mod: types.ModuleType) -> bool:

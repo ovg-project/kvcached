@@ -423,6 +423,10 @@ class HiCacheMambaHostPoolPatch(VersionAwarePatch, BasePatch):
             if not (enable_kvcached() and _elastic_mamba(device_pool)):
                 original_init(host, device_pool, *args, **kwargs)
                 return
+            if getattr(device_pool, "_slot_siblings", ()):
+                raise KVCachedConfigError(
+                    "HiCache cannot restore PLE slot state from the elastic Mamba host pool; "
+                    "disable hierarchical caching for this model")
             original_init(host, device_pool if device_pool._is_contiguous
                           else _StackedMambaPool(device_pool), *args, **kwargs)
             host.device_pool = device_pool
