@@ -39,12 +39,16 @@ def extract_models_mapping(
         else:
             arg_list: List[str] = []
             for item in raw_args:
-                arg_list.extend(shlex.split(str(item)))
+                if isinstance(item, (list, tuple)):
+                    arg_list.extend(map(str, item))
+                else:
+                    arg_list.extend(shlex.split(str(item)))
 
         # Detect --host / --port options
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--host")
         parser.add_argument("--port", type=int)
+        parser.add_argument("--enable-weights-cpu-backup", action="store_true")
 
         known_args, _ = parser.parse_known_args(arg_list)
 
@@ -67,6 +71,9 @@ def extract_models_mapping(
                 "engine": engine_name
             }
         }
+
+        if engine_name.lower() in {"sgl", "sglang"}:
+            models_mapping[model_name]["weights_cpu_backup"] = known_args.enable_weights_cpu_backup
 
     return models_mapping
 

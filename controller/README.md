@@ -124,6 +124,21 @@ These settings apply to all vLLM models in the controller; defaults are `abort` 
 
 `wait` requires vLLM >= 0.17.0 with V1 multiprocessing and [sleep mode enabled](https://docs.vllm.ai/en/latest/features/sleep_mode/#online-serving). It drains running requests, not queued ones. Allow enough timeout for draining and offload; an HTTP timeout does not cancel remote sleep.
 
+For fast SGLang swapping, launch each model with `--enable-memory-saver` and
+`--enable-weights-cpu-backup`. The frontend detects the CPU backup flag in
+`engine_args` and skips the disk reload after resume. Models without the flag
+still reload weights from disk. CPU backup uses host RAM roughly proportional
+to model weights. Keep CUDA IPC weight caching disabled for sleeping models.
+
+When using `SleepManager` directly, match the engine's actual configuration:
+
+```python
+sleep_manager.add_sglang_model(
+    "Qwen/Qwen2.5-0.5B-Instruct", "localhost", "30000",
+    weights_cpu_backup=True,
+)
+```
+
 ### Note: URL Encoding for Model Names
 When using endpoints with model names containing slashes (e.g., `meta-llama/Llama-3.2-1B`), URL encode the slashes:
 * Original: `meta-llama/Llama-3.2-1B`
