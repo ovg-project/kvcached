@@ -646,7 +646,10 @@ def sglang_scheduler(monkeypatch):
     from runtime_control_fake import attach_control
     attach_control(manager, monkeypatch)
     def initialize(*args, **kwargs):
-        getattr(manager, "_runtime_control").test_state["can_shrink"] = kwargs["can_shrink"](manager)
+        state = getattr(manager, "_runtime_control").test_state
+        state["can_shrink"] = kwargs["can_shrink"](manager)
+        if "count_participants" in kwargs:
+            state["expected_participants"] = kwargs["count_participants"](1)
         return (manager,)
     monkeypatch.setattr("kvcached.runtime_control.initialize_runtime_controls", initialize)
     cache = FakeSGLangCache(manager)
@@ -984,7 +987,7 @@ def test_sglang_tensor_parallel_hicache_trim_stops_once_no_rank_needs_space(
     assert hicache_retention.parallel_hicache_trim_pending(hicache) is peer_needs
 
 
-def test_lockstep_evicts_once_per_component():
+def test_lockstep_evicts_once_per_component(monkeypatch):
     """DSV4's C128 KV, C4 KV and C4 index managers share one prefix tree, so
     an agreed count is evicted once, then each manager reclaims its pages."""
     from kvcached.integration.sglang import patches
@@ -995,11 +998,12 @@ def test_lockstep_evicts_once_per_component():
     def reclaimer(index, tokens):
         manager = SimpleNamespace(in_shrink=True,
                                   reclaim_for_shrink=lambda: reclaimed.append(index))
-        return SimpleNamespace(swa=False, manager=manager, shrink_tokens=lambda: tokens,
-                               evict_tokens=evicted.append)
+        return SimpleNamespace(swa=False, manager=manager, shrink_tokens=lambda: tokens)
 
     reclaimers = [reclaimer(0, 16), reclaimer(1, 0), reclaimer(2, 0)]
-    scheduler = SimpleNamespace(_kvcached_lockstep_idle_passes=patches._LOCKSTEP_SHRINK_INTERVAL - 1)
+    monkeypatch.setattr(patches, "_sglang_evict_params_cls", lambda: None)
+    scheduler = SimpleNamespace(tree_cache=SimpleNamespace(evict=evicted.append),
+                                _kvcached_lockstep_idle_passes=patches._LOCKSTEP_SHRINK_INTERVAL - 1)
     with mock.patch.object(patches, "reduce_counts", lambda counts, groups, op: counts):
         patches._shrink_in_lockstep(scheduler, reclaimers, ["group"])
 
@@ -1051,7 +1055,8 @@ def test_sglang_tensor_parallel_swa_pool_shrinks_only_without_hicache(
 
     assert manager._runtime_control.test_state["can_shrink"] is (not hicache)
     if hicache:
-        reclaimer.evict_tokens(4)
+        tp_lockstep.peer.extend([0, 4])
+        _idle_round(scheduler)
         assert trims == [] and len(cache.cached) == 32
 
 
@@ -1086,6 +1091,35 @@ def test_sglang_pipeline_shrinks_in_lockstep(sglang_scheduler, tp_lockstep, tp_s
             break
         _idle_round(scheduler)
     _assert_sglang_within_limit(scheduler)
+
+
+def test_coordinated_pipeline_counts_pools_and_keeps_lockstep_shrink(
+        sglang_scheduler, tp_lockstep, monkeypatch):
+    from kvcached.integration.sglang.scheduler import pipeline
+
+    tp_lockstep.stages = 2
+    monkeypatch.setenv("KVCACHED_RANK_COORDINATION_ENABLE", "1")
+    # One pool on this stage, two on the peer stage.
+    monkeypatch.setattr(pipeline, "sum_pipeline_counts", lambda scheduler, local: local + 2)
+    scheduler = sglang_scheduler(pp_size=2)
+    control = scheduler.tree_cache.manager._runtime_control.test_state
+    assert control["expected_participants"] == 3
+    assert control["can_shrink"] is True
+
+
+def test_sglang_pipeline_swa_only_stage_evicts_peer_full_prefix(sglang_scheduler, tp_lockstep):
+    tp_lockstep.stages = 2
+    cache = sglang_scheduler(pp_size=2).tree_cache
+    cache.token_to_kv_pool_allocator = SimpleNamespace(
+        _kvcached_dsv4_backing=SimpleNamespace(manager=cache.manager), free_group=None)
+    scheduler = sglang_scheduler(pp_size=2)
+    assert [r.swa for r in scheduler._kvcached_shrink_reclaimers] == [True]
+    tp_lockstep.peer.extend([12, 0])
+
+    _idle_round(scheduler)
+
+    assert tp_lockstep.reduces == [[0, 0]]
+    assert len(cache.cached) == 32 - 12
 
 
 def test_sglang_pipeline_evicts_what_another_stage_needs(sglang_scheduler, tp_lockstep):

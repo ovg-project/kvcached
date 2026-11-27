@@ -1177,6 +1177,35 @@ def test_parked_dsv4_releases_only_unused_cuda_segments(monkeypatch):
     preview()
     trim.assert_called_once()
 
+    # A PP receiver can be waiting for this admission pass to complete.
+    with monkeypatch.context() as pipeline:
+        from kvcached.integration.sglang.scheduler.pipeline import PipelineProgress
+
+        pipeline.setattr(patches, "pipeline_stages", lambda: 2)
+        pp_trim = mock.Mock()
+        pipeline.setattr(torch.cuda, "empty_cache", pp_trim)
+        clock[0] += 1.0
+        preview()
+        pp_trim.assert_not_called()
+        output = types.SimpleNamespace(payload=types.SimpleNamespace(is_cuda=True), work=mock.Mock())
+        proxy = types.SimpleNamespace(payload=types.SimpleNamespace(is_cuda=True), work=mock.Mock())
+        output.work.is_completed.return_value = proxy.work.is_completed.return_value = False
+        scheduler = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=2), send_output_work=[output],
+                                          send_proxy_work=[proxy], _pp_commit_comm_work=list.clear)
+        progress = PipelineProgress(scheduler, logical)
+        progress.defer_output_work()
+        progress.after_agreement()
+        proxy.work.is_completed.return_value = True
+        progress.after_agreement()
+        pp_trim.assert_not_called()
+        assert logical._kvcached_parked_cuda_probe
+        output.work.is_completed.return_value = True
+        progress.after_agreement()
+        pp_trim.assert_called_once()
+        assert not logical._kvcached_parked_cuda_probe
+        progress.after_agreement()
+        pp_trim.assert_called_once()
+
     # No prefix progress: a later change in physical pressure can rearm the probe.
     clock[0] += 1.0
     cost.return_value = set()

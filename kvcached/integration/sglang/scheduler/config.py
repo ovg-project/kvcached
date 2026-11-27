@@ -27,8 +27,7 @@ def validate_runtime_config() -> None:
     if slot_delay is not None and running_limit is not None:
         slot_delay = min(slot_delay, running_limit)
     unsupported = (
-        parallel.pp_size != 1
-        or parallel.enable_dp_attention
+        parallel.enable_dp_attention
         or get_spec().speculative_algorithm is not None
         or get_disagg().disaggregation_mode != "null"
         or get_exec().dllm.dllm_algorithm is not None
@@ -41,11 +40,22 @@ def validate_runtime_config() -> None:
         or (slot_delay is not None and slot_delay > 1)
         or (schedule.enable_priority_scheduling and not schedule.disable_priority_preemption)
     )
+    if parallel.pp_size > 1:
+        from sglang.srt.runtime_context import get_device
+        from sglang.srt.utils.common import is_cuda
+
+        unsupported = unsupported or (
+            parallel.pp_async_batch_depth != 0
+            or str(get_device().device).split(":")[0] != "cuda"
+            or not is_cuda()
+            or get_memory().enable_hierarchical_cache
+        )
     if unsupported:
         raise ValueError(
-            "KVCached rank coordination requires PP=1, attention-DP disabled, "
+            "KVCached rank coordination requires attention-DP disabled, "
             "non-speculative text generation, fixed separate prefill/decode batches, "
             "and no preemption, LoRA, storage-tier cache or disaggregation. "
+            "PP additionally requires CUDA, --pp-async-batch-depth=0 and no hierarchical cache. "
             "Disable --enable-prefill-delayer and use --min-free-slots-delay=1. "
             "Use those settings, or unset KVCACHED_RANK_COORDINATION_ENABLE "
             "to retain native multi-rank DSV4 storage."

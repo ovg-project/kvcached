@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -19,6 +19,7 @@ from kvcached.observability import (
 )
 from kvcached.pool_registry import (
     clear_registered_kv_cache_pools,
+    get_registered_kv_cache_pools,
     register_kv_cache_pool,
 )
 from kvcached.tp_ipc_util import (
@@ -48,6 +49,8 @@ _async_sched = False
 _contiguous_layout = CONTIGUOUS_LAYOUT
 _world_size: int = 1
 _pp_rank: int = 0
+_defer_physical_release = False
+_pipeline_release_barrier: Optional[Callable[[], None]] = None
 
 # Single source of truth for what this shim accepts. The capability record
 # in kvcached.observability reports these, so the guards below and the
@@ -63,9 +66,13 @@ def init_kvcached(
     pp_rank: int = 0,
     device: Optional[str] = None,
     async_sched: bool = False,
+    defer_physical_release: bool = False,
 ) -> None:
     global _kvcached_initialized, _kvcached_device, _async_sched, _world_size, _pp_rank
+    global _defer_physical_release
     if _kvcached_initialized:
+        if defer_physical_release != _defer_physical_release:
+            raise RuntimeError("Cannot change SGLang physical-release policy after initialization")
         return
 
     if device is None:
@@ -78,6 +85,7 @@ def init_kvcached(
     _async_sched = async_sched
     _world_size = world_size
     _pp_rank = pp_rank
+    _defer_physical_release = defer_physical_release
 
     if world_size > 1:
         # start the listener thread for tensor parallel kv cache management
@@ -91,6 +99,7 @@ def init_kvcached(
 def shutdown_kvcached() -> bool:
     """Release KV resources, or return False if an active listener needs a retry."""
     global _kvcached_initialized, _kvcached_device, _async_sched
+    global _defer_physical_release, _pipeline_release_barrier
     if not _kvcached_initialized:
         clear_registered_kv_cache_pools(integration="sglang")
         runtime_reservations.clear_runtime_owned_reservations(integration="sglang")
@@ -105,7 +114,25 @@ def shutdown_kvcached() -> bool:
     _kvcached_initialized = False
     _kvcached_device = None
     _async_sched = False
+    _defer_physical_release = False
+    _pipeline_release_barrier = None
     return True
+
+
+def set_pipeline_release_barrier(barrier: Callable[[], None]) -> None:
+    """Install scheduler stream fences before the PP loop can send outputs."""
+    global _pipeline_release_barrier
+    if not _defer_physical_release:
+        raise RuntimeError("PP storage requires deferred physical release at initialization")
+    managers = [manager for manager, _ in get_registered_kv_cache_pools(integration="sglang")]
+    if any(
+        not manager.defer_physical_release or getattr(manager, "_uses_worker_ipc", False)
+        for manager in managers
+    ):
+        raise RuntimeError("PP storage requires rank-local deferred-release pools")
+    _pipeline_release_barrier = barrier
+    for manager in managers:
+        manager.physical_release_barrier = barrier
 
 
 def register_runtime_owned_reservation(
@@ -639,7 +666,7 @@ def get_kv_cache_manager(
         num_layers,
         world_size=1,
         pp_rank=_pp_rank,
-        async_sched=_async_sched,
+        async_sched=_async_sched and not _defer_physical_release,
         reserve_null_block=reserve_null_block,
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
@@ -651,7 +678,14 @@ def get_kv_cache_manager(
         # each needs its own limit and usage, i.e. its own segment.
         own_segment=True,
         page_size=get_page_size_for_block(block_size * cell_size, PAGE_SIZE),
+        defer_physical_release=_defer_physical_release,
     )
+    if _defer_physical_release:
+        # During construction there is no PP output ring. Once the loop starts,
+        # its stream fence replaces this initialization-only device barrier.
+        manager.physical_release_barrier = _pipeline_release_barrier or (
+            lambda: torch.cuda.synchronize(_kvcached_device)
+        )
     register_kv_cache_pool(
         manager,
         integration="sglang",

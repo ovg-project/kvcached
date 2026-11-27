@@ -3366,7 +3366,7 @@ def _dsv4_single_rank_backing() -> bool:
         return True
     if enabled():
         validate_runtime_config()
-        return tp_size > 1 and pp_size == 1
+        return tp_size > 1 or pp_size > 1
     return False
 
 
@@ -3545,12 +3545,19 @@ class DeepSeekV4KVPoolPatch(VersionAwarePatch, BasePatch):
 
             num_pages = (self.size + self.page_size + 1) // self.page_size
             tp_rank, tp_size, pp_rank = _resolve_sglang_parallel_context()
+            from sglang.srt.distributed import get_pipeline_model_parallel_world_size
+
+            release_policy = (
+                {"defer_physical_release": True}
+                if get_pipeline_model_parallel_world_size() > 1 else {}
+            )
             kvi.init_kvcached(
                 tp_rank=tp_rank,
                 world_size=tp_size,
                 pp_rank=pp_rank,
                 device=self.device,
                 async_sched=True,
+                **release_policy,
             )
             buffers, self._kvcached_raw_tensors = (
                 kvi.alloc_dsv4_swa_cache(
@@ -4162,6 +4169,15 @@ def _release_cuda_cache_for_parked_dsv4(adder: Any) -> None:
     allocator = _sglang_dsv4_demand_allocator(adder)
     if allocator is None:
         return
+    # PP peers may still need a later admission round to receive an output.
+    # The next safe round retries the probe on this rank's persistent allocator.
+    if pipeline_stages() > 1:
+        allocator._kvcached_parked_cuda_probe = True
+        return
+    _probe_parked_dsv4_cuda_cache(allocator)
+
+
+def _probe_parked_dsv4_cuda_cache(allocator: Any) -> None:
     # TP admission previews clone the request on every scheduler round.
     # The logical allocator outlives those previews on this rank.
     now = time.monotonic()
@@ -4497,6 +4513,16 @@ def _frees_are_deferred(allocator: Any) -> bool:
     return not _sglang_free_immediately(allocator)
 
 
+def _evict_shrink_tokens(cache: Any, tokens: int, *, swa: bool) -> None:
+    params = _sglang_evict_params_cls()
+    if swa:
+        if params is None:
+            raise RuntimeError("SWA reclaim requires EvictParams")
+        evict_prefix_cache(cache, params(num_tokens=0, swa_num_tokens=tokens))
+    else:
+        evict_prefix_cache(cache, _make_sglang_evict_arg(tokens, params))
+
+
 class _PrefixCacheShrinkReclaimer:
     """Evicts a scheduler's prefix cache while one kvcached pool shrinks.
 
@@ -4555,7 +4581,7 @@ class _PrefixCacheShrinkReclaimer:
         before = int(evictable())
         if before <= 0:
             return 0
-        self._evict(cache, pages * tokens_per_page)
+        _evict_shrink_tokens(cache, pages * tokens_per_page, swa=self.swa)
         return max(0, before - int(evictable())) // tokens_per_page
 
     def shrink_tokens(self) -> int:
@@ -4565,28 +4591,6 @@ class _PrefixCacheShrinkReclaimer:
         if evictable is None or excess <= 0:
             return 0
         return min(int(evictable()), excess * tokens_per_page)
-
-    def evict_tokens(self, tokens: int) -> None:
-        """Evict ``tokens`` in lockstep; every TP rank calls this together."""
-        hicache = getattr(self._scheduler(), "_kvcached_shrink_hicache", None)
-        if hicache is None:
-            cache, _, _ = self._cache()
-            self._evict(cache, tokens)
-        elif not self.swa:
-            # The ranks agree on the victims, not just the count (#641).
-            # Agreement covers the full component; an SWA pool waits.
-            from kvcached.integration.sglang.hicache_retention import evict_parallel_hicache
-
-            evict_parallel_hicache(hicache, tokens)
-
-    def _evict(self, cache: Any, tokens: int) -> None:
-        if self.swa:
-            params = _sglang_evict_params_cls()
-            if params is None:
-                raise RuntimeError("SWA reclaim requires EvictParams")
-            evict_prefix_cache(cache, params(num_tokens=0, swa_num_tokens=tokens))
-        else:
-            evict_prefix_cache(cache, _make_sglang_evict_arg(tokens, _sglang_evict_params_cls()))
 
     def reclaim(self) -> None:
         cache, evictable, tokens_per_page = self._cache()
@@ -4599,7 +4603,7 @@ class _PrefixCacheShrinkReclaimer:
             before = evictable()
             if before <= 0:
                 return
-            self._evict(cache, excess * tokens_per_page)
+            _evict_shrink_tokens(cache, excess * tokens_per_page, swa=self.swa)
             if evictable() >= before or _frees_are_deferred(allocator):
                 # Nothing evicted, or the frees wait for the free group to
                 # end: the next allocation or idle pass continues.
@@ -4789,12 +4793,16 @@ def _shrink_in_lockstep(scheduler: Any, reclaimers: Sequence[_PrefixCacheShrinkR
         return
     else:
         agreed = _agreed_shrink_tokens(reclaimers, groups)
-        # The managers of a component (e.g. DSV4's C128 KV, C4 KV and C4
-        # index) share one prefix tree, so evict once per component.
+        # Pipeline stages share the logical prefix tree even when a stage
+        # has no local backing pool for the component that requested space.
         for slot, tokens in enumerate(agreed):
-            owner = next((r for r in reclaimers if int(r.swa) == slot), None)
-            if tokens > 0 and owner is not None:
-                owner.evict_tokens(tokens)
+            if tokens <= 0:
+                continue
+            if hicache is None:
+                _evict_shrink_tokens(scheduler.tree_cache, tokens, swa=bool(slot))
+            elif slot == 0:
+                # HiCache victim agreement covers only the full component.
+                hicache_retention.evict_parallel_hicache(hicache, tokens)
     for reclaimer in reclaimers:
         if reclaimer.manager.in_shrink:
             # No reclaimer is registered, so this only releases the pages
@@ -4989,15 +4997,25 @@ class SchedulerIdleLimitPatch(VersionAwarePatch, BasePatch):
                     request_state = _sglang_request_state(sched_self)
                     managed = token_managers + (request_state.managers() if request_state is not None else [])
                     ranks = _sglang_parallel_size(sched_self)
+                    control_options: dict[str, Any] = {}
+                    if getattr(getattr(sched_self, "ps", None), "pp_size", 1) > 1:
+                        from kvcached.integration.sglang.scheduler.config import enabled
+                        from kvcached.integration.sglang.scheduler.pipeline import (
+                            sum_pipeline_counts,
+                        )
+
+                        if enabled():
+                            control_options["count_participants"] = functools.partial(
+                                sum_pipeline_counts, sched_self)
                     # Under TP or PP only pools the ranks reclaim in lockstep
                     # may shrink; others keep the native cap on growth.
                     shrinkable = (managed if ranks == 1 else
                                   [reclaimer.manager for reclaimer in reclaimers
-                                   # evict_tokens skips an SWA pool under HiCache.
+                                   # HiCache victim agreement covers only the full component.
                                    if not (reclaimer.swa and sched_self._kvcached_shrink_hicache is not None)]
                                   if sched_self._kvcached_shrink_lockstep_groups else [])
                     sched_self._kvcached_control_managers = initialize_runtime_controls(
-                        "sglang", ranks=ranks,
+                        "sglang", ranks=ranks, **control_options,
                         can_shrink=lambda manager: any(
                             manager is member for member in shrinkable))
                     if len(managed) > 1 and (

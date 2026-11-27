@@ -14,7 +14,7 @@ import importlib.metadata
 import logging
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any
 
@@ -52,10 +52,22 @@ class RankCoordinator:
         self.scheduler = scheduler
         self.group = getattr(scheduler, "tp_group", None)
         ps = getattr(scheduler, "ps", None)
-        self.size = int(getattr(self.group, "world_size", getattr(ps, "tp_size", 1)))
-        self.rank = int(getattr(self.group, "rank_in_group", 0))
+        self.tp_size = int(getattr(self.group, "world_size", getattr(ps, "tp_size", 1)))
+        self.tp_rank = int(getattr(self.group, "rank_in_group", 0))
+        self.pp_size = int(getattr(ps, "pp_size", 1))
+        pp_group = getattr(scheduler, "pp_group", None)
+        self.pp_rank = int(getattr(pp_group, "rank_in_group", 0))
+        self.pp_cpu_group = getattr(pp_group, "cpu_group", None)
+        if self.pp_size > 1 and (
+            self.pp_cpu_group is None or getattr(pp_group, "world_size", None) != self.pp_size
+            or getattr(scheduler, "_kvcached_pipeline_progress", None) is None
+        ):
+            raise RankConsensusError("PP coordination requires the native pipeline progress hooks")
+        self.size = self.tp_size * self.pp_size
+        self.rank = self.pp_rank * self.tp_size + self.tp_rank
+        self.committed_signature = None
         self.cpu_group = getattr(scheduler, "tp_cpu_group", None)
-        if self.size > 1 and (self.group is None or self.cpu_group is None):
+        if self.tp_size > 1 and (self.group is None or self.cpu_group is None):
             raise RankConsensusError("rank coordination requires the instance TP CPU group")
         self.round = 0
         self.last_restriction_log = float("-inf")
@@ -84,11 +96,8 @@ class RankCoordinator:
         self.row_reservation: Any = None
         self.planned = self.grammar_polled = self.priority_sorted = False
         error = None
-        if (
-            bool(getattr(scheduler, "enable_dp_attention", False))
-            or int(getattr(ps, "pp_size", 1)) != 1
-        ):
-            error = "rank coordination currently requires PP=1 and attention-DP disabled"
+        if bool(getattr(scheduler, "enable_dp_attention", False)):
+            error = "rank coordination requires attention-DP disabled"
         spec = getattr(scheduler, "spec_algorithm", None)
         if spec is not None and (not spec.is_none()):
             error = "rank coordination requires non-speculative generation"
@@ -112,7 +121,10 @@ class RankCoordinator:
             and (not set(cp.ranks) <= set(self.group.ranks))
         ):
             error = "instance TP consensus must contain every CP rank"
-        self.exchange("init", None, error=error)
+        topology = self.exchange("init", (self.tp_size, self.pp_size, self.rank), error=error)
+        expected = [(self.tp_size, self.pp_size, rank) for rank in range(self.size)]
+        if topology != expected:
+            raise RankConsensusError(f"invalid TP/PP rank layout: {topology}")
         if self.rank == 0:
             LOG.info(
                 "[kvcached-rank-consensus] enabled size=%s ranks=%s; no cross-instance collective",
@@ -120,28 +132,31 @@ class RankCoordinator:
                 getattr(self.group, "ranks", None),
             )
 
-    def exchange(self, stage, value, *, error=None):
+    def exchange(self, stage, value, *, error=None, tp_only=False):
         """Every boundary uses the same tagged CPU collective protocol.
 
         A peer taking a different branch meets a phase/round mismatch rather
         than interpreting another boundary's payload as its own decision.
         """
         local = {"round": self.round, "stage": stage, "value": value, "error": error}
-        if self.size == 1:
-            states: list[Any] = [local]
-        else:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            states = [None] * self.size
+        states: list[Any] = [local]
+        if self.tp_size > 1:
+            states = [None] * self.tp_size
             dist.all_gather_object(states, local, group=self.cpu_group)
+        if self.pp_size > 1 and not tp_only:
+            stages: list[Any] = [None] * self.pp_size
+            dist.all_gather_object(stages, states, group=self.pp_cpu_group)
+            states = [state for peers in stages for state in peers]
         if any((s["round"] != self.round or s["stage"] != stage or s["error"] for s in states)):
             raise RankConsensusError(
                 f"rank consensus boundary failed: local={stage} states={states}"
             )
         return [s["value"] for s in states]
 
-    def agree(self, stage, value, *, error=None):
-        values = self.exchange(stage, value, error=error)
+    def agree(self, stage, value, *, error=None, tp_only=False):
+        values = self.exchange(stage, value, error=error, tp_only=tp_only)
         if any((v != values[0] for v in values[1:])):
             raise RankConsensusError(
                 f"rank consensus mismatch before forward: round={self.round} stage={stage} values={values}"
@@ -216,7 +231,24 @@ class RankCoordinator:
         counts = getattr(allocator, "_kvcached_budget_counts", None)
         if value is not None:
             value["native_backing"] = counts is not None
+        progress = getattr(self.scheduler, "_kvcached_pipeline_progress", None)
+        if self.pp_size > 1 and value is not None:
+            try:
+                value["pipeline"] = (
+                    self.scheduler.pp_loop_size,
+                    next(i for i, batch in enumerate(self.scheduler.running_mbs) if batch is running),
+                )
+            except Exception as exc:
+                error = f"invalid PP microbatch: {exc}"
         self.agree("start", value, error=error)
+        if progress is not None:
+            release_error = None
+            try:
+                progress.after_agreement()
+                progress.release_storage()
+            except Exception as exc:
+                release_error = f"{type(exc).__name__}: {exc}"
+            self.exchange("pipeline_release", None, error=release_error)
         self.token_budget = None
         if counts is not None:
             local, count_error = None, None
@@ -239,46 +271,70 @@ class RankCoordinator:
         rows, or a previously blocked allocator. No conditional inner AND can
         collide with the scheduler's next collective.
         """
-        pool = getattr(self.scheduler, "req_to_token_pool", None)
+        pool: Any = getattr(self.scheduler, "req_to_token_pool", None)
         allocator: Any = getattr(pool, "_kvcached_dsv4_request_state", None)
         reservation, local_slots, error = (None, 0, None)
         ownership, reused = (None, 0)
         leading_reuse = False
-        try:
+
+        @contextmanager
+        def capacity(count):
             if allocator is not None:
-                with allocator.capacity_query(allocator.logical_available()):
-                    target = max(0, int(query()))
-                if demand_preview is not None:
-                    chunk = getattr(self.scheduler, "chunked_req", None)
-                    reqs = ([chunk] if chunk is not None else []) + list(
-                        self.scheduler.waiting_queue
-                    )
-                    by_id = {str(req.rid): req for req in reqs}
-                    if len(by_id) != len(reqs):
-                        raise ValueError("duplicate prefill request IDs")
-                    # A streaming session restores its row during prefix matching.
-                    # Let the preview match each queue entry once, even with no free rows.
-                    with allocator.capacity_query(allocator.logical_available() + len(reqs)):
-                        logical_slots = int(query())
-                    candidate = demand_preview(logical_slots)["p"]
-                    matched = matches if matches is not None else {}
-                    matched_requests = matched.get("requests", {})
-                    slots_by_id = {
-                        rid: request_slot(matched_requests.get(rid, req)) for rid, req in by_id.items()
-                    }
-                    ownership = [(rid, slot is not None) for rid, slot in slots_by_id.items()]
+                with allocator.capacity_query(count):
+                    yield
+            else:
+                # Expose held chunk rows as logical capacity without editing
+                # native free lists. The scheduler owns this synchronous query.
+                previous = pool.__dict__.get("available_size")
+                pool.available_size = lambda: count
+                try:
+                    yield
+                finally:
+                    if previous is None:
+                        del pool.available_size
+                    else:
+                        pool.available_size = previous
+
+        try:
+            logical = allocator.logical_available() if allocator is not None else None
+            if demand_preview is not None:
+                if logical is None:
+                    logical = pool.available_size()
+                chunk = getattr(self.scheduler, "chunked_req", None)
+                reqs = ([chunk] if chunk is not None else []) + list(self.scheduler.waiting_queue)
+                by_id = {str(req.rid): req for req in reqs}
+                if len(by_id) != len(reqs):
+                    raise ValueError("duplicate prefill request IDs")
+                # A streaming session may restore its row during prefix matching,
+                # including on a stage that uses only native request rows.
+                with capacity(logical + len(reqs)):
+                    logical_slots = int(query())
+                candidate = demand_preview(logical_slots)["p"]
+                matched_requests = matches.get("requests", {}) if matches is not None else {}
+                slots_by_id = {
+                    rid: request_slot(matched_requests.get(rid, req)) for rid, req in by_id.items()
+                }
+                ownership = [(rid, slot is not None) for rid, slot in slots_by_id.items()]
+                if allocator is not None:
                     for rid, slot in slots_by_id.items():
                         if slot is not None and int(slot) not in allocator.active:
                             raise ValueError(f"request {rid} does not own a backed C128 row")
-                    rows = [] if candidate is None else candidate["rows"]
-                    reused = sum(slots_by_id[row["rid"]] is not None for row in rows)
-                    target = len(rows) - reused
-                    leading_reuse = bool(rows and slots_by_id[rows[0]["rid"]] is not None)
-                    if self.row_retry_cap is not None and (self.row_retry_cap > 0 or leading_reuse):
-                        target = min(target, self.row_retry_cap)
+                rows = [] if candidate is None else candidate["rows"]
+                reused = sum(slots_by_id[row["rid"]] is not None for row in rows)
+                target = len(rows) - reused
+                leading_reuse = bool(rows and slots_by_id[rows[0]["rid"]] is not None)
+                if self.row_retry_cap is not None and (self.row_retry_cap > 0 or leading_reuse):
+                    target = min(target, self.row_retry_cap)
+            elif allocator is not None:
+                with capacity(logical):
+                    target = max(0, int(query()))
+            if allocator is not None:
                 reservation = allocator.prepare_admission(target)
                 self.row_reservation = (allocator, reservation)
-                with allocator.capacity_query(reservation.available + reused):
+                with capacity(reservation.available + reused):
+                    local_slots = int(query())
+            elif demand_preview is not None:
+                with capacity(logical + reused):
                     local_slots = int(query())
             else:
                 local_slots = int(query())
@@ -294,8 +350,10 @@ class RankCoordinator:
         }
         try:
             states = self.exchange("slots", value, error=error)
-            if any(((s["c128"] is None) != (states[0]["c128"] is None) for s in states)):
-                raise RankConsensusError(f"C128 allocator presence differs: {states}")
+            for offset in range(0, self.size, self.tp_size):
+                peers = states[offset:offset + self.tp_size]
+                if any((s["c128"] is None) != (peers[0]["c128"] is None) for s in peers):
+                    raise RankConsensusError(f"C128 allocator presence differs within TP: {states}")
             if any((s["ownership"] != states[0]["ownership"] for s in states)):
                 raise RankConsensusError(f"C128 request row ownership differs: {states}")
         except Exception as exc:
@@ -310,17 +368,24 @@ class RankCoordinator:
                 "C128 slot exchange failed; refusing collective retry"
             ) from exc
         self.slot_budget = max(0, min((s["slots"] for s in states)))
-        if allocator is not None:
+        managed = [s["c128"]["available"] for s in states if s["c128"] is not None]
+        if managed:
             self.leading_row_reused = all(s["leading_reuse"] for s in states)
-            c128_budget = min((s["c128"]["available"] for s in states))
-            self.new_slot_budget = max(0, c128_budget)
+            self.new_slot_budget = max(0, min(managed))
             finish_error = None
-            try:
-                allocator.finish_admission(reservation, c128_budget)
-            except Exception as exc:
-                finish_error = f"{type(exc).__name__}: {exc}"
+            if allocator is None:
+                # A stage without C128 rows still joins the release and budget
+                # refresh for this distributed admission.
+                self.row_reservation = (None, None)
+            else:
+                try:
+                    allocator.finish_admission(reservation, self.new_slot_budget)
+                except Exception as exc:
+                    finish_error = f"{type(exc).__name__}: {exc}"
             if self.token_budget is not None:
                 self.refresh_token_budget("token_capacity_after_rows", finish_error)
+            elif self.pp_size > 1:
+                self.exchange("row_finalize", None, error=finish_error)
             elif finish_error is not None:
                 raise RuntimeError(finish_error)
         return self.slot_budget
@@ -349,20 +414,25 @@ class RankCoordinator:
         if pending is None:
             return
         allocator, reservation = pending
-        refresh = refresh and self.token_budget is not None and bool(self.new_slot_budget)
+        refresh_budget = refresh and self.token_budget is not None and bool(self.new_slot_budget)
         error = None
-        try:
-            allocator.finish_admission(reservation, 0)
-        except Exception as exc:
-            if not refresh:
-                raise
-            error = f"{type(exc).__name__}: {exc}"
-        finally:
-            allocator.end_admission()
-        if refresh:
-            # The same scheduler round can still admit decode after a parked
-            # prefill. Its budget must see the pages returned by the rollback.
+        if allocator is not None:
+            try:
+                try:
+                    allocator.finish_admission(reservation, 0)
+                finally:
+                    allocator.end_admission()
+            except Exception as exc:
+                if not refresh:
+                    raise
+                error = f"{type(exc).__name__}: {exc}"
+        if refresh_budget:
+            # Decode in this round must see pages returned by the rollback.
             self.refresh_token_budget("token_capacity_after_row_release", error)
+        elif refresh and self.pp_size > 1:
+            self.exchange("row_release", None, error=error)
+        elif error is not None:
+            raise RuntimeError(error)
 
     def prepare(self, candidates, *, error=None):
         states = self.exchange("candidates", candidates, error=error)
@@ -384,7 +454,12 @@ class RankCoordinator:
                 signature = batch_signature(batch)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-        self.agree(stage, signature, error=error)
+        tp_only = self.pp_size > 1 and stage == "forward"
+        if tp_only and signature != self.committed_signature:
+            error = error or "PP batch changed after admission consensus"
+        self.agree(stage, signature, error=error, tp_only=tp_only)
+        if stage == "selected":
+            self.committed_signature = signature
 
     def begin_admission(self, req, states):
         """Accept tier-placement differences for one logical prefix.
@@ -565,6 +640,11 @@ def patch_rank_coordination():
 
     @functools.wraps(original_next)
     def next_batch(self, running_batch, last_batch):
+        if getattr(self, "_kvcached_native_pipeline", False):
+            return original_next(self, running_batch, last_batch)
+        progress = getattr(self, "_kvcached_pipeline_progress", None)
+        if progress is not None:
+            progress.before_admission()
         runtime = _runtime(self)
         if runtime.size == 1:
             return original_next(self, running_batch, last_batch)
@@ -660,12 +740,12 @@ def patch_rank_coordination():
                     lambda: original_slots(
                         self, len(running_batch.reqs), **{"running_batch": running_batch}
                     ),
-                    demand_preview=shadow if allocator is not None else None,
+                    demand_preview=shadow if allocator is not None or runtime.pp_size > 1 else None,
                     matches=preview_matches,
                 )
                 candidates = shadow(
                     runtime.slot_budget,
-                    **{"new_slots": runtime.new_slot_budget} if allocator is not None else {},
+                    **{"new_slots": runtime.new_slot_budget} if runtime.new_slot_budget is not None else {},
                 )
             except RankConsensusError:
                 raise
@@ -1023,6 +1103,8 @@ def patch_rank_coordination():
 
     @functools.wraps(original_run)
     def run(self, batch, *args, **kwargs):
+        if getattr(self, "_kvcached_native_pipeline", False):
+            return original_run(self, batch, *args, **kwargs)
         runtime = _runtime(self)
         if runtime.size > 1:
             runtime.selected(batch, stage="forward")
@@ -1045,5 +1127,8 @@ def patch_rank_coordination():
         ScheduleBatch.prepare_for_decode, "prepare_decode"
     )
     Scheduler.run_batch = run
+    from .pipeline import patch_pipeline_progress
+
+    patch_pipeline_progress(Scheduler)
     _PATCHED = True
     return ["rank-coordination"]

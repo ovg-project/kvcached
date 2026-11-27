@@ -78,6 +78,7 @@ def test_sglang_keeps_real_tp_size_for_ipc_but_owns_pool_locally(
         "world_size": 1,
         "pp_rank": pp_rank,
         "async_sched": True,
+        "defer_physical_release": False,
         "reserve_null_block": True,
         "num_kv_buffers": 2,
         "group_id": 3,

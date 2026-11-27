@@ -388,7 +388,7 @@ def install_request_admission(scheduler: Any) -> bool:
     @functools.wraps(raw)
     def prefill(this: Any, *args: Any, **kwargs: Any) -> Any:
         owner = getattr(this.req_to_token_pool, "_kvcached_dsv4_request_state", None)
-        if owner is None or this.ps.tp_size != 1:
+        if owner is None or this.ps.tp_size != 1 or getattr(this.ps, "pp_size", 1) != 1:
             return raw(this, *args, **kwargs)
         batch = kwargs.get("running_batch", args[-1] if args else this.running_batch)
         pending = this.beam_coordinator.pending_member_rows(batch)

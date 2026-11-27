@@ -83,6 +83,8 @@ def preparation_case(world=None, *, failing_rank=3, chunk=False, fatal=False):
         def worker(rank):
             scheduler = schedulers[rank]
             running = case.Batch([consensus.Req("decode", tokens=100, host=0, output=1)])
+            if hasattr(world, "configure_scheduler"):
+                world.configure_scheduler(scheduler, running)
             first = scheduler.get_next_batch_to_run(running, None)
             if first.batch_to_run is not None:
                 scheduler.run_batch(first.batch_to_run)
@@ -154,6 +156,8 @@ def decode_case(world=None, *, failing_rank=3, rollback_error=False):
         def worker(rank):
             allocator, backing = owners[rank]
             scheduler = case.Scheduler(rank, 65536)
+            if hasattr(world, "configure_scheduler"):
+                world.configure_scheduler(scheduler, None)
             runtime = consensus.coord.RankCoordinator(scheduler)
             req = consensus.Req("decode", tokens=4, host=0)
             req.kv.kv_committed_len = 4
@@ -168,6 +172,8 @@ def decode_case(world=None, *, failing_rank=3, rollback_error=False):
                 assert batch.check_decode_mem()
                 backing.manager.budget = len(backing.manager.live)
                 assert allocator.alloc_decode().tolist() == [20]
+                if runtime.pp_size > 1:
+                    runtime.selected(batch)
                 runtime.selected(batch, stage="forward")
                 return True
             finally:

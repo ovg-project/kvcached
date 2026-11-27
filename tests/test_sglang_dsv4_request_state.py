@@ -14,8 +14,7 @@ import pytest
 from test_sglang_dsv4_native_backing import Manager, SWABacking
 
 
-@pytest.fixture
-def request_module(monkeypatch):
+def load_request_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "kvcached.integration.sglang.dsv4_backing",
                         SimpleNamespace(SWABacking=SWABacking))
     path = Path(__file__).parents[1] / "kvcached/integration/sglang/dsv4_request_state.py"
@@ -24,6 +23,11 @@ def request_module(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def request_module(monkeypatch):
+    return load_request_module(monkeypatch)
 
 
 class NativeRows:
@@ -203,6 +207,18 @@ def single_rank_scheduler(module, pool, queue, *, pending=0, accept=lambda req: 
 def requests(count, width=1):
     beam = SimpleNamespace(beam_width=width) if width > 1 else None
     return [SimpleNamespace(rid=str(i), beam_group=beam, req_pool_idx=None) for i in range(count)]
+
+
+def test_tp1_pipeline_preserves_distributed_row_reservation(request_module, monkeypatch):
+    pool, owner, _ = bind(request_module)
+    owner.reserve(2)
+    standby = owner.standby.copy()
+    queue = requests(1)
+    scheduler = single_rank_scheduler(request_module, pool, queue)
+    scheduler.ps.pp_size = 2
+    monkeypatch.setattr(owner, "reserve", lambda n: pytest.fail("duplicate row reservation"))
+    assert scheduler._get_new_batch_prefill_raw(0, scheduler.running_batch) == queue
+    assert owner.standby == standby
 
 
 def test_beam_admission_reserves_pending_rows_before_native_gate(request_module):

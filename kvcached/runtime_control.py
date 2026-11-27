@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from kvcached import prefix_cache_retention
@@ -135,7 +136,8 @@ class RuntimeControl:
             self.acknowledged = signature
 
 
-def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int = 1) -> tuple[Any, ...]:
+def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int = 1,
+                                count_participants: Callable[[int], int] | None = None) -> tuple[Any, ...]:
     from kvcached.pool_registry import get_registered_kv_cache_pools
 
     managers = tuple(manager for manager, _ in
@@ -149,11 +151,12 @@ def initialize_runtime_controls(integration: str, *, can_shrink=None, ranks: int
     if worker_ipc and managers:
         from kvcached.tp_ipc_util import _target_pp_ranks
         ranks = managers[0].world_size * len(_target_pp_ranks(managers[0].pp_rank))
+    expected = count_participants(len(managers)) if count_participants is not None else len(managers) * ranks
     for manager in managers:
         supported = True if can_shrink is None else bool(can_shrink(manager))
         manager._runtime_control = RuntimeControl(
             manager, worker_ipc=worker_ipc, can_shrink=supported,
-            expected_participants=len(managers) * ranks)
+            expected_participants=expected)
     if managers:
         prefix_cache_retention._policy.instance_name = managers[0]._control_instance_name()
     return managers
