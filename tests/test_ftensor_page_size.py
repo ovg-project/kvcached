@@ -68,6 +68,42 @@ def test_tensor_page_size_cannot_change_after_creation():
         vmm.shutdown_kvcached()
 
 
+def test_compound_page_maps_relative_to_reservation_base():
+    """Exercise the native assertion in a CUDA checkout.
+
+    CFLAGS=-UNDEBUG CXXFLAGS=-UNDEBUG python setup.py build_ext --inplace --force
+    python -m pytest -q tests/test_ftensor_page_size.py -k maps_relative_to_reservation_base
+    """
+    vmm = _compiled_vmm_ops()
+    import torch
+
+    page = 2 * 1024**2
+    layers = 24
+    stride = layers * page
+    vmm.init_kvcached("cuda:0", page, True)
+    try:
+        for group in (0, 2):
+            raw, = vmm.create_kv_tensors(2 * page, 1, "cuda:0", layers,
+                                         num_kv_buffers=1, group_id=group)
+            if raw.data_ptr() % stride:
+                break
+            if group == 0:
+                # Advance the next reservation hint by one driver-aligned page.
+                vmm.create_kv_tensors(page, 1, "cuda:0", 1, num_kv_buffers=1, group_id=1)
+        else:
+            pytest.skip("driver returned only compound-page-aligned reservations")
+        assert vmm.kv_mapping_page_size(group) == stride
+        assert vmm.map_to_kv_tensors([0, stride], group)
+        raw[:8].fill_(11)
+        raw[stride:stride + 8].fill_(22)
+        assert torch.all(raw[:8] == 11).item()
+        assert vmm.unmap_from_kv_tensors([0], group)
+        assert torch.all(raw[stride:stride + 8] == 22).item()
+        assert vmm.unmap_from_kv_tensors([stride], group)
+    finally:
+        vmm.shutdown_kvcached()
+
+
 @pytest.mark.parametrize("contiguous", [False, True])
 @pytest.mark.parametrize("buffers", [1, 2])
 def test_unaligned_offsets_cannot_alias_a_live_page(contiguous, buffers):
