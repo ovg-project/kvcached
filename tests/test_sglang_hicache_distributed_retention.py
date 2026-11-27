@@ -8,13 +8,14 @@ from array import array
 from dataclasses import dataclass
 from datetime import timedelta
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from weakref import WeakKeyDictionary, ref
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from kvcached.integration.sglang import hicache_retention as retention
+from kvcached.integration.sglang import hicache_retention as retention, rank_groups
 
 
 class Leaf:
@@ -50,10 +51,10 @@ def _priority_cache(parent_locked):
     priorities = {cold: 0, parent: 1, hot: 2, active: -1}
     order = []
     cache = SimpleNamespace(
-        root_node=root, evictable_leaves={cold, hot}, evictable_size_=3 - int(parent_locked),
+        root_node=root, evictable_leaves={cold, hot}, evictable_size_=3 - int(parent_locked), protected_size_=0,
         eviction_strategy=SimpleNamespace(get_priority=priorities.__getitem__),
         cache_controller=SimpleNamespace(write_policy="write_through"), pp_size=1,
-        _all_reduce_attn_groups=lambda *_: None, update_eviction_metrics=lambda *_: None)
+        update_eviction_metrics=lambda *_: None)
 
     def demote(node):
         assert node in cache.evictable_leaves and not node.lock_ref
@@ -88,6 +89,74 @@ def test_retention_reconsiders_new_device_leaves(locked, expected, resident):
     _poll_to_limit(cache, cache.evictable_size_ - 2)
     assert order == expected
     assert [node.key[0] for node in nodes if not node.evicted] == resident
+
+
+def test_limit_shrink_evicts_a_token_count_through_the_victim_plan():
+    """A memory-limit shrink asks for a count; the plan picks the victims."""
+    cache, order, _ = _priority_cache(False)
+    # Without retention's leaf tracking no rank can enumerate victims.
+    assert not retention.evict_parallel_hicache(cache, 2)
+    assert order == []
+
+    retention._track_device_leaves(cache)
+    result = retention.evict_parallel_hicache(cache, 2)
+    while result is None:
+        result = retention.evict_parallel_hicache(cache, 0)
+    assert result
+    assert order == [11, 10]
+    assert not retention.parallel_hicache_trim_pending(cache)
+
+
+def test_limit_shrink_polls_once_per_call(monkeypatch):
+    """Each call does one bounded poll and keeps the plan for the next idle
+    pass; the target is fixed when the trim starts."""
+    cache, order, _ = _priority_cache(False)
+    retention._track_device_leaves(cache)
+    limits = []
+    group_demand = retention._group_demand
+
+    def count_demand(cache, limit, changed):
+        limits.append(limit)
+        return group_demand(cache, limit, changed)
+
+    monkeypatch.setattr(retention, "_group_demand", count_demand)
+    target = cache.evictable_size_ - 2
+    calls = 0
+    result = None
+    while result is None:
+        result = retention.evict_parallel_hicache(cache, 2 if calls == 0 else 5)
+        calls += 1
+        assert len(limits) == calls
+    assert result and order == [11, 10]
+    assert set(limits) == {target}
+
+
+@pytest.mark.parametrize("still_needed", [0, 32])
+def test_lockstep_trim_stops_once_no_rank_needs_space(monkeypatch, still_needed):
+    """kvctl raises the limit after a 32-token trim indexed its first page.
+    The trim then keeps every prefix, unless some rank still needs space."""
+    from kvcached.integration.sglang import patches
+
+    cache, order, _ = _priority_cache(False)
+    cache.evictable_leaves = {Leaf(token, cache.root_node) for token in range(100, 1124)}
+    cache.evictable_size_ = len(cache.evictable_leaves)
+    cache.eviction_strategy.get_priority = lambda node: node.key[0]
+    retention._track_device_leaves(cache)
+    assert retention.evict_parallel_hicache(cache, 32) is None
+    assert order == []
+
+    monkeypatch.setattr(patches, "reduce_counts", lambda counts, groups, op: counts)
+    reclaimer: Any = SimpleNamespace(swa=False, shrink_tokens=lambda: still_needed,
+                                     manager=SimpleNamespace(in_shrink=False))
+    scheduler = SimpleNamespace(_kvcached_shrink_hicache=cache)
+    # Stay between two lockstep rounds, so every pass only continues the trim.
+    for _ in range(patches._LOCKSTEP_SHRINK_INTERVAL - 1):
+        if not retention.parallel_hicache_trim_pending(cache):
+            break
+        patches._shrink_in_lockstep(scheduler, [reclaimer], ["group"])
+
+    assert not retention.parallel_hicache_trim_pending(cache)
+    assert order == list(range(100, 100 + still_needed))
 
 
 def test_unbacked_parent_above_cap_retries_after_host_child_leaves():
@@ -128,8 +197,8 @@ def test_large_trim_reuses_its_plan_between_quiet_polls(monkeypatch, paused, sto
         evictable_size_=0, protected_size_=2048, evictable_leaves=set(),
         eviction_strategy=SimpleNamespace(get_priority=priority),
         check_hicache_events=lambda: None, _all_reduce=lambda *_: None,
-        _all_reduce_attn_groups=lambda vote, op: votes.append(vote.numel()),
         _enforce_prefix_cache_retention=lambda limit: None, update_eviction_metrics=lambda *_: None)
+    monkeypatch.setattr(retention, "_reduce_victims", lambda vote, op: votes.append(vote.numel()))
 
     def demote(node):
         cache.evictable_leaves.remove(node)
@@ -251,7 +320,7 @@ def test_shared_search_refreshes_a_leaf_hit_between_polls(monkeypatch):
         clock[0] += 2.0
 
     monkeypatch.setattr(retention.time, "perf_counter", lambda: clock[0])
-    cache._all_reduce_attn_groups = vote
+    monkeypatch.setattr(retention, "_reduce_victims", vote)
     cache.update_eviction_metrics = lambda n, start: metrics.append((n, clock[0] - start))
     plan = retention._VictimPlan()
     plan.remaining = 1
@@ -264,7 +333,7 @@ def test_shared_search_refreshes_a_leaf_hit_between_polls(monkeypatch):
     assert metrics == [(1, 6.0)]
 
 
-def test_eviction_plans_bound_sibling_reads_on_wide_prefixes():
+def test_eviction_plans_bound_sibling_reads_on_wide_prefixes(monkeypatch):
     reads = 0
 
     class Children(dict):
@@ -285,7 +354,7 @@ def test_eviction_plans_bound_sibling_reads_on_wide_prefixes():
         if op == dist.ReduceOp.MIN:
             vote.zero_()
 
-    cache._all_reduce_attn_groups = reject
+    monkeypatch.setattr(retention, "_reduce_victims", reject)
     plan = retention._VictimPlan()
     plan.remaining = 1
     for verdict in plan._shared_victims(cache, 0):
@@ -404,7 +473,7 @@ def test_shared_search_indexes_deep_disjoint_paths_in_bounded_steps(monkeypatch)
     assert indexed == leaves
 
 
-def test_shared_search_batches_common_victims_with_resident_siblings():
+def test_shared_search_batches_common_victims_with_resident_siblings(monkeypatch):
     cache, freed, _ = _priority_cache(False)
     cache.evictable_leaves.clear()
     for i in range(200):
@@ -421,7 +490,7 @@ def test_shared_search_batches_common_victims_with_resident_siblings():
         if op == dist.ReduceOp.MIN:
             ballots.append(data.numel())
 
-    cache._all_reduce_attn_groups = vote
+    monkeypatch.setattr(retention, "_reduce_victims", vote)
     plan = retention._VictimPlan()
     plan.remaining = 199
     assert list(plan._shared_victims(cache, 0))[-1] is True
@@ -489,7 +558,7 @@ def test_locked_parents_allow_full_victim_pages(monkeypatch, unified):
         if op == dist.ReduceOp.MIN:
             accepted.append(vote.numel())
 
-    cache._all_reduce_attn_groups = count
+    monkeypatch.setattr(retention, "_reduce_victims", count)
     cache.evictable_leaves = leaves
     def evict(node):
         leaves.remove(node)
@@ -518,7 +587,7 @@ def test_busy_exhausted_search_backs_off_across_pages(monkeypatch):
         elif op == dist.ReduceOp.MIN:
             vote.zero_()  # No proposed victim exists on the peer.
 
-    cache._all_reduce_attn_groups = dissent
+    monkeypatch.setattr(retention, "_reduce_victims", dissent)
     cache._enforce_prefix_cache_retention = cache._all_reduce = lambda *_: None
     cache.check_hicache_events = lambda: cache._all_reduce(ready.clone(), dist.ReduceOp.MIN)
     scheduler = SimpleNamespace(tree_cache=cache, enable_hierarchical_cache=True, _engine_paused=False,
@@ -739,8 +808,7 @@ def test_paused_continuation_refreshes_after_tree_changes(monkeypatch, change):
         cache_controller=SimpleNamespace(write_policy="write_through"),
         eviction_strategy=SimpleNamespace(get_priority=lambda n: target_priority if n is target else n.key[0]),
         _enforce_prefix_cache_retention=lambda _: None, _all_reduce=lambda *_: None,
-        _all_reduce_attn_groups=lambda *_: None, check_hicache_events=lambda: None,
-        update_eviction_metrics=lambda *_: None)
+        check_hicache_events=lambda: None, update_eviction_metrics=lambda *_: None)
 
     def evict(node):
         evicted.append(node)
@@ -797,7 +865,7 @@ def test_shared_prefix_hashed_once_per_plan(monkeypatch):
         cache_controller=SimpleNamespace(write_policy="write_through"),
         _evict_backuped=lambda node: len(node.key), update_eviction_metrics=lambda *_: None)
     votes = []
-    cache._all_reduce_attn_groups = lambda vote, op: votes.append(vote[:8].tolist())
+    monkeypatch.setattr(retention, "_reduce_victims", lambda vote, op: votes.append(vote[:8].tolist()))
     _poll_to_limit(cache, 0)
     parent.key.cache_salt = "new namespace"
     _poll_to_limit(cache, 0)
@@ -824,6 +892,16 @@ def test_victim_identity_survives_a_split_above_the_leaf(bigram):
         assert victim([[1, 2], [3]]) != victim([[1], [2, 3]])
 
 
+def _use_groups(attention, pipeline):
+    """Point kvcached's shared rank groups at these Gloo groups; None has no peer."""
+    def coordinator(group):
+        return SimpleNamespace(world_size=1 if group is None else dist.get_world_size(group), cpu_group=group)
+
+    state = SimpleNamespace(get_attn_tp_group=lambda: coordinator(attention),
+                            get_pp_group=lambda: coordinator(pipeline))
+    rank_groups._parallel_state = lambda: state
+
+
 def _exercise_mixed_limits(stage, lane, attention, pipeline):
     @dataclass
     class Match:
@@ -840,13 +918,12 @@ def _exercise_mixed_limits(stage, lane, attention, pipeline):
             if write_back_rank == (stage if pp else lane):
                 cache.cache_controller.write_policy = "write_back"
             cache.tp_world_size, cache.pp_size, cache.pp_rank = 2, 2 if pp else 1, stage if pp else 0
-            cache.pp_group = pipeline
             cache.protected_size_ = 1
-            cache._all_reduce_attn_groups = lambda t, op: dist.all_reduce(t, op=op, group=attention)
+            _use_groups(attention, pipeline if pp else None)
 
             def native_ack(t, op):
                 if not pp or stage == 0:
-                    cache._all_reduce_attn_groups(t, op)
+                    dist.all_reduce(t, op=op, group=attention)
                 if pp:
                     dist.broadcast(t, src=lane, group=pipeline)
 
@@ -923,8 +1000,8 @@ def _exercise_mixed_limits(stage, lane, attention, pipeline):
 
 def _exercise_unequal_batches(rank, attention, pipeline):
     cache, _, _ = _priority_cache(False)
-    cache.pp_size, cache.pp_group = 2, pipeline
-    cache._all_reduce_attn_groups = lambda t, op: dist.all_reduce(t, op=op, group=attention)
+    cache.pp_size = 2
+    _use_groups(attention, pipeline)
     cache.evictable_leaves = set()
     count = 2 * retention._VICTIMS_PER_BATCH
     for token in range(count):
@@ -984,8 +1061,8 @@ def _exercise(rank, uri):
         # A peer with no candidate blocks the ordered vote immediately.
         # Once a shared leaf becomes available the next plan can commit it.
         cache, _, _ = _priority_cache(False)
-        cache.pp_size, cache.pp_group = 2, pipeline
-        cache._all_reduce_attn_groups = lambda t, op: dist.all_reduce(t, op=op, group=attention)
+        cache.pp_size = 2
+        _use_groups(attention, pipeline)
         size = retention._VICTIMS_PER_BATCH ** 2
         cache.evictable_leaves = {Leaf(i, cache.root_node) for i in range(size) if rank != 3}
         cache.eviction_strategy.get_priority = lambda n: n.key[0]
@@ -1008,8 +1085,8 @@ def _exercise(rank, uri):
         # A lock on one rank prevents promotion there. Every rank can demote
         # the cold child, then their proposed next victims disagree.
         cache, order, nodes = _priority_cache(rank == 3)
-        cache.pp_size, cache.pp_group = 2, pipeline
-        cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
+        cache.pp_size = 2
+        _use_groups(attention, pipeline)
         _poll_to_limit(cache, 0)
         assert order == [11, 20]
         assert [node.key[0] for node in nodes if not node.evicted] == [10, 30]
@@ -1017,8 +1094,8 @@ def _exercise(rank, uri):
         # Native first choices differ, but demoting their common child
         # promotes a shared parent that ranks ahead of the unrelated hot leaf.
         cache, order, nodes = _priority_cache(False)
-        cache.pp_size, cache.pp_group = 2, pipeline
-        cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
+        cache.pp_size = 2
+        _use_groups(attention, pipeline)
         if rank == 3:
             priority = cache.eviction_strategy.get_priority
             hot_leaf = nodes[2]
@@ -1030,8 +1107,8 @@ def _exercise(rank, uri):
         # child. Its newly eligible parent should be proposed by the next
         # poll, without rebuilding the index of already rejected prefixes.
         cache, order, (parent, child, hot, _) = _priority_cache(False)
-        cache.pp_size, cache.pp_group = 2, pipeline
-        cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
+        cache.pp_size = 2
+        _use_groups(attention, pipeline)
         cache.evictable_leaves.remove(hot)
         page = retention._VICTIMS_PER_BATCH
         cache.evictable_leaves.update(Leaf(-i - 1, parent.parent, str(rank)) for i in range(page))
@@ -1050,8 +1127,8 @@ def _exercise(rank, uri):
         cold, hot = nodes[1:3]
         cache._evict_backuped(cold)
         cache.eviction_strategy.get_priority = lambda n: int((n is hot) != (rank == 3))
-        cache.pp_size, cache.pp_group = 2, pipeline
-        cache._all_reduce_attn_groups = lambda vote, op: dist.all_reduce(vote, op=op, group=attention)
+        cache.pp_size = 2
+        _use_groups(attention, pipeline)
         _poll_to_limit(cache, 0)
         assert order == [11, 10, 20]
         assert [node.key[0] for node in nodes if not node.evicted] == [30]
@@ -1080,10 +1157,7 @@ def _exercise(rank, uri):
         # for a subgroup that does not contain global rank zero.
         for pp_size, local_group, first_rank in ((1, attention, stage * 2), (2, None, lane), (2, attention, 0)):
             cache.pp_size, cache.pp_rank = pp_size, stage if pp_size > 1 else 0
-            def reduce_local(vote, op):
-                if local_group is not None:
-                    dist.all_reduce(vote, op=op, group=local_group)
-            cache._all_reduce_attn_groups = reduce_local
+            _use_groups(local_group, pipeline if pp_size > 1 else None)
             cache.evictable_leaves = {Leaf(i, root) for i in (10, 20, 30)}
             cache.evictable_size_ = 3
             reverse = bool(first_rank % 2) if rank == first_rank else not bool(first_rank % 2)
@@ -1179,12 +1253,14 @@ def _exercise(rank, uri):
         cache.evictable_leaves.add(Leaf(limit + rank, root))
         cache.evictable_size_ = limit
         rounds = []
+        reduce_victims = retention._reduce_victims
         def count_round(tensor, op):
             rounds.append(tensor.numel())
-            dist.all_reduce(tensor, op=op, group=attention)
-        cache._all_reduce_attn_groups = count_round
+            reduce_victims(tensor, op)
         freed_tokens.clear()
-        assert _poll_to_limit(cache, 0) is False
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(retention, "_reduce_victims", count_round)
+            assert _poll_to_limit(cache, 0) is False
         assert len(rounds) == 4 and freed_tokens == list(range(limit - 1))
 
         # PP0 has exactly the cap. Only the far stage needs to reclaim. Its
@@ -1244,7 +1320,7 @@ def _exercise(rank, uri):
                     _evict_backuped=evict,
                     update_eviction_metrics=lambda *args: None,
                     tp_world_size=1 if topology == "PP" else 2,
-                    pp_size=1 if topology == "TP" else 2, pp_group=pipeline,
+                    pp_size=1 if topology == "TP" else 2,
                     _enforce_prefix_cache_retention=delegated.append)
 
                 def reduce_attention(vote, op):
@@ -1261,7 +1337,6 @@ def _exercise(rank, uri):
                     if topology != "TP":
                         dist.broadcast(vote, src=lane, group=pipeline)
 
-                cache._all_reduce_attn_groups = reduce_attention
                 cache.match_prefix = lambda p: p.key
                 cache._all_reduce = ready_counts
                 cache.check_hicache_events = lambda: cache._all_reduce(torch.zeros(2, dtype=torch.int), dist.ReduceOp.MIN)
@@ -1275,7 +1350,15 @@ def _exercise(rank, uri):
                                             ps=SimpleNamespace(attn_dp_size=1),
                                             disaggregation_mode=SimpleNamespace(value="null"),
                                             pp_group=SimpleNamespace(is_last_rank=bool(stage)), pp_outputs=None)
+                _use_groups(None if topology == "PP" else attention, None if topology == "TP" else pipeline)
+                reduce_victims = retention._reduce_victims
+
+                def record_vote(vote, op):
+                    vote_sizes.append(vote.numel())
+                    reduce_victims(vote, op)
+
                 with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(retention, "_reduce_victims", record_vote)
                     policy = retention.prefix_cache_retention._policy
                     patch.setattr(policy, "limit_tokens", -1 if topology == "TP" else 0)
                     patch.setattr(policy, "applied_revision", None)
@@ -1397,7 +1480,7 @@ def test_unlimited_pipeline_keeps_native_scheduler_and_leaf_set(monkeypatch):
     scheduler = SimpleNamespace(tree_cache=cache, enable_hierarchical_cache=True, ps=SimpleNamespace(attn_dp_size=1),
                                 disaggregation_mode=SimpleNamespace(value="null"))
     votes = []
-    monkeypatch.setattr(retention, "_reduce_victims", lambda _, data, op: votes.append(data.tolist()))
+    monkeypatch.setattr(retention, "_reduce_victims", lambda data, op: votes.append(data.tolist()))
     monkeypatch.setattr(retention, "get_prefix_cache_retention_limit", lambda: -1)
     native_cache, native_scheduler = vars(cache).copy(), vars(scheduler).copy()
     retention.install_parallel_hicache_retention(scheduler)

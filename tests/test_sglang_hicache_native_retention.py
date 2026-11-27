@@ -107,8 +107,9 @@ def test_shared_ballot_revalidates_prefix_after_native_parent_split(native, bigr
         pp_size=1, tp_world_size=2, page_size=1, root_node=root, evictable_leaves={leaf},
         eviction_strategy=SimpleNamespace(get_priority=lambda n: n.priority),
         evictable_size_=1, protected_size_=0, cache_controller=SimpleNamespace(write_policy="write_through"),
-        _all_reduce_attn_groups=vote, _all_reduce=lambda *_: None,
+        _all_reduce=lambda *_: None,
         _enforce_prefix_cache_retention=lambda *_: None, update_eviction_metrics=lambda *_: None)
+    monkeypatch.setattr(parallel, "_reduce_victims", vote)
     def evict(node):
         accepted.append(node)
         cache.evictable_leaves.remove(node)
