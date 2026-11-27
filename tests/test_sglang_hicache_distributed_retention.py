@@ -1046,6 +1046,16 @@ def _exercise(rank, uri):
         stage, lane = divmod(rank, 2)
         attention = groups[(stage * 2, stage * 2 + 1)]
         pipeline = groups[(lane, lane + 2)]
+        # Only one rank has an active SWA cap; all four must receive the error.
+        enforcer = SimpleNamespace(_kvcached_max_swa_tokens=0 if rank == 0 else -1)
+        cache = SimpleNamespace(tp_world_size=2, supports_swa=lambda: True, _enforce_prefix_cache_retention=enforcer)
+        scheduler = SimpleNamespace(enable_hierarchical_cache=True, tree_cache=cache,
+                                    world_group=SimpleNamespace(world_size=4, cpu_group=dist.group.WORLD))
+        with pytest.raises(ValueError, match="KVCACHED_MAX_CACHED_SWA_TOKENS=-1"):
+            retention._validate_parallel_swa_limit(scheduler)
+        # DP-attention replicas can share a scheduler world but own separate caches.
+        cache.tp_world_size = 1
+        retention._validate_parallel_swa_limit(scheduler)
         _exercise_mixed_limits(stage, lane, attention, pipeline)
         _exercise_unequal_batches(rank, attention, pipeline)
         # A peer with no candidate blocks the ordered vote immediately.
@@ -1436,6 +1446,32 @@ def _exercise(rank, uri):
 
 def test_retention_agrees_across_attention_and_pipeline_groups(tmp_path):
     torch.multiprocessing.spawn(_exercise, args=((tmp_path / "store").as_uri(),), nprocs=4)
+
+
+@pytest.mark.parametrize("version", ["0.5.13", "0.5.15", "0.5.20"])
+@pytest.mark.parametrize("local_cap", [True, False], ids=["local-cap", "peer-cap"])
+def test_parallel_swa_hicache_rejects_cap_before_selecting_a_planner(monkeypatch, version, local_cap):
+    cache = SimpleNamespace(tp_world_size=2, tree_core=object(), supports_swa=lambda: True,
+                            _enforce_prefix_cache_retention=SimpleNamespace(_kvcached_max_swa_tokens=0 if local_cap else -1))
+    world = SimpleNamespace(world_size=2, cpu_group=object())
+
+    class Scheduler:
+        def __init__(self):
+            self.tree_cache, self.world_group, self.enable_hierarchical_cache = cache, world, True
+
+    def peer_vote(vote, op, group):
+        assert vote.item() == int(local_cap) and group is world.cpu_group and op == dist.ReduceOp.MAX
+        vote.fill_(1)
+
+    monkeypatch.setattr(dist, "all_reduce", peer_vote)
+    monkeypatch.setattr(retention, "enable_kvcached", lambda: True)
+    patch = retention.DistributedHiCacheRetentionPatch()
+    monkeypatch.setattr(patch.version_manager, "detect_version", lambda _: version)
+    module = ModuleType("scheduler")
+    setattr(module, "Scheduler", Scheduler)
+    assert patch.apply(module)
+    with pytest.raises(ValueError, match="KVCACHED_MAX_CACHED_SWA_TOKENS=-1"):
+        Scheduler()
 
 
 def test_unlimited_pipeline_keeps_native_scheduler_and_leaf_set(monkeypatch):

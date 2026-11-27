@@ -111,7 +111,7 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # Before SchedulerIdleLimitPatch, so its Scheduler.__init__ wrapper
             # is the inner one: the victim protocol is installed by the time
             # shrink support is decided (hicache_retention.shrink_trim_cache).
-            (DistributedHiCacheRetentionPatch(), HICACHE_RANGE),
+            (DistributedHiCacheRetentionPatch(), ">=0.5.13"),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (DeepSeekV4RequestAdmissionPatch(), ">=0.5.20"),
             (DeepSeekV4PoolStatsPatch(), ">=0.5.20"),

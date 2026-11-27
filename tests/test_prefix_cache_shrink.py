@@ -896,14 +896,14 @@ def test_autopatch_installs_victim_protocol_before_shrink_support(monkeypatch):
     from kvcached.integration.sglang import autopatch, hicache_retention, patches
     from kvcached.integration.sglang.scheduler import rank_coordination
 
-    order: List[type] = []
+    entries: list[tuple[type, str]] = []
 
     class Manager:
         def __init__(self, library):
             pass
 
-        def register_patches_with_versions(self, entries):
-            order.extend(type(patch) for patch, _ in entries)
+        def register_patches_with_versions(self, patches):
+            entries.extend((type(patch), versions) for patch, versions in patches)
 
         def apply_all_patches(self):
             return {}
@@ -915,7 +915,10 @@ def test_autopatch_installs_victim_protocol_before_shrink_support(monkeypatch):
     monkeypatch.setattr(rank_coordination, "patch_rank_coordination", lambda: None)
     autopatch._patch_sglang(None)
 
-    assert (order.index(hicache_retention.DistributedHiCacheRetentionPatch)
+    distributed = hicache_retention.DistributedHiCacheRetentionPatch
+    assert [versions for patch, versions in entries if patch is distributed] == [">=0.5.13"]
+    order = [patch for patch, _ in entries]
+    assert (order.index(distributed)
             < order.index(patches.SchedulerIdleLimitPatch))
 
 

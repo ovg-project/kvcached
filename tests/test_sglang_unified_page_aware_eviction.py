@@ -214,6 +214,8 @@ def _install_retention_scheduler(cache, patch):
     class Scheduler:
         def __init__(self):
             self.tree_cache = cache
+            self.world_group = types.SimpleNamespace(world_size=torch.distributed.get_world_size(),
+                                                     cpu_group=torch.distributed.group.WORLD)
             self.enable_hierarchical_cache = True
             self._engine_paused = False
 

@@ -24,7 +24,7 @@ from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.sglang.hicache import HICACHE_RANGE
 from kvcached.integration.sglang.rank_groups import reduce_tensor, stage_cpu_groups
 from kvcached.integration.sglang.scheduler.rank_plan import request_slot
-from kvcached.integration.version_utils import VersionAwarePatch, version_range
+from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 
 # Limit synchronous scheduler work even when only part of a batch agrees.
 _VICTIMS_PER_BATCH = 64
@@ -657,6 +657,29 @@ def _prepare_pipeline_vote(scheduler: Any, cache: Any) -> Callable[[], None]:
     return prepare
 
 
+def _validate_parallel_swa_limit(scheduler: Any) -> None:
+    if not getattr(scheduler, "enable_hierarchical_cache", False):
+        return
+    world = scheduler.world_group
+    if world.world_size == 1:
+        return
+
+    import torch
+    import torch.distributed as dist
+
+    cache = getattr(scheduler.tree_cache, "inner", scheduler.tree_cache)
+    enforcer = getattr(cache, "_enforce_prefix_cache_retention", None)
+    capped = (getattr(enforcer, "_kvcached_max_swa_tokens", -1) >= 0
+              and parallel_cache(cache) and cache.supports_swa())
+    # At startup every scheduler participates, including opaque trees and PP
+    # stages without SWA. A single capped rank makes local eviction unsafe.
+    vote = torch.tensor(int(capped), dtype=torch.uint8, device="cpu")
+    dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=world.cpu_group)
+    if vote.item():
+        raise ValueError("Multi-rank HiCache retention requires KVCACHED_MAX_CACHED_SWA_TOKENS=-1 "
+                         "until ranks can agree on SWA eviction victims")
+
+
 def parallel_trim_cache(scheduler: Any) -> Optional[Any]:
     """The distributed HiCache whose ranks can agree on device victims, if any."""
     if not getattr(scheduler, "enable_hierarchical_cache", False):
@@ -1172,7 +1195,7 @@ class DistributedHiCacheRetentionPatch(VersionAwarePatch, BasePatch):
     def apply(self, target_module: types.ModuleType) -> bool:
         return self.initialize_version_info() and self.patch_scheduler(target_module)
 
-    @version_range(HICACHE_RANGE)
+    @version_range(">=0.5.13")
     def patch_scheduler(self, module: types.ModuleType) -> bool:
         cls = self._get_target_class(module)
         if cls is None:
@@ -1181,11 +1204,15 @@ class DistributedHiCacheRetentionPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original):
             return True
 
+        full_planner = VersionRange(HICACHE_RANGE).contains(self.detected_version or "")
+
         @functools.wraps(original)
         def initialize(scheduler: Any, *args: Any, **kwargs: Any) -> None:
             original(scheduler, *args, **kwargs)
             if enable_kvcached():
-                install_parallel_hicache_retention(scheduler)
+                _validate_parallel_swa_limit(scheduler)
+                if full_planner:
+                    install_parallel_hicache_retention(scheduler)
 
         self._mark_as_patched(initialize)
         cls.__init__ = initialize

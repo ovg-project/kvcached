@@ -106,6 +106,8 @@ def evict_prefix_cache(cache: Any, params: Union["EvictParams", int]) -> Any:
     """
     if (
         isinstance(params, int)
+        or not hasattr(params, "swa_num_tokens")
+        or not hasattr(params, "mamba_num")
         or params.num_tokens <= 0
         or params.swa_num_tokens
         or params.mamba_num
