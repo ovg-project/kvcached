@@ -636,6 +636,26 @@ def main() -> int:
                 if not a.no_install:
                     ct.install_kvcached(a.repo, out / f"{engine}-install.log")
                 setup.add("install_kvcached", True)
+                if engine == "sglang" and a.profile == "basic" and not a.skip_cases:
+                    tests_dir = str(a.repo.resolve() / "tests") if a.local else f"{SRC_IN_CONTAINER}/tests"
+                    if a.no_install and not a.local:
+                        tests_dir = "/tmp/kvcached-e2e-tests"
+                        sh(DOCKER + ["cp", str(a.repo.resolve() / "tests"), f"{ct.name}:{tests_dir}"], check=True)
+                    retention_test = (f"{tests_dir}/test_sglang_unified_page_aware_eviction.py"
+                                      "::test_hicache_retention_preserves_unified_host_backups")
+                    command = f"cd /tmp && python3 -m pytest -q -rA {shlex.quote(retention_test)}"
+                    if not a.local:
+                        command = ("(python3 -c 'import pytest' || python3 -m pip install -q 'pytest>=8,<9') && "
+                                   + command)
+                    try:
+                        proc = ct.exec(f"timeout 175s bash -c {shlex.quote(command)}", timeout=180)
+                        output = proc.stdout + proc.stderr
+                        passed = proc.returncode == 0 and b"PASSED " in proc.stdout
+                    except subprocess.TimeoutExpired as exc:
+                        output = (exc.stdout or b"") + (exc.stderr or b"") + b"\nRetention check timed out\n"
+                        passed = False
+                    (out / "sglang-unified-retention.log").write_bytes(output)
+                    setup.add("unified_hicache_retention", passed, "sglang-unified-retention.log")
                 containers[engine] = ct
                 engine_info[engine] = {"image": spec.image, "digest": ct.image_digest(),
                                        **ct.versions()}

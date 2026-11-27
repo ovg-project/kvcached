@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "allocator.hpp"
+#include "exact_blocks.hpp"
 #include "gpu_utils.hpp"
 #include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
@@ -70,6 +71,10 @@ std::vector<int64_t> InternalPage::alloc(int64_t num_blocks) {
   }
   free_list.erase(free_list.begin(), free_list.begin() + num_blocks);
   return block_ids;
+}
+
+bool InternalPage::alloc_exact(const std::vector<int64_t> &block_ids) {
+  return claim_exact_blocks(free_list, block_ids);
 }
 
 void InternalPage::free(int64_t block_id) { free_list.push_back(block_id); }
@@ -168,25 +173,44 @@ PageAllocator::~PageAllocator() {
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  return alloc_page_impl(-1);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::try_alloc_page_at(page_id_t page_id) {
+  if (page_id < 0) {
+    throw std::invalid_argument("Exact page ID must be nonnegative");
+  }
+  return alloc_page_impl(page_id);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::alloc_page_impl(page_id_t requested_id) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
+  bool trimmed_for_exact = false;
 
   while (page_id == -1) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
       throw StateConsistencyError(transaction_error_);
     }
     // Fast path: allocate from reserved pages
-    if (!reserved_page_list_.empty()) {
-      page_id = reserved_page_list_.front();
-      reserved_page_list_.pop_front();
+    auto reserved = requested_id < 0
+                        ? reserved_page_list_.begin()
+                        : std::find(reserved_page_list_.begin(),
+                                    reserved_page_list_.end(), requested_id);
+    if (reserved != reserved_page_list_.end()) {
+      page_id = *reserved;
+      reserved_page_list_.erase(reserved);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
+      // An exact claim may be followed by a sibling pool's exact claim.
+      // Refilling arbitrary IDs here could take the headroom it needs.
+      if (requested_id < 0 && reserved_page_list_.size() <
+                                  static_cast<size_t>(min_reserved_pages_)) {
         prealloc_needed_ = true;
         cond_.notify_all();
       }
@@ -203,13 +227,49 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     }
 
     // Slow path: allocate from free pages
-    if (!free_page_list_.empty()) {
-      page_id = free_page_list_.front();
-      free_page_list_.pop_front();
+    auto free = requested_id < 0
+                    ? free_page_list_.begin()
+                    : std::find(free_page_list_.begin(), free_page_list_.end(),
+                                requested_id);
+    auto reclaimed = reclaimed_page_list_.end();
+    if (requested_id >= 0 && free == free_page_list_.end()) {
+      reclaimed = std::find(reclaimed_page_list_.begin(),
+                            reclaimed_page_list_.end(), requested_id);
+    }
+    if (requested_id >= 0 && (free != free_page_list_.end() ||
+                              reclaimed != reclaimed_page_list_.end())) {
+      // A shrink limits the number of pages, not their virtual placement.
+      // Preallocated backing at another ID may need to be unmapped first.
+      if (free_page_list_.empty() || get_avail_physical_pages() <= 0) {
+        if (!trimmed_for_exact && !reserved_page_list_.empty()) {
+          trimmed_for_exact = true;
+          lock.unlock();
+          trim();
+          lock.lock();
+          continue;
+        }
+        return nullptr;
+      }
+      if (reclaimed != reclaimed_page_list_.end()) {
+        // Exchange one unused slot without growing the active page budget.
+        // The displaced ID remains available to a later resize or exact claim.
+        free = free_page_list_.begin();
+        std::swap(*free, *reclaimed);
+      }
+    }
+    if (free != free_page_list_.end()) {
+      page_id = *free;
+      free_page_list_.erase(free);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
       break;
     }
 
+    if (requested_id >= 0) {
+      // Another allocation, preallocation, or release may own this ID.
+      // Never substitute another page or wait while an integration holds a
+      // sibling pool's allocation. The caller can roll back and retry.
+      return nullptr;
+    }
     if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
       throw std::runtime_error("No free pages left");
     }
@@ -245,7 +305,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
                              ": " + e.what());
   }
 
-  if (enable_page_prealloc_) {
+  if (requested_id < 0 && enable_page_prealloc_) {
     trigger_preallocation();
   }
 
@@ -453,18 +513,32 @@ bool PageAllocator::resize(int64_t new_mem_size) {
 }
 
 int64_t PageAllocator::trim(int64_t max_pages) {
+  return trim_impl(max_pages, nullptr);
+}
+
+int64_t PageAllocator::trim_selected(const std::vector<page_id_t> &eligible) {
+  return trim_impl(-1, &eligible);
+}
+
+int64_t PageAllocator::trim_impl(int64_t max_pages,
+                                 const std::vector<page_id_t> *eligible) {
   throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    const auto count = max_pages < 0 ? reserved_page_list_.size()
-                                     : std::min(reserved_page_list_.size(),
-                                                static_cast<size_t>(max_pages));
-    pages_to_unmap.assign(reserved_page_list_.end() - count,
-                          reserved_page_list_.end());
-    reserved_page_list_.erase(reserved_page_list_.end() - count,
-                              reserved_page_list_.end());
+    if (eligible) {
+      pages_to_unmap = extract_reserved_pages(reserved_page_list_, *eligible);
+    } else {
+      const auto count = max_pages < 0
+                             ? reserved_page_list_.size()
+                             : std::min(reserved_page_list_.size(),
+                                        static_cast<size_t>(max_pages));
+      pages_to_unmap.assign(reserved_page_list_.end() - count,
+                            reserved_page_list_.end());
+      reserved_page_list_.erase(reserved_page_list_.end() - count,
+                                reserved_page_list_.end());
+    }
 
     if (pages_to_unmap.empty()) {
       update_memory_usage_unlocked();
@@ -480,6 +554,8 @@ int64_t PageAllocator::trim(int64_t max_pages) {
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
+    // Wake allocations waiting for these IDs without requesting a refill.
+    cond_.notify_all();
   }
   return static_cast<int64_t>(pages_to_unmap.size());
 }
@@ -588,7 +664,7 @@ PageState PageAllocator::get_page_state_unlocked() const {
                    static_cast<int64_t>(reserved_page_list_.size())};
 }
 
-int64_t PageAllocator::get_avail_physical_pages() const {
+int64_t PageAllocator::get_avail_physical_bytes() const {
   const int previous_device = gpu_vmm::current_device();
   const int pool_device = FTensorAllocator::device_index();
   const bool change_device = pool_device >= 0 && previous_device != pool_device;
@@ -608,8 +684,7 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  size_t usable_phy_mem_size =
-      saturating_subtract(avail_phy_mem_size, headroom);
+  int64_t usable_phy_mem_size = signed_headroom(avail_phy_mem_size, headroom);
   // The local scheduler must honor the same GPU/instance limits as grants.
   // Worker-IPC allocators own their ledgers in the workers, not this process.
   // This remains an estimate; the actual map still performs atomic admission.
@@ -620,7 +695,22 @@ int64_t PageAllocator::get_avail_physical_pages() const {
           std::min(usable_phy_mem_size, allocator->available_physical_bytes());
   }
 
-  // Calculate available pages considering layers and KV buffers
+  return usable_phy_mem_size;
+}
+
+std::optional<ExactRecoveryQuote>
+PageAllocator::exact_recovery_quote(const std::vector<page_id_t> &pages) const {
+  std::lock_guard<std::mutex> guard(lock_);
+  if (transaction_failed_.load(std::memory_order_acquire))
+    throw StateConsistencyError(transaction_error_);
+  const auto bundle = page_size_ * num_layers_ * num_kv_buffers_;
+  return quote_exact_pages(pages, free_page_list_, reclaimed_page_list_,
+                           reserved_page_list_, bundle);
+}
+
+int64_t PageAllocator::get_avail_physical_pages() const {
+  const auto usable_phy_mem_size =
+      std::max<int64_t>(0, get_avail_physical_bytes());
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;

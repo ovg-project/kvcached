@@ -86,7 +86,7 @@ public:
   static FTensorAllocator *global_allocator(int64_t group_id = 0);
   void destroy();
   BudgetSnapshot physical_budget_state();
-  uint64_t available_physical_bytes();
+  int64_t available_physical_bytes();
   // Post the instance's demand on this GPU (see GpuBudget::set_demand).
   void set_kv_demand(uint64_t bytes);
   // Post what the instance can release on this GPU, by tier, and read what
@@ -99,7 +99,7 @@ public:
   InstanceControl configure_instance_control(bool can_shrink,
                                              uint64_t expected_participants,
                                              uint64_t startup_pages,
-                                             bool reserve_null = false);
+                                             uint64_t minimum_pages = 0);
   InstanceControl instance_control_state();
   bool acknowledge_instance_control(uint64_t revision);
   std::string instance_control_path();

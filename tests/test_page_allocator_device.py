@@ -43,13 +43,15 @@ def device_probe(tmp_path_factory):
         _method(allocator, "FTensorAllocator *FTensorAllocator::find_allocator("),
         _method(allocator, "FTensorAllocator *FTensorAllocator::global_allocator("),
         _method(allocator, "void FTensorAllocator::shutdown("),
+        _method(pages, "int64_t PageAllocator::get_avail_physical_bytes() const"),
         _method(pages, "int64_t PageAllocator::get_avail_physical_pages() const"),
     ])
     build = tmp_path_factory.mktemp("page-device")
     source = build / "probe.cpp"
     source.write_text(_RUNTIME + methods + _CASES)
     binary = build / "probe"
-    subprocess.run([compiler, "-std=c++17", "-pthread", str(source), "-o", str(binary)],
+    subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(root / "csrc/inc"),
+                    str(source), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     return binary
 
@@ -144,6 +146,8 @@ _RUNTIME = r'''
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
+#include "math_utils.hpp"
+using kvcached::signed_headroom;
 namespace gpu_vmm {
 thread_local int device = 0, queried = -1, selections = 0;
 int fail_target = -1;
@@ -201,7 +205,7 @@ public:
   static std::string g_instance_name_;
   int64_t group_id_ = 0;
   bool tensors_created = false, fail_budget = false;
-  uint64_t budget_bytes = 3 * 1024 * 1024;
+  int64_t budget_bytes = 3 * 1024 * 1024;
   int owner;
   FTensorAllocator(const torch::stable::Device& device, bool) {
     owner = device.index() < 0 ? gpu_vmm::current_device() : device.index();
@@ -213,7 +217,7 @@ public:
   static int device_index();
   static void shutdown();
   bool kv_tensors_created() { return tensors_created; }
-  uint64_t available_physical_bytes() {
+  int64_t available_physical_bytes() {
     if (fail_budget) throw std::runtime_error("budget unavailable");
     return budget_bytes;
   }
@@ -230,9 +234,9 @@ public:
   int64_t world_size_ = 1, group_id_ = 0;
   bool worker_ipc = false;
   bool should_use_worker_ipc() const { return worker_ipc; }
+  int64_t get_avail_physical_bytes() const;
   int64_t get_avail_physical_pages() const;
 };
-size_t saturating_subtract(size_t a, size_t b) { return a > b ? a - b : 0; }
 '''
 
 _CASES = r'''

@@ -538,6 +538,13 @@ int main(int argc, char **argv) {
   }
   {
     auto budget = GpuBudget::connect(path, [] { return 1000; });
+    auto slot = budget->register_pool("permanent-state-pages", 0);
+    budget->configure_control_pool(slot, 120, 12, true, 1, 2);
+    budget->ready_control_pool(slot);
+    assert(budget->control_state(slot).minimum_bytes == 24);
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 1000; });
     auto a = budget->register_pool("floors", 0);
     auto b = budget->register_pool("floors", 1);
     auto c = budget->register_pool("floors", 2);

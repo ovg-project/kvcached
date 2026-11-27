@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -462,7 +463,8 @@ py::dict control_dict(const InstanceControl &state) {
 
 py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
                                 uint64_t expected_participants,
-                                uint64_t startup_pages, bool reserve_null) {
+                                uint64_t startup_pages, bool reserve_null,
+                                uint64_t minimum_pages) {
   InstanceControl state;
   std::string path, name;
   {
@@ -470,7 +472,7 @@ py::dict local_instance_control(int64_t group_id, std::optional<bool> configure,
     auto allocator = FTensorAllocator::global_allocator(group_id);
     state = configure ? allocator->configure_instance_control(
                             *configure, expected_participants, startup_pages,
-                            reserve_null)
+                            std::max<uint64_t>(reserve_null, minimum_pages))
                       : allocator->instance_control_state();
     path = allocator->instance_control_path();
     name = FTensorAllocator::instance_control_name();
@@ -617,7 +619,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("local_instance_control", &kvcached::local_instance_control,
         py::arg("group_id") = 0, py::arg("configure") = py::none(),
         py::arg("expected_participants") = 0, py::arg("startup_pages") = 0,
-        py::arg("reserve_null") = false);
+        py::arg("reserve_null") = false, py::arg("minimum_pages") = 0);
   m.def("query_instance_control", &kvcached::query_instance_control,
         py::arg("path"), py::arg("instance"), py::arg("slot") = SIZE_MAX);
   m.def("observe_instance_control", &kvcached::observe_instance_control,
@@ -737,6 +739,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("alloc_page", &kvcached::page_allocator_alloc_page,
            py::call_guard<py::gil_scoped_release>())
+      .def("try_alloc_page_at", &kvcached::PageAllocator::try_alloc_page_at,
+           py::call_guard<py::gil_scoped_release>())
       .def("free_page", &kvcached::page_allocator_free_page,
            py::call_guard<py::gil_scoped_release>())
       .def("free_pages", &kvcached::page_allocator_free_pages,
@@ -762,6 +766,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_page_state", &kvcached::page_allocator_get_page_state)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("get_avail_physical_bytes",
+           &kvcached::PageAllocator::get_avail_physical_bytes)
+      .def("exact_recovery_quote",
+           &kvcached::PageAllocator::exact_recovery_quote)
+      .def("trim_selected", &kvcached::PageAllocator::trim_selected,
+           py::call_guard<py::gil_scoped_release>())
       .def("check_and_get_resize_target",
            &kvcached::page_allocator_check_and_get_resize_target)
       .def("get_resize_target", &kvcached::page_allocator_get_resize_target)
@@ -784,6 +794,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("init", &kvcached::InternalPage::init, py::arg("block_mem_size"),
            py::arg("max_block_id") = -1)
       .def("alloc", &kvcached::InternalPage::alloc)
+      .def("alloc_exact", &kvcached::InternalPage::alloc_exact)
       .def("free", &kvcached::InternalPage::free)
       .def("free_batch", &kvcached::InternalPage::free_batch)
       .def("empty", &kvcached::InternalPage::empty)
