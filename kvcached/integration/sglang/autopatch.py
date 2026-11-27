@@ -11,6 +11,10 @@ from kvcached.integration.patch_base import (
     is_integration_version_supported,
     log_patch_results,
 )
+from kvcached.integration.sglang.dsv4_pool_stats import (
+    DeepSeekV4FullPoolCheckPatch,
+    DeepSeekV4PoolStatsPatch,
+)
 from kvcached.integration.sglang.hicache import (
     HICACHE_RANGE,
     HiCacheKVHostPoolPatch,
@@ -106,6 +110,8 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (DeepSeekV4RequestAdmissionPatch(), ">=0.5.20"),
+            (DeepSeekV4PoolStatsPatch(), ">=0.5.20"),
+            (DeepSeekV4FullPoolCheckPatch(), ">=0.5.20"),
             (RadixCacheLimitPatch(), SGLANG_ALL_RANGE),
             # Prefix caches that are not RadixCache subclasses.
             (UnifiedRadixCacheLimitPatch(), ">=0.5.13"),

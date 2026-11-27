@@ -323,6 +323,42 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             target_reservation + sum(breakdown.values())
         )
 
+        # Use the installed observer against the actual native DSV4 allocator.
+        # Only the physical headroom sample is fixed; logical IDs stay native.
+        from kvcached.integration.sglang.dsv4_pool_stats import DeepSeekV4PoolStatsPatch
+
+        observer_module = importlib.import_module(
+            "sglang.srt.managers.scheduler_components.pool_stats_observer")
+        observer_class = observer_module.SchedulerPoolStatsObserver
+        observer = observer_class(
+            tree_cache=types.SimpleNamespace(
+                full_evictable_size=lambda: 0, swa_evictable_size=lambda: 0),
+            token_to_kv_pool_allocator=shared,
+            req_to_token_pool=target.req_to_token_pool,
+            session_controller=None, hisparse_coordinator=None,
+            is_hybrid_swa=True, is_hybrid_ssm=False, enable_hisparse=False,
+            full_tokens_per_layer=shared.full_attn_allocator.size,
+            swa_tokens_per_layer=shared.swa_attn_allocator.size,
+            max_total_num_tokens=target.max_total_num_tokens,
+            get_last_batch=lambda: None, get_running_batch=lambda: None,
+        )
+        with monkeypatch.context() as pressure:
+            observer_patch = DeepSeekV4PoolStatsPatch()
+            method = observer_class._get_swa_token_info
+            # An installed .pth can apply this wrapper during SGLang import.
+            native_method = method.__wrapped__ if observer_patch._is_already_patched(method) else method
+            pressure.setattr(observer_class, "_get_swa_token_info", native_method)
+            pressure.setattr(manager, "available_size", lambda: 0)
+            physical_available = shared.swa_available_size()
+            native_stats = observer._get_swa_token_info()
+            assert native_stats.swa_num_used > 0
+            assert observer_patch.apply(observer_module)
+            stats = observer._get_swa_token_info()
+            assert stats.full_num_used == stats.swa_num_used == 0
+            assert stats.full_available_size == observer.full_tokens_per_layer
+            assert stats.swa_available_size == observer.swa_tokens_per_layer
+            assert shared.swa_available_size() == physical_available
+
         # Full IDs remain native; physical pressure must roll them back before
         # the composite publishes any full-to-SWA mapping.
         logical = shared.full_attn_allocator
