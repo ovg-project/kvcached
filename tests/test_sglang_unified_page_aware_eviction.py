@@ -239,6 +239,7 @@ def _install_retention_scheduler(cache, patch):
 def _hicache_retention_rank(rank, rendezvous):
     import torch.distributed as dist
     from sglang.srt.mem_cache import base_prefix_cache, cache_init_params, unified_radix_cache
+    from test_sglang_hicache_distributed_retention import _use_groups
 
     from kvcached.integration.sglang import hicache_retention as retention
 
@@ -246,6 +247,7 @@ def _hicache_retention_rank(rank, rendezvous):
         "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=45),
     )
     try:
+        _use_groups(dist.group.WORLD, None)
         native = types.SimpleNamespace(unified=unified_radix_cache, base=base_prefix_cache, init=cache_init_params)
         component = unified_radix_cache.BASE_COMPONENT_TYPE
         for scenario in ("different_keys", "different_backup", "same"):

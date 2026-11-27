@@ -108,6 +108,10 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             # Records the waiting request a round cannot admit as KV demand.
             (PrefillAdderDemandPatch(), ">=0.5.13"),
             (SGLangShutdownPatch(), SGLANG_ALL_RANGE),
+            # Before SchedulerIdleLimitPatch, so its Scheduler.__init__ wrapper
+            # is the inner one: the victim protocol is installed by the time
+            # shrink support is decided (hicache_retention.shrink_trim_cache).
+            (DistributedHiCacheRetentionPatch(), HICACHE_RANGE),
             (SchedulerIdleLimitPatch(), SGLANG_ALL_RANGE),
             (DeepSeekV4RequestAdmissionPatch(), ">=0.5.20"),
             (DeepSeekV4PoolStatsPatch(), ">=0.5.20"),
@@ -125,7 +129,6 @@ def _patch_sglang(_sglang: types.ModuleType) -> None:
             (HiCacheMLAHostPoolPatch(), HICACHE_RANGE),
             (HiCacheMambaHostPoolPatch(), HICACHE_RANGE),
             (HiCacheSizeSplitPatch(), HICACHE_RANGE),
-            (DistributedHiCacheRetentionPatch(), HICACHE_RANGE),
         ]
     )
 

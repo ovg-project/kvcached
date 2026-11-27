@@ -22,6 +22,7 @@ from kvcached import prefix_cache_retention
 from kvcached.control import get_prefix_cache_retention_limit
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.sglang.hicache import HICACHE_RANGE
+from kvcached.integration.sglang.rank_groups import reduce_tensor, stage_cpu_groups
 from kvcached.integration.sglang.scheduler.rank_plan import request_slot
 from kvcached.integration.version_utils import VersionAwarePatch, version_range
 
@@ -300,12 +301,8 @@ def _signature_pages(leaves: Any, ancestors: WeakKeyDictionary) -> Iterator[Tupl
         yield [], False, 0
 
 
-def _reduce_victims(cache: Any, data: Any, op: Any) -> None:
-    import torch.distributed as dist
-
-    cache._all_reduce_attn_groups(data, op)
-    if cache.pp_size > 1:
-        dist.all_reduce(data, op=op, group=cache.pp_group)
+def _reduce_victims(data: Any, op: Any) -> None:
+    reduce_tensor(data, stage_cpu_groups(), op)
 
 
 class _OrderedVote(Enum):
@@ -331,7 +328,7 @@ def _trim_batches(cache: Any, demand: int) -> Iterator[Tuple[_OrderedVote, int, 
         # 2 marks a ready rank, 1 an unfinished index, 0 an exhausted rank.
         state = 1 if building else (2 if length or done else 0)
         vote = torch.cat((raw, 255 - raw, raw.new_tensor([length, 255 - length, done, state])))
-        _reduce_victims(cache, vote, dist.ReduceOp.MIN)
+        _reduce_victims(vote, dist.ReduceOp.MIN)
         shortest = int(vote[-4])
         low, high = vote[:2 * width].view(2, _VICTIMS_PER_BATCH, -1)[:, :shortest]
         mismatch = (low != 255 - high).any(dim=1).nonzero()
@@ -521,7 +518,7 @@ class _VictimPlan:
                 # If the final index page used most of the slot, every rank
                 # resumes the ballot next poll with its full budget.
                 packet[-1] = indexing or ballot_budget < 2 * _VICTIMS_PER_BATCH
-                _reduce_victims(cache, torch.frombuffer(packet, dtype=torch.uint8), dist.ReduceOp.MAX)
+                _reduce_victims(torch.frombuffer(packet, dtype=torch.uint8), dist.ReduceOp.MAX)
                 count, more, last_may_promote, building = packet[-4:]
                 if building:
                     # Peers are still indexing. Recheck these priorities when
@@ -553,7 +550,7 @@ class _VictimPlan:
                 paths.clear()
                 if count:
                     accepted = torch.tensor(votes, dtype=torch.uint8, device="cpu")
-                    _reduce_victims(cache, accepted, dist.ReduceOp.MIN)
+                    _reduce_victims(accepted, dist.ReduceOp.MIN)
                     votes = accepted.tolist()
                     reindex |= 1 in votes
                     # An accepted final child can refill the proposer's heap.
@@ -602,7 +599,7 @@ def _group_demand(cache: Any, limit: int, changed: bool) -> Tuple[int, bool, Opt
     # release the same prefix to satisfy a peer's finite limit.
     election = -rank if _write_through(cache) else 1
     status = torch.tensor([_excess(cache, limit), int(changed), election], dtype=torch.int64, device="cpu")
-    _reduce_victims(cache, status, dist.ReduceOp.MAX)
+    _reduce_victims(status, dist.ReduceOp.MAX)
     excess, changed_flag, election = status.tolist()
     return excess, bool(changed_flag), -election if election <= 0 else None
 
@@ -660,24 +657,108 @@ def _prepare_pipeline_vote(scheduler: Any, cache: Any) -> Callable[[], None]:
     return prepare
 
 
-def install_parallel_hicache_retention(scheduler: Any) -> None:
+def parallel_trim_cache(scheduler: Any) -> Optional[Any]:
+    """The distributed HiCache whose ranks can agree on device victims, if any."""
     if not getattr(scheduler, "enable_hierarchical_cache", False):
-        return
+        return None
     # PD multiplexing schedules split prefill directly, bypassing the
     # regular HiCache poll. Keep its existing request-finish enforcer.
     if getattr(scheduler, "enable_pdmux", False):
-        return
+        return None
     # On 0.5.18/19 the diffusion loop bypasses the prefill HiCache poll.
     # 0.5.20 drains HiCache before choosing the diffusion or prefill path.
     if getattr(scheduler, "dllm_config", None) is not None and not hasattr(scheduler, "_process_hicache_events"):
-        return
+        return None
     cache = scheduler.tree_cache
     cache = getattr(cache, "inner", cache)
     controller = getattr(cache, "cache_controller", None)
     if controller is None or getattr(cache, "linker", None) is not None or not parallel_cache(cache):
-        return
+        return None
     if hasattr(cache, "tree_core") and not hasattr(cache.tree_core, "evictable_device_leaves"):
         # Opaque backends cannot enumerate an exact set of logical victims.
+        return None
+    return cache
+
+
+def _device_leaves(cache: Any) -> Any:
+    tree = getattr(cache, "tree_core", None)
+    return getattr(cache if tree is None else tree,
+                   "evictable_leaves" if tree is None else "evictable_device_leaves", None)
+
+
+def shrink_trim_cache(scheduler: Any) -> Optional[Any]:
+    """The HiCache a memory-limit shrink can trim with agreed victims, if any.
+
+    Requires the condition evict_parallel_hicache needs: a write-through
+    cache whose device leaves the victim protocol tracks. The protocol
+    (DistributedHiCacheRetentionPatch, HICACHE_RANGE only) wraps inside the
+    scheduler's idle-limit init, so it is installed before this runs. Older
+    SGLang keeps the native leaf set, and the pool keeps the growth cap.
+    """
+    cache = parallel_trim_cache(scheduler)
+    if cache is None or not _write_through(cache):
+        return None
+    return cache if isinstance(_device_leaves(cache), _DeviceLeaves) else None
+
+
+class _ShrinkTrim:
+    """A memory-limit trim in progress, kept across idle passes."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.plan = _VictimPlan()
+        self.stamp: Optional[Tuple[Any, ...]] = None
+
+
+def _shrink_state(cache: Any) -> Tuple[Any, ...]:
+    if hasattr(cache, "tree_core"):
+        eligible, locked = cache.full_evictable_size(), cache.full_protected_size()
+    else:
+        eligible, locked = cache.evictable_size_, cache.protected_size_
+    return getattr(cache, "root_node", None), eligible, locked
+
+
+def parallel_hicache_trim_pending(cache: Any) -> bool:
+    return getattr(cache, "_kvcached_shrink_trim", None) is not None
+
+
+def cancel_parallel_hicache_trim(cache: Any) -> None:
+    """Drop a pending trim; every rank must drop it on the same pass."""
+    cache._kvcached_shrink_trim = None
+
+
+def evict_parallel_hicache(cache: Any, tokens: int) -> Optional[bool]:
+    """Advance a trim of ``tokens`` device tokens with victims every rank agrees on.
+
+    Every rank must call this together. ``tokens`` starts a trim when none
+    is pending: each rank trims to its own evictable size less ``tokens``,
+    so the group demand is ``tokens``. Each call does one bounded poll, as
+    the retention path does, and returns None until the plan reaches a
+    verdict; call again (any ``tokens``) to continue. The verdict comes from
+    group votes, so every rank keeps or drops the trim on the same call.
+    A cache whose device leaves are not tracked evicts nothing.
+    """
+    if not isinstance(_device_leaves(cache), _DeviceLeaves):
+        return False
+    trim = getattr(cache, "_kvcached_shrink_trim", None)
+    if trim is None:
+        if tokens <= 0:
+            return True
+        size = cache.full_evictable_size() if hasattr(cache, "tree_core") else cache.evictable_size_
+        trim = cache._kvcached_shrink_trim = _ShrinkTrim(max(0, size - tokens))
+    start = time.perf_counter()
+    state = _shrink_state(cache)
+    demand, changed, proposer = _group_demand(cache, trim.limit, state != trim.stamp)
+    result = trim.plan.poll(cache, demand, proposer, changed, start) if demand else True
+    trim.stamp = _shrink_state(cache)
+    if result is not None:
+        cache._kvcached_shrink_trim = None
+    return result
+
+
+def install_parallel_hicache_retention(scheduler: Any) -> None:
+    cache = parallel_trim_cache(scheduler)
+    if cache is None:
         return
     prepare_vote = None
     if cache.pp_size > 1:
@@ -708,7 +789,7 @@ def install_parallel_hicache_retention(scheduler: Any) -> None:
     limit = get_prefix_cache_retention_limit()
     through = _write_through(cache)
     startup = torch.tensor([limit >= 0, limit == 0, through, not through], dtype=torch.uint8, device="cpu")
-    _reduce_victims(cache, startup, dist.ReduceOp.MAX)
+    _reduce_victims(startup, dist.ReduceOp.MAX)
     any_cap, any_zero, any_write_through, any_write_back = startup.tolist()
     if cache.pp_size > 1:
         # Runtime retention-limit updates support TP only. An unlimited
@@ -801,7 +882,7 @@ def install_parallel_hicache_retention(scheduler: Any) -> None:
         nonlocal group_write_through, group_write_back
         through = _write_through(cache)
         policies = torch.tensor([through, not through], dtype=torch.uint8, device="cpu")
-        _reduce_victims(cache, policies, dist.ReduceOp.MAX)
+        _reduce_victims(policies, dist.ReduceOp.MAX)
         any_through, any_back = policies.tolist()
         group_write_through, group_write_back = not any_back, not any_through
         set_cold_admission(group_zero and group_write_through)

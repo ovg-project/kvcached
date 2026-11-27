@@ -17,7 +17,7 @@ from types import ModuleType, SimpleNamespace as NS
 import pytest
 import torch
 import torch.distributed as dist
-from test_sglang_hicache_distributed_retention import Leaf
+from test_sglang_hicache_distributed_retention import Leaf, _use_groups
 
 from kvcached.integration.sglang import hicache_retention as retention
 
@@ -115,9 +115,10 @@ def _run_loop(path, depth, attention, pipeline, dp_stage=None, follower_pressure
             data = tensor.clone()
             ack_work.append(NS(work=dist.isend(data, dst=following, group=pipeline, tag=4), tensor=data))
 
-    cache = NS(pp_size=len(ranks), pp_rank=stage, pp_group=pipeline, tp_world_size=1,
+    _use_groups(attention, pipeline)
+    cache = NS(pp_size=len(ranks), pp_rank=stage, tp_world_size=1,
                cache_controller=NS(write_policy="write_through"), evictable_leaves=set(),
-               evictable_size_=0, protected_size_=0, _all_reduce_attn_groups=reduce_attention,
+               evictable_size_=0, protected_size_=0,
                _all_reduce=ready_counts, _enforce_prefix_cache_retention=lambda _: None,
                eviction_strategy=NS(get_priority=lambda n: n.key[0]), update_eviction_metrics=lambda *_: None)
     evicted_at = []
