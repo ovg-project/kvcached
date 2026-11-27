@@ -689,19 +689,16 @@ def _device_leaves(cache: Any) -> Any:
 def shrink_trim_cache(scheduler: Any) -> Optional[Any]:
     """The HiCache a memory-limit shrink can trim with agreed victims, if any.
 
-    Runs while the scheduler is built, before this module's own patch
-    (applied around it) installs the victim protocol. So it checks that the
-    patch wraps this scheduler and that the leaf set is one it will track.
-    Otherwise (e.g. SGLang outside HICACHE_RANGE) the pool keeps the cap.
+    Requires the condition evict_parallel_hicache needs: a write-through
+    cache whose device leaves the victim protocol tracks. The protocol
+    (DistributedHiCacheRetentionPatch, HICACHE_RANGE only) wraps inside the
+    scheduler's idle-limit init, so it is installed before this runs. Older
+    SGLang keeps the native leaf set, and the pool keeps the growth cap.
     """
-    marker = f"__kvcached_patched_{DistributedHiCacheRetentionPatch.patch_name}__"
-    if not getattr(type(scheduler).__init__, marker, False):
-        return None
     cache = parallel_trim_cache(scheduler)
     if cache is None or not _write_through(cache):
         return None
-    leaves = _device_leaves(cache)
-    return cache if type(leaves) is set or isinstance(leaves, _DeviceLeaves) else None
+    return cache if isinstance(_device_leaves(cache), _DeviceLeaves) else None
 
 
 class _ShrinkTrim:
