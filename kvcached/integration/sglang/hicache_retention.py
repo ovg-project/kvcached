@@ -680,30 +680,78 @@ def parallel_trim_cache(scheduler: Any) -> Optional[Any]:
     return cache
 
 
-def evict_parallel_hicache(cache: Any, tokens: int) -> bool:
-    """Evict ``tokens`` more device tokens with victims every rank agrees on.
-
-    Every rank must call this together. Each one trims to its own evictable
-    size less ``tokens``, so the group demand is ``tokens``. A cache whose
-    device leaves are not tracked (retention was never installed) evicts
-    nothing; that state is the same on every rank.
-    """
+def _device_leaves(cache: Any) -> Any:
     tree = getattr(cache, "tree_core", None)
-    leaves = getattr(cache if tree is None else tree,
-                     "evictable_leaves" if tree is None else "evictable_device_leaves", None)
-    if not isinstance(leaves, _DeviceLeaves):
+    return getattr(cache if tree is None else tree,
+                   "evictable_leaves" if tree is None else "evictable_device_leaves", None)
+
+
+def shrink_trim_cache(scheduler: Any) -> Optional[Any]:
+    """The HiCache a memory-limit shrink can trim with agreed victims, if any.
+
+    Runs while the scheduler is built, before this module's own patch
+    (applied around it) installs the victim protocol. So it checks that the
+    patch wraps this scheduler and that the leaf set is one it will track.
+    Otherwise (e.g. SGLang outside HICACHE_RANGE) the pool keeps the cap.
+    """
+    marker = f"__kvcached_patched_{DistributedHiCacheRetentionPatch.patch_name}__"
+    if not getattr(type(scheduler).__init__, marker, False):
+        return None
+    cache = parallel_trim_cache(scheduler)
+    if cache is None or not _write_through(cache):
+        return None
+    leaves = _device_leaves(cache)
+    return cache if type(leaves) is set or isinstance(leaves, _DeviceLeaves) else None
+
+
+class _ShrinkTrim:
+    """A memory-limit trim in progress, kept across idle passes."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.plan = _VictimPlan()
+        self.stamp: Optional[Tuple[Any, ...]] = None
+
+
+def _shrink_state(cache: Any) -> Tuple[Any, ...]:
+    if hasattr(cache, "tree_core"):
+        eligible, locked = cache.full_evictable_size(), cache.full_protected_size()
+    else:
+        eligible, locked = cache.evictable_size_, cache.protected_size_
+    return getattr(cache, "root_node", None), eligible, locked
+
+
+def parallel_hicache_trim_pending(cache: Any) -> bool:
+    return getattr(cache, "_kvcached_shrink_trim", None) is not None
+
+
+def evict_parallel_hicache(cache: Any, tokens: int) -> Optional[bool]:
+    """Advance a trim of ``tokens`` device tokens with victims every rank agrees on.
+
+    Every rank must call this together. ``tokens`` starts a trim when none
+    is pending: each rank trims to its own evictable size less ``tokens``,
+    so the group demand is ``tokens``. Each call does one bounded poll, as
+    the retention path does, and returns None until the plan reaches a
+    verdict; call again (any ``tokens``) to continue. The verdict comes from
+    group votes, so every rank keeps or drops the trim on the same call.
+    A cache whose device leaves are not tracked evicts nothing.
+    """
+    if not isinstance(_device_leaves(cache), _DeviceLeaves):
         return False
-    size = cache.full_evictable_size() if tree is not None else cache.evictable_size_
-    limit = max(0, size - tokens)
-    # Poll the plan synchronously; the ranks advance it together.
-    plan = _VictimPlan()
-    demand, _, proposer = _group_demand(cache, limit, True)
-    while demand:
-        result = plan.poll(cache, demand, proposer, False)
-        if result is not None:
-            return result
-        demand, _, proposer = _group_demand(cache, limit, False)
-    return True
+    trim = getattr(cache, "_kvcached_shrink_trim", None)
+    if trim is None:
+        if tokens <= 0:
+            return True
+        size = cache.full_evictable_size() if hasattr(cache, "tree_core") else cache.evictable_size_
+        trim = cache._kvcached_shrink_trim = _ShrinkTrim(max(0, size - tokens))
+    start = time.perf_counter()
+    state = _shrink_state(cache)
+    demand, changed, proposer = _group_demand(cache, trim.limit, state != trim.stamp)
+    result = trim.plan.poll(cache, demand, proposer, changed, start) if demand else True
+    trim.stamp = _shrink_state(cache)
+    if result is not None:
+        cache._kvcached_shrink_trim = None
+    return result
 
 
 def install_parallel_hicache_retention(scheduler: Any) -> None:

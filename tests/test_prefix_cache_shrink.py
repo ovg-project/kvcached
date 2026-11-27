@@ -836,6 +836,7 @@ def test_sglang_tensor_parallel_hicache_evicts_agreed_victims(
 
     hicache = _hicache("write_through")
     trims: List[tuple] = []
+    _install_victim_protocol(sglang_scheduler, monkeypatch)
     monkeypatch.setattr(hicache_retention, "parallel_trim_cache", lambda scheduler: hicache)
 
     def evict_agreed(cache, tokens):
@@ -860,7 +861,100 @@ def test_sglang_tensor_parallel_hicache_evicts_agreed_victims(
 
 
 def _hicache(write_policy: str) -> SimpleNamespace:
-    return SimpleNamespace(cache_controller=SimpleNamespace(write_policy=write_policy))
+    # A plain leaf set is what the victim protocol converts and tracks.
+    return SimpleNamespace(cache_controller=SimpleNamespace(write_policy=write_policy),
+                           evictable_leaves=set())
+
+
+def _install_victim_protocol(scheduler_cls, monkeypatch) -> None:
+    """Mark the scheduler as wrapped by DistributedHiCacheRetentionPatch."""
+    from kvcached.integration.sglang import hicache_retention
+
+    marker = f"__kvcached_patched_{hicache_retention.DistributedHiCacheRetentionPatch.patch_name}__"
+    monkeypatch.setattr(scheduler_cls.__init__, marker, True, raising=False)
+
+
+@pytest.mark.parametrize("missing", ["patch", "leaf_set"])
+def test_sglang_tensor_parallel_hicache_without_victim_protocol_keeps_cap(
+        sglang_scheduler, tp_lockstep, monkeypatch, missing):
+    """A write-through HiCache shrinks only where the #641 protocol is
+    installed (HICACHE_RANGE) and can track its leaves; otherwise an agreed
+    count would evict nothing and the shrink would stay pending."""
+    from kvcached.integration.sglang import hicache_retention
+
+    hicache = _hicache("write_through")
+    if missing == "patch":
+        pass  # e.g. SGLang 0.5.15: the HiCache exists but the patch does not apply
+    else:
+        _install_victim_protocol(sglang_scheduler, monkeypatch)
+        hicache.evictable_leaves = frozenset()
+    monkeypatch.setattr(hicache_retention, "parallel_trim_cache", lambda scheduler: hicache)
+    monkeypatch.setattr(sglang_scheduler, "enable_hierarchical_cache", True, raising=False)
+    scheduler = sglang_scheduler(tp_size=2)
+    manager = scheduler.tree_cache.manager
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+
+    _idle_round(scheduler)
+
+    assert manager._runtime_control.test_state["can_shrink"] is False
+    assert tp_lockstep.reduces == []
+    assert len(scheduler.tree_cache.cached) == 32
+
+
+def test_sglang_tensor_parallel_continues_a_hicache_trim_every_pass(
+        sglang_scheduler, tp_lockstep, monkeypatch):
+    """A HiCache trim polls once per idle pass, keeping the plan between
+    passes, instead of draining it in one hook."""
+    from kvcached.integration.sglang import hicache_retention
+
+    hicache = _hicache("write_through")
+    calls: List[int] = []
+    _install_victim_protocol(sglang_scheduler, monkeypatch)
+    monkeypatch.setattr(hicache_retention, "parallel_trim_cache", lambda scheduler: hicache)
+
+    def evict_agreed(cache, tokens):
+        calls.append(tokens)
+        cache._kvcached_shrink_trim = None if len(calls) == 3 else object()
+        return True if len(calls) == 3 else None
+
+    monkeypatch.setattr(hicache_retention, "evict_parallel_hicache", evict_agreed)
+    monkeypatch.setattr(sglang_scheduler, "enable_hierarchical_cache", True, raising=False)
+    scheduler = sglang_scheduler(tp_size=2)
+    manager = scheduler.tree_cache.manager
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+
+    _idle_round(scheduler)
+    assert calls == [(9 - LIMIT_PAGES) * BLOCKS_PER_PAGE]
+    scheduler.on_idle()
+    scheduler.on_idle()
+    # Continued on the next two passes without another count vote.
+    assert calls[1:] == [0, 0]
+    assert len(tp_lockstep.reduces) == 1
+    scheduler.on_idle()
+    assert len(calls) == 3
+
+
+def test_lockstep_evicts_once_per_component():
+    """DSV4's C128 KV, C4 KV and C4 index managers share one prefix tree, so
+    an agreed count is evicted once, then each manager reclaims its pages."""
+    from kvcached.integration.sglang import patches
+
+    evicted: List[int] = []
+    reclaimed: List[int] = []
+
+    def reclaimer(index, tokens):
+        manager = SimpleNamespace(in_shrink=True,
+                                  reclaim_for_shrink=lambda: reclaimed.append(index))
+        return SimpleNamespace(swa=False, manager=manager, shrink_tokens=lambda: tokens,
+                               evict_tokens=evicted.append)
+
+    reclaimers = [reclaimer(0, 16), reclaimer(1, 0), reclaimer(2, 0)]
+    scheduler = SimpleNamespace(_kvcached_lockstep_idle_passes=patches._LOCKSTEP_SHRINK_INTERVAL - 1)
+    with mock.patch.object(patches, "reduce_counts", lambda counts, groups, op: counts):
+        patches._shrink_in_lockstep(scheduler, reclaimers, ["group"])
+
+    assert evicted == [16]
+    assert reclaimed == [0, 1, 2]
 
 
 def test_sglang_tensor_parallel_hicache_write_back_keeps_cap(
@@ -869,6 +963,7 @@ def test_sglang_tensor_parallel_hicache_write_back_keeps_cap(
     HiCache keeps the native cap instead of a shrink that never finishes."""
     from kvcached.integration.sglang import hicache_retention
 
+    _install_victim_protocol(sglang_scheduler, monkeypatch)
     monkeypatch.setattr(hicache_retention, "parallel_trim_cache",
                         lambda scheduler: _hicache("write_back"))
     monkeypatch.setattr(sglang_scheduler, "enable_hierarchical_cache", True, raising=False)
@@ -891,6 +986,7 @@ def test_sglang_tensor_parallel_swa_pool_shrinks_only_without_hicache(
 
     trims: List[tuple] = []
     if hicache:
+        _install_victim_protocol(sglang_scheduler, monkeypatch)
         monkeypatch.setattr(hicache_retention, "parallel_trim_cache",
                             lambda scheduler: _hicache("write_through"))
         monkeypatch.setattr(hicache_retention, "evict_parallel_hicache",

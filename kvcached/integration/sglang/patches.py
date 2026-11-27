@@ -4668,9 +4668,9 @@ def _register_shrink_reclaimers(scheduler: Any) -> List[_PrefixCacheShrinkReclai
         scheduler._kvcached_shrink_lockstep_groups = lockstep
         scheduler._kvcached_shrink_hicache = None
         if lockstep:
-            from kvcached.integration.sglang.hicache_retention import parallel_trim_cache
+            from kvcached.integration.sglang.hicache_retention import shrink_trim_cache
 
-            scheduler._kvcached_shrink_hicache = parallel_trim_cache(scheduler)
+            scheduler._kvcached_shrink_hicache = shrink_trim_cache(scheduler)
         if _sglang_parallel_size(scheduler) == 1 or lockstep:
             request_state = (_sglang_request_state(scheduler)
                              if not lockstep else None)
@@ -4721,14 +4721,11 @@ def _sglang_lockstep_shrink_groups(scheduler: Any) -> List[Any]:
         if hicache or mode != "null" or int(getattr(ps, "attn_dp_size", 1) or 1) > 1 or pp_cpu_group() is None:
             return []
     elif hicache:
-        from kvcached.integration.sglang.hicache_retention import (
-            _write_through,
-            parallel_trim_cache,
-        )
+        from kvcached.integration.sglang.hicache_retention import shrink_trim_cache
 
-        # Victim agreement trims only a write-through cache (_excess).
-        trim = parallel_trim_cache(scheduler)
-        if trim is None or not _write_through(trim):
+        # Victim agreement trims only a write-through cache (_excess), and
+        # only where its protocol is installed.
+        if shrink_trim_cache(scheduler) is None:
             return []
     return stage_cpu_groups()
 
@@ -4746,27 +4743,44 @@ def _shrink_in_lockstep(scheduler: Any, reclaimers: Sequence[_PrefixCacheShrinkR
     different iterations and must not evict alone. They do reach the idle
     hook on the same iteration, since they run the same batches. Every
     _LOCKSTEP_SHRINK_INTERVAL passes, one MAX all-reduce agrees on how many
-    tokens the full and the SWA pool evict, and every rank evicts that many
-    with native eviction. The trees are replicated, so the ranks drop the
-    same prefixes even though each frees its own pages. A rank whose own
-    limit is not lower yet simply keeps those pages mapped.
+    tokens the full and the SWA pool evict, and every rank evicts that many,
+    once per component. Without HiCache this is native eviction: the trees
+    are replicated, so the ranks drop the same prefixes even though each
+    frees its own pages. With HiCache, whether a prefix can go depends on
+    the rank's own host backups, so the ranks agree on the victims
+    themselves (#641) in bounded steps, one per idle pass, until the trim
+    reaches a verdict. A rank whose own limit is not lower yet simply keeps
+    those pages mapped.
     """
     passes = getattr(scheduler, "_kvcached_lockstep_idle_passes", 0) + 1
     scheduler._kvcached_lockstep_idle_passes = passes
-    if passes % _LOCKSTEP_SHRINK_INTERVAL:
+    from kvcached.integration.sglang import hicache_retention
+
+    hicache = getattr(scheduler, "_kvcached_shrink_hicache", None)
+    if hicache is not None and hicache_retention.parallel_hicache_trim_pending(hicache):
+        # A HiCache trim does bounded work per pass. The ranks started it on
+        # the same pass and its verdicts are group votes, so they continue
+        # and finish it together.
+        hicache_retention.evict_parallel_hicache(hicache, 0)
+    elif passes % _LOCKSTEP_SHRINK_INTERVAL:
         return
-    # Counts go by component, not by position: pipeline stages hold
-    # different layers and need not have the same pools. Every rank reduces,
-    # even one without a reclaimer, so the collective always matches.
-    counts = [0, 0]
+    else:
+        # Counts go by component, not by position: pipeline stages hold
+        # different layers and need not have the same pools. Every rank
+        # reduces, even one without a reclaimer, so the collective always
+        # matches.
+        counts = [0, 0]
+        for reclaimer in reclaimers:
+            slot = int(reclaimer.swa)
+            counts[slot] = max(counts[slot], reclaimer.shrink_tokens())
+        agreed = reduce_counts(counts, groups, "MAX")
+        # The managers of a component (e.g. DSV4's C128 KV, C4 KV and C4
+        # index) share one prefix tree, so evict once per component.
+        for slot, tokens in enumerate(agreed):
+            owner = next((r for r in reclaimers if int(r.swa) == slot), None)
+            if tokens > 0 and owner is not None:
+                owner.evict_tokens(tokens)
     for reclaimer in reclaimers:
-        slot = int(reclaimer.swa)
-        counts[slot] = max(counts[slot], reclaimer.shrink_tokens())
-    agreed = reduce_counts(counts, groups, "MAX")
-    for reclaimer in reclaimers:
-        tokens = agreed[int(reclaimer.swa)]
-        if tokens > 0:
-            reclaimer.evict_tokens(tokens)
         if reclaimer.manager.in_shrink:
             # No reclaimer is registered, so this only releases the pages
             # the eviction emptied and completes the shrink.

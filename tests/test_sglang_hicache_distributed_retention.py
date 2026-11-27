@@ -50,7 +50,7 @@ def _priority_cache(parent_locked):
     priorities = {cold: 0, parent: 1, hot: 2, active: -1}
     order = []
     cache = SimpleNamespace(
-        root_node=root, evictable_leaves={cold, hot}, evictable_size_=3 - int(parent_locked),
+        root_node=root, evictable_leaves={cold, hot}, evictable_size_=3 - int(parent_locked), protected_size_=0,
         eviction_strategy=SimpleNamespace(get_priority=priorities.__getitem__),
         cache_controller=SimpleNamespace(write_policy="write_through"), pp_size=1,
         update_eviction_metrics=lambda *_: None)
@@ -98,8 +98,36 @@ def test_limit_shrink_evicts_a_token_count_through_the_victim_plan():
     assert order == []
 
     retention._track_device_leaves(cache)
-    assert retention.evict_parallel_hicache(cache, 2)
+    result = retention.evict_parallel_hicache(cache, 2)
+    while result is None:
+        result = retention.evict_parallel_hicache(cache, 0)
+    assert result
     assert order == [11, 10]
+    assert not retention.parallel_hicache_trim_pending(cache)
+
+
+def test_limit_shrink_polls_once_per_call(monkeypatch):
+    """Each call does one bounded poll and keeps the plan for the next idle
+    pass; the target is fixed when the trim starts."""
+    cache, order, _ = _priority_cache(False)
+    retention._track_device_leaves(cache)
+    limits = []
+    group_demand = retention._group_demand
+
+    def count_demand(cache, limit, changed):
+        limits.append(limit)
+        return group_demand(cache, limit, changed)
+
+    monkeypatch.setattr(retention, "_group_demand", count_demand)
+    target = cache.evictable_size_ - 2
+    calls = 0
+    result = None
+    while result is None:
+        result = retention.evict_parallel_hicache(cache, 2 if calls == 0 else 5)
+        calls += 1
+        assert len(limits) == calls
+    assert result and order == [11, 10]
+    assert set(limits) == {target}
 
 
 def test_unbacked_parent_above_cap_retries_after_host_child_leaves():
