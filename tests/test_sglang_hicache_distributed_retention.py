@@ -8,6 +8,7 @@ from array import array
 from dataclasses import dataclass
 from datetime import timedelta
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from weakref import WeakKeyDictionary, ref
 
 import pytest
@@ -145,8 +146,8 @@ def test_lockstep_trim_stops_once_no_rank_needs_space(monkeypatch, still_needed)
     assert order == []
 
     monkeypatch.setattr(patches, "reduce_counts", lambda counts, groups, op: counts)
-    reclaimer = SimpleNamespace(swa=False, shrink_tokens=lambda: still_needed,
-                                manager=SimpleNamespace(in_shrink=False))
+    reclaimer: Any = SimpleNamespace(swa=False, shrink_tokens=lambda: still_needed,
+                                     manager=SimpleNamespace(in_shrink=False))
     scheduler = SimpleNamespace(_kvcached_shrink_hicache=cache)
     # Stay between two lockstep rounds, so every pass only continues the trim.
     for _ in range(patches._LOCKSTEP_SHRINK_INTERVAL - 1):
