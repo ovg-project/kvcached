@@ -52,6 +52,11 @@ if TYPE_CHECKING:
 logger = get_kvcached_logger()
 
 
+def _uses_qsa(config: Any) -> bool:
+    text = getattr(getattr(config, "model_config", None), "hf_text_config", None)
+    return bool(getattr(text, "indexer_compress_ratio", None))
+
+
 def _worker_physical_release_barrier(worker: Any) -> bool:
     """Finish earlier worker RPCs and their CUDA work before retiring pages."""
     import torch
@@ -535,7 +540,7 @@ def _get_max_cached_blocks(block_size: int, num_kv_cache_groups: int = 1) -> int
     Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
     Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
     Otherwise returns ``max(1, MAX_CACHED_TOKENS // block_size)`` times the
-    number of KV cache groups: every group holds its own blocks for the same
+    number of cacheable KV groups: each group holds its own blocks for the same
     cached tokens, and all of them count against one pool-wide cap.
 
     The floor matters: a *positive* ``MAX_CACHED_TOKENS`` smaller than
@@ -726,6 +731,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 max_cached_blocks: int = 1000,
                 hash_block_size: Optional[int] = None,
                 num_kv_cache_groups: int = 1,
+                mrv2_geometry=None,
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
@@ -742,6 +748,10 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         "Elastic KV cache events require vLLM 0.30.x")
 
                 self.num_gpu_blocks = num_gpu_blocks
+                self._qsa_whole_blocks = (
+                    mrv2_geometry.usable_blocks(num_gpu_blocks)
+                    if mrv2_geometry is not None and mrv2_geometry.has_qsa_ring else None
+                )
                 # Request.block_hashes are computed at hash_block_size, which
                 # can be smaller than a heterogeneous KV group's physical
                 # block_size. Keep this distinct from block_size, which is also
@@ -753,12 +763,16 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self.kv_event_queue = []  # type: ignore[var-annotated]
                 self.kv_block_pool = [KVCacheBlockClass(i) for i in range(num_gpu_blocks)]
 
-                from kvcached.integration.vllm.interfaces import get_kv_cache_manager
+                if mrv2_geometry is None:
+                    from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
-                self.kv_cache_manager = get_kv_cache_manager(
-                    num_gpu_blocks, block_size, cell_size, num_layers,
-                    num_kv_buffers=num_kv_buffers,
-                    pool_name="block_pool")
+                    self.kv_cache_manager = get_kv_cache_manager(
+                        num_gpu_blocks, block_size, cell_size, num_layers,
+                        num_kv_buffers=num_kv_buffers, pool_name="block_pool")
+                else:
+                    from kvcached.integration.vllm.model_runner_v2 import create_cache_manager
+
+                    self.kv_cache_manager = create_cache_manager(num_gpu_blocks, mrv2_geometry)
 
                 # Allocate a dedicated null block – a placeholder for skipped
                 # positions (e.g. sliding-window / chunked-local attention).
@@ -1247,7 +1261,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 manager.post_demand(manager.demand_pages(need))
 
             def get_usage(self) -> float:
-                return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
+                capacity = self.num_gpu_blocks if self._qsa_whole_blocks is None else self._qsa_whole_blocks - 1
+                return 1.0 - (self.get_num_free_blocks() / capacity)
 
             def take_events(
                 self,
@@ -1314,6 +1329,35 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         from kvcached.integration.vllm.offload_config import patch_offload_initialization
 
         patch_offload_initialization(EngineCore)
+
+        planner = getattr(engine_mod, "get_kv_cache_configs", None)
+        if planner is not None and VersionRange(VLLM_MRV2_RANGE).contains(detected_version or "0"):
+            @wraps(planner)
+            def plan_caches(vllm_config, *args, **kwargs):
+                configs = planner(vllm_config, *args, **kwargs)
+                if enable_kvcached() and _uses_qsa(vllm_config):
+                    from kvcached.integration.vllm.model_runner_v2 import validate_qsa_cache_plan
+
+                    validate_qsa_cache_plan(vllm_config, configs)
+                return configs
+
+            setattr(engine_mod, "get_kv_cache_configs", plan_caches)
+
+            report = getattr(engine_mod, "update_kv_cache_capacity", None)
+            if report is not None:
+                @wraps(report)
+                def report_capacity(vllm_config, kv_cache_config):
+                    if enable_kvcached() and _uses_qsa(vllm_config):
+                        from dataclasses import replace
+
+                        from kvcached.integration.vllm.model_runner_v2 import cache_geometry
+
+                        usable = cache_geometry(kv_cache_config).usable_blocks(kv_cache_config.num_blocks)
+                        kv_cache_config = replace(kv_cache_config, num_blocks=usable - 1)
+                    return report(vllm_config, kv_cache_config)
+
+                setattr(engine_mod, "update_kv_cache_capacity", report_capacity)
+
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
@@ -2067,6 +2111,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 logger.info("Prefix caching enabled for kvcached")
 
             kv_cache_config = getattr(self, "kv_cache_config")
+            groups = getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+            retention_groups = sum(getattr(group.kv_cache_spec, "prefix_cacheable", True)
+                                   for group in groups)
+            geometry = None
 
             if use_mrv2_geometry:
                 from kvcached.integration.vllm.model_runner_v2 import cache_geometry
@@ -2134,11 +2182,10 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 enable_caching=enable_caching,
                 enable_kv_cache_events=enable_kv_cache_events,
                 num_kv_buffers=num_kv_buffers,
-                max_cached_blocks=_get_max_cached_blocks(
-                    block_size, len(getattr(kv_cache_config, "kv_cache_groups", ()) or ())),
+                max_cached_blocks=_get_max_cached_blocks(block_size, retention_groups),
                 hash_block_size=hash_block_size,
-                num_kv_cache_groups=len(
-                    getattr(kv_cache_config, "kv_cache_groups", ()) or ()),
+                num_kv_cache_groups=retention_groups,
+                mrv2_geometry=geometry,
             )
             for manager in self.single_type_managers:
                 manager.block_pool = self.block_pool
@@ -3392,7 +3439,10 @@ class HybridBlockSizeAlignPatch(VersionAwarePatch, BasePatch):
         def align_hybrid_block_size(cls, vllm_config, *args: Any, **kwargs: Any):
             result = original(cls, vllm_config, *args, **kwargs)
             if enable_kvcached():
-                _align_block_size_to_kvcached_page(vllm_config.cache_config, logger)
+                # QSA packs more than main K/V and constrains the token block
+                # by its raw-key ring. Preserve the block chosen by vLLM.
+                if not _uses_qsa(vllm_config):
+                    _align_block_size_to_kvcached_page(vllm_config.cache_config, logger)
             return result
 
         self._mark_as_patched(align_hybrid_block_size)
@@ -3762,6 +3812,11 @@ class KVCacheManagerAllocateSlotsPatch(VersionAwarePatch, BasePatch):
         if self._is_already_patched(original_allocate_slots, "allocate_slots"):
             self.logger.debug("KVCacheManager.allocate_slots already patched")
             return True
+
+        if self.detected_version and VersionRange(VLLM_MRV2_RANGE).contains(self.detected_version):
+            from kvcached.integration.vllm.model_runner_v2 import patch_qsa_watermark
+
+            patch_qsa_watermark(KVCacheManager)
 
         logger = self.logger
 

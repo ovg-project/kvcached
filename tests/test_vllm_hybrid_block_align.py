@@ -123,15 +123,17 @@ def test_initial_page_holding_block_keeps_upstream_validation(
     assert (error is not None) == (page_mb == 4)
 
 
-def test_patch_wraps_the_platform_classmethod(vllm_patches, monkeypatch):
+@pytest.mark.parametrize("qsa", [False, True])
+def test_patch_wraps_the_platform_classmethod(vllm_patches, monkeypatch, qsa):
     calls = []
 
     class Platform:
         @classmethod
         def _align_hybrid_block_size(cls, vllm_config, backend_cls):
             calls.append(backend_cls)
-            vllm_config.cache_config.block_size = 784
-            vllm_config.cache_config.mamba_page_size_padded = 784 * 4096
+            tokens, cell = (1104, 2048) if qsa else (784, 4096)
+            vllm_config.cache_config.block_size = tokens
+            vllm_config.cache_config.mamba_page_size_padded = tokens * cell
 
     class CudaPlatform(Platform):
         pass
@@ -147,9 +149,12 @@ def test_patch_wraps_the_platform_classmethod(vllm_patches, monkeypatch):
     assert patch.apply(module)
     assert patch.apply(module)  # idempotent
     vllm_config = types.SimpleNamespace(cache_config=_cache_config())
+    if qsa:
+        vllm_config.model_config = types.SimpleNamespace(
+            hf_text_config=types.SimpleNamespace(indexer_compress_ratio=4))
     CudaPlatform._align_hybrid_block_size(vllm_config, "backend")
     assert calls == ["backend"]
-    assert vllm_config.cache_config.block_size == 1024
+    assert vllm_config.cache_config.block_size == (1104 if qsa else 1024)
 
 
 def test_disabled_kvcached_keeps_native_behavior(vllm_patches, monkeypatch):

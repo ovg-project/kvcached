@@ -8,6 +8,7 @@ import torch
 
 from kvcached import runtime_reservations
 from kvcached.kv_cache_manager import KVCacheManager
+from kvcached.kv_geometry import PAGE_GRANULARITY
 from kvcached.observability import (
     RuntimeReservationSnapshot,
     build_runtime_snapshot,
@@ -29,6 +30,7 @@ from kvcached.tp_ipc_util import (
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     PAGE_SIZE,
+    KVCachedConfigError,
     get_kvcached_logger,
     get_page_size_for_block,
     normalize_gpu_device,
@@ -967,6 +969,7 @@ def _resolve_manager_num_blocks(
     num_layers: int,
     num_kv_buffers: int,
     group_id: int,
+    page_size: Optional[int] = None,
 ) -> int:
     """Validate or derive the manager's block capacity for ``group_id``.
 
@@ -993,7 +996,7 @@ def _resolve_manager_num_blocks(
     if num_blocks is None:
         num_blocks = _created_capacity_num_blocks(record, block_mem_size, num_kv_buffers)
     _validate_manager_against_created_tensors(
-        record, num_blocks, block_mem_size, num_layers, num_kv_buffers, group_id
+        record, num_blocks, block_mem_size, num_layers, num_kv_buffers, group_id, page_size
     )
     return num_blocks
 
@@ -1015,12 +1018,29 @@ def get_kv_cache_manager(
     manager is created first, ``alloc_kv_cache`` runs the same validation
     before creating the tensors.
     """
+    return _create_cache_manager(num_blocks, block_size, cell_size, num_layers, num_kv_buffers,
+                                 group_id, pool_name, None)
+
+
+def _create_cache_manager(num_blocks, block_size, cell_size, num_layers, num_kv_buffers,
+                          group_id, pool_name, page_size) -> KVCacheManager:
     if not _kvcached_initialized:
         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
 
+    block_bytes = block_size * cell_size
+    if block_bytes <= 0:
+        raise ValueError("KV block size in bytes must be positive")
+    resolved_page_size = get_page_size_for_block(block_bytes, PAGE_SIZE) if page_size is None else page_size
+    if page_size is not None and (page_size <= 0 or page_size % PAGE_GRANULARITY):
+        raise KVCachedConfigError("Manager page size must be a positive multiple of 2 MiB")
     num_blocks = _resolve_manager_num_blocks(
-        num_blocks, block_size, cell_size, num_layers, num_kv_buffers, group_id
+        num_blocks, block_size, cell_size, num_layers, num_kv_buffers, group_id, resolved_page_size
     )
+    if page_size is not None and num_blocks * block_bytes < page_size:
+        minimum = (page_size + block_bytes - 1) // block_bytes
+        raise KVCachedConfigError(
+            f"KV pool has {num_blocks} blocks and needs at least {minimum} for one physical page"
+        )
 
     manager = KVCacheManager(
         num_blocks,
@@ -1035,7 +1055,7 @@ def get_kv_cache_manager(
         reserve_null_block=True,
         pool_name=pool_name,
         defer_physical_release=_async_sched,
-        page_size=get_page_size_for_block(block_size * cell_size, PAGE_SIZE),
+        page_size=resolved_page_size,
     )
     register_kv_cache_pool(
         manager,
