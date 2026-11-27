@@ -2478,11 +2478,11 @@ class KVCacheManager:
         # Clear reserved blocks
         self.free_reserved()
 
-        # A runtime zero cap forbids new physical grants. Keep the mandatory
-        # null page charged across clear(), rather than temporarily overriding
-        # the instance cap to rebuild it.
+        # Keep padding mapped across clear(), including before runtime control
+        # takes ownership. Releasing it would discard its contents and require
+        # a new physical grant that another instance could consume first.
         retained_null_page = None
-        if getattr(self, "_runtime_control", None) is not None and self.null_block == [0]:
+        if self.null_block == [0]:
             retained_null_page = self.avail_pages.get(0, self.full_pages.get(0))
         # State sentinels can be read or cleared by the engine at any time.
         # They each own one whole page and must stay mapped across clear().
