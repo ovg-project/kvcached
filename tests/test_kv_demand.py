@@ -1181,7 +1181,7 @@ def test_parked_dsv4_releases_only_unused_cuda_segments(monkeypatch):
     with monkeypatch.context() as pipeline:
         from kvcached.integration.sglang.scheduler.pipeline import PipelineProgress
 
-        pipeline.setattr(patches, "_sglang_pipeline_stages", lambda: 2)
+        pipeline.setattr(patches, "pipeline_stages", lambda: 2)
         pp_trim = mock.Mock()
         pipeline.setattr(torch.cuda, "empty_cache", pp_trim)
         clock[0] += 1.0

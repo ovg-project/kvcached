@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import time
+from array import array
 from collections import defaultdict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -41,11 +42,11 @@ def native(monkeypatch):
 
     ns = dict(__name__=__name__, BasePrefixCache=object, dataclasses=dataclasses,
               BASE_COMPONENT_TYPE="full", rank_consensus=rank_consensus,
-              defaultdict=defaultdict, heapq=heapq, time=time, torch=torch,
+              defaultdict=defaultdict, heapq=heapq, time=time, torch=torch, array=array,
               logger=logging.getLogger(__name__), StorageMedium=SimpleNamespace(CPU="cpu", GPU="gpu"))
     for filename, names in (
         ("base_prefix_cache.py", {"EvictParams", "EvictResult", "IncLockRefResult", "DecLockRefResult"}),
-        ("radix_cache.py", {"RadixCache", "TreeNode"}),
+        ("radix_cache.py", {"RadixCache", "RadixKey", "TreeNode"}),
         ("hiradix_cache.py", {"HiRadixCache"}),
         ("unified_radix_cache.py", {"UnifiedRadixCache"}),
     ):
@@ -70,6 +71,70 @@ def native(monkeypatch):
     monkeypatch.setattr(retention, "_policy", retention._PrefixCacheRetentionPolicy(-1))
     autopatch._patch_sglang(ModuleType("sglang"))
     return native
+
+
+@pytest.mark.parametrize("bigram,change_scope,splits_to_make", [
+    (False, False, 1), (True, False, 1), (False, True, 1), (True, True, 1), (False, False, 510),
+])
+def test_shared_ballot_revalidates_prefix_after_native_parent_split(native, bigram, change_scope, splits_to_make,
+                                                                    monkeypatch):
+    from kvcached.integration.sglang import hicache_retention as parallel
+
+    root, parent, leaf = (native.TreeNode() for _ in range(3))
+    parent.parent, leaf.parent = root, parent
+    end = splits_to_make + 2
+    parent.key = native.RadixKey(array("q", range(1, end + 1)), is_bigram=bigram)
+    leaf.key = native.RadixKey(array("q", [end, end + 1] if bigram else [end + 1]), is_bigram=bigram)
+    root.children[parent.key.child_key()] = parent
+    parent.children[leaf.key.child_key()] = leaf
+    # No store or event hashes have been generated for this prefix.
+    monkeypatch.setitem(native.HiRadixCache._split_node.__globals__, "split_node_hash_value",
+                        lambda value, *_: (None, None) if value is None else pytest.fail("unexpected hash"))
+    accepted = []
+    splits: list[object] = []
+    width = 32 * parallel._VICTIMS_PER_BATCH
+
+    def vote(data, op):
+        if data.numel() == 2 * width + 4:
+            data[0] = data[width] = 0  # The peer proposes a different first victim.
+        elif data.numel() == width + 4 and not splits:
+            for _ in range(splits_to_make):
+                splits.append(native.HiRadixCache._split_node(cache, parent.key, parent, 1))
+            if change_scope:
+                parent.key.cache_salt = "other"
+
+    cache = SimpleNamespace(
+        pp_size=1, tp_world_size=2, page_size=1, root_node=root, evictable_leaves={leaf},
+        eviction_strategy=SimpleNamespace(get_priority=lambda n: n.priority),
+        evictable_size_=1, protected_size_=0, cache_controller=SimpleNamespace(write_policy="write_through"),
+        _all_reduce=lambda *_: None,
+        _enforce_prefix_cache_retention=lambda *_: None, update_eviction_metrics=lambda *_: None)
+    monkeypatch.setattr(parallel, "_reduce_victims", vote)
+    def evict(node):
+        accepted.append(node)
+        cache.evictable_leaves.remove(node)
+        cache.evictable_size_ -= len(node.key)
+        return len(node.key)
+
+    cache._evict_regular = evict
+    cache.check_hicache_events = lambda: cache._all_reduce(torch.zeros(2), torch.distributed.ReduceOp.MIN)
+    scheduler = SimpleNamespace(tree_cache=cache, enable_hierarchical_cache=True, _engine_paused=False,
+                                process_input_requests=lambda _: None)
+    monkeypatch.setattr(retention, "_policy", retention._PrefixCacheRetentionPolicy(0))
+    parallel.install_parallel_hicache_retention(scheduler)
+    extend = Mock(wraps=parallel._extend_path)
+    monkeypatch.setattr(parallel, "_extend_path", extend)
+    cache.check_hicache_events()
+    assert len(splits) == splits_to_make and splits[-1] is parent.parent
+    if splits_to_make > parallel._INDEX_PER_POLL:
+        assert not accepted and extend.call_count <= parallel._INDEX_PER_POLL
+        for _ in range(10):
+            extend.reset_mock()
+            cache.check_hicache_events()
+            assert extend.call_count <= parallel._INDEX_PER_POLL
+            if accepted:
+                break
+    assert accepted == ([] if change_scope else [leaf])
 
 
 def test_write_through_ack_trims_unlocked_device_kv(native):

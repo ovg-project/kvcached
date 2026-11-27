@@ -323,6 +323,42 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             target_reservation + sum(breakdown.values())
         )
 
+        # Use the installed observer against the actual native DSV4 allocator.
+        # Only the physical headroom sample is fixed; logical IDs stay native.
+        from kvcached.integration.sglang.dsv4_pool_stats import DeepSeekV4PoolStatsPatch
+
+        observer_module = importlib.import_module(
+            "sglang.srt.managers.scheduler_components.pool_stats_observer")
+        observer_class = observer_module.SchedulerPoolStatsObserver
+        observer = observer_class(
+            tree_cache=types.SimpleNamespace(
+                full_evictable_size=lambda: 0, swa_evictable_size=lambda: 0),
+            token_to_kv_pool_allocator=shared,
+            req_to_token_pool=target.req_to_token_pool,
+            session_controller=None, hisparse_coordinator=None,
+            is_hybrid_swa=True, is_hybrid_ssm=False, enable_hisparse=False,
+            full_tokens_per_layer=shared.full_attn_allocator.size,
+            swa_tokens_per_layer=shared.swa_attn_allocator.size,
+            max_total_num_tokens=target.max_total_num_tokens,
+            get_last_batch=lambda: None, get_running_batch=lambda: None,
+        )
+        with monkeypatch.context() as pressure:
+            observer_patch = DeepSeekV4PoolStatsPatch()
+            method = observer_class._get_swa_token_info
+            # An installed .pth can apply this wrapper during SGLang import.
+            native_method = method.__wrapped__ if observer_patch._is_already_patched(method) else method
+            pressure.setattr(observer_class, "_get_swa_token_info", native_method)
+            pressure.setattr(manager, "available_size", lambda: 0)
+            physical_available = shared.swa_available_size()
+            native_stats = observer._get_swa_token_info()
+            assert native_stats.swa_num_used > 0
+            assert observer_patch.apply(observer_module)
+            stats = observer._get_swa_token_info()
+            assert stats.full_num_used == stats.swa_num_used == 0
+            assert stats.full_available_size == observer.full_tokens_per_layer
+            assert stats.swa_available_size == observer.swa_tokens_per_layer
+            assert shared.swa_available_size() == physical_available
+
         # Full IDs remain native; physical pressure must roll them back before
         # the composite publishes any full-to-SWA mapping.
         logical = shared.full_attn_allocator
@@ -605,6 +641,9 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
             assert req.kv.req_pool_idx is None and not owner.active
             req_pool.clear()
 
+        if compress_ratio == 4 and not fp4 and not with_state:
+            _check_native_swa_component_shrink(monkeypatch, target)
+
         draft_owner = weakref.ref(draft.token_to_kv_pool)
         del draft
         gc.collect()
@@ -619,3 +658,84 @@ def test_dsv4_real_runner_shared_draft_ownership(monkeypatch, enabled, compress_
         for state in [*state_pools, *request_state_pools]:
             assert state._kvcached_dsv4_backing.manager.shutdown()
         assert interfaces.shutdown_kvcached()
+
+
+def _check_native_swa_component_shrink(monkeypatch, runner):
+    """A real unified cache can release SWA while its FULL prefix stays locked."""
+    import torch
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        EvictParams,
+        InsertParams,
+        MatchPrefixParams,
+    )
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    from kvcached.integration.sglang import patches
+
+    allocator = runner.token_to_kv_pool_allocator
+    backing = allocator._kvcached_dsv4_backing
+    manager = backing.manager
+    page = allocator.page_size
+    # Span multiple physical pages, retaining just the final native page as
+    # the active SWA window. No model weights or kernels are involved.
+    num_pages = 3 * manager.page_size // backing.native_page_bytes + 2
+    num_tokens = num_pages * page
+    assert num_tokens <= allocator.swa_available_size()
+    monkeypatch.setenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
+    cache = UnifiedRadixCache(CacheInitParams(
+        disable=False, req_to_token_pool=runner.req_to_token_pool,
+        token_to_kv_pool_allocator=allocator, page_size=page,
+        sliding_window_size=page, tree_components=(ComponentType.FULL, ComponentType.SWA),
+    ))
+    prefix = torch.zeros(1, dtype=torch.int64, device="cuda")
+    seq = torch.full_like(prefix, num_tokens)
+    last = torch.full_like(prefix, -1)
+    values = allocator.alloc_extend(prefix, prefix.cpu(), seq, seq.cpu(), last, num_tokens)
+    assert values is not None
+    tokens = list(range(num_tokens))
+    cache.insert(InsertParams(key=RadixKey(tokens), value=values))
+    # Split off an internal old-window prefix before taking the active lock.
+    cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens[:-page])))
+    node = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
+    receipt = cache.inc_lock_ref(node)
+    assert cache.full_evictable_size() == 0
+    assert cache.swa_evictable_size() >= num_tokens - page
+    tail_slots = allocator.translate_loc_from_full_to_swa(values[-page:]).clone()
+    tail_pages = set((tail_slots // page).tolist())
+    assert tail_pages and tail_pages <= backing.live
+    tail_backing = {physical for native_page in tail_pages for physical in backing._span(native_page)}
+    full_available = allocator.full_available_size()
+    occupied = len(manager.full_pages) + len(manager.avail_pages)
+    assert occupied >= 3
+
+    class Scheduler:
+        def __init__(self):
+            self.tree_cache = cache
+            self.token_to_kv_pool_allocator = allocator
+            self.ps = types.SimpleNamespace(tp_size=1, pp_size=1)
+
+    scheduler = Scheduler()
+    patches._register_shrink_reclaimers(scheduler)
+    # Apply a per-pool resize as runtime control would after distributing
+    # an instance limit. Only the SWA physical pool is under pressure here.
+    original_bytes = manager.page_allocator.get_num_total_pages() * manager.page_size
+    target_bytes = (occupied - 1) * manager.page_size
+    try:
+        manager.resize(target_bytes)
+        patches._apply_kvcached_limits_on_idle(scheduler)
+        assert not manager.in_shrink
+        assert manager.page_allocator.get_num_total_pages() == occupied - 1
+        assert len(manager.full_pages) + len(manager.avail_pages) < occupied
+        assert cache.full_evictable_size() == 0
+        assert allocator.full_available_size() == full_available
+        assert torch.equal(allocator.translate_loc_from_full_to_swa(values[-page:]), tail_slots)
+        assert tail_pages <= backing.live
+        mapped = manager.full_pages.keys() | manager.avail_pages.keys()
+        assert (tail_backing | backing.permanent_pages) <= mapped
+    finally:
+        cache.dec_lock_ref(node, receipt.to_dec_params())
+        cache.evict(EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens))
+        manager.resize(original_bytes)

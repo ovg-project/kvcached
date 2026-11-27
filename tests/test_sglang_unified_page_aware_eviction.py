@@ -186,6 +186,111 @@ def test_parallel_rollback_retention_keeps_logical_prefixes(native, tmp_path):
     )
 
 
+def _check_retracted_host_match(scheduler):
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    from kvcached.integration.sglang import hicache_retention as retention
+
+    cache = scheduler.tree_cache
+    cache.tree_core.set_hicache_enabled()
+    retention.prefix_cache_retention._apply_prefix_cache_retention_update(
+        {"revision": (1,), "limit_tokens": 0})
+    scheduler.process_input_requests([])
+    cache.check_hicache_events()
+    for resumed in (False, True):
+        req = Req(str(resumed), "", array("q", [10, 99]), SamplingParams(max_new_tokens=3))
+        if resumed:
+            req.output_ids.append(101)
+            req.reset_for_retract()
+        assert retention.request_slot(req) is None
+        req.init_next_round_input(cache)
+        assert req.prefix_indices.numel() == 0 and req.host_hit_length == int(resumed)
+
+
+def _install_retention_scheduler(cache, patch):
+    from kvcached.integration.sglang import autopatch
+
+    class Scheduler:
+        def __init__(self):
+            self.tree_cache = cache
+            self.enable_hierarchical_cache = True
+            self._engine_paused = False
+
+        def process_input_requests(self, requests):
+            pass
+
+    module = types.ModuleType("scheduler")
+    setattr(module, "Scheduler", Scheduler)
+    cache._enforce_prefix_cache_retention = lambda _: None
+    cache.cache_controller = types.SimpleNamespace(write_policy="write_through", ack_write_queue=[], ack_load_queue=[])
+    # Exercise the installed registry, version filter and scheduler constructor.
+    # Other engine patches and model initialization are outside this cache fixture.
+    def apply_selected(manager, hook):
+        return hook.apply(module) if hook.patch_name == "distributed_hicache_retention" else True
+
+    patch.setenv("ENABLE_KVCACHED", "true")
+    patch.setenv("KVCACHED_AUTOPATCH", "true")
+    patch.setattr(autopatch.PatchManager, "_apply_single_patch", apply_selected)
+    autopatch._patch_sglang(types.ModuleType("sglang"))
+    return Scheduler()
+
+
+def _hicache_retention_rank(rank, rendezvous):
+    import torch.distributed as dist
+    from sglang.srt.mem_cache import base_prefix_cache, cache_init_params, unified_radix_cache
+    from test_sglang_hicache_distributed_retention import _use_groups
+
+    from kvcached.integration.sglang import hicache_retention as retention
+
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=45),
+    )
+    try:
+        _use_groups(dist.group.WORLD, None)
+        native = types.SimpleNamespace(unified=unified_radix_cache, base=base_prefix_cache, init=cache_init_params)
+        component = unified_radix_cache.BASE_COMPONENT_TYPE
+        for scenario in ("different_keys", "different_backup", "same"):
+            cache, manager = make_cache(native, range(2))
+            cache.attn_tp_group = dist.group.WORLD
+            nodes = []
+            for i in range(2):
+                tokens = [10 + i + (100 * rank if scenario == "different_keys" else 0)]
+                insert(native, cache, tokens, [i])
+                _, node_id = match(native, cache, tokens)
+                node = cache.tree_core.node_by_id(node_id)
+                if scenario != "different_backup" or i or rank == 0:
+                    cache.tree_core.commit_backup(node.id, torch.tensor([50 + i]), {})
+                nodes.append(node)
+            with pytest.MonkeyPatch.context() as patch:
+                policy = retention.prefix_cache_retention
+                patch.setattr(policy, "_policy", policy._PrefixCacheRetentionPolicy(1))
+                scheduler = _install_retention_scheduler(cache, patch)
+                for _ in range(4):
+                    scheduler.tree_cache.check_hicache_events()
+                assert manager.allocated == {"different_keys": {0, 1}, "different_backup": {0}, "same": {1}}[scenario]
+                assert [node.evicted for node in nodes] == [scenario == "same", scenario == "different_backup"]
+                first_backup = nodes[0].component(component).host_value
+                if scenario == "different_backup" and rank == 1:
+                    assert first_backup is None
+                else:
+                    assert first_backup.tolist() == [50]
+                assert nodes[1].component(component).host_value.tolist() == [51]
+                if scenario == "same":
+                    _check_retracted_host_match(scheduler)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_hicache_retention_preserves_unified_host_backups(native, tmp_path):
+    cache, _ = make_cache(native, [])
+    if not hasattr(getattr(cache, "tree_core", None), "commit_backup"):
+        pytest.skip("requires SGLang's split UnifiedRadixCache tree core")
+    torch.multiprocessing.spawn(
+        _hicache_retention_rank, args=((tmp_path / "gloo").as_uri(),), nprocs=2, join=True,
+    )
+
+
 @pytest.mark.parametrize("policy", ["lru", "lfu"])
 @pytest.mark.parametrize("session_field", [True, False], ids=["current", "pre_0_5_17"])
 def test_page_selection_retains_scattered_old_prefixes(native, policy, session_field):
