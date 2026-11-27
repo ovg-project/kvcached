@@ -130,6 +130,34 @@ def test_limit_shrink_polls_once_per_call(monkeypatch):
     assert set(limits) == {target}
 
 
+@pytest.mark.parametrize("still_needed", [0, 32])
+def test_lockstep_trim_stops_once_no_rank_needs_space(monkeypatch, still_needed):
+    """kvctl raises the limit after a 32-token trim indexed its first page.
+    The trim then keeps every prefix, unless some rank still needs space."""
+    from kvcached.integration.sglang import patches
+
+    cache, order, _ = _priority_cache(False)
+    cache.evictable_leaves = {Leaf(token, cache.root_node) for token in range(100, 1124)}
+    cache.evictable_size_ = len(cache.evictable_leaves)
+    cache.eviction_strategy.get_priority = lambda node: node.key[0]
+    retention._track_device_leaves(cache)
+    assert retention.evict_parallel_hicache(cache, 32) is None
+    assert order == []
+
+    monkeypatch.setattr(patches, "reduce_counts", lambda counts, groups, op: counts)
+    reclaimer = SimpleNamespace(swa=False, shrink_tokens=lambda: still_needed,
+                                manager=SimpleNamespace(in_shrink=False))
+    scheduler = SimpleNamespace(_kvcached_shrink_hicache=cache)
+    # Stay between two lockstep rounds, so every pass only continues the trim.
+    for _ in range(patches._LOCKSTEP_SHRINK_INTERVAL - 1):
+        if not retention.parallel_hicache_trim_pending(cache):
+            break
+        patches._shrink_in_lockstep(scheduler, [reclaimer], ["group"])
+
+    assert not retention.parallel_hicache_trim_pending(cache)
+    assert order == list(range(100, 100 + still_needed))
+
+
 def test_unbacked_parent_above_cap_retries_after_host_child_leaves():
     cache, order, (parent, cold, _, _) = _priority_cache(False)
     cache._evict_backuped(cold)

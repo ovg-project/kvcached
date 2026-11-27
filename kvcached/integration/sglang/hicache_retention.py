@@ -722,6 +722,11 @@ def parallel_hicache_trim_pending(cache: Any) -> bool:
     return getattr(cache, "_kvcached_shrink_trim", None) is not None
 
 
+def cancel_parallel_hicache_trim(cache: Any) -> None:
+    """Drop a pending trim; every rank must drop it on the same pass."""
+    cache._kvcached_shrink_trim = None
+
+
 def evict_parallel_hicache(cache: Any, tokens: int) -> Optional[bool]:
     """Advance a trim of ``tokens`` device tokens with victims every rank agrees on.
 

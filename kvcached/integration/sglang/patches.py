@@ -4735,6 +4735,21 @@ def _sglang_lockstep_shrink_groups(scheduler: Any) -> List[Any]:
 _LOCKSTEP_SHRINK_INTERVAL = 8
 
 
+def _agreed_shrink_tokens(reclaimers: Sequence[_PrefixCacheShrinkReclaimer],
+                          groups: Sequence[Any]) -> List[int]:
+    """The [full, SWA] tokens some rank of the group still needs evicted.
+
+    Counts go by component, not by position: pipeline stages hold different
+    layers and need not have the same pools. Every rank reduces, even one
+    without a reclaimer, so the collective always matches.
+    """
+    counts = [0, 0]
+    for reclaimer in reclaimers:
+        slot = int(reclaimer.swa)
+        counts[slot] = max(counts[slot], reclaimer.shrink_tokens())
+    return reduce_counts(counts, groups, "MAX")
+
+
 def _shrink_in_lockstep(scheduler: Any, reclaimers: Sequence[_PrefixCacheShrinkReclaimer],
                         groups: Sequence[Any]) -> None:
     """Evict prefix cache for a pending shrink on every TP and PP rank at once.
@@ -4749,8 +4764,9 @@ def _shrink_in_lockstep(scheduler: Any, reclaimers: Sequence[_PrefixCacheShrinkR
     frees its own pages. With HiCache, whether a prefix can go depends on
     the rank's own host backups, so the ranks agree on the victims
     themselves (#641) in bounded steps, one per idle pass, until the trim
-    reaches a verdict. A rank whose own limit is not lower yet simply keeps
-    those pages mapped.
+    reaches a verdict. Each of those passes reduces the counts again and
+    drops the trim once no rank needs space. A rank whose own limit is not
+    lower yet simply keeps those pages mapped.
     """
     passes = getattr(scheduler, "_kvcached_lockstep_idle_passes", 0) + 1
     scheduler._kvcached_lockstep_idle_passes = passes
@@ -4760,20 +4776,19 @@ def _shrink_in_lockstep(scheduler: Any, reclaimers: Sequence[_PrefixCacheShrinkR
     if hicache is not None and hicache_retention.parallel_hicache_trim_pending(hicache):
         # A HiCache trim does bounded work per pass. The ranks started it on
         # the same pass and its verdicts are group votes, so they continue
-        # and finish it together.
-        hicache_retention.evict_parallel_hicache(hicache, 0)
+        # and finish it together. kvctl may have raised the limit since the
+        # trim began, so it continues only while some rank still needs space.
+        # A partial raise keeps the old target, since a new one would restart
+        # the plan's index; the check on the next pass bounds the excess to
+        # one poll.
+        if _agreed_shrink_tokens(reclaimers, groups)[0] > 0:
+            hicache_retention.evict_parallel_hicache(hicache, 0)
+        else:
+            hicache_retention.cancel_parallel_hicache_trim(hicache)
     elif passes % _LOCKSTEP_SHRINK_INTERVAL:
         return
     else:
-        # Counts go by component, not by position: pipeline stages hold
-        # different layers and need not have the same pools. Every rank
-        # reduces, even one without a reclaimer, so the collective always
-        # matches.
-        counts = [0, 0]
-        for reclaimer in reclaimers:
-            slot = int(reclaimer.swa)
-            counts[slot] = max(counts[slot], reclaimer.shrink_tokens())
-        agreed = reduce_counts(counts, groups, "MAX")
+        agreed = _agreed_shrink_tokens(reclaimers, groups)
         # The managers of a component (e.g. DSV4's C128 KV, C4 KV and C4
         # index) share one prefix tree, so evict once per component.
         for slot, tokens in enumerate(agreed):

@@ -944,11 +944,44 @@ def test_sglang_tensor_parallel_continues_a_hicache_trim_every_pass(
     assert calls == [(9 - LIMIT_PAGES) * BLOCKS_PER_PAGE]
     scheduler.on_idle()
     scheduler.on_idle()
-    # Continued on the next two passes without another count vote.
+    # Continued on the next two passes, each after the group still needs space.
     assert calls[1:] == [0, 0]
-    assert len(tp_lockstep.reduces) == 1
+    assert len(tp_lockstep.reduces) == 3
     scheduler.on_idle()
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("peer_needs", [False, True])
+def test_sglang_tensor_parallel_hicache_trim_stops_once_no_rank_needs_space(
+        sglang_scheduler, tp_lockstep, monkeypatch, peer_needs):
+    """kvctl can raise the limit while a HiCache trim is pending. The trim
+    then stops on every rank, unless a peer still needs the space."""
+    from kvcached.integration.sglang import hicache_retention
+
+    hicache = _hicache("write_through")
+    calls: List[int] = []
+    monkeypatch.setattr(hicache_retention, "parallel_trim_cache", lambda scheduler: hicache)
+
+    def evict_agreed(cache, tokens):
+        calls.append(tokens)
+        cache._kvcached_shrink_trim = hicache_retention._ShrinkTrim(0)
+
+    monkeypatch.setattr(hicache_retention, "evict_parallel_hicache", evict_agreed)
+    monkeypatch.setattr(sglang_scheduler, "enable_hierarchical_cache", True, raising=False)
+    scheduler = sglang_scheduler(tp_size=2)
+    manager = scheduler.tree_cache.manager
+    manager.set_memory_limit(manager.page_size * LIMIT_PAGES)
+    _idle_round(scheduler)
+    assert len(calls) == 1
+
+    manager.set_memory_limit(manager.page_size * MAX_PAGES)
+    if peer_needs:
+        tp_lockstep.peer.extend([12, 0])
+    scheduler.on_idle()
+
+    assert not manager.in_shrink
+    assert calls[1:] == ([0] if peer_needs else [])
+    assert hicache_retention.parallel_hicache_trim_pending(hicache) is peer_needs
 
 
 def test_lockstep_evicts_once_per_component():
