@@ -5,12 +5,23 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 _registered_pools: Dict[int, Tuple[Any, Optional[str]]] = {}
 _registered_pools_lock = threading.RLock()
+
+
+def _reset_after_fork() -> None:
+    global _registered_pools, _registered_pools_lock
+    _registered_pools = {}
+    _registered_pools_lock = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def register_kv_cache_pool(
