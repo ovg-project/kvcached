@@ -62,6 +62,7 @@ class SleepManager:
         self.manual_sleep_models: Set[str] = set(
         )  # Models manually put to sleep
         self._model_locks: Dict[str, asyncio.Lock] = {}
+        self._sleep_transitions: Set[str] = set()
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         # Initialize default vLLM models config if not provided
@@ -114,46 +115,65 @@ class SleepManager:
             logger.info(f"Model {model_name} is already sleeping")
             return False
 
+        self._sleep_transitions.add(model_name)
         try:
-            # Use vLLM Python API to put model to sleep
-            if model_name in self.config.vllm_models_config:
-                model_config = self.config.vllm_models_config[model_name]
-                host = model_config.get("host", "localhost")
-                port = model_config.get("port", "8000")
-
-                success = await self._call_vllm_sleep_api(host, port, level=1)
-                if not success:
-                    logger.error(
-                        f"Failed to call vLLM sleep API for model {model_name}"
-                    )
+            # The candidate list is stale by now: auto-sleep must never abort
+            # traffic, manual sleep is the operator's call.
+            stats = (self.traffic_monitor.get_model_stats(model_name)
+                     if self.traffic_monitor is not None else None)
+            if stats is not None:
+                if manual:
+                    if stats.is_busy():
+                        logger.warning(
+                            f"Model {model_name} has {stats.inflight_requests} "
+                            f"in-flight request(s); manual sleep will abort them")
+                elif not stats.is_idle(self.config.idle_threshold_seconds):
+                    logger.info(f"Model {model_name} became busy or is no "
+                                f"longer idle; skipping auto-sleep")
                     return False
-            # Use SGLang Python API to release memory occupation
-            elif model_name in self.config.sglang_models_config:
-                model_config = self.config.sglang_models_config[model_name]
-                host = model_config.get("host", "localhost")
-                port = model_config.get("port", "8000")
 
-                success = await self._call_sglang_release_api(host, port)
-                if not success:
-                    logger.error(
-                        f"Failed to call SGLang release API for model {model_name}"
+            try:
+                # Use vLLM Python API to put model to sleep
+                if model_name in self.config.vllm_models_config:
+                    model_config = self.config.vllm_models_config[model_name]
+                    host = model_config.get("host", "localhost")
+                    port = model_config.get("port", "8000")
+
+                    success = await self._call_vllm_sleep_api(host, port, level=1)
+                    if not success:
+                        logger.error(
+                            f"Failed to call vLLM sleep API for model {model_name}"
+                        )
+                        return False
+                # Use SGLang Python API to release memory occupation
+                elif model_name in self.config.sglang_models_config:
+                    model_config = self.config.sglang_models_config[model_name]
+                    host = model_config.get("host", "localhost")
+                    port = model_config.get("port", "8000")
+
+                    success = await self._call_sglang_release_api(host, port)
+                    if not success:
+                        logger.error(
+                            f"Failed to call SGLang release API for model {model_name}"
+                        )
+                        return False
+                else:
+                    logger.warning(
+                        f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
                     )
-                    return False
-            else:
-                logger.warning(
-                    f"No vLLM or SGLang configuration found for model {model_name}, using fallback behavior"
-                )
 
-            self.sleeping_models[model_name] = time.time()
-            if manual:
-                self.manual_sleep_models.add(model_name)
+                self.sleeping_models[model_name] = time.time()
+                if manual:
+                    self.manual_sleep_models.add(model_name)
 
-            logger.info(f"Put model {model_name} to sleep (manual: {manual})")
-            return True
+                logger.info(f"Put model {model_name} to sleep (manual: {manual})")
+                return True
 
-        except Exception as e:
-            logger.error(f"Failed to put model {model_name} to sleep: {e}")
-            return False
+            except Exception as e:
+                logger.error(f"Failed to put model {model_name} to sleep: {e}")
+                return False
+        finally:
+            self._sleep_transitions.discard(model_name)
 
     async def wakeup_model(self, model_name: str) -> bool:
         """
@@ -240,6 +260,11 @@ class SleepManager:
         """Check if a model is currently sleeping"""
         return model_name in self.sleeping_models
 
+    def is_model_sleeping_or_transitioning(self, model_name: str) -> bool:
+        """Whether a request must go through the wake path for this model."""
+        return (model_name in self.sleeping_models
+                or model_name in self._sleep_transitions)
+
     def get_sleeping_models(self) -> Dict[str, Dict]:
         """Get information about all sleeping models"""
         current_time = time.time()
@@ -261,10 +286,20 @@ class SleepManager:
             return []
         idle_models = self.traffic_monitor.get_idle_models(
             self.config.idle_threshold_seconds)
-        # Filter out already sleeping models
-        return [
-            model for model in idle_models if model not in self.sleeping_models
-        ]
+        candidates = []
+        for model in idle_models:
+            if model in self.sleeping_models or model in self._sleep_transitions:
+                continue
+            stats = self.traffic_monitor.get_model_stats(model)
+            # A sleep call kills running requests; unknown state fails closed.
+            if stats is None or stats.is_busy():
+                logger.debug(
+                    f"Model {model} is not a sleep candidate "
+                    f"(in-flight: "
+                    f"{'unknown' if stats is None else stats.inflight_requests})")
+                continue
+            candidates.append(model)
+        return candidates
 
     async def _monitor_idle_models(self):
         """Background task to automatically put idle models to sleep"""
@@ -307,14 +342,10 @@ class SleepManager:
         if not self.config.wakeup_on_request:
             return False
 
-        if model_name not in self.sleeping_models:
-            return True  # Already awake
-
         logger.info(
             f"Incoming request for sleeping model {model_name}, attempting to wake up"
         )
         success = await self.wakeup_model(model_name)
-        # Another request may have woken the model while we waited for its lock.
         return success or model_name not in self.sleeping_models
 
     def update_config(self, **kwargs):

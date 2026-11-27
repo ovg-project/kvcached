@@ -11,6 +11,7 @@ std::atomic<int> create_count{0}, unmap_count{0}, map_count{0};
 std::atomic<int> fail_create{0}, fail_unmap{0}, fail_map_start{0};
 std::atomic<int> injected{0};
 std::atomic<int> release_count{0}, fail_release{0};
+std::atomic<int> access_count{0}, fail_access{0};
 void *driver_symbol(const char *name) {
   // PyTorch may load libcuda locally, outside LD_PRELOAD's RTLD_NEXT scope.
   static void *driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -28,6 +29,7 @@ extern "C" void kvcached_fault_arm(int create_at, int unmap_at, int map_start) {
   fail_unmap = unmap_at;
   fail_map_start = map_start;
   release_count = fail_release = 0;
+  access_count = fail_access = 0;
 }
 
 extern "C" void kvcached_fault_release(int release_at) {
@@ -36,6 +38,7 @@ extern "C" void kvcached_fault_release(int release_at) {
 }
 
 extern "C" int kvcached_fault_hits() { return injected.load(); }
+extern "C" int kvcached_fault_release_calls() { return release_count.load(); }
 extern "C" int kvcached_create_count() { return create_count.load(); }
 extern "C" int kvcached_release_count() { return release_count.load(); }
 
@@ -85,4 +88,21 @@ extern "C" CUresult CUDAAPI cuMemMap(CUdeviceptr ptr, size_t size,
   auto original =
       reinterpret_cast<decltype(&cuMemMap)>(driver_symbol("cuMemMap"));
   return original(ptr, size, offset, handle, flags);
+}
+
+extern "C" void kvcached_fault_access(int access_at) {
+  access_count = 0;
+  fail_access = access_at;
+}
+
+extern "C" CUresult CUDAAPI cuMemSetAccess(CUdeviceptr ptr, size_t size,
+                                           const CUmemAccessDesc *desc,
+                                           size_t count) {
+  if (fail_at(access_count, fail_access)) {
+    ++injected;
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  auto original = reinterpret_cast<decltype(&cuMemSetAccess)>(
+      driver_symbol("cuMemSetAccess"));
+  return original(ptr, size, desc, count);
 }

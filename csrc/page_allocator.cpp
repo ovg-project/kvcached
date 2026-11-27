@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "allocator.hpp"
+#include "exact_blocks.hpp"
 #include "gpu_utils.hpp"
 #include "math_utils.hpp"
 #include "mem_info_tracker.hpp"
@@ -45,10 +46,12 @@ InternalPage::InternalPage(page_id_t id, int64_t size)
     : page_id(id), page_size(size), start_block(0), end_block(0),
       num_kv_blocks(0) {}
 
-void InternalPage::init(int64_t block_mem_size) {
+void InternalPage::init(int64_t block_mem_size, int64_t max_block_id) {
   auto range = get_block_range(page_id, page_size, block_mem_size);
-  start_block = range.first;
-  end_block = range.second;
+  start_block =
+      max_block_id < 0 ? range.first : std::min(range.first, max_block_id);
+  end_block =
+      max_block_id < 0 ? range.second : std::min(range.second, max_block_id);
   num_kv_blocks = end_block - start_block;
   free_list.clear();
   for (int64_t i = start_block; i < end_block; ++i) {
@@ -68,6 +71,10 @@ std::vector<int64_t> InternalPage::alloc(int64_t num_blocks) {
   }
   free_list.erase(free_list.begin(), free_list.begin() + num_blocks);
   return block_ids;
+}
+
+bool InternalPage::alloc_exact(const std::vector<int64_t> &block_ids) {
+  return claim_exact_blocks(free_list, block_ids);
 }
 
 void InternalPage::free(int64_t block_id) { free_list.push_back(block_id); }
@@ -159,34 +166,51 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
 
 PageAllocator::~PageAllocator() {
   try {
-    if (enable_page_prealloc_ && prealloc_thread_) {
-      stop_prealloc_thread_internal();
-    }
+    stop_prealloc_thread_internal();
   } catch (...) {
     // Silently ignore exceptions during cleanup
   }
 }
 
 std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+  return alloc_page_impl(-1);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::try_alloc_page_at(page_id_t page_id) {
+  if (page_id < 0) {
+    throw std::invalid_argument("Exact page ID must be nonnegative");
+  }
+  return alloc_page_impl(page_id);
+}
+
+std::shared_ptr<InternalPage>
+PageAllocator::alloc_page_impl(page_id_t requested_id) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::unique_lock<std::mutex> lock(lock_);
   page_id_t page_id = -1;
+  bool trimmed_for_exact = false;
 
   while (page_id == -1) {
     if (transaction_failed_.load(std::memory_order_acquire)) {
       throw StateConsistencyError(transaction_error_);
     }
     // Fast path: allocate from reserved pages
-    if (!reserved_page_list_.empty()) {
-      page_id = reserved_page_list_.front();
-      reserved_page_list_.pop_front();
+    auto reserved = requested_id < 0
+                        ? reserved_page_list_.begin()
+                        : std::find(reserved_page_list_.begin(),
+                                    reserved_page_list_.end(), requested_id);
+    if (reserved != reserved_page_list_.end()) {
+      page_id = *reserved;
+      reserved_page_list_.erase(reserved);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
 
-      // Trigger preallocation to refill reserved pool if getting low
-      if (reserved_page_list_.size() <
-          static_cast<size_t>(min_reserved_pages_)) {
+      // An exact claim may be followed by a sibling pool's exact claim.
+      // Refilling arbitrary IDs here could take the headroom it needs.
+      if (requested_id < 0 && reserved_page_list_.size() <
+                                  static_cast<size_t>(min_reserved_pages_)) {
         prealloc_needed_ = true;
         cond_.notify_all();
       }
@@ -203,13 +227,49 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
     }
 
     // Slow path: allocate from free pages
-    if (!free_page_list_.empty()) {
-      page_id = free_page_list_.front();
-      free_page_list_.pop_front();
+    auto free = requested_id < 0
+                    ? free_page_list_.begin()
+                    : std::find(free_page_list_.begin(), free_page_list_.end(),
+                                requested_id);
+    auto reclaimed = reclaimed_page_list_.end();
+    if (requested_id >= 0 && free == free_page_list_.end()) {
+      reclaimed = std::find(reclaimed_page_list_.begin(),
+                            reclaimed_page_list_.end(), requested_id);
+    }
+    if (requested_id >= 0 && (free != free_page_list_.end() ||
+                              reclaimed != reclaimed_page_list_.end())) {
+      // A shrink limits the number of pages, not their virtual placement.
+      // Preallocated backing at another ID may need to be unmapped first.
+      if (free_page_list_.empty() || get_avail_physical_pages() <= 0) {
+        if (!trimmed_for_exact && !reserved_page_list_.empty()) {
+          trimmed_for_exact = true;
+          lock.unlock();
+          trim();
+          lock.lock();
+          continue;
+        }
+        return nullptr;
+      }
+      if (reclaimed != reclaimed_page_list_.end()) {
+        // Exchange one unused slot without growing the active page budget.
+        // The displaced ID remains available to a later resize or exact claim.
+        free = free_page_list_.begin();
+        std::swap(*free, *reclaimed);
+      }
+    }
+    if (free != free_page_list_.end()) {
+      page_id = *free;
+      free_page_list_.erase(free);
       num_free_pages_.fetch_sub(1, std::memory_order_relaxed);
       break;
     }
 
+    if (requested_id >= 0) {
+      // Another allocation, preallocation, or release may own this ID.
+      // Never substitute another page or wait while an integration holds a
+      // sibling pool's allocation. The caller can roll back and retry.
+      return nullptr;
+    }
     if (num_free_pages_.load(std::memory_order_relaxed) <= 0) {
       throw std::runtime_error("No free pages left");
     }
@@ -245,7 +305,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
                              ": " + e.what());
   }
 
-  if (enable_page_prealloc_) {
+  if (requested_id < 0 && enable_page_prealloc_) {
     trigger_preallocation();
   }
 
@@ -288,10 +348,16 @@ void PageAllocator::free_page(page_id_t page_id) {
 }
 
 void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+  (void)free_pages_with_receipt(page_ids);
+}
+
+int64_t
+PageAllocator::free_pages_with_receipt(const std::vector<page_id_t> &page_ids) {
   throw_if_failed();
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<page_id_t> pages_to_unmap;
+  int64_t retained = 0;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
@@ -307,12 +373,13 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       reserved_page_list_.insert(reserved_page_list_.end(), page_ids.begin(),
                                  reserve_end);
 
+      retained = std::distance(page_ids.begin(), reserve_end);
       pages_to_unmap.assign(reserve_end, page_ids.end());
 
       if (pages_to_unmap.empty()) {
         update_memory_usage_unlocked();
         cond_.notify_all();
-        return;
+        return retained;
       }
     } else {
       pages_to_unmap = page_ids;
@@ -335,6 +402,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
       end_time - start_time);
   LOGGER(DEBUG, "free %ld pages cost %lu us", page_ids.size(),
          duration.count());
+  return retained;
 }
 
 bool PageAllocator::resize(int64_t new_mem_size) {
@@ -444,19 +512,37 @@ bool PageAllocator::resize(int64_t new_mem_size) {
   return true;
 }
 
-void PageAllocator::trim() {
+int64_t PageAllocator::trim(int64_t max_pages) {
+  return trim_impl(max_pages, nullptr);
+}
+
+int64_t PageAllocator::trim_selected(const std::vector<page_id_t> &eligible) {
+  return trim_impl(-1, &eligible);
+}
+
+int64_t PageAllocator::trim_impl(int64_t max_pages,
+                                 const std::vector<page_id_t> *eligible) {
   throw_if_failed();
   std::vector<page_id_t> pages_to_unmap;
 
   {
     std::lock_guard<std::mutex> lock(lock_);
-    pages_to_unmap.assign(reserved_page_list_.begin(),
-                          reserved_page_list_.end());
-    reserved_page_list_.clear();
+    if (eligible) {
+      pages_to_unmap = extract_reserved_pages(reserved_page_list_, *eligible);
+    } else {
+      const auto count = max_pages < 0
+                             ? reserved_page_list_.size()
+                             : std::min(reserved_page_list_.size(),
+                                        static_cast<size_t>(max_pages));
+      pages_to_unmap.assign(reserved_page_list_.end() - count,
+                            reserved_page_list_.end());
+      reserved_page_list_.erase(reserved_page_list_.end() - count,
+                                reserved_page_list_.end());
+    }
 
     if (pages_to_unmap.empty()) {
       update_memory_usage_unlocked();
-      return;
+      return 0;
     }
   }
 
@@ -468,12 +554,49 @@ void PageAllocator::trim() {
     free_page_list_.insert(free_page_list_.end(), pages_to_unmap.begin(),
                            pages_to_unmap.end());
     update_memory_usage_unlocked();
+    // Wake allocations waiting for these IDs without requesting a refill.
+    cond_.notify_all();
   }
+  return static_cast<int64_t>(pages_to_unmap.size());
 }
 
 int64_t PageAllocator::get_num_free_pages() const {
   throw_if_failed();
   return num_free_pages_.load(std::memory_order_relaxed);
+}
+
+int64_t
+PageAllocator::get_allocatable_block_capacity(int64_t block_mem_size,
+                                              int64_t new_page_limit,
+                                              int64_t max_block_id) const {
+  if (block_mem_size <= 0) {
+    throw std::invalid_argument("block_mem_size must be positive");
+  }
+  throw_if_failed();
+  std::lock_guard<std::mutex> lock(lock_);
+  if (transaction_failed_.load(std::memory_order_acquire)) {
+    throw StateConsistencyError(transaction_error_);
+  }
+  int64_t capacity = 0;
+  auto add_page = [&](page_id_t page_id) {
+    const auto range =
+        InternalPage::get_block_range(page_id, page_size_, block_mem_size);
+    const int64_t start =
+        max_block_id < 0 ? range.first : std::min(range.first, max_block_id);
+    const int64_t end =
+        max_block_id < 0 ? range.second : std::min(range.second, max_block_id);
+    capacity += end - start;
+  };
+  for (page_id_t page_id : reserved_page_list_) {
+    add_page(page_id);
+  }
+  const auto count =
+      std::min(free_page_list_.size(),
+               static_cast<size_t>(std::max<int64_t>(0, new_page_limit)));
+  for (size_t i = 0; i < count; ++i) {
+    add_page(free_page_list_[i]);
+  }
+  return capacity;
 }
 
 int64_t PageAllocator::get_num_inuse_pages() const {
@@ -541,16 +664,53 @@ PageState PageAllocator::get_page_state_unlocked() const {
                    static_cast<int64_t>(reserved_page_list_.size())};
 }
 
-int64_t PageAllocator::get_avail_physical_pages() const {
+int64_t PageAllocator::get_avail_physical_bytes() const {
+  const int previous_device = gpu_vmm::current_device();
+  const int pool_device = FTensorAllocator::device_index();
+  const bool change_device = pool_device >= 0 && previous_device != pool_device;
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(pool_device));
+  }
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  const auto status =
+      device_mem_info(pool_device >= 0 ? pool_device : previous_device,
+                      &avail_phy_mem_size, &total_phy_mem_size);
+  // Restore the caller's device even when the query reports an error, then
+  // preserve the existing fatal runtime-error contract.
+  if (change_device) {
+    CHECK_GPU(gpu_vmm::set_device(previous_device));
+  }
+  CHECK_GPU(status);
 
   const size_t headroom =
       static_cast<size_t>(total_phy_mem_size * (1.0 - gpu_utilization_));
-  const size_t usable_phy_mem_size =
-      saturating_subtract(avail_phy_mem_size, headroom);
+  int64_t usable_phy_mem_size = signed_headroom(avail_phy_mem_size, headroom);
+  // The local scheduler must honor the same GPU/instance limits as grants.
+  // Worker-IPC allocators own their ledgers in the workers, not this process.
+  // This remains an estimate; the actual map still performs atomic admission.
+  if (world_size_ == 1 && !should_use_worker_ipc()) {
+    auto allocator = FTensorAllocator::find_allocator(group_id_);
+    if (allocator != nullptr && allocator->kv_tensors_created())
+      usable_phy_mem_size =
+          std::min(usable_phy_mem_size, allocator->available_physical_bytes());
+  }
 
-  // Calculate available pages considering layers and KV buffers
+  return usable_phy_mem_size;
+}
+
+std::optional<ExactRecoveryQuote>
+PageAllocator::exact_recovery_quote(const std::vector<page_id_t> &pages) const {
+  std::lock_guard<std::mutex> guard(lock_);
+  if (transaction_failed_.load(std::memory_order_acquire))
+    throw StateConsistencyError(transaction_error_);
+  const auto bundle = page_size_ * num_layers_ * num_kv_buffers_;
+  return quote_exact_pages(pages, free_page_list_, reclaimed_page_list_,
+                           reserved_page_list_, bundle);
+}
+
+int64_t PageAllocator::get_avail_physical_pages() const {
+  const auto usable_phy_mem_size =
+      std::max<int64_t>(0, get_avail_physical_bytes());
   int64_t avail_phy_pages = usable_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
@@ -562,13 +722,8 @@ page_id_t PageAllocator::get_page_id(int64_t block_id,
   return block_id * block_mem_size / page_size_;
 }
 
-int64_t
-PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
-  if (!mem_info_tracker_) {
-    return -1;
-  }
-  return mem_info_tracker_->check_and_get_resize_target(
-      current_mem_size, num_layers_, num_kv_buffers_);
+int64_t PageAllocator::check_and_get_resize_target(int64_t) const {
+  return -1; // Raw total_size writers are no longer a control authority.
 }
 
 std::unordered_map<page_id_t, std::vector<int64_t>>
@@ -639,16 +794,10 @@ void PageAllocator::set_use_worker_ipc(bool use_worker_ipc) {
 }
 
 void PageAllocator::start_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    start_prealloc_thread_internal();
-  }
+  start_prealloc_thread_internal();
 }
 
-void PageAllocator::stop_prealloc_thread() {
-  if (enable_page_prealloc_) {
-    stop_prealloc_thread_internal();
-  }
-}
+void PageAllocator::stop_prealloc_thread() { stop_prealloc_thread_internal(); }
 
 void PageAllocator::prealloc_worker() {
   auto start_time = std::chrono::steady_clock::now();
@@ -868,7 +1017,7 @@ void PageAllocator::trigger_preallocation() {
 
 void PageAllocator::start_prealloc_thread_internal() {
   std::lock_guard<std::mutex> ctl(thread_ctl_lock_);
-  if (!prealloc_thread_) {
+  if (enable_page_prealloc_ && !prealloc_thread_) {
     prealloc_running_ = true;
     prealloc_thread_ =
         std::make_unique<std::thread>(&PageAllocator::prealloc_worker, this);
@@ -877,12 +1026,7 @@ void PageAllocator::start_prealloc_thread_internal() {
     trigger_preallocation();
   }
 
-  // Start resize watcher thread alongside prealloc thread
-  if (!resize_watcher_thread_) {
-    resize_watcher_running_ = true;
-    resize_watcher_thread_ =
-        std::make_unique<std::thread>(&PageAllocator::resize_watcher, this);
-  }
+  // Runtime controls are consumed by the engine independently of preallocation.
 }
 
 namespace {
@@ -932,27 +1076,7 @@ bool PageAllocator::should_use_worker_ipc() const {
   return use_worker_ipc_.load(std::memory_order_acquire);
 }
 
-void PageAllocator::resize_watcher() {
-  LOGGER(INFO, "Resize watcher thread started (poll interval: 100ms)");
-  while (resize_watcher_running_) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!resize_watcher_running_) {
-      break;
-    }
-    if (mem_info_tracker_) {
-      int64_t target = mem_info_tracker_->check_and_get_resize_target(
-          last_observed_mem_size_, num_layers_, num_kv_buffers_);
-      if (target >= 0) {
-        // Observe quota changes, including a return to the startup value.
-        // Retain the latest request between polls so allocations can apply
-        // it later, including when an in-use page initially prevents shrink.
-        last_observed_mem_size_ = target;
-        resize_target_.store(target, std::memory_order_relaxed);
-      }
-    }
-  }
-  LOGGER(INFO, "Resize watcher thread stopped");
-}
+void PageAllocator::resize_watcher() {}
 
 int64_t PageAllocator::get_resize_target() const {
   return resize_target_.load(std::memory_order_relaxed);

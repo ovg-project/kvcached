@@ -87,6 +87,62 @@ def test_queue_api_reset_flushes_only_when_empty(monkeypatch, legacy, pending):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+def test_reset_publishes_cache_events_only_after_engine_becomes_idle(
+    monkeypatch, legacy, pending, busy,
+):
+    events_mod = types.ModuleType("vllm.distributed.kv_events")
+    setattr(events_mod, "KVEventBatch", SimpleNamespace)
+    monkeypatch.setitem(sys.modules, events_mod.__name__, events_mod)
+    manager = FakeManager()
+    batch_queue: Any = Queue() if legacy else deque()
+    if pending:
+        (batch_queue.put_nowait if legacy else batch_queue.appendleft)(object())
+    EngineCore = _patch_engine(monkeypatch, mock.Mock(), lambda self: True)
+    engine = _engine(EngineCore, manager, batch_queue)
+    engine.scheduler.has_requests = lambda: busy
+    engine.scheduler.kv_cache_manager.block_pool.enable_kv_cache_events = True
+    event = object()
+    take_events = mock.Mock(return_value=[event])
+    engine.scheduler.kv_cache_manager.take_events = take_events
+    publish = mock.Mock()
+    engine.scheduler.kv_event_publisher = SimpleNamespace(publish=publish)
+
+    assert engine.reset_prefix_cache() is True
+
+    if busy or pending:
+        take_events.assert_not_called()
+        publish.assert_not_called()
+    else:
+        take_events.assert_called_once_with()
+        assert publish.call_count == 1
+        assert publish.call_args.args[0].events == [event]
+
+
+@pytest.mark.parametrize("events", [[], [object()]])
+def test_idle_event_publisher_preserves_empty_queue_and_propagates_errors(monkeypatch, events):
+    events_mod = types.ModuleType("vllm.distributed.kv_events")
+    setattr(events_mod, "KVEventBatch", SimpleNamespace)
+    monkeypatch.setitem(sys.modules, events_mod.__name__, events_mod)
+    manager = FakeManager()
+    EngineCore = _patch_engine(monkeypatch, mock.Mock(), lambda self: True)
+    engine = _engine(EngineCore, manager, None)
+    engine.scheduler.has_requests = lambda: False
+    engine.scheduler.kv_cache_manager.block_pool.enable_kv_cache_events = True
+    engine.scheduler.kv_cache_manager.take_events = mock.Mock(return_value=events)
+    publish = mock.Mock(side_effect=ValueError("publisher failed"))
+    engine.scheduler.kv_event_publisher = SimpleNamespace(publish=publish)
+
+    if events:
+        with pytest.raises(ValueError, match="publisher failed"):
+            engine.reset_prefix_cache()
+    else:
+        assert engine.reset_prefix_cache() is True
+        publish.assert_not_called()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
 def test_queue_api_submission_drains_after_step_returns(monkeypatch, legacy):
     manager = FakeManager()
     queue: Any = Queue() if legacy else deque()

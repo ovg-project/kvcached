@@ -44,6 +44,8 @@ _vllm_pkg.interfaces = sys.modules["kvcached.integration.vllm.interfaces"]
 
 import pytest  # noqa: E402
 
+import kvcached.prefix_cache_retention as retention  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Mock classes
 # ---------------------------------------------------------------------------
@@ -798,6 +800,40 @@ class TestEdgeCases:
         pool.get_new_blocks(50)
         # 50+1(null) allocated, 0 evictable -> 49 free from kvcached
         assert pool.get_usage() == pytest.approx(0.51)
+
+
+class TestRuntimeRetentionLimit:
+    def test_lower_limit_trims_already_evictable_blocks(
+            self, pool_factory, monkeypatch):
+
+        monkeypatch.setattr(
+            retention, "_policy", retention._PrefixCacheRetentionPolicy(-1))
+        pool, _ = pool_factory(20, True)
+        blocks = _simulate_request(pool, ["h0", "h1", "h2", "h3"])
+        _finish_request(pool, blocks)
+        assert len(pool._evictable_blocks) == 4
+
+        retention._policy.set_limit(32)
+
+        assert pool.max_cached_blocks == 2
+        assert len(pool._evictable_blocks) == 2
+
+    def test_active_blocks_wait_until_they_become_evictable(
+            self, pool_factory, monkeypatch):
+
+        monkeypatch.setattr(
+            retention, "_policy", retention._PrefixCacheRetentionPolicy(-1))
+        pool, manager = pool_factory(20, True)
+        initial_free = manager.available_size()
+        blocks = _simulate_request(pool, ["h0", "h1"])
+
+        retention._policy.set_limit(0)
+        assert manager.available_size() == initial_free - 2
+
+        _finish_request(pool, blocks)
+
+        assert len(pool._evictable_blocks) == 0
+        assert manager.available_size() == initial_free
 
 
 class DrainedPoolManager(MockKVCacheManager):

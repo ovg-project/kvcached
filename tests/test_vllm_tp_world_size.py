@@ -372,7 +372,8 @@ def test_engine_core_rejects_partial_integration_before_initialization(
 
 def test_coordinator_scales_cache_cap_by_kv_cache_groups(monkeypatch, vllm_modules):
     interfaces, patches = vllm_modules
-    monkeypatch.setattr("kvcached.utils.MAX_CACHED_TOKENS", 160)
+    monkeypatch.setattr(
+        "kvcached.prefix_cache_retention._policy.limit_tokens", 160)
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
     monkeypatch.setattr(patches, "_validate_kv_cache_groups", lambda cfg: None)
     monkeypatch.setattr(
@@ -476,14 +477,48 @@ def test_engine_core_rejects_kv_offloading_before_initialization(
         original_init.assert_called_once()
 
 
+@pytest.mark.parametrize("version", ["0.29.0", "0.30.0"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_engine_core_starts_with_kv_offloading_on_model_runner_v2(
+    monkeypatch, vllm_modules, version, tp_size
+):
+    # From 0.29 OffloadingConnector allocates through kvcached, and its copies
+    # are pinned once the engine is up (offload_pins.py).
+    interfaces, patches = vllm_modules
+    monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
+    monkeypatch.setattr(patches, "_should_enable_async_sched", lambda cfg: False)
+    initialize = mock.Mock()
+    monkeypatch.setattr(interfaces, "init_kvcached", initialize)
+    original_init = mock.Mock(return_value=None)
+
+    class EngineCore:
+        __init__ = original_init
+
+    patch = patches.EngineCorePatch()
+    patch.detected_version = version
+    assert patch.patch_engine_init(types.SimpleNamespace(EngineCore=EngineCore))
+    EngineCore(types.SimpleNamespace(
+        use_v2_model_runner=True,
+        parallel_config=types.SimpleNamespace(
+            tensor_parallel_size=tp_size, pipeline_parallel_size=1,
+            distributed_executor_backend="mp" if tp_size > 1 else "uni",
+        ),
+        kv_transfer_config=types.SimpleNamespace(kv_connector="OffloadingConnector"),
+    ))
+    initialize.assert_called_once()
+    assert initialize.call_args.kwargs["world_size"] == tp_size
+    original_init.assert_called_once()
+
+
 @pytest.mark.parametrize("coordinator_flag,pool_flag,expected", [
     (True, False, True),   # <= 0.29: the coordinator owns the flag
     (False, True, False),
     (None, True, True),    # 0.30: only the native pool has it
     (None, False, False),
 ])
+@pytest.mark.parametrize("events", [False, True])
 def test_coordinator_reads_caching_flag(
-    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected
+    monkeypatch, vllm_modules, coordinator_flag, pool_flag, expected, events
 ):
     interfaces, patches = vllm_modules
     monkeypatch.setattr(patches, "enable_kvcached", lambda: True)
@@ -509,10 +544,12 @@ def test_coordinator_reads_caching_flag(
                 self.enable_caching = coordinator_flag
             self.kv_cache_config = types.SimpleNamespace(num_blocks=8)
             self.single_type_managers = [types.SimpleNamespace()]
-            self.block_pool = types.SimpleNamespace(hash_block_size=16, enable_caching=pool_flag)
+            self.block_pool = types.SimpleNamespace(
+                hash_block_size=16, enable_caching=pool_flag, enable_kv_cache_events=events)
 
     kvcoord_mod = types.ModuleType("mock_kvcoord_mod")
     setattr(kvcoord_mod, "KVCacheCoordinator", FakeKVCacheCoordinator)
     assert patches.KVCacheCoordinatorPatch().patch_coordinator(kvcoord_mod)
     coordinator = kvcoord_mod.KVCacheCoordinator()
     assert coordinator.block_pool.kwargs["enable_caching"] is expected
+    assert coordinator.block_pool.kwargs.get("enable_kv_cache_events", False) is events

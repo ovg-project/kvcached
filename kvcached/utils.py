@@ -65,6 +65,24 @@ def _ipc_segment_exists(name: str) -> bool:
         return False
 
 
+# Inode of Linux's initial PID namespace, PID_NS_INIT_INO in <linux/nsfs.h>.
+_HOST_PID_NAMESPACE = 0xEFFFFFFC
+
+
+def _pid_namespace_tag() -> str:
+    """Return "pidns<inode>_" inside a container's PID namespace, else "".
+
+    Every container starts its init process as PID 1 in a new session, so
+    PGIDs repeat across containers. Engines in two containers that share the
+    per-GPU ledger would otherwise derive one name and join one instance.
+    """
+    try:
+        inode = os.stat("/proc/self/ns/pid").st_ino
+    except OSError:
+        return ""
+    return "" if inode == _HOST_PID_NAMESPACE else f"pidns{inode}_"
+
+
 def _obtain_default_ipc_name() -> str:
     """Return a default IPC name like kvcached_<Engine>_<PGID>.
 
@@ -72,7 +90,8 @@ def _obtain_default_ipc_name() -> str:
     1) KVCACHED_IPC_NAME: explicit full name
     2) Otherwise, derive from engine tag and process group id (PGID).
     Using PGID ensures all processes within the same instance share a
-    single segment, while separate launches get distinct names.
+    single segment, while separate launches get distinct names. Inside a
+    container the PID namespace is added: kvcached_<Engine>_pidns<ino>_<PGID>.
     """
 
     explicit = os.getenv("KVCACHED_IPC_NAME")
@@ -94,7 +113,7 @@ def _obtain_default_ipc_name() -> str:
 
     # No explicit override: start from conventional base and ensure uniqueness
     base = "kvcached"
-    name = f"{base}_{engine_tag}_{group_id}"
+    name = f"{base}_{engine_tag}_{_pid_namespace_tag()}{group_id}"
     if not _ipc_segment_exists(name):
         return name
     for i in range(1, 100):

@@ -4,11 +4,11 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 from aiohttp import web
-from router import LLMRouter
+from router import LLMRouter, RouteError
 from sleep_manager import SleepConfig, SleepManager
 from traffic_monitor import TrafficMonitor
 from utils import extract_models_mapping, set_ulimit
@@ -73,11 +73,124 @@ def _extract_sleep_config(raw_cfg: Dict[str, Any]) -> SleepConfig:
     return config
 
 
+def _json_error(status: int, error_type: str, message: str) -> web.Response:
+    """Build an OpenAI-shaped error response."""
+    return web.Response(text=json.dumps({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status,
+        }
+    }),
+                        status=status,
+                        content_type='application/json')
+
+
+async def _close_upstream_stream(result: Any,
+                                *,
+                                success: bool,
+                                error_message: Optional[str] = None) -> None:
+    """Release an upstream stream and record the request's end exactly once.
+
+    Objects without ``aclose`` (plain ``ClientResponse``, test doubles) are
+    only released.
+    """
+    aclose = getattr(result, "aclose", None)
+    if aclose is not None:
+        await aclose(success=success, error_message=error_message)
+    else:
+        await result.release()
+
+
+def _find_event_end(buf: bytes, start: int = 0) -> tuple[int, int]:
+    """Return (blank_line_end, resume) for the first blank line in buf."""
+    i = start
+    n = len(buf)
+    last_start = -1
+    last_end = -1
+    while i < n:
+        if buf[i] == 0x0A:
+            end = i + 1
+        elif buf[i] == 0x0D:
+            end = i + (2 if i + 1 < n and buf[i + 1] == 0x0A else 1)
+        else:
+            i += 1
+            continue
+        j = end
+        if j < n and buf[j] in (0x0A, 0x0D):
+            if buf[j] == 0x0D and j + 1 < n and buf[j + 1] == 0x0A:
+                return j + 2, 0
+            return j + 1, 0
+        last_start = i
+        last_end = end
+        i = end
+    return -1, (last_start if last_end == n else n)
+
+
+def _event_was_aborted(event: bytes) -> bool:
+    """True if the event data has ``choices[].finish_reason == abort``."""
+    data = b""
+    for line in event.splitlines():
+        if line.startswith(b":"):
+            continue
+        field, _, value = line.partition(b":")
+        if field != b"data":
+            continue
+        if value.startswith(b" "):
+            value = value[1:]
+        data += value + b"\n"
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    if not data:
+        return False
+    try:
+        payload = json.loads(data)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(isinstance(c, dict) and c.get("finish_reason") == "abort"
+               for c in choices)
+
+
+def _consume_events(buffer: bytearray, scan: int) -> tuple[bool, int]:
+    """Consume complete events, returning (any_aborted, next_scan)."""
+    aborted = False
+    while True:
+        end, scan = _find_event_end(buffer, scan)
+        if end == -1:
+            return aborted, scan
+        if _event_was_aborted(bytes(buffer[:end])):
+            aborted = True
+        del buffer[:end]
+        scan = 0
+
+
+def _events_aborted(buffer: bytearray) -> bool:
+    return _consume_events(buffer, 0)[0]
+
+
+def _abort_downstream_stream(request: web.Request) -> None:
+    """Terminate a response whose headers are already on the wire.
+
+    The body is truncated on purpose: the upstream stream failed, so finishing
+    the chunked body would make clients treat a partial answer as complete.
+    """
+    transport = request.transport
+    if transport is not None:
+        transport.close()
+
+
 class MultiLLMFrontend:
 
     def __init__(self, port: int, model_config_json: Dict[str, Any],
                  sleep_config: SleepConfig):
-        self.traffic_monitor = TrafficMonitor()
+        # Share the sleep policy's threshold with the traffic monitor.
+        self.traffic_monitor = TrafficMonitor(
+            idle_threshold_seconds=sleep_config.idle_threshold_seconds)
         self.sleep_manager = SleepManager(config=sleep_config,
                                           traffic_monitor=self.traffic_monitor)
         self.router = LLMRouter(models_config=model_config_json,
@@ -119,74 +232,31 @@ class MultiLLMFrontend:
         self.app.router.add_post('/action/wakeup/{model_name}',
                                  self.handle_model_wakeup)
 
-    async def handle_completion(self, request: web.Request) -> web.Response:
+    async def handle_completion(self, request: web.Request) -> web.StreamResponse:
         """Handle completion requests"""
-        try:
-            request_data = await request.json()
-            model_name = request_data.get('model')
+        return await self._proxy_completion_request(request, "/v1/completions",
+                                                    "completion")
 
-            if not model_name:
-                return web.Response(text=json.dumps(
-                    {"error": "model parameter is required"}),
-                                    status=400,
-                                    content_type='application/json')
-
-            # Route the request
-            result = await self.router.route_request(model_name, request_data,
-                                                     "/v1/completions")
-
-            if result is None:
-                return web.Response(text=json.dumps({
-                    "error":
-                    f"Failed to route request for model {model_name}"
-                }),
-                                    status=500,
-                                    content_type='application/json')
-
-            # Check if this is a streaming response
-            if hasattr(result, 'content') and hasattr(result, 'headers'):
-                # This is a streaming response (aiohttp.ClientResponse)
-                response = web.StreamResponse(status=result.status,
-                                              headers={
-                                                  'Content-Type':
-                                                  result.headers.get(
-                                                      'Content-Type',
-                                                      'text/event-stream'),
-                                                  'Cache-Control':
-                                                  'no-cache',
-                                                  'Connection':
-                                                  'keep-alive'
-                                              })
-                await response.prepare(request)
-
-                try:
-                    async for chunk in result.content.iter_chunked(1024):
-                        await response.write(chunk)
-
-                    # Explicitly close the stream to make sure the
-                    # connection/FIFO is released promptly.
-                    await response.write_eof()
-
-                    return response
-                finally:
-                    await result.release()
-            else:
-                # This is a regular JSON response
-                return web.Response(text=json.dumps(result),
-                                    status=200,
-                                    content_type='application/json')
-
-        except Exception as e:
-            logger.error(f"Error handling completion request: {str(e)}")
-            return web.Response(text=json.dumps({"error": str(e)}),
-                                status=500,
-                                content_type='application/json')
-
-    async def handle_chat_completion(self,
-                                     request: web.Request) -> web.Response:
+    async def handle_chat_completion(
+        self, request: web.Request) -> web.StreamResponse:
         """Handle chat completion requests"""
+        return await self._proxy_completion_request(request,
+                                                    "/v1/chat/completions",
+                                                    "chat completion")
+
+    async def _proxy_completion_request(self, request: web.Request,
+                                        upstream_path: str,
+                                        label: str) -> web.StreamResponse:
+        """Forward a completion request to the engine picked by the router."""
         try:
-            request_data = await request.json()
+            try:
+                request_data = await request.json()
+            except json.JSONDecodeError as e:
+                # Only the client body is the caller's fault: a decode failure of the upstream
+                # response must stay a server/gateway error.
+                logger.warning(f"Invalid JSON body for {label} request: {e}")
+                return _json_error(400, "BadRequestError",
+                                   f"Invalid JSON body: {e}")
             model_name = request_data.get('model')
 
             if not model_name:
@@ -197,53 +267,115 @@ class MultiLLMFrontend:
 
             # Route the request
             result = await self.router.route_request(model_name, request_data,
-                                                     "/v1/chat/completions")
+                                                     upstream_path)
 
             if result is None:
-                return web.Response(text=json.dumps({
-                    "error":
-                    f"Failed to route request for model {model_name}"
-                }),
-                                    status=500,
-                                    content_type='application/json')
+                return _json_error(
+                    502, "BadGatewayError",
+                    f"The router returned no response for model {model_name}")
 
             # Check if this is a streaming response
             if hasattr(result, 'content') and hasattr(result, 'headers'):
                 # This is a streaming response (aiohttp.ClientResponse)
-                response = web.StreamResponse(status=result.status,
-                                              headers={
-                                                  'Content-Type':
-                                                  result.headers.get(
-                                                      'Content-Type',
-                                                      'text/event-stream'),
-                                                  'Cache-Control':
-                                                  'no-cache',
-                                                  'Connection':
-                                                  'keep-alive'
-                                              })
-                await response.prepare(request)
-
                 try:
-                    async for chunk in result.content.iter_chunked(1024):
-                        await response.write(chunk)
+                    return await self._relay_stream_response(
+                        request, result, label)
+                except BaseException:
+                    # The relay never cleaned up; closing twice is a no-op.
+                    await _close_upstream_stream(
+                        result,
+                        success=False,
+                        error_message="Stream relay did not complete")
+                    raise
 
-                    # Ensure the downstream connection is properly closed.
-                    await response.write_eof()
-
-                    return response
-                finally:
-                    await result.release()
-            else:
-                # This is a regular JSON response
-                return web.Response(text=json.dumps(result),
-                                    status=200,
-                                    content_type='application/json')
-
-        except Exception as e:
-            logger.error(f"Error handling chat completion request: {e}")
-            return web.Response(text=json.dumps({"error": str(e)}),
-                                status=500,
+            # This is a regular JSON response
+            return web.Response(text=json.dumps(result),
+                                status=200,
                                 content_type='application/json')
+
+        except RouteError as e:
+            logger.error(f"{label} request failed: {e}")
+            return web.Response(text=json.dumps(e.payload()),
+                                status=e.status,
+                                content_type=e.content_type)
+        except Exception as e:
+            logger.error(f"Error handling {label} request: {str(e)}")
+            return _json_error(500, "InternalServerError", str(e))
+
+    async def _relay_stream_response(self, request: web.Request, result: Any,
+                                     label: str) -> web.StreamResponse:
+        """Relay an upstream streaming response to the downstream client.
+
+        The response is committed as soon as ``prepare()`` writes the status
+        line and headers: from that point on a second HTTP response can no
+        longer be sent. Returning a fresh ``web.Response`` from the error path
+        would append a new status line and headers to the unfinished chunked
+        body, which clients cannot parse (#610). A failure after that point
+        therefore aborts the connection so the client observes a truncated
+        stream; a failure before ``prepare()`` still propagates to the caller
+        and becomes a regular JSON error response.
+        """
+        response = web.StreamResponse(status=result.status,
+                                      headers={
+                                          'Content-Type':
+                                          result.headers.get(
+                                              'Content-Type',
+                                              'text/event-stream'),
+                                          'Cache-Control': 'no-cache',
+                                          'Connection': 'keep-alive'
+                                      })
+        try:
+            await response.prepare(request)
+        except Exception as e:
+            await _close_upstream_stream(
+                result,
+                success=False,
+                error_message=f"Downstream stream not committed: {e}")
+            raise
+
+        stream_error: Optional[BaseException] = None
+        upstream_aborted = False
+        pending = bytearray()
+        scan = 0
+        try:
+            async for chunk in result.content.iter_chunked(1024):
+                pending.extend(chunk)
+                aborted, scan = _consume_events(pending, scan)
+                if aborted:
+                    upstream_aborted = True
+                await response.write(chunk)
+
+            if _event_was_aborted(bytes(pending)):
+                upstream_aborted = True
+
+            # Explicitly close the stream to release the connection/FIFO
+            # promptly.
+            await response.write_eof()
+        except asyncio.CancelledError as e:
+            # A cancelled relay is not a finished request; let it propagate.
+            stream_error = e
+            _abort_downstream_stream(request)
+            raise
+        except Exception as e:
+            stream_error = e
+            logger.error(f"Upstream {label} stream failed after the response "
+                         f"was committed: {e}")
+            _abort_downstream_stream(request)
+        finally:
+            # The relay is the request: only now is the model done serving it.
+            if stream_error is not None:
+                error_message = str(stream_error) or type(stream_error).__name__
+            elif upstream_aborted:
+                error_message = ("Upstream aborted the generation "
+                                 "(finish_reason=abort)")
+            else:
+                error_message = None
+            await _close_upstream_stream(
+                result,
+                success=error_message is None,
+                error_message=error_message)
+
+        return response
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """Handle health check requests"""
@@ -302,7 +434,18 @@ class MultiLLMFrontend:
         """Handle traffic statistics requests for all models"""
         try:
             # Get optional query parameters
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be an integer, got "
+                    f"{request.query.get('window')!r}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             stats = self.traffic_monitor.get_traffic_summary(window_seconds)
 
@@ -326,7 +469,18 @@ class MultiLLMFrontend:
         try:
             import urllib.parse
             model_name = urllib.parse.unquote(request.match_info['model_name'])
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be an integer, got "
+                    f"{request.query.get('window')!r}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             model_stats = self.traffic_monitor.get_model_stats(model_name)
             if not model_stats:
@@ -367,8 +521,21 @@ class MultiLLMFrontend:
         """Handle requests for idle models that could be put to sleep"""
         try:
             # Get optional threshold parameter
-            idle_threshold = int(request.query.get('threshold',
-                                                   300))  # Default 5 minutes
+            try:
+                idle_threshold = int(
+                    request.query.get(
+                        'threshold',
+                        self.traffic_monitor.idle_threshold_seconds))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be an integer, got "
+                    f"{request.query.get('threshold')!r}")
+
+            if idle_threshold < 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be non-negative, got {idle_threshold}")
 
             idle_models = self.traffic_monitor.get_idle_models(idle_threshold)
 
@@ -380,6 +547,7 @@ class MultiLLMFrontend:
                     idle_model_stats[model_name] = {
                         'idle_time_seconds': model_stats.get_idle_time(),
                         'total_requests': model_stats.total_requests,
+                        'inflight_requests': model_stats.inflight_requests,
                         'last_activity_time': model_stats.last_activity_time
                     }
 
@@ -406,9 +574,28 @@ class MultiLLMFrontend:
         """Handle requests for active models"""
         try:
             # Get optional threshold parameter
-            idle_threshold = int(request.query.get('threshold',
-                                                   300))  # Default 5 minutes
-            window_seconds = int(request.query.get('window', 60))
+            try:
+                idle_threshold = int(
+                    request.query.get(
+                        'threshold',
+                        self.traffic_monitor.idle_threshold_seconds))
+                window_seconds = int(request.query.get('window', 60))
+            except ValueError:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold and window must be integers, got "
+                    f"threshold={request.query.get('threshold')!r}, "
+                    f"window={request.query.get('window')!r}")
+
+            if idle_threshold < 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"threshold must be non-negative, got {idle_threshold}")
+            if window_seconds <= 0:
+                return _json_error(
+                    400, "BadRequestError",
+                    f"window must be a positive number of seconds, got "
+                    f"{window_seconds}")
 
             active_models = self.traffic_monitor.get_active_models(
                 idle_threshold)
@@ -423,6 +610,8 @@ class MultiLLMFrontend:
                         model_stats.get_request_rate(window_seconds),
                         'total_requests':
                         model_stats.total_requests,
+                        'inflight_requests':
+                        model_stats.inflight_requests,
                         'avg_response_time':
                         model_stats.avg_response_time,
                         'last_activity_time':
@@ -489,8 +678,9 @@ class MultiLLMFrontend:
                     candidate_details[model_name] = {
                         'idle_time_seconds': model_stats.get_idle_time(),
                         'total_requests': model_stats.total_requests,
+                        'inflight_requests': model_stats.inflight_requests,
                         'last_activity_time': model_stats.last_activity_time,
-                        'can_sleep': True
+                        'can_sleep': not model_stats.is_busy()
                     }
 
             return web.Response(text=json.dumps({

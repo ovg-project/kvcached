@@ -67,7 +67,7 @@ def _manager():
     manager._physical_release_epoch = 0
     manager._retired_pages = []
     manager.in_shrink = False
-    manager.target_num_blocks = None
+    manager.target_num_pages = None
     manager._avail_physical_pages_cache = mock.sentinel.cached_capacity
     manager._post_init_done = threading.Event()
     manager._post_init_done.set()
@@ -159,14 +159,19 @@ def test_failed_release_preserves_retirement_for_retry(failure_stage):
     assert manager._avail_physical_pages_cache is None
 
 
-def test_shrink_waits_until_retired_pages_are_physically_released():
+@pytest.mark.parametrize("engine_pass", [False, True])
+def test_shrink_waits_until_retired_pages_are_physically_released(engine_pass):
     manager = _manager()
     manager.in_shrink = True
-    manager.target_num_blocks = 0
+    manager.target_num_pages = 0
+    manager.page_size = 4
     manager._get_num_alloced_blocks = mock.Mock(return_value=0)
     _retire(manager, [(1, [10])])
 
-    manager._maybe_finish_shrink()
+    if engine_pass:
+        manager.reclaim_for_shrink()
+    else:
+        manager._maybe_finish_shrink()
     manager.page_allocator.resize.assert_not_called()
 
     manager.release_retired_pages_through(1)

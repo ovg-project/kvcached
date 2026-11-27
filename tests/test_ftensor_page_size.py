@@ -23,6 +23,7 @@ def test_pool_page_sizes_do_not_change_existing_or_default_pools(contiguous, uni
                 4 * page, 1, "cuda:0", layers, num_kv_buffers=buffers,
                 group_id=group, unified_pool=unified, **kwargs)
             stride = page * layers * buffers if contiguous else page
+            assert vmm.kv_mapping_page_size(group) == stride
             views = ([raw[0][:stride], raw[0][stride:2 * stride]] if contiguous else
                      [tensor[start:start + page]
                       for tensor in raw
@@ -63,5 +64,73 @@ def test_tensor_page_size_cannot_change_after_creation():
         vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=4 * 1024**2)
         with pytest.raises(RuntimeError, match="Cannot change page size"):
             vmm.create_kv_tensors(16 * 1024**2, 1, "cuda:0", 1, page_size=2 * 1024**2)
+    finally:
+        vmm.shutdown_kvcached()
+
+
+def test_compound_page_maps_relative_to_reservation_base():
+    """Exercise the native assertion in a CUDA checkout.
+
+    CFLAGS=-UNDEBUG CXXFLAGS=-UNDEBUG python setup.py build_ext --inplace --force
+    python -m pytest -q tests/test_ftensor_page_size.py -k maps_relative_to_reservation_base
+    """
+    vmm = _compiled_vmm_ops()
+    import torch
+
+    page = 2 * 1024**2
+    layers = 24
+    stride = layers * page
+    vmm.init_kvcached("cuda:0", page, True)
+    try:
+        for group in (0, 2):
+            raw, = vmm.create_kv_tensors(2 * page, 1, "cuda:0", layers,
+                                         num_kv_buffers=1, group_id=group)
+            if raw.data_ptr() % stride:
+                break
+            if group == 0:
+                # Advance the next reservation hint by one driver-aligned page.
+                vmm.create_kv_tensors(page, 1, "cuda:0", 1, num_kv_buffers=1, group_id=1)
+        else:
+            pytest.skip("driver returned only compound-page-aligned reservations")
+        assert vmm.kv_mapping_page_size(group) == stride
+        assert vmm.map_to_kv_tensors([0, stride], group)
+        raw[:8].fill_(11)
+        raw[stride:stride + 8].fill_(22)
+        assert torch.all(raw[:8] == 11).item()
+        assert vmm.unmap_from_kv_tensors([0], group)
+        assert torch.all(raw[stride:stride + 8] == 22).item()
+        assert vmm.unmap_from_kv_tensors([stride], group)
+    finally:
+        vmm.shutdown_kvcached()
+
+
+@pytest.mark.parametrize("contiguous", [False, True])
+@pytest.mark.parametrize("buffers", [1, 2])
+def test_unaligned_offsets_cannot_alias_a_live_page(contiguous, buffers):
+    import torch
+
+    vmm = _compiled_vmm_ops()
+    page = 2 * 1024**2
+    vmm.init_kvcached("cuda:0", page, contiguous)
+    try:
+        with pytest.raises(RuntimeError, match="initialized"):
+            vmm.kv_mapping_page_size(3)
+        raw = vmm.create_kv_tensors(
+            8 * page, 1, "cuda:0", 2, num_kv_buffers=buffers, group_id=3)
+        stride = vmm.kv_mapping_page_size(3)
+        assert stride == (page * 2 * buffers if contiguous else page)
+        assert vmm.map_to_kv_tensors_with_result([0], 3) == (True, [0])
+        views = [tensor[:128] for tensor in raw]
+        for view in views:
+            view.fill_(17)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="page aligned"):
+            vmm.map_to_kv_tensors_with_result([stride // 2], 3)
+        with pytest.raises(RuntimeError, match="page aligned"):
+            vmm.prepare_unmap_from_kv_tensors([stride // 2], "unaligned", 3)
+        assert vmm.map_to_kv_tensors_with_result([0], 3) == (True, [])
+        assert all(torch.all(view == 17).item() for view in views)
+        torch.cuda.synchronize()
+        assert vmm.unmap_from_kv_tensors([0], 3)
     finally:
         vmm.shutdown_kvcached()

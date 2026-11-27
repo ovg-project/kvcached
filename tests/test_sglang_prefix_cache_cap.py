@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 import kvcached.integration.sglang.patches as sgl_patches
+import kvcached.prefix_cache_retention as retention
 
 
 @dataclasses.dataclass
@@ -32,6 +33,11 @@ PATCHES = [
     ("SWARadixCacheLimitPatch", "sglang.srt.mem_cache.swa_radix_cache", "SWARadixCache"),
     ("MambaRadixCacheLimitPatch", "sglang.srt.mem_cache.mamba_radix_cache", "MambaRadixCache"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def enable_kvcached(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "1")
 
 
 @pytest.fixture(params=PATCHES, ids=[p[2] for p in PATCHES])
@@ -68,7 +74,8 @@ def _modules(monkeypatch, full_evictable, target, swa_evictable=0):
 
 
 def _apply(monkeypatch, mod, cap, target):
-    monkeypatch.setattr(sgl_patches, "MAX_CACHED_TOKENS", cap)
+    monkeypatch.setattr(
+        retention, "_policy", retention._PrefixCacheRetentionPolicy(cap))
     patch = getattr(sgl_patches, target[0])()
     monkeypatch.setattr(patch.version_manager, "detect_version", lambda _name: "0.5.20")
     assert patch.apply(mod)
@@ -76,6 +83,14 @@ def _apply(monkeypatch, mod, cap, target):
 
 
 def test_finished_request_trims_the_cache_to_the_cap(monkeypatch, target):
+    original_evict = sgl_patches.evict_prefix_cache
+    requests = []
+
+    def evict_prefix_cache(cache, params):
+        requests.append((cache, params))
+        return original_evict(cache, params)
+
+    monkeypatch.setattr(sgl_patches, "evict_prefix_cache", evict_prefix_cache)
     mod, cache_cls = _modules(monkeypatch, 20000, target)
     _apply(monkeypatch, mod, 16000, target)
 
@@ -84,6 +99,7 @@ def test_finished_request_trims_the_cache_to_the_cap(monkeypatch, target):
 
     assert cache.finished == ["req"]
     assert cache.evicted == [EvictParams(num_tokens=4000)]
+    assert requests == [(cache, EvictParams(num_tokens=4000))]
 
 
 @pytest.mark.parametrize("evictable", [0, 16000])
@@ -96,11 +112,19 @@ def test_cache_within_the_cap_is_left_alone(monkeypatch, target, evictable):
     assert cache.evicted == []
 
 
-def test_unlimited_cap_leaves_the_class_unpatched(monkeypatch, target):
+def test_unlimited_cap_installs_runtime_hook_but_does_not_evict(
+        monkeypatch, target):
     mod, cache_cls = _modules(monkeypatch, 20000, target)
     original = cache_cls.cache_finished_req
     _apply(monkeypatch, mod, -1, target)
-    assert cache_cls.cache_finished_req is original
+    assert cache_cls.cache_finished_req is not original
+
+    cache = cache_cls()
+    cache.cache_finished_req("req")
+    assert cache.evicted == []
+
+    retention._policy.set_limit(16000)
+    assert cache.evicted == [EvictParams(num_tokens=4000)]
 
 
 def test_patch_is_idempotent(monkeypatch, target):
@@ -136,16 +160,26 @@ def test_component_limits_are_independent(
     assert cache.evicted == ([] if expected is None else [expected])
 
 
-def test_swa_setting_does_not_enable_full_only_mamba_cap(monkeypatch):
-    target = PATCHES[2]
-    mod, cache_cls = _modules(monkeypatch, 20000, target, 20000)
-    original = cache_cls.cache_finished_req
+def test_disabled_kvcached_leaves_native_swa_prefixes_alone(monkeypatch):
+    monkeypatch.setenv("ENABLE_KVCACHED", "0")
     monkeypatch.setattr(sgl_patches, "MAX_CACHED_SWA_TOKENS", 0)
+    target = PATCHES[0]
+    mod, cache_cls = _modules(monkeypatch, 12, target, 12)
     _apply(monkeypatch, mod, -1, target)
-    assert cache_cls.cache_finished_req is original
-    _apply(monkeypatch, mod, 16000, target)
     cache = cache_cls()
     cache.cache_finished_req("req")
+    assert cache.evicted == []
+
+
+def test_swa_setting_leaves_mamba_on_its_runtime_full_limit(monkeypatch):
+    target = PATCHES[2]
+    mod, cache_cls = _modules(monkeypatch, 20000, target, 20000)
+    monkeypatch.setattr(sgl_patches, "MAX_CACHED_SWA_TOKENS", 0)
+    _apply(monkeypatch, mod, -1, target)
+    cache = cache_cls()
+    cache.cache_finished_req("req")
+    assert cache.evicted == []
+    retention._policy.set_limit(16000)
     assert cache.evicted == [EvictParams(num_tokens=4000)]
 
 

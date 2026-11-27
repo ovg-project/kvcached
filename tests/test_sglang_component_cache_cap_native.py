@@ -12,6 +12,7 @@ import pytest
 
 @pytest.fixture(params=["unified", "swa"])
 def native_cache(monkeypatch, request):
+    monkeypatch.setenv("KVCACHED_AUTOPATCH", "0")
     pytest.importorskip("sglang")
     if importlib.metadata.version("sglang") != "0.5.20":
         pytest.skip("Native cache fixture is pinned to SGLang 0.5.20")
@@ -19,18 +20,25 @@ def native_cache(monkeypatch, request):
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the native SWA allocator")
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache import memory_pool
+    from sglang.srt.mem_cache.allocator import swa
+    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
     monkeypatch.setenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
-    pool = SWAKVPool(size=64, size_swa=64, page_size=1, dtype=torch.float16,
+    # A previously imported SGLang may already have captured elastic aliases.
+    mha_pool = memory_pool.MHATokenToKVPool
+    if mha_pool is getattr(memory_pool, "ElasticMHATokenToKVPool", None):
+        mha_pool = mha_pool.__base__
+    monkeypatch.setattr(swa, "TokenToKVPoolAllocator", TokenToKVPoolAllocator)
+    pool = SWAKVPool(token_to_kv_pool_class=mha_pool, size=64, size_swa=64, page_size=1, dtype=torch.float16,
                      head_num=1, head_dim=16, swa_attention_layer_ids=[1],
                      full_attention_layer_ids=[0], device="cuda")
     req_pool = ReqToTokenPool(2, 64, "cuda", enable_memory_saver=False)
-    allocator = SWATokenToKVPoolAllocator(
+    allocator = swa.SWATokenToKVPoolAllocator(
         64, 64, 1, torch.float16, "cuda", pool, need_sort=False)
     module_name, class_name, patch_name = (
         ("unified_radix_cache", "UnifiedRadixCache", "UnifiedRadixCacheLimitPatch")
@@ -38,8 +46,15 @@ def native_cache(monkeypatch, request):
         ("swa_radix_cache", "SWARadixCache", "SWARadixCacheLimitPatch"))
     module = importlib.import_module("sglang.srt.mem_cache." + module_name)
     cache_cls = getattr(module, class_name)
-    # Restore the real class after each parameterized fixture.
-    monkeypatch.setattr(cache_cls, "cache_finished_req", cache_cls.cache_finished_req)
+    from kvcached.integration.sglang import patches
+
+    patch = getattr(patches, patch_name)()
+    # Another test or a site hook may already have patched this class.
+    for name, marker in (("cache_finished_req", None), ("__init__", "__kvcached_retention_registration__"),
+                         ("reset", None)):
+        method = getattr(cache_cls, name)
+        monkeypatch.setattr(cache_cls, name, method.__wrapped__ if patch._is_already_patched(method, marker) else method)
+    monkeypatch.setattr(cache_cls, "_enforce_prefix_cache_retention", None, raising=False)
     cache = cache_cls(CacheInitParams(
         disable=False, req_to_token_pool=req_pool,
         token_to_kv_pool_allocator=allocator, page_size=1,
@@ -60,10 +75,12 @@ def test_native_caps_preserve_active_full_prefix_and_swa_window(
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.sampling.sampling_params import SamplingParams
 
+    from kvcached import prefix_cache_retention as retention
     from kvcached.integration.sglang import patches
 
     cache, allocator, pool, req_pool, module, patch_name = native_cache
-    monkeypatch.setattr(patches, "MAX_CACHED_TOKENS", full_cap)
+    monkeypatch.setenv("ENABLE_KVCACHED", "1")
+    monkeypatch.setattr(retention, "_policy", retention._PrefixCacheRetentionPolicy(full_cap))
     monkeypatch.setattr(patches, "MAX_CACHED_SWA_TOKENS", swa_cap)
     assert getattr(patches, patch_name)().apply(module)
 
@@ -113,7 +130,9 @@ def test_native_caps_preserve_active_full_prefix_and_swa_window(
     try:
         torch.cuda.synchronize()
         assert torch.all(pool.get_key_buffer(0)[values] == 42).item()
-        assert torch.all(pool.get_key_buffer(1)[active_swa] == 84).item()
+        live_swa = allocator.translate_loc_from_full_to_swa(values[-4:])
+        assert torch.equal(live_swa, active_swa)
+        assert torch.all(pool.get_key_buffer(1)[live_swa] == 84).item()
         # Native eviction may split or drop an unprotected FULL leaf to release
         # SWA. All remaining FULL slots belong to the locked prefix or the cache.
         assert allocator.full_available_size() == 64 - 12 - cache.full_evictable_size()
