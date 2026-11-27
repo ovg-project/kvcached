@@ -48,3 +48,37 @@ vllm serve <model> --no-enable-prefix-caching
 # SGLang
 python -m sglang.launch_server --model <model> --disable-radix-cache
 ```
+
+## Update the bound at runtime
+
+`KVCACHED_MAX_CACHED_TOKENS` only sets the initial bound. A controller can
+publish a new bound to a running instance from another process:
+
+```python
+from kvcached.control import set_prefix_cache_retention_limit
+
+result = set_prefix_cache_retention_limit(4000, instance_name="my-model")
+```
+
+`instance_name` is the engine's `KVCACHED_IPC_NAME`, and the engine must finish
+initialization first. Limits use the same values as the environment variable:
+`-1` for unlimited, `0` to drop cached prefixes as soon as they become
+evictable, or a token count.
+
+The engine applies the bound on its engine or scheduler thread, including
+while idle, and evicts cached prefixes above it. SGLang tensor-parallel ranks
+apply the update together. With pipeline parallelism, publication may still be
+accepted, but the scheduler keeps the existing bound.
+
+The returned `status` has the same meaning as for `set_instance_memory_limit`;
+see [Memory control](../02_memory_control/README.md#embedding-revisioned-limits-in-a-production-controller).
+
+## Read the bound in the engine
+
+Inside the engine process, read the bound currently in effect:
+
+```python
+from kvcached.control import get_prefix_cache_retention_limit
+
+limit_tokens = get_prefix_cache_retention_limit()
+```
