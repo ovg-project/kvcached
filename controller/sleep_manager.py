@@ -26,7 +26,7 @@ class SleepConfig:
     check_interval_seconds: int = 60  # Check every minute
     auto_sleep_enabled: bool = False  # Whether to automatically put models to sleep
     wakeup_on_request: bool = True  # Whether to automatically wake models on request
-    min_sleep_duration: int = 60  # Minimum time to keep model asleep (seconds)
+    min_sleep_duration: int = 60  # Minimum awake time before auto-sleep reconsiders
     vllm_sleep_mode: str = "abort"
     vllm_sleep_timeout_seconds: float = 30
     vllm_models_config: Dict[str, Dict[
@@ -59,6 +59,8 @@ class SleepManager:
         self.traffic_monitor = traffic_monitor  # Injected dependency
         self.sleeping_models: Dict[str, float] = {
         }  # model_name -> sleep_start_time
+        self._last_wakeup: Dict[str, float] = {
+        }  # model_name -> wake_up time
         self.manual_sleep_models: Set[str] = set(
         )  # Models manually put to sleep
         self._model_locks: Dict[str, asyncio.Lock] = {}
@@ -132,6 +134,14 @@ class SleepManager:
                                 f"longer idle; skipping auto-sleep")
                     return False
 
+            if not manual:
+                cooldown = self._auto_sleep_cooldown(model_name)
+                if cooldown > 0:
+                    logger.info(f"Model {model_name} was woken recently; "
+                                f"keeping it awake for another "
+                                f"{cooldown:.0f}s")
+                    return False
+
             try:
                 # Use vLLM Python API to put model to sleep
                 if model_name in self.config.vllm_models_config:
@@ -194,17 +204,8 @@ class SleepManager:
             return False
 
         try:
-            # Check minimum sleep duration
             sleep_start_time = self.sleeping_models[model_name]
             sleep_duration = time.time() - sleep_start_time
-            logger.info(
-                f"Model {model_name} has only been sleeping for {sleep_duration:.1f}s, "
-                f"minimum is {self.config.min_sleep_duration}s")
-            if sleep_duration < self.config.min_sleep_duration:
-                logger.info(
-                    f"Model {model_name} has only been sleeping for {sleep_duration:.1f}s, "
-                    f"minimum is {self.config.min_sleep_duration}s")
-                return False
 
             # Use vLLM Python API to wake up the model
             if model_name in self.config.vllm_models_config:
@@ -246,6 +247,7 @@ class SleepManager:
 
             del self.sleeping_models[model_name]
             self.manual_sleep_models.discard(model_name)
+            self._last_wakeup[model_name] = time.time()
 
             logger.info(
                 f"Woke up model {model_name} after {sleep_duration:.1f}s of sleep"
@@ -277,6 +279,14 @@ class SleepManager:
             for model_name, sleep_start_time in self.sleeping_models.items()
         }
 
+    def _auto_sleep_cooldown(self, model_name: str) -> float:
+        """Seconds this model must stay awake before auto-sleep may run again."""
+        woke_at = self._last_wakeup.get(model_name)
+        if woke_at is None:
+            return 0.0
+        return max(0.0,
+                   self.config.min_sleep_duration - (time.time() - woke_at))
+
     def get_sleep_candidates(self) -> List[str]:
         """Get models that are candidates for sleep mode based on activity"""
         if self.traffic_monitor is None:
@@ -289,6 +299,11 @@ class SleepManager:
         candidates = []
         for model in idle_models:
             if model in self.sleeping_models or model in self._sleep_transitions:
+                continue
+            cooldown = self._auto_sleep_cooldown(model)
+            if cooldown > 0:
+                logger.debug(f"Model {model} was woken recently; auto-sleep "
+                             f"waits another {cooldown:.0f}s")
                 continue
             stats = self.traffic_monitor.get_model_stats(model)
             # A sleep call kills running requests; unknown state fails closed.
